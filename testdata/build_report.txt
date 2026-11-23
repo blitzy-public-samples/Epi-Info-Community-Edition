@@ -1,0 +1,6 @@
+Lyme/Lyme.mdb: CaseReport1 <- CaseReport1  fields=43 rows=1159 missing_in_source=[] extra_in_source=[]
+EColi/EColi.mdb: FoodHistory2 <- FoodHistory1  fields=45 rows=359 missing_in_source=[] extra_in_source=[]
+EColi/EColi.mdb: FoodHistory3 <- FoodHistory2  fields=29 rows=359 missing_in_source=[] extra_in_source=[]
+join CaseReport/CaseReport1: base=1159 page=1159 orphan_page=0 base_without_page=0
+join FoodHistory/FoodHistory2: base=359 page=359 orphan_page=0 base_without_page=0
+join FoodHistory/FoodHistory3: base=359 page=359 orphan_page=0 base_without_page=0

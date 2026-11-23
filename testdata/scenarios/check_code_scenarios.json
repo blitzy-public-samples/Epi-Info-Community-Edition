@@ -1,0 +1,409 @@
+{
+  "note": "Expected values are derived from legacy source code (cited per scenario), not captured from a running legacy app. Confirm with characterization tests on the Windows environment.",
+  "scenarios": [
+    {
+      "id": "LY-01",
+      "form": "CaseReport",
+      "event": "Sex.After",
+      "given": {
+        "Sex": "1"
+      },
+      "expect": {
+        "Pregnant": {
+          "enabled": true
+        }
+      },
+      "source": "metaViews.CheckCode (CaseReport): Field Sex After / Field LastName Before",
+      "legacyDefect": false,
+      "inScope": true
+    },
+    {
+      "id": "LY-02",
+      "form": "CaseReport",
+      "event": "Sex.After",
+      "given": {
+        "Sex": "2",
+        "Pregnant": "1"
+      },
+      "expect": {
+        "Pregnant": {
+          "enabled": false,
+          "value": null
+        }
+      },
+      "source": "metaViews.CheckCode (CaseReport): Field Sex After / Field LastName Before",
+      "legacyDefect": true,
+      "inScope": true,
+      "note": "codeSex \"1\" = Male, \"2\" = Female, so the legacy rule disables Pregnant for females. Parity keeps this unless listed under Approved Behavior Changes."
+    },
+    {
+      "id": "LY-03",
+      "form": "CaseReport",
+      "event": "LastName.Before",
+      "given": {
+        "Sex": "2",
+        "Pregnant": "2"
+      },
+      "expect": {
+        "Pregnant": {
+          "enabled": false,
+          "value": null
+        }
+      },
+      "source": "metaViews.CheckCode (CaseReport): Field Sex After / Field LastName Before",
+      "legacyDefect": true,
+      "inScope": true
+    },
+    {
+      "id": "LY-04",
+      "form": "CaseReport",
+      "event": "Sex.After",
+      "given": {
+        "Sex": null
+      },
+      "expect": {
+        "Pregnant": {
+          "enabled": false,
+          "value": null
+        }
+      },
+      "source": "metaViews.CheckCode (CaseReport): Field Sex After / Field LastName Before",
+      "legacyDefect": false,
+      "inScope": true,
+      "note": "Empty Sex is not \"1\", so the ELSE branch runs."
+    },
+    {
+      "id": "EC-AGE-01",
+      "form": "FoodHistory",
+      "event": "DOB.After",
+      "given": {
+        "DOB": "1986-01-01",
+        "DateofInterview": "2011-05-11"
+      },
+      "expect": {
+        "Age": 25
+      },
+      "source": "metaViews.CheckCode: ASSIGN AGE = YEARS(DOB, DateofInterview); Rule_Years.cs: new DateTime((later-earlier).Ticks).Year - 1",
+      "legacyDefect": false,
+      "inScope": true
+    },
+    {
+      "id": "EC-AGE-02",
+      "form": "FoodHistory",
+      "event": "DOB.After",
+      "given": {
+        "DOB": "2001-09-01",
+        "DateofInterview": "2011-06-15"
+      },
+      "expect": {
+        "Age": 9
+      },
+      "source": "metaViews.CheckCode: ASSIGN AGE = YEARS(DOB, DateofInterview); Rule_Years.cs: new DateTime((later-earlier).Ticks).Year - 1",
+      "legacyDefect": false,
+      "inScope": true,
+      "note": "9.79 elapsed years: legacy returns completed years (9), not rounded."
+    },
+    {
+      "id": "EC-AGE-03",
+      "form": "FoodHistory",
+      "event": "DOB.After",
+      "given": {
+        "DOB": "2000-02-29",
+        "DateofInterview": "2011-02-28"
+      },
+      "expect": {
+        "Age": 11
+      },
+      "source": "metaViews.CheckCode: ASSIGN AGE = YEARS(DOB, DateofInterview); Rule_Years.cs: new DateTime((later-earlier).Ticks).Year - 1",
+      "legacyDefect": true,
+      "inScope": true,
+      "note": "Leap-day DOB. Legacy YEARS returns 11 here; a birthday-based age would give 10. Parity keeps 11."
+    },
+    {
+      "id": "EC-AGE-04",
+      "form": "FoodHistory",
+      "event": "DOB.After",
+      "given": {
+        "DOB": "2011-06-15",
+        "DateofInterview": "2011-06-15"
+      },
+      "expect": {
+        "Age": 0
+      },
+      "source": "metaViews.CheckCode: ASSIGN AGE = YEARS(DOB, DateofInterview); Rule_Years.cs: new DateTime((later-earlier).Ticks).Year - 1",
+      "legacyDefect": false,
+      "inScope": true
+    },
+    {
+      "id": "EC-AGE-05",
+      "form": "FoodHistory",
+      "event": "DOB.After",
+      "given": {
+        "DOB": "2011-01-20",
+        "DateofInterview": null
+      },
+      "expect": {
+        "Age": null
+      },
+      "source": "Rule_Years.cs: new DateTime((later-earlier).Ticks).Year - 1",
+      "legacyDefect": false,
+      "inScope": true,
+      "note": "Missing interview date assigns null."
+    },
+    {
+      "id": "EC-WEEK-01",
+      "form": "FoodHistory",
+      "event": "OnsetDate.After",
+      "given": {
+        "OnsetDate": "2011-01-01"
+      },
+      "expect": {
+        "OnsetWeek": 52
+      },
+      "source": "ASSIGN OnsetWeek = EPIWEEK(OnsetDate); Rule_EPIWEEK.cs (MMWR week, weeks start Sunday)",
+      "legacyDefect": false,
+      "inScope": true,
+      "note": "Year-boundary case."
+    },
+    {
+      "id": "EC-WEEK-02",
+      "form": "FoodHistory",
+      "event": "OnsetDate.After",
+      "given": {
+        "OnsetDate": "2011-01-02"
+      },
+      "expect": {
+        "OnsetWeek": 1
+      },
+      "source": "ASSIGN OnsetWeek = EPIWEEK(OnsetDate); Rule_EPIWEEK.cs (MMWR week, weeks start Sunday)",
+      "legacyDefect": false,
+      "inScope": true,
+      "note": "Year-boundary case."
+    },
+    {
+      "id": "EC-WEEK-03",
+      "form": "FoodHistory",
+      "event": "OnsetDate.After",
+      "given": {
+        "OnsetDate": "2011-05-04"
+      },
+      "expect": {
+        "OnsetWeek": 18
+      },
+      "source": "ASSIGN OnsetWeek = EPIWEEK(OnsetDate); Rule_EPIWEEK.cs (MMWR week, weeks start Sunday)",
+      "legacyDefect": false,
+      "inScope": true
+    },
+    {
+      "id": "EC-WEEK-04",
+      "form": "FoodHistory",
+      "event": "OnsetDate.After",
+      "given": {
+        "OnsetDate": "2012-12-29"
+      },
+      "expect": {
+        "OnsetWeek": 52
+      },
+      "source": "ASSIGN OnsetWeek = EPIWEEK(OnsetDate); Rule_EPIWEEK.cs (MMWR week, weeks start Sunday)",
+      "legacyDefect": false,
+      "inScope": true,
+      "note": "Year-boundary case."
+    },
+    {
+      "id": "EC-WEEK-05",
+      "form": "FoodHistory",
+      "event": "OnsetDate.After",
+      "given": {
+        "OnsetDate": "2012-12-30"
+      },
+      "expect": {
+        "OnsetWeek": 1
+      },
+      "source": "ASSIGN OnsetWeek = EPIWEEK(OnsetDate); Rule_EPIWEEK.cs (MMWR week, weeks start Sunday)",
+      "legacyDefect": false,
+      "inScope": true,
+      "note": "Year-boundary case."
+    },
+    {
+      "id": "EC-RACE-01",
+      "form": "FoodHistory",
+      "event": "Asian.Click",
+      "given": {
+        "White": true,
+        "Asian": false
+      },
+      "expect": {
+        "White": false,
+        "NativeHawaiianOtherPacificIslander": false,
+        "UnknownOther": false,
+        "Black": false,
+        "AmericanIndianAlaskanNative": false,
+        "Multiracial": false,
+        "Asian": true
+      },
+      "source": "Field Asian Click: ASSIGN <other race checkboxes> = (-)",
+      "legacyDefect": false,
+      "inScope": true
+    },
+    {
+      "id": "EC-RACE-02",
+      "form": "FoodHistory",
+      "event": "Asian.Click",
+      "given": {
+        "Asian": true,
+        "Black": false
+      },
+      "expect": {
+        "White": false,
+        "NativeHawaiianOtherPacificIslander": false,
+        "UnknownOther": false,
+        "Black": false,
+        "AmericanIndianAlaskanNative": false,
+        "Asian": false,
+        "Multiracial": false
+      },
+      "source": "Click fires on uncheck too: Asian toggles off and the others are assigned (-).",
+      "legacyDefect": false,
+      "inScope": true
+    },
+    {
+      "id": "EC-FEVER-01",
+      "form": "FoodHistory",
+      "event": "FeverTemp.After",
+      "given": {
+        "FeverTemp": 101.2,
+        "Fever": false
+      },
+      "expect": {
+        "dialog": "Warning: A fever temperature has been entered, but 'fever' was not selected as a symptom.",
+        "FeverTemp": 101.2
+      },
+      "source": "Field FeverTemp After: IF NOT FeverTemp = (.) AND Fever = (-) THEN DIALOG ...",
+      "legacyDefect": false,
+      "inScope": true
+    },
+    {
+      "id": "EC-FEVER-02",
+      "form": "FoodHistory",
+      "event": "FeverTemp.After",
+      "given": {
+        "FeverTemp": 101.2,
+        "Fever": true
+      },
+      "expect": {
+        "dialog": null
+      },
+      "source": "Field FeverTemp After: IF NOT FeverTemp = (.) AND Fever = (-) THEN DIALOG ...",
+      "legacyDefect": false,
+      "inScope": true
+    },
+    {
+      "id": "EC-FEVER-03",
+      "form": "FoodHistory",
+      "event": "FeverTemp.After",
+      "given": {
+        "FeverTemp": null,
+        "Fever": false
+      },
+      "expect": {
+        "dialog": null
+      },
+      "source": "Field FeverTemp After: IF NOT FeverTemp = (.) AND Fever = (-) THEN DIALOG ...",
+      "legacyDefect": false,
+      "inScope": true
+    },
+    {
+      "id": "EC-GEO-01",
+      "form": "FoodHistory",
+      "event": "GetCoordinates.Click",
+      "given": {
+        "PatientAddress": "1 Example St"
+      },
+      "expect": {
+        "skipped": true,
+        "logged": true
+      },
+      "source": "GEOCODE needs an external geocoding service",
+      "legacyDefect": false,
+      "inScope": false,
+      "note": "Out of scope: unsupported statement is logged and skipped."
+    },
+    {
+      "id": "EC-VAL-01",
+      "form": "FoodHistory",
+      "event": "save",
+      "given": {
+        "DateofInterview": "2011-01-01"
+      },
+      "expect": {
+        "rejected": true,
+        "field": "DateofInterview"
+      },
+      "source": "metaFields Lower/Upper/Pattern",
+      "legacyDefect": false,
+      "inScope": true,
+      "note": "Range 01-15-2011 to 12-31-2012."
+    },
+    {
+      "id": "EC-VAL-02",
+      "form": "FoodHistory",
+      "event": "save",
+      "given": {
+        "FeverTemp": 112
+      },
+      "expect": {
+        "rejected": true,
+        "field": "FeverTemp"
+      },
+      "source": "metaFields Lower/Upper/Pattern",
+      "legacyDefect": false,
+      "inScope": true,
+      "note": "Range 80 to 110."
+    },
+    {
+      "id": "EC-VAL-03",
+      "form": "FoodHistory",
+      "event": "save",
+      "given": {
+        "Sex": "X-Other"
+      },
+      "expect": {
+        "rejected": true,
+        "field": "Sex"
+      },
+      "source": "Legal values limited to codephvs_administrativesex_hl7_2x",
+      "legacyDefect": false,
+      "inScope": true
+    },
+    {
+      "id": "DATA-01",
+      "form": "*",
+      "event": "load",
+      "given": {
+        "record": "any sample record"
+      },
+      "expect": {
+        "storedValuesUnchanged": true
+      },
+      "source": "testdata/build_report.txt",
+      "legacyDefect": false,
+      "inScope": true,
+      "note": "Historical OnsetWeek values do not follow the current EPIWEEK rule (40 of 326 sample records match). Check code runs on entry events only; the new app must not recompute stored values on load."
+    },
+    {
+      "id": "DATA-02",
+      "form": "*",
+      "event": "navigate",
+      "given": {
+        "RecStatus": 0
+      },
+      "expect": {
+        "recordRetained": true,
+        "markedDeleted": true
+      },
+      "source": "GuiMediator.MarkAsDeletedRecordHandler sets RecStatus = 0 (soft delete)",
+      "legacyDefect": false,
+      "inScope": true
+    }
+  ]
+}

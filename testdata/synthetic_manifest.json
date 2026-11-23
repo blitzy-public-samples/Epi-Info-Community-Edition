@@ -1,0 +1,14 @@
+{
+  "seed": 20261123,
+  "countPerForm": 250,
+  "forms": {
+    "CaseReport": {
+      "records": 250,
+      "softDeleted": 17
+    },
+    "FoodHistory": {
+      "records": 250,
+      "softDeleted": 12
+    }
+  }
+}
