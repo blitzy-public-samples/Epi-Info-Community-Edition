@@ -56,10 +56,10 @@ public static class Evaluator
     /// </summary>
     /// <remarks>
     /// <para>
-    /// The caller, <c>CheckCodeEngine.Run</c>, selects the blocks: every <c>Field</c> block whose name matches the
-    /// event's field without regard to case, holding an event block of the event's kind, in source order. Each
-    /// selected block's static diagnostics are added here, ahead of its runtime errors, so the caller must not add
-    /// them again.
+    /// The caller, <c>CheckCodeEngine.Run</c>, selects the blocks: the event blocks of the event's kind, in source
+    /// order, inside the last <c>Field</c> block whose name matches the event's field without regard to case, because
+    /// a later block of a name replaced the earlier one in legacy Epi Info. Each selected block's static diagnostics
+    /// are added here, ahead of its runtime errors, so the caller must not add them again.
     /// </para>
     /// <para>
     /// The blocks run in the given order over one shared <see cref="EvaluationContext"/>, so a later block reads the
