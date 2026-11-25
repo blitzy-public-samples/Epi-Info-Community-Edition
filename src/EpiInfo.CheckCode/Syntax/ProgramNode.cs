@@ -46,9 +46,9 @@ namespace EpiInfo.CheckCode.Syntax;
 public sealed record ProgramNode(IReadOnlyList<FieldBlockNode> FieldBlocks, IReadOnlyList<Diagnostic> Diagnostics)
 {
     private readonly ImmutableList<FieldBlockNode> fieldBlocks =
-        ProgramLists.Snapshot(FieldBlocks, nameof(FieldBlocks));
+        SyntaxLists.Snapshot(FieldBlocks, nameof(FieldBlocks));
 
-    private readonly ImmutableList<Diagnostic> diagnostics = ProgramLists.Snapshot(Diagnostics, nameof(Diagnostics));
+    private readonly ImmutableList<Diagnostic> diagnostics = SyntaxLists.Snapshot(Diagnostics, nameof(Diagnostics));
 
     /// <summary>
     /// The program with no blocks and no diagnostics: the parse of a <see langword="null"/>, blank or comment-only
@@ -66,7 +66,7 @@ public sealed record ProgramNode(IReadOnlyList<FieldBlockNode> FieldBlocks, IRea
     {
         get => fieldBlocks;
         // Copied here as well as in the constructor, so a `with` expression cannot alias a mutable list.
-        init => fieldBlocks = ProgramLists.Snapshot(value, nameof(FieldBlocks));
+        init => fieldBlocks = SyntaxLists.Snapshot(value, nameof(FieldBlocks));
     }
 
     /// <summary>The program's static diagnostics in source order, as an immutable snapshot.</summary>
@@ -75,7 +75,7 @@ public sealed record ProgramNode(IReadOnlyList<FieldBlockNode> FieldBlocks, IRea
     public IReadOnlyList<Diagnostic> Diagnostics
     {
         get => diagnostics;
-        init => diagnostics = ProgramLists.Snapshot(value, nameof(Diagnostics));
+        init => diagnostics = SyntaxLists.Snapshot(value, nameof(Diagnostics));
     }
 
     /// <inheritdoc />
@@ -98,26 +98,4 @@ public sealed record ProgramNode(IReadOnlyList<FieldBlockNode> FieldBlocks, IRea
     /// <inheritdoc />
     public override int GetHashCode() =>
         HashCode.Combine(SyntaxEquality.ListHash(FieldBlocks), SyntaxEquality.ListHash(Diagnostics));
-}
-
-/// <summary>Immutable snapshots of the program node's list members.</summary>
-file static class ProgramLists
-{
-    // An immutable list exposes no writable storage: its collection-interface writes throw NotSupportedException
-    // and its own modifying methods return a new list. Each element is read once, so a null cannot slip past the
-    // check. The member name is passed as paramName because the list is not a parameter of this helper.
-    public static ImmutableList<T> Snapshot<T>(IReadOnlyList<T> value, string paramName)
-        where T : class
-    {
-        ArgumentNullException.ThrowIfNull(value, paramName);
-        var builder = ImmutableList.CreateBuilder<T>();
-        var count = value.Count;
-        for (var i = 0; i < count; i++)
-        {
-            builder.Add(value[i]
-                ?? throw new ArgumentException($"{paramName} must not contain a null element.", paramName));
-        }
-
-        return builder.ToImmutable();
-    }
 }

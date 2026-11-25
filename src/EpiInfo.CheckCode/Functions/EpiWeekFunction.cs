@@ -1,4 +1,5 @@
 using System.Globalization;
+using EpiInfo.CheckCode.Syntax;
 using EpiInfo.Domain.Values;
 
 namespace EpiInfo.CheckCode.Functions;
@@ -24,8 +25,8 @@ namespace EpiInfo.CheckCode.Functions;
 /// </remarks>
 public static class EpiWeekFunction
 {
-    /// <summary>The function name, matched case-insensitively.</summary>
-    public const string Name = "EPIWEEK";
+    /// <summary>The function name, <see cref="FunctionNames.EpiWeek"/>, matched case-insensitively.</summary>
+    public const string Name = FunctionNames.EpiWeek;
 
     /// <summary>Computes <c>EPIWEEK</c>.</summary>
     /// <param name="arguments">One or two evaluated arguments: the date, then the optional first day.</param>

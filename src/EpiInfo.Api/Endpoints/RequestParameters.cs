@@ -6,20 +6,27 @@ using EpiInfo.Domain.Records;
 namespace EpiInfo.Api.Endpoints;
 
 /// <summary>
-/// The single owner of route and query coercion. Endpoints bind <c>position</c>, <c>page</c>, <c>pageSize</c>,
-/// <c>includeDeleted</c> and <c>q</c> as strings and hand them here, so framework binding never produces an
-/// undocumented status: a value that does not coerce is a field-level 400 keyed by the parameter's wire name.
+/// The single owner of route and query coercion. Endpoints bind <c>position</c> and <c>q</c> as strings, and
+/// <c>page</c>, <c>pageSize</c> and <c>includeDeleted</c> as the strings of every occurrence sent, and hand them
+/// here, so framework binding never produces an undocumented status: a value that does not coerce is a field-level
+/// 400 keyed by the parameter's wire name.
 /// </summary>
 /// <remarks>
 /// <para>
-/// <b>Absent values.</b> For <c>page</c>, <c>pageSize</c> and <c>includeDeleted</c>, <see langword="null"/> and the
-/// empty string both mean absent, because a bare <c>?page=</c> carries no value and string binding may present it
-/// either way; an absent value takes its default. Any other text, whitespace included, is present and must coerce.
-/// <c>position</c> is a route segment and has no default.
+/// <b>Absent values.</b> <c>page</c>, <c>pageSize</c> and <c>includeDeleted</c> arrive as their occurrences in the
+/// order sent: none for a key that was not sent, and the empty string for an occurrence sent without a value, such as
+/// <c>?page=</c> or a bare <c>?page</c>. Only a parameter with no occurrence, an empty or <see langword="null"/> list,
+/// is absent and takes its default. A parameter sent once is that one value, and any text, the empty string and
+/// whitespace included, must coerce. A parameter sent more than once has no single value and is a 400 under its key
+/// with the same fixed message as a value that does not coerce, whatever each occurrence holds, so an empty
+/// occurrence is never dropped in favour of another. A <see langword="null"/> occurrence is invalid. <c>position</c>
+/// is a route segment and has no default.
 /// </para>
 /// <para>
-/// <b>Integers</b> are invariant 32-bit values with an optional leading sign and nothing else: no surrounding
-/// whitespace, thousands separators, decimals, exponents or hex. A value outside <see cref="int"/> is a 400.
+/// <b>Integers</b> are invariant 32-bit values written as one complete token: an optional single leading <c>+</c> or
+/// <c>-</c> followed by one or more ASCII digits <c>0</c> to <c>9</c>, and nothing else. Surrounding whitespace,
+/// embedded or trailing NUL characters, non-ASCII digits and signs, thousands separators, decimals, exponents and hex
+/// are rejected before the range conversion, and a token outside <see cref="int"/> is a 400.
 /// </para>
 /// <para>
 /// <b>One 400 per request.</b> Every bad parameter of a request is reported in one
@@ -62,17 +69,21 @@ public static class RequestParameters
     /// <summary>
     /// Coerces <c>includeDeleted</c>, on every endpoint that takes it, <c>count</c> included.
     /// </summary>
-    /// <param name="raw">The query value as bound, or <see langword="null"/> when absent.</param>
+    /// <param name="raw">
+    /// The query occurrences as bound, in the order sent: none, or <see langword="null"/>, when the key was not sent;
+    /// the empty string for an occurrence sent without a value.
+    /// </param>
     /// <param name="includeDeleted">
-    /// The flag: <see langword="false"/> when <paramref name="raw"/> is absent, otherwise <c>true</c> or <c>false</c>
-    /// matched ignoring case; <see langword="false"/> on failure.
+    /// The flag: <see langword="false"/> when <paramref name="raw"/> has no occurrence; for exactly one occurrence,
+    /// <c>true</c> or <c>false</c> matched ignoring case; <see langword="false"/> on failure, which includes an empty
+    /// occurrence and a key sent more than once.
     /// </param>
     /// <param name="problem">
     /// <see langword="null"/> on success; otherwise a field-level 400 with <c>errors["includeDeleted"]</c>.
     /// </param>
     /// <returns>Whether <paramref name="raw"/> coerced.</returns>
     public static bool TryParseIncludeDeleted(
-        string? raw,
+        string[]? raw,
         out bool includeDeleted,
         [NotNullWhen(false)] out IResult? problem)
     {
@@ -105,7 +116,8 @@ public static class RequestParameters
     /// </summary>
     /// <param name="position">The route value of <c>position</c>, as <see cref="TryParsePosition"/> coerces it.</param>
     /// <param name="includeDeleted">
-    /// The query value of <c>includeDeleted</c>, as <see cref="TryParseIncludeDeleted"/> coerces it.
+    /// The query occurrences of <c>includeDeleted</c> in the order sent, as <see cref="TryParseIncludeDeleted"/>
+    /// coerces them.
     /// </param>
     /// <param name="parsedPosition">The parsed position; 0 on failure.</param>
     /// <param name="parsedIncludeDeleted">The parsed flag; <see langword="false"/> on failure.</param>
@@ -115,7 +127,7 @@ public static class RequestParameters
     /// <returns>Whether both parameters coerced.</returns>
     public static bool TryParsePositionRequest(
         string? position,
-        string? includeDeleted,
+        string[]? includeDeleted,
         out int parsedPosition,
         out bool parsedIncludeDeleted,
         [NotNullWhen(false)] out IResult? problem)
@@ -143,15 +155,19 @@ public static class RequestParameters
     /// trimming.
     /// </param>
     /// <param name="includeDeleted">
-    /// The query value of <c>includeDeleted</c>, as <see cref="TryParseIncludeDeleted"/> coerces it.
+    /// The query occurrences of <c>includeDeleted</c> in the order sent, as <see cref="TryParseIncludeDeleted"/>
+    /// coerces them.
     /// </param>
     /// <param name="page">
-    /// The page number; absent means <see cref="RecordQueryRules.DefaultPage"/>. It must be an integer of at least
-    /// <see cref="RecordQueryRules.MinPage"/>.
+    /// The occurrences of the page number in the order sent; none, or <see langword="null"/>, a key not sent, means
+    /// <see cref="RecordQueryRules.DefaultPage"/>. Exactly one occurrence, the empty string included, must be an
+    /// integer of at least <see cref="RecordQueryRules.MinPage"/>, and more than one is a 400.
     /// </param>
     /// <param name="pageSize">
-    /// The page size; absent means <see cref="RecordQueryRules.DefaultPageSize"/>. It must be an integer from
-    /// <see cref="RecordQueryRules.MinPageSize"/> to <see cref="RecordQueryRules.MaxPageSize"/>.
+    /// The occurrences of the page size in the order sent; none, or <see langword="null"/>, a key not sent, means
+    /// <see cref="RecordQueryRules.DefaultPageSize"/>. Exactly one occurrence, the empty string included, must be an
+    /// integer from <see cref="RecordQueryRules.MinPageSize"/> to <see cref="RecordQueryRules.MaxPageSize"/>, and
+    /// more than one is a 400.
     /// </param>
     /// <param name="query">The coerced query on success; otherwise <see langword="null"/>.</param>
     /// <param name="problem">
@@ -161,9 +177,9 @@ public static class RequestParameters
     /// <returns>Whether every parameter coerced and the paging bounds hold.</returns>
     public static bool TryParseListQuery(
         string? q,
-        string? includeDeleted,
-        string? page,
-        string? pageSize,
+        string[]? includeDeleted,
+        string[]? page,
+        string[]? pageSize,
         [NotNullWhen(true)] out RecordListQuery? query,
         [NotNullWhen(false)] out IResult? problem)
     {
@@ -197,11 +213,17 @@ public static class RequestParameters
     }
 
     private static void CoerceIncludeDeleted(
-        string? raw,
+        string[]? occurrences,
         out bool includeDeleted,
         ref Dictionary<string, string[]>? errors)
     {
         includeDeleted = false;
+        if (!TryGetSingleOccurrence(occurrences, out var raw))
+        {
+            AddError(IncludeDeleted, BooleanExpectedMessage, ref errors);
+            return;
+        }
+
         if (IsAbsent(raw) || string.Equals(raw, FalseText, StringComparison.OrdinalIgnoreCase))
         {
             return;
@@ -247,8 +269,14 @@ public static class RequestParameters
         }
     }
 
-    private static bool TryParseOptionalInteger(string? raw, int defaultValue, out int value)
+    private static bool TryParseOptionalInteger(string[]? occurrences, int defaultValue, out int value)
     {
+        if (!TryGetSingleOccurrence(occurrences, out var raw))
+        {
+            value = 0;
+            return false;
+        }
+
         if (IsAbsent(raw))
         {
             value = defaultValue;
@@ -258,10 +286,59 @@ public static class RequestParameters
         return TryParseInteger(raw, out value);
     }
 
-    private static bool TryParseInteger([NotNullWhen(true)] string? raw, out int value) =>
-        int.TryParse(raw, NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out value);
+    private static bool TryParseInteger([NotNullWhen(true)] string? raw, out int value)
+    {
+        // int.TryParse alone also admits trailing NUL characters, so the token is checked first and the parse only
+        // converts it and checks the 32-bit range.
+        if (!IsIntegerToken(raw))
+        {
+            value = 0;
+            return false;
+        }
 
-    private static bool IsAbsent([NotNullWhen(false)] string? raw) => string.IsNullOrEmpty(raw);
+        return int.TryParse(raw, NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out value);
+    }
+
+    // An optional single leading '+' or '-' followed by one or more ASCII digits, and nothing else.
+    private static bool IsIntegerToken([NotNullWhen(true)] string? raw)
+    {
+        if (raw is null)
+        {
+            return false;
+        }
+
+        var digits = raw.AsSpan();
+        if (!digits.IsEmpty && digits[0] is '+' or '-')
+        {
+            digits = digits[1..];
+        }
+
+        return !digits.IsEmpty && !digits.ContainsAnyExceptInRange('0', '9');
+    }
+
+    // Resolves the occurrences of one query key as bound: none is absent, so raw is null; exactly one non-null
+    // occurrence is raw, the empty string included. A key sent more than once, or a null occurrence, has no single
+    // value and fails, so no occurrence is ever chosen over or dropped in favour of another.
+    private static bool TryGetSingleOccurrence(string[]? occurrences, out string? raw)
+    {
+        switch (occurrences)
+        {
+            case null or []:
+                raw = null;
+                return true;
+
+            case [{ } single]:
+                raw = single;
+                return true;
+
+            default:
+                raw = null;
+                return false;
+        }
+    }
+
+    // Only a key that was not sent is absent; the empty string is a value that was sent.
+    private static bool IsAbsent([NotNullWhen(false)] string? raw) => raw is null;
 
     private static void AddError(string parameter, string message, ref Dictionary<string, string[]>? errors)
     {

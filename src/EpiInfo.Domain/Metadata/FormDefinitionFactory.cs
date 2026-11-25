@@ -170,8 +170,10 @@ public static class FormDefinitionFactory
     /// </summary>
     /// <param name="form">The form's metadata.</param>
     /// <returns>
-    /// The data fields in page <c>Position</c>, <c>PageId</c>, <c>TabIndex</c> and <c>FieldId</c> order, the order
-    /// the grid columns are taken from.
+    /// The data fields in page <c>Position</c>, <c>PageId</c>, <c>TabIndex</c> and <c>FieldId</c> order.
+    /// <see cref="EpiInfo.Domain.Records.RecordQueryRules.GetGridColumns(IReadOnlyList{DataFieldMetadata})"/>
+    /// re-sorts them by page <c>Position</c>, then <c>TabIndex</c>, to choose the grid columns, so the grid order
+    /// can differ from this one only for fields on pages that share a <c>Position</c>.
     /// </returns>
     /// <exception cref="ArgumentNullException"><paramref name="form"/> is null.</exception>
     public static DataFieldSet GetDataFields(FormMetadata form)

@@ -40,7 +40,7 @@ namespace EpiInfo.CheckCode.Syntax;
 /// <exception cref="ArgumentException"><paramref name="Events"/> contains a <see langword="null"/> element.</exception>
 public sealed record FieldBlockNode(string FieldName, int Line, IReadOnlyList<EventBlockNode> Events)
 {
-    private readonly ImmutableList<EventBlockNode> events = BlockLists.Snapshot(Events, nameof(Events));
+    private readonly ImmutableList<EventBlockNode> events = SyntaxLists.Snapshot(Events, nameof(Events));
 
     /// <summary>
     /// The event blocks in source order: an immutable snapshot that later changes to the caller's list or array
@@ -52,7 +52,7 @@ public sealed record FieldBlockNode(string FieldName, int Line, IReadOnlyList<Ev
     {
         get => events;
         // Copied here as well as in the constructor, so a `with` expression cannot alias a mutable list.
-        init => events = BlockLists.Snapshot(value, nameof(Events));
+        init => events = SyntaxLists.Snapshot(value, nameof(Events));
     }
 
     /// <inheritdoc />
@@ -121,9 +121,9 @@ public sealed record EventBlockNode(
     IReadOnlyList<StatementNode> Statements,
     IReadOnlyList<Diagnostic> Diagnostics)
 {
-    private readonly ImmutableList<StatementNode> statements = BlockLists.Snapshot(Statements, nameof(Statements));
+    private readonly ImmutableList<StatementNode> statements = SyntaxLists.Snapshot(Statements, nameof(Statements));
 
-    private readonly ImmutableList<Diagnostic> diagnostics = BlockLists.Snapshot(Diagnostics, nameof(Diagnostics));
+    private readonly ImmutableList<Diagnostic> diagnostics = SyntaxLists.Snapshot(Diagnostics, nameof(Diagnostics));
 
     /// <summary>
     /// The supported statements in source order: an immutable snapshot that later changes to the caller's list or
@@ -135,7 +135,7 @@ public sealed record EventBlockNode(
     {
         get => statements;
         // Copied here as well as in the constructor, so a `with` expression cannot alias a mutable list.
-        init => statements = BlockLists.Snapshot(value, nameof(Statements));
+        init => statements = SyntaxLists.Snapshot(value, nameof(Statements));
     }
 
     /// <summary>The block's static diagnostics in source order, as an immutable snapshot.</summary>
@@ -144,7 +144,7 @@ public sealed record EventBlockNode(
     public IReadOnlyList<Diagnostic> Diagnostics
     {
         get => diagnostics;
-        init => diagnostics = BlockLists.Snapshot(value, nameof(Diagnostics));
+        init => diagnostics = SyntaxLists.Snapshot(value, nameof(Diagnostics));
     }
 
     /// <inheritdoc />
@@ -173,26 +173,4 @@ public sealed record EventBlockNode(
             Line,
             SyntaxEquality.ListHash(Statements),
             SyntaxEquality.ListHash(Diagnostics));
-}
-
-/// <summary>Immutable snapshots of the block nodes' list members.</summary>
-file static class BlockLists
-{
-    // An immutable list exposes no writable storage: its collection-interface writes throw NotSupportedException
-    // and its own modifying methods return a new list. Each element is read once, so a null cannot slip past the
-    // check. The member name is passed as paramName because the list is not a parameter of this helper.
-    public static ImmutableList<T> Snapshot<T>(IReadOnlyList<T> value, string paramName)
-        where T : class
-    {
-        ArgumentNullException.ThrowIfNull(value, paramName);
-        var builder = ImmutableList.CreateBuilder<T>();
-        var count = value.Count;
-        for (var i = 0; i < count; i++)
-        {
-            builder.Add(value[i]
-                ?? throw new ArgumentException($"{paramName} must not contain a null element.", paramName));
-        }
-
-        return builder.ToImmutable();
-    }
 }

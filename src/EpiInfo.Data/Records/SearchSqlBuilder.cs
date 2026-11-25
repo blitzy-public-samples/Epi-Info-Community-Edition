@@ -202,8 +202,7 @@ internal static class SearchSqlBuilder
         AppendBase(sql, uniqueKey).Append(" AS [k], ROW_NUMBER() OVER (ORDER BY ");
         AppendBase(sql, uniqueKey).Append(") AS [pos] FROM ");
         AppendBaseTable(sql, schema);
-        RecordSqlBuilder.AppendSelectedSetPredicate(
-            sql, schema, includeDeleted, parameters, RecordSqlBuilder.BaseAlias, " WHERE ");
+        RecordSqlBuilder.AppendSelectedSetPredicate(sql, schema, includeDeleted, parameters, SelectedSetClause.Where);
 
         sql.Append(") SELECT TOP (")
             .Append(parameters.Add(n => ColumnValueConverter.Int32(n, RecordQueryRules.SearchCap)))
@@ -536,7 +535,7 @@ internal static class SearchSqlBuilder
         }
 
         var filtered = RecordSqlBuilder.AppendSelectedSetPredicate(
-            sql, schema, query.IncludeDeleted, parameters, RecordSqlBuilder.BaseAlias, " WHERE ");
+            sql, schema, query.IncludeDeleted, parameters, SelectedSetClause.Where);
         if (query.Filter is not { } filter)
         {
             return;

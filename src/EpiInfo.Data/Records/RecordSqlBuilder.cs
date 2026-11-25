@@ -87,6 +87,22 @@ internal sealed record RecordSelect(
     IReadOnlyList<PagePresence> Pages);
 
 /// <summary>
+/// The keyword that joins the selected-set predicate to a statement, chosen by
+/// <see cref="RecordSqlBuilder.AppendSelectedSetPredicate"/>. The keyword text is fixed inside the builder, so a
+/// caller selects a clause and never supplies SQL text.
+/// </summary>
+internal enum SelectedSetClause
+{
+    /// <summary>The predicate opens the statement's <c>WHERE</c> clause: <c> WHERE b.[RecStatus] = @pN</c>.</summary>
+    Where,
+
+    /// <summary>
+    /// The predicate extends a <c>WHERE</c> clause the caller has already opened: <c> AND b.[RecStatus] = @pN</c>.
+    /// </summary>
+    And,
+}
+
+/// <summary>
 /// Builds every statement that reads or writes a form's base table and page tables, except search and the grid list,
 /// which <c>SearchSqlBuilder</c> renders with the helpers defined here. It is a pure text-and-parameter builder: no
 /// connection, no I/O, no logging and no cache.
@@ -102,8 +118,20 @@ internal sealed record RecordSelect(
 /// <para>
 /// <b>Values.</b> Every value is a positional parameter built by <see cref="ColumnValueConverter"/>, typed by the
 /// column the reader discovered; a route-supplied <c>globalRecordId</c> that the base table has not yet confirmed is
-/// bound as <see cref="ColumnValueConverter.Text"/> at full length, so an over-long id finds no row instead of
-/// failing to bind.
+/// bound as <see cref="ColumnValueConverter.Text"/> at full length.
+/// </para>
+/// <para>
+/// <b>Record identity.</b> SQL Server compares strings as if the shorter were padded with trailing spaces. Every
+/// predicate this builder renders that matches a base row against a <c>GlobalRecordId</c> parameter, in
+/// <see cref="RecordById"/>, <see cref="SetPositionLookup"/>, <see cref="LockBase"/> and the base-row key of
+/// <see cref="RecordByUniqueKey"/>, <see cref="UpdateBaseStamp"/> and <see cref="SoftDelete"/>, compares under the
+/// column's collation and, because of that padding, also requires equal byte lengths (<c>DATALENGTH</c>): an id
+/// longer than the column, or one that differs from a stored id only by trailing spaces, finds no row instead of
+/// failing to bind or matching that stored id, while letter case still follows the collation. The page statements
+/// (<see cref="UpdatePageColumns"/>, <see cref="InsertPageKey"/>) bind the stored id the locked read returned, and the
+/// page join of a record read compares two stored columns. Neither meets a request's spelling, so the page
+/// <c>UPDATE</c> and the join keep plain equality. The by-id reads return the id as the base row stores it, and every
+/// later statement binds that stored spelling, never the request's.
 /// </para>
 /// <para>
 /// <b>Aliases.</b> Reads alias the base table <c>b</c> and each page <c>p{i}</c>, where <c>i</c> is the page's index in
@@ -111,13 +139,21 @@ internal sealed record RecordSelect(
 /// no alias.
 /// </para>
 /// <para>
-/// <b>Locking.</b> The seeded base tables key on <c>UniqueKey</c> (<c>int IDENTITY PRIMARY KEY</c>) and do not index
-/// <c>GlobalRecordId</c>, and the schema is never changed, so a lookup by id scans the base table. The locked read
-/// (<see cref="LockBase"/>) therefore has no <c>TOP</c>: scanning every row under <c>UPDLOCK</c> serialises the
-/// writers of one base table. Every later base statement addresses the row by <c>UniqueKey</c> and
-/// <c>GlobalRecordId</c> together, a clustered-key seek, so a writer reaches another writer's locked rows only in the
-/// snapshot counts; a deadlock there (1205) is reported by the repository as not written. Page tables key on
-/// <c>GlobalRecordId</c>, so page statements seek.
+/// <b>Locking.</b> The locked read (<see cref="LockBase"/>) takes an update lock on the base row it matches and holds
+/// it to the end of the transaction, so two writers of one record serialise: that is the guarantee the save path
+/// relies on. The read has no <c>TOP</c>, so every base row carrying the id is locked, and the caller takes the first
+/// in <c>UniqueKey</c> order. The seeded base tables key on <c>UniqueKey</c> (<c>int IDENTITY PRIMARY KEY</c>) and do
+/// not index <c>GlobalRecordId</c>, and the schema is never changed, so the lookup scans the base table. Whether the
+/// scan keeps the update locks it takes on rows that do not match depends on the plan the optimizer chooses, and SQL
+/// Server guarantees neither outcome. In the plans observed on the seeded tables, the comparison with the full-length
+/// (<c>nvarchar(max)</c>) id parameter this builder binds ran in a Filter operator above the clustered index scan, so
+/// every scanned row stayed locked and a writer of another record of the table waited; with a parameter of the
+/// column's own type the equality ran inside the scan, and only the matching row stayed locked. Nothing may therefore
+/// depend on serialisation across a whole table, or assume its absence. Every later base statement addresses the row by
+/// <c>UniqueKey</c> and <c>GlobalRecordId</c> together, a clustered-key seek, and page tables key on
+/// <c>GlobalRecordId</c>, so page statements seek. A writer can still wait on another record's writer, in the locked
+/// scan or in the snapshot counts; a deadlock that ends such a wait (1205) is reported by the repository as not
+/// written.
 /// </para>
 /// <para>
 /// Every exception message is fixed text naming no table, column, value or id, as the redaction policy requires.
@@ -129,7 +165,9 @@ internal static class RecordSqlBuilder
     /// <summary>The alias of the base table in every read.</summary>
     internal const string BaseAlias = "b";
 
-    /// <summary>The ordinal of the base row's <c>GlobalRecordId</c> in a <see cref="RecordSelect"/>.</summary>
+    /// <summary>
+    /// The ordinal of the base row's <c>GlobalRecordId</c>, as stored, in a <see cref="RecordSelect"/>.
+    /// </summary>
     internal const int RecordGlobalRecordIdOrdinal = 0;
 
     /// <summary>The ordinal of the base row's <c>UniqueKey</c> in a <see cref="RecordSelect"/>.</summary>
@@ -147,6 +185,14 @@ internal static class RecordSqlBuilder
     /// The ordinal of <c>RecStatus</c> in the base-row reads <see cref="SetPositionLookup"/> and <see cref="LockBase"/>.
     /// </summary>
     internal const int BaseRowRecStatusOrdinal = 1;
+
+    /// <summary>
+    /// The ordinal of <c>GlobalRecordId</c>, as stored, in the base-row reads <see cref="SetPositionLookup"/> and
+    /// <see cref="LockBase"/>. The caller binds this spelling, never the request's, in every later statement of the
+    /// operation: <see cref="RecordByUniqueKey"/>, <see cref="UpdateBaseStamp"/>, <see cref="UpdatePageColumns"/>,
+    /// <see cref="InsertPageKey"/> and <see cref="SoftDelete"/>.
+    /// </summary>
+    internal const int BaseRowGlobalRecordIdOrdinal = 2;
 
     /// <summary>
     /// The most columns one page <c>UPDATE</c> sets, the chunk size legacy Epi Info uses
@@ -171,6 +217,7 @@ internal static class RecordSqlBuilder
     private const string DuplicateColumnMessage = "A column cannot be written twice in one statement.";
     private const string AmbiguousValueMessage = "Two submitted values name the same field.";
     private const string NullEntryMessage = "The list must not hold a null entry.";
+    private const string UnknownClauseMessage = "The selected-set clause is not a defined member.";
 
     /// <summary>The alias of a joined page table: <c>p</c> followed by the page's index.</summary>
     /// <param name="pageIndex">The page's 0-based index in <see cref="FormSchema.Pages"/>.</param>
@@ -195,35 +242,48 @@ internal static class RecordSqlBuilder
     }
 
     /// <summary>
-    /// Appends the selected-set predicate: <c>&lt;alias&gt;.[RecStatus] = @pN</c> for the active set, nothing when
-    /// every row is selected. It is the one rendering of that predicate in the data layer; the rule itself is
-    /// <see cref="RecordQueryRules.RequiredRecStatus"/>.
+    /// Appends the selected-set predicate: the keyword <paramref name="clause"/> selects, then
+    /// <c>b.[RecStatus] = @pN</c>, for the active set; nothing when every row is selected. It is the one rendering of
+    /// that predicate in the data layer; the rule itself is <see cref="RecordQueryRules.RequiredRecStatus"/>. Every
+    /// piece of the text is fixed here or quoted from the reader-built column, and the caller supplies none of it.
     /// </summary>
-    /// <param name="sql">The statement text being built.</param>
+    /// <param name="sql">
+    /// The statement text being built, whose base table carries the alias <see cref="BaseAlias"/>.
+    /// </param>
     /// <param name="schema">The form's catalogue view.</param>
     /// <param name="includeDeleted">Whether the caller selected every row.</param>
     /// <param name="parameters">The statement's parameters; the status value is added to them.</param>
-    /// <param name="alias">The alias of the base table in the statement, normally <see cref="BaseAlias"/>.</param>
-    /// <param name="prefix">
-    /// Text written immediately before the predicate and only with it, such as <c>" WHERE "</c> or <c>" AND "</c>, so a
-    /// caller never leaves a dangling keyword when no predicate applies.
+    /// <param name="clause">
+    /// The keyword written immediately before the predicate and only with it: <c>" WHERE "</c> for
+    /// <see cref="SelectedSetClause.Where"/> and <c>" AND "</c> for <see cref="SelectedSetClause.And"/>, so a caller
+    /// never leaves a dangling keyword when no predicate applies.
     /// </param>
     /// <returns>Whether a predicate was appended.</returns>
-    /// <exception cref="ArgumentNullException">An argument is null.</exception>
+    /// <exception cref="ArgumentNullException">
+    /// <paramref name="sql"/>, <paramref name="schema"/> or <paramref name="parameters"/> is null.
+    /// </exception>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// <paramref name="clause"/> is not a defined <see cref="SelectedSetClause"/>. Nothing is appended and no parameter
+    /// is added, whatever <paramref name="includeDeleted"/> is.
+    /// </exception>
     /// <exception cref="InvalidOperationException">The base table has no <c>RecStatus</c> column.</exception>
     internal static bool AppendSelectedSetPredicate(
         StringBuilder sql,
         FormSchema schema,
         bool includeDeleted,
         PositionalParameters parameters,
-        string alias,
-        string prefix = "")
+        SelectedSetClause clause)
     {
         ArgumentNullException.ThrowIfNull(sql);
         ArgumentNullException.ThrowIfNull(schema);
         ArgumentNullException.ThrowIfNull(parameters);
-        ArgumentNullException.ThrowIfNull(alias);
-        ArgumentNullException.ThrowIfNull(prefix);
+
+        var keyword = clause switch
+        {
+            SelectedSetClause.Where => " WHERE ",
+            SelectedSetClause.And => " AND ",
+            _ => throw new ArgumentOutOfRangeException(nameof(clause), UnknownClauseMessage),
+        };
 
         if (RecordQueryRules.RequiredRecStatus(includeDeleted) is not { } recStatus)
         {
@@ -233,7 +293,9 @@ internal static class RecordSqlBuilder
         // The converter narrows the status to the column's own integer type, smallint in the seeded tables.
         var column = Require(schema.RecStatus);
         var name = parameters.Add(n => ColumnValueConverter.ToSystemParameter(n, column, recStatus));
-        sql.Append(prefix).Append(alias).Append('.').Append(SqlIdentifier.Quote(column)).Append(" = ").Append(name);
+        sql.Append(keyword);
+        AppendBaseColumn(sql, column);
+        sql.Append(" = ").Append(name);
         return true;
     }
 
@@ -339,7 +401,7 @@ internal static class RecordSqlBuilder
         var parameters = new PositionalParameters();
         var sql = new StringBuilder("SELECT COUNT_BIG(*) FROM ");
         AppendBaseTable(sql, schema);
-        AppendSelectedSetPredicate(sql, schema, includeDeleted, parameters, BaseAlias, " WHERE ");
+        AppendSelectedSetPredicate(sql, schema, includeDeleted, parameters, SelectedSetClause.Where);
 
         return parameters.ToStatement(sql.ToString());
     }
@@ -367,21 +429,24 @@ internal static class RecordSqlBuilder
         AppendBaseColumn(sql, uniqueKeyColumn);
         sql.Append(" <= ")
             .Append(parameters.Add(n => ColumnValueConverter.ToSystemParameter(n, uniqueKeyColumn, uniqueKey)));
-        AppendSelectedSetPredicate(sql, schema, includeDeleted, parameters, BaseAlias, " AND ");
+        AppendSelectedSetPredicate(sql, schema, includeDeleted, parameters, SelectedSetClause.And);
 
         return parameters.ToStatement(sql.ToString());
     }
 
     /// <summary>
     /// Finds a record's base row by id, reading the base table only, so a base row that lacks a page row is still
-    /// placed: <c>SELECT b.[UniqueKey] AS [c0], b.[RecStatus] AS [c1] FROM [base] b WHERE b.[GlobalRecordId] = @p0
-    /// ORDER BY b.[UniqueKey]</c>. The caller takes the first row.
+    /// placed: <c>SELECT b.[UniqueKey] AS [c0], b.[RecStatus] AS [c1], b.[GlobalRecordId] AS [c2] FROM [base] b WHERE
+    /// b.[GlobalRecordId] = @p0 AND DATALENGTH(b.[GlobalRecordId]) = DATALENGTH(@p0) ORDER BY b.[UniqueKey]</c>. The
+    /// caller takes the first row, and binds its stored id, not the request's, in any later statement.
     /// </summary>
     /// <param name="schema">The form's catalogue view.</param>
-    /// <param name="globalRecordId">The id from the request, bound at full length.</param>
+    /// <param name="globalRecordId">The id from the request, bound at full length and matched exactly.</param>
     /// <returns>
-    /// A statement returning <c>UniqueKey</c> at <see cref="BaseRowUniqueKeyOrdinal"/> and <c>RecStatus</c> at
-    /// <see cref="BaseRowRecStatusOrdinal"/>, or no row for an unknown id.
+    /// A statement returning <c>UniqueKey</c> at <see cref="BaseRowUniqueKeyOrdinal"/>, <c>RecStatus</c> at
+    /// <see cref="BaseRowRecStatusOrdinal"/> and the stored <c>GlobalRecordId</c> at
+    /// <see cref="BaseRowGlobalRecordIdOrdinal"/>; no row for an unknown id, including one that differs from a stored
+    /// id only by trailing spaces or is longer than the column.
     /// </returns>
     /// <exception cref="ArgumentNullException">An argument is null.</exception>
     /// <exception cref="InvalidOperationException">The base table lacks a required system column.</exception>
@@ -419,7 +484,7 @@ internal static class RecordSqlBuilder
         var offset = RecordQueryRules.PositionToOffset(position);
         var core = RecordSelectCore(schema, dataFields);
         var parameters = new PositionalParameters();
-        AppendSelectedSetPredicate(core.Sql, schema, includeDeleted, parameters, BaseAlias, " WHERE ");
+        AppendSelectedSetPredicate(core.Sql, schema, includeDeleted, parameters, SelectedSetClause.Where);
         AppendOrderByUniqueKey(core.Sql, schema);
         core.Sql.Append(" OFFSET ")
             .Append(parameters.Add(n => ColumnValueConverter.Int64(n, offset)))
@@ -430,12 +495,17 @@ internal static class RecordSqlBuilder
 
     /// <summary>
     /// Reads a record by id, deleted records included: the record <c>SELECT</c>, then <c>WHERE b.[GlobalRecordId] =
-    /// @p0 ORDER BY b.[UniqueKey]</c>. The caller takes the first row.
+    /// @p0 AND DATALENGTH(b.[GlobalRecordId]) = DATALENGTH(@p0) ORDER BY b.[UniqueKey]</c>. The caller takes the first
+    /// row, and binds the stored id it returns at <see cref="RecordGlobalRecordIdOrdinal"/>, not the request's, in any
+    /// later statement.
     /// </summary>
     /// <param name="schema">The form's catalogue view.</param>
     /// <param name="dataFields">The data fields to project, in data-field order.</param>
-    /// <param name="globalRecordId">The id from the request, bound at full length.</param>
-    /// <returns>The statement and its result layout; no row for an unknown id.</returns>
+    /// <param name="globalRecordId">The id from the request, bound at full length and matched exactly.</param>
+    /// <returns>
+    /// The statement and its result layout; no row for an unknown id, including one that differs from a stored id only
+    /// by trailing spaces or is longer than the column.
+    /// </returns>
     /// <exception cref="ArgumentNullException">An argument is null.</exception>
     /// <exception cref="ArgumentException">A data field is not a column of the form, or the list holds a null entry.</exception>
     /// <exception cref="InvalidOperationException">A table lacks a required system or key column.</exception>
@@ -448,12 +518,15 @@ internal static class RecordSqlBuilder
         ArgumentNullException.ThrowIfNull(dataFields);
         ArgumentNullException.ThrowIfNull(globalRecordId);
 
-        var globalRecordIdColumn = Require(schema.GlobalRecordId);
         var core = RecordSelectCore(schema, dataFields);
         var parameters = new PositionalParameters();
         core.Sql.Append(" WHERE ");
-        AppendBaseColumn(core.Sql, globalRecordIdColumn);
-        core.Sql.Append(" = ").Append(parameters.Add(n => ColumnValueConverter.Text(n, globalRecordId)));
+        AppendGlobalRecordIdMatch(
+            core.Sql,
+            schema,
+            parameters,
+            BaseAlias,
+            (n, _) => ColumnValueConverter.Text(n, globalRecordId));
         AppendOrderByUniqueKey(core.Sql, schema);
 
         return core.Finish(parameters);
@@ -461,13 +534,18 @@ internal static class RecordSqlBuilder
 
     /// <summary>
     /// Reads a record whose base row the caller has already located, by its clustered key and id together: the record
-    /// <c>SELECT</c>, then <c>WHERE b.[UniqueKey] = @p0 AND b.[GlobalRecordId] = @p1</c>. Write transactions use it for
-    /// the page-row read and the response snapshot, so the base row is reached by a seek rather than a scan.
+    /// <c>SELECT</c>, then <c>WHERE b.[UniqueKey] = @p0 AND b.[GlobalRecordId] = @p1 AND
+    /// DATALENGTH(b.[GlobalRecordId]) = DATALENGTH(@p1)</c>. Write transactions use it for the page-row read and the
+    /// response snapshot, so the base row is reached by a seek rather than a scan.
     /// </summary>
     /// <param name="schema">The form's catalogue view.</param>
     /// <param name="dataFields">The data fields to project, in data-field order.</param>
     /// <param name="uniqueKey">The base row's <c>UniqueKey</c>.</param>
-    /// <param name="globalRecordId">The base row's <c>GlobalRecordId</c>, as stored.</param>
+    /// <param name="globalRecordId">
+    /// The base row's <c>GlobalRecordId</c>, as stored: the value <see cref="LockBase"/> returned at
+    /// <see cref="BaseRowGlobalRecordIdOrdinal"/>. A spelling of another length, such as one with trailing spaces,
+    /// matches no row.
+    /// </param>
     /// <returns>The statement and its result layout.</returns>
     /// <exception cref="ArgumentNullException">An argument is null.</exception>
     /// <exception cref="ArgumentException">
@@ -611,20 +689,28 @@ internal static class RecordSqlBuilder
 
     /// <summary>
     /// Locks and reads a record's base row at the start of an update or a soft delete: <c>SELECT b.[UniqueKey] AS
-    /// [c0], b.[RecStatus] AS [c1] FROM [base] b WITH (UPDLOCK, ROWLOCK) WHERE b.[GlobalRecordId] = @p0 ORDER BY
-    /// b.[UniqueKey]</c>.
+    /// [c0], b.[RecStatus] AS [c1], b.[GlobalRecordId] AS [c2] FROM [base] b WITH (UPDLOCK, ROWLOCK) WHERE
+    /// b.[GlobalRecordId] = @p0 AND DATALENGTH(b.[GlobalRecordId]) = DATALENGTH(@p0) ORDER BY b.[UniqueKey]</c>.
     /// </summary>
     /// <remarks>
-    /// The base table does not index <c>GlobalRecordId</c>, so this read scans it, and it has no <c>TOP</c> so the
-    /// scan examines every row: two writers of one base table therefore serialise behind the update lock, and two
-    /// saves can never both pass the required gate on stale state. It returns <c>UniqueKey</c> because every later
-    /// base statement of the transaction seeks the row by <c>UniqueKey</c> and <c>GlobalRecordId</c>.
+    /// The update lock on the matched base row is held to the end of the transaction, so two writers of the same record
+    /// serialise here, and two saves of one record can never both pass the required gate on stale state. The read has
+    /// no <c>TOP</c>, so every base row carrying the id is locked, and the caller takes the first in <c>UniqueKey</c>
+    /// order. The base table does not index <c>GlobalRecordId</c>, so the read scans it, and whether the locks it takes
+    /// on rows that do not match are held as well depends on the plan, as the class remarks describe: no caller may
+    /// rely on this read to serialise the writers of different records, and a wait on such a writer that ends in a
+    /// deadlock (1205) is reported as not written. It returns <c>UniqueKey</c> and the stored <c>GlobalRecordId</c>
+    /// because every later base statement of the transaction seeks the row by both, and every later page statement
+    /// binds that stored id.
     /// </remarks>
     /// <param name="schema">The form's catalogue view.</param>
-    /// <param name="globalRecordId">The id from the request, bound at full length.</param>
+    /// <param name="globalRecordId">The id from the request, bound at full length and matched exactly.</param>
     /// <returns>
-    /// A statement returning <c>UniqueKey</c> at <see cref="BaseRowUniqueKeyOrdinal"/> and <c>RecStatus</c> at
-    /// <see cref="BaseRowRecStatusOrdinal"/>, or no row for an unknown id. The caller takes the first row.
+    /// A statement returning <c>UniqueKey</c> at <see cref="BaseRowUniqueKeyOrdinal"/>, <c>RecStatus</c> at
+    /// <see cref="BaseRowRecStatusOrdinal"/> and the stored <c>GlobalRecordId</c> at
+    /// <see cref="BaseRowGlobalRecordIdOrdinal"/>; no row for an unknown id, including one that differs from a stored
+    /// id only by trailing spaces or is longer than the column, so the caller reports it missing before any write. The
+    /// caller takes the first row.
     /// </returns>
     /// <exception cref="ArgumentNullException">An argument is null.</exception>
     /// <exception cref="InvalidOperationException">The base table lacks a required system column.</exception>
@@ -638,11 +724,16 @@ internal static class RecordSqlBuilder
 
     /// <summary>
     /// Stamps a record's base row on update: <c>UPDATE [base] SET [LastSaveLogonName] = @p0, [LastSaveTime] = @p1
-    /// WHERE [UniqueKey] = @p2 AND [GlobalRecordId] = @p3</c>, naming only the stamp columns the base table has.
+    /// WHERE [UniqueKey] = @p2 AND [GlobalRecordId] = @p3 AND DATALENGTH([GlobalRecordId]) = DATALENGTH(@p3)</c>,
+    /// naming only the stamp columns the base table has.
     /// </summary>
     /// <param name="schema">The form's catalogue view.</param>
     /// <param name="uniqueKey">The locked base row's <c>UniqueKey</c>.</param>
-    /// <param name="globalRecordId">The locked base row's <c>GlobalRecordId</c>, as stored.</param>
+    /// <param name="globalRecordId">
+    /// The locked base row's <c>GlobalRecordId</c>, as stored: the value <see cref="LockBase"/> returned at
+    /// <see cref="BaseRowGlobalRecordIdOrdinal"/>. A spelling of another length, such as one with trailing spaces,
+    /// matches no row.
+    /// </param>
     /// <param name="stamp">The save stamp of this write.</param>
     /// <returns>The update, or <see langword="null"/> when the base table has neither last-save column.</returns>
     /// <exception cref="ArgumentNullException">An argument is null.</exception>
@@ -755,7 +846,8 @@ internal static class RecordSqlBuilder
 
     /// <summary>
     /// Soft-deletes a record on its base row only: <c>UPDATE [base] SET [RecStatus] = @p0[, [LastSaveLogonName] =
-    /// @p1][, [LastSaveTime] = @p2] WHERE [UniqueKey] = @pN AND [GlobalRecordId] = @pM</c>.
+    /// @p1][, [LastSaveTime] = @p2] WHERE [UniqueKey] = @pN AND [GlobalRecordId] = @pM AND
+    /// DATALENGTH([GlobalRecordId]) = DATALENGTH(@pM)</c>.
     /// </summary>
     /// <remarks>
     /// <c>RecStatus</c> becomes <see cref="RecordQueryRules.DeletedRecStatus"/> and the last-save stamps are written
@@ -765,7 +857,11 @@ internal static class RecordSqlBuilder
     /// </remarks>
     /// <param name="schema">The form's catalogue view.</param>
     /// <param name="uniqueKey">The locked base row's <c>UniqueKey</c>.</param>
-    /// <param name="globalRecordId">The locked base row's <c>GlobalRecordId</c>, as stored.</param>
+    /// <param name="globalRecordId">
+    /// The locked base row's <c>GlobalRecordId</c>, as stored: the value <see cref="LockBase"/> returned at
+    /// <see cref="BaseRowGlobalRecordIdOrdinal"/>. A spelling of another length, such as one with trailing spaces,
+    /// matches no row.
+    /// </param>
     /// <param name="stamp">The save stamp of this write.</param>
     /// <returns>The update statement.</returns>
     /// <exception cref="ArgumentNullException">An argument is null.</exception>
@@ -848,9 +944,12 @@ internal static class RecordSqlBuilder
         return new SelectCore(sql, columns.AsReadOnly(), presences.AsReadOnly());
     }
 
-    // SELECT b.[UniqueKey] AS [c0], b.[RecStatus] AS [c1] FROM [base] b<hints> WHERE b.[GlobalRecordId] = @p0
-    // ORDER BY b.[UniqueKey]. The id comes from a request and the base table has not confirmed it yet, so it is bound
-    // at full length: an id longer than the column finds no row rather than failing to bind.
+    // SELECT b.[UniqueKey] AS [c0], b.[RecStatus] AS [c1], b.[GlobalRecordId] AS [c2] FROM [base] b<hints> WHERE
+    // b.[GlobalRecordId] = @p0 AND DATALENGTH(b.[GlobalRecordId]) = DATALENGTH(@p0) ORDER BY b.[UniqueKey]. The id
+    // comes from a request and the base table has not confirmed it yet, so it is bound at full length and matched
+    // exactly: an id longer than the column, or one that differs from a stored id only by trailing spaces, finds no row
+    // rather than failing to bind or matching that stored id. The row returns the id as stored, the spelling every
+    // later statement of the caller binds at the column's own size.
     private static SqlStatement BaseRowById(FormSchema schema, string globalRecordId, string? tableHints)
     {
         var uniqueKeyColumn = Require(schema.UniqueKey);
@@ -862,17 +961,24 @@ internal static class RecordSqlBuilder
         AppendProjection(sql, BaseAlias, uniqueKeyColumn, BaseRowUniqueKeyOrdinal);
         sql.Append(", ");
         AppendProjection(sql, BaseAlias, recStatusColumn, BaseRowRecStatusOrdinal);
+        sql.Append(", ");
+        AppendProjection(sql, BaseAlias, globalRecordIdColumn, BaseRowGlobalRecordIdOrdinal);
         sql.Append(" FROM ");
         AppendBaseTable(sql, schema);
         sql.Append(tableHints).Append(" WHERE ");
-        AppendBaseColumn(sql, globalRecordIdColumn);
-        sql.Append(" = ").Append(parameters.Add(n => ColumnValueConverter.Text(n, globalRecordId)));
+        AppendGlobalRecordIdMatch(
+            sql,
+            schema,
+            parameters,
+            BaseAlias,
+            (n, _) => ColumnValueConverter.Text(n, globalRecordId));
         AppendOrderByUniqueKey(sql, schema);
 
         return parameters.ToStatement(sql.ToString());
     }
 
-    // UPDATE [base] SET [a] = @p0, ... WHERE [UniqueKey] = @pN AND [GlobalRecordId] = @pM, with no alias.
+    // UPDATE [base] SET [a] = @p0, ... WHERE [UniqueKey] = @pN AND [GlobalRecordId] = @pM AND
+    // DATALENGTH([GlobalRecordId]) = DATALENGTH(@pM), with no alias.
     private static SqlStatement UpdateBaseRow(
         FormSchema schema,
         int uniqueKey,
@@ -896,8 +1002,9 @@ internal static class RecordSqlBuilder
         return parameters.ToStatement(sql.ToString());
     }
 
-    // [alias.][UniqueKey] = @pN AND [alias.][GlobalRecordId] = @pM: a clustered-key seek that also confirms the id,
-    // both bound with the types of the reader-built columns.
+    // [alias.][UniqueKey] = @pN AND [alias.][GlobalRecordId] = @pM AND DATALENGTH([alias.][GlobalRecordId]) =
+    // DATALENGTH(@pM): a clustered-key seek that also confirms the stored id exactly, both bound with the types of the
+    // reader-built columns.
     private static void AppendBaseRowKey(
         StringBuilder sql,
         FormSchema schema,
@@ -907,15 +1014,37 @@ internal static class RecordSqlBuilder
         string? alias)
     {
         var uniqueKeyColumn = Require(schema.UniqueKey);
-        var globalRecordIdColumn = Require(schema.GlobalRecordId);
 
         AppendQualified(sql, alias, uniqueKeyColumn)
             .Append(" = ")
             .Append(parameters.Add(n => ColumnValueConverter.ToSystemParameter(n, uniqueKeyColumn, uniqueKey)))
             .Append(" AND ");
-        AppendQualified(sql, alias, globalRecordIdColumn)
-            .Append(" = ")
-            .Append(parameters.Add(n => ColumnValueConverter.ToSystemParameter(n, globalRecordIdColumn, globalRecordId)));
+        AppendGlobalRecordIdMatch(
+            sql,
+            schema,
+            parameters,
+            alias,
+            (n, column) => ColumnValueConverter.ToSystemParameter(n, column, globalRecordId));
+    }
+
+    // [alias.][GlobalRecordId] = @pN AND DATALENGTH([alias.][GlobalRecordId]) = DATALENGTH(@pN): the one exact match on
+    // a base row's id. SQL Server compares strings as if the shorter were padded with trailing spaces, so equality
+    // alone would let an id that differs only by trailing spaces match; equal byte lengths rule that out, while letter
+    // case still follows the column's collation. One positional parameter, referenced twice, carries the id; bind
+    // receives its name and the reader-built column, so the caller keeps the binding choice: full length for a request
+    // id, the column's own size for a stored id.
+    private static void AppendGlobalRecordIdMatch(
+        StringBuilder sql,
+        FormSchema schema,
+        PositionalParameters parameters,
+        string? alias,
+        Func<string, ColumnSchema, SqlParameterValue> bind)
+    {
+        var column = Require(schema.GlobalRecordId);
+        var name = parameters.Add(n => bind(n, column));
+
+        AppendQualified(sql, alias, column).Append(" = ").Append(name).Append(" AND DATALENGTH(");
+        AppendQualified(sql, alias, column).Append(") = DATALENGTH(").Append(name).Append(')');
     }
 
     // [base] b

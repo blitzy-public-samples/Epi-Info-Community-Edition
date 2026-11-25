@@ -1,4 +1,5 @@
 using EpiInfo.CheckCode.Functions;
+using EpiInfo.CheckCode.Syntax;
 using EpiInfo.Domain.Values;
 
 namespace EpiInfo.CheckCode.Tests.Functions;
@@ -108,6 +109,59 @@ public sealed class YearsFunctionTests
     public void RegistryDoesNotResolveAnUnsupportedFunction()
     {
         Assert.False(FunctionRegistry.TryGet("DAYS", out _));
+    }
+
+    [Theory]
+    [InlineData("YEARS", true)]
+    [InlineData("years", true)]
+    [InlineData("EpiWeek", true)]
+    [InlineData("epiweek", true)]
+    [InlineData("YEAR", false)]
+    [InlineData("EPIWEEKS", false)]
+    [InlineData(" YEARS", false)]
+    [InlineData("DAYS", false)]
+    [InlineData("", false)]
+    [InlineData(null, false)]
+    public void SyntaxVocabularyAndRegistryAgreeOnEveryName(string? name, bool supported)
+    {
+        // The parser accepts a call by the vocabulary and the evaluator runs it through the registry, so both must
+        // hold the same names in the same order, and every vocabulary name must have an implementation.
+        Assert.Equal(new[] { "YEARS", "EPIWEEK" }, FunctionNames.Supported);
+        Assert.Equal(FunctionNames.Supported, FunctionRegistry.SupportedNames);
+        foreach (var vocabularyName in FunctionNames.Supported)
+        {
+            Assert.True(FunctionRegistry.TryGet(vocabularyName.ToLowerInvariant(), out _), vocabularyName);
+        }
+
+        Assert.Equal(supported, FunctionNames.IsSupported(name));
+        Assert.Equal(supported, FunctionRegistry.TryGet(name, out var function));
+        Assert.Equal(supported, function is not null);
+    }
+
+    [Fact]
+    public void SupportedNamesExposeNoWritableStorage()
+    {
+        // A read-only wrapper hands out its backing array through ICollection.SyncRoot, so a caller could rewrite
+        // the advertised names while lookups still matched the originals. Immutable storage is its own SyncRoot
+        // and refuses every write through the collection interfaces.
+        foreach (var names in new[] { FunctionNames.Supported, FunctionRegistry.SupportedNames })
+        {
+            Assert.Same(names, ((System.Collections.ICollection)names).SyncRoot);
+
+            var list = (IList<string>)names;
+            Assert.Throws<NotSupportedException>(() => list[0] = "UNSUPPORTED");
+            Assert.Throws<NotSupportedException>(() => list.Insert(0, "UNSUPPORTED"));
+            Assert.Throws<NotSupportedException>(() => list.RemoveAt(0));
+
+            var collection = (ICollection<string>)names;
+            Assert.Throws<NotSupportedException>(() => collection.Add("UNSUPPORTED"));
+            Assert.Throws<NotSupportedException>(() => collection.Remove(FunctionNames.Years));
+            Assert.Throws<NotSupportedException>(collection.Clear);
+        }
+
+        Assert.Equal(new[] { "YEARS", "EPIWEEK" }, FunctionNames.Supported);
+        Assert.Equal(new[] { "YEARS", "EPIWEEK" }, FunctionRegistry.SupportedNames);
+        Assert.False(FunctionNames.IsSupported("UNSUPPORTED"));
     }
 
     private static FieldValue Date(int year, int month, int day) => FieldValue.FromDate(new DateOnly(year, month, day));

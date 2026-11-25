@@ -16,10 +16,14 @@ namespace EpiInfo.Domain.Records;
 /// </para>
 /// <para>
 /// <b>Intrinsic coordinates.</b> <see cref="Position"/> and <see cref="Count"/> belong to the record, not to the
-/// request: an active record is numbered within the active set and a deleted one within every row, whatever
-/// <c>includeDeleted</c> the caller sent. The navigator's "[n] of N" over the set its deleted toggle selects comes
-/// from <see cref="NavigationPosition"/> instead, so the two agree only for an active record viewed without
-/// <c>includeDeleted</c>.
+/// request: they are taken over the record's intrinsic set, which its <see cref="RecStatus"/> chooses, so an active
+/// record is numbered within the active set and a deleted one within every row, whatever <c>includeDeleted</c> the
+/// caller sent. The navigator's "[n] of N" is taken over the set its deleted toggle selects: N is the count from
+/// <c>GET /api/forms/{viewId}/records/count</c> with the toggle's <c>includeDeleted</c>, and n is the requested
+/// position after <c>at/{n}</c>; after an open by id, a save of a new or an existing record or a toggle change, it
+/// is the <see cref="NavigationPosition.Position"/> from
+/// <c>GET /api/forms/{viewId}/records/{globalRecordId}/position</c> with the same <c>includeDeleted</c>. Neither
+/// pair is derived from the other, and equal numbers in the two pairs do not mean the two sets are the same.
 /// </para>
 /// <para>
 /// <b>Equality.</b> The synthesized record equality compares <see cref="Values"/> by reference, so two DTOs built

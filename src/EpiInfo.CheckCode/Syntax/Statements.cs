@@ -55,9 +55,9 @@ public sealed record IfStatementNode(
     IReadOnlyList<StatementNode>? Else,
     int Line) : StatementNode(Line)
 {
-    private readonly ImmutableList<StatementNode> thenBranch = StatementLists.Snapshot(Then, nameof(Then));
+    private readonly ImmutableList<StatementNode> thenBranch = SyntaxLists.Snapshot(Then, nameof(Then));
 
-    private readonly ImmutableList<StatementNode>? elseBranch = StatementLists.SnapshotOrNull(Else, nameof(Else));
+    private readonly ImmutableList<StatementNode>? elseBranch = SyntaxLists.SnapshotOrNull(Else, nameof(Else));
 
     /// <summary>
     /// The <c>THEN</c> statements in source order: an immutable snapshot that later changes to the caller's list
@@ -69,7 +69,7 @@ public sealed record IfStatementNode(
     {
         get => thenBranch;
         // Copied here as well as in the constructor, so a `with` expression cannot alias a mutable list.
-        init => thenBranch = StatementLists.Snapshot(value, nameof(Then));
+        init => thenBranch = SyntaxLists.Snapshot(value, nameof(Then));
     }
 
     /// <summary>
@@ -80,7 +80,7 @@ public sealed record IfStatementNode(
     public IReadOnlyList<StatementNode>? Else
     {
         get => elseBranch;
-        init => elseBranch = StatementLists.SnapshotOrNull(value, nameof(Else));
+        init => elseBranch = SyntaxLists.SnapshotOrNull(value, nameof(Else));
     }
 
     /// <inheritdoc />
@@ -113,7 +113,7 @@ public sealed record IfStatementNode(
 /// <exception cref="ArgumentException"><paramref name="Names"/> contains a <see langword="null"/> element.</exception>
 public sealed record EnableStatementNode(IReadOnlyList<string> Names, int Line) : StatementNode(Line)
 {
-    private readonly ImmutableList<string> names = StatementLists.Snapshot(Names, nameof(Names));
+    private readonly ImmutableList<string> names = SyntaxLists.Snapshot(Names, nameof(Names));
 
     /// <summary>The names in source order, as an immutable snapshot.</summary>
     /// <exception cref="ArgumentNullException">The value is <see langword="null"/>.</exception>
@@ -121,7 +121,7 @@ public sealed record EnableStatementNode(IReadOnlyList<string> Names, int Line) 
     public IReadOnlyList<string> Names
     {
         get => names;
-        init => names = StatementLists.Snapshot(value, nameof(Names));
+        init => names = SyntaxLists.Snapshot(value, nameof(Names));
     }
 
     /// <inheritdoc />
@@ -145,7 +145,7 @@ public sealed record EnableStatementNode(IReadOnlyList<string> Names, int Line) 
 /// <exception cref="ArgumentException"><paramref name="Names"/> contains a <see langword="null"/> element.</exception>
 public sealed record DisableStatementNode(IReadOnlyList<string> Names, int Line) : StatementNode(Line)
 {
-    private readonly ImmutableList<string> names = StatementLists.Snapshot(Names, nameof(Names));
+    private readonly ImmutableList<string> names = SyntaxLists.Snapshot(Names, nameof(Names));
 
     /// <summary>The names in source order, as an immutable snapshot.</summary>
     /// <exception cref="ArgumentNullException">The value is <see langword="null"/>.</exception>
@@ -153,7 +153,7 @@ public sealed record DisableStatementNode(IReadOnlyList<string> Names, int Line)
     public IReadOnlyList<string> Names
     {
         get => names;
-        init => names = StatementLists.Snapshot(value, nameof(Names));
+        init => names = SyntaxLists.Snapshot(value, nameof(Names));
     }
 
     /// <inheritdoc />
@@ -177,7 +177,7 @@ public sealed record DisableStatementNode(IReadOnlyList<string> Names, int Line)
 /// <exception cref="ArgumentException"><paramref name="Names"/> contains a <see langword="null"/> element.</exception>
 public sealed record ClearStatementNode(IReadOnlyList<string> Names, int Line) : StatementNode(Line)
 {
-    private readonly ImmutableList<string> names = StatementLists.Snapshot(Names, nameof(Names));
+    private readonly ImmutableList<string> names = SyntaxLists.Snapshot(Names, nameof(Names));
 
     /// <summary>The names in source order, as an immutable snapshot.</summary>
     /// <exception cref="ArgumentNullException">The value is <see langword="null"/>.</exception>
@@ -185,7 +185,7 @@ public sealed record ClearStatementNode(IReadOnlyList<string> Names, int Line) :
     public IReadOnlyList<string> Names
     {
         get => names;
-        init => names = StatementLists.Snapshot(value, nameof(Names));
+        init => names = SyntaxLists.Snapshot(value, nameof(Names));
     }
 
     /// <inheritdoc />
@@ -241,7 +241,7 @@ public sealed record DialogStatementNode(string Message, string? Title, int Line
 /// </exception>
 public sealed record GeocodeStatementNode(IReadOnlyList<string> Arguments, int Line) : StatementNode(Line)
 {
-    private readonly ImmutableList<string> arguments = StatementLists.Snapshot(Arguments, nameof(Arguments));
+    private readonly ImmutableList<string> arguments = SyntaxLists.Snapshot(Arguments, nameof(Arguments));
 
     /// <summary>The field names in source order, as an immutable snapshot.</summary>
     /// <exception cref="ArgumentNullException">The value is <see langword="null"/>.</exception>
@@ -249,7 +249,7 @@ public sealed record GeocodeStatementNode(IReadOnlyList<string> Arguments, int L
     public IReadOnlyList<string> Arguments
     {
         get => arguments;
-        init => arguments = StatementLists.Snapshot(value, nameof(Arguments));
+        init => arguments = SyntaxLists.Snapshot(value, nameof(Arguments));
     }
 
     /// <inheritdoc />
@@ -259,30 +259,4 @@ public sealed record GeocodeStatementNode(IReadOnlyList<string> Arguments, int L
     /// <inheritdoc />
     public override int GetHashCode() =>
         HashCode.Combine(base.GetHashCode(), SyntaxEquality.ListHash(Arguments));
-}
-
-/// <summary>Immutable snapshots of the statement nodes' list members.</summary>
-file static class StatementLists
-{
-    // An immutable list exposes no writable storage: its collection-interface writes throw NotSupportedException
-    // and its own modifying methods return a new list. Each element is read once, so a null cannot slip past the
-    // check. The member name is passed as paramName because the list is not a parameter of this helper.
-    public static ImmutableList<T> Snapshot<T>(IReadOnlyList<T> value, string paramName)
-        where T : class
-    {
-        ArgumentNullException.ThrowIfNull(value, paramName);
-        var builder = ImmutableList.CreateBuilder<T>();
-        var count = value.Count;
-        for (var i = 0; i < count; i++)
-        {
-            builder.Add(value[i]
-                ?? throw new ArgumentException($"{paramName} must not contain a null element.", paramName));
-        }
-
-        return builder.ToImmutable();
-    }
-
-    public static ImmutableList<T>? SnapshotOrNull<T>(IReadOnlyList<T>? value, string paramName)
-        where T : class =>
-        value is null ? null : Snapshot(value, paramName);
 }

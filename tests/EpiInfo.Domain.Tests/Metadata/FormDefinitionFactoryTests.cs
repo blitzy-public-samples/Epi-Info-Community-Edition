@@ -430,7 +430,8 @@ public sealed class FormDefinitionFactoryTests
         Assert.Equal([0m, 0m], second.Fields.Select(field => field.TabIndex));
         Assert.Equal([10, 10], second.Fields.Select(field => field.PageId));
 
-        // The data fields keep the same storage order, page Position first, which the grid columns are taken from.
+        // The data fields keep the same storage order, page Position first. The grid columns re-sort them by page
+        // Position, then TabIndex.
         DataFieldSet dataFields = FormDefinitionFactory.GetDataFields(form);
         Assert.Equal(["B", "C", "A", "E", "D"], dataFields.Select(field => field.Name));
         Assert.Equal([20, 20, 20, 10, 10], dataFields.Select(field => field.Page.PageId));

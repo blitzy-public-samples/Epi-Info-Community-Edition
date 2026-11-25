@@ -53,6 +53,8 @@ public sealed class RecordQueryRulesTests
 
     private static readonly IReadOnlyList<string> PagePositionGrid = ["A1", "A2", "A3", "B1", "B2", "B3"];
 
+    private static readonly IReadOnlyList<string> TiedPagePositionGrid = ["H1", "H2", "H3", "H4", "L5", "L6"];
+
     [Fact]
     public void Constants_HoldTheContractValues()
     {
@@ -291,28 +293,102 @@ public sealed class RecordQueryRulesTests
         Assert.Equal(expected, RecordQueryRules.IsTruncated(total));
     }
 
+    /// <summary>
+    /// The factory and the public constructor, the two ways to build a response, both keep the total and derive
+    /// <c>truncated</c> as <c>total &gt; 200</c>.
+    /// </summary>
     [Theory]
     [InlineData(0, 0, false)]
     [InlineData(200, 200, false)]
     [InlineData(200, 201, true)]
     [InlineData(200, 5000, true)]
-    public void SearchResponseCreate_KeepsTheTotalAndDerivesTruncated(int itemCount, int total, bool truncated)
+    public void SearchResponse_KeepsTheTotalAndDerivesTruncated(int itemCount, int total, bool truncated)
     {
         IReadOnlyList<SearchResult> items = Results(itemCount);
 
-        SearchResponse response = SearchResponse.Create(items, total);
+        SearchResponse[] responses = [SearchResponse.Create(items, total), new SearchResponse(items, total)];
 
-        Assert.Equal(itemCount, response.Items.Count);
-        Assert.Equal(total, response.Total);
-        Assert.Equal(truncated, response.Truncated);
+        Assert.All(responses, response =>
+        {
+            Assert.Equal(itemCount, response.Items.Count);
+            Assert.Equal(total, response.Total);
+            Assert.Equal(truncated, response.Truncated);
+        });
+    }
+
+    /// <summary>
+    /// More items than the cap, more items than the total counts, and a negative total are each rejected by the
+    /// factory and by the public constructor alike.
+    /// </summary>
+    [Theory]
+    [InlineData(RecordQueryRules.SearchCap + 1, 5000, "items")]
+    [InlineData(3, 2, "items")]
+    [InlineData(0, -1, "total")]
+    public void SearchResponse_ItemsOrTotalOutsideTheLimits_Throws(int itemCount, int total, string parameter)
+    {
+        IReadOnlyList<SearchResult> items = Results(itemCount);
+
+        Assert.Throws<ArgumentOutOfRangeException>(parameter, () => SearchResponse.Create(items, total));
+        Assert.Throws<ArgumentOutOfRangeException>(parameter, () => new SearchResponse(items, total));
+    }
+
+    /// <summary>
+    /// A list whose count is already outside the limits is rejected from that count alone, before any item is read,
+    /// so it is never copied: even a list reporting <see cref="int.MaxValue"/> items gets this exception rather than
+    /// exhausting memory.
+    /// </summary>
+    [Theory]
+    [InlineData(RecordQueryRules.SearchCap + 1, 5000)]
+    [InlineData(int.MaxValue, 5000)]
+    [InlineData(3, 2)]
+    public void SearchResponse_ItemCountOutsideTheLimits_ThrowsBeforeReadingAnyItem(int itemCount, int total)
+    {
+        CountingResults items = new(itemCount);
+
+        Assert.Throws<ArgumentOutOfRangeException>("items", () => SearchResponse.Create(items, total));
+        Assert.Throws<ArgumentOutOfRangeException>("items", () => new SearchResponse(items, total));
+        Assert.Equal(0, items.Reads);
     }
 
     [Fact]
-    public void SearchResponseCreate_MoreItemsThanTheSearchCap_Throws()
+    public void SearchResponse_NullItems_Throws()
     {
-        IReadOnlyList<SearchResult> items = Results(RecordQueryRules.SearchCap + 1);
+        Assert.Throws<ArgumentNullException>("items", () => SearchResponse.Create(null!, 0));
+        Assert.Throws<ArgumentNullException>("items", () => new SearchResponse(null!, 0));
+    }
 
-        Assert.Throws<ArgumentOutOfRangeException>("items", () => SearchResponse.Create(items, 5000));
+    /// <summary>
+    /// No member has a setter, so neither an initializer nor a <c>with</c> expression can assign <c>total</c> or
+    /// <c>truncated</c>, and a <c>with</c> copy keeps the original's items, total and derived <c>truncated</c>.
+    /// </summary>
+    [Fact]
+    public void SearchResponseWithCopy_KeepsTheTotalAndTruncatedConsistent()
+    {
+        SearchResponse response = new(Results(RecordQueryRules.SearchCap), 201);
+
+        SearchResponse copy = response with { };
+
+        Assert.All(typeof(SearchResponse).GetProperties(), property => Assert.Null(property.SetMethod));
+        Assert.Equal(response, copy);
+        Assert.Same(response.Items, copy.Items);
+        Assert.Equal(201, copy.Total);
+        Assert.True(copy.Truncated);
+    }
+
+    /// <summary>
+    /// The response keeps a read-only copy of the items, so growing the caller's list afterwards cannot push it past
+    /// the cap or past its total.
+    /// </summary>
+    [Fact]
+    public void SearchResponse_KeepsAReadOnlyCopyOfTheItems()
+    {
+        List<SearchResult> items = [.. Results(RecordQueryRules.SearchCap)];
+        SearchResponse response = new(items, RecordQueryRules.SearchCap);
+
+        items.AddRange(Results(5));
+
+        Assert.Equal(RecordQueryRules.SearchCap, response.Items.Count);
+        Assert.True(Assert.IsAssignableFrom<ICollection<SearchResult>>(response.Items).IsReadOnly);
     }
 
     [Theory]
@@ -402,6 +478,20 @@ public sealed class RecordQueryRulesTests
     }
 
     /// <summary>
+    /// When two pages share a <c>Position</c>, <c>TabIndex</c> orders their fields before <c>PageId</c> does: the
+    /// page with the higher <c>PageId</c> holds the lower <c>TabIndex</c>es, so its four fields come first and the
+    /// lower page's <c>L7</c> and <c>L8</c> fall past the sixth column. <c>PageId</c> order would instead have kept
+    /// <c>L7</c> and <c>L8</c> and cut <c>H3</c> and <c>H4</c>.
+    /// </summary>
+    [Fact]
+    public void GetGridColumns_PagesSharingAPosition_TabIndexDecidesBeforePageId()
+    {
+        IReadOnlyList<DataFieldMetadata> columns = RecordQueryRules.GetGridColumns(TabIndexBreaksPagePositionTie());
+
+        Assert.Equal(TiedPagePositionGrid, columns.Select(column => column.Name));
+    }
+
+    /// <summary>
     /// The form overload, the data-field-set overload and the list overload given the data fields in reverse give
     /// the same columns: the list overload orders its input itself.
     /// </summary>
@@ -412,6 +502,7 @@ public sealed class RecordQueryRulesTests
     [InlineData("FewerThanSix")]
     [InlineData("NoGridField")]
     [InlineData("PagePositionDecides")]
+    [InlineData("TabIndexBreaksPagePositionTie")]
     public void GetGridColumns_Overloads_AgreeWithEachOther(string formName)
     {
         FormMetadata form = BuildForm(formName);
@@ -489,6 +580,7 @@ public sealed class RecordQueryRulesTests
         "FewerThanSix" => FewerThanSix(),
         "NoGridField" => NoGridField(),
         "PagePositionDecides" => PagePositionDecides(),
+        "TabIndexBreaksPagePositionTie" => TabIndexBreaksPagePositionTie(),
         _ => throw new ArgumentOutOfRangeException(nameof(formName), formName, "No such test form."),
     };
 
@@ -704,6 +796,37 @@ public sealed class RecordQueryRulesTests
     }
 
     /// <summary>
+    /// Two pages that share <c>Position</c> 0, listed and numbered lower page first: page <c>L</c> (<c>PageId</c>
+    /// 14) holds four text fields at <c>TabIndex</c> 5 to 8 with the lower field ids, and page <c>H</c>
+    /// (<c>PageId</c> 15) four text fields at <c>TabIndex</c> 1 to 4. Eight fields are eligible, so the sixth
+    /// column's cut depends on which key follows <c>Position</c>.
+    /// </summary>
+    private static FormMetadata TabIndexBreaksPagePositionTie()
+    {
+        const int pageL = 14;
+        const int pageH = 15;
+        FieldMetadata[] fields =
+        [
+            .. SystemRows(firstFieldId: 500),
+            Row(503, "L5", TextType, pageL, 5, Nvarchar("L5", 50)),
+            Row(504, "L6", TextType, pageL, 6, Nvarchar("L6", 50)),
+            Row(505, "L7", TextType, pageL, 7, Nvarchar("L7", 50)),
+            Row(506, "L8", TextType, pageL, 8, Nvarchar("L8", 50)),
+            Row(507, "H1", TextType, pageH, 1, Nvarchar("H1", 50)),
+            Row(508, "H2", TextType, pageH, 2, Nvarchar("H2", 50)),
+            Row(509, "H3", TextType, pageH, 3, Nvarchar("H3", 50)),
+            Row(510, "H4", TextType, pageH, 4, Nvarchar("H4", 50)),
+        ];
+
+        return new FormMetadata(
+            14,
+            "TabIndexBreaksPagePositionTie",
+            "Y",
+            [new PageMetadata(pageL, "L", 0, "Y14"), new PageMetadata(pageH, "H", 0, "Y15")],
+            fields);
+    }
+
+    /// <summary>
     /// The system rows <c>UniqueKey</c>, <c>RecStatus</c> and <c>GlobalRecordId</c>, which belong to no page and own
     /// no page-table column, with consecutive field ids as seeded.
     /// </summary>
@@ -780,6 +903,41 @@ public sealed class RecordQueryRulesTests
                 i,
                 new Dictionary<string, FieldValue>()))
             .ToArray();
+
+    /// <summary>
+    /// A list that reports a count without holding that many items, yields one fixed result for each index it
+    /// reports, and counts every item read through its indexer or its enumerator.
+    /// </summary>
+    private sealed class CountingResults(int count) : IReadOnlyList<SearchResult>
+    {
+        private static readonly SearchResult Result = Results(1)[0];
+
+        public int Reads { get; private set; }
+
+        public int Count => count;
+
+        public SearchResult this[int index]
+        {
+            get
+            {
+                ArgumentOutOfRangeException.ThrowIfNegative(index);
+                ArgumentOutOfRangeException.ThrowIfGreaterThanOrEqual(index, count);
+                Reads++;
+                return Result;
+            }
+        }
+
+        public IEnumerator<SearchResult> GetEnumerator()
+        {
+            for (int i = 0; i < count; i++)
+            {
+                Reads++;
+                yield return Result;
+            }
+        }
+
+        System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
+    }
 
     /// <summary>A seeded <c>metaFieldTypes</c> row: its id and its name exactly as stored.</summary>
     private readonly record struct SeededType(int Id, string Name);

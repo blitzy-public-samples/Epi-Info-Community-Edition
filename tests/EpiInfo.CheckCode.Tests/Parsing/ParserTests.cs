@@ -1,3 +1,5 @@
+using System.Collections.Frozen;
+using System.Collections.Immutable;
 using EpiInfo.CheckCode.Lexing;
 using EpiInfo.CheckCode.Parsing;
 using EpiInfo.CheckCode.Syntax;
@@ -337,6 +339,184 @@ public sealed class ParserTests
         AssertAssign(Assert.Single(block.Events[2].Statements), "A", "c");
         Assert.All(block.Events, eventBlock => Assert.Empty(eventBlock.Diagnostics));
         Assert.Empty(program.Diagnostics);
+    }
+
+    /// <summary>How a test hands a caller-owned list to a list member of a syntax record.</summary>
+    public enum SnapshotPath
+    {
+        /// <summary>The list is a constructor argument.</summary>
+        Constructor,
+
+        /// <summary>
+        /// The list is set by a <see langword="with"/> expression on a record built from an empty list.
+        /// </summary>
+        With,
+    }
+
+    public static TheoryData<string, SnapshotPath> ListMembers
+    {
+        get
+        {
+            var data = new TheoryData<string, SnapshotPath>();
+            foreach (string member in ListMemberChecks.Keys)
+            {
+                data.Add(member, SnapshotPath.Constructor);
+                data.Add(member, SnapshotPath.With);
+            }
+
+            return data;
+        }
+    }
+
+    // Every list member of a syntax record is a snapshot taken by the constructor and by a `with` expression, so
+    // changing the caller's list afterwards never reaches the record, whichever path handed the list over.
+    [Theory]
+    [MemberData(nameof(ListMembers))]
+    public void ListMemberKeepsItsElementsWhenTheCallersListChanges(string member, SnapshotPath path) =>
+        ListMemberChecks[member](path);
+
+    private static readonly ExpressionNode SnapshotCondition =
+        new EqualsNode(new IdentifierNode("A", 3), LiteralNode.FromString("1", 3), 3);
+
+    private static readonly ImmutableArray<StatementNode> SnapshotStatements =
+    [
+        new AssignStatementNode("A", LiteralNode.FromString("a", 4), 4),
+        new AssignStatementNode("B", LiteralNode.FromString("b", 5), 5),
+    ];
+
+    private static readonly ImmutableArray<string> SnapshotNames = ["A", "B"];
+
+    private static readonly ImmutableArray<ExpressionNode> SnapshotArguments =
+        [new IdentifierNode("DOB", 3), new IdentifierNode("DateofInterview", 3)];
+
+    private static readonly ImmutableArray<Diagnostic> SnapshotDiagnostics =
+    [
+        new Diagnostic(DiagnosticSeverity.Warning, "TestForm", 3, Goto, "Unsupported command."),
+        new Diagnostic(DiagnosticSeverity.Info, "TestForm", 4, Parser.Commands.Geocode, "Skipped."),
+    ];
+
+    private static readonly ImmutableArray<EventBlockNode> SnapshotEvents =
+    [
+        new EventBlockNode(FieldEventKind.FieldBefore, 2, [], []),
+        new EventBlockNode(FieldEventKind.FieldAfter, 5, [], []),
+    ];
+
+    private static readonly ImmutableArray<FieldBlockNode> SnapshotFieldBlocks =
+        [new FieldBlockNode("X", 1, []), new FieldBlockNode("Y", 8, [])];
+
+    // One check per list member of the syntax records, keyed by record and member. Each builds the record from the
+    // list it is given (once by the constructor, once by `with`) and reads the member back.
+    private static readonly FrozenDictionary<string, Action<SnapshotPath>> ListMemberChecks =
+        new Dictionary<string, Action<SnapshotPath>>
+        {
+            ["IfStatementNode.Then"] = path => AssertListMemberIsASnapshot(
+                path,
+                SnapshotStatements,
+                list => new IfStatementNode(SnapshotCondition, list, null, 3),
+                (node, list) => node with { Then = list },
+                node => node.Then),
+            ["IfStatementNode.Else"] = path => AssertListMemberIsASnapshot(
+                path,
+                SnapshotStatements,
+                list => new IfStatementNode(SnapshotCondition, [], list, 3),
+                (node, list) => node with { Else = list },
+                node => node.Else),
+            ["EnableStatementNode.Names"] = path => AssertListMemberIsASnapshot(
+                path,
+                SnapshotNames,
+                list => new EnableStatementNode(list, 3),
+                (node, list) => node with { Names = list },
+                node => node.Names),
+            ["DisableStatementNode.Names"] = path => AssertListMemberIsASnapshot(
+                path,
+                SnapshotNames,
+                list => new DisableStatementNode(list, 3),
+                (node, list) => node with { Names = list },
+                node => node.Names),
+            ["ClearStatementNode.Names"] = path => AssertListMemberIsASnapshot(
+                path,
+                SnapshotNames,
+                list => new ClearStatementNode(list, 3),
+                (node, list) => node with { Names = list },
+                node => node.Names),
+            ["GeocodeStatementNode.Arguments"] = path => AssertListMemberIsASnapshot(
+                path,
+                SnapshotNames,
+                list => new GeocodeStatementNode(list, 3),
+                (node, list) => node with { Arguments = list },
+                node => node.Arguments),
+            ["FunctionCallNode.Arguments"] = path => AssertListMemberIsASnapshot(
+                path,
+                SnapshotArguments,
+                list => new FunctionCallNode("YEARS", list, 3),
+                (node, list) => node with { Arguments = list },
+                node => node.Arguments),
+            ["EventBlockNode.Statements"] = path => AssertListMemberIsASnapshot(
+                path,
+                SnapshotStatements,
+                list => new EventBlockNode(FieldEventKind.FieldAfter, 2, list, []),
+                (node, list) => node with { Statements = list },
+                node => node.Statements),
+            ["EventBlockNode.Diagnostics"] = path => AssertListMemberIsASnapshot(
+                path,
+                SnapshotDiagnostics,
+                list => new EventBlockNode(FieldEventKind.FieldAfter, 2, [], list),
+                (node, list) => node with { Diagnostics = list },
+                node => node.Diagnostics),
+            ["FieldBlockNode.Events"] = path => AssertListMemberIsASnapshot(
+                path,
+                SnapshotEvents,
+                list => new FieldBlockNode("X", 1, list),
+                (node, list) => node with { Events = list },
+                node => node.Events),
+            ["ProgramNode.FieldBlocks"] = path => AssertListMemberIsASnapshot(
+                path,
+                SnapshotFieldBlocks,
+                list => new ProgramNode(list, []),
+                (node, list) => node with { FieldBlocks = list },
+                node => node.FieldBlocks),
+            ["ProgramNode.Diagnostics"] = path => AssertListMemberIsASnapshot(
+                path,
+                SnapshotDiagnostics,
+                list => new ProgramNode([], list),
+                (node, list) => node with { Diagnostics = list },
+                node => node.Diagnostics),
+        }.ToFrozenDictionary(StringComparer.Ordinal);
+
+    // Hands the record a caller-owned copy of the two elements by the given path, then overwrites, appends to and
+    // finally clears that list, asserting after each change that the member still holds both elements, in order.
+    private static void AssertListMemberIsASnapshot<TNode, T>(
+        SnapshotPath path,
+        ImmutableArray<T> elements,
+        Func<IReadOnlyList<T>, TNode> construct,
+        Func<TNode, IReadOnlyList<T>, TNode> withMember,
+        Func<TNode, IReadOnlyList<T>?> readMember)
+        where T : class
+    {
+        List<T> callersList = [.. elements];
+        TNode node = path == SnapshotPath.Constructor
+            ? construct(callersList)
+            : withMember(construct([]), callersList);
+        AssertHoldsExactly(elements, readMember(node));
+
+        callersList[0] = callersList[1];
+        callersList.Add(elements[0]);
+        AssertHoldsExactly(elements, readMember(node));
+
+        callersList.Clear();
+        AssertHoldsExactly(elements, readMember(node));
+    }
+
+    // Compares elements by reference, so the check never rests on the records' value equality.
+    private static void AssertHoldsExactly<T>(ImmutableArray<T> expected, IReadOnlyList<T>? actual)
+        where T : class
+    {
+        Assert.NotNull(actual);
+        Assert.Equal(expected.Length, actual.Count);
+        for (int i = 0; i < expected.Length; i++)
+        {
+            Assert.Same(expected[i], actual[i]);
+        }
     }
 
     // Lines 434-440: an IF closes with END-IF or END, and both give the same node.

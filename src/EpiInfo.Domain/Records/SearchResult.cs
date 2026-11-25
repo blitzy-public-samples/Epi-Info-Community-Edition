@@ -16,10 +16,10 @@ namespace EpiInfo.Domain.Records;
 /// the parity notes' "Search semantics" section.
 /// </para>
 /// <para>
-/// <b>Not a Record.</b> A result carries the grid columns only, like a record summary, and its
-/// <see cref="Position"/> is over the caller's selected set. The Record DTO's own <c>position</c> and
-/// <c>count</c> are intrinsic to its <c>RecStatus</c> instead, so the two agree only for an active record searched
-/// without <c>includeDeleted</c>.
+/// <b>Not a Record.</b> A result carries the grid columns only, like a record summary. Its <see cref="Position"/>
+/// is taken over the caller's selected set, the one the search's <c>includeDeleted</c> chooses. The Record DTO's
+/// own <c>position</c> and <c>count</c> are taken over the record's intrinsic set, the one its <c>RecStatus</c>
+/// chooses, whatever <c>includeDeleted</c> the search sent. Each is computed over its own set, never from the other.
 /// </para>
 /// <para>
 /// <see cref="Values"/> is field data, which the redaction policy keeps out of logs and error bodies. The

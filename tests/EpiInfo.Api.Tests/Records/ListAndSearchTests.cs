@@ -1,10 +1,25 @@
+using System.Globalization;
+using System.Net;
 using System.Text.Json;
 using EpiInfo.Api.Contracts;
+using EpiInfo.Api.Endpoints;
+using EpiInfo.Api.Errors;
 using EpiInfo.Api.Json;
+using EpiInfo.Api.Services;
+using EpiInfo.Api.Tests.Infrastructure;
+using EpiInfo.CheckCode;
 using EpiInfo.Domain.Records;
+using EpiInfo.Domain.Storage;
 using EpiInfo.Domain.Values;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Http.Json;
+using Microsoft.AspNetCore.Mvc.ApiExplorer;
+using Microsoft.AspNetCore.Mvc.ModelBinding;
+using Microsoft.AspNetCore.Routing;
+using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
 namespace EpiInfo.Api.Tests.Records;
@@ -83,5 +98,758 @@ public sealed class SearchRequestBindingTests
         var criteria = Deserialize(json, options).Criteria;
         Assert.NotNull(criteria);
         return Assert.Single(criteria);
+    }
+}
+
+/// <summary>
+/// The route and query coercion of the record routes (AAP 0.3.4.1), owned by <see cref="RequestParameters"/>, over
+/// HTTP: only a parameter that was not sent takes its default, a value sent once coerces only when it is a complete
+/// integer token or <c>true</c>/<c>false</c>, and every other value, a key sent more than once included, is one
+/// field-level 400, keyed by parameter, that reaches no store call and echoes no submitted value.
+/// </summary>
+/// <remarks>
+/// <para>
+/// The host is composed here rather than through <see cref="ApiFactory"/>, which hosts the composition root in
+/// <c>Program.cs</c>. It maps exactly <see cref="RecordEndpoints.MapRecordEndpoints"/> over the real
+/// <see cref="FormService"/>, <see cref="RecordService"/> and <see cref="CheckCodeEngine"/> on a test server, with a
+/// <see cref="FakeDataStore"/> as the store, so each case observes the framework's string binding, the coercion and
+/// the record service, and nothing else the composition root maps or registers. The endpoint API explorer, which the
+/// OpenAPI document's parameters are generated from, is registered too, so the binding's parameter descriptions can
+/// be read.
+/// </para>
+/// <para>
+/// The class needs no database: it carries no <c>Integration</c> trait, joins no database collection and takes no
+/// <c>DatabaseWriteLock</c>. Each request it asserts on starts from an empty store call log, so a rejected request is
+/// shown to reach no store member, the form lookup included. In a query string <c>+</c> decodes to a space, so a
+/// leading plus sign is sent as <c>%2B</c>.
+/// </para>
+/// </remarks>
+public sealed class RequestParameterCoercionTests : IAsyncLifetime
+{
+    // The store seeds FakeForms.TwoPage with three active records and, between the second and the third, one deleted
+    // record; FakeForms.Empty holds none.
+    private const int ActiveRecordCount = 3;
+    private const int AllRecordCount = ActiveRecordCount + 1;
+
+    // No form of this store has this view id.
+    private const int UnknownViewId = 9999;
+
+    private const string FirstActiveId = "0b7a6c9e-2f1d-4e57-9c3a-5d8e1f20a001";
+    private const string SecondActiveId = "0b7a6c9e-2f1d-4e57-9c3a-5d8e1f20a002";
+    private const string DeletedId = "0b7a6c9e-2f1d-4e57-9c3a-5d8e1f20a003";
+    private const string ThirdActiveId = "0b7a6c9e-2f1d-4e57-9c3a-5d8e1f20a004";
+
+    // The LastName of the second active record and of no other, so q can be shown to filter.
+    private const string FilterMatch = "Bravo";
+
+    // The query text that sends one parameter, up to its value.
+    private const string PageQuery = "?" + RequestParameters.Page + "=";
+    private const string PageSizeQuery = "?" + RequestParameters.PageSize + "=";
+    private const string IncludeDeletedQuery = "?" + RequestParameters.IncludeDeleted + "=";
+    private const string FilterQuery = "?" + RequestParameters.Query + "=";
+
+    // Sent integer values that are not one complete token of an optional single sign and ASCII digits, or that leave
+    // Int32, as the query text after the key: "=" sends an empty value and "" sends the bare key.
+    private static readonly string[] MalformedIntegerQueryValues =
+    [
+        "=",
+        "",
+        "=%201",
+        "=1%20",
+        "=%091",
+        "=1%00",
+        "=%001",
+        "=1.0",
+        "=1e3",
+        "=0x10",
+        "=1,000",
+        "=abc",
+        "=%2B%2B1",
+        "=--1",
+        "=%2B-1",
+        "=1-",
+        "=%2B",
+        "=-",
+        "=%EF%BC%91",
+        "=%D9%A1",
+        "=%E2%88%921",
+        "=" + AboveInt32,
+        "=" + BelowInt32,
+        "=99999999999999999999",
+    ];
+
+    // Sent includeDeleted values that are neither true nor false ignoring case, in the same form.
+    private static readonly string[] InvalidBooleanQueryValues =
+    [
+        "=",
+        "",
+        "=%20true",
+        "=true%20",
+        "=true%00",
+        "=%00false",
+        "=1",
+        "=0",
+        "=yes",
+        "=no",
+        "=tru",
+        "=truefalse",
+    ];
+
+    // Sent values that repeat the key, in the same form, where {0} is the key and {1} and {2} are two values the
+    // parameter accepts when sent once: an empty or bare occurrence beside an accepted one, the same accepted value
+    // twice, and two different accepted values.
+    private static readonly string[] RepeatedQueryValueTemplates =
+    [
+        "=&{0}={1}",
+        "={1}&{0}",
+        "={1}&{0}={1}",
+        "={1}&{0}={2}",
+    ];
+
+    // The occurrence-bound query parameters, by the endpoint name of each route that takes them.
+    private static readonly string[] OccurrenceBoundParameters =
+    [
+        "ListRecords/" + RequestParameters.IncludeDeleted,
+        "ListRecords/" + RequestParameters.Page,
+        "ListRecords/" + RequestParameters.PageSize,
+        "CountRecords/" + RequestParameters.IncludeDeleted,
+        "GetRecordAt/" + RequestParameters.IncludeDeleted,
+        "GetRecordPosition/" + RequestParameters.IncludeDeleted,
+    ];
+
+    private readonly FakeDataStore store = new(FakeForms.TwoPage, FakeForms.Empty);
+
+    private WebApplication? app;
+
+    private HttpClient? client;
+
+    /// <summary>
+    /// Every sent page or pageSize value that is not one integer, a repeated key included, per parameter.
+    /// </summary>
+    public static TheoryData<string, string> MalformedPagingValues
+    {
+        get
+        {
+            var data = new TheoryData<string, string>();
+            (string Parameter, long Accepted, long OtherAccepted)[] parameters =
+            [
+                (RequestParameters.Page, RecordQueryRules.MinPage, RecordQueryRules.MinPage + 1),
+                (RequestParameters.PageSize, RecordQueryRules.DefaultPageSize, RecordQueryRules.MaxPageSize),
+            ];
+            foreach (var (parameter, accepted, otherAccepted) in parameters)
+            {
+                foreach (var value in MalformedIntegerQueryValues)
+                {
+                    data.Add(parameter, value);
+                }
+
+                foreach (var value in RepeatedQueryValues(parameter, Text(accepted), Text(otherAccepted)))
+                {
+                    data.Add(parameter, value);
+                }
+            }
+
+            return data;
+        }
+    }
+
+    /// <summary>
+    /// Every invalid includeDeleted value, a repeated key included, on each of the four routes that take the flag.
+    /// </summary>
+    public static TheoryData<string, string> InvalidIncludeDeletedRequests
+    {
+        get
+        {
+            var data = new TheoryData<string, string>();
+            string[] values =
+            [
+                .. InvalidBooleanQueryValues,
+                .. RepeatedQueryValues(RequestParameters.IncludeDeleted, "true", "false"),
+            ];
+            foreach (var path in IncludeDeletedRoutes)
+            {
+                foreach (var value in values)
+                {
+                    data.Add(path, value);
+                }
+            }
+
+            return data;
+        }
+    }
+
+    /// <summary>An absent includeDeleted and accepted spellings, on each route that takes the flag.</summary>
+    public static TheoryData<string, string> AcceptedIncludeDeletedRequests
+    {
+        get
+        {
+            var data = new TheoryData<string, string>();
+            string[] queries = [string.Empty, IncludeDeletedQuery + "TRUE", IncludeDeletedQuery + "False"];
+            foreach (var path in IncludeDeletedRoutes)
+            {
+                foreach (var query in queries)
+                {
+                    data.Add(path, query);
+                }
+            }
+
+            return data;
+        }
+    }
+
+    /// <summary>The includeDeleted query of a count request and the count it selects.</summary>
+    public static TheoryData<string, int> CountSelections => new()
+    {
+        { string.Empty, ActiveRecordCount },
+        { IncludeDeletedQuery + "TRUE", AllRecordCount },
+        { IncludeDeletedQuery + "tRuE", AllRecordCount },
+        { IncludeDeletedQuery + "False", ActiveRecordCount },
+        { IncludeDeletedQuery + "FALSE", ActiveRecordCount },
+    };
+
+    /// <summary>
+    /// Route positions that are not a 32-bit integer token. A NUL is not among them: the host's URL decoder refuses
+    /// <c>%00</c> in a path before routing, so the NUL cases are sent as query values, which the same integer rule
+    /// coerces.
+    /// </summary>
+    public static TheoryData<string> MalformedPositions => new()
+    {
+        "abc",
+        "1.5",
+        "1e3",
+        "0x1",
+        "1,0",
+        AboveInt32,
+        BelowInt32,
+        "%201",
+        "1%20",
+        "1%09",
+        "%E2%88%921",
+        "%EF%BC%91",
+        "--1",
+        "+",
+        "-",
+    };
+
+    /// <summary>Accepted route positions with their query and the record each opens.</summary>
+    public static TheoryData<string, string> OpenedPositions => new()
+    {
+        { "1", FirstActiveId },
+        { "+1", FirstActiveId },
+        { "003", ThirdActiveId },
+        { "3" + IncludeDeletedQuery + "False", ThirdActiveId },
+        { "3" + IncludeDeletedQuery + "TRUE", DeletedId },
+        { "+4" + IncludeDeletedQuery + "true", ThirdActiveId },
+    };
+
+    /// <summary>32-bit integer positions outside 1..count, which coerce and reach the service's 404.</summary>
+    public static TheoryData<string> PositionsOutsideTheSet => new()
+    {
+        "0",
+        "-0",
+        "-1",
+        Int32Min,
+        Int32Max,
+        Text(ActiveRecordCount + 1),
+        Text(AllRecordCount + 1) + IncludeDeletedQuery + "true",
+    };
+
+    /// <summary>Integer page and pageSize values outside their bounds, with the range message each gets.</summary>
+    public static TheoryData<string, string, string> OutOfRangePagingValues => new()
+    {
+        { RequestParameters.Page, Text(RecordQueryRules.MinPage - 1), RecordQueryRules.PageOutOfRangeMessage },
+        { RequestParameters.Page, "-0", RecordQueryRules.PageOutOfRangeMessage },
+        { RequestParameters.Page, "-1", RecordQueryRules.PageOutOfRangeMessage },
+        { RequestParameters.Page, Int32Min, RecordQueryRules.PageOutOfRangeMessage },
+        {
+            RequestParameters.PageSize,
+            Text(RecordQueryRules.MinPageSize - 1),
+            RecordQueryRules.PageSizeOutOfRangeMessage
+        },
+        { RequestParameters.PageSize, "-1", RecordQueryRules.PageSizeOutOfRangeMessage },
+        {
+            RequestParameters.PageSize,
+            Text(RecordQueryRules.MaxPageSize + 1),
+            RecordQueryRules.PageSizeOutOfRangeMessage
+        },
+        { RequestParameters.PageSize, Int32Max, RecordQueryRules.PageSizeOutOfRangeMessage },
+        { RequestParameters.PageSize, Int32Min, RecordQueryRules.PageSizeOutOfRangeMessage },
+    };
+
+    /// <summary>Accepted list requests with the page, page size and total each returns.</summary>
+    public static TheoryData<string, int, int, int> AcceptedListPages => new()
+    {
+        { RecordsPath, RecordQueryRules.DefaultPage, RecordQueryRules.DefaultPageSize, ActiveRecordCount },
+        {
+            RecordsPath + PageSizeQuery + Text(RecordQueryRules.MinPageSize),
+            RecordQueryRules.DefaultPage,
+            RecordQueryRules.MinPageSize,
+            ActiveRecordCount
+        },
+        {
+            RecordsPath + PageSizeQuery + Text(RecordQueryRules.MaxPageSize),
+            RecordQueryRules.DefaultPage,
+            RecordQueryRules.MaxPageSize,
+            ActiveRecordCount
+        },
+        {
+            WithQuery(RecordsPath, (RequestParameters.Page, "%2B2"), (RequestParameters.PageSize, "%2B1")),
+            2,
+            1,
+            ActiveRecordCount
+        },
+        {
+            WithQuery(RecordsPath, (RequestParameters.Page, "0002"), (RequestParameters.PageSize, "002")),
+            2,
+            2,
+            ActiveRecordCount
+        },
+        { RecordsPath + PageQuery + "2", 2, RecordQueryRules.DefaultPageSize, ActiveRecordCount },
+        { RecordsPath + PageQuery + Int32Max, int.MaxValue, RecordQueryRules.DefaultPageSize, ActiveRecordCount },
+        {
+            WithQuery(
+                RecordsPath,
+                (RequestParameters.Page, Int32Max),
+                (RequestParameters.PageSize, Text(RecordQueryRules.MaxPageSize))),
+            int.MaxValue,
+            RecordQueryRules.MaxPageSize,
+            ActiveRecordCount
+        },
+        {
+            WithQuery(RecordsPath, (RequestParameters.Page, Int32Max), (RequestParameters.IncludeDeleted, "true")),
+            int.MaxValue,
+            RecordQueryRules.DefaultPageSize,
+            AllRecordCount
+        },
+        { EmptyRecordsPath, RecordQueryRules.DefaultPage, RecordQueryRules.DefaultPageSize, 0 },
+        { EmptyRecordsPath + PageQuery + Int32Max, int.MaxValue, RecordQueryRules.DefaultPageSize, 0 },
+    };
+
+    /// <summary>The q part of a list request and the total it selects.</summary>
+    public static TheoryData<string, int> ListFilters => new()
+    {
+        { string.Empty, ActiveRecordCount },
+        { "?" + RequestParameters.Query, ActiveRecordCount },
+        { FilterQuery, ActiveRecordCount },
+        { FilterQuery + "%20%20", ActiveRecordCount },
+        { FilterQuery + "%09", ActiveRecordCount },
+        { FilterQuery + FilterMatch, 1 },
+    };
+
+    /// <summary>
+    /// Requests with more than one bad parameter, or a bad parameter on an unknown form, with the errors keys and the
+    /// one message each key carries, in the same order.
+    /// </summary>
+    public static TheoryData<string, string[], string[]> MergedRejections => new()
+    {
+        {
+            WithQuery(
+                RecordsPath,
+                (RequestParameters.Page, "x"),
+                (RequestParameters.PageSize, Text(RecordQueryRules.MinPageSize - 1)),
+                (RequestParameters.IncludeDeleted, "maybe")),
+            [RequestParameters.Page, RequestParameters.PageSize, RequestParameters.IncludeDeleted],
+            [
+                RequestParameters.IntegerExpectedMessage,
+                RecordQueryRules.PageSizeOutOfRangeMessage,
+                RequestParameters.BooleanExpectedMessage,
+            ]
+        },
+        {
+            WithQuery(
+                RecordsPath,
+                (RequestParameters.Page, string.Empty),
+                (RequestParameters.PageSize, string.Empty),
+                (RequestParameters.IncludeDeleted, string.Empty)),
+            [RequestParameters.Page, RequestParameters.PageSize, RequestParameters.IncludeDeleted],
+            [
+                RequestParameters.IntegerExpectedMessage,
+                RequestParameters.IntegerExpectedMessage,
+                RequestParameters.BooleanExpectedMessage,
+            ]
+        },
+        {
+            WithQuery(
+                RecordsPath,
+                (RequestParameters.Page, null),
+                (RequestParameters.PageSize, null),
+                (RequestParameters.IncludeDeleted, null)),
+            [RequestParameters.Page, RequestParameters.PageSize, RequestParameters.IncludeDeleted],
+            [
+                RequestParameters.IntegerExpectedMessage,
+                RequestParameters.IntegerExpectedMessage,
+                RequestParameters.BooleanExpectedMessage,
+            ]
+        },
+        {
+            WithQuery(
+                RecordsPath,
+                (RequestParameters.Page, Text(RecordQueryRules.MinPage - 1)),
+                (RequestParameters.PageSize, Text(RecordQueryRules.MaxPageSize + 1))),
+            [RequestParameters.Page, RequestParameters.PageSize],
+            [RecordQueryRules.PageOutOfRangeMessage, RecordQueryRules.PageSizeOutOfRangeMessage]
+        },
+        {
+            WithQuery(RecordsPath, (RequestParameters.Page, "-1"), (RequestParameters.PageSize, "x")),
+            [RequestParameters.Page, RequestParameters.PageSize],
+            [RecordQueryRules.PageOutOfRangeMessage, RequestParameters.IntegerExpectedMessage]
+        },
+        {
+            WithQuery(
+                RecordsPath,
+                (RequestParameters.Page, string.Empty),
+                (RequestParameters.Page, Text(RecordQueryRules.MinPage)),
+                (RequestParameters.PageSize, Text(RecordQueryRules.DefaultPageSize)),
+                (RequestParameters.IncludeDeleted, "true"),
+                (RequestParameters.IncludeDeleted, null)),
+            [RequestParameters.Page, RequestParameters.IncludeDeleted],
+            [RequestParameters.IntegerExpectedMessage, RequestParameters.BooleanExpectedMessage]
+        },
+        {
+            AtPath("abc") + IncludeDeletedQuery + "maybe",
+            [RequestParameters.Position, RequestParameters.IncludeDeleted],
+            [RequestParameters.IntegerExpectedMessage, RequestParameters.BooleanExpectedMessage]
+        },
+        {
+            AtPath("1%20") + IncludeDeletedQuery,
+            [RequestParameters.Position, RequestParameters.IncludeDeleted],
+            [RequestParameters.IntegerExpectedMessage, RequestParameters.BooleanExpectedMessage]
+        },
+        {
+            RecordsPathOf(UnknownViewId) + PageQuery + "x",
+            [RequestParameters.Page],
+            [RequestParameters.IntegerExpectedMessage]
+        },
+        {
+            RecordsPathOf(UnknownViewId) + "/count" + IncludeDeletedQuery,
+            [RequestParameters.IncludeDeleted],
+            [RequestParameters.BooleanExpectedMessage]
+        },
+    };
+
+    /// <summary>
+    /// Rejected requests carrying sentinels: <c>{0}</c> is a text sentinel and <c>{1}</c> a nine-digit sentinel.
+    /// </summary>
+    public static TheoryData<string> SentinelRequests => new()
+    {
+        RecordsPath + PageQuery + "{0}",
+        RecordsPath + PageQuery + "-{1}",
+        RecordsPath + PageSizeQuery + "{0}",
+        RecordsPath + PageSizeQuery + "{1}",
+        RecordsPath + IncludeDeletedQuery + "{0}",
+        WithQuery(
+            RecordsPath,
+            (RequestParameters.Page, "{0}"),
+            (RequestParameters.PageSize, "{1}"),
+            (RequestParameters.IncludeDeleted, "{0}")),
+        CountPath + IncludeDeletedQuery + "{0}",
+        AtPath("{0}"),
+        AtPath("{1}{0}") + IncludeDeletedQuery + "{0}",
+        AtPath("1") + IncludeDeletedQuery + "{0}",
+        PositionPath + IncludeDeletedQuery + "{0}",
+    };
+
+    // The Int32 bounds and the integers just outside them, as sent.
+    private static string Int32Max => Text(int.MaxValue);
+
+    private static string Int32Min => Text(int.MinValue);
+
+    private static string AboveInt32 => Text((long)int.MaxValue + 1L);
+
+    private static string BelowInt32 => Text((long)int.MinValue - 1L);
+
+    private static string RecordsPath => RecordsPathOf(FakeForms.TwoPageViewId);
+
+    private static string EmptyRecordsPath => RecordsPathOf(FakeForms.EmptyViewId);
+
+    private static string CountPath => RecordsPath + "/count";
+
+    private static string PositionPath => $"{RecordsPath}/{FirstActiveId}/position";
+
+    // The four routes that take includeDeleted: the list, count, at/{position} and the position endpoint.
+    private static string[] IncludeDeletedRoutes => [RecordsPath, CountPath, AtPath("1"), PositionPath];
+
+    private HttpClient Client => client ?? throw new InvalidOperationException("The test host is not started.");
+
+    /// <summary>Seeds the store and starts the test server.</summary>
+    public async Task InitializeAsync()
+    {
+        store.SeedRecord(FakeForms.TwoPageViewId, LastName("Alpha"), globalRecordId: FirstActiveId);
+        store.SeedRecord(FakeForms.TwoPageViewId, LastName(FilterMatch), globalRecordId: SecondActiveId);
+        store.SeedRecord(
+            FakeForms.TwoPageViewId,
+            LastName("Charlie"),
+            recStatus: RecordQueryRules.DeletedRecStatus,
+            globalRecordId: DeletedId);
+        store.SeedRecord(FakeForms.TwoPageViewId, LastName("Delta"), globalRecordId: ThirdActiveId);
+
+        var builder = WebApplication.CreateSlimBuilder();
+        builder.WebHost.UseTestServer();
+        builder.Logging.ClearProviders();
+        builder.Services.AddApiJson();
+        builder.Services.AddSingleton<IDataStore>(store);
+        builder.Services.AddSingleton<ICheckCodeEngine, CheckCodeEngine>();
+        builder.Services.AddSingleton(TimeProvider.System);
+        builder.Services.AddSingleton<SaveStampProvider>();
+        builder.Services.AddScoped<FormService>();
+        builder.Services.AddScoped<RecordService>();
+        builder.Services.AddEndpointsApiExplorer();
+
+        app = builder.Build();
+        app.MapRecordEndpoints();
+        await app.StartAsync();
+        client = app.GetTestClient();
+    }
+
+    /// <summary>Stops the test server.</summary>
+    public async Task DisposeAsync()
+    {
+        client?.Dispose();
+        if (app is not null)
+        {
+            await app.DisposeAsync();
+        }
+    }
+
+    // AAP 0.3.4.1: a missing page is 1 and a missing pageSize is 50; any sent value that is not a 32-bit integer,
+    // the empty value, the bare key and a key sent more than once included, is a 400 under errors[<parameter>] and
+    // nothing else.
+    [Theory]
+    [MemberData(nameof(MalformedPagingValues))]
+    public async Task MalformedPagingValueIsRejectedBeforeAnyStoreCall(string parameter, string value)
+    {
+        var errors = await GetRejectedAsync($"{RecordsPath}?{parameter}{value}");
+
+        AssertErrors(errors, [parameter], [RequestParameters.IntegerExpectedMessage]);
+    }
+
+    // AAP 0.3.4.1 and C-19: only an absent includeDeleted is false; any other value but true or false ignoring case,
+    // the empty value, the bare key and a key sent more than once included, is a 400 on every route that takes the
+    // flag, count included.
+    [Theory]
+    [MemberData(nameof(InvalidIncludeDeletedRequests))]
+    public async Task InvalidIncludeDeletedIsRejectedBeforeAnyStoreCall(string path, string value)
+    {
+        var errors = await GetRejectedAsync($"{path}?{RequestParameters.IncludeDeleted}{value}");
+
+        AssertErrors(errors, [RequestParameters.IncludeDeleted], [RequestParameters.BooleanExpectedMessage]);
+    }
+
+    [Theory]
+    [MemberData(nameof(AcceptedIncludeDeletedRequests))]
+    public async Task AcceptedIncludeDeletedReachesTheService(string path, string query) =>
+        await GetOkAsync(path + query);
+
+    [Theory]
+    [MemberData(nameof(CountSelections))]
+    public async Task IncludeDeletedSelectsTheCountedSet(string query, int expectedCount)
+    {
+        var body = await GetOkAsync(CountPath + query);
+
+        Assert.Equal(expectedCount, body.GetProperty("count").GetInt32());
+    }
+
+    // AAP 0.3.4.1: {position} is parsed as an invariant 32-bit integer, and anything else is a 400 under
+    // errors["position"] before the form lookup.
+    [Theory]
+    [MemberData(nameof(MalformedPositions))]
+    public async Task MalformedPositionIsRejectedBeforeAnyStoreCall(string position)
+    {
+        var errors = await GetRejectedAsync(AtPath(position));
+
+        AssertErrors(errors, [RequestParameters.Position], [RequestParameters.IntegerExpectedMessage]);
+    }
+
+    [Theory]
+    [MemberData(nameof(OpenedPositions))]
+    public async Task IntegerPositionInTheSetOpensItsRecord(string positionAndQuery, string expectedId)
+    {
+        var body = await GetOkAsync(AtPath(positionAndQuery));
+
+        Assert.Equal(expectedId, body.GetProperty("globalRecordId").GetString());
+    }
+
+    // AAP 0.3.4.1: an integer position outside 1..count coerces, and the record service answers 404.
+    [Theory]
+    [MemberData(nameof(PositionsOutsideTheSet))]
+    public async Task IntegerPositionOutsideTheSetIsTheServiceNotFound(string positionAndQuery)
+    {
+        store.ClearCalls();
+        using var response = await Client.GetAsync(AtPath(positionAndQuery));
+        var text = await response.Content.ReadAsStringAsync();
+
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+        Assert.Equal(ApiProblems.ProblemContentType, response.Content.Headers.ContentType?.MediaType);
+        var body = ParseProblem(text, StatusCodes.Status404NotFound);
+        Assert.Equal(ApiProblems.PositionNotFoundDetail, body.GetProperty("detail").GetString());
+        Assert.False(body.TryGetProperty("errors", out _), text);
+        Assert.Contains(store.Calls, call => call.Method == nameof(IDataStore.GetFormMetadataAsync));
+    }
+
+    // AAP 0.3.4.1 and 0.7.1: page < 1 and pageSize outside 1-200 are 400s with the range message, not the
+    // integer message.
+    [Theory]
+    [MemberData(nameof(OutOfRangePagingValues))]
+    public async Task OutOfRangePagingValueGetsItsRangeMessage(string parameter, string value, string message)
+    {
+        var errors = await GetRejectedAsync($"{RecordsPath}?{parameter}={value}");
+
+        AssertErrors(errors, [parameter], [message]);
+    }
+
+    // AAP 0.3.4.1: the defaults apply to omitted parameters, and the largest admitted page, 2147483647, returns
+    // items: [] with the correct total.
+    [Theory]
+    [MemberData(nameof(AcceptedListPages))]
+    public async Task AcceptedPagingReturnsThePage(string uri, int page, int pageSize, int total)
+    {
+        var body = await GetOkAsync(uri);
+
+        Assert.Equal(page, body.GetProperty("page").GetInt32());
+        Assert.Equal(pageSize, body.GetProperty("pageSize").GetInt32());
+        Assert.Equal(total, body.GetProperty("total").GetInt32());
+
+        var offset = ((long)page - 1L) * pageSize;
+        var expectedItems = offset >= total ? 0 : (int)Math.Min(pageSize, total - offset);
+        Assert.Equal(expectedItems, body.GetProperty("items").GetArrayLength());
+    }
+
+    // AAP 0.3.4.1: an absent, empty or whitespace q means no filter.
+    [Theory]
+    [MemberData(nameof(ListFilters))]
+    public async Task BlankFilterMeansNoFilter(string query, int total)
+    {
+        var body = await GetOkAsync(RecordsPath + query);
+
+        Assert.Equal(total, body.GetProperty("total").GetInt32());
+    }
+
+    // AAP 0.3.4.2: every bad parameter of one request is reported in one field-level 400, each key with exactly its
+    // own fixed message, ahead of the form lookup.
+    [Theory]
+    [MemberData(nameof(MergedRejections))]
+    public async Task EveryBadParameterIsReportedInOneRejection(string uri, string[] keys, string[] messages)
+    {
+        var errors = await GetRejectedAsync(uri);
+
+        AssertErrors(errors, keys, messages);
+    }
+
+    // AAP 0.9.3: an error body never carries a query-string or route value.
+    [Theory]
+    [MemberData(nameof(SentinelRequests))]
+    public async Task RejectionNeverEchoesTheSubmittedValue(string template)
+    {
+        var text = "T" + Guid.NewGuid().ToString("N");
+        var digits = Random.Shared.Next(100_000_000, 1_000_000_000).ToString(CultureInfo.InvariantCulture);
+
+        store.ClearCalls();
+        using var response = await Client.GetAsync(string.Format(CultureInfo.InvariantCulture, template, text, digits));
+        var body = await response.Content.ReadAsStringAsync();
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.Empty(store.Calls);
+        Assert.DoesNotContain(text, body, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(digits, body, StringComparison.Ordinal);
+    }
+
+    // AAP 0.3.4.1: includeDeleted, page and pageSize stay optional query parameters in the API description the OpenAPI
+    // document is generated from, whatever type binds their occurrences.
+    [Fact]
+    public void OccurrenceBoundParametersAreOptionalQueryParameters()
+    {
+        var host = app ?? throw new InvalidOperationException("The test host is not started.");
+        var described = host.Services.GetRequiredService<IApiDescriptionGroupCollectionProvider>()
+            .ApiDescriptionGroups.Items
+            .SelectMany(group => group.Items)
+            .SelectMany(description => description.ParameterDescriptions.Select(parameter =>
+                (Key: EndpointName(description) + "/" + parameter.Name, Parameter: parameter)))
+            .Where(entry => OccurrenceBoundParameters.Contains(entry.Key, StringComparer.Ordinal))
+            .ToList();
+
+        Assert.Equal(
+            OccurrenceBoundParameters.Order(StringComparer.Ordinal),
+            described.Select(entry => entry.Key).Order(StringComparer.Ordinal));
+        Assert.All(described, entry =>
+        {
+            Assert.Equal(BindingSource.Query, entry.Parameter.Source);
+            Assert.False(entry.Parameter.IsRequired, entry.Key);
+        });
+    }
+
+    private static string EndpointName(ApiDescription description) =>
+        description.ActionDescriptor.EndpointMetadata.OfType<IEndpointNameMetadata>().Single().EndpointName;
+
+    // The query values, after the key, that send parameter more than once, from two values it accepts when sent once.
+    private static IEnumerable<string> RepeatedQueryValues(string parameter, string accepted, string otherAccepted) =>
+        RepeatedQueryValueTemplates.Select(template =>
+            string.Format(CultureInfo.InvariantCulture, template, parameter, accepted, otherAccepted));
+
+    private static string RecordsPathOf(int viewId) => Invariant($"/api/forms/{viewId}/records");
+
+    private static string AtPath(string positionAndQuery) => $"{RecordsPath}/at/{positionAndQuery}";
+
+    private static string Invariant(FormattableString text) => text.ToString(CultureInfo.InvariantCulture);
+
+    private static string Text(long value) => value.ToString(CultureInfo.InvariantCulture);
+
+    // path?name=value&..., where a null value sends the bare key.
+    private static string WithQuery(string path, params (string Name, string? Value)[] parameters) =>
+        path + "?" + string.Join(
+            '&',
+            parameters.Select(parameter =>
+                parameter.Value is null ? parameter.Name : parameter.Name + "=" + parameter.Value));
+
+    private static IReadOnlyDictionary<string, FieldValue> LastName(string value) =>
+        new Dictionary<string, FieldValue>(StringComparer.Ordinal) { ["LastName"] = FieldValue.FromText(value) };
+
+    private static JsonElement ParseProblem(string text, int status)
+    {
+        using var document = JsonDocument.Parse(text);
+        return ApiTestClient.AssertProblemDetails(document.RootElement.Clone(), status);
+    }
+
+    // Asserts that errors holds exactly the keys given, each with exactly its one message.
+    private static void AssertErrors(JsonElement errors, string[] keys, string[] messages)
+    {
+        Assert.Equal(keys.Length, messages.Length);
+        Assert.Equal(JsonValueKind.Object, errors.ValueKind);
+
+        var actual = errors.EnumerateObject().ToDictionary(
+            entry => entry.Name,
+            entry => entry.Value.EnumerateArray().Select(message => message.GetString()).ToArray(),
+            StringComparer.Ordinal);
+        Assert.Equal(keys.Order(StringComparer.Ordinal), actual.Keys.Order(StringComparer.Ordinal));
+        for (var index = 0; index < keys.Length; index++)
+        {
+            Assert.Equal(new string?[] { messages[index] }, actual[keys[index]]);
+        }
+    }
+
+    // Sends a GET that coercion must reject: a field-level 400 ProblemDetails, and no store call at all.
+    private async Task<JsonElement> GetRejectedAsync(string uri)
+    {
+        store.ClearCalls();
+        using var response = await Client.GetAsync(uri);
+        var text = await response.Content.ReadAsStringAsync();
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.Equal(ApiProblems.ProblemContentType, response.Content.Headers.ContentType?.MediaType);
+        Assert.Empty(store.Calls);
+
+        var body = ParseProblem(text, StatusCodes.Status400BadRequest);
+        Assert.Equal(ApiProblems.ValidationFailedDetail, body.GetProperty("detail").GetString());
+        return body.GetProperty("errors").Clone();
+    }
+
+    // Sends a GET that must succeed after reaching the store, and returns its body.
+    private async Task<JsonElement> GetOkAsync(string uri)
+    {
+        store.ClearCalls();
+        using var response = await Client.GetAsync(uri);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.NotEmpty(store.Calls);
+        return await ApiTestClient.ReadJsonElementAsync(response);
     }
 }

@@ -2,6 +2,8 @@ using System.Globalization;
 using System.Net;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
+using System.Text.RegularExpressions;
 using EpiInfo.Api.Hosting;
 using EpiInfo.CheckCode;
 using EpiInfo.Data.Sql;
@@ -10,6 +12,7 @@ using EpiInfo.Tests.Shared;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.AspNetCore.TestHost;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Logging;
@@ -20,12 +23,19 @@ namespace EpiInfo.Api.Tests.Infrastructure;
 /// <summary>
 /// Where an <see cref="ApiFactoryBase"/> host takes its <c>ConnectionStrings:EpiInfo</c> setting from.
 /// </summary>
+/// <remarks>
+/// A database host, such as one from <see cref="ApiFactory.ForDatabaseAsync"/>, accepts only
+/// <see cref="Default"/> and always connects with the connection string <see cref="TestDatabase"/> resolved when its
+/// probe succeeded. <see cref="Supplied"/>, <see cref="None"/> and an <see cref="ApiFactoryOptions.ExtraSettings"/>
+/// connection override are for hosts created with a constructor, such as the negative connectivity tests.
+/// </remarks>
 public enum ApiConnectionMode
 {
     /// <summary>
-    /// The rehearsal database resolved by <see cref="TestDatabase.ConnectionString"/>; with a
-    /// <see cref="ApiFactoryOptions.DataStore"/>, the credential-free
-    /// <see cref="ApiFactoryBase.FakeDataStoreConnectionString"/> instead, because nothing connects.
+    /// The rehearsal database resolved by <see cref="TestDatabase.ConnectionString"/>. With a
+    /// <see cref="ApiFactoryOptions.DataStore"/>, an empty value instead: nothing connects, because that store replaces
+    /// the SQL Server one, so the only effect is the API's startup warning that the key is not set. The empty value
+    /// also overrides any <c>ConnectionStrings__EpiInfo</c> in the process environment.
     /// </summary>
     Default,
 
@@ -78,6 +88,19 @@ public sealed record ApiFactoryOptions
     /// Further host settings, applied after the connection string and timeout so they can override any setting, for
     /// example <c>urls</c> for the binding guard cases.
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The factory copies the entries when it validates the options, so a later change to the dictionary passed here
+    /// changes nothing. Configuration keys are case-insensitive, so two keys that differ only in case are rejected.
+    /// </para>
+    /// <para>
+    /// A host created with a constructor lets a <c>ConnectionStrings:EpiInfo</c> entry replace the connection string
+    /// its <see cref="ConnectionMode"/> gives. A database host, such as one from
+    /// <see cref="ApiFactory.ForDatabaseAsync"/>, rejects an entry that addresses the connection string, in any casing
+    /// and in the <c>ConnectionStrings__EpiInfo</c> environment form, because its writes must reach the database
+    /// <see cref="TestDatabase"/> probes, locks and reads back.
+    /// </para>
+    /// </remarks>
     public IReadOnlyDictionary<string, string?> ExtraSettings { get; init; } = new Dictionary<string, string?>();
 
     /// <summary>Options for a host whose data store is <paramref name="store"/>; no SQL Server is needed.</summary>
@@ -129,19 +152,33 @@ public sealed record ApiFactoryOptions
 /// </remarks>
 public abstract class ApiFactoryBase : WebApplicationFactory<Program>
 {
-    /// <summary>
-    /// The connection string a <see cref="FakeDataStore"/> host is given: it holds no credential, and nothing connects
-    /// with it, because the store is replaced. Being non-blank, it keeps the missing-connection-string path out of
-    /// tests that do not ask for it.
-    /// </summary>
-    public const string FakeDataStoreConnectionString = "Server=fake-data-store;Database=EpiRehearsal";
+    // The connection string a database host was pinned to when its probe succeeded; null for a host created from
+    // options alone. Never printed and never exposed: it carries the database password.
+    private readonly string? _databaseConnectionString;
 
     /// <summary>Validates <paramref name="options"/> and creates the doubles.</summary>
     /// <param name="options">The host configuration; the defaults when <see langword="null"/>.</param>
     /// <exception cref="ArgumentException">The options are inconsistent; the message names the member.</exception>
     protected ApiFactoryBase(ApiFactoryOptions? options)
+        : this(Validate(options ?? new ApiFactoryOptions()), databaseConnectionString: null)
     {
-        Options = Validate(options ?? new ApiFactoryOptions());
+    }
+
+    /// <summary>
+    /// Creates a database host from <paramref name="host"/>: the options its preparation validated, and the connection
+    /// string pinned when its probe succeeded, which no setting can replace.
+    /// </summary>
+    /// <param name="host">The prepared host, from <see cref="DatabaseHost.PrepareAsync"/>.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="host"/> is <see langword="null"/>.</exception>
+    protected ApiFactoryBase(DatabaseHost host)
+        : this((host ?? throw new ArgumentNullException(nameof(host))).Options, host.ConnectionString)
+    {
+    }
+
+    private ApiFactoryBase(ApiFactoryOptions validatedOptions, string? databaseConnectionString)
+    {
+        Options = validatedOptions;
+        _databaseConnectionString = databaseConnectionString;
         Recorder = new SqlCommandRecorder();
         Clock = new ControlledTimeProvider();
         Logs = new CapturingLoggerProvider();
@@ -223,6 +260,107 @@ public abstract class ApiFactoryBase : WebApplicationFactory<Program>
     {
     }
 
+    /// <summary>
+    /// The validated options of a database host and the connection string it is pinned to: the one the
+    /// <see cref="TestDatabase"/> probe proved reachable. Only <see cref="PrepareAsync"/> creates one, so every
+    /// database host writes to the database that the probe, <see cref="DatabaseWriteLock"/> and
+    /// <see cref="SqlSnapshot"/> reach. If the variables change after the probe, preparing a host, taking the lock and
+    /// taking a snapshot all fail instead of reaching another database.
+    /// </summary>
+    /// <remarks>
+    /// A derived factory's <c>ForDatabaseAsync</c> awaits <see cref="PrepareAsync"/> and passes the result to the
+    /// <see cref="ApiFactoryBase(DatabaseHost)"/> constructor. <see cref="ToString"/> never prints the connection
+    /// string.
+    /// </remarks>
+    protected sealed class DatabaseHost
+    {
+        private DatabaseHost(ApiFactoryOptions options, string connectionString)
+        {
+            Options = options;
+            ConnectionString = connectionString;
+        }
+
+        /// <summary>The validated options, holding the copy of the extra settings taken at validation.</summary>
+        internal ApiFactoryOptions Options { get; }
+
+        // The pinned connection string; it carries the database password.
+        internal string ConnectionString { get; }
+
+        /// <summary>
+        /// Validates <paramref name="options"/> for a database host, then proves the rehearsal database reachable and
+        /// pins the connection string the <see cref="TestDatabase"/> probe proved, after checking that the variables
+        /// still resolve it.
+        /// </summary>
+        /// <param name="options">
+        /// The host configuration, in <see cref="ApiConnectionMode.Default"/> mode, without a data store and without
+        /// an extra setting that addresses the connection string; the defaults when <see langword="null"/>.
+        /// </param>
+        /// <returns>The prepared host.</returns>
+        /// <exception cref="ArgumentException">
+        /// The options are inconsistent, set a data store or another connection mode, or carry an extra setting that
+        /// addresses <c>ConnectionStrings:EpiInfo</c>. It is thrown before the probe, and its message names the member,
+        /// never a value.
+        /// </exception>
+        /// <exception cref="TestDatabaseUnavailableException">
+        /// The database is not configured or cannot be reached, or its variables changed after the process's probe
+        /// succeeded. It is thrown before the host exists, so nothing is written.
+        /// </exception>
+        public static async Task<DatabaseHost> PrepareAsync(ApiFactoryOptions? options)
+        {
+            ApiFactoryOptions validated = ValidateDatabaseHost(Validate(options ?? new ApiFactoryOptions()));
+            string probed = await TestDatabase.EnsureReachableTargetAsync().ConfigureAwait(false);
+
+            // The probe runs once per process, so its target can predate a change to the variables. Resolving them
+            // again throws on such a change, so the factory fails here, before any write, rather than pin a target
+            // that DatabaseWriteLock and SqlSnapshot no longer resolve.
+            _ = TestDatabase.ConnectionString;
+            return new DatabaseHost(validated, probed);
+        }
+
+        /// <inheritdoc />
+        public override string ToString() => $"{nameof(DatabaseHost)} {{ {nameof(Options)} = {Options} }}";
+    }
+
+    // A database host connects only with the connection its probe proved: the SQL Server store, the Default mode, and
+    // no extra setting that would replace that connection.
+    private static ApiFactoryOptions ValidateDatabaseHost(ApiFactoryOptions options)
+    {
+        if (options.DataStore is not null)
+        {
+            throw new ArgumentException(
+                $"A database host uses the SQL Server store; create a {nameof(FakeDataStore)} host with the " +
+                "constructor.",
+                nameof(options));
+        }
+
+        if (options.ConnectionMode != ApiConnectionMode.Default)
+        {
+            throw new ArgumentException(
+                $"A database host connects through {nameof(TestDatabase)}, so its connection mode must be " +
+                $"{nameof(ApiConnectionMode)}.{nameof(ApiConnectionMode.Default)}.",
+                nameof(options));
+        }
+
+        if (options.ExtraSettings.Keys.Any(AddressesConnectionString))
+        {
+            throw new ArgumentException(
+                $"A database host connects through {nameof(TestDatabase)}, so " +
+                $"{nameof(ApiFactoryOptions.ExtraSettings)} must not set {ApiOptions.ConnectionStringKey}; create a " +
+                "host with another connection with the constructor.",
+                nameof(options));
+        }
+
+        return options;
+    }
+
+    // Whether a setting key names the connection string: configuration compares keys case-insensitively, and the
+    // environment-variable form writes the ':' section delimiter as "__".
+    private static bool AddressesConnectionString(string key) =>
+        string.Equals(
+            key.Trim().Replace("__", ConfigurationPath.KeyDelimiter, StringComparison.Ordinal),
+            ApiOptions.ConnectionStringKey,
+            StringComparison.OrdinalIgnoreCase);
+
     private static ApiFactoryOptions Validate(ApiFactoryOptions options)
     {
         if (!Enum.IsDefined(options.ConnectionMode))
@@ -270,7 +408,22 @@ public abstract class ApiFactoryBase : WebApplicationFactory<Program>
                 nameof(options));
         }
 
-        return options;
+        var extraSettings = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
+        foreach ((string key, string? value) in options.ExtraSettings)
+        {
+            // Configuration keys are case-insensitive, so two such keys would set one value, whichever came last.
+            if (!extraSettings.TryAdd(key, value))
+            {
+                throw new ArgumentException(
+                    $"{nameof(ApiFactoryOptions.ExtraSettings)} must not hold two keys that differ only in case; " +
+                    "configuration keys are case-insensitive.",
+                    nameof(options));
+            }
+        }
+
+        // The host reads the settings when it is built, so it gets a copy taken now that the caller cannot reach: a
+        // later change to the caller's dictionary cannot bypass these checks.
+        return options with { ExtraSettings = extraSettings.AsReadOnly() };
     }
 
     // Configuration keys compare case-insensitively, so an extra setting replaces a computed one whatever its casing.
@@ -278,11 +431,12 @@ public abstract class ApiFactoryBase : WebApplicationFactory<Program>
     {
         var settings = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
 
-        // An extra setting for the connection string wins anyway, so the test database is not resolved, and cannot
-        // fail for a missing password, when one is given.
+        // A database host uses only the connection pinned when its probe succeeded, applied last below. On a host
+        // created from options alone, an extra setting for the connection string wins, for the negative connectivity
+        // tests, so the test database is not resolved, and cannot fail for a missing password, when one is given.
         bool connectionStringOverridden = Options.ExtraSettings.Keys.Any(
             key => string.Equals(key, ApiOptions.ConnectionStringKey, StringComparison.OrdinalIgnoreCase));
-        if (!connectionStringOverridden)
+        if (_databaseConnectionString is null && !connectionStringOverridden)
         {
             settings[ApiOptions.ConnectionStringKey] = ResolveConnectionString();
         }
@@ -297,6 +451,13 @@ public abstract class ApiFactoryBase : WebApplicationFactory<Program>
             settings[key] = value;
         }
 
+        // After the extra settings, so none can replace it; preparing the host also rejected every one that addresses
+        // the connection string.
+        if (_databaseConnectionString is not null)
+        {
+            settings[ApiOptions.ConnectionStringKey] = _databaseConnectionString;
+        }
+
         return settings;
     }
 
@@ -307,7 +468,7 @@ public abstract class ApiFactoryBase : WebApplicationFactory<Program>
         ApiConnectionMode.None => string.Empty,
         ApiConnectionMode.Supplied => Options.ConnectionString
             ?? throw new InvalidOperationException("A supplied connection string was validated as present."),
-        _ when Options.DataStore is not null => FakeDataStoreConnectionString,
+        _ when Options.DataStore is not null => string.Empty,
         _ => TestDatabase.ConnectionString,
     };
 }
@@ -331,43 +492,37 @@ public sealed class ApiFactory : ApiFactoryBase
     {
     }
 
+    private ApiFactory(DatabaseHost host)
+        : base(host)
+    {
+    }
+
     /// <summary>
     /// Creates a factory whose host uses the SQL Server store and the rehearsal database, after proving that database
-    /// reachable.
+    /// reachable. The host connects with the connection string the <see cref="TestDatabase"/> probe proved reachable,
+    /// the database <see cref="DatabaseWriteLock"/> locks and <see cref="SqlSnapshot"/> reads, and no setting can
+    /// replace it.
     /// </summary>
     /// <param name="options">
-    /// The host configuration, in <see cref="ApiConnectionMode.Default"/> mode and without a data store; the defaults
-    /// when <see langword="null"/>.
+    /// The host configuration, in <see cref="ApiConnectionMode.Default"/> mode, without a data store and without an
+    /// <see cref="ApiFactoryOptions.ExtraSettings"/> entry that addresses <c>ConnectionStrings:EpiInfo</c>, in any
+    /// casing or in its <c>ConnectionStrings__EpiInfo</c> form; the defaults when <see langword="null"/>. A host with
+    /// another connection is created with the constructor.
     /// </param>
     /// <returns>The factory, not yet started.</returns>
     /// <exception cref="ArgumentException">
-    /// <paramref name="options"/> sets a data store or another connection mode: the database host must use the real
-    /// store on the connection <see cref="TestDatabase"/> resolves and probes.
+    /// <paramref name="options"/> is inconsistent, sets a data store or another connection mode, or sets the
+    /// connection string through <see cref="ApiFactoryOptions.ExtraSettings"/>. It is thrown before the probe.
     /// </exception>
     /// <exception cref="TestDatabaseUnavailableException">
-    /// The database is not configured or cannot be reached. Integration tests let it fail the test, naming
-    /// <c>SQL_HOST</c>, <c>MSSQL_SA_PASSWORD</c> and <c>ConnectionStrings__EpiInfo</c>; they never skip.
+    /// The database is not configured or cannot be reached, or its variables changed after the process's probe
+    /// succeeded. Integration tests let it fail the test, naming <c>SQL_HOST</c>, <c>MSSQL_SA_PASSWORD</c> and
+    /// <c>ConnectionStrings__EpiInfo</c>; they never skip.
     /// </exception>
     public static async Task<ApiFactory> ForDatabaseAsync(ApiFactoryOptions? options = null)
     {
-        if (options?.DataStore is not null)
-        {
-            throw new ArgumentException(
-                $"A database host uses the SQL Server store; create a {nameof(FakeDataStore)} host with the " +
-                "constructor.",
-                nameof(options));
-        }
-
-        if (options is not null && options.ConnectionMode != ApiConnectionMode.Default)
-        {
-            throw new ArgumentException(
-                $"A database host connects through {nameof(TestDatabase)}, so its connection mode must be " +
-                $"{nameof(ApiConnectionMode)}.{nameof(ApiConnectionMode.Default)}.",
-                nameof(options));
-        }
-
-        await TestDatabase.EnsureReachableAsync().ConfigureAwait(false);
-        return new ApiFactory(options);
+        DatabaseHost host = await DatabaseHost.PrepareAsync(options).ConfigureAwait(false);
+        return new ApiFactory(host);
     }
 }
 
@@ -473,25 +628,42 @@ public sealed record CreatedRecord(JsonElement Record, string GlobalRecordId);
 /// are written once.
 /// </summary>
 /// <remarks>
-/// Failure messages carry the response status and body, which hold only what the API chose to return; a test that
-/// checks redaction asserts on the body itself.
+/// Failure messages describe a response by its shape alone: the status code and name, the media type only when it is
+/// <c>application/json</c>, <c>application/problem+json</c>, <c>text/plain</c> or <c>text/html</c>, the body's
+/// length and JSON kind with its member or item count, and the <c>traceId</c> only when it has the form of a trace
+/// identifier. A form lookup lists the form names that have the form of an identifier and counts the rest, and a
+/// ProblemDetails <c>status</c> is printed only within the range of HTTP status codes. Messages never quote the body,
+/// another member value, the <c>Location</c> header, a character set, a decoder or parser message, and they attach
+/// no inner exception, because a failing assertion is exactly when a response may carry a connection string, SQL text
+/// or field values, and test runners print every message and inner exception. A test that checks redaction asserts on
+/// the body itself.
 /// </remarks>
-public static class ApiTestClient
+public static partial class ApiTestClient
 {
     /// <summary>The media type of every body these helpers send.</summary>
     public const string JsonMediaType = "application/json";
 
-    // A failure message quotes at most this much of a response body.
-    private const int MaxQuotedBodyLength = 4096;
+    // How a failure message describes a body without a traceId member.
+    private const string NoTraceId = "no traceId";
 
     // The ProblemDetails members that must be strings.
     private static readonly string[] ProblemTextMembers = ["type", "title", "detail"];
 
+    // The media types a failure message names, in lowercase; DescribeMediaType compares them case-insensitively.
+    private static readonly string[] KnownMediaTypes =
+        [JsonMediaType, "application/problem+json", "text/plain", "text/html"];
+
     /// <summary>
-    /// The serializer settings of request bodies and response reads: camelCase names and case-insensitive reads.
-    /// Dictionary keys, such as field names in <c>values</c>, are written unchanged.
+    /// The serializer settings of request bodies and response reads: camelCase names, case-insensitive reads and
+    /// strict numbers, as the API's wire contract has them, so a typed read rejects a number written as a string such
+    /// as <c>"1"</c>. Dictionary keys, such as field names in <c>values</c>, are written unchanged.
     /// </summary>
-    public static JsonSerializerOptions Json { get; } = new(JsonSerializerDefaults.Web);
+    /// <remarks>
+    /// The instance is read-only and shared by every test, so no test can change how another reads; setting any of
+    /// its properties throws <see cref="InvalidOperationException"/>. A test that needs other settings copies it with
+    /// <c>new JsonSerializerOptions(ApiTestClient.Json)</c>.
+    /// </remarks>
+    public static JsonSerializerOptions Json { get; } = CreateJsonOptions();
 
     /// <summary>Sends <paramref name="body"/> as <c>application/json; charset=utf-8</c> with <c>POST</c>.</summary>
     /// <param name="client">The client of a test host.</param>
@@ -523,11 +695,15 @@ public static class ApiTestClient
     /// <param name="response">The response to read.</param>
     /// <param name="ct">Cancels the read.</param>
     /// <returns>The deserialised value.</returns>
-    /// <exception cref="XunitException">The body is not JSON of that shape, or is the literal <c>null</c>.</exception>
+    /// <exception cref="XunitException">
+    /// The body cannot be decoded as text, is not JSON of that shape, holds a number as a string, is the literal
+    /// <c>null</c>, or has a member of a type the serializer does not support. The message names the target type and
+    /// the parser's position, and describes the response by shape only.
+    /// </exception>
     public static async Task<T> ReadJsonAsync<T>(HttpResponseMessage response, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(response);
-        string text = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+        string text = await ReadBodyTextAsync(response, ct).ConfigureAwait(false);
 
         T? value;
         try
@@ -536,25 +712,35 @@ public static class ApiTestClient
         }
         catch (JsonException failure)
         {
+            // The parser's message and path can quote the body, so only its position is reported, and the exception
+            // is not attached.
             throw new XunitException(
-                $"The response body is not a {typeof(T).Name}: {failure.Message} {Describe(response, text)}",
-                failure);
+                $"The response body is not a {typeof(T).Name}{DescribePosition(failure)}. {Describe(response, text)}");
+        }
+        catch (NotSupportedException)
+        {
+            // The serializer's message ends with the JSON path it reached, which names the body's members, so it is
+            // not quoted and the exception is not attached.
+            throw new XunitException(
+                $"The response body cannot be read as a {typeof(T).Name}, because the serializer does not support " +
+                $"that type or one of its members. {Describe(response, text)}");
         }
 
-        return value ?? throw new XunitException($"The response body is null. {Describe(response, text)}");
+        return value ?? throw new XunitException(
+            $"The response body is the JSON literal null, not a {typeof(T).Name}. {Describe(response, text)}");
     }
 
     /// <summary>Reads the response body as a JSON element that outlives the response.</summary>
     /// <param name="response">The response to read.</param>
     /// <param name="ct">Cancels the read.</param>
     /// <returns>A clone of the body's root element.</returns>
-    /// <exception cref="XunitException">The body is empty or not JSON.</exception>
+    /// <exception cref="XunitException">The body cannot be decoded as text, is empty, or is not JSON.</exception>
     public static async Task<JsonElement> ReadJsonElementAsync(
         HttpResponseMessage response,
         CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(response);
-        string text = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+        string text = await ReadBodyTextAsync(response, ct).ConfigureAwait(false);
         return ParseBody(response, text);
     }
 
@@ -566,7 +752,10 @@ public static class ApiTestClient
     /// <param name="formName">The form name, compared ordinally, for example <c>CaseReport</c>.</param>
     /// <param name="ct">Cancels the request.</param>
     /// <returns>The form's view id.</returns>
-    /// <exception cref="XunitException">The list does not answer 200, or names no such form.</exception>
+    /// <exception cref="XunitException">
+    /// The list does not answer 200, or names no such form. The message lists the names that have the form of an Epi
+    /// Info identifier and only counts the others.
+    /// </exception>
     public static async Task<int> GetViewIdAsync(HttpClient client, string formName, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(client);
@@ -578,21 +767,33 @@ public static class ApiTestClient
             .ConfigureAwait(false);
         if (forms.ValueKind != JsonValueKind.Array)
         {
-            throw new XunitException(
-                $"GET {FormsPath} did not return an array. {Describe(response, forms.GetRawText())}");
+            throw new XunitException($"GET {FormsPath} did not return an array. {Describe(response, forms)}");
         }
 
+        // Names are listed only when they have the form of an identifier; any other name could be data.
         var names = new List<string>();
+        int otherNames = 0;
+        int unnamed = 0;
         foreach (JsonElement form in forms.EnumerateArray())
         {
             if (form.ValueKind != JsonValueKind.Object ||
                 !form.TryGetProperty("name", out JsonElement name) ||
-                name.GetString() is not { } text)
+                name.ValueKind != JsonValueKind.String)
             {
+                unnamed++;
                 continue;
             }
 
-            names.Add(text);
+            string? text = TryGetString(name);
+            if (text is not null && FormIdentifier().IsMatch(text))
+            {
+                names.Add(text);
+            }
+            else
+            {
+                otherNames++;
+            }
+
             if (!string.Equals(text, formName, StringComparison.Ordinal))
             {
                 continue;
@@ -605,11 +806,21 @@ public static class ApiTestClient
                 return id;
             }
 
-            throw new XunitException($"Form '{formName}' has no integer viewId: {form.GetRawText()}");
+            throw new XunitException(
+                $"Form '{formName}' in GET {FormsPath} has no 32-bit integer viewId: viewId is " +
+                $"{DescribeMember(form, "viewId")}, in a form that is {DescribeShape(form)}.");
         }
 
+        string others = otherNames switch
+        {
+            0 => string.Empty,
+            1 => " and 1 name that is not an identifier",
+            _ => string.Create(CultureInfo.InvariantCulture, $" and {otherNames} names that are not identifiers"),
+        };
+        string withoutName = unnamed == 0 ? string.Empty : $", and {Count(unnamed, "item")} without a String name";
         throw new XunitException(
-            $"GET {FormsPath} lists no form named '{formName}'; it lists: [{string.Join(", ", names)}].");
+            $"GET {FormsPath} lists no form named '{formName}'; it lists [{string.Join(", ", names)}]{others}" +
+            $"{withoutName}. {Describe(response, forms)}");
     }
 
     /// <summary>
@@ -643,13 +854,30 @@ public static class ApiTestClient
         if (record.ValueKind != JsonValueKind.Object ||
             !record.TryGetProperty("globalRecordId", out JsonElement id) ||
             id.ValueKind != JsonValueKind.String ||
-            id.GetString() is not { Length: > 0 } globalRecordId)
+            TryGetString(id) is not { Length: > 0 } globalRecordId)
         {
             throw new XunitException(
-                $"POST {path} returned no globalRecordId. {Describe(response, record.GetRawText())}");
+                $"POST {path} returned no non-empty string globalRecordId: globalRecordId is " +
+                $"{DescribeMember(record, "globalRecordId")}. {Describe(response, record)}");
         }
 
-        Assert.Equal($"{path}/{globalRecordId}", response.Headers.Location?.OriginalString);
+        // Compared here rather than by an equality assertion, whose message would print both the returned id and the
+        // header: the server wrote both, so either could be data.
+        if (response.Headers.Location is not { } location)
+        {
+            string header = response.Headers.NonValidated.Contains("Location")
+                ? "a Location header that is not a URI reference"
+                : "no Location header";
+            throw new XunitException($"POST {path} returned {header}. {Describe(response, record)}");
+        }
+
+        if (!string.Equals(location.OriginalString, $"{path}/{globalRecordId}", StringComparison.Ordinal))
+        {
+            throw new XunitException(
+                $"POST {path} returned a Location header that is not {path}/ followed by the returned " +
+                $"globalRecordId. {Describe(response, record)}");
+        }
+
         return new CreatedRecord(record, globalRecordId);
     }
 
@@ -660,6 +888,10 @@ public static class ApiTestClient
     /// <param name="body">The response body.</param>
     /// <param name="status">The expected status code.</param>
     /// <returns><paramref name="body"/>, for further assertions.</returns>
+    /// <exception cref="XunitException">
+    /// The body is not such a problem. The message names the member and the kind of value found, never the value; a
+    /// wrong <c>status</c> is printed only when it lies in the HTTP status range 100 to 599.
+    /// </exception>
     public static JsonElement AssertProblemDetails(JsonElement body, int status)
     {
         Assert.Equal(JsonValueKind.Object, body.ValueKind);
@@ -668,21 +900,48 @@ public static class ApiTestClient
         {
             Assert.True(
                 body.TryGetProperty(member, out JsonElement value) && value.ValueKind == JsonValueKind.String,
-                $"ProblemDetails member '{member}' is missing or not a string: {body.GetRawText()}");
+                $"ProblemDetails member '{member}' must be of kind String; it is {DescribeMember(body, member)}.");
         }
 
-        Assert.True(
-            body.TryGetProperty("status", out JsonElement actual) && actual.ValueKind == JsonValueKind.Number,
-            $"ProblemDetails member 'status' is missing or not a number: {body.GetRawText()}");
-        Assert.Equal(status, actual.GetInt32());
+        if (!body.TryGetProperty("status", out JsonElement actual) ||
+            actual.ValueKind != JsonValueKind.Number ||
+            !actual.TryGetInt32(out int actualStatus))
+        {
+            throw new XunitException(
+                "ProblemDetails member 'status' must be a Number that is a 32-bit integer; it is " +
+                $"{DescribeMember(body, "status")}.");
+        }
+
+        if (actualStatus != status)
+        {
+            // Not an equality assertion, which would print any integer the body holds; a value outside the range of
+            // HTTP status codes could be data.
+            string found = actualStatus is >= 100 and <= 599
+                ? actualStatus.ToString(CultureInfo.InvariantCulture)
+                : "an integer outside the HTTP status range 100 to 599";
+            throw new XunitException(
+                string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"ProblemDetails member 'status' must be {status}; it is {found}."));
+        }
 
         Assert.True(
             body.TryGetProperty("traceId", out JsonElement traceId) &&
             traceId.ValueKind == JsonValueKind.String &&
-            !string.IsNullOrWhiteSpace(traceId.GetString()),
-            $"ProblemDetails member 'traceId' is missing or empty: {body.GetRawText()}");
+            !string.IsNullOrWhiteSpace(TryGetString(traceId)),
+            $"ProblemDetails member 'traceId' must be a non-empty String; it is {DescribeMember(body, "traceId")}.");
 
         return body;
+    }
+
+    private static JsonSerializerOptions CreateJsonOptions()
+    {
+        var options = new JsonSerializerOptions(JsonSerializerDefaults.Web)
+        {
+            NumberHandling = JsonNumberHandling.Strict,
+        };
+        options.MakeReadOnly(populateMissingResolver: true);
+        return options;
     }
 
     private static async Task<HttpResponseMessage> SendJsonAsync(
@@ -710,7 +969,7 @@ public static class ApiTestClient
         string request,
         CancellationToken ct)
     {
-        string text = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+        string text = await ReadBodyTextAsync(response, ct).ConfigureAwait(false);
         if (response.StatusCode != expected)
         {
             throw new XunitException(
@@ -721,6 +980,24 @@ public static class ApiTestClient
         }
 
         return ParseBody(response, text);
+    }
+
+    // The body as text, the one place a helper decodes it. HttpContent reports a Content-Type charset it cannot
+    // decode with an InvalidOperationException whose inner exception quotes that charset, so the failure is described
+    // by status alone and the exception is not attached. Cancellation, a disposed response and transport failures
+    // propagate unchanged.
+    private static async Task<string> ReadBodyTextAsync(HttpResponseMessage response, CancellationToken ct)
+    {
+        try
+        {
+            return await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+        }
+        catch (InvalidOperationException failure) when (failure is not ObjectDisposedException)
+        {
+            throw new XunitException(
+                "The response body cannot be decoded as text, for example because its Content-Type names a " +
+                $"character set this runtime does not support. {DescribeStatus(response)}.");
+        }
     }
 
     private static JsonElement ParseBody(HttpResponseMessage response, string text)
@@ -737,17 +1014,158 @@ public static class ApiTestClient
         }
         catch (JsonException failure)
         {
+            // The parser's message and path can quote the body, so only its position is reported, and the exception
+            // is not attached.
             throw new XunitException(
-                $"The response body is not JSON: {failure.Message} {Describe(response, text)}",
-                failure);
+                $"The response body is not JSON{DescribePosition(failure)}. {Describe(response, text)}");
         }
     }
 
+    // Describes a response by its status, media type, body length, JSON kind and trace identifier, never its text.
     private static string Describe(HttpResponseMessage response, string body)
     {
-        string quoted = body.Length <= MaxQuotedBodyLength ? body : body[..MaxQuotedBodyLength] + "...";
+        string shape;
+        string trace;
+        if (body.Length == 0)
+        {
+            (shape, trace) = ("empty", NoTraceId);
+        }
+        else if (string.IsNullOrWhiteSpace(body))
+        {
+            (shape, trace) = ("only whitespace", NoTraceId);
+        }
+        else
+        {
+            try
+            {
+                using JsonDocument document = JsonDocument.Parse(body);
+                (shape, trace) = (DescribeShape(document.RootElement), DescribeTraceId(document.RootElement));
+            }
+            catch (JsonException)
+            {
+                (shape, trace) = ("not JSON", NoTraceId);
+            }
+        }
+
         return string.Create(
             CultureInfo.InvariantCulture,
-            $"Status {(int)response.StatusCode} {response.StatusCode}, body: {quoted}");
+            $"{DescribeStatus(response)}, body of {body.Length} characters that is {shape}, {trace}.");
     }
+
+    // Describes a response whose body has already been parsed to body.
+    private static string Describe(HttpResponseMessage response, JsonElement body) =>
+        $"{DescribeStatus(response)}, body that is {DescribeShape(body)}, {DescribeTraceId(body)}.";
+
+    private static string DescribeStatus(HttpResponseMessage response) =>
+        string.Create(
+            CultureInfo.InvariantCulture,
+            $"Status {(int)response.StatusCode} {response.StatusCode}, {DescribeMediaType(response)}");
+
+    // The Content-Type media type, named only when it is one of KnownMediaTypes, in that list's lowercase form; any
+    // other value is server text, which could be data.
+    private static string DescribeMediaType(HttpResponseMessage response)
+    {
+        if (response.Content.Headers.ContentType?.MediaType is not { } mediaType)
+        {
+            // A header that is present but does not parse is not absent.
+            return response.Content.Headers.NonValidated.Contains("Content-Type")
+                ? "another media type"
+                : "media type none";
+        }
+
+        foreach (string known in KnownMediaTypes)
+        {
+            if (string.Equals(known, mediaType, StringComparison.OrdinalIgnoreCase))
+            {
+                return "media type " + known;
+            }
+        }
+
+        return "another media type";
+    }
+
+    // The JSON kind of element, with the member or item count of an object or array; never a value.
+    private static string DescribeShape(JsonElement element) => element.ValueKind switch
+    {
+        JsonValueKind.Object => "a JSON object with " + Count(element.GetPropertyCount(), "member"),
+        JsonValueKind.Array => "a JSON array with " + Count(element.GetArrayLength(), "item"),
+        JsonValueKind.String => "a JSON string",
+        JsonValueKind.Number => "a JSON number",
+        JsonValueKind.True or JsonValueKind.False => "a JSON boolean",
+        JsonValueKind.Null => "the JSON literal null",
+        _ => "no JSON value",
+    };
+
+    private static string Count(int count, string noun) =>
+        string.Create(CultureInfo.InvariantCulture, $"{count} {noun}{(count == 1 ? string.Empty : "s")}");
+
+    // The kind of value an object holds under member, or "missing"; never the value itself.
+    private static string DescribeMember(JsonElement body, string member)
+    {
+        if (body.ValueKind != JsonValueKind.Object || !body.TryGetProperty(member, out JsonElement value))
+        {
+            return "missing";
+        }
+
+        return value.ValueKind switch
+        {
+            JsonValueKind.String => TryGetString(value) switch
+            {
+                null => "a String with an unpaired surrogate",
+                { } text when string.IsNullOrWhiteSpace(text) => "an empty or whitespace String",
+                _ => "a String",
+            },
+            JsonValueKind.Number => value.TryGetInt32(out _)
+                ? "a Number that is a 32-bit integer"
+                : "a Number that is not a 32-bit integer",
+            JsonValueKind.Object => "an Object",
+            JsonValueKind.Array => "an Array",
+            _ => $"of kind {value.ValueKind}",
+        };
+    }
+
+    // The traceId of an object body, quoted only when it has the form of a trace identifier the API writes: an
+    // Activity id in W3C format, or an ASP.NET Core request identifier. Any other value could be data.
+    private static string DescribeTraceId(JsonElement body)
+    {
+        if (body.ValueKind != JsonValueKind.Object || !body.TryGetProperty("traceId", out JsonElement traceId))
+        {
+            return NoTraceId;
+        }
+
+        return traceId.ValueKind == JsonValueKind.String &&
+            TryGetString(traceId) is { } value &&
+            TraceIdentifier().IsMatch(value)
+                ? $"traceId {value}"
+                : "a traceId that is not a trace identifier";
+    }
+
+    // The parser's zero-based position, the one part of a JsonException that cannot quote the input.
+    private static string DescribePosition(JsonException failure) =>
+        failure.LineNumber is long line && failure.BytePositionInLine is long position
+            ? string.Create(
+                CultureInfo.InvariantCulture,
+                $" (reading failed at zero-based line {line}, byte {position} of that line)")
+            : string.Empty;
+
+    // The text of a String element, or null when it holds an escaped lone surrogate, which has no string form.
+    private static string? TryGetString(JsonElement element)
+    {
+        try
+        {
+            return element.GetString();
+        }
+        catch (InvalidOperationException)
+        {
+            return null;
+        }
+    }
+
+    [GeneratedRegex(
+        @"\A(?:[0-9a-f]{2}-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}|[0-9A-Z]{13}(?::[0-9A-F]{8})?)\z")]
+    private static partial Regex TraceIdentifier();
+
+    // The form of an Epi Info form name: a letter, then up to 63 letters, digits or underscores.
+    [GeneratedRegex(@"\A[A-Za-z][A-Za-z0-9_]{0,63}\z")]
+    private static partial Regex FormIdentifier();
 }

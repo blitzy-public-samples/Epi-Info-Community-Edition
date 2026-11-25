@@ -13,13 +13,16 @@ namespace EpiInfo.Domain.Records;
 /// <remarks>
 /// <para>
 /// <b>Selected set.</b> One predicate serves every query that selects records: <c>count</c>, <c>at</c>, positions,
-/// the records list, search and the <c>position</c> endpoint. The active set is <c>RecStatus = 1</c> exactly;
-/// <c>includeDeleted=true</c> selects every row. Deleted records are therefore hidden by default, and
-/// <c>includeDeleted=true</c> reproduces the legacy navigation set, which legacy never filtered by status
-/// (<c>Epi.Core/Data/Services/CollectedDataProvider.cs</c>, lines 1422-1878). Legacy Find filtered
-/// <c>RecStatus &gt; 0</c> (<c>CollectedDataProvider.cs</c>, line 2249); search uses this predicate instead, so a
-/// search position always equals the navigation position. The two legacy filters differ only for status values
-/// other than 0 and 1, which the seeded data does not hold.
+/// the records list, search and the <c>position</c> endpoint (<see cref="RequiredRecStatus"/>). It selects the
+/// target active set, <c>RecStatus = 1</c> exactly, unless <c>includeDeleted=true</c> selects every row, so
+/// deleted records are hidden by default. Two legacy predicates differ from it. Legacy navigation applied no status
+/// filter (<c>Epi.Core/Data/Services/CollectedDataProvider.cs</c>, lines 1422-1878; <c>RunTimeView.cs</c>, lines
+/// 673-694), so <c>includeDeleted=true</c> reproduces the legacy navigation set. Legacy Find appended
+/// <c>RecStatus &gt; 0</c> (<c>CollectedDataProvider.cs</c>, line 2249). The target active set and legacy Find
+/// differ only for status values other than 0 and 1, which the seeded data does not hold; legacy navigation and
+/// legacy Find differ for status 0, which navigation kept and Find left out. Search uses this selected-set
+/// predicate in place of legacy Find's, the same one navigation uses, so a search position always equals the
+/// navigation position.
 /// </para>
 /// <para>
 /// <b>Ordering and positions.</b> Records are ordered by <c>UniqueKey</c> ascending. The position of the record
@@ -32,8 +35,12 @@ namespace EpiInfo.Domain.Records;
 /// <para>
 /// <b>Intrinsic coordinates.</b> A Record DTO's own <c>position</c> and <c>count</c> do not follow the caller's
 /// toggle: they are over the active set for an active record and over every row for a deleted one
-/// (<see cref="IntrinsicIncludesDeleted"/>). The navigator's selected-set position comes from the
-/// <c>position</c> endpoint instead.
+/// (<see cref="IntrinsicIncludesDeleted"/>). The navigator's "[n] of N" is taken over the set its deleted toggle
+/// selects: N is the count from <c>GET /api/forms/{viewId}/records/count</c> with the toggle's
+/// <c>includeDeleted</c>, and n is the requested position after <c>at/{n}</c>; after an open by id, a save of a new
+/// or an existing record or a toggle change, it is the <see cref="NavigationPosition.Position"/> from
+/// <c>GET /api/forms/{viewId}/records/{globalRecordId}/position</c> with the same <c>includeDeleted</c>. Neither n
+/// nor N is derived from search, and the Record DTO's own coordinates are left as they are.
 /// </para>
 /// <para>
 /// Every member is a pure function of its arguments with no shared state, so the class is safe to call from any
@@ -269,15 +276,16 @@ public static class RecordQueryRules
             throw new ArgumentException("A data field must not be null.", nameof(dataFields));
         }
 
-        // The sort keys are the data-field order of FormDefinitionFactory: page Position, then PageId, then
-        // TabIndex with a missing value read as 0, then FieldId. The grid therefore never disagrees with the
-        // tabIndex the form definition reports, which also reads a missing TabIndex as 0, rather than placing such
-        // a field last. OrderBy is stable, so rows equal on every key keep their input order.
+        // Page Position, then TabIndex, order the grid. Position is not unique, so the fields of pages that share
+        // one interleave by TabIndex; PageId, then FieldId, only break ties between fields equal on both keys. A
+        // missing TabIndex reads as 0, as the tabIndex the form definition reports does, so the grid never places
+        // such a field last while the form shows it first. OrderBy is stable, so rows equal on every key keep their
+        // input order.
         return dataFields
             .Where(field => IsGridFieldType(field.FieldType))
             .OrderBy(field => field.Page.Position)
-            .ThenBy(field => field.Page.PageId)
             .ThenBy(field => field.Field.TabIndex ?? 0m)
+            .ThenBy(field => field.Page.PageId)
             .ThenBy(field => field.Field.FieldId)
             .Take(GridColumnCount)
             .ToArray();

@@ -1,4 +1,5 @@
 using System.Diagnostics.CodeAnalysis;
+using EpiInfo.CheckCode.Syntax;
 using EpiInfo.Domain.Values;
 
 namespace EpiInfo.CheckCode.Functions;
@@ -74,13 +75,16 @@ public readonly record struct FunctionResult(FieldValue Value, string? Error)
 public delegate FunctionResult CheckCodeFunction(IReadOnlyList<FieldValue> arguments);
 
 /// <summary>
-/// The check-code functions the interpreter executes, <c>YEARS</c> and <c>EPIWEEK</c>, looked up by name.
+/// The implementations of the check-code functions the interpreter executes, <c>YEARS</c> and <c>EPIWEEK</c>,
+/// looked up by name.
 /// </summary>
 /// <remarks>
 /// <para>
-/// Names match case-insensitively and exactly, as check-code keywords do: <c>years</c> and <c>EpiWeek</c>
-/// resolve, while <c>YEAR</c>, <c>EPIWEEKS</c> and a name with surrounding spaces do not. Every other
-/// function is unsupported; the parser reports a call to one as a <c>warning</c> diagnostic.
+/// The names are the syntax-level <see cref="FunctionNames"/> vocabulary, which the parser reads as well: the
+/// registry maps each of them to its implementation. Names match case-insensitively and exactly, as check-code
+/// keywords do: <c>years</c> and <c>EpiWeek</c> resolve, while <c>YEAR</c>, <c>EPIWEEKS</c> and a name with
+/// surrounding spaces do not. Every other function is unsupported; the parser reports a call to one as a
+/// <c>warning</c> diagnostic.
 /// </para>
 /// <para>
 /// The registry does not check the argument count. Each function enforces its own arity in its
@@ -101,9 +105,11 @@ public static class FunctionRegistry
         { EpiWeekFunction.Name, EpiWeekFunction.Invoke },
     };
 
-    /// <summary>The canonical names of the supported functions: <c>YEARS</c>, then <c>EPIWEEK</c>.</summary>
-    public static IReadOnlyCollection<string> SupportedNames { get; } =
-        Array.AsReadOnly(new[] { YearsFunction.Name, EpiWeekFunction.Name });
+    /// <summary>
+    /// The canonical names of the supported functions, <see cref="FunctionNames.Supported"/>: <c>YEARS</c>, then
+    /// <c>EPIWEEK</c>.
+    /// </summary>
+    public static IReadOnlyCollection<string> SupportedNames => FunctionNames.Supported;
 
     /// <summary>Looks up a supported function by name.</summary>
     /// <param name="name">The function name as written in the program. <see langword="null"/> matches nothing.</param>

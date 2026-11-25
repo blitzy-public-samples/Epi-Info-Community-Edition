@@ -22,6 +22,15 @@ namespace EpiInfo.Tests.Shared;
 /// its only statement is the <c>SELECT DB_NAME()</c> probe.
 /// </para>
 /// <para>
+/// <see cref="ConnectionString"/>, <see cref="Builder"/> and <see cref="OpenConnectionAsync"/>, and so
+/// <see cref="DatabaseWriteLock"/> and <see cref="SqlSnapshot"/>, read the environment on every access. Until the probe
+/// of <see cref="EnsureReachableAsync"/> succeeds, that is all they do. From then on the probed connection string is
+/// the one target of the process: each still resolves the environment, but fails before any connection opens when that
+/// resolution differs from the probed one. A test therefore cannot reach a database the probe did not prove, or write
+/// to one database while it locks and reads back another, even when a variable changes during the run.
+/// <see cref="IsConfigured"/> reads the environment alone, before and after the probe.
+/// </para>
+/// <para>
 /// An unconfigured or unreachable database makes an integration test fail with
 /// <see cref="TestDatabaseUnavailableException"/>; integration tests never skip. Messages name the
 /// server and database at most, never the password or the connection string, plus the failure's type and
@@ -71,9 +80,22 @@ public static class TestDatabase
         "or point " + SqlHostVariable + " at one, load it with testdata/init.sh (which drops and recreates " +
         DatabaseName + ", so run it only against the rehearsal server), and confirm every 99_verify row shows ok = 1.";
 
+    // Names the variables only, never a value: either the old or the new resolution can carry a password.
+    private const string ChangedAfterProbe =
+        "The rehearsal database settings changed after the probe proved the database reachable: " +
+        ConnectionStringVariable + ", " + SqlHostVariable + " and " + PasswordVariable + " now resolve a different " +
+        "connection string, so a test could reach a database that the probe, the test lock and the snapshots do not " +
+        "cover. Each test process probes once, so keep these variables unchanged for the whole run. " + Guidance;
+
     // One probe per test process. The task keeps a failure as well, so after one failed probe every later
-    // test class fails at once with the same message instead of waiting out the connect timeout again.
-    private static readonly Lazy<Task> Probe = new(ProbeAsync, LazyThreadSafetyMode.ExecutionAndPublication);
+    // test class fails at once with the same message instead of waiting out the connect timeout again. Its result is
+    // the connection string it proved reachable.
+    private static readonly Lazy<Task<string>> Probe = new(ProbeAsync, LazyThreadSafetyMode.ExecutionAndPublication);
+
+    // The connection string the probe proved reachable, exactly as resolved, before the probe set its own connect
+    // timeout; null until a probe has succeeded. The probe writes it once, just before its task completes successfully,
+    // and volatile makes that write visible to every thread that reads it afterwards, without a lock.
+    private static volatile string? _probedConnectionString;
 
     /// <summary>
     /// Whether a database is configured: <see cref="ConnectionStringVariable"/> or
@@ -83,9 +105,13 @@ public static class TestDatabase
     public static bool IsConfigured => IsSet(ConnectionStringVariable) || IsSet(PasswordVariable);
 
     /// <summary>
-    /// The resolved connection string, read from the environment on every access.
+    /// The resolved connection string, read from the environment on every access. Once the probe of
+    /// <see cref="EnsureReachableAsync"/> has succeeded, it is always the probed connection string.
     /// </summary>
-    /// <exception cref="TestDatabaseUnavailableException">Neither variable that configures it is set.</exception>
+    /// <exception cref="TestDatabaseUnavailableException">
+    /// Neither variable that configures it is set, or the probe has succeeded and the variables now resolve a
+    /// different connection string. Neither message names a value.
+    /// </exception>
     public static string ConnectionString => Resolve();
 
     /// <summary>
@@ -93,35 +119,19 @@ public static class TestDatabase
     /// such as <c>Pooling</c>, <c>ConnectTimeout</c> or <c>ApplicationName</c> without affecting others.
     /// </summary>
     /// <exception cref="TestDatabaseUnavailableException">
-    /// The connection string is not configured, or <see cref="ConnectionStringVariable"/> does not parse. The
-    /// parser's exception is not attached, because its message can quote part of the value.
+    /// The connection string is not configured, the probe has succeeded and the variables now resolve a different
+    /// connection string, or <see cref="ConnectionStringVariable"/> does not parse. The parser's exception is not
+    /// attached, because its message can quote part of the value.
     /// </exception>
-    public static SqlConnectionStringBuilder Builder()
-    {
-        string connectionString = ConnectionString;
-        try
-        {
-            return new SqlConnectionStringBuilder(connectionString);
-        }
-        catch (Exception failure) when (
-            failure is ArgumentException or FormatException or OverflowException or NotSupportedException)
-        {
-            // Every failure the parser raises: a malformed string, an unsupported keyword or an out-of-range value
-            // (ArgumentException), a boolean or integer setting that does not convert (FormatException), an integer
-            // beyond Int32 (OverflowException), or a keyword this platform does not support (NotSupportedException).
-            // Neither the parser's message nor its exception is passed on: an unsupported keyword and a value that
-            // does not convert are quoted in it, and that text can be part of a password that holds an unquoted ';'.
-            throw new TestDatabaseUnavailableException(
-                $"The value of {ConnectionStringVariable} is not a valid SQL Server connection string. {Guidance}");
-        }
-    }
+    public static SqlConnectionStringBuilder Builder() => Parse(ConnectionString);
 
     /// <summary>Opens a connection to the resolved database; the caller disposes it.</summary>
     /// <param name="cancellationToken">Cancels the open.</param>
     /// <exception cref="TestDatabaseUnavailableException">
-    /// The database is not configured, SqlClient rejects its connection string, or the connection cannot be opened,
-    /// including over a transport this platform does not support. An open failure's message names the server, the
-    /// database, the failure's type and its SQL error number; the SqlClient exception is not attached.
+    /// The database is not configured, the probe has succeeded and the variables now resolve a different connection
+    /// string (checked before any connection opens), SqlClient rejects its connection string, or the connection cannot
+    /// be opened, including over a transport this platform does not support. An open failure's message names the
+    /// server, the database, the failure's type and its SQL error number; the SqlClient exception is not attached.
     /// </exception>
     public static Task<SqlConnection> OpenConnectionAsync(CancellationToken cancellationToken = default) =>
         OpenAsync(Builder(), cancellationToken);
@@ -130,13 +140,28 @@ public static class TestDatabase
     /// Fails unless the rehearsal database answers <c>SELECT DB_NAME()</c> within five seconds. Every
     /// integration test class awaits it before its first test, for example in
     /// <see cref="IAsyncLifetime.InitializeAsync"/>. The probe runs once per process and its outcome,
-    /// success or failure, is shared by every later caller.
+    /// success or failure, is shared by every later caller. A successful probe fixes the process's target: from then
+    /// on <see cref="ConnectionString"/>, <see cref="Builder"/> and <see cref="OpenConnectionAsync"/> fail when the
+    /// variables resolve a different connection string.
     /// </summary>
     /// <exception cref="TestDatabaseUnavailableException">
     /// The database is not configured, SqlClient rejects its connection string, or it is not reachable, refuses the
     /// login or does not answer in time.
     /// </exception>
     public static Task EnsureReachableAsync() => Probe.Value;
+
+    /// <summary>
+    /// Awaits the probe of <see cref="EnsureReachableAsync"/> and returns the connection string it proved reachable,
+    /// exactly as resolved and without the probe's own connect timeout, so a caller such as the API test host can pin
+    /// that target instead of resolving the environment again.
+    /// </summary>
+    /// <returns>
+    /// The probed connection string. It carries the database password, so it is never printed or put in a message.
+    /// </returns>
+    /// <exception cref="TestDatabaseUnavailableException">
+    /// The probe failed, as for <see cref="EnsureReachableAsync"/>.
+    /// </exception>
+    internal static Task<string> EnsureReachableTargetAsync() => Probe.Value;
 
     /// <summary>
     /// Returns a new test marker: <c>T-</c> followed by a GUID in <c>N</c> format, exactly
@@ -152,7 +177,23 @@ public static class TestDatabase
     /// </remarks>
     public static string NewMarker() => MarkerPrefix + Guid.NewGuid().ToString("N");
 
+    // The environment's resolution, held to the probed target once a probe has succeeded. After that, settings that no
+    // longer resolve at all are a change as well, so the failure reports the change rather than a missing setting.
     private static string Resolve()
+    {
+        string? connectionString = ResolveEnvironment();
+        string? probed = _probedConnectionString;
+        if (probed is not null && !string.Equals(connectionString, probed, StringComparison.Ordinal))
+        {
+            throw new TestDatabaseUnavailableException(ChangedAfterProbe);
+        }
+
+        return connectionString ?? throw new TestDatabaseUnavailableException(
+            $"Neither {ConnectionStringVariable} nor {PasswordVariable} is set. {Guidance}");
+    }
+
+    // The connection string the variables give now, or null when neither variable that configures it is set.
+    private static string? ResolveEnvironment()
     {
         string? connectionString = Environment.GetEnvironmentVariable(ConnectionStringVariable);
         if (!string.IsNullOrWhiteSpace(connectionString))
@@ -163,8 +204,7 @@ public static class TestDatabase
         string? password = Environment.GetEnvironmentVariable(PasswordVariable);
         if (string.IsNullOrWhiteSpace(password))
         {
-            throw new TestDatabaseUnavailableException(
-                $"Neither {ConnectionStringVariable} nor {PasswordVariable} is set. {Guidance}");
+            return null;
         }
 
         string? host = Environment.GetEnvironmentVariable(SqlHostVariable);
@@ -177,6 +217,26 @@ public static class TestDatabase
             TrustServerCertificate = true,
         };
         return builder.ConnectionString;
+    }
+
+    // A builder over a resolved connection string; every failure the parser raises becomes one that quotes nothing.
+    private static SqlConnectionStringBuilder Parse(string connectionString)
+    {
+        try
+        {
+            return new SqlConnectionStringBuilder(connectionString);
+        }
+        catch (Exception failure) when (
+            failure is ArgumentException or FormatException or OverflowException or NotSupportedException)
+        {
+            // Every failure the parser raises: a malformed string, an unsupported keyword or an out-of-range value
+            // (ArgumentException), a boolean or integer setting that does not convert (FormatException), an integer
+            // beyond Int32 (OverflowException), or a keyword this platform does not support (NotSupportedException).
+            // Neither the parser's message nor its exception is passed on: an unsupported keyword and a value that
+            // does not convert are quoted in it, and that text can be part of a password that holds an unquoted ';'.
+            throw new TestDatabaseUnavailableException(
+                $"The value of {ConnectionStringVariable} is not a valid SQL Server connection string. {Guidance}");
+        }
     }
 
     private static async Task<SqlConnection> OpenAsync(
@@ -206,9 +266,11 @@ public static class TestDatabase
         }
     }
 
-    private static async Task ProbeAsync()
+    private static async Task<string> ProbeAsync()
     {
-        SqlConnectionStringBuilder target = Builder();
+        // Resolved once, so the string recorded below is exactly the one this probe connected with.
+        string connectionString = Resolve();
+        SqlConnectionStringBuilder target = Parse(connectionString);
         target.ConnectTimeout = ProbeTimeoutSeconds;
 
         SqlConnection connection = await OpenAsync(target, CancellationToken.None).ConfigureAwait(false);
@@ -241,6 +303,10 @@ public static class TestDatabase
         {
             await connection.DisposeAsync().ConfigureAwait(false);
         }
+
+        // Only now has the probe succeeded: a failure above leaves the process without a probed target.
+        _probedConnectionString = connectionString;
+        return connectionString;
     }
 
     /// <summary>

@@ -1,3 +1,4 @@
+using EpiInfo.CheckCode.Syntax;
 using EpiInfo.Domain.Values;
 
 namespace EpiInfo.CheckCode.Functions;
@@ -21,8 +22,8 @@ namespace EpiInfo.CheckCode.Functions;
 /// </remarks>
 public static class YearsFunction
 {
-    /// <summary>The function name, matched case-insensitively.</summary>
-    public const string Name = "YEARS";
+    /// <summary>The function name, <see cref="FunctionNames.Years"/>, matched case-insensitively.</summary>
+    public const string Name = FunctionNames.Years;
 
     /// <summary>Computes <c>YEARS</c>.</summary>
     /// <param name="arguments">Exactly two evaluated arguments.</param>

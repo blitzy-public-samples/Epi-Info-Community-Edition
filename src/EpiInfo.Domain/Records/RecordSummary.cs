@@ -9,8 +9,12 @@ namespace EpiInfo.Domain.Records;
 /// <remarks>
 /// <para>
 /// A summary carries the record's identity, its status and its grid columns, and nothing else. It has no
-/// <c>position</c> or <c>count</c>: the grid opens a row by <see cref="GlobalRecordId"/>, and the navigator takes
-/// its "[n] of N" from the record it then opens.
+/// <c>position</c> or <c>count</c>: the grid opens a row by <see cref="GlobalRecordId"/>, and the navigator then
+/// shows "[n] of N" over the set its deleted toggle selects. n is the <see cref="NavigationPosition.Position"/> of
+/// <c>GET /api/forms/{viewId}/records/{globalRecordId}/position</c> and N is the count from
+/// <c>GET /api/forms/{viewId}/records/count</c>, both with the toggle's <c>includeDeleted</c>. Neither is taken from
+/// the opened record's <see cref="RecordDto.Position"/> or <see cref="RecordDto.Count"/>, which are intrinsic to its
+/// <c>RecStatus</c>.
 /// </para>
 /// <para>
 /// This is a wire type. Each public property is a member of the response body and of the committed OpenAPI

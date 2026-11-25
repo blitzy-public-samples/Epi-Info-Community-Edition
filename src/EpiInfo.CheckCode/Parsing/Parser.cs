@@ -1,6 +1,5 @@
 using System.Collections.Frozen;
 using System.Globalization;
-using EpiInfo.CheckCode.Functions;
 using EpiInfo.CheckCode.Lexing;
 using EpiInfo.CheckCode.Syntax;
 using EpiInfo.Domain.Diagnostics;
@@ -21,7 +20,7 @@ namespace EpiInfo.CheckCode.Parsing;
 /// <c>IF … THEN … [ELSE …] END-IF | END</c>; <c>ASSIGN</c>, <c>ENABLE</c>, <c>DISABLE</c>, <c>CLEAR</c>,
 /// <c>DIALOG "text" [TITLETEXT = "title"]</c> and <c>GEOCODE</c>; the operators <c>=</c>, <c>NOT</c> and
 /// <c>AND</c>; string and number literals, <c>(.)</c> and <c>(-)</c>; and calls of the functions
-/// <see cref="FunctionRegistry"/> supports. Everything else yields a <see cref="DiagnosticSeverity.Warning"/> and
+/// <see cref="FunctionNames"/> supports. Everything else yields a <see cref="DiagnosticSeverity.Warning"/> and
 /// is left out of the tree; each <c>GEOCODE</c> statement yields one <see cref="DiagnosticSeverity.Info"/>. The
 /// parser never reports a <see cref="DiagnosticSeverity.Error"/>.
 /// </para>
@@ -1314,7 +1313,7 @@ public static class Parser
         {
             Token nameToken = Current;
             string name = nameToken.Text.ToUpperInvariant();
-            if (!FunctionRegistry.IsSupported(name))
+            if (!FunctionNames.IsSupported(name))
             {
                 Warn(nameToken, name, $"Unsupported function {name}; {context.Suffix}");
                 return null;

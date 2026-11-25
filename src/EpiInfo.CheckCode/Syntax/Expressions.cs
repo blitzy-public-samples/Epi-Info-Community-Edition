@@ -158,6 +158,48 @@ public sealed record LiteralNode(LiteralKind Kind, string? Text, double? Number,
 public sealed record IdentifierNode(string Name, int Line) : ExpressionNode(Line);
 
 /// <summary>
+/// The vocabulary of check-code functions the subset executes: <c>YEARS</c> and <c>EPIWEEK</c>.
+/// </summary>
+/// <remarks>
+/// <para>
+/// The parser builds a <see cref="FunctionCallNode"/> only for a name in this vocabulary and reports a call of any
+/// other function as a <c>warning</c> diagnostic, with no node. The function registry maps each name to its
+/// implementation. Both read the names from here, so they are written once and the syntax tree depends on neither.
+/// </para>
+/// <para>
+/// Names match case-insensitively and exactly, as check-code keywords do (grammar line 4): <c>years</c> and
+/// <c>EpiWeek</c> match, while <c>YEAR</c>, <c>EPIWEEKS</c> and a name with surrounding spaces do not. The
+/// vocabulary is built once during type initialisation and never changes, so it is safe to use from any number of
+/// threads.
+/// </para>
+/// </remarks>
+public static class FunctionNames
+{
+    /// <summary>The canonical name of <c>YEARS(first, second)</c>.</summary>
+    public const string Years = "YEARS";
+
+    /// <summary>The canonical name of <c>EPIWEEK(date[, firstDay])</c>.</summary>
+    public const string EpiWeek = "EPIWEEK";
+
+    /// <summary>
+    /// The canonical names of the vocabulary: <see cref="Years"/>, then <see cref="EpiWeek"/>. An immutable list
+    /// that exposes no writable storage: writes through its collection interfaces throw
+    /// <see cref="NotSupportedException"/>, and <c>ICollection.SyncRoot</c> is the list itself.
+    /// </summary>
+    public static IReadOnlyCollection<string> Supported { get; } =
+        System.Collections.Immutable.ImmutableList.Create(Years, EpiWeek);
+
+    // Declared after Supported, which it is built from: static initialisers run in textual order.
+    private static readonly System.Collections.Frozen.FrozenSet<string> Lookup =
+        System.Collections.Frozen.FrozenSet.ToFrozenSet(Supported, StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Whether a name is in the vocabulary.</summary>
+    /// <param name="name">The function name as written in the program. <see langword="null"/> matches nothing.</param>
+    /// <returns>Whether <paramref name="name"/> names a supported function, ignoring case.</returns>
+    public static bool IsSupported(string? name) => name is not null && Lookup.Contains(name);
+}
+
+/// <summary>
 /// A call of a registered function (<c>YEARS</c> or <c>EPIWEEK</c>); any other function is a diagnostic and
 /// never becomes a node. <see cref="Arguments"/> is an immutable snapshot taken by the constructor and by a
 /// <see langword="with"/> expression, so later changes to the caller's list or array never reach the node, and no
@@ -167,7 +209,7 @@ public sealed record IdentifierNode(string Name, int Line) : ExpressionNode(Line
 /// </summary>
 /// <param name="Name">
 /// The function name, stored in upper-invariant form (<c>YEARS</c>, <c>EPIWEEK</c>). Function names are
-/// case-insensitive like keywords (grammar line 4) and <see cref="Functions.FunctionRegistry"/> looks them up
+/// case-insensitive like keywords (grammar line 4) and <see cref="FunctionNames"/> matches them
 /// case-insensitively, so <c>Years</c>, <c>years</c> and <c>YEARS</c> build equal nodes.
 /// </param>
 /// <param name="Arguments">
@@ -186,7 +228,7 @@ public sealed record FunctionCallNode(string Name, IReadOnlyList<ExpressionNode>
     private readonly string name = CanonicalName(Name);
 
     private readonly System.Collections.Immutable.ImmutableList<ExpressionNode> arguments =
-        Snapshot(Arguments, nameof(Arguments));
+        SyntaxLists.Snapshot(Arguments, nameof(Arguments));
 
     /// <summary>
     /// The function name in upper-invariant form (<c>YEARS</c>, <c>EPIWEEK</c>), whatever its spelling in the
@@ -211,7 +253,7 @@ public sealed record FunctionCallNode(string Name, IReadOnlyList<ExpressionNode>
     {
         get => arguments;
         // Copied here as well as in the constructor, so a `with` expression cannot alias a mutable list.
-        init => arguments = Snapshot(value, nameof(Arguments));
+        init => arguments = SyntaxLists.Snapshot(value, nameof(Arguments));
     }
 
     /// <inheritdoc />
@@ -229,25 +271,6 @@ public sealed record FunctionCallNode(string Name, IReadOnlyList<ExpressionNode>
     {
         ArgumentNullException.ThrowIfNull(value, nameof(Name));
         return value.ToUpperInvariant();
-    }
-
-    // An immutable list exposes no writable storage: its collection-interface writes throw NotSupportedException,
-    // ICollection.SyncRoot is the list itself (a ReadOnlyCollection's would be its backing array), and its own
-    // modifying methods return a new list. Each element is read once, so a null cannot slip past the check. The
-    // property name is passed as paramName because Arguments is not a parameter of this helper.
-    private static System.Collections.Immutable.ImmutableList<ExpressionNode> Snapshot(
-        IReadOnlyList<ExpressionNode> value, string paramName)
-    {
-        ArgumentNullException.ThrowIfNull(value, paramName);
-        var builder = System.Collections.Immutable.ImmutableList.CreateBuilder<ExpressionNode>();
-        var count = value.Count;
-        for (var i = 0; i < count; i++)
-        {
-            builder.Add(value[i]
-                ?? throw new ArgumentException("A function call argument must not be null.", paramName));
-        }
-
-        return builder.ToImmutable();
     }
 }
 
@@ -324,4 +347,52 @@ internal static class SyntaxEquality
 
         return hash.ToHashCode();
     }
+}
+
+/// <summary>
+/// Immutable snapshots for the list members of syntax records. Every syntax record holding a list copies it through
+/// these two methods, in its constructor and in the member's <see langword="init"/> accessor, so neither the
+/// constructor nor a <see langword="with"/> expression can alias the caller's list or array.
+/// </summary>
+internal static class SyntaxLists
+{
+    // An immutable list exposes no writable storage: its collection-interface writes throw NotSupportedException,
+    // ICollection.SyncRoot is the list itself (a ReadOnlyCollection's would be its backing array), and its own
+    // modifying methods return a new list. Each element is read once, so a null cannot slip past the check. The
+    // member name is passed as paramName because the list is not a parameter of this helper.
+
+    /// <summary>
+    /// Copies <paramref name="value"/>, in order, into a new immutable list, reporting a failure under
+    /// <paramref name="paramName"/>, the name of the record member being set.
+    /// </summary>
+    /// <exception cref="ArgumentNullException"><paramref name="value"/> is <see langword="null"/>.</exception>
+    /// <exception cref="ArgumentException">
+    /// <paramref name="value"/> contains a <see langword="null"/> element.
+    /// </exception>
+    public static System.Collections.Immutable.ImmutableList<T> Snapshot<T>(IReadOnlyList<T> value, string paramName)
+        where T : class
+    {
+        ArgumentNullException.ThrowIfNull(value, paramName);
+        var builder = System.Collections.Immutable.ImmutableList.CreateBuilder<T>();
+        var count = value.Count;
+        for (var i = 0; i < count; i++)
+        {
+            builder.Add(value[i]
+                ?? throw new ArgumentException($"{paramName} must not contain a null element.", paramName));
+        }
+
+        return builder.ToImmutable();
+    }
+
+    /// <summary>
+    /// <see cref="Snapshot{T}"/> for an optional list member: <see langword="null"/> when <paramref name="value"/> is
+    /// <see langword="null"/>, otherwise the snapshot of <paramref name="value"/>.
+    /// </summary>
+    /// <exception cref="ArgumentException">
+    /// <paramref name="value"/> contains a <see langword="null"/> element.
+    /// </exception>
+    public static System.Collections.Immutable.ImmutableList<T>? SnapshotOrNull<T>(
+        IReadOnlyList<T>? value, string paramName)
+        where T : class =>
+        value is null ? null : Snapshot(value, paramName);
 }

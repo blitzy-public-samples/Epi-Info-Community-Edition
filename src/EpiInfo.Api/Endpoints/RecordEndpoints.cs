@@ -19,6 +19,9 @@ namespace EpiInfo.Api.Endpoints;
 /// <see cref="RecordService"/> and returns its result. The set predicate, positions, validation, the save path and the
 /// search rules all belong to the service and the Domain rules it calls. A coercion failure is returned at once, before
 /// any service call, so a bad parameter is reported without a database read and ahead of the form lookup.
+/// <c>includeDeleted</c>, <c>page</c> and <c>pageSize</c> bind as the array of every occurrence sent, because binding
+/// a repeated key to one string joins only its non-empty occurrences: an empty or repeated occurrence therefore reaches
+/// the coercion instead of being dropped or merged.
 /// </para>
 /// <para>
 /// <b>Routes.</b> <c>{viewId}</c> carries the <c>int</c> constraint, so a non-integer form id matches no route and
@@ -154,18 +157,20 @@ public static class RecordEndpoints
     /// <summary>Handles <c>GET /api/forms/{viewId}/records</c>.</summary>
     /// <param name="viewId">The form's <c>metaViews.ViewId</c>, already an integer by its route constraint.</param>
     /// <param name="q">The grid filter; absent or whitespace means no filter.</param>
-    /// <param name="includeDeleted">The deleted toggle as sent; absent means <c>false</c>.</param>
-    /// <param name="page">The 1-based page number as sent; absent means 1.</param>
-    /// <param name="pageSize">The page size as sent; absent means 50.</param>
+    /// <param name="includeDeleted">
+    /// Every sent occurrence of the deleted toggle, in order and as sent; none means <c>false</c>.
+    /// </param>
+    /// <param name="page">Every sent occurrence of the 1-based page number, in order and as sent; none means 1.</param>
+    /// <param name="pageSize">Every sent occurrence of the page size, in order and as sent; none means 50.</param>
     /// <param name="service">The record service.</param>
     /// <param name="cancellationToken">The request's abort token.</param>
     /// <returns>200 with the page, the coercion 400, or the service's 404 for an unknown form.</returns>
     private static Task<IResult> ListRecordsAsync(
         [FromRoute] int viewId,
         [FromQuery(Name = RequestParameters.Query)] string? q,
-        [FromQuery(Name = RequestParameters.IncludeDeleted)] string? includeDeleted,
-        [FromQuery(Name = RequestParameters.Page)] string? page,
-        [FromQuery(Name = RequestParameters.PageSize)] string? pageSize,
+        [FromQuery(Name = RequestParameters.IncludeDeleted)] string[]? includeDeleted,
+        [FromQuery(Name = RequestParameters.Page)] string[]? page,
+        [FromQuery(Name = RequestParameters.PageSize)] string[]? pageSize,
         [FromServices] RecordService service,
         CancellationToken cancellationToken)
     {
@@ -179,13 +184,15 @@ public static class RecordEndpoints
 
     /// <summary>Handles <c>GET /api/forms/{viewId}/records/count</c>.</summary>
     /// <param name="viewId">The form's <c>metaViews.ViewId</c>, already an integer by its route constraint.</param>
-    /// <param name="includeDeleted">The deleted toggle as sent; absent means <c>false</c>.</param>
+    /// <param name="includeDeleted">
+    /// Every sent occurrence of the deleted toggle, in order and as sent; none means <c>false</c>.
+    /// </param>
     /// <param name="service">The record service.</param>
     /// <param name="cancellationToken">The request's abort token.</param>
     /// <returns>200 with the count, the coercion 400, or the service's 404 for an unknown form.</returns>
     private static Task<IResult> CountRecordsAsync(
         [FromRoute] int viewId,
-        [FromQuery(Name = RequestParameters.IncludeDeleted)] string? includeDeleted,
+        [FromQuery(Name = RequestParameters.IncludeDeleted)] string[]? includeDeleted,
         [FromServices] RecordService service,
         CancellationToken cancellationToken)
     {
@@ -200,7 +207,9 @@ public static class RecordEndpoints
     /// <summary>Handles <c>GET /api/forms/{viewId}/records/at/{position}</c>.</summary>
     /// <param name="viewId">The form's <c>metaViews.ViewId</c>, already an integer by its route constraint.</param>
     /// <param name="position">The 1-based position as sent, coerced here rather than by a route constraint.</param>
-    /// <param name="includeDeleted">The deleted toggle as sent; absent means <c>false</c>.</param>
+    /// <param name="includeDeleted">
+    /// Every sent occurrence of the deleted toggle, in order and as sent; none means <c>false</c>.
+    /// </param>
     /// <param name="service">The record service.</param>
     /// <param name="cancellationToken">The request's abort token.</param>
     /// <returns>
@@ -210,7 +219,7 @@ public static class RecordEndpoints
     private static Task<IResult> GetRecordAtAsync(
         [FromRoute] int viewId,
         [FromRoute(Name = RequestParameters.Position)] string position,
-        [FromQuery(Name = RequestParameters.IncludeDeleted)] string? includeDeleted,
+        [FromQuery(Name = RequestParameters.IncludeDeleted)] string[]? includeDeleted,
         [FromServices] RecordService service,
         CancellationToken cancellationToken)
     {
@@ -243,7 +252,9 @@ public static class RecordEndpoints
     /// <summary>Handles <c>GET /api/forms/{viewId}/records/{globalRecordId}/position</c>.</summary>
     /// <param name="viewId">The form's <c>metaViews.ViewId</c>, already an integer by its route constraint.</param>
     /// <param name="globalRecordId">The record's <c>GlobalRecordId</c>.</param>
-    /// <param name="includeDeleted">The deleted toggle as sent; absent means <c>false</c>.</param>
+    /// <param name="includeDeleted">
+    /// Every sent occurrence of the deleted toggle, in order and as sent; none means <c>false</c>.
+    /// </param>
     /// <param name="service">The record service.</param>
     /// <param name="cancellationToken">The request's abort token.</param>
     /// <returns>
@@ -252,7 +263,7 @@ public static class RecordEndpoints
     private static Task<IResult> GetRecordPositionAsync(
         [FromRoute] int viewId,
         [FromRoute] string globalRecordId,
-        [FromQuery(Name = RequestParameters.IncludeDeleted)] string? includeDeleted,
+        [FromQuery(Name = RequestParameters.IncludeDeleted)] string[]? includeDeleted,
         [FromServices] RecordService service,
         CancellationToken cancellationToken)
     {
