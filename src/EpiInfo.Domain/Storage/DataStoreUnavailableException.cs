@@ -17,10 +17,15 @@ namespace EpiInfo.Domain.Storage;
 /// failed), 4060 (cannot open the database), -2 (command timeout) or 1205 (deadlock victim);
 /// </description></item>
 /// <item><description>
-/// a SQL exception that carries none of those numbers and whose primary error is number 0 with severity class 20 or
-/// above: the form in which SqlClient's managed network layer, used on Linux and macOS, reports the connection
-/// failures that Windows reports under the numbers above, such as a refused connection, an unreachable server or an
-/// unresolvable host. <see cref="SqlErrorNumber"/> is then 0;
+/// a SQL exception that carries none of those numbers, whose primary error is number 0 with severity class 20 or
+/// above and has a message ending in the "(provider: …, error: … - …)" text that SqlClient's network interface layer
+/// appends to every error it raises, and which carries transport evidence: a socket, I/O or timeout cause or, without
+/// one, a connection-failure SNI error code in that text, such as 40 "could not open a connection", 2 "connection
+/// terminated" or 11 "connection timeout". That is the form in which SqlClient's managed network layer, used on Linux
+/// and macOS, reports the connection failures that Windows reports under the numbers above, such as a refused
+/// connection, an unreachable server or an unresolvable host. <see cref="SqlErrorNumber"/> is then 0. A malformed
+/// connection string's code 25 and the other configuration codes, and a generic fatal number-0 error without the
+/// network layer's text, such as a server-side severe error, remain a 500;
 /// </description></item>
 /// <item><description>SqlClient connection-pool exhaustion while opening a connection;</description></item>
 /// <item><description>
@@ -52,12 +57,13 @@ namespace EpiInfo.Domain.Storage;
 /// reported a commit, and otherwise from <see cref="Outcome"/>.
 /// </para>
 /// <para>
-/// The message is always <see cref="FixedMessage"/>, and no constructor accepts another, so the exception can never
-/// carry SQL text, a parameter or field value, a connection string or a database exception's message. The inner
-/// exception may be attached for diagnostics. The handler logs only the exception type, <see cref="SqlErrorNumber"/>,
-/// <see cref="Operation"/> and the trace id; it never logs <see cref="Exception.Message"/> or any inner message.
-/// Never pass this exception to a logger as its exception argument: <see cref="Exception.ToString"/> includes the
-/// inner exception's message.
+/// Redaction: <see cref="Exception.Message"/> is always <see cref="FixedMessage"/>, because no constructor takes a
+/// message, so <see cref="Exception.Message"/> never carries SQL text, a parameter or field value, a connection string
+/// or a database exception's message. That guarantee covers the message alone: the inner exception, attached for
+/// diagnostics, may hold any of these, and so may <see cref="Exception.ToString"/>, which includes it. The handler logs
+/// only the exception type, <see cref="SqlErrorNumber"/>, <see cref="Operation"/> and the trace id; it never logs
+/// <see cref="Exception.Message"/> or any inner message. Never pass this exception to a logger as its exception
+/// argument, because the logger records <see cref="Exception.ToString"/>.
 /// </para>
 /// </remarks>
 public sealed class DataStoreUnavailableException : Exception

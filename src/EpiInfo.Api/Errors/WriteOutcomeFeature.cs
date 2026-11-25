@@ -20,8 +20,10 @@ namespace EpiInfo.Api.Errors;
 /// <c>SoftDeleteAsync</c>, after the metadata read and the phase-1 validation.
 /// </description></item>
 /// <item><description>
-/// Call <see cref="MarkWritten"/> as soon as that call returns successfully, before any post-commit step: building
-/// the response DTO, the post-commit log line, serialisation.
+/// The store reads the response snapshot and builds the response DTO inside the transaction, before it commits, so
+/// a projection failure rolls the save back. The store call returning successfully is the store reporting the
+/// commit. Call <see cref="MarkWritten"/> as soon as that call returns, before any post-commit step: the post-commit
+/// log line, serialisation and delivery of the DTO already built.
 /// </description></item>
 /// <item><description>
 /// A <c>DELETE</c> of an already-deleted record writes nothing and need not be marked written. Marking it would be
