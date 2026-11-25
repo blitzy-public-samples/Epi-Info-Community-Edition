@@ -83,7 +83,7 @@ Each is `not run`: `web/scripts/api-generate.mjs`, `web/scripts/check-api-fresh.
 ### Proofs not made
 
 - **Reserved-word round trip** (`ReservedWordIdentifierTests`): not proved. Neither the metadata reader's internal `tempdb` overload nor the repository's internal open-connection overload is in the tree.
-- **`tests/Directory.Build.props` inert for `Tests/Tests.csproj`**: not re-proved on this tree, which does not hold the props file (see "Boundary checks").
+- **`tests/Directory.Build.props` inert for `Tests/Tests.csproj`**: not provable on the snapshot tree, which did not hold the props file; proved once it was added (see "Boundary checks").
 - **OpenAPI clean and warm byte-identity**: not re-proved; the generation scripts are not in the tree.
 
 ### Tree checks at the snapshot
@@ -116,7 +116,12 @@ These checks hold for the snapshot only. The run's closing check repeats them on
   ```
 
 - **Collision**: none. No tracked `tests/` path, and no planned `tests/` path in the file map, shares a name with one of the four legacy files, so a case-insensitive checkout that merges the two folders also has no same-name file.
-- **`tests/Directory.Build.props` and `Tests/Tests.csproj`**: on this ext4 checkout, MSBuild's upward search from `Tests/` never reaches `tests/`, so the props file is not imported at all. For a case-insensitive checkout, where it would be imported, the static finding (planning time) is that its `PropertyGroup` and `ItemGroup` are conditioned on `'$(UsingMicrosoftNETSdk)' == 'true'`, which a sandbox test showed is empty for the old-style `Tests/Tests.csproj`. The props file is not in the tree at the snapshot, so that guard is not re-checked here.
+- **`tests/Directory.Build.props` and `Tests/Tests.csproj`**: on this ext4 checkout, MSBuild's upward search from `Tests/` never reaches `tests/`, so the props file is not imported at all: `dotnet msbuild Tests/Tests.csproj -getProperty:DirectoryBuildPropsPath -getProperty:Nullable -getProperty:TargetFramework` reports all three empty.
+- **Guard check for a case-insensitive checkout** (pass, run once the props file was added, SDK 10.0.115, evaluation only, legacy project never built or edited). A copy of `Tests/Tests.csproj` was evaluated beside a copy of the props file, the layout a merged `Tests/` and `tests/` folder gives:
+  - `-preprocess` shows the props file imported, through the `Microsoft.Common.props` import that `Microsoft.CSharp.targets` makes for old-style projects;
+  - `UsingMicrosoftNETSdk` is empty, and `TargetFramework`, `Nullable`, `WarningsAsErrors`, `ImplicitUsings`, `IsPackable`, `IsTestProject` and the `Using` items are all empty, while `TargetFrameworkVersion` stays `v4.6.1`;
+  - a control copy of the props file with both conditions removed sets every one of them, so the `'$(UsingMicrosoftNETSdk)' == 'true'` guard is what keeps the legacy project unaffected;
+  - the four SDK-style test projects evaluate `UsingMicrosoftNETSdk` as `true` and take every setting.
 - **Outcome**: verified for this build machine.
 
 ### `src/`, `web/` and `docs/` (C-11, A19)

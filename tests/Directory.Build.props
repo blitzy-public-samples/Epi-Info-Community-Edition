@@ -1,10 +1,8 @@
 <Project>
   <!--
-    Shared settings for the SDK-style test projects of EpiInfo.Web.sln.
-
-    Both groups are conditioned on UsingMicrosoftNETSdk, which is empty for an old-style
-    project, so the legacy Tests/Tests.csproj stays unaffected on a case-insensitive file
-    system where Tests/ and tests/ are the same folder.
+    Settings shared by the SDK-style test projects of EpiInfo.Web.sln. Both groups are conditioned on
+    UsingMicrosoftNETSdk, which is empty for old-style projects, so the legacy Tests/Tests.csproj stays
+    unaffected where a case-insensitive file system makes Tests/ and tests/ one folder.
   -->
   <PropertyGroup Condition="'$(UsingMicrosoftNETSdk)' == 'true'">
     <TargetFramework>net10.0</TargetFramework>
