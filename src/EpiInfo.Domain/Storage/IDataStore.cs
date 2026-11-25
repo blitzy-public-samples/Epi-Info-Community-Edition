@@ -1,0 +1,641 @@
+using System.Diagnostics.CodeAnalysis;
+using EpiInfo.Domain.Forms;
+using EpiInfo.Domain.Metadata;
+using EpiInfo.Domain.Records;
+using EpiInfo.Domain.Search;
+using EpiInfo.Domain.Validation;
+using EpiInfo.Domain.Values;
+
+namespace EpiInfo.Domain.Storage;
+
+/// <summary>
+/// The persistence port of the web data-entry server: every metadata read, record read and record write the API
+/// performs, as one operation-level method each. The API reaches data only through this interface and never handles
+/// a SQL client type, a connection or a transaction. <c>EpiInfo.Data.SqlServerDataStore</c> implements it against
+/// SQL Server, and the API tests' <c>FakeDataStore</c> implements it in memory.
+/// </summary>
+/// <remarks>
+/// <para>
+/// <b>Failures.</b> A store-specific failure surfaces only as <see cref="DataStoreUnavailableException"/>, which the
+/// API maps to 503, or as <see cref="DataStoreWriteException"/>, which it maps to 500. Each carries the failed
+/// <c>Operation</c>, its <see cref="WriteOutcome"/> as <c>Outcome</c>, and the SQL error number when there is one as
+/// <c>SqlErrorNumber</c>. No SQL client exception escapes an implementation. When
+/// <c>cancellationToken</c> is cancelled because the client aborted the request, the failure is an
+/// <see cref="OperationCanceledException"/>, which is never wrapped. An argument that breaks a method's documented
+/// contract, such as a <c>values</c> key that is not a data field of the form, is a programming error raised as
+/// <see cref="ArgumentException"/> before any base- or page-table command is sent, and is never wrapped either.
+/// </para>
+/// <para>
+/// <b>Classification</b> of SQL failures into those two exceptions is owned by the data layer's
+/// <c>SqlErrorClassifier</c>. Exception messages are fixed text and never carry data: no SQL text, parameter value,
+/// field value, identifier or connection string.
+/// </para>
+/// <para>
+/// <b>Threading.</b> Implementations are stateless and thread-safe, so one instance serves every request. Each call
+/// uses its own connection, and nothing is cached between calls, metadata included: a form's metadata, code tables
+/// and column types are read again on every call that needs them.
+/// </para>
+/// <para>
+/// <b>Identifiers.</b> Field names in arguments and results are canonical <c>metaFields.Name</c> values, matched
+/// case-insensitively. Every table and column name a store uses comes from its own catalogue read, never from a
+/// caller's string; in <c>EpiInfo.Data</c> that is the reader-built <c>TableSchema</c>. The
+/// <see cref="FormMetadata"/> a record method receives identifies the form, and the store resolves its tables and
+/// columns again for that call.
+/// </para>
+/// <para>
+/// <b>Cancellation.</b> Every method takes the request's abort token as its last, required parameter, so no caller
+/// can omit it.
+/// </para>
+/// <para>
+/// <b>Reads.</b> <see cref="CountAsync"/>, <see cref="GetAtPositionAsync"/>, <see cref="GetByIdAsync"/>,
+/// <see cref="GetPositionAsync"/>, <see cref="GetSetPositionAsync"/>, <see cref="ListAsync"/>,
+/// <see cref="SearchAsync"/> and the metadata methods issue only <c>SELECT</c> statements and never run check code,
+/// so loading a record changes nothing in the database (scenario <c>DATA-01</c>). They share the record-set rules of
+/// <see cref="RecordQueryRules"/>:
+/// </para>
+/// <list type="bullet">
+/// <item><description>
+/// <b>Selected set:</b> <c>RecStatus = 1</c>, or every row when <c>includeDeleted</c> is <see langword="true"/>
+/// (<see cref="RecordQueryRules.IsInSelectedSet"/>).
+/// </description></item>
+/// <item><description><b>Ordering:</b> <c>UniqueKey</c> ascending.</description></item>
+/// <item><description>
+/// <b>Page rows:</b> each page table is <c>LEFT JOIN</c>ed to the base table on <c>GlobalRecordId</c>, so a base row
+/// without a row on some page is still read, with <see cref="FieldValue.Null"/> for every field of that page, as the
+/// legacy per-page load nulls them.
+/// </description></item>
+/// </list>
+/// <para>
+/// <b>Writes.</b> <see cref="InsertAsync"/>, <see cref="UpdateAsync"/> and <see cref="SoftDeleteAsync"/> each run in
+/// one transaction at <c>READ COMMITTED</c>, so a failure before commit leaves no partial record. They share this
+/// contract:
+/// </para>
+/// <list type="bullet">
+/// <item><description>
+/// <b>Values</b> have already passed the API's <c>RecordValidator</c>: they are keyed by canonical name and limited to
+/// writable data fields. Read-only, unsupported and system columns never appear in them, and callers can never
+/// supply <c>GlobalRecordId</c>, <c>UniqueKey</c>, <c>RecStatus</c> or a stamp column.
+/// </description></item>
+/// <item><description>
+/// <b>Inside the transaction</b> run the locked read and the gates, every write, and the read of the response
+/// snapshot (base and page rows with the intrinsic position and count) together with the construction of its
+/// <see cref="RecordDto"/> through <see cref="RecordDto.From"/>. A failure in any of them rolls the write back.
+/// </description></item>
+/// <item><description>
+/// <b>Return value:</b> a normal return of <see cref="InsertAsync"/>, a <see cref="RecordWriteStatus.Success"/> from
+/// <see cref="UpdateAsync"/> or <see cref="SoftDeleteResult.Deleted"/> from <see cref="SoftDeleteAsync"/> means the
+/// transaction committed, and the API's <c>RecordService</c> then records <see cref="WriteOutcome.Written"/> for the
+/// request. Every other result means nothing was written: the transaction rolled back, or no data statement was
+/// sent.
+/// </description></item>
+/// <item><description>
+/// <b>Failures</b> carry their <see cref="WriteOutcome"/>: <see cref="WriteOutcome.NotWritten"/> for a failure before
+/// any data statement was sent, for a rollback that completed and for a deadlock the server aborted;
+/// <see cref="WriteOutcome.Unknown"/> when neither the commit nor a rollback can be confirmed. A store never reports
+/// <see cref="WriteOutcome.Written"/> itself, because after the commit it makes no database call.
+/// </description></item>
+/// <item><description>
+/// <b>After the commit</b> the store makes no database call, computes nothing from data and logs no value.
+/// </description></item>
+/// </list>
+/// </remarks>
+public interface IDataStore
+{
+    /// <summary>
+    /// Lists every form: one entry per <c>metaViews</c> row, ordered by <c>ViewId</c> ascending, with
+    /// <see cref="FormSummary.PageCount"/> the number of that view's <c>metaPages</c> rows.
+    /// </summary>
+    /// <param name="cancellationToken">The request's abort token.</param>
+    /// <returns>Every form, possibly none.</returns>
+    Task<IReadOnlyList<FormSummary>> ListFormsAsync(CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Reads the metadata of one form, fresh on every call: its <c>metaViews</c> row, its <c>metaPages</c> rows
+    /// (ordered by <c>Position</c>) and every <c>metaFields</c> row of the view joined to its
+    /// <c>metaFieldTypes.Name</c> and to its page-table column, whose type and length come from the database
+    /// catalogue.
+    /// </summary>
+    /// <param name="viewId">A <c>metaViews.ViewId</c>.</param>
+    /// <param name="cancellationToken">The request's abort token.</param>
+    /// <returns>
+    /// The form's metadata, or <see langword="null"/> when <paramref name="viewId"/> is not in <c>metaViews</c>, which
+    /// the API reports as 404.
+    /// </returns>
+    Task<FormMetadata?> GetFormMetadataAsync(int viewId, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Reads the options of every Legal Values field of <paramref name="form"/>: one entry per data field that
+    /// <see cref="FieldTypeMapper"/> maps to <see cref="FieldType.LegalValues"/>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A field's options are the rows of its code table <see cref="FieldMetadata.SourceTableName"/>, column
+    /// <see cref="FieldMetadata.TextColumnName"/>, each as <c>new FieldOption(FieldValue.FromText(text), text)</c>.
+    /// They keep the order in which the unsorted read returns them, as legacy reads code tables, so no order is
+    /// promised beyond the database's own; they are sorted by text only when <see cref="FieldMetadata.Sort"/> is set,
+    /// as legacy sorts the list. A field without a usable code table, because either name is missing or the table or
+    /// column is not in the catalogue, gets an empty list.
+    /// </para>
+    /// <para>
+    /// Option fields are not served here: their labels come from <c>metaFields.List</c>, which
+    /// <see cref="FieldTypeMapper.ParseOptionItems"/> parses.
+    /// </para>
+    /// </remarks>
+    /// <param name="form">The form's metadata, as <see cref="GetFormMetadataAsync"/> returned it.</param>
+    /// <param name="cancellationToken">The request's abort token.</param>
+    /// <returns>
+    /// The options keyed by canonical field name, with keys compared ignoring case; the shape
+    /// <see cref="FormDefinitionFactory.Create"/> takes.
+    /// </returns>
+    Task<IReadOnlyDictionary<string, IReadOnlyList<FieldOption>>> GetOptionsAsync(
+        FormMetadata form,
+        CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Reads the check-code program of a form: the <c>metaViews.CheckCode</c> text, unchanged.
+    /// </summary>
+    /// <param name="viewId">A <c>metaViews.ViewId</c>.</param>
+    /// <param name="cancellationToken">The request's abort token.</param>
+    /// <returns>
+    /// The program text, or <see langword="null"/> when the column is <c>NULL</c> or the view is unknown. Callers treat
+    /// <see langword="null"/> as an empty program and resolve an unknown form to 404 through
+    /// <see cref="GetFormMetadataAsync"/> first.
+    /// </returns>
+    Task<string?> GetCheckCodeAsync(int viewId, CancellationToken cancellationToken);
+
+    /// <summary>Counts the records of the selected set.</summary>
+    /// <param name="form">The form's metadata.</param>
+    /// <param name="includeDeleted">
+    /// <see langword="false"/> for the active set (<c>RecStatus = 1</c>); <see langword="true"/> for every row.
+    /// </param>
+    /// <param name="cancellationToken">The request's abort token.</param>
+    /// <returns>The number of base-table rows in the selected set; 0 for a form with none.</returns>
+    Task<int> CountAsync(FormMetadata form, bool includeDeleted, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Reads the record at a 1-based position of the selected set, ordered by <c>UniqueKey</c>, with every page row.
+    /// </summary>
+    /// <remarks>
+    /// The row is the one at offset <see cref="RecordQueryRules.PositionToOffset"/> of that order, a 64-bit value the
+    /// SQL store binds as <c>bigint</c>, fetching one row.
+    /// </remarks>
+    /// <param name="form">The form's metadata.</param>
+    /// <param name="position">The 1-based position.</param>
+    /// <param name="includeDeleted">Whether the selected set holds every row rather than the active set.</param>
+    /// <param name="cancellationToken">The request's abort token.</param>
+    /// <returns>
+    /// The record, or <see langword="null"/> when <paramref name="position"/> is outside 1 to the selected-set count,
+    /// which the API reports as 404.
+    /// </returns>
+    Task<StoredRecord?> GetAtPositionAsync(
+        FormMetadata form,
+        int position,
+        bool includeDeleted,
+        CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Reads one record by its <c>GlobalRecordId</c>, with every page row. Deleted records are included.
+    /// </summary>
+    /// <param name="form">The form's metadata.</param>
+    /// <param name="globalRecordId">The record's base-table <c>GlobalRecordId</c>.</param>
+    /// <param name="cancellationToken">The request's abort token.</param>
+    /// <returns>
+    /// The record, or <see langword="null"/> when the id is not in the base table, which the API reports as 404.
+    /// </returns>
+    Task<StoredRecord?> GetByIdAsync(FormMetadata form, string globalRecordId, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Computes a record's intrinsic coordinates, the <c>position</c> and <c>count</c> its <see cref="RecordDto"/>
+    /// carries in every response.
+    /// </summary>
+    /// <remarks>
+    /// The set is the one <see cref="RecordQueryRules.IntrinsicIncludesDeleted"/> chooses for
+    /// <c>record.RecStatus</c>: the active set when it is 1, every row otherwise. The caller's deleted toggle plays no
+    /// part. <c>Position</c> is the number of rows of that set whose <c>UniqueKey</c> is at most
+    /// <c>record.UniqueKey</c>, the legacy record-number formula, and <c>Count</c> is the number of rows in the set.
+    /// </remarks>
+    /// <param name="form">The form's metadata.</param>
+    /// <param name="record">The record, as a read of this store returned it.</param>
+    /// <param name="cancellationToken">The request's abort token.</param>
+    /// <returns>The record's intrinsic position and the size of the same set.</returns>
+    Task<(int Position, int Count)> GetPositionAsync(
+        FormMetadata form,
+        StoredRecord record,
+        CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Places a record in the caller's selected set, for the navigator's "[n] of N" display.
+    /// </summary>
+    /// <remarks>
+    /// Only the base table is read, so a record missing a page row is still placed. These coordinates differ from the
+    /// intrinsic ones of <see cref="GetPositionAsync"/> whenever the toggle selects a set other than the record's own.
+    /// </remarks>
+    /// <param name="form">The form's metadata.</param>
+    /// <param name="globalRecordId">The record's base-table <c>GlobalRecordId</c>.</param>
+    /// <param name="includeDeleted">Whether the selected set holds every row rather than the active set.</param>
+    /// <param name="cancellationToken">The request's abort token.</param>
+    /// <returns>
+    /// <see langword="null"/> when the id is not in the base table, which the API reports as 404. Otherwise
+    /// <see cref="NavigationPosition.Count"/> is the selected-set count and <see cref="NavigationPosition.Position"/>
+    /// is the record's position in that set, or <see langword="null"/> when the record is outside it.
+    /// </returns>
+    Task<NavigationPosition?> GetSetPositionAsync(
+        FormMetadata form,
+        string globalRecordId,
+        bool includeDeleted,
+        CancellationToken cancellationToken);
+
+    // ListAsync and SearchAsync deliberately take no grid-column argument: the store derives the columns from the
+    // form with RecordQueryRules, the one owner of that rule, so no column name a store queries comes from a caller.
+    /// <summary>
+    /// Reads one page of the records list: the selected set, filtered by the grid filter, ordered by
+    /// <c>UniqueKey</c> and paged.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The grid columns are the ones <see cref="RecordQueryRules.GetGridColumns(FormMetadata)"/> selects for
+    /// <paramref name="form"/>; the store derives them itself, so every column it names comes from its own catalogue
+    /// read.
+    /// </para>
+    /// <list type="bullet">
+    /// <item><description>
+    /// <see cref="RecordListQuery.Filter"/>, when not <see langword="null"/>, keeps the rows in which any grid column
+    /// contains it, ignoring case and independent of the database collation, with the filter text passed as a
+    /// parameter and its pattern characters matched literally. <see langword="null"/> applies no filter.
+    /// </description></item>
+    /// <item><description>
+    /// Rows come from the selected set of <see cref="RecordListQuery.IncludeDeleted"/> and are paged at the 64-bit
+    /// <see cref="RecordListQuery.Offset"/> for <see cref="RecordListQuery.PageSize"/> rows.
+    /// </description></item>
+    /// </list>
+    /// </remarks>
+    /// <param name="form">The form's metadata.</param>
+    /// <param name="query">The coerced list parameters, whose paging bounds the API has already checked.</param>
+    /// <param name="cancellationToken">The request's abort token.</param>
+    /// <returns>
+    /// A page whose <see cref="RecordPage.Items"/> are <see cref="RecordSummary"/> values holding exactly the grid
+    /// columns, in grid order; whose <see cref="RecordPage.Total"/> counts the whole filtered set; and whose
+    /// <see cref="RecordPage.Page"/> and <see cref="RecordPage.PageSize"/> echo <paramref name="query"/>. A valid page
+    /// past the end has no items and the correct total.
+    /// </returns>
+    Task<RecordPage> ListAsync(FormMetadata form, RecordListQuery query, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Finds the records matching the parsed Find criteria, following the legacy Find semantics as the target
+    /// reconciles them.
+    /// </summary>
+    /// <remarks>
+    /// <list type="bullet">
+    /// <item><description>
+    /// One statement <c>INNER JOIN</c>s the base table to every page table, so only base rows with a row on every page
+    /// can match, which is the result set legacy Find produced after it hydrated its matches.
+    /// </description></item>
+    /// <item><description>
+    /// <paramref name="conditions"/> combine with AND, and the alternatives of one condition with OR. Every value is a
+    /// parameter.
+    /// </description></item>
+    /// <item><description>
+    /// Rows are limited to the selected set of <paramref name="includeDeleted"/>, and
+    /// <paramref name="excludeGlobalRecordId"/> is removed before <see cref="SearchResponse.Total"/> is counted and
+    /// before the cap applies.
+    /// </description></item>
+    /// <item><description>
+    /// Results are ordered by <c>UniqueKey</c> and capped at <see cref="RecordQueryRules.SearchCap"/>. Each result's
+    /// position is its row number over the selected set by <c>UniqueKey</c>, numbered before the criteria filter, so it
+    /// equals the record's navigation position.
+    /// </description></item>
+    /// <item><description>
+    /// Each result holds the grid columns of <see cref="RecordQueryRules.GetGridColumns(FormMetadata)"/>, which the
+    /// store derives itself, and the response is built with <see cref="SearchResponse.Create"/>.
+    /// </description></item>
+    /// </list>
+    /// </remarks>
+    /// <param name="form">The form's metadata.</param>
+    /// <param name="conditions">
+    /// The parsed criteria, at most one per column; never empty, because the search criteria parser rejects an empty
+    /// list before the store is called.
+    /// </param>
+    /// <param name="includeDeleted">Whether the selected set holds every row rather than the active set.</param>
+    /// <param name="excludeGlobalRecordId">
+    /// The <c>GlobalRecordId</c> of the record open in the client, which is left out of the results, or
+    /// <see langword="null"/> to leave nothing out.
+    /// </param>
+    /// <param name="cancellationToken">The request's abort token.</param>
+    /// <returns>
+    /// The capped results with the uncapped match count; no match gives an empty list and a total of 0.
+    /// </returns>
+    Task<SearchResponse> SearchAsync(
+        FormMetadata form,
+        IReadOnlyList<SearchCondition> conditions,
+        bool includeDeleted,
+        string? excludeGlobalRecordId,
+        CancellationToken cancellationToken);
+
+    // A failed ping is deliberately allowed to be either false or a classified exception, not false alone: the
+    // health check catches store failures itself, and the SQL Server store classifies every failure the same way
+    // for every member, so callers handle both forms and no exception text can reach the health result.
+    /// <summary>
+    /// Checks that the database answers a trivial query, <c>SELECT 1</c>, for <c>GET /health</c>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A store may report a failure either by returning <see langword="false"/> or by throwing the exceptions of the
+    /// interface's failure rule, which is what the SQL Server store does for every member, a missing connection string
+    /// included. Cancellation of <paramref name="cancellationToken"/> propagates as
+    /// <see cref="OperationCanceledException"/>.
+    /// </para>
+    /// <para>
+    /// The caller, the API's SQL Server health check, therefore reports Unhealthy both for <see langword="false"/> and
+    /// for any exception other than the caller's own cancellation, and never attaches the exception or its message to
+    /// its result, so no exception text reaches the health-check log.
+    /// </para>
+    /// </remarks>
+    /// <param name="cancellationToken">The request's abort token.</param>
+    /// <returns><see langword="true"/> when the database answered.</returns>
+    Task<bool> PingAsync(CancellationToken cancellationToken);
+
+
+    /// <summary>
+    /// Inserts a new active record: one base row and one row on every page, then reads the response snapshot and
+    /// commits, all in one transaction.
+    /// </summary>
+    /// <remarks>
+    /// <list type="number">
+    /// <item><description>
+    /// The base row gets a new GUID string as <c>GlobalRecordId</c> and <c>RecStatus</c> 1. <paramref name="stamp"/>
+    /// fills <c>FirstSaveLogonName</c>, <c>FirstSaveTime</c>, <c>LastSaveLogonName</c> and <c>LastSaveTime</c>, each
+    /// written only when that column exists. The statement returns the new key through
+    /// <c>OUTPUT INSERTED.UniqueKey</c>. <c>FKEY</c> is not named, so it keeps its default <c>NULL</c>, as legacy
+    /// leaves it for a form without a foreign-key field.
+    /// </description></item>
+    /// <item><description>
+    /// One page row per page, in <see cref="PageMetadata.Position"/> order, keyed by the same <c>GlobalRecordId</c>
+    /// and holding every writable data column, <c>NULL</c> for each field absent from <paramref name="values"/>.
+    /// Unsupported columns are not named, so they stay <c>NULL</c>.
+    /// </description></item>
+    /// <item><description>The response snapshot is read, then the transaction commits.</description></item>
+    /// </list>
+    /// </remarks>
+    /// <param name="form">The form's metadata, as <see cref="GetFormMetadataAsync"/> returned it.</param>
+    /// <param name="values">
+    /// The validated, normalised values of writable data fields, keyed by canonical name; a field may be absent.
+    /// </param>
+    /// <param name="stamp">The save stamp of this write.</param>
+    /// <param name="cancellationToken">The request's abort token.</param>
+    /// <returns>
+    /// The new record as committed, with its intrinsic position and count. Every failure throws, so a return always
+    /// means the transaction committed.
+    /// </returns>
+    Task<RecordDto> InsertAsync(
+        FormMetadata form,
+        IReadOnlyDictionary<string, FieldValue> values,
+        SaveStamp stamp,
+        CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Updates the submitted fields of an existing record, as a delta, inside one transaction that first locks the
+    /// base row and re-checks the required fields against the stored state.
+    /// </summary>
+    /// <remarks>
+    /// <para>Steps, in this order, inside the transaction:</para>
+    /// <list type="number">
+    /// <item><description>
+    /// Read the base row's <c>RecStatus</c> <c>WITH (UPDLOCK, ROWLOCK)</c>. A missing row rolls back with
+    /// <see cref="RecordWriteStatus.NotFound"/>; <c>RecStatus</c> 0 rolls back with
+    /// <see cref="RecordWriteStatus.Deleted"/>.
+    /// </description></item>
+    /// <item><description>Read every page row into a <see cref="StoredRecord"/>.</description></item>
+    /// <item><description>
+    /// When <paramref name="permissions"/> is not <see langword="null"/>, every page whose row the locked read found
+    /// missing must pass <see cref="FormPermissions.CanInsertInto"/> for its <see cref="PageMetadata.TableName"/>;
+    /// otherwise roll back with <see cref="RecordWriteStatus.Forbidden"/> before any data statement.
+    /// </description></item>
+    /// <item><description>
+    /// Call <paramref name="requiredGate"/> with the stored record. A result that is not valid rolls back before any
+    /// write, with <see cref="RecordWriteStatus.ValidationFailed"/> carrying that result. Running the gate after the
+    /// locked read means two concurrent saves can never both pass it on stale state.
+    /// </description></item>
+    /// <item><description>
+    /// Set the base <c>LastSaveLogonName</c> and <c>LastSaveTime</c> from <paramref name="stamp"/>.
+    /// </description></item>
+    /// <item><description>
+    /// For each page holding a submitted field, in <see cref="PageMetadata.Position"/> order, update only the
+    /// submitted columns. When no row is affected, insert the page row with its <c>GlobalRecordId</c> and repeat the
+    /// update, as legacy does.
+    /// </description></item>
+    /// <item><description>Read the response snapshot, then commit.</description></item>
+    /// </list>
+    /// <para>
+    /// An exception thrown by <paramref name="requiredGate"/> rolls back and surfaces as a
+    /// <see cref="DataStoreWriteException"/> with <see cref="WriteOutcome.NotWritten"/>, no SQL error number and the
+    /// gate's exception as its inner exception. Concurrency is last-writer-wins under the lock: for a field two saves
+    /// both submitted the later commit wins, a field only one save submitted keeps that save's value, and there is no
+    /// row-version check.
+    /// </para>
+    /// </remarks>
+    /// <param name="form">The form's metadata, as <see cref="GetFormMetadataAsync"/> returned it.</param>
+    /// <param name="globalRecordId">The record's base-table <c>GlobalRecordId</c>.</param>
+    /// <param name="submitted">
+    /// The validated, normalised values of the writable data fields the request submitted, keyed by canonical name.
+    /// It may be empty, which updates only the stamps.
+    /// </param>
+    /// <param name="stamp">The save stamp of this write.</param>
+    /// <param name="requiredGate">
+    /// The required-field check of the effective record. The API passes
+    /// <c>stored =&gt; validator.CheckRequired(stored, submitted)</c>, which overlays the submitted values on the
+    /// stored ones itself.
+    /// </param>
+    /// <param name="permissions">
+    /// The login's per-table permissions for the missing-page insert check, or <see langword="null"/> for no check,
+    /// which is what callers pass while permission awareness is not delivered.
+    /// </param>
+    /// <param name="cancellationToken">The request's abort token.</param>
+    /// <returns>
+    /// <see cref="RecordWriteStatus.Success"/> with the updated record and its intrinsic position and count when the
+    /// transaction committed; any other status when it rolled back with nothing written.
+    /// </returns>
+    Task<RecordWriteResult> UpdateAsync(
+        FormMetadata form,
+        string globalRecordId,
+        IReadOnlyDictionary<string, FieldValue> submitted,
+        SaveStamp stamp,
+        Func<StoredRecord, RecordValidationResult> requiredGate,
+        FormPermissions? permissions,
+        CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Soft-deletes a record: sets the base row's <c>RecStatus</c> to 0 with the last-save stamp, in one transaction.
+    /// </summary>
+    /// <remarks>
+    /// <list type="number">
+    /// <item><description>
+    /// Read the base row's <c>RecStatus</c> <c>WITH (UPDLOCK, ROWLOCK)</c>. A missing row gives
+    /// <see cref="SoftDeleteResult.NotFound"/>; <c>RecStatus</c> 0 gives <see cref="SoftDeleteResult.AlreadyDeleted"/>
+    /// with nothing written, stamps included.
+    /// </description></item>
+    /// <item><description>
+    /// Otherwise update the base row's <c>RecStatus</c> to 0 and its <c>LastSaveLogonName</c> and <c>LastSaveTime</c>
+    /// from <paramref name="stamp"/>, then commit.
+    /// </description></item>
+    /// </list>
+    /// <para>Page rows are never touched and nothing cascades to other forms.</para>
+    /// </remarks>
+    /// <param name="form">The form's metadata, as <see cref="GetFormMetadataAsync"/> returned it.</param>
+    /// <param name="globalRecordId">The record's base-table <c>GlobalRecordId</c>.</param>
+    /// <param name="stamp">The save stamp, written only when the record is active.</param>
+    /// <param name="cancellationToken">The request's abort token.</param>
+    /// <returns>What happened to the record.</returns>
+    Task<SoftDeleteResult> SoftDeleteAsync(
+        FormMetadata form,
+        string globalRecordId,
+        SaveStamp stamp,
+        CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Reads the login's INSERT and UPDATE permissions on the base table and every page table of
+    /// <paramref name="form"/>, for permission awareness.
+    /// </summary>
+    /// <remarks>
+    /// The permissions are read on every call and never cached, so a grant or revoke applies to the next request.
+    /// <see cref="FormPermissions"/> derives the form-level insert, update and delete decisions from them.
+    /// </remarks>
+    /// <param name="form">The form's metadata.</param>
+    /// <param name="cancellationToken">The request's abort token.</param>
+    /// <returns>
+    /// One entry per table, or <see langword="null"/> when the store does not report permissions. Then no permission
+    /// check runs, the form-definition permission flags stay <see langword="null"/>, and a SQL permission failure on a
+    /// write surfaces as <see cref="DataStoreWriteException"/>.
+    /// </returns>
+    Task<FormPermissions?> GetPermissionsAsync(FormMetadata form, CancellationToken cancellationToken);
+}
+
+/// <summary>
+/// How <see cref="IDataStore.UpdateAsync"/> ended. Only <see cref="Success"/> means the transaction committed; every
+/// other status means it rolled back with nothing written.
+/// </summary>
+public enum RecordWriteStatus
+{
+    /// <summary>The update committed; the API answers 200 with the updated record.</summary>
+    Success,
+
+    /// <summary>The <c>GlobalRecordId</c> is not in the base table; the API answers 404.</summary>
+    NotFound,
+
+    /// <summary>
+    /// The record has <c>RecStatus</c> 0, and a <c>PUT</c> on a deleted record is refused; the API answers 409.
+    /// </summary>
+    Deleted,
+
+    /// <summary>
+    /// The required gate failed on the stored record overlaid with the submitted values; the API answers 400 with
+    /// <see cref="RecordWriteResult.Validation"/>.
+    /// </summary>
+    ValidationFailed,
+
+    /// <summary>
+    /// A page row of the record is missing and the login may not insert into that page table; the API answers 403.
+    /// Only a store given permissions, under permission awareness, returns it.
+    /// </summary>
+    Forbidden,
+}
+
+/// <summary>
+/// The result of <see cref="IDataStore.UpdateAsync"/>: its <see cref="Status"/>, the updated record for
+/// <see cref="RecordWriteStatus.Success"/>, and the failed gate result for
+/// <see cref="RecordWriteStatus.ValidationFailed"/>.
+/// </summary>
+/// <remarks>
+/// The factories are the only way to build one, so <see cref="Record"/> is set exactly for
+/// <see cref="RecordWriteStatus.Success"/> and <see cref="Validation"/> exactly for
+/// <see cref="RecordWriteStatus.ValidationFailed"/>. Instances are immutable and safe to share across threads.
+/// </remarks>
+public sealed class RecordWriteResult
+{
+    private static readonly RecordWriteResult NotFoundResult = new(RecordWriteStatus.NotFound, null, null);
+    private static readonly RecordWriteResult DeletedResult = new(RecordWriteStatus.Deleted, null, null);
+    private static readonly RecordWriteResult ForbiddenResult = new(RecordWriteStatus.Forbidden, null, null);
+
+    private RecordWriteResult(RecordWriteStatus status, RecordDto? record, RecordValidationResult? validation)
+    {
+        Status = status;
+        Record = record;
+        Validation = validation;
+    }
+
+    /// <summary>How the update ended.</summary>
+    public RecordWriteStatus Status { get; }
+
+    /// <summary>
+    /// The updated record with its intrinsic position and count, read inside the committed transaction; set only when
+    /// <see cref="Status"/> is <see cref="RecordWriteStatus.Success"/>.
+    /// </summary>
+    public RecordDto? Record { get; }
+
+    /// <summary>
+    /// The required gate's failed result; set only when <see cref="Status"/> is
+    /// <see cref="RecordWriteStatus.ValidationFailed"/>.
+    /// </summary>
+    public RecordValidationResult? Validation { get; }
+
+    /// <summary>Whether the update committed, in which case <see cref="Record"/> is set.</summary>
+    [MemberNotNullWhen(true, nameof(Record))]
+    public bool IsSuccess => Status == RecordWriteStatus.Success;
+
+    /// <summary>A committed update.</summary>
+    /// <param name="record">The updated record, as the snapshot read inside the transaction built it.</param>
+    /// <returns>A <see cref="RecordWriteStatus.Success"/> result carrying <paramref name="record"/>.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="record"/> is <see langword="null"/>.</exception>
+    public static RecordWriteResult Success(RecordDto record)
+    {
+        ArgumentNullException.ThrowIfNull(record);
+        return new RecordWriteResult(RecordWriteStatus.Success, record, null);
+    }
+
+    /// <summary>The record is not in the base table.</summary>
+    /// <returns>A <see cref="RecordWriteStatus.NotFound"/> result.</returns>
+    public static RecordWriteResult NotFound() => NotFoundResult;
+
+    /// <summary>The record is soft-deleted, so it cannot be updated.</summary>
+    /// <returns>A <see cref="RecordWriteStatus.Deleted"/> result.</returns>
+    public static RecordWriteResult Deleted() => DeletedResult;
+
+    /// <summary>The required gate failed, so nothing was written.</summary>
+    /// <param name="validation">The gate's result, which must not be valid.</param>
+    /// <returns>
+    /// A <see cref="RecordWriteStatus.ValidationFailed"/> result carrying <paramref name="validation"/>.
+    /// </returns>
+    /// <exception cref="ArgumentNullException"><paramref name="validation"/> is <see langword="null"/>.</exception>
+    /// <exception cref="ArgumentException"><paramref name="validation"/> is valid.</exception>
+    public static RecordWriteResult ValidationFailed(RecordValidationResult validation)
+    {
+        ArgumentNullException.ThrowIfNull(validation);
+
+        if (validation.IsValid)
+        {
+            throw new ArgumentException("A validation failure needs a result that is not valid.", nameof(validation));
+        }
+
+        return new RecordWriteResult(RecordWriteStatus.ValidationFailed, null, validation);
+    }
+
+    /// <summary>The login may not insert a missing page row of the record, so nothing was written.</summary>
+    /// <returns>A <see cref="RecordWriteStatus.Forbidden"/> result.</returns>
+    public static RecordWriteResult Forbidden() => ForbiddenResult;
+}
+
+/// <summary>How <see cref="IDataStore.SoftDeleteAsync"/> ended.</summary>
+public enum SoftDeleteResult
+{
+    /// <summary>The record was active and is now deleted; the transaction committed and the API answers 204.</summary>
+    Deleted,
+
+    /// <summary>
+    /// The record was already deleted, so nothing was written, stamps included; the API still answers 204, which makes
+    /// a repeated <c>DELETE</c> safe.
+    /// </summary>
+    AlreadyDeleted,
+
+    /// <summary>The <c>GlobalRecordId</c> is not in the base table; the API answers 404.</summary>
+    NotFound,
+}
+
