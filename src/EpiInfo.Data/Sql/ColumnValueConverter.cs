@@ -427,7 +427,8 @@ internal static class ColumnValueConverter
         return new SqlParameterValue(name, dbType, bound, dbType == DbType.String ? MaxSize : null);
     }
 
-    // The binding of a data field's value: the column's type, checked against the field type.
+    // The binding of a data field's value: the column's type, which the mapper's column-family rule must admit for the
+    // field type, so no caller can write or read a column through a pairing the mapper never admits.
     private static ColumnBinding FieldBinding(ColumnMetadata column, FieldType fieldType)
     {
         ArgumentNullException.ThrowIfNull(column);
@@ -437,7 +438,7 @@ internal static class ColumnValueConverter
             throw new ArgumentException(NotDataFieldMessage, nameof(fieldType));
         }
 
-        if (BindingFor(column) is not { } binding || !Admits(fieldType, binding.DbType))
+        if (BindingFor(column) is not { } binding || !FieldTypeMapper.IsAdmitted(fieldType, column))
         {
             throw new ArgumentException(ColumnNotAdmittedMessage, nameof(column));
         }
@@ -446,7 +447,8 @@ internal static class ColumnValueConverter
     }
 
     // The DbType and size of each admitted SQL Server type; null for every other type. A family that disagrees with
-    // the type name is refused too, because the representability rule would then judge a type other than the one bound.
+    // the type name is refused too, because the mapper's admission and representability rules would then judge a type
+    // other than the one bound.
     private static ColumnBinding? BindingFor(ColumnMetadata column)
     {
         var typeName = column.SqlTypeName?.Trim().ToLowerInvariant();
@@ -474,20 +476,6 @@ internal static class ColumnValueConverter
             _ => null,
         };
     }
-
-    // FieldTypeMapper admits a data field only on a column of a compatible family and maps every other field
-    // unsupported. This guard restates that pairing in bound types, so no caller can write or read a column through a
-    // pairing the mapper never admits: text on a character type, number on an integer type or float, date on datetime,
-    // checkbox on bit, and an option index on tinyint, smallint or int.
-    private static bool Admits(FieldType fieldType, DbType columnType) => fieldType switch
-    {
-        FieldType.Text or FieldType.Multiline or FieldType.LegalValues => columnType == DbType.String,
-        FieldType.Number => columnType is DbType.Byte or DbType.Int16 or DbType.Int32 or DbType.Int64 or DbType.Double,
-        FieldType.Date => columnType == DbType.DateTime,
-        FieldType.Checkbox => columnType == DbType.Boolean,
-        FieldType.Option => columnType is DbType.Byte or DbType.Int16 or DbType.Int32,
-        _ => false,
-    };
 
     // The CLR value bound for a field value the column has accepted as representable. Each arm is boxed as its own
     // type, so the bound CLR type always matches the DbType.

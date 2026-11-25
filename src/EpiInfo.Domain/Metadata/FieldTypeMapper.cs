@@ -9,7 +9,7 @@ namespace EpiInfo.Domain.Metadata;
 /// The one owner of field-type mapping and column-family compatibility: it turns a <c>metaFieldTypes</c> name and
 /// the page-table column a field owns into the <see cref="FieldType"/> the API exposes, and decides which values a
 /// column can store exactly. The form-definition factory, the record validator, the search parser, the record query
-/// rules and the metadata reader all call it rather than repeating these rules.
+/// rules, the metadata reader and the SQL value converter all call it rather than repeating these rules.
 /// </summary>
 /// <remarks>
 /// <para>
@@ -152,6 +152,11 @@ public static class FieldTypeMapper
     /// integer or float for number; <c>datetime</c> for date; <c>bit</c> for checkbox; and <c>tinyint</c>,
     /// <c>smallint</c> or <c>int</c> for option. Labels and groups need no column.
     /// </description></item>
+    /// <item><description>
+    /// An option is stored as its 0-based index, so the index of the last item of <c>metaFields.List</c> must fit
+    /// its column: 256 items fit <c>tinyint</c>, while 257 leave the field unsupported rather than offer index 256,
+    /// which no write could store. No item is dropped or renumbered, and a list with no item is admitted.
+    /// </description></item>
     /// </list>
     /// </remarks>
     /// <exception cref="ArgumentNullException"><paramref name="field"/> is null.</exception>
@@ -183,8 +188,53 @@ public static class FieldTypeMapper
             return UnsupportedResult(field);
         }
 
-        return IsAdmitted(candidate, field.Column) ? (candidate, false, null) : UnsupportedResult(field);
+        if (!IsAdmitted(candidate, field.Column))
+        {
+            return UnsupportedResult(field);
+        }
+
+        // The column admission judges the column alone. An option is stored as its 0-based index, so the index of the
+        // last item must fit the column too.
+        if (candidate == FieldType.Option && field.Column is { } column && !LastOptionIndexFits(field.List, column))
+        {
+            return UnsupportedResult(field);
+        }
+
+        return (candidate, false, null);
     }
+
+    /// <summary>
+    /// Column-family compatibility: whether a field of the type may own the column, because the application converts
+    /// the type's values to and from it exactly. <see cref="Map"/> applies this rule, and the data layer applies it
+    /// again before it binds or reads a field's value, so no caller restates it.
+    /// </summary>
+    /// <param name="type">The field type.</param>
+    /// <param name="column">The page-table column the field owns, or <see langword="null"/> when it owns none.</param>
+    /// <returns>
+    /// <see langword="true"/> for labels and groups, which need no column, whatever <paramref name="column"/> is, and
+    /// for a data type on a column of a compatible family: character for text, multiline and legal values; integer or
+    /// float for number; <c>datetime</c> for date; <c>bit</c> for checkbox; and <c>tinyint</c>, <c>smallint</c> or
+    /// <c>int</c> for option. <see langword="false"/> for a data type with no column or on any other column, and for
+    /// <see cref="FieldType.Unsupported"/>.
+    /// </returns>
+    /// <remarks>
+    /// The rule judges the column alone. The items of an Option field are <see cref="Map"/>'s separate check: the
+    /// index of the last item must also fit the column.
+    /// </remarks>
+    public static bool IsAdmitted(FieldType type, ColumnMetadata? column) => type switch
+    {
+        FieldType.Label or FieldType.Group => true,
+        FieldType.Text or FieldType.Multiline or FieldType.LegalValues => column?.Family == ColumnFamily.Character,
+        FieldType.Number => column?.Family is ColumnFamily.Integer or ColumnFamily.Float,
+        FieldType.Date => column?.Family == ColumnFamily.DateTime,
+        FieldType.Checkbox => column?.Family == ColumnFamily.Bit,
+
+        // Legacy stores the 0-based index in a smallint column. The admitted option columns stop at int, so a
+        // bigint column leaves the field unsupported.
+        FieldType.Option => column is { Family: ColumnFamily.Integer }
+            && NormalizeSqlTypeName(column.SqlTypeName) is "tinyint" or "smallint" or "int",
+        _ => false,
+    };
 
     /// <summary>
     /// The kind of value a field of the given type holds in a record's <c>values</c>.
@@ -306,25 +356,22 @@ public static class FieldTypeMapper
     /// </returns>
     public static IReadOnlyList<FieldOption> ParseOptionItems(string? list)
     {
-        var itemText = list ?? string.Empty;
-        var separator = itemText.IndexOf("||", StringComparison.Ordinal);
-        if (separator >= 0)
-        {
-            itemText = itemText[..separator];
-        }
+        var itemText = OptionItemText(list);
 
         // Legacy splits even empty text and shows one blank radio button. With no item text there is nothing to
         // choose, so no option is offered, whether the list is missing, empty or starts with "||".
-        if (itemText.Length == 0)
+        if (itemText.IsEmpty)
         {
             return ReadOnlyCollection<FieldOption>.Empty;
         }
 
-        var items = itemText.Split(',');
-        var options = new FieldOption[items.Length];
-        for (var index = 0; index < items.Length; index++)
+        // Every comma starts another item, so there is one item more than there are commas, empty items included.
+        var options = new FieldOption[itemText.Count(',') + 1];
+        var index = 0;
+        foreach (var item in itemText.Split(','))
         {
-            options[index] = new FieldOption(FieldValue.FromIndex(index), items[index]);
+            options[index] = new FieldOption(FieldValue.FromIndex(index), itemText[item].ToString());
+            index++;
         }
 
         return Array.AsReadOnly(options);
@@ -360,21 +407,41 @@ public static class FieldTypeMapper
         || normalizedTypeName.Contains("gps", StringComparison.Ordinal)
         || normalizedTypeName.Contains("geocode", StringComparison.Ordinal);
 
-    // Column-family compatibility: a data type is admitted only on a column it converts exactly.
-    private static bool IsAdmitted(FieldType type, ColumnMetadata? column) => type switch
+    // The item text of a stored metaFields.List, as legacy OptionField reads it: everything before the first "||",
+    // the whole list when it has none, and nothing for a missing list.
+    private static ReadOnlySpan<char> OptionItemText(string? list)
     {
-        FieldType.Label or FieldType.Group => true,
-        FieldType.Text or FieldType.Multiline or FieldType.LegalValues => column?.Family == ColumnFamily.Character,
-        FieldType.Number => column?.Family is ColumnFamily.Integer or ColumnFamily.Float,
-        FieldType.Date => column?.Family == ColumnFamily.DateTime,
-        FieldType.Checkbox => column?.Family == ColumnFamily.Bit,
+        var itemText = list.AsSpan();
+        var separator = itemText.IndexOf("||", StringComparison.Ordinal);
+        return separator >= 0 ? itemText[..separator] : itemText;
+    }
 
-        // Legacy stores the 0-based index in a smallint column. The admitted option columns stop at int, so a
-        // bigint column leaves the field unsupported.
-        FieldType.Option => column is { Family: ColumnFamily.Integer }
-            && NormalizeSqlTypeName(column.SqlTypeName) is "tinyint" or "smallint" or "int",
-        _ => false,
-    };
+    // 257 items on tinyint would offer index 256, which no write can store, so such a field is unsupported rather
+    // than offering a choice it cannot save; no item is dropped or renumbered. A list with no item offers no index.
+    // The items are counted in place, as ParseOptionItems splits them: each comma starts the next index, and the
+    // count stops at the first index past the column's maximum, so a stored list of any length allocates nothing
+    // here. A column with no integer range stores no index.
+    private static bool LastOptionIndexFits(string? list, ColumnMetadata column)
+    {
+        if (IntegerRange(column.SqlTypeName) is not { } range)
+        {
+            return false;
+        }
+
+        var remaining = OptionItemText(list);
+        var lastIndex = 0L;
+        for (var comma = remaining.IndexOf(','); comma >= 0; comma = remaining.IndexOf(','))
+        {
+            if (++lastIndex > range.Max)
+            {
+                return false;
+            }
+
+            remaining = remaining[(comma + 1)..];
+        }
+
+        return true;
+    }
 
     // Integer columns decide on the exact integer, never on the nearest double, as FieldValue requires: a number
     // such as 2.0000000000000001, or an integer above 2^53 whose double is rounded, must not pass as whole or

@@ -1006,6 +1006,40 @@ public sealed class FormDefinitionFactoryTests
     }
 
     /// <summary>
+    /// An option is stored as its 0-based index. 256 items on <c>tinyint</c> are offered with indexes 0 to 255, its
+    /// largest value; 257 would offer index 256, which no write can store, so that field is unsupported, carries no
+    /// options and is not a data field.
+    /// </summary>
+    [Theory]
+    [InlineData(256, FieldType.Option, null, true)]
+    [InlineData(257, FieldType.Unsupported, "Option", false)]
+    public void Create_OptionOnTinyint_OffersEveryItemOnlyWhileTheLastIndexFits(
+        int itemCount,
+        FieldType expectedType,
+        string? expectedUnsupportedType,
+        bool expectedDataField)
+    {
+        string[] labels = Enumerable.Range(0, itemCount)
+            .Select(index => "Item" + index.ToString(CultureInfo.InvariantCulture))
+            .ToArray();
+        FormMetadata form = SinglePageForm(
+            Field(1, "Colour", "Option", tabIndex: 1, sqlType: "tinyint", list: string.Join(',', labels)));
+        FieldOption[]? expectedOptions = expectedDataField
+            ? labels.Select((label, index) => new FieldOption(FieldValue.FromIndex(index), label)).ToArray()
+            : null;
+
+        FieldDefinition field = Assert.Single(Assert.Single(Create(form).Pages).Fields);
+
+        Assert.Equal(expectedType, field.FieldType);
+        Assert.Equal(expectedUnsupportedType is not null, field.Unsupported);
+        Assert.Equal(expectedUnsupportedType, field.UnsupportedType);
+        Assert.Equal(expectedOptions, field.Options);
+        Assert.Equal(
+            expectedDataField,
+            FormDefinitionFactory.GetDataFields(form).Any(dataField => dataField.Name == "Colour"));
+    }
+
+    /// <summary>
     /// Each seeded Legal Values field gets its own code-table rows, in the order given, because <c>Sort</c> is 0.
     /// </summary>
     [Theory]

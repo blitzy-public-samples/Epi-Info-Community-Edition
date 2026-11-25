@@ -1,9 +1,11 @@
 using System.Globalization;
+using System.Reflection;
 using System.Text.Json;
 using EpiInfo.Domain.Diagnostics;
 using EpiInfo.Domain.Forms;
 using EpiInfo.Domain.Metadata;
 using EpiInfo.Domain.Values;
+using Xunit.Sdk;
 
 namespace EpiInfo.Domain.Tests.Metadata;
 
@@ -127,6 +129,76 @@ public sealed class FieldTypeMapperTests
         AssertUnsupported(typeName, FieldTypeMapper.Map(FieldOn(typeName, sqlType)));
     }
 
+    // The seeded names no form field uses on a page. The system rows UniqueKey, RecStatus and GlobalRecordId have a
+    // null PageId, so the metadata reader gives them no column, which is the case the API meets. The typed rows use
+    // the base-table types (UniqueKey int, RecStatus smallint, GlobalRecordId and FKEY nvarchar(255)) and pin the
+    // generic fallback: none of these names is in the always-unsupported list, so each is text on a character
+    // column and unsupported on any other.
+    [Theory]
+    [InlineData("RecStatus", null, FieldType.Unsupported)]
+    [InlineData("RecStatus", "smallint", FieldType.Unsupported)]
+    [InlineData("UniqueKey", null, FieldType.Unsupported)]
+    [InlineData("UniqueKey", "int", FieldType.Unsupported)]
+    [InlineData("GlobalRecordId", null, FieldType.Unsupported)]
+    [InlineData("GlobalRecordId", "nvarchar(255)", FieldType.Text)]
+    [InlineData("ForeignKey", null, FieldType.Unsupported)]
+    [InlineData("ForeignKey", "nvarchar(255)", FieldType.Text)]
+    [InlineData("ForeignKey", "int", FieldType.Unsupported)]
+    [InlineData("List", null, FieldType.Unsupported)]
+    [InlineData("List", "nvarchar(255)", FieldType.Text)]
+    [InlineData("List", "tinyint", FieldType.Unsupported)]
+    [InlineData("Unknown", null, FieldType.Unsupported)]
+    [InlineData("Unknown", "nvarchar(255)", FieldType.Text)]
+    [InlineData("Unknown", "int", FieldType.Unsupported)]
+    public void Map_SystemOrGenericSeededName_IsTextOnlyOnACharacterColumn(
+        string typeName,
+        string? sqlType,
+        FieldType expected)
+    {
+        (FieldType FieldType, bool Unsupported, string? UnsupportedType) result =
+            FieldTypeMapper.Map(FieldOn(typeName, sqlType));
+
+        if (expected == FieldType.Unsupported)
+        {
+            AssertUnsupported(typeName, result);
+        }
+        else
+        {
+            AssertSupported(expected, result);
+        }
+    }
+
+    // SC-8 asks for mapping evidence for every seeded name, and an entry of SeededTypeNames alone proves nothing.
+    // The check reads the rows xUnit runs for every Map_ theory, so a seeded name added without a mapping row, or a
+    // row removed or respelt, fails here, and no second list has to be kept in step with the theories. A name must
+    // appear exactly as stored; the alternative spellings of the normalisation tests do not stand in for it.
+    [Fact]
+    public void MapTheories_EverySeededTypeName_IsAMapInput()
+    {
+        HashSet<string> mappedTypeNames = new(StringComparer.Ordinal);
+        foreach (MethodInfo method in typeof(FieldTypeMapperTests).GetMethods())
+        {
+            int typeNameIndex = Array.FindIndex(method.GetParameters(), parameter => parameter.Name == "typeName");
+            if (!method.Name.StartsWith("Map_", StringComparison.Ordinal) || typeNameIndex < 0)
+            {
+                continue;
+            }
+
+            foreach (DataAttribute data in method.GetCustomAttributes<DataAttribute>())
+            {
+                foreach (object?[] row in data.GetData(method))
+                {
+                    if (row[typeNameIndex] is string typeName)
+                    {
+                        mappedTypeNames.Add(typeName);
+                    }
+                }
+            }
+        }
+
+        Assert.Empty(SeededTypeNames.Values.Where(name => !mappedTypeNames.Contains(name)).Order(StringComparer.Ordinal));
+    }
+
     public static TheoryData<string, string?> AlwaysUnsupportedCases
     {
         get
@@ -151,6 +223,33 @@ public sealed class FieldTypeMapperTests
     public void Map_AlwaysUnsupportedType_IsUnsupportedOnAnyColumn(string typeName, string? sqlType)
     {
         AssertUnsupported(typeName, FieldTypeMapper.Map(FieldOn(typeName, sqlType)));
+    }
+
+    // Any type whose name holds "gps" or "geocode", in any case or spacing, is unsupported. No seeded name does, so
+    // the names are synthetic, with an id no seeded row has. On a character column the text fallback would otherwise
+    // make such a field writable text; "Geo Code" matches only once the space is removed.
+    [Theory]
+    [InlineData("GPS", "nvarchar(255)")]
+    [InlineData("Gps Coordinates", "nvarchar(255)")]
+    [InlineData("GeoCode", "nvarchar(255)")]
+    [InlineData("Geo Code", "nvarchar(255)")]
+    [InlineData("Address GEOCODE", "nvarchar(255)")]
+    [InlineData("GPS", "float")]
+    [InlineData("GeoCode", "int")]
+    public void Map_GpsOrGeocodeTypeName_IsUnsupportedOnAnyColumn(string typeName, string sqlType)
+    {
+        FieldMetadata field = new()
+        {
+            FieldId = 1,
+            Name = DefaultFieldName,
+            FieldTypeId = 100,
+            FieldTypeName = typeName,
+            PageId = 1,
+            TabIndex = 1,
+            Column = Column(DefaultFieldName, sqlType),
+        };
+
+        AssertUnsupported(typeName, FieldTypeMapper.Map(field));
     }
 
     [Theory]
@@ -230,6 +329,81 @@ public sealed class FieldTypeMapperTests
         AssertUnsupported(typeName, FieldTypeMapper.Map(FieldOn(typeName, sqlType)));
     }
 
+    // Synthetic, because no seeded field is an Option. An option is stored as its 0-based index, so the item count
+    // minus 1 must fit the column: 255 is the largest tinyint and 32767 the largest smallint.
+    [Theory]
+    [InlineData("tinyint", 256, FieldType.Option, null)]
+    [InlineData("tinyint", 257, FieldType.Unsupported, "Option")]
+    [InlineData("smallint", 32768, FieldType.Option, null)]
+    [InlineData("smallint", 32769, FieldType.Unsupported, "Option")]
+    public void Map_OptionOnAdmittedColumn_IsSupportedOnlyWhileItsLastIndexFits(
+        string sqlType,
+        int itemCount,
+        FieldType expectedType,
+        string? expectedUnsupportedType)
+    {
+        string list = string.Join(
+            ',',
+            Enumerable.Range(0, itemCount).Select(index => "Item" + index.ToString(CultureInfo.InvariantCulture)));
+        FieldMetadata field = FieldOn("Option", sqlType) with { List = list };
+
+        Assert.Equal(
+            (expectedType, expectedUnsupportedType is not null, expectedUnsupportedType),
+            FieldTypeMapper.Map(field));
+    }
+
+    // Map counts the items in place rather than parsing them, so it must count exactly the items ParseOptionItems
+    // gives: a comma after "||" starts no item, however many follow, while an empty item still takes an index.
+    [Theory]
+    [InlineData("tinyint", 256, "Item", 100_000, FieldType.Option, null)]
+    [InlineData("tinyint", 257, "Item", 100_000, FieldType.Unsupported, "Option")]
+    [InlineData("tinyint", 0, "Item", 100_000, FieldType.Option, null)]
+    [InlineData("tinyint", 256, "", 0, FieldType.Option, null)]
+    [InlineData("tinyint", 257, "", 0, FieldType.Unsupported, "Option")]
+    public void Map_OptionListWithSeparatorOrEmptyItems_CountsOnlyTheItemsParseOptionItemsGives(
+        string sqlType,
+        int itemCount,
+        string itemLabel,
+        int commasAfterSeparator,
+        FieldType expectedType,
+        string? expectedUnsupportedType)
+    {
+        string items = string.Join(',', Enumerable.Repeat(itemLabel, itemCount));
+        string list = commasAfterSeparator > 0 ? items + "||" + new string(',', commasAfterSeparator) : items;
+        FieldMetadata field = FieldOn("Option", sqlType) with { List = list };
+
+        Assert.Equal(itemCount, FieldTypeMapper.ParseOptionItems(list).Count);
+        Assert.Equal(
+            (expectedType, expectedUnsupportedType is not null, expectedUnsupportedType),
+            FieldTypeMapper.Map(field));
+    }
+
+    // Map counts an Option's items in place, so what it allocates does not grow with the stored list: a list of
+    // 131,072 items, 524,286 bytes of metaFields.List, costs Map exactly what three items cost, where parsing the
+    // items would allocate megabytes. Both fields are mapped once first, so the measurement holds no first-call work.
+    [Theory]
+    [InlineData("tinyint")]
+    [InlineData("int")]
+    public void Map_OptionWithLongList_AllocatesExactlyWhatAShortListDoes(string sqlType)
+    {
+        FieldMetadata shortList = FieldOn("Option", sqlType) with { List = "Yes,No,Unknown" };
+        FieldMetadata longList = FieldOn("Option", sqlType) with
+        {
+            List = string.Join(',', Enumerable.Repeat("a", 131_072)),
+        };
+        _ = FieldTypeMapper.Map(shortList);
+        _ = FieldTypeMapper.Map(longList);
+
+        long start = GC.GetAllocatedBytesForCurrentThread();
+        _ = FieldTypeMapper.Map(shortList);
+        long shortListBytes = GC.GetAllocatedBytesForCurrentThread() - start;
+        start = GC.GetAllocatedBytesForCurrentThread();
+        _ = FieldTypeMapper.Map(longList);
+        long longListBytes = GC.GetAllocatedBytesForCurrentThread() - start;
+
+        Assert.Equal(shortListBytes, longListBytes);
+    }
+
     // A data type with no page-table column has nowhere to write its value.
     [Theory]
     [InlineData("Text")]
@@ -241,6 +415,24 @@ public sealed class FieldTypeMapperTests
     public void Map_DataTypeWithoutColumn_IsUnsupported(string typeName)
     {
         AssertUnsupported(typeName, FieldTypeMapper.Map(Field(typeName, column: null)));
+    }
+
+    // The data layer calls IsAdmitted directly, so the answers Map never asks for are pinned here: labels and groups
+    // need no column, whichever they carry, and an unsupported field is admitted on none.
+    [Theory]
+    [InlineData(FieldType.Label, null, true)]
+    [InlineData(FieldType.Label, "nvarchar(255)", true)]
+    [InlineData(FieldType.Group, null, true)]
+    [InlineData(FieldType.Group, "int", true)]
+    [InlineData(FieldType.Unsupported, null, false)]
+    [InlineData(FieldType.Unsupported, "nvarchar(255)", false)]
+    [InlineData(FieldType.Unsupported, "smallint", false)]
+    [InlineData(FieldType.Unsupported, "bit", false)]
+    public void IsAdmitted_TypeHoldingNoValue_DoesNotDependOnTheColumn(FieldType type, string? sqlType, bool expected)
+    {
+        ColumnMetadata? column = sqlType is null ? null : Column(DefaultFieldName, sqlType);
+
+        Assert.Equal(expected, FieldTypeMapper.IsAdmitted(type, column));
     }
 
     [Theory]
@@ -338,6 +530,23 @@ public sealed class FieldTypeMapperTests
             new(FieldValue.FromIndex(1), "Green"),
             new(FieldValue.FromIndex(2), "Blue"),
         ];
+
+        Assert.Equal(expected, FieldTypeMapper.ParseOptionItems(list));
+    }
+
+    // Legacy OptionField splits the stored list without trimming, so a label keeps its surrounding spaces and an
+    // empty item stays a choice. Dropping one would move every later item to another index than legacy stored.
+    [Theory]
+    [InlineData(" Yes,,No ||1,2", new[] { " Yes", "", "No " })]
+    [InlineData("A,B,", new[] { "A", "B", "" })]
+    [InlineData(",Only", new[] { "", "Only" })]
+    public void ParseOptionItems_UntrimmedAndEmptyItems_AreKeptAtTheirZeroBasedIndexes(
+        string list,
+        string[] expectedLabels)
+    {
+        FieldOption[] expected = expectedLabels
+            .Select((label, index) => new FieldOption(FieldValue.FromIndex(index), label))
+            .ToArray();
 
         Assert.Equal(expected, FieldTypeMapper.ParseOptionItems(list));
     }
