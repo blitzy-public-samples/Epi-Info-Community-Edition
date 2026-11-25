@@ -45,6 +45,8 @@ This file is the single ledger of the Epi Info web data-entry migration: every r
 | `FoodHistory3 orphans` | 0 | 0 | 1 |
 | `soft-deleted records` | 29 | 29 | 1 |
 
+- **Compatibility level**: no compatibility level is required. Catalogue discovery (`MetadataQueries.Columns`) reads its table-name list with `OPENJSON` at database compatibility level 130 or higher, and with a fixed fallback decoder of the JSON string syntax below it; both paths return the same rows. The nine `99_verify` checks do not cover the level, and `testdata/sql/00_create_database.sql` pins none, so the database takes the server's `model` level. Measured read-only on `EpiRehearsal` (`sys.databases.compatibility_level`), 2026-11-25: 160.
+
 ### Checks that need no database
 
 The precondition passed, so this list only separates the steps that do not depend on it.

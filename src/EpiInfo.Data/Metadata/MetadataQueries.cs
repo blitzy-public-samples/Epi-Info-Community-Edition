@@ -2,13 +2,15 @@ namespace EpiInfo.Data.Metadata;
 
 /// <summary>
 /// Fixed SQL read by <c>SqlMetadataReader</c> from the Epi Info <c>meta*</c> tables and the SQL Server catalogue.
-/// Every statement is a <c>SELECT</c> whose only variable input is a parameter; the column aliases are the
+/// Every statement is a <c>SELECT</c> whose only variable input is a parameter, and <see cref="Columns"/> picks its
+/// <c>OPENJSON</c> path or its fallback path by the database's compatibility level; the column aliases are the
 /// contract with the reader's Dapper row classes.
 /// </summary>
 /// <remarks>
-/// The metadata tables are referenced unqualified, as legacy Epi Info does, so they resolve through the
-/// caller's default schema. The parameter names below are spelled literally inside the statements, because a
-/// constant built from them would need interpolation; keep both spellings identical.
+/// The metadata tables are referenced unqualified, as legacy Epi Info does, so they resolve as any unqualified
+/// name does: in the caller's default schema first, then in <c>dbo</c>. The parameter names below are spelled
+/// literally inside the statements, because a constant built from them would need interpolation; keep both
+/// spellings identical.
 /// </remarks>
 internal static class MetadataQueries
 {
@@ -23,7 +25,7 @@ internal static class MetadataQueries
 
     /// <summary>No parameters; returns <c>ViewId</c>, <c>Name</c>, <c>PageCount</c>, one row per <c>metaViews</c> row ordered by <c>ViewId</c>.</summary>
     /// <remarks>Related views are listed too: legacy does not filter on <c>IsRelatedView</c>.</remarks>
-    public const string ListForms = """
+    internal const string ListForms = """
         SELECT v.[ViewId] AS ViewId,
                v.[Name] AS Name,
                (SELECT COUNT(*) FROM [metaPages] AS p WHERE p.[ViewId] = v.[ViewId]) AS PageCount
@@ -32,7 +34,7 @@ internal static class MetadataQueries
         """;
 
     /// <summary>Takes <c>@viewId</c>; returns <c>ViewId</c>, <c>Name</c> of that <c>metaViews</c> row, or no row for an unknown form.</summary>
-    public const string View = """
+    internal const string View = """
         SELECT v.[ViewId] AS ViewId,
                v.[Name] AS Name
         FROM [metaViews] AS v
@@ -44,7 +46,7 @@ internal static class MetadataQueries
     /// Same statement as legacy <c>MetadataDbProvider.GetDataTableName</c>. Legacy takes the first row; the reader
     /// instead requires exactly one non-blank row and treats anything else as broken metadata.
     /// </remarks>
-    public const string DataTableName = """
+    internal const string DataTableName = """
         SELECT DISTINCT [DataTableName] AS DataTableName
         FROM [metaFields]
         WHERE [ViewId] = @viewId
@@ -52,7 +54,7 @@ internal static class MetadataQueries
         """;
 
     /// <summary>Takes <c>@viewId</c>; returns <c>PageId</c>, <c>Name</c>, <c>Position</c> (<c>smallint</c>, 0-based in the seed) ordered by <c>Position</c>, then <c>PageId</c>.</summary>
-    public const string Pages = """
+    internal const string Pages = """
         SELECT [PageId] AS PageId,
                [Name] AS Name,
                [Position] AS Position
@@ -66,7 +68,7 @@ internal static class MetadataQueries
     /// System rows with a null <c>PageId</c> (<c>UniqueKey</c>, <c>RecStatus</c>, <c>GlobalRecordId</c>) are included;
     /// the reader and the form-definition factory decide what is listed. <c>PromptText</c> is aliased <c>Prompt</c>.
     /// </remarks>
-    public const string Fields = """
+    internal const string Fields = """
         SELECT f.[FieldId] AS FieldId,
                f.[Name] AS Name,
                f.[PromptText] AS Prompt,
@@ -92,12 +94,25 @@ internal static class MetadataQueries
         ORDER BY f.[FieldId];
         """;
 
-    /// <summary>Takes <c>@names</c>; returns <c>TableName</c>, <c>ColumnName</c>, <c>TypeName</c>, <c>MaxLengthBytes</c>, <c>IsNullable</c>, <c>IsIdentity</c>, <c>ColumnId</c> for the named tables of the caller's default schema, ordered by table, then <c>ColumnId</c>.</summary>
+    /// <summary>Takes <c>@names</c>; returns <c>TableName</c>, <c>SchemaName</c> (the schema the name resolved in), <c>ColumnName</c>, <c>TypeName</c>, <c>MaxLengthBytes</c>, <c>IsNullable</c>, <c>IsIdentity</c>, <c>ColumnId</c> for each named table that its unqualified name reaches for the caller, ordered by table, then <c>ColumnId</c>.</summary>
     /// <remarks>
     /// <para>
-    /// The names arrive as one JSON array read with <c>OPENJSON</c>, so the text stays constant and the list stays a
-    /// single typed parameter; Dapper's list expansion is not used because the reader binds every parameter with an
-    /// explicit <c>DbType</c>. <c>OPENJSON</c> needs compatibility level 130 or later; the rehearsal database uses 160.
+    /// The names arrive as one JSON array, so the text stays constant and the list stays a single typed parameter;
+    /// Dapper's list expansion is not used because the reader binds every parameter with an explicit
+    /// <c>DbType</c>. The array is read with <c>OPENJSON</c> when it is available, at database compatibility level
+    /// 130 or higher. Below 130 the same array is read by a fixed recursive decoder of the JSON string syntax, so
+    /// discovery works at every compatibility level SQL Server 2022 supports. Deferred name resolution keeps the
+    /// <c>OPENJSON</c> branch from being bound below 130. The seed scripts under <c>testdata/sql</c> pin no level,
+    /// so the rehearsal database takes the server's <c>model</c> level.
+    /// </para>
+    /// <para>
+    /// The decoder reads the text under a binary collation, so no database collation can ignore or fold a quote or
+    /// a backslash, and every position counts UTF-16 code units, as the searches do. It begins after the first
+    /// quote. Inside a string it moves to the next quote or backslash. A quote ends the string, which is emitted,
+    /// and the next string begins after the following quote. A backslash decodes <c>\uXXXX</c> to that UTF-16 code
+    /// unit, <c>\b</c>, <c>\f</c>, <c>\n</c>, <c>\r</c> and <c>\t</c> to their control characters, and any other
+    /// escaped character to itself. Every step moves forward through the text and an unterminated string ends the
+    /// scan, so the unlimited recursion always finishes.
     /// </para>
     /// <para>
     /// Names are compared under an explicit case-insensitive collation whatever the database collation is, because
@@ -105,29 +120,99 @@ internal static class MetadataQueries
     /// The reader prefers an exact ordinal match among the rows returned.
     /// </para>
     /// <para>
+    /// A catalogue table is returned only when its own bracket-quoted name, written unqualified, reaches that very
+    /// table for the caller: <c>OBJECT_ID</c> resolves a one-part name in the caller's default schema first, then in
+    /// <c>dbo</c>, as SQL Server resolves every unqualified reference. The unqualified <c>meta*</c> reads of this
+    /// class and the one-part identifiers the reader builds from the returned names resolve the same way, so
+    /// descriptors, catalogue rows and record or code-table SQL always reach one object. <c>SchemaName</c> reports
+    /// the schema that resolution chose, so the two-part name it forms with <c>TableName</c> reaches the same table
+    /// as the one-part name; the reader carries <c>SchemaName</c> with the table it builds, so validation and later
+    /// SQL reuse the same binding. A table, view or synonym of the same name in the default schema shadows a
+    /// <c>dbo</c> table: a shadowing table is the one returned, and a shadowing view or synonym, which is not in
+    /// <c>sys.tables</c>, leaves the name with no row.
+    /// </para>
+    /// <para>
     /// <c>sys.types</c> is joined on <c>user_type_id</c>, so a column of an alias type reports the alias name, which
     /// the field-type mapper does not admit, and the field ends up unsupported.
     /// </para>
     /// </remarks>
-    public const string Columns = """
-        SELECT t.[name] AS TableName,
-               c.[name] AS ColumnName,
-               ty.[name] AS TypeName,
-               c.[max_length] AS MaxLengthBytes,
-               c.[is_nullable] AS IsNullable,
-               c.[is_identity] AS IsIdentity,
-               c.[column_id] AS ColumnId
-        FROM sys.tables AS t
-        INNER JOIN sys.columns AS c ON c.[object_id] = t.[object_id]
-        INNER JOIN sys.types AS ty ON ty.[user_type_id] = c.[user_type_id]
-        WHERE t.[schema_id] = SCHEMA_ID()
-          AND t.[name] COLLATE Latin1_General_100_CI_AS IN
-              (SELECT n.[value] COLLATE Latin1_General_100_CI_AS FROM OPENJSON(@names) AS n)
-        ORDER BY t.[name], c.[column_id];
+    internal const string Columns = """
+        IF (SELECT d.[compatibility_level] FROM sys.databases AS d WHERE d.[database_id] = DB_ID()) >= 130
+            SELECT t.[name] AS TableName,
+                   SCHEMA_NAME(t.[schema_id]) AS SchemaName,
+                   c.[name] AS ColumnName,
+                   ty.[name] AS TypeName,
+                   c.[max_length] AS MaxLengthBytes,
+                   c.[is_nullable] AS IsNullable,
+                   c.[is_identity] AS IsIdentity,
+                   c.[column_id] AS ColumnId
+            FROM sys.tables AS t
+            INNER JOIN sys.columns AS c ON c.[object_id] = t.[object_id]
+            INNER JOIN sys.types AS ty ON ty.[user_type_id] = c.[user_type_id]
+            WHERE t.[object_id] = OBJECT_ID(QUOTENAME(t.[name]))
+              AND t.[name] COLLATE Latin1_General_100_CI_AS IN
+                  (SELECT n.[value] COLLATE Latin1_General_100_CI_AS FROM OPENJSON(@names) AS n)
+            ORDER BY t.[name], c.[column_id];
+        ELSE
+            WITH [Scan] ([Position], [Text], [Name]) AS
+            (
+                -- The first string's content starts after the first quote.
+                SELECT CAST(CHARINDEX(N'"', @names COLLATE Latin1_General_100_BIN2) + 1 AS bigint),
+                       CAST(N'' AS nvarchar(max)) COLLATE Latin1_General_100_BIN2,
+                       CAST(NULL AS nvarchar(max)) COLLATE Latin1_General_100_BIN2
+                WHERE CHARINDEX(N'"', @names COLLATE Latin1_General_100_BIN2) > 0
+                UNION ALL
+                -- Each step reads the current string up to its next quote or backslash ([At]). A quote ends the
+                -- string: [Name] is emitted and [Position] moves past the next quote, or to 0 when none is left.
+                -- A backslash appends its decoded escape to [Text] and [Position] moves past the escape.
+                SELECT CASE
+                           WHEN m.[Mark] = N'"' THEN ISNULL(NULLIF(CHARINDEX(N'"', @names COLLATE Latin1_General_100_BIN2, m.[At] + 1), 0) + 1, 0)
+                           WHEN m.[Escape] = N'u' THEN m.[At] + 6
+                           ELSE m.[At] + 2
+                       END,
+                       CASE
+                           WHEN m.[Mark] = N'"' THEN N''
+                           ELSE s.[Text] + m.[Chunk] + CASE m.[Escape]
+                                                           WHEN N'u' THEN NCHAR(CONVERT(int, CONVERT(varbinary(2), N'0x' + SUBSTRING(@names COLLATE Latin1_General_100_BIN2, m.[At] + 2, 4), 1)))
+                                                           WHEN N'b' THEN NCHAR(8)
+                                                           WHEN N'f' THEN NCHAR(12)
+                                                           WHEN N'n' THEN NCHAR(10)
+                                                           WHEN N'r' THEN NCHAR(13)
+                                                           WHEN N't' THEN NCHAR(9)
+                                                           ELSE m.[Escape]
+                                                       END
+                       END,
+                       CASE WHEN m.[Mark] = N'"' THEN s.[Text] + m.[Chunk] END
+                FROM [Scan] AS s
+                CROSS APPLY (SELECT p.[At],
+                                    SUBSTRING(@names COLLATE Latin1_General_100_BIN2, s.[Position], p.[At] - s.[Position]) AS [Chunk],
+                                    SUBSTRING(@names COLLATE Latin1_General_100_BIN2, p.[At], 1) AS [Mark],
+                                    SUBSTRING(@names COLLATE Latin1_General_100_BIN2, p.[At] + 1, 1) AS [Escape]
+                             FROM (VALUES (s.[Position] - 1 + NULLIF(PATINDEX(N'%["\]%', SUBSTRING(@names COLLATE Latin1_General_100_BIN2, s.[Position], 2147483647)), 0))) AS p ([At])) AS m
+                -- [At] is NULL when the rest of the text holds no quote or backslash: an unterminated string ends the scan.
+                WHERE s.[Position] > 0
+                  AND m.[At] IS NOT NULL
+            )
+            SELECT t.[name] AS TableName,
+                   SCHEMA_NAME(t.[schema_id]) AS SchemaName,
+                   c.[name] AS ColumnName,
+                   ty.[name] AS TypeName,
+                   c.[max_length] AS MaxLengthBytes,
+                   c.[is_nullable] AS IsNullable,
+                   c.[is_identity] AS IsIdentity,
+                   c.[column_id] AS ColumnId
+            FROM sys.tables AS t
+            INNER JOIN sys.columns AS c ON c.[object_id] = t.[object_id]
+            INNER JOIN sys.types AS ty ON ty.[user_type_id] = c.[user_type_id]
+            WHERE t.[object_id] = OBJECT_ID(QUOTENAME(t.[name]))
+              AND t.[name] COLLATE Latin1_General_100_CI_AS IN
+                  (SELECT s.[Name] COLLATE Latin1_General_100_CI_AS FROM [Scan] AS s WHERE s.[Name] IS NOT NULL)
+            ORDER BY t.[name], c.[column_id]
+            OPTION (MAXRECURSION 0);
         """;
 
     /// <summary>Takes <c>@viewId</c>; returns <c>CheckCode</c> (<c>ntext</c>, possibly <c>NULL</c>) of the form, or no row for an unknown form.</summary>
-    public const string CheckCode = """
+    internal const string CheckCode = """
         SELECT [CheckCode] AS CheckCode
         FROM [metaViews]
         WHERE [ViewId] = @viewId;
@@ -135,7 +220,7 @@ internal static class MetadataQueries
 
     /// <summary>Takes <c>@tableName</c>; returns one unnamed column, the <c>tempdb</c> object id of the session temporary table, or <c>NULL</c> when it does not exist.</summary>
     /// <remarks>Used only by the reserved-word test fixture, so a missing <c>#</c> table fails with a clear message.</remarks>
-    public const string TempTableObjectId = """
+    internal const string TempTableObjectId = """
         SELECT OBJECT_ID(N'tempdb..' + @tableName);
         """;
 
@@ -144,7 +229,7 @@ internal static class MetadataQueries
     /// Used only by the reserved-word test fixture. No <c>TableName</c> column is returned: the <c>tempdb</c>
     /// catalogue holds a mangled name, so the reader keeps the session name it was given.
     /// </remarks>
-    public const string TempdbColumns = """
+    internal const string TempdbColumns = """
         SELECT c.[name] AS ColumnName,
                ty.[name] AS TypeName,
                c.[max_length] AS MaxLengthBytes,
