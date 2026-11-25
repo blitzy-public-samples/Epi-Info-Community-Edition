@@ -3,7 +3,9 @@ namespace EpiInfo.Api.Hosting;
 /// <summary>
 /// Refuses to start the API unless every effective listen setting binds the IPv4 loopback address
 /// <c>127.0.0.1</c> exactly. It reads configuration only, so it runs before any socket opens and a rejected
-/// setting never listens.
+/// setting never listens. For a server that opens sockets, <see cref="FreezeListenSettings"/> then reads the listen
+/// settings once more, fails when none is configured, and gives Kestrel and the host a fixed copy of exactly the
+/// values it verified, so a settings file that changes afterwards cannot alter what is bound.
 /// </summary>
 public static class LoopbackBindingGuard
 {
@@ -24,8 +26,27 @@ public static class LoopbackBindingGuard
 
     private const string EndpointUrlKey = "Url";
 
+    private const string KestrelSection = "Kestrel";
+
+    private const string EndpointsKey = "Endpoints";
+
+    // Host key that decides whether the urls addresses replace the Kestrel endpoints.
+    private const string PreferHostingUrlsKey = "preferHostingUrls";
+
+    // Fixed text naming keys only, never a value, like every message of the guard.
+    private const string NoListenAddressMessage =
+        "No listen address is configured: set 'Kestrel:Endpoints:Http:Url' (committed in appsettings.json) or 'urls' "
+        + "to an http://127.0.0.1 URL; Kestrel's default would also bind IPv6 loopback.";
+
+    private const string NotPinnableMessage =
+        "The listen settings cannot be pinned: the configuration given to the Kestrel setup is not the host's "
+        + "configuration builder, so the host could bind settings that were never verified.";
+
     // Ports-only settings make the host bind every interface, whatever the port, so any non-empty value is refused.
     private static readonly string[] PortsOnlyKeys = [HttpPortsKey, HttpsPortsKey];
+
+    // The host keys the generic web host reads when it starts the server, beside the Kestrel section.
+    private static readonly string[] HostListenKeys = [UrlsKey, HttpPortsKey, HttpsPortsKey, PreferHostingUrlsKey];
 
     /// <summary>
     /// Throws when any listen setting in <paramref name="configuration"/> breaks the loopback rule, naming every
@@ -40,56 +61,90 @@ public static class LoopbackBindingGuard
             return;
         }
 
-        // Keys only, never values: a configured URL can carry credentials or internal host names.
-        string keys = string.Join(", ", violations.Select(key => $"'{key}'"));
-        string subject = violations.Count == 1 ? $"Listen setting {keys} is" : $"Listen settings {keys} are";
-        throw new InvalidOperationException(
-            $"{subject} not allowed: the API must bind to http://127.0.0.1 only (ports-only settings are rejected).");
+        throw new InvalidOperationException(DescribeViolations(violations));
     }
 
     /// <summary>
     /// Returns the full configuration keys whose listen setting breaks the loopback rule: Kestrel endpoint URLs in
     /// section order, then <see cref="UrlsKey"/>, <see cref="HttpPortsKey"/> and <see cref="HttpsPortsKey"/>.
-    /// A null, empty or whitespace setting counts as absent, so a configuration with no listen setting at all passes.
-    /// The API therefore relies on the committed <c>appsettings.json</c> endpoint being loaded; without it Kestrel
-    /// falls back to its own default, <c>http://localhost:5000</c>.
+    /// Each setting is checked in the form <see cref="FreezeListenSettings"/> hands to the server: an endpoint URL and
+    /// each <c>;</c>-separated <see cref="UrlsKey"/> entry are trimmed, and a null, empty or whitespace setting or
+    /// entry counts as absent. A configuration with no listen setting at all therefore passes here, which keeps hosts
+    /// that open no socket, such as the in-memory test server, usable; a server that opens sockets fails closed on it
+    /// in <see cref="FreezeListenSettings"/>.
     /// </summary>
     public static IReadOnlyList<string> FindViolations(IConfiguration configuration)
     {
         ArgumentNullException.ThrowIfNull(configuration);
 
-        var violations = new List<string>();
-
-        foreach (IConfigurationSection endpoint in configuration.GetSection(KestrelEndpointsSection).GetChildren())
-        {
-            string? url = endpoint[EndpointUrlKey];
-            if (!string.IsNullOrWhiteSpace(url) && !IsAllowedListenUrl(url))
-            {
-                violations.Add(ConfigurationPath.Combine(KestrelEndpointsSection, endpoint.Key, EndpointUrlKey));
-            }
-        }
-
-        string? urls = configuration[UrlsKey];
-        if (!string.IsNullOrWhiteSpace(urls)
-            && !urls.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).All(IsAllowedListenUrl))
-        {
-            violations.Add(UrlsKey);
-        }
-
-        foreach (string portsKey in PortsOnlyKeys)
-        {
-            if (!string.IsNullOrWhiteSpace(configuration[portsKey]))
-            {
-                violations.Add(portsKey);
-            }
-        }
-
-        return violations;
+        return Inspect(configuration).Violations;
     }
 
     /// <summary>
-    /// Whether <paramref name="url"/> is an <c>http</c> or <c>https</c> URL that Kestrel binds to <c>127.0.0.1</c>
-    /// alone, on any port (<c>0</c> included). Never throws.
+    /// Verifies the listen settings of <paramref name="configuration"/> for a server that opens sockets, and returns
+    /// the <c>Kestrel</c> section for <c>KestrelServerOptions.Configure</c> as a fixed copy of the values verified,
+    /// while pinning the host's own listen keys to that same copy. Call it from the <c>ConfigureKestrel</c> callback
+    /// of the host that owns <paramref name="configuration"/>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The live sources are read once. The returned copy never reloads and holds every setting of the <c>Kestrel</c>
+    /// section, with each endpoint <c>Url</c> replaced by its trimmed, verified text; an endpoint whose <c>Url</c> is
+    /// missing or blank is left out with all of its settings, because Kestrel would reject it and abort startup.
+    /// </para>
+    /// <para>
+    /// One in-memory source is added last to <paramref name="configuration"/>, so it outranks every reloadable
+    /// settings file when the host starts the server: <see cref="UrlsKey"/> holds the verified entries joined by
+    /// <c>;</c>, or is empty when there are none; <see cref="HttpPortsKey"/> and <see cref="HttpsPortsKey"/> are
+    /// empty; and <c>preferHostingUrls</c> keeps the value read only while <see cref="UrlsKey"/> has entries, and is
+    /// <c>false</c> otherwise, so the verified endpoints win over any address the host captured before this call.
+    /// </para>
+    /// </remarks>
+    /// <exception cref="InvalidOperationException">
+    /// A listen setting is not allowed (the message <see cref="Validate"/> gives); no listen address is configured,
+    /// in which case Kestrel would bind its <c>localhost</c> default, IPv6 loopback included; or
+    /// <paramref name="configuration"/> is not a configuration builder the pinned values can be added to.
+    /// </exception>
+    public static IConfiguration FreezeListenSettings(IConfiguration configuration)
+    {
+        ArgumentNullException.ThrowIfNull(configuration);
+
+        // Everything below checks and hands on this one copy, so a settings file reloading meanwhile cannot change
+        // what the server is given.
+        IConfigurationRoot snapshot = CopyListenSettings(configuration);
+        ListenSettings settings = Inspect(snapshot);
+
+        if (settings.Violations.Count > 0)
+        {
+            throw new InvalidOperationException(DescribeViolations(settings.Violations));
+        }
+
+        if (!settings.HasAddress)
+        {
+            throw new InvalidOperationException(NoListenAddressMessage);
+        }
+
+        if (configuration is not IConfigurationBuilder hostConfiguration)
+        {
+            throw new InvalidOperationException(NotPinnableMessage);
+        }
+
+        string? preferHostingUrls = snapshot[PreferHostingUrlsKey];
+        hostConfiguration.AddInMemoryCollection(new Dictionary<string, string?>
+        {
+            [UrlsKey] = string.Join(';', settings.Urls),
+            [HttpPortsKey] = string.Empty,
+            [HttpsPortsKey] = string.Empty,
+            [PreferHostingUrlsKey] = settings.Urls.Count > 0 && preferHostingUrls is not null ? preferHostingUrls : "false",
+        });
+
+        return FreezeKestrelSection(snapshot, settings);
+    }
+
+    /// <summary>
+    /// Whether <paramref name="url"/>, exactly as written, is an <c>http</c> or <c>https</c> URL that Kestrel binds to
+    /// <c>127.0.0.1</c> alone, on any port (<c>0</c> included). Nothing is trimmed: Kestrel parses the text it is given
+    /// unchanged, so surrounding whitespace fails, and a setting is normalised before it is checked. Never throws.
     /// </summary>
     public static bool IsAllowedListenUrl(string url)
     {
@@ -98,8 +153,7 @@ public static class LoopbackBindingGuard
             return false;
         }
 
-        string candidate = url.Trim();
-        if (!Uri.TryCreate(candidate, UriKind.Absolute, out Uri? uri))
+        if (!Uri.TryCreate(url, UriKind.Absolute, out Uri? uri))
         {
             return false;
         }
@@ -114,18 +168,26 @@ public static class LoopbackBindingGuard
             return false;
         }
 
-        return SpellsLoopbackAuthority(candidate);
+        return SpellsLoopbackUrl(url);
     }
 
-    // Kestrel does not parse listen URLs with Uri. It takes the host as the text between "://" and the last ':'
-    // before the first '/', and binds every interface when that text is neither "localhost" nor an IP address.
-    // Uri reports host 127.0.0.1 for forms Kestrel reads otherwise ("http://user@127.0.0.1:5000",
-    // "http://127.0.0.1:5000?x", "http://127.0.0.1:"), and normalises shorthand such as "http://127.1", so the URL
-    // text itself must spell "127.0.0.1" or "127.0.0.1:<digits>", optionally followed by a single '/'.
-    private static bool SpellsLoopbackAuthority(string url)
+    // Kestrel does not parse listen URLs with Uri. It takes the scheme as the text before "://" and the host as the
+    // text between "://" and the last ':' before the first '/', and binds every interface when that host text is
+    // neither "localhost" nor an IP address. Uri ignores surrounding whitespace, reports host 127.0.0.1 for forms
+    // Kestrel reads otherwise ("http://user@127.0.0.1:5000", "http://127.0.0.1:5000?x", "http://127.0.0.1:"), and
+    // normalises shorthand such as "http://127.1", so the URL text itself must spell "http" or "https" in any case, as
+    // Kestrel compares it, then "://127.0.0.1" or "://127.0.0.1:<digits>", optionally followed by a single '/'.
+    private static bool SpellsLoopbackUrl(string url)
     {
         int schemeDelimiter = url.IndexOf(Uri.SchemeDelimiter, StringComparison.Ordinal);
         if (schemeDelimiter < 0)
+        {
+            return false;
+        }
+
+        ReadOnlySpan<char> scheme = url.AsSpan(0, schemeDelimiter);
+        if (!scheme.Equals(Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase)
+            && !scheme.Equals(Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
         {
             return false;
         }
@@ -151,5 +213,122 @@ public static class LoopbackBindingGuard
 
         ReadOnlySpan<char> digits = portPart[1..];
         return portPart[0] == ':' && !digits.IsEmpty && !digits.ContainsAnyExceptInRange('0', '9');
+    }
+
+    // Keys only, never values: a configured URL can carry credentials or internal host names.
+    private static string DescribeViolations(IReadOnlyList<string> violations)
+    {
+        string keys = string.Join(", ", violations.Select(key => $"'{key}'"));
+        string subject = violations.Count == 1 ? $"Listen setting {keys} is" : $"Listen settings {keys} are";
+        return $"{subject} not allowed: the API must bind to http://127.0.0.1 only (ports-only settings are rejected).";
+    }
+
+    // The single reading of the listen settings that both FindViolations and FreezeListenSettings use, so the text
+    // checked is the text the server is given: each endpoint Url trimmed, a blank one absent; urls split on ';' into
+    // trimmed, non-empty entries; and any non-blank ports-only setting refused.
+    private static ListenSettings Inspect(IConfiguration configuration)
+    {
+        var endpoints = new List<EndpointSetting>();
+        var violations = new List<string>();
+
+        foreach (IConfigurationSection endpoint in configuration.GetSection(KestrelEndpointsSection).GetChildren())
+        {
+            string? url = endpoint[EndpointUrlKey]?.Trim() is { Length: > 0 } trimmed ? trimmed : null;
+            endpoints.Add(new EndpointSetting(endpoint.Key, url));
+            if (url is not null && !IsAllowedListenUrl(url))
+            {
+                violations.Add(ConfigurationPath.Combine(KestrelEndpointsSection, endpoint.Key, EndpointUrlKey));
+            }
+        }
+
+        string[] urls = (configuration[UrlsKey] ?? string.Empty)
+            .Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (!urls.All(IsAllowedListenUrl))
+        {
+            violations.Add(UrlsKey);
+        }
+
+        foreach (string portsKey in PortsOnlyKeys)
+        {
+            if (!string.IsNullOrWhiteSpace(configuration[portsKey]))
+            {
+                violations.Add(portsKey);
+            }
+        }
+
+        return new ListenSettings(endpoints, urls, violations);
+    }
+
+    // Reads the Kestrel section and the host listen keys from the live sources into memory in one pass, full keys
+    // unchanged. The section keeps its exact shape: every key it enumerates is copied, null-valued nodes included,
+    // because a settings file stores an empty object or array (an SNI host name with no settings, the "*" SNI
+    // fallback) as a key with a null value, and the in-memory copy enumerates such a key as a child the same way.
+    // The host listen keys are scalars and are copied only when set.
+    private static IConfigurationRoot CopyListenSettings(IConfiguration configuration)
+    {
+        var copy = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
+        foreach (KeyValuePair<string, string?> setting in configuration.GetSection(KestrelSection).AsEnumerable())
+        {
+            copy[setting.Key] = setting.Value;
+        }
+
+        foreach (string key in HostListenKeys)
+        {
+            if (configuration[key] is string value)
+            {
+                copy[key] = value;
+            }
+        }
+
+        return new ConfigurationBuilder().AddInMemoryCollection(copy).Build();
+    }
+
+    // The Kestrel section as the server loads it, with keys relative to the section. It keeps the copy's exact shape,
+    // null-valued nodes (empty objects and arrays) included, so an SNI allowlist entry or "*" fallback with no
+    // settings still reaches Kestrel. Each endpoint without a Url is left out with its whole subtree, its own node
+    // included, and each kept endpoint Url is replaced by its verified text.
+    private static IConfigurationRoot FreezeKestrelSection(IConfiguration snapshot, ListenSettings settings)
+    {
+        string[] droppedEndpoints = settings.Endpoints
+            .Where(endpoint => endpoint.Url is null)
+            .Select(endpoint => ConfigurationPath.Combine(EndpointsKey, endpoint.Name))
+            .ToArray();
+
+        var frozen = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
+        foreach (KeyValuePair<string, string?> setting in
+                 snapshot.GetSection(KestrelSection).AsEnumerable(makePathsRelative: true))
+        {
+            if (!droppedEndpoints.Any(path => IsPathOrDescendant(setting.Key, path)))
+            {
+                frozen[setting.Key] = setting.Value;
+            }
+        }
+
+        foreach (EndpointSetting endpoint in settings.Endpoints)
+        {
+            if (endpoint.Url is not null)
+            {
+                frozen[ConfigurationPath.Combine(EndpointsKey, endpoint.Name, EndpointUrlKey)] = endpoint.Url;
+            }
+        }
+
+        return new ConfigurationBuilder().AddInMemoryCollection(frozen).Build();
+    }
+
+    // Configuration keys compare without case.
+    private static bool IsPathOrDescendant(string key, string path) =>
+        key.Equals(path, StringComparison.OrdinalIgnoreCase)
+        || key.StartsWith(path + ConfigurationPath.KeyDelimiter, StringComparison.OrdinalIgnoreCase);
+
+    // One child of Kestrel:Endpoints: its name, and its trimmed Url, or null when the Url is missing or blank.
+    private sealed record EndpointSetting(string Name, string? Url);
+
+    // The normalised listen settings, with the offending keys in the order FindViolations documents.
+    private sealed record ListenSettings(
+        IReadOnlyList<EndpointSetting> Endpoints,
+        IReadOnlyList<string> Urls,
+        IReadOnlyList<string> Violations)
+    {
+        public bool HasAddress => Urls.Count > 0 || Endpoints.Any(endpoint => endpoint.Url is not null);
     }
 }

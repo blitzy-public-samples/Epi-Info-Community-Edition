@@ -12,8 +12,12 @@ LoopbackBindingGuard.Validate(builder.Configuration);
 
 builder.WebHost.ConfigureKestrel((context, options) =>
 {
-    // Reload off: a changed appsettings.json cannot rebind the running server to an endpoint the guard never saw.
-    options.Configure(context.Configuration.GetSection("Kestrel"), reloadOnChange: false);
+    // Reload stays off, Kestrel loads the guard's frozen copy of the verified Kestrel section, and the host's urls and
+    // ports settings read values the guard pinned to that same copy, so a changed appsettings.json can neither alter
+    // the first bind nor rebind the running server later. An endpoint with a blank Url is dropped rather than
+    // rejected by Kestrel, and a server with no listen address fails here instead of binding Kestrel's dual-stack
+    // localhost default.
+    options.Configure(LoopbackBindingGuard.FreezeListenSettings(context.Configuration), reloadOnChange: false);
 
     // Loading the Kestrel section binds endpoints, not limits, so the body cap is applied from configuration here.
     options.Limits.MaxRequestBodySize = ApiOptions.FromConfiguration(context.Configuration).MaxRequestBodySize;
