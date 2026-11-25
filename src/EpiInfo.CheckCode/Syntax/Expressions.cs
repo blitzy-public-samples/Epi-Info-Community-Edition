@@ -10,7 +10,7 @@ public enum LiteralKind
     /// <summary>A double-quoted string literal; its content is in <see cref="LiteralNode.Text"/>.</summary>
     String,
 
-    /// <summary>A numeric literal; its invariant-culture value is in <see cref="LiteralNode.Number"/>.</summary>
+    /// <summary>A numeric literal; its finite invariant-culture value is in <see cref="LiteralNode.Number"/>.</summary>
     Number,
 
     /// <summary>The missing-value literal <c>(.)</c>, which evaluates to no value.</summary>
@@ -25,10 +25,22 @@ public enum LiteralKind
 /// </summary>
 /// <remarks>
 /// <para>
-/// <see cref="Line"/> is the 1-based line, in the form's <c>metaViews.CheckCode</c> text, of the construct's
-/// first token: the <c>NOT</c> keyword for <see cref="NotNode"/>, the left operand's first token for
-/// <see cref="AndNode"/> and <see cref="EqualsNode"/>, and the function name for <see cref="FunctionCallNode"/>.
-/// Nodes carry that line rather than a token, so the tree has no dependency on the lexer.
+/// <see cref="Line"/> is the 1-based line, in the form's <c>metaViews.CheckCode</c> text, of the token the
+/// construct is attributed to: the literal or identifier token for <see cref="LiteralNode"/> and
+/// <see cref="IdentifierNode"/>, the function name for <see cref="FunctionCallNode"/>, the <c>NOT</c> keyword for
+/// <see cref="NotNode"/>, the <c>AND</c> keyword for <see cref="AndNode"/> and the <c>=</c> operator for
+/// <see cref="EqualsNode"/>. When an expression sits on one line, a binary node's operator shares that line with
+/// its left operand's first token. On a multiline expression a binary node carries its operator's line, the line
+/// the parser reports operator diagnostics at, and each operand node carries its own line by these same rules.
+/// The tree does not record where a binary node's left operand begins: that operand can itself be a binary node
+/// carrying its operator's line, or a parenthesised expression whose <c>(</c> has no node. With
+/// <c>IF A = "1"</c> on line 3 and <c>AND B = "2" THEN</c> on line 4, the condition is an <see cref="AndNode"/>
+/// with line 4 whose left <see cref="EqualsNode"/> has line 3 and whose right <see cref="EqualsNode"/> has line 4.
+/// With <c>IF A</c> on line 3 and <c>= "1" THEN</c> on line 4, the condition is an <see cref="EqualsNode"/> with
+/// line 4 whose left <see cref="IdentifierNode"/> has line 3 and whose right <see cref="LiteralNode"/> has line 4.
+/// In the chain <c>a = b = c</c> the outer <see cref="EqualsNode"/> carries the line of the first <c>=</c> and the
+/// inner one the line of the second. Nodes carry that line rather than a token, so the tree has no dependency on
+/// the lexer.
 /// </para>
 /// <para>
 /// Precedence follows the grammar's expression ladder: <c>NOT</c> binds one comparison and <c>AND</c> binds
@@ -51,14 +63,16 @@ public enum LiteralKind
 /// reach the tree.
 /// </para>
 /// </remarks>
-/// <param name="Line">The 1-based source line of the construct's first token.</param>
+/// <param name="Line">The 1-based source line the construct is attributed to; see remarks.</param>
 public abstract record ExpressionNode(int Line);
 
 /// <summary>
 /// A literal value. Build it through <see cref="FromString"/>, <see cref="FromNumber"/>, <see cref="Missing"/>
 /// or <see cref="Unchecked"/>, which keep <see cref="Text"/> and <see cref="Number"/> consistent with
 /// <see cref="Kind"/>: only a <see cref="LiteralKind.String"/> has text and only a
-/// <see cref="LiteralKind.Number"/> has a number.
+/// <see cref="LiteralKind.Number"/> has a number. <see cref="Number"/> is always finite: the constructor and a
+/// <see langword="with"/> expression reject NaN and infinities, as <c>FieldValue.FromNumber</c> does for the value
+/// the literal evaluates to.
 /// </summary>
 /// <param name="Kind">The literal's kind.</param>
 /// <param name="Text">
@@ -66,10 +80,26 @@ public abstract record ExpressionNode(int Line);
 /// trimming and no escape processing, because the grammar's <c>String</c> terminal has no escapes. Otherwise
 /// <see langword="null"/>.
 /// </param>
-/// <param name="Number">For a numeric literal, its invariant-culture value; otherwise <see langword="null"/>.</param>
+/// <param name="Number">
+/// For a numeric literal, its finite invariant-culture value; otherwise <see langword="null"/>.
+/// </param>
 /// <param name="Line">The 1-based source line of the literal.</param>
+/// <exception cref="ArgumentOutOfRangeException"><paramref name="Number"/> is NaN or infinite.</exception>
 public sealed record LiteralNode(LiteralKind Kind, string? Text, double? Number, int Line) : ExpressionNode(Line)
 {
+    private const string NotFiniteMessage = "A numeric literal must be a finite number.";
+
+    private readonly double? number = ValidateNumber(Number, nameof(Number));
+
+    /// <summary>For a numeric literal, its finite invariant-culture value; otherwise <see langword="null"/>.</summary>
+    /// <exception cref="ArgumentOutOfRangeException">The value is NaN or infinite.</exception>
+    public double? Number
+    {
+        get => number;
+        // Validated here as well as in the constructor, so a `with` expression cannot bypass the rule.
+        init => number = ValidateNumber(value, nameof(Number));
+    }
+
     /// <summary>Creates a string literal whose content, quotes already removed, is <paramref name="text"/>.</summary>
     /// <exception cref="ArgumentNullException"><paramref name="text"/> is <see langword="null"/>.</exception>
     public static LiteralNode FromString(string text, int line)
@@ -78,9 +108,24 @@ public sealed record LiteralNode(LiteralKind Kind, string? Text, double? Number,
         return new LiteralNode(LiteralKind.String, text, null, line);
     }
 
-    /// <summary>Creates a numeric literal with the invariant-culture <paramref name="value"/>.</summary>
-    public static LiteralNode FromNumber(double value, int line) =>
-        new(LiteralKind.Number, null, value, line);
+    /// <summary>Creates a numeric literal with the finite invariant-culture <paramref name="value"/>.</summary>
+    /// <remarks>
+    /// <see cref="double.TryParse(string, System.Globalization.NumberStyles, IFormatProvider, out double)"/>
+    /// succeeds with an infinity for an overflowing literal such as <c>1E999</c>. A caller converting source text
+    /// therefore tests <see cref="double.IsFinite(double)"/> first and reports such a literal as an unsupported
+    /// numeric literal (a <c>NUMBER-LITERAL</c> warning, with only that statement skipped) instead of building a
+    /// node.
+    /// </remarks>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="value"/> is NaN or infinite.</exception>
+    public static LiteralNode FromNumber(double value, int line)
+    {
+        if (!double.IsFinite(value))
+        {
+            throw new ArgumentOutOfRangeException(nameof(value), NotFiniteMessage);
+        }
+
+        return new LiteralNode(LiteralKind.Number, null, value, line);
+    }
 
     /// <summary>Creates the missing-value literal <c>(.)</c>.</summary>
     public static LiteralNode Missing(int line) =>
@@ -89,6 +134,18 @@ public sealed record LiteralNode(LiteralKind Kind, string? Text, double? Number,
     /// <summary>Creates the unchecked literal <c>(-)</c>.</summary>
     public static LiteralNode Unchecked(int line) =>
         new(LiteralKind.Unchecked, null, null, line);
+
+    // Callers pass the name to report, the Number constructor parameter or property, because it is not a
+    // parameter of this helper.
+    private static double? ValidateNumber(double? value, string paramName)
+    {
+        if (value.HasValue && !double.IsFinite(value.Value))
+        {
+            throw new ArgumentOutOfRangeException(paramName, NotFiniteMessage);
+        }
+
+        return value;
+    }
 }
 
 /// <summary>A reference to a field of the form.</summary>
@@ -102,15 +159,61 @@ public sealed record IdentifierNode(string Name, int Line) : ExpressionNode(Line
 
 /// <summary>
 /// A call of a registered function (<c>YEARS</c> or <c>EPIWEEK</c>); any other function is a diagnostic and
-/// never becomes a node. Equality compares <see cref="Arguments"/> element by element, so a parsed tree equals
-/// a separately built expected tree.
+/// never becomes a node. <see cref="Arguments"/> is an immutable snapshot taken by the constructor and by a
+/// <see langword="with"/> expression, so later changes to the caller's list or array never reach the node, and no
+/// cast or collection interface on the snapshot reaches writable storage. Equality compares <see cref="Name"/>
+/// ordinally and <see cref="Arguments"/> element by element, so a parsed tree equals a separately built expected
+/// tree.
 /// </summary>
-/// <param name="Name">The function name as written.</param>
-/// <param name="Arguments">The argument expressions in source order.</param>
+/// <param name="Name">
+/// The function name, stored in upper-invariant form (<c>YEARS</c>, <c>EPIWEEK</c>). Function names are
+/// case-insensitive like keywords (grammar line 4) and <see cref="Functions.FunctionRegistry"/> looks them up
+/// case-insensitively, so <c>Years</c>, <c>years</c> and <c>YEARS</c> build equal nodes.
+/// </param>
+/// <param name="Arguments">
+/// The argument expressions in source order, copied into an immutable snapshot.
+/// </param>
 /// <param name="Line">The 1-based source line of the function name.</param>
+/// <exception cref="ArgumentNullException">
+/// <paramref name="Name"/> or <paramref name="Arguments"/> is <see langword="null"/>.
+/// </exception>
+/// <exception cref="ArgumentException">
+/// <paramref name="Arguments"/> contains a <see langword="null"/> element.
+/// </exception>
 public sealed record FunctionCallNode(string Name, IReadOnlyList<ExpressionNode> Arguments, int Line)
     : ExpressionNode(Line)
 {
+    private readonly string name = CanonicalName(Name);
+
+    private readonly System.Collections.Immutable.ImmutableList<ExpressionNode> arguments =
+        Snapshot(Arguments, nameof(Arguments));
+
+    /// <summary>
+    /// The function name in upper-invariant form (<c>YEARS</c>, <c>EPIWEEK</c>), whatever its spelling in the
+    /// program.
+    /// </summary>
+    /// <exception cref="ArgumentNullException">The value is <see langword="null"/>.</exception>
+    public string Name
+    {
+        get => name;
+        // Canonicalised here as well as in the constructor, so a `with` expression cannot bypass the rule.
+        init => name = CanonicalName(value);
+    }
+
+    /// <summary>
+    /// The argument expressions in source order: an immutable snapshot that later changes to the caller's list
+    /// or array never reach. It exposes no writable storage: writes through its collection interfaces throw
+    /// <see cref="NotSupportedException"/>, and its own modifying methods return a new list.
+    /// </summary>
+    /// <exception cref="ArgumentNullException">The value is <see langword="null"/>.</exception>
+    /// <exception cref="ArgumentException">The value contains a <see langword="null"/> element.</exception>
+    public IReadOnlyList<ExpressionNode> Arguments
+    {
+        get => arguments;
+        // Copied here as well as in the constructor, so a `with` expression cannot alias a mutable list.
+        init => arguments = Snapshot(value, nameof(Arguments));
+    }
+
     /// <inheritdoc />
     public bool Equals(FunctionCallNode? other) =>
         other is not null
@@ -121,6 +224,31 @@ public sealed record FunctionCallNode(string Name, IReadOnlyList<ExpressionNode>
     /// <inheritdoc />
     public override int GetHashCode() =>
         HashCode.Combine(base.GetHashCode(), Name, SyntaxEquality.ListHash(Arguments));
+
+    private static string CanonicalName(string value)
+    {
+        ArgumentNullException.ThrowIfNull(value, nameof(Name));
+        return value.ToUpperInvariant();
+    }
+
+    // An immutable list exposes no writable storage: its collection-interface writes throw NotSupportedException,
+    // ICollection.SyncRoot is the list itself (a ReadOnlyCollection's would be its backing array), and its own
+    // modifying methods return a new list. Each element is read once, so a null cannot slip past the check. The
+    // property name is passed as paramName because Arguments is not a parameter of this helper.
+    private static System.Collections.Immutable.ImmutableList<ExpressionNode> Snapshot(
+        IReadOnlyList<ExpressionNode> value, string paramName)
+    {
+        ArgumentNullException.ThrowIfNull(value, paramName);
+        var builder = System.Collections.Immutable.ImmutableList.CreateBuilder<ExpressionNode>();
+        var count = value.Count;
+        for (var i = 0; i < count; i++)
+        {
+            builder.Add(value[i]
+                ?? throw new ArgumentException("A function call argument must not be null.", paramName));
+        }
+
+        return builder.ToImmutable();
+    }
 }
 
 /// <summary>The negation <c>NOT &lt;comparison&gt;</c>.</summary>
@@ -131,13 +259,13 @@ public sealed record NotNode(ExpressionNode Operand, int Line) : ExpressionNode(
 /// <summary>The conjunction <c>&lt;left&gt; AND &lt;right&gt;</c>; a chain nests to the right.</summary>
 /// <param name="Left">The left operand, a <c>NOT</c> term.</param>
 /// <param name="Right">The right operand, the rest of the chain.</param>
-/// <param name="Line">The 1-based source line of the left operand's first token.</param>
+/// <param name="Line">The 1-based source line of the <c>AND</c> keyword.</param>
 public sealed record AndNode(ExpressionNode Left, ExpressionNode Right, int Line) : ExpressionNode(Line);
 
 /// <summary>The comparison <c>&lt;left&gt; = &lt;right&gt;</c>; a chain nests to the right.</summary>
 /// <param name="Left">The left operand.</param>
 /// <param name="Right">The right operand, the rest of the chain.</param>
-/// <param name="Line">The 1-based source line of the left operand's first token.</param>
+/// <param name="Line">The 1-based source line of the <c>=</c> operator.</param>
 public sealed record EqualsNode(ExpressionNode Left, ExpressionNode Right, int Line) : ExpressionNode(Line);
 
 /// <summary>

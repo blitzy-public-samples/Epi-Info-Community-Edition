@@ -1,4 +1,5 @@
 using System.Globalization;
+using EpiInfo.Domain.Values;
 
 namespace EpiInfo.Domain.Validation;
 
@@ -89,8 +90,6 @@ public static class ValidationMessages
 
     /// <summary>Legal-values check: text that equals none of the field's options.</summary>
     public const string NotALegalValue = "The value is not one of the field's legal values.";
-
-    private const string IsoDateFormat = "yyyy-MM-dd";
 
     /// <summary>
     /// Formats <see cref="FieldIsRequiredLong"/> for one missing field. The prompt is used exactly as stored,
@@ -187,5 +186,5 @@ public static class ValidationMessages
         return bound.ToString("R", CultureInfo.InvariantCulture);
     }
 
-    private static string FormatBound(DateOnly bound) => bound.ToString(IsoDateFormat, CultureInfo.InvariantCulture);
+    private static string FormatBound(DateOnly bound) => FieldValue.FormatIsoDate(bound);
 }

@@ -1,4 +1,4 @@
-using System.Globalization;
+using System.Buffers;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using EpiInfo.Domain.Values;
@@ -12,14 +12,16 @@ namespace EpiInfo.Api.Json;
 /// </summary>
 /// <remarks>
 /// <para>
-/// Writing: null is <c>null</c>; text and legal values are strings; a number is a JSON number; a checkbox is a
-/// boolean; a date is the string <c>YYYY-MM-DD</c> with no time of day; an option is its 0-based index as a JSON
-/// integer.
+/// Writing: null is <c>null</c>; text and legal values are strings; a number is a JSON number, written digit for
+/// digit when it holds an exact integer and in round-trip form otherwise; a checkbox is a boolean; a date is the
+/// string <c>YYYY-MM-DD</c> with no time of day; an option is its 0-based index as a JSON integer.
 /// </para>
 /// <para>
 /// Reading is raw and field-type blind: a string becomes text, even when it holds an ISO date; a number becomes a
-/// finite double, even when it is integral; a boolean becomes a boolean. Interpreting a value for its field type
-/// belongs to <c>RecordValidator</c>, <c>SearchCriteriaParser</c> and <c>ValuesReader.ToTyped</c>.
+/// finite number value kept exact, so a whole number within the signed 64-bit range keeps its exact integer, even
+/// above 2^53, and any other number keeps its nearest double without being rounded into a whole number; a boolean
+/// becomes a boolean. Interpreting a value for its field type belongs to <c>RecordValidator</c>,
+/// <c>SearchCriteriaParser</c> and <c>ValuesReader.ToTyped</c>.
 /// </para>
 /// <para>
 /// Exception messages are fixed text and never echo the value read or written, because field data is kept out of
@@ -52,17 +54,22 @@ public sealed class FieldValueJsonConverter : JsonConverter<FieldValue>
                 return FieldValue.Null;
 
             case JsonTokenType.String:
-                // A String token always yields a string. It is kept verbatim: trimming and empty-to-null
-                // normalisation are validation rules.
+                // GetString() throws for text it cannot decode, such as malformed UTF-8 or an escaped lone
+                // surrogate: the reader tags that InvalidOperationException as rethrowable, and the serializer
+                // rethrows it as a JsonException during binding, so the body fails as malformed JSON. Any other
+                // string is kept verbatim: trimming and empty-to-null normalisation are validation rules.
                 return FieldValue.FromText(reader.GetString()!);
 
             case JsonTokenType.Number:
-                // Integers are read as doubles too; the per-type owners turn an integral double into an option
-                // index where the field type requires one. TryGetDouble already refuses values that overflow to
-                // infinity; the finiteness check keeps FromNumber's precondition explicit.
-                if (reader.TryGetDouble(out var number) && double.IsFinite(number))
+                // Exact and field-type blind: a whole number within the signed 64-bit range keeps its exact
+                // integer, and any other number keeps its nearest double without being rounded into a whole
+                // number; the per-type owners decide what the field accepts. The reader has already checked the
+                // JSON number grammar. TryGetDouble would succeed with infinity for 1e400, so it is not used: the
+                // parse rejects a number that is not finite by its own double.IsFinite check.
+                ReadOnlySpan<byte> literal = reader.HasValueSequence ? reader.ValueSequence.ToArray() : reader.ValueSpan;
+                if (FieldValueCoercion.TryParseNumber(literal, out var number))
                 {
-                    return FieldValue.FromNumber(number);
+                    return number;
                 }
 
                 throw new JsonException(NonFiniteMessage);
@@ -95,14 +102,24 @@ public sealed class FieldValueJsonConverter : JsonConverter<FieldValue>
                 break;
 
             case FieldValueKind.Number:
-                var number = value.AsNumber();
-                if (!double.IsFinite(number))
+                if (value.TryGetInteger(out var integer))
                 {
-                    // FromNumber admits finite values only; this keeps NaN and Infinity off the wire regardless.
-                    throw new JsonException(NonFiniteMessage);
+                    // An exact integer is written digit for digit, so a bigint beyond 2^53 is not rounded.
+                    writer.WriteNumberValue(integer);
+                }
+                else
+                {
+                    var number = value.AsNumber();
+                    if (!double.IsFinite(number))
+                    {
+                        // The factories admit finite values only; this keeps NaN and Infinity off the wire
+                        // regardless.
+                        throw new JsonException(NonFiniteMessage);
+                    }
+
+                    writer.WriteNumberValue(number);
                 }
 
-                writer.WriteNumberValue(number);
                 break;
 
             case FieldValueKind.Boolean:
@@ -111,7 +128,7 @@ public sealed class FieldValueJsonConverter : JsonConverter<FieldValue>
 
             case FieldValueKind.Date:
                 // Date fields are date-only on the wire: never a time of day, whatever the column type stores.
-                writer.WriteStringValue(value.AsDate().ToString("yyyy-MM-dd", CultureInfo.InvariantCulture));
+                writer.WriteStringValue(FieldValue.FormatIsoDate(value.AsDate()));
                 break;
 
             case FieldValueKind.Index:

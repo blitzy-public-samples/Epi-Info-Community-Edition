@@ -1,9 +1,11 @@
 using System.Globalization;
+using System.Security;
 using Microsoft.AspNetCore.Routing.Constraints;
 using Microsoft.AspNetCore.Routing.Matching;
 using Microsoft.AspNetCore.Routing.Patterns;
 using Microsoft.AspNetCore.StaticFiles;
 using Microsoft.Extensions.FileProviders;
+using Microsoft.Extensions.Primitives;
 
 namespace EpiInfo.Api.Hosting;
 
@@ -22,10 +24,17 @@ namespace EpiInfo.Api.Hosting;
 /// <c>/health</c>, never matches a path whose last segment looks like a file name, and has the lowest route order,
 /// so every concrete route wins and a missing asset or an unknown API route stays a 404.
 /// </para>
+/// <para>
+/// Assets and the fallback's <c>index.html</c> are read through one provider with the same exclusions: a file under
+/// <c>api/</c> or <c>openapi/</c>, compared case-insensitively, or a file named <c>health</c> is never served, so a
+/// request under a server path stays the route miss. That provider also refuses a file whose path below the client
+/// folder passes through a symbolic link or junction, so nothing outside the folder is served. The folder itself may
+/// be a link.
+/// </para>
 /// </remarks>
 public static partial class ClientAppHosting
 {
-    /// <summary>The logger category of the startup warning.</summary>
+    /// <summary>The logger category of the startup warnings.</summary>
     public const string LoggerCategory = "EpiInfo.Api.Hosting.ClientAppHosting";
 
     /// <summary>The page every client route is answered with.</summary>
@@ -39,18 +48,31 @@ public static partial class ClientAppHosting
 
     private const string ClientRoutePattern = "{" + FirstSegmentParameter + "}/{*" + RestParameter + "}";
 
+    // The server's own paths: /api/**, /openapi/** and /health. The fallback route and asset serving both read this
+    // one list, so a file in the client folder can never answer a request that belongs to the server.
+    private const string HealthPath = "health";
+
+    private static readonly string[] ServerPrefixes = ["api", "openapi"];
+
     // Fixed text with no arguments: the resolved folder is a local path, which the log redaction policy keeps out of
     // every log line. The configuration key is a compile-time constant, not a value.
     private const string ClientMissingMessage =
         $"Client application not found at the folder configured by {ApiOptions.ClientPathKey} ({IndexFileName} " +
         "missing); only /api, /health and /openapi are served. Run npm run build in web/.";
 
+    // Fixed text with no arguments, for the same reason: the rejected value is a local path.
+    private const string ClientPathInvalidMessage =
+        $"The folder configured by {ApiOptions.ClientPathKey} is not a usable path; only /api, /health and /openapi " +
+        "are served. Set it to the folder npm run build writes.";
+
     private static readonly string[] FallbackMethods = [HttpMethods.Get, HttpMethods.Head];
 
     /// <summary>
     /// Serves the client folder that <see cref="ApiOptions.ClientPath"/> names, resolved against the content root,
-    /// and maps the <c>index.html</c> fallback. When the folder or its <c>index.html</c> is missing, logs one warning
-    /// and registers nothing, so <c>/api</c>, <c>/health</c> and <c>/openapi</c> keep serving.
+    /// and maps the <c>index.html</c> fallback. When the folder or its <c>index.html</c> is missing, an
+    /// <c>index.html</c> reached through a link included, or the configured path is not a usable path, logs one
+    /// warning that names the configuration key but not its value, and registers nothing, so <c>/api</c>,
+    /// <c>/health</c> and <c>/openapi</c> keep serving.
     /// </summary>
     /// <param name="app">The application, after routing and every endpoint have been added.</param>
     /// <returns>The same application, for chaining.</returns>
@@ -60,16 +82,51 @@ public static partial class ClientAppHosting
         ArgumentNullException.ThrowIfNull(app);
 
         ApiOptions options = app.Services.GetRequiredService<ApiOptions>();
-        string folder = ResolveClientPath(app.Environment.ContentRootPath, options.ClientPath);
+        ILogger logger = app.Services.GetRequiredService<ILoggerFactory>().CreateLogger(LoggerCategory);
 
-        if (!Directory.Exists(folder) || !File.Exists(Path.Combine(folder, IndexFileName)))
+        // The client is optional, so a configured path the file system rejects leaves the API serving. Only the
+        // failures of resolving and opening a path are caught; the exception is not logged, because its message
+        // carries the path.
+        ClientFileProvider? fileProvider;
+        try
         {
-            // A warning, not a startup failure: dotnet test runs before npm run build in the documented sequence.
-            LogClientMissing(app.Services.GetRequiredService<ILoggerFactory>().CreateLogger(LoggerCategory));
+            fileProvider = OpenClientFolder(app.Environment.ContentRootPath, options.ClientPath);
+        }
+        catch (ArgumentException)
+        {
+            // Path.GetFullPath rejects a null character, among other malformed paths.
+            LogClientPathInvalid(logger);
+            return app;
+        }
+        catch (NotSupportedException)
+        {
+            LogClientPathInvalid(logger);
+            return app;
+        }
+        catch (IOException)
+        {
+            // A path too long for the platform, among others; a folder removed meanwhile is handled as missing.
+            LogClientPathInvalid(logger);
+            return app;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            LogClientPathInvalid(logger);
+            return app;
+        }
+        catch (SecurityException)
+        {
+            LogClientPathInvalid(logger);
             return app;
         }
 
-        var fileProvider = new PhysicalFileProvider(folder);
+        if (fileProvider is null)
+        {
+            // A warning, not a startup failure: dotnet test runs before npm run build in the documented sequence.
+            LogClientMissing(logger);
+            return app;
+        }
+
         app.Lifetime.ApplicationStopped.Register(fileProvider.Dispose);
 
         var staticOptions = new StaticFileOptions
@@ -91,7 +148,9 @@ public static partial class ClientAppHosting
     /// <param name="contentRootPath">The application's content root, <c>src/EpiInfo.Api</c> in a checkout.</param>
     /// <param name="clientPath">The configured <c>Web:ClientPath</c>.</param>
     /// <returns>The normalised full path of the client folder.</returns>
-    /// <exception cref="ArgumentException">Either argument is <see langword="null"/>, empty or whitespace.</exception>
+    /// <exception cref="ArgumentException">
+    /// Either argument is <see langword="null"/>, empty or whitespace, or the combined path contains a null character.
+    /// </exception>
     public static string ResolveClientPath(string contentRootPath, string clientPath)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(contentRootPath);
@@ -101,12 +160,49 @@ public static partial class ClientAppHosting
         return Path.GetFullPath(Path.Combine(contentRootPath, clientPath));
     }
 
+    // Returns null when the folder or its index.html is missing. The index is looked up through the same provider
+    // that serves it, so an index.html reached through a link counts as missing.
+    private static ClientFileProvider? OpenClientFolder(string contentRootPath, string clientPath)
+    {
+        string folder = ResolveClientPath(contentRootPath, clientPath);
+        if (!Directory.Exists(folder))
+        {
+            return null;
+        }
+
+        ClientFileProvider fileProvider;
+        try
+        {
+            fileProvider = new ClientFileProvider(folder);
+        }
+        catch (DirectoryNotFoundException)
+        {
+            // Removed between the existence check and the provider's own: missing, not unusable.
+            return null;
+        }
+
+        if (fileProvider.GetFileInfo(IndexFileName).Exists)
+        {
+            return fileProvider;
+        }
+
+        fileProvider.Dispose();
+        return null;
+    }
+
     [LoggerMessage(
         EventId = 1,
         EventName = "ClientAppMissing",
         Level = LogLevel.Warning,
         Message = ClientMissingMessage)]
     private static partial void LogClientMissing(ILogger logger);
+
+    [LoggerMessage(
+        EventId = 2,
+        EventName = "ClientAppPathInvalid",
+        Level = LogLevel.Warning,
+        Message = ClientPathInvalidMessage)]
+    private static partial void LogClientPathInvalid(ILogger logger);
 
     // The page names the current hashed bundles, so browsers must revalidate it; the bundles themselves are
     // content-addressed and keep the default caching.
@@ -164,6 +260,13 @@ public static partial class ClientAppHosting
             .Add(builder => ((RouteEndpointBuilder)builder).Order = int.MaxValue);
     }
 
+    // Case-insensitive, as routing compares literals.
+    private static bool IsServerPrefix(string segment) =>
+        ServerPrefixes.Contains(segment, StringComparer.OrdinalIgnoreCase);
+
+    private static bool IsHealthPath(string path) =>
+        string.Equals(path, HealthPath, StringComparison.OrdinalIgnoreCase);
+
     /// <summary>
     /// The policy of the first-segment parameter of <see cref="ClientRoutePattern"/>. It matches every client route
     /// outside <c>/api/**</c>, <c>/openapi/**</c> and <c>/health</c>, compared case-insensitively as routing compares
@@ -171,10 +274,6 @@ public static partial class ClientAppHosting
     /// </summary>
     private sealed class ClientRouteConstraint : IRouteConstraint, IParameterLiteralNodeMatchingPolicy
     {
-        private const string HealthPath = "health";
-
-        private static readonly string[] ServerPrefixes = ["api", "openapi"];
-
         // The framework's own "nonfile" rule, applied to whichever parameter holds the last path segment.
         private static readonly NonFileNameRouteConstraint NonFileName = new();
 
@@ -197,8 +296,7 @@ public static partial class ClientAppHosting
                 return NonFileName.Match(httpContext, route, RestParameter, values, routeDirection);
             }
 
-            return !string.Equals(first, HealthPath, StringComparison.OrdinalIgnoreCase)
-                && NonFileName.Match(httpContext, route, routeKey, values, routeDirection);
+            return !IsHealthPath(first) && NonFileName.Match(httpContext, route, routeKey, values, routeDirection);
         }
 
         // Asked for each literal first segment of the other routes, such as api, health and openapi. Returning false
@@ -206,12 +304,92 @@ public static partial class ClientAppHosting
         // because the health literal also begins client routes such as /health/x.
         public bool MatchesLiteral(string parameterName, string literal) => !IsServerPrefix(literal);
 
-        private static bool IsServerPrefix(string segment) =>
-            ServerPrefixes.Contains(segment, StringComparer.OrdinalIgnoreCase);
-
         private static string ReadValue(RouteValueDictionary values, string key) =>
             values.TryGetValue(key, out object? value)
                 ? Convert.ToString(value, CultureInfo.InvariantCulture) ?? string.Empty
                 : string.Empty;
+    }
+
+    /// <summary>
+    /// The one provider both serving paths read, the root static-file middleware and the <c>index.html</c> fallback.
+    /// It wraps a <see cref="PhysicalFileProvider"/>, whose containment check is lexical and which follows links, and
+    /// reports as not found a file under <c>api/</c> or <c>openapi/</c>, a file named <c>health</c>, and a file whose
+    /// path below the root passes through a symbolic link or junction.
+    /// </summary>
+    private sealed class ClientFileProvider : IFileProvider, IDisposable
+    {
+        private static readonly char[] Separators = [Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar];
+
+        private readonly PhysicalFileProvider inner;
+
+        /// <exception cref="DirectoryNotFoundException"><paramref name="root"/> does not exist.</exception>
+        public ClientFileProvider(string root) => inner = new PhysicalFileProvider(root);
+
+        public IFileInfo GetFileInfo(string subpath)
+        {
+            IFileInfo file = inner.GetFileInfo(subpath);
+            if (!file.Exists || file.PhysicalPath is null)
+            {
+                return file;
+            }
+
+            // Judged on the resolved path, not the request path: the inner provider drops leading separators, so
+            // //api/x.json names api/x.json, and the operating system's path normalisation has already been applied.
+            string relativePath = Path.GetRelativePath(inner.Root, file.PhysicalPath);
+            string[] segments = relativePath.Split(Separators);
+
+            bool refused = IsOutsideRoot(relativePath, segments)
+                || IsServerPrefix(segments[0])
+                || IsHealthPath(relativePath)
+                || PassesThroughLink(segments);
+
+            return refused ? new NotFoundFileInfo(subpath) : file;
+        }
+
+        // The client host serves files only: it registers neither default files nor directory browsing, so nothing
+        // lists a folder, and a listing would bypass the per-file checks of GetFileInfo.
+        public IDirectoryContents GetDirectoryContents(string subpath) => NotFoundDirectoryContents.Singleton;
+
+        public IChangeToken Watch(string filter) => inner.Watch(filter);
+
+        public void Dispose() => inner.Dispose();
+
+        // The inner provider already refuses a path above its root; checked again so a surprise fails closed.
+        private static bool IsOutsideRoot(string relativePath, string[] segments) =>
+            Path.IsPathRooted(relativePath) || segments[0] == "..";
+
+        // Every entry below the root, each folder and the file itself, is checked on every request, so a link added
+        // after startup is refused too. A link whose target stays inside the root is refused as well: the built client
+        // contains none. The root and its parents are not checked, because the configured folder may itself be a
+        // link, such as a deployment's current-release folder. An entry that cannot be inspected counts as a link.
+        // The check runs before the static-file middleware opens the file by path, and .NET offers neither a
+        // no-follow open nor the path of an open handle, so the client folder must be writable only by the account
+        // that runs the API: a writer racing a link in between could otherwise redirect that open.
+        private bool PassesThroughLink(string[] segments)
+        {
+            string path = inner.Root;
+            try
+            {
+                for (int i = 0; i < segments.Length; i++)
+                {
+                    path = Path.Join(path, segments[i]);
+                    FileSystemInfo entry = i == segments.Length - 1 ? new FileInfo(path) : new DirectoryInfo(path);
+                    if (entry.LinkTarget is not null)
+                    {
+                        return true;
+                    }
+                }
+
+                return false;
+            }
+            catch (IOException)
+            {
+                return true;
+            }
+            catch (UnauthorizedAccessException)
+            {
+                return true;
+            }
+        }
     }
 }

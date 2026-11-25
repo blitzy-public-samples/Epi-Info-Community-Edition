@@ -26,8 +26,14 @@ public enum FieldType
     Group,
 
     /// <summary>
-    /// Seeded <c>Text</c>, and any other metadata type stored in a character column, such as the
-    /// seeded <c>Phone Number</c> and <c>Comment Legal</c>. The value is a JSON string.
+    /// Seeded <c>Text</c>, and the fallback for a metadata type that is neither another supported
+    /// seeded type (<c>Label/Title</c>, <c>Group</c>, <c>Multiline</c>, <c>Number</c>,
+    /// <c>Date</c>, <c>Checkbox</c>, <c>Option</c>, <c>Legal Values</c>) nor one always mapped
+    /// <c>Unsupported</c>, on a field that is not encrypted and whose column is an admitted
+    /// character column (<c>nvarchar(n)</c>, <c>nchar(n)</c>, <c>nvarchar(max)</c> or
+    /// <c>ntext</c>), such as the seeded <c>Phone Number</c> and <c>Comment Legal</c>. The same
+    /// unlisted types on any other column, such as the seeded <c>Yes/No</c> on <c>tinyint</c>, are
+    /// <c>Unsupported</c>. The value is a JSON string.
     /// </summary>
     Text,
 

@@ -14,7 +14,9 @@ namespace EpiInfo.Api.Hosting;
 /// <param name="ClientPath">
 /// The built web client folder as configured, still relative to the content root unless configured absolute.
 /// </param>
-/// <param name="MaxRequestBodySize">The largest request body accepted, in bytes, at least 1.</param>
+/// <param name="MaxRequestBodySize">
+/// The largest request body accepted, in bytes, from 1 to <see cref="DefaultMaxRequestBodySize"/> (1 MiB).
+/// </param>
 public sealed record ApiOptions(
     string? ConnectionString,
     int CommandTimeoutSeconds,
@@ -46,7 +48,9 @@ public sealed record ApiOptions(
     /// <summary>The configuration key of the request body limit, shared with Kestrel's own limit.</summary>
     public const string MaxRequestBodySizeKey = "Kestrel:Limits:MaxRequestBodySize";
 
-    /// <summary>The request body limit used when none is configured: 1 MiB.</summary>
+    /// <summary>
+    /// The request body limit used when none is configured, and the largest limit configuration may set: 1 MiB.
+    /// </summary>
     public const long DefaultMaxRequestBodySize = 1_048_576L;
 
     /// <summary>Whether a non-blank connection string is configured.</summary>
@@ -57,7 +61,8 @@ public sealed record ApiOptions(
     /// </summary>
     /// <exception cref="ArgumentNullException"><paramref name="configuration"/> is <see langword="null"/>.</exception>
     /// <exception cref="InvalidOperationException">
-    /// The command timeout or the request body limit is set to something other than a positive integer.
+    /// The command timeout is set to something other than a positive integer, or the request body limit to something
+    /// other than an integer from 1 to <see cref="DefaultMaxRequestBodySize"/>.
     /// </exception>
     public static ApiOptions FromConfiguration(IConfiguration configuration)
     {
@@ -98,17 +103,26 @@ public sealed record ApiOptions(
             return DefaultMaxRequestBodySize;
         }
 
-        if (long.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out long bytes) && bytes >= 1)
+        // The default is also the cap: a lower limit is accepted, a higher one would let both hosts take larger bodies.
+        if (long.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out long bytes) &&
+            bytes is >= 1 and <= DefaultMaxRequestBodySize)
         {
             return bytes;
         }
 
-        throw NotAPositiveInteger(MaxRequestBodySizeKey);
+        throw NotWithinRequestBodyCap();
     }
 
     // The message names the key only: a rejected value may be a mistyped secret, and startup errors reach the logs.
     private static InvalidOperationException NotAPositiveInteger(string key) =>
         new($"Configuration value '{key}' must be a positive integer.");
+
+    // The same rule: the message names the key and the fixed cap, never the configured value.
+    private static InvalidOperationException NotWithinRequestBodyCap() =>
+        new(string.Create(
+            CultureInfo.InvariantCulture,
+            $"Configuration value '{MaxRequestBodySizeKey}' must be a positive integer no greater than " +
+            $"{DefaultMaxRequestBodySize}."));
 
     // Replaces the record's generated member list so ToString() reports whether a connection string is set but never
     // its value, which carries the password.

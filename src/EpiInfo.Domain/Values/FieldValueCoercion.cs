@@ -78,7 +78,6 @@ public readonly record struct FieldValueCoercionResult(FieldValue Value, FieldVa
 /// </remarks>
 public static class FieldValueCoercion
 {
-    private const string IsoDateFormat = "yyyy-MM-dd";
     private const string MetadataDateFormat = "MM-dd-yyyy";
 
     /// <summary>
@@ -88,7 +87,8 @@ public static class FieldValueCoercion
     /// <see langword="null"/>, a <see cref="string"/>, a <see cref="bool"/>, a numeric primitive
     /// (<see cref="double"/>, <see cref="float"/>, <see cref="decimal"/>, <see cref="int"/>, <see cref="long"/>,
     /// <see cref="short"/>, <see cref="byte"/>, <see cref="sbyte"/>, <see cref="uint"/>, <see cref="ulong"/> or
-    /// <see cref="ushort"/>), or a <see cref="DateOnly"/> for a date target.
+    /// <see cref="ushort"/>), or a <see cref="DateOnly"/> for a date target. A boxed <see cref="FieldValue"/> is
+    /// coerced by the <see cref="Coerce(FieldValue, FieldValueKind, bool)"/> overload.
     /// </param>
     /// <param name="target">The kind of value the field holds.</param>
     /// <param name="normalizeEmptyText">
@@ -100,7 +100,11 @@ public static class FieldValueCoercion
     /// value of the target kind, or the reason the raw value cannot be one:
     /// <list type="bullet">
     /// <item><description>text needs a string;</description></item>
-    /// <item><description>a number needs a finite numeric primitive;</description></item>
+    /// <item><description>
+    /// a number needs a finite numeric primitive, kept exact: an integer primitive, or a whole decimal, within the
+    /// signed 64-bit range keeps its exact integer, and any other value keeps its nearest double without being
+    /// rounded into a whole number;
+    /// </description></item>
     /// <item><description>a boolean needs a <see cref="bool"/>;</description></item>
     /// <item><description>a date needs a <c>yyyy-MM-dd</c> string or a <see cref="DateOnly"/>;</description></item>
     /// <item><description>an index needs an integral numeric primitive from 0 to <see cref="int.MaxValue"/>.</description></item>
@@ -111,6 +115,11 @@ public static class FieldValueCoercion
         if (raw is null)
         {
             return FieldValueCoercionResult.Success(FieldValue.Null);
+        }
+
+        if (raw is FieldValue value)
+        {
+            return Coerce(value, target, normalizeEmptyText);
         }
 
         return target switch
@@ -129,6 +138,58 @@ public static class FieldValueCoercion
     }
 
     /// <summary>
+    /// Coerces a value already read from the wire, such as one the JSON converter produced field-type blind,
+    /// into a <see cref="FieldValue"/> of the <paramref name="target"/> kind, keeping a number exact.
+    /// </summary>
+    /// <param name="raw">
+    /// The value as read: <see cref="FieldValue.Null"/>, text, a number, a boolean, a date or an option index.
+    /// </param>
+    /// <param name="target">The kind of value the field holds.</param>
+    /// <param name="normalizeEmptyText">
+    /// Whether empty text for a text target becomes <see cref="FieldValue.Null"/>. Only the empty string is
+    /// normalised; whitespace is kept as entered.
+    /// </param>
+    /// <returns>
+    /// For a number: the number unchanged for a number target; for an index target, an index when the number
+    /// holds an exact integer (<see cref="FieldValue.TryGetInteger"/>) from 0 to <see cref="int.MaxValue"/>,
+    /// otherwise <see cref="FieldValueCoercionError.NotIntegral"/>, <see cref="FieldValueCoercionError.Negative"/>
+    /// or <see cref="FieldValueCoercionError.OutOfRange"/>, so <c>2.0000000000000001</c> is never index 2;
+    /// <see cref="FieldValueCoercionError.WrongType"/> for a text, boolean or date target; and
+    /// <see cref="FieldValueCoercionError.UnsupportedTarget"/> for a <see cref="FieldValueKind.Null"/> or undefined
+    /// target. Any other value is coerced as its CLR primitive by the
+    /// <see cref="Coerce(object, FieldValueKind, bool)"/> overload.
+    /// </returns>
+    public static FieldValueCoercionResult Coerce(FieldValue raw, FieldValueKind target, bool normalizeEmptyText = false)
+    {
+        if (raw.Kind == FieldValueKind.Number)
+        {
+            return target switch
+            {
+                FieldValueKind.Number => FieldValueCoercionResult.Success(raw),
+                FieldValueKind.Index => IndexFromNumber(raw),
+                FieldValueKind.Text or FieldValueKind.Boolean or FieldValueKind.Date =>
+                    FieldValueCoercionResult.Failure(FieldValueCoercionError.WrongType),
+
+                // FieldValueKind.Null and any undefined kind cannot hold a non-null value.
+                _ => FieldValueCoercionResult.Failure(FieldValueCoercionError.UnsupportedTarget),
+            };
+        }
+
+        // Every other kind holds exactly its CLR primitive, so the primitive rules apply unchanged.
+        return raw.Kind switch
+        {
+            FieldValueKind.Null => Coerce((object?)null, target, normalizeEmptyText),
+            FieldValueKind.Text => Coerce(raw.AsText(), target, normalizeEmptyText),
+            FieldValueKind.Boolean => Coerce(raw.AsBoolean(), target, normalizeEmptyText),
+            FieldValueKind.Date => Coerce(raw.AsDate(), target, normalizeEmptyText),
+            FieldValueKind.Index => Coerce(raw.AsIndex(), target, normalizeEmptyText),
+
+            // The factories create no other kind; a value of an undefined kind fits no target.
+            _ => FieldValueCoercionResult.Failure(FieldValueCoercionError.WrongType),
+        };
+    }
+
+    /// <summary>
     /// Parses a date in exactly the form <c>yyyy-MM-dd</c> with the invariant culture, without trimming.
     /// The storage range of the column is not checked here.
     /// </summary>
@@ -140,7 +201,7 @@ public static class FieldValueCoercion
     /// format.
     /// </returns>
     public static bool TryParseIsoDate([NotNullWhen(true)] string? text, out DateOnly value) =>
-        DateOnly.TryParseExact(text, IsoDateFormat, CultureInfo.InvariantCulture, DateTimeStyles.None, out value);
+        DateOnly.TryParseExact(text, FieldValue.IsoDateFormat, CultureInfo.InvariantCulture, DateTimeStyles.None, out value);
 
     /// <summary>
     /// Parses a metadata date bound, stored as <c>MM-dd-yyyy</c> (for example <c>01-15-2011</c>), after
@@ -172,6 +233,8 @@ public static class FieldValueCoercion
     /// <summary>
     /// Parses a finite number with the invariant culture: surrounding whitespace, a leading sign, a decimal
     /// point and an exponent are allowed, and thousands separators are not. Negative zero becomes zero.
+    /// The result is the nearest double; <see cref="TryParseNumber(string, out FieldValue)"/> keeps a whole
+    /// number exact and never rounds a fraction into one.
     /// </summary>
     /// <param name="text">The text, such as <c>120</c> or <c>37.5</c>.</param>
     /// <param name="value">The number, or 0 when parsing fails.</param>
@@ -198,6 +261,67 @@ public static class FieldValueCoercion
         }
 
         return true;
+    }
+
+    /// <summary>
+    /// Parses a finite number exactly, with the lexical rules of
+    /// <see cref="TryParseInvariantNumber(string, out double)"/>: the invariant culture, surrounding whitespace, a
+    /// leading sign, a decimal point and an exponent, and no thousands separators. A whole number within the
+    /// signed 64-bit range, such as <c>9007199254740993</c>, <c>2.0</c> or <c>2e3</c>, keeps its exact integer;
+    /// any other number keeps its nearest double without being rounded into a whole number, so
+    /// <c>2.0000000000000001</c> is not the integer 2. Negative zero becomes zero.
+    /// </summary>
+    /// <param name="text">Search or metadata text, such as <c>120</c> or <c>37.5</c>.</param>
+    /// <param name="value">The number, or <see cref="FieldValue.Null"/> when parsing fails.</param>
+    /// <returns>
+    /// Whether <paramref name="text"/> is a finite number; <see langword="false"/> for <see langword="null"/>,
+    /// empty or whitespace input, <c>NaN</c>, infinities, values that overflow to infinity, and text such as
+    /// <c>1,000</c> or <c>37,5</c>.
+    /// </returns>
+    public static bool TryParseNumber([NotNullWhen(true)] string? text, out FieldValue value)
+    {
+        if (long.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out var integer))
+        {
+            value = FieldValue.FromInteger(integer);
+            return true;
+        }
+
+        if (double.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out var nearest))
+        {
+            return TryFromNonInt64Number(nearest, out value);
+        }
+
+        value = FieldValue.Null;
+        return false;
+    }
+
+    /// <summary>
+    /// Parses a finite number from UTF-8 text exactly, with the rules of
+    /// <see cref="TryParseNumber(string, out FieldValue)"/>. It serves JSON number literals, which the JSON reader
+    /// has already checked against the JSON number grammar, so <c>9007199254740993</c> keeps its exact integer
+    /// and <c>1e400</c> is refused rather than read as infinity.
+    /// </summary>
+    /// <param name="utf8Text">The UTF-8 text, such as a JSON number literal.</param>
+    /// <param name="value">The number, or <see cref="FieldValue.Null"/> when parsing fails.</param>
+    /// <returns>
+    /// Whether <paramref name="utf8Text"/> is a finite number; <see langword="false"/> for empty input, text that
+    /// is not a number, and values that overflow to infinity.
+    /// </returns>
+    public static bool TryParseNumber(ReadOnlySpan<byte> utf8Text, out FieldValue value)
+    {
+        if (long.TryParse(utf8Text, NumberStyles.Float, CultureInfo.InvariantCulture, out var integer))
+        {
+            value = FieldValue.FromInteger(integer);
+            return true;
+        }
+
+        if (double.TryParse(utf8Text, NumberStyles.Float, CultureInfo.InvariantCulture, out var nearest))
+        {
+            return TryFromNonInt64Number(nearest, out value);
+        }
+
+        value = FieldValue.Null;
+        return false;
     }
 
     /// <summary>
@@ -239,16 +363,52 @@ public static class FieldValueCoercion
             : FieldValueCoercionResult.Success(FieldValue.FromText(text));
     }
 
-    private static FieldValueCoercionResult CoerceNumber(object raw)
+    // Integer primitives become exact integers, never doubles, so a bigint beyond 2^53 keeps its value; only a
+    // value that no signed 64-bit integer holds keeps its nearest double, and then never as a whole number.
+    private static FieldValueCoercionResult CoerceNumber(object raw) => raw switch
     {
-        if (!TryGetDouble(raw, out var number))
+        double value => NumberFromDouble(value),
+        float value => NumberFromDouble(value),
+        int value => FieldValueCoercionResult.Success(FieldValue.FromInteger(value)),
+        long value => FieldValueCoercionResult.Success(FieldValue.FromInteger(value)),
+        short value => FieldValueCoercionResult.Success(FieldValue.FromInteger(value)),
+        sbyte value => FieldValueCoercionResult.Success(FieldValue.FromInteger(value)),
+        byte value => FieldValueCoercionResult.Success(FieldValue.FromInteger(value)),
+        ushort value => FieldValueCoercionResult.Success(FieldValue.FromInteger(value)),
+        uint value => FieldValueCoercionResult.Success(FieldValue.FromInteger(value)),
+        ulong value => FieldValueCoercionResult.Success(value <= long.MaxValue
+            ? FieldValue.FromInteger((long)value)
+            : FieldValue.FromNonInt64Number(value)),
+        decimal value => NumberFromDecimal(value),
+        _ => FieldValueCoercionResult.Failure(FieldValueCoercionError.WrongType),
+    };
+
+    // A double or float is exact as given, so FromNumber keeps a whole one as its exact integer.
+    private static FieldValueCoercionResult NumberFromDouble(double value) => double.IsFinite(value)
+        ? FieldValueCoercionResult.Success(FieldValue.FromNumber(value))
+        : FieldValueCoercionResult.Failure(FieldValueCoercionError.NotFinite);
+
+    // A decimal can hold a fraction a double rounds away, such as 2.0000000000000001, so it is tested for a whole
+    // value in decimal arithmetic. Every decimal lies within the range of double, so the conversion cannot overflow.
+    private static FieldValueCoercionResult NumberFromDecimal(decimal value) =>
+        FieldValueCoercionResult.Success(
+            decimal.Truncate(value) == value && value >= long.MinValue && value <= long.MaxValue
+                ? FieldValue.FromInteger((long)value)
+                : FieldValue.FromNonInt64Number((double)value));
+
+    // long.TryParse refuses every number that is not exactly a whole number within the signed 64-bit range, so a
+    // number reaching here keeps only its nearest double. The invariant culture accepts "NaN", "Infinity" and "∞",
+    // and overflow yields an infinity, so a successful double parse alone does not make a field value.
+    private static bool TryFromNonInt64Number(double nearest, out FieldValue value)
+    {
+        if (!double.IsFinite(nearest))
         {
-            return FieldValueCoercionResult.Failure(FieldValueCoercionError.WrongType);
+            value = FieldValue.Null;
+            return false;
         }
 
-        return double.IsFinite(number)
-            ? FieldValueCoercionResult.Success(FieldValue.FromNumber(number))
-            : FieldValueCoercionResult.Failure(FieldValueCoercionError.NotFinite);
+        value = FieldValue.FromNonInt64Number(nearest);
+        return true;
     }
 
     private static FieldValueCoercionResult CoerceDate(object raw) => raw switch
@@ -334,47 +494,24 @@ public static class FieldValueCoercion
             : FieldValueCoercionResult.Success(FieldValue.FromIndex((int)value));
     }
 
-    private static bool TryGetDouble(object raw, out double value)
+    // A number value decides on its exact integer, never on its double. One without an exact integer is either
+    // non-integral or an integer beyond the signed 64-bit range. Rounding is monotonic and -2^63 and 2^63 are exact
+    // doubles, so an integer beyond that range has a nearest double at or past one of them, and a nearest double
+    // strictly between them can only stand for a non-integral number.
+    private static FieldValueCoercionResult IndexFromNumber(FieldValue number)
     {
-        switch (raw)
+        if (number.TryGetInteger(out var integer))
         {
-            case double number:
-                value = number;
-                return true;
-            case float number:
-                value = number;
-                return true;
-            case decimal number:
-                // Every decimal lies within the range of double, so this explicit conversion cannot overflow.
-                value = (double)number;
-                return true;
-            case int number:
-                value = number;
-                return true;
-            case long number:
-                value = number;
-                return true;
-            case short number:
-                value = number;
-                return true;
-            case byte number:
-                value = number;
-                return true;
-            case sbyte number:
-                value = number;
-                return true;
-            case uint number:
-                value = number;
-                return true;
-            case ulong number:
-                value = number;
-                return true;
-            case ushort number:
-                value = number;
-                return true;
-            default:
-                value = 0d;
-                return false;
+            return IndexFromSigned(integer);
         }
+
+        var nearest = number.AsNumber();
+        if (nearest > -9223372036854775808d && nearest < 9223372036854775808d)
+        {
+            return FieldValueCoercionResult.Failure(FieldValueCoercionError.NotIntegral);
+        }
+
+        return FieldValueCoercionResult.Failure(
+            nearest < 0d ? FieldValueCoercionError.Negative : FieldValueCoercionError.OutOfRange);
     }
 }
