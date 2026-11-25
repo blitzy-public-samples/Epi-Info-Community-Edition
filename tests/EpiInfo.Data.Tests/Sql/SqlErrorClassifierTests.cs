@@ -1,9 +1,11 @@
+using System.Data;
 using System.Globalization;
 using System.Net.Sockets;
 using System.Reflection;
 using System.Security.Authentication;
 using EpiInfo.Data.Sql;
 using EpiInfo.Domain.Storage;
+using EpiInfo.Tests.Shared;
 using Microsoft.Data.SqlClient;
 
 namespace EpiInfo.Data.Tests.Sql;
@@ -665,5 +667,91 @@ public sealed class SqlErrorClassifierTests
 
         private static InvalidOperationException Missing(string member) =>
             new($"Microsoft.Data.SqlClient {typeof(SqlException).Assembly.GetName().Version} has no usable {member}.");
+    }
+}
+
+/// <summary>
+/// Integration tests of the shared test lock's failure attribution (<see cref="DatabaseWriteLock"/>): a code
+/// <c>sp_getapplock</c> returned and a failure that only coincides with a cancelled token are each reported as
+/// themselves, and only SqlClient's own report of a cancellation becomes an <see cref="OperationCanceledException"/>.
+/// They need the rehearsal database, and change no data: they take application locks and run <c>SELECT 1/0</c>.
+/// </summary>
+[Collection(DatabaseCollections.Database)]
+[Trait("Category", "Integration")]
+public sealed class DatabaseWriteLockTests : IAsyncLifetime
+{
+    private const int DivideByZeroErrorNumber = 8134;
+
+    public Task InitializeAsync() => TestDatabase.EnsureReachableAsync();
+
+    public Task DisposeAsync() => Task.CompletedTask;
+
+    // -1 timed out, -2 cancelled, -3 deadlock victim, -999 call error: each is sp_getapplock's answer, so a token
+    // cancelled after it returned never turns it into a cancellation.
+    [Theory]
+    [InlineData(-1)]
+    [InlineData(-2)]
+    [InlineData(-3)]
+    [InlineData(-999)]
+    public async Task AcquireAsync_ReturnedFailureCodeUnderLateCancellation_ReportsTheCodeAndClosesTheSession(int code)
+    {
+        using var cancellation = new CancellationTokenSource();
+        SqlConnection? session = null;
+
+        InvalidOperationException failure = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            DatabaseWriteLock.AcquireAsync(
+                DatabaseLockMode.Exclusive,
+                (connection, _) =>
+                {
+                    session = connection;
+                    cancellation.Cancel();
+                    return Task.FromResult(code);
+                },
+                cancellation.Token));
+
+        Assert.True(cancellation.IsCancellationRequested);
+        Assert.Contains(
+            "sp_getapplock returned " + code.ToString(CultureInfo.InvariantCulture) + " (",
+            failure.Message,
+            StringComparison.Ordinal);
+        Assert.Contains($"'{DatabaseWriteLock.ResourceName}'", failure.Message, StringComparison.Ordinal);
+        Assert.Contains(nameof(DatabaseLockMode.Exclusive), failure.Message, StringComparison.Ordinal);
+        Assert.NotNull(session);
+        Assert.Equal(ConnectionState.Closed, session.State);
+    }
+
+    [Fact]
+    public async Task AcquireAsync_ServerErrorUnderLateCancellation_PropagatesTheSqlExceptionAndClosesTheSession()
+    {
+        using var cancellation = new CancellationTokenSource();
+        SqlConnection? session = null;
+
+        SqlException failure = await Assert.ThrowsAsync<SqlException>(() =>
+            DatabaseWriteLock.AcquireAsync(
+                DatabaseLockMode.Exclusive,
+                async (connection, _) =>
+                {
+                    session = connection;
+                    cancellation.Cancel();
+                    await using var command = new SqlCommand("SELECT 1/0;", connection);
+                    await command.ExecuteNonQueryAsync(CancellationToken.None);
+                    return 0;
+                },
+                cancellation.Token));
+
+        Assert.True(cancellation.IsCancellationRequested);
+        Assert.Equal(DivideByZeroErrorNumber, failure.Number);
+        Assert.NotNull(session);
+        Assert.Equal(ConnectionState.Closed, session.State);
+    }
+
+    [Fact]
+    public async Task AcquireExclusiveAsync_CancelledWhileWaiting_ThrowsOperationCanceledException()
+    {
+        await using DatabaseWriteLock held = await DatabaseWriteLock.AcquireExclusiveAsync();
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(1));
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            DatabaseWriteLock.AcquireExclusiveAsync(cancellation.Token));
     }
 }

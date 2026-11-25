@@ -1,6 +1,7 @@
 using System.Data;
 using System.Diagnostics;
 using System.Globalization;
+using EpiInfo.Data.Sql;
 using Microsoft.Data.SqlClient;
 
 namespace EpiInfo.Tests.Shared;
@@ -107,10 +108,18 @@ public sealed class DatabaseWriteLock : IAsyncDisposable
     /// The database is not configured, SqlClient rejects its connection string, or it is not reachable.
     /// </exception>
     /// <exception cref="InvalidOperationException">
-    /// <c>sp_getapplock</c> did not grant the lock: it timed out, was cancelled, chose this request as a deadlock
-    /// victim, or rejected the call.
+    /// <c>sp_getapplock</c> did not grant the lock: it returned a negative code, which the message names with its
+    /// meaning (it timed out, was cancelled, chose this request as a deadlock victim, or rejected the call), also
+    /// when <paramref name="cancellationToken"/> was cancelled after it returned; or it returned no code at all.
     /// </exception>
-    /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> was cancelled.</exception>
+    /// <exception cref="OperationCanceledException">
+    /// <paramref name="cancellationToken"/> was cancelled and SqlClient reported the cancellation: a
+    /// <see cref="TaskCanceledException"/>, or the attention acknowledgement of the cancelled <c>sp_getapplock</c>
+    /// call. Whatever the state of the token, any other <see cref="SqlException"/>,
+    /// <see cref="InvalidOperationException"/> or <see cref="NotSupportedException"/> from opening the lock session
+    /// is reported as unreachable (<see cref="TestDatabaseUnavailableException"/>), and any other failure propagates
+    /// unchanged.
+    /// </exception>
     public static Task<DatabaseWriteLock> AcquireExclusiveAsync(CancellationToken cancellationToken = default) =>
         AcquireAsync(DatabaseLockMode.Exclusive, cancellationToken);
 
@@ -123,10 +132,18 @@ public sealed class DatabaseWriteLock : IAsyncDisposable
     /// The database is not configured, SqlClient rejects its connection string, or it is not reachable.
     /// </exception>
     /// <exception cref="InvalidOperationException">
-    /// <c>sp_getapplock</c> did not grant the lock: it timed out, was cancelled, chose this request as a deadlock
-    /// victim, or rejected the call.
+    /// <c>sp_getapplock</c> did not grant the lock: it returned a negative code, which the message names with its
+    /// meaning (it timed out, was cancelled, chose this request as a deadlock victim, or rejected the call), also
+    /// when <paramref name="cancellationToken"/> was cancelled after it returned; or it returned no code at all.
     /// </exception>
-    /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> was cancelled.</exception>
+    /// <exception cref="OperationCanceledException">
+    /// <paramref name="cancellationToken"/> was cancelled and SqlClient reported the cancellation: a
+    /// <see cref="TaskCanceledException"/>, or the attention acknowledgement of the cancelled <c>sp_getapplock</c>
+    /// call. Whatever the state of the token, any other <see cref="SqlException"/>,
+    /// <see cref="InvalidOperationException"/> or <see cref="NotSupportedException"/> from opening the lock session
+    /// is reported as unreachable (<see cref="TestDatabaseUnavailableException"/>), and any other failure propagates
+    /// unchanged.
+    /// </exception>
     public static Task<DatabaseWriteLock> AcquireSharedAsync(CancellationToken cancellationToken = default) =>
         AcquireAsync(DatabaseLockMode.Shared, cancellationToken);
 
@@ -189,8 +206,44 @@ public sealed class DatabaseWriteLock : IAsyncDisposable
         }
     }
 
-    private static async Task<DatabaseWriteLock> AcquireAsync(DatabaseLockMode mode, CancellationToken cancellationToken)
+    private static Task<DatabaseWriteLock> AcquireAsync(DatabaseLockMode mode, CancellationToken cancellationToken) =>
+        AcquireAsync(mode, (connection, token) => RequestAsync(connection, mode, token), cancellationToken);
+
+    /// <summary>
+    /// The test seam of the acquire path: opens the lock session as <see cref="AcquireExclusiveAsync"/> and
+    /// <see cref="AcquireSharedAsync"/> do, runs <paramref name="request"/> on it in place of <c>sp_getapplock</c>,
+    /// and handles the code it returns as <c>sp_getapplock</c>'s.
+    /// </summary>
+    /// <param name="mode">The mode the lock is granted in, and the one a failure names.</param>
+    /// <param name="request">
+    /// Runs on the opened lock session in place of <c>sp_getapplock</c>, under <paramref name="cancellationToken"/>,
+    /// and returns its code: 0 or 1 grants the lock, any other code fails the acquisition.
+    /// </param>
+    /// <param name="cancellationToken">Cancels the connection and the request.</param>
+    /// <returns>The held lock; dispose it to release.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="request"/> is <see langword="null"/>.</exception>
+    /// <exception cref="TestDatabaseUnavailableException">
+    /// The database is not configured, SqlClient rejects its connection string, or it is not reachable.
+    /// </exception>
+    /// <exception cref="InvalidOperationException">
+    /// <paramref name="request"/> returned a code other than 0 or 1, which the message names with its meaning, also
+    /// when <paramref name="cancellationToken"/> was cancelled after it returned.
+    /// </exception>
+    /// <exception cref="OperationCanceledException">
+    /// <paramref name="cancellationToken"/> was cancelled and SqlClient reported the cancellation: a
+    /// <see cref="TaskCanceledException"/>, or the attention acknowledgement of the cancelled command. Whatever the
+    /// state of the token, any other <see cref="SqlException"/>, <see cref="InvalidOperationException"/> or
+    /// <see cref="NotSupportedException"/> from opening the lock session is reported as unreachable
+    /// (<see cref="TestDatabaseUnavailableException"/>), and any other failure of the open or of
+    /// <paramref name="request"/> propagates unchanged.
+    /// </exception>
+    internal static async Task<DatabaseWriteLock> AcquireAsync(
+        DatabaseLockMode mode,
+        Func<SqlConnection, CancellationToken, Task<int>> request,
+        CancellationToken cancellationToken)
     {
+        ArgumentNullException.ThrowIfNull(request);
+
         SqlConnectionStringBuilder target = TestDatabase.Builder();
 
         // Pooling must stay off: a pooled connection keeps its session alive after Close, and the session owns
@@ -200,39 +253,43 @@ public sealed class DatabaseWriteLock : IAsyncDisposable
 
         // Created before the try: a connection SqlClient rejects was never created, so there is nothing to dispose.
         SqlConnection connection = TestDatabase.CreateConnection(target);
+        int code;
         try
         {
             await OpenAsync(connection, target, cancellationToken).ConfigureAwait(false);
-
-            int code = await RequestAsync(connection, mode, cancellationToken).ConfigureAwait(false);
-            if (code is not (0 or 1))
-            {
-                string codeText = code.ToString(CultureInfo.InvariantCulture);
-                throw new InvalidOperationException(
-                    $"The {mode} test lock '{ResourceName}' was not granted: sp_getapplock returned {codeText} " +
-                    $"({DescribeRequestCode(code)}).");
-            }
-
-            return new DatabaseWriteLock(connection, mode);
+            code = await request(connection, cancellationToken).ConfigureAwait(false);
         }
-        catch (Exception failure) when (
-            cancellationToken.IsCancellationRequested && failure is not OperationCanceledException)
+        catch (Exception failure) when (IsReportedCancellation(failure, cancellationToken))
         {
-            // SqlClient reports a cancelled command as a SqlException; the caller asked for cancellation. The failure
-            // is named, not attached, because a SqlClient message can quote connection-string content; only a
-            // TestDatabaseUnavailableException, already redacted, is kept as the inner exception.
+            // SqlClient reports a command it cancelled as a SqlException, its attention acknowledgement. The failure
+            // is named, not attached, because a SqlClient message can quote connection-string content.
             await TestDatabase.DisposeQuietlyAsync(connection).ConfigureAwait(false);
             throw new OperationCanceledException(
                 $"Acquiring the {mode} test lock '{ResourceName}' was cancelled " +
                 $"({TestDatabase.DescribeFailure(failure)}).",
-                failure as TestDatabaseUnavailableException,
                 cancellationToken);
         }
         catch
         {
+            // An OperationCanceledException already reports the cancellation, and a TestDatabaseUnavailableException is
+            // OpenAsync's report of an unreachable database; these, every other open failure and every failure of the
+            // request, including one that only coincides with a cancelled token, propagate unchanged.
             await TestDatabase.DisposeQuietlyAsync(connection).ConfigureAwait(false);
             throw;
         }
+
+        // Outside the try: a code sp_getapplock returned is its answer, so it is reported as that code even when the
+        // token was cancelled after the call returned.
+        if (code is 0 or 1)
+        {
+            return new DatabaseWriteLock(connection, mode);
+        }
+
+        await TestDatabase.DisposeQuietlyAsync(connection).ConfigureAwait(false);
+        string codeText = code.ToString(CultureInfo.InvariantCulture);
+        throw new InvalidOperationException(
+            $"The {mode} test lock '{ResourceName}' was not granted: sp_getapplock returned {codeText} " +
+            $"({DescribeRequestCode(code)}).");
     }
 
     private static async Task OpenAsync(
@@ -245,12 +302,13 @@ public sealed class DatabaseWriteLock : IAsyncDisposable
             await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
         }
         catch (Exception failure) when (
-            !cancellationToken.IsCancellationRequested &&
+            !IsReportedCancellation(failure, cancellationToken) &&
             failure is SqlException or InvalidOperationException or NotSupportedException)
         {
             // NotSupportedException: SqlClient raises PlatformNotSupportedException for a transport this platform
-            // lacks, such as a named pipe or LocalDB on Linux. A failure once cancellation is requested, and any other
-            // type, propagates unchanged to AcquireAsync.
+            // lacks, such as a named pipe or LocalDB on Linux. An open failure that only coincides with a cancelled
+            // token is still unreachable, and redacted. SqlClient's report of the cancellation, and any other type,
+            // propagates unchanged to AcquireAsync.
             throw TestDatabase.Unreachable(
                 $"The test lock '{ResourceName}' cannot reach the rehearsal database", target, failure);
         }
@@ -298,6 +356,15 @@ public sealed class DatabaseWriteLock : IAsyncDisposable
         returnValue.Value is int code
             ? code
             : throw new InvalidOperationException($"{procedure} completed without a return code.");
+
+    // True when failure is SqlClient's report that it cancelled the command under cancellationToken. The decision is
+    // SqlErrorClassifier's: the token was cancelled and the failure is SqlClient's attention acknowledgement of the
+    // cancelled command. A failure that only coincides with a cancelled token, such as a server error or a command
+    // timeout, keeps its own type. Only a SqlException qualifies, so an OperationCanceledException, which already
+    // reports the cancellation, propagates unchanged rather than being wrapped again.
+    private static bool IsReportedCancellation(Exception failure, CancellationToken cancellationToken) =>
+        failure is SqlException
+        && SqlErrorClassifier.Classify(failure, cancellationToken).Kind == SqlFailureKind.Cancelled;
 
     private static string TypeName(Exception exception) => exception.GetType().FullName ?? exception.GetType().Name;
 
