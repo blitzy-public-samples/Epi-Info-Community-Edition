@@ -18,8 +18,10 @@ namespace EpiInfo.CheckCode.Functions;
 /// </para>
 /// <para>
 /// <see cref="Value"/> may be computed from field data, which the redaction policy keeps out of logs and
-/// error bodies. Only <see cref="Error"/> may be logged, never the value or this result's
-/// <see cref="object.ToString"/>.
+/// error bodies. <see cref="Error"/> is client diagnostic text: the evaluator puts it into the reason of the
+/// statement's <c>error</c> diagnostic, which the field-event response returns. It is not a log argument. The
+/// diagnostic is logged through a fixed message template with structured fields only, so neither
+/// <see cref="Error"/>, <see cref="Value"/> nor this result's <see cref="object.ToString"/> is passed to a logger.
 /// </para>
 /// </remarks>
 /// <param name="Value">The returned value; <see cref="FieldValue.Null"/> for a null result or a failure.</param>
@@ -38,9 +40,9 @@ public readonly record struct FunctionResult(FieldValue Value, string? Error)
 
     /// <summary>Creates a failed result, whose value is <see cref="FieldValue.Null"/>.</summary>
     /// <remarks>
-    /// Diagnostics are written to the API log, so the message names the function and the problem only and
-    /// never contains an argument value, for example <c>"YEARS requires exactly 2 arguments"</c> or
-    /// <c>"EPIWEEK requires a date"</c>.
+    /// The message becomes part of a diagnostic returned to the client, so it names the function and the
+    /// problem only and never contains an argument value, for example <c>"YEARS requires exactly 2 arguments"</c>
+    /// or <c>"EPIWEEK requires a date"</c>. It is never itself written to the log.
     /// </remarks>
     /// <param name="message">A fixed message naming the function and the problem.</param>
     /// <returns>A result whose <see cref="IsSuccess"/> is <see langword="false"/>.</returns>

@@ -19,7 +19,7 @@ public enum TokenKind
     /// <summary>A double-quoted string such as <c>"1"</c> (line 24); it has no escape sequence and cannot span lines.</summary>
     String,
 
-    /// <summary>An unsigned <c>DecLiteral</c> or <c>RealLiteral</c> such as <c>12</c>, <c>37.5</c>, <c>.5</c> or <c>2E-3</c> (lines 34-38); a sign is a separate token.</summary>
+    /// <summary>A <c>DecLiteral</c> or <c>RealLiteral</c> with no leading sign, such as <c>12</c>, <c>37.5</c>, <c>.5</c> or <c>2E-3</c> (lines 34-38); a leading <c>+</c> or <c>-</c> is a separate <see cref="PlusSign"/> or <see cref="MinusSign"/> token (lines 34, 37, 521-522), while an exponent sign, as in <c>2E-3</c>, belongs to the number (lines 35-36).</summary>
     Number,
 
     /// <summary>A date literal such as <c>01/15/2011</c> or <c>1-15-2011</c> (line 44).</summary>

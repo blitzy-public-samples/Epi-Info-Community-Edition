@@ -46,8 +46,12 @@ namespace EpiInfo.Domain.Diagnostics;
 /// The keyword of the command or construct the diagnostic concerns, for example <c>GEOCODE</c> or <c>GOTO</c>.
 /// </param>
 /// <param name="Message">
-/// Fixed, human-readable text describing the problem. Because diagnostics are logged as well as returned, it never
-/// contains a field value, a <c>values</c> entry or any other request-supplied data; it may name an identifier taken
-/// from the program text, such as a field name, because that is metadata.
+/// Fixed, human-readable text describing the problem. It is client diagnostic text, returned in the response: a form
+/// definition's <c>unsupportedCheckCode</c> or a field-event response's <c>diagnostics</c>. It never contains a field
+/// value, a <c>values</c> entry or any other request-supplied data; it may name an identifier taken from the program
+/// text, such as a field name, because that is metadata. It is not a log argument and is never passed to a logger;
+/// the log records each diagnostic's occurrence through a fixed message template whose arguments are limited to the
+/// fields the redaction policy allows: the form, ids, operation, outcome, status, exception type, SQL error number
+/// and trace id, never the message text.
 /// </param>
 public sealed record Diagnostic(DiagnosticSeverity Severity, string Form, int Line, string Command, string Message);
