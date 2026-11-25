@@ -60,9 +60,10 @@ namespace EpiInfo.Api.Contracts;
 /// </param>
 /// <param name="ExcludeGlobalRecordId">
 /// The <c>GlobalRecordId</c> of the record open in the editor, which the result must not list. It is removed on the
-/// server before <c>total</c> and the 200-item cap are computed, where legacy dropped it from the result after the
-/// query. <see langword="null"/> or absent excludes nothing. The id is neither parsed nor validated as a GUID: it is
-/// only bound as a SQL parameter, so an id that matches no record excludes nothing.
+/// server before <c>total</c> and the 200-item cap are computed. Standard Enter Find keeps a matching open record;
+/// legacy dropped it after the query only on the linked-record path. <see langword="null"/> or absent excludes
+/// nothing. The id is neither parsed nor validated as a GUID: it is only bound as a SQL parameter, so an id that
+/// matches no record excludes nothing.
 /// </param>
 public sealed record SearchRequest(
     IReadOnlyList<SearchCriterion>? Criteria,
