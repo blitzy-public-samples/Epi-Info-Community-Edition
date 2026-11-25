@@ -38,7 +38,8 @@ public sealed record RecordCountResponse(int Count);
 /// service has no check-code engine, and the legacy re-save after opening a record is not carried, so loading a record
 /// changes nothing (scenario <c>DATA-01</c>). A Record DTO always carries its intrinsic <c>position</c> and
 /// <c>count</c>, over the active set for an active record and over every row for a deleted one, never the caller's
-/// selected-set coordinates; the navigator takes those from <see cref="GetNavigationPositionAsync"/>.
+/// selected-set coordinates; the navigator takes those from <see cref="GetNavigationPositionAsync"/>. The store
+/// returns them with the row from one consistent read, and the service passes that DTO through unchanged.
 /// </para>
 /// <para>
 /// <b>Writes.</b> The input checks run outside any transaction, then the store runs the write in one transaction.
@@ -160,14 +161,13 @@ public sealed partial class RecordService(
             return ApiProblems.PositionNotFound();
         }
 
-        var stored = await store.GetAtPositionAsync(form, position, includeDeleted, cancellationToken)
+        var record = await store.GetAtPositionAsync(form, position, includeDeleted, cancellationToken)
             .ConfigureAwait(false);
-        if (stored is null)
+        if (record is null)
         {
             return ApiProblems.PositionNotFound();
         }
 
-        var record = await ToIntrinsicDtoAsync(form, stored, cancellationToken).ConfigureAwait(false);
         return TypedResults.Ok(record);
     }
 
@@ -193,13 +193,12 @@ public sealed partial class RecordService(
             return ApiProblems.FormNotFound();
         }
 
-        var stored = await store.GetByIdAsync(form, globalRecordId, cancellationToken).ConfigureAwait(false);
-        if (stored is null)
+        var record = await store.GetByIdAsync(form, globalRecordId, cancellationToken).ConfigureAwait(false);
+        if (record is null)
         {
             return ApiProblems.RecordNotFound();
         }
 
-        var record = await ToIntrinsicDtoAsync(form, stored, cancellationToken).ConfigureAwait(false);
         return TypedResults.Ok(record);
     }
 
@@ -537,21 +536,6 @@ public sealed partial class RecordService(
             default:
                 throw new InvalidOperationException("The store returned a delete result outside its contract.");
         }
-    }
-
-    /// <summary>
-    /// Attaches a record's intrinsic coordinates: its position and count over the active set when it is active, and
-    /// over every row otherwise, whatever the caller's deleted toggle.
-    /// </summary>
-    private async Task<RecordDto> ToIntrinsicDtoAsync(
-        FormMetadata form,
-        StoredRecord stored,
-        CancellationToken cancellationToken)
-    {
-        // The store chooses the set with RecordQueryRules.IntrinsicIncludesDeleted and returns position and count
-        // from the same set, so neither can come from the caller's selected set.
-        var (position, count) = await store.GetPositionAsync(form, stored, cancellationToken).ConfigureAwait(false);
-        return RecordDto.From(stored, position, count);
     }
 
     /// <summary>

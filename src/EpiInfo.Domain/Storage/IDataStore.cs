@@ -48,10 +48,9 @@ namespace EpiInfo.Domain.Storage;
 /// </para>
 /// <para>
 /// <b>Reads.</b> <see cref="CountAsync"/>, <see cref="GetAtPositionAsync"/>, <see cref="GetByIdAsync"/>,
-/// <see cref="GetPositionAsync"/>, <see cref="GetSetPositionAsync"/>, <see cref="ListAsync"/>,
-/// <see cref="SearchAsync"/> and the metadata methods issue only <c>SELECT</c> statements and never run check code,
-/// so loading a record changes nothing in the database (scenario <c>DATA-01</c>). They share the record-set rules of
-/// <see cref="RecordQueryRules"/>:
+/// <see cref="GetSetPositionAsync"/>, <see cref="ListAsync"/>, <see cref="SearchAsync"/> and the metadata methods
+/// issue only <c>SELECT</c> statements and never run check code, so loading a record changes nothing in the database
+/// (scenario <c>DATA-01</c>). They share the record-set rules of <see cref="RecordQueryRules"/>:
 /// </para>
 /// <list type="bullet">
 /// <item><description>
@@ -60,9 +59,29 @@ namespace EpiInfo.Domain.Storage;
 /// </description></item>
 /// <item><description><b>Ordering:</b> <c>UniqueKey</c> ascending.</description></item>
 /// <item><description>
-/// <b>Page rows:</b> each page table is <c>LEFT JOIN</c>ed to the base table on <c>GlobalRecordId</c>, so a base row
-/// without a row on some page is still read, with <see cref="FieldValue.Null"/> for every field of that page, as the
-/// legacy per-page load nulls them.
+/// <b>Intrinsic coordinates:</b> the <see cref="RecordDto"/> that <see cref="GetAtPositionAsync"/> and
+/// <see cref="GetByIdAsync"/> return carries the record's own <see cref="RecordDto.Position"/> and
+/// <see cref="RecordDto.Count"/>. Their set is the one <see cref="RecordQueryRules.IntrinsicIncludesDeleted"/>
+/// chooses for the record's <c>RecStatus</c>: the active set for 1, every row otherwise. The position is the number
+/// of rows of that set whose <c>UniqueKey</c> is at most the record's, the legacy record-number formula, and the count
+/// is the number of rows of that set. The caller's deleted toggle plays no part in them. The <c>RecStatus</c>, the
+/// position, the count and the page values come from one consistent read: in the SQL store, one statement whose
+/// base-table read holds its shared locks until the statement completes (<c>HOLDLOCK</c>), so no base row it read can
+/// change before it returns, and the three values describe one committed state even under a concurrent soft delete.
+/// </description></item>
+/// <item><description>
+/// <b>Page rows</b> of record hydration, that is <see cref="GetAtPositionAsync"/>, <see cref="GetByIdAsync"/> and
+/// the response snapshots of the writes: each page table is <c>LEFT JOIN</c>ed to the base table on
+/// <c>GlobalRecordId</c>, so a base row without a row on some page is still read, with <see cref="FieldValue.Null"/>
+/// for every field of that page, as the legacy per-page load nulls them. The list projection of
+/// <see cref="ListAsync"/> <c>LEFT JOIN</c>s only the pages holding a grid column, so such a record is still listed,
+/// with <see cref="FieldValue.Null"/> for the grid columns of the missing page.
+/// </description></item>
+/// <item><description>
+/// <b>Exempt from the page-row rule:</b> <see cref="SearchAsync"/>, whose one statement <c>INNER JOIN</c>s the base
+/// table to every page table, so only a base row with a row on every page can match; and the base-only reads
+/// <see cref="CountAsync"/> and <see cref="GetSetPositionAsync"/>, which read the base table alone, so a record
+/// missing a page row is still counted and placed.
 /// </description></item>
 /// </list>
 /// <para>
@@ -78,8 +97,9 @@ namespace EpiInfo.Domain.Storage;
 /// </description></item>
 /// <item><description>
 /// <b>Inside the transaction</b> run the locked read and the gates, every write, and the read of the response
-/// snapshot (base and page rows with the intrinsic position and count) together with the construction of its
-/// <see cref="RecordDto"/> through <see cref="RecordDto.From"/>. A failure in any of them rolls the write back.
+/// snapshot (base and page rows with the intrinsic position and count, which follow the same intrinsic rule as the
+/// record reads) together with the construction of its <see cref="RecordDto"/> through <see cref="RecordDto.From"/>.
+/// A failure in any of them rolls the write back.
 /// </description></item>
 /// <item><description>
 /// <b>Return value:</b> a normal return of <see cref="InsertAsync"/>, a <see cref="RecordWriteStatus.Success"/> from
@@ -89,13 +109,19 @@ namespace EpiInfo.Domain.Storage;
 /// sent.
 /// </description></item>
 /// <item><description>
-/// <b>Failures</b> carry their <see cref="WriteOutcome"/>: <see cref="WriteOutcome.NotWritten"/> for a failure before
-/// any data statement was sent, for a rollback that completed and for a deadlock the server aborted;
-/// <see cref="WriteOutcome.Unknown"/> when neither the commit nor a rollback can be confirmed. A store never reports
-/// <see cref="WriteOutcome.Written"/> itself, because after the commit it makes no database call.
+/// <b>Failures</b> carry the <see cref="WriteOutcome"/> the store can prove:
+/// <see cref="WriteOutcome.NotWritten"/> for a failure before any data statement was sent, for a rollback that
+/// completed without error, and for a deadlock the server aborted (1205); <see cref="WriteOutcome.Unknown"/> when a
+/// data statement was sent and neither a commit nor a completed rollback can be confirmed, because the commit failed
+/// or did not return, or the rollback itself failed; <see cref="WriteOutcome.Written"/> when the commit is confirmed
+/// and a later step inside the store still fails, such as releasing the transaction or the connection. A store must
+/// report such a post-commit failure as <see cref="WriteOutcome.Written"/>, never as
+/// <see cref="WriteOutcome.Unknown"/> or <see cref="WriteOutcome.NotWritten"/>.
 /// </description></item>
 /// <item><description>
-/// <b>After the commit</b> the store makes no database call, computes nothing from data and logs no value.
+/// <b>After the commit</b> the store keeps its work to a minimum: it makes no database call, computes nothing from
+/// data and logs no value, so the only failure left to it there is one of those release steps, which it reports as
+/// <see cref="WriteOutcome.Written"/>.
 /// </description></item>
 /// </list>
 /// </remarks>
@@ -173,62 +199,58 @@ public interface IDataStore
     Task<int> CountAsync(FormMetadata form, bool includeDeleted, CancellationToken cancellationToken);
 
     /// <summary>
-    /// Reads the record at a 1-based position of the selected set, ordered by <c>UniqueKey</c>, with every page row.
+    /// Reads the record at a 1-based position of the selected set, ordered by <c>UniqueKey</c>, with every page row
+    /// and its intrinsic position and count.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// The row is the one at offset <see cref="RecordQueryRules.PositionToOffset"/> of that order, a 64-bit value the
     /// SQL store binds as <c>bigint</c>, fetching one row.
+    /// </para>
+    /// <para>
+    /// <paramref name="includeDeleted"/> selects the row only. Its position and count follow the intrinsic rule of
+    /// the interface remarks and come from the same consistent read as the row, so an active record at position q of
+    /// the set with every row carries its active-set position, which is smaller when deleted rows precede it.
+    /// </para>
     /// </remarks>
     /// <param name="form">The form's metadata.</param>
     /// <param name="position">The 1-based position.</param>
     /// <param name="includeDeleted">Whether the selected set holds every row rather than the active set.</param>
     /// <param name="cancellationToken">The request's abort token.</param>
     /// <returns>
-    /// The record, or <see langword="null"/> when <paramref name="position"/> is outside 1 to the selected-set count,
-    /// which the API reports as 404.
+    /// The record with its intrinsic position and count, built with <see cref="RecordDto.From"/>; or
+    /// <see langword="null"/> when <paramref name="position"/> is outside 1 to the selected-set count, which the API
+    /// reports as 404.
     /// </returns>
-    Task<StoredRecord?> GetAtPositionAsync(
+    Task<RecordDto?> GetAtPositionAsync(
         FormMetadata form,
         int position,
         bool includeDeleted,
         CancellationToken cancellationToken);
 
     /// <summary>
-    /// Reads one record by its <c>GlobalRecordId</c>, with every page row. Deleted records are included.
+    /// Reads one record by its <c>GlobalRecordId</c>, with every page row and its intrinsic position and count.
+    /// Deleted records are included.
     /// </summary>
+    /// <remarks>
+    /// The position and count follow the intrinsic rule of the interface remarks and come from the same consistent
+    /// read as the row.
+    /// </remarks>
     /// <param name="form">The form's metadata.</param>
     /// <param name="globalRecordId">The record's base-table <c>GlobalRecordId</c>.</param>
     /// <param name="cancellationToken">The request's abort token.</param>
     /// <returns>
-    /// The record, or <see langword="null"/> when the id is not in the base table, which the API reports as 404.
+    /// The record with its intrinsic position and count, built with <see cref="RecordDto.From"/>; or
+    /// <see langword="null"/> when the id is not in the base table, which the API reports as 404.
     /// </returns>
-    Task<StoredRecord?> GetByIdAsync(FormMetadata form, string globalRecordId, CancellationToken cancellationToken);
-
-    /// <summary>
-    /// Computes a record's intrinsic coordinates, the <c>position</c> and <c>count</c> its <see cref="RecordDto"/>
-    /// carries in every response.
-    /// </summary>
-    /// <remarks>
-    /// The set is the one <see cref="RecordQueryRules.IntrinsicIncludesDeleted"/> chooses for
-    /// <c>record.RecStatus</c>: the active set when it is 1, every row otherwise. The caller's deleted toggle plays no
-    /// part. <c>Position</c> is the number of rows of that set whose <c>UniqueKey</c> is at most
-    /// <c>record.UniqueKey</c>, the legacy record-number formula, and <c>Count</c> is the number of rows in the set.
-    /// </remarks>
-    /// <param name="form">The form's metadata.</param>
-    /// <param name="record">The record, as a read of this store returned it.</param>
-    /// <param name="cancellationToken">The request's abort token.</param>
-    /// <returns>The record's intrinsic position and the size of the same set.</returns>
-    Task<(int Position, int Count)> GetPositionAsync(
-        FormMetadata form,
-        StoredRecord record,
-        CancellationToken cancellationToken);
+    Task<RecordDto?> GetByIdAsync(FormMetadata form, string globalRecordId, CancellationToken cancellationToken);
 
     /// <summary>
     /// Places a record in the caller's selected set, for the navigator's "[n] of N" display.
     /// </summary>
     /// <remarks>
     /// Only the base table is read, so a record missing a page row is still placed. These coordinates differ from the
-    /// intrinsic ones of <see cref="GetPositionAsync"/> whenever the toggle selects a set other than the record's own.
+    /// intrinsic ones a <see cref="RecordDto"/> carries whenever the toggle selects a set other than the record's own.
     /// </remarks>
     /// <param name="form">The form's metadata.</param>
     /// <param name="globalRecordId">The record's base-table <c>GlobalRecordId</c>.</param>

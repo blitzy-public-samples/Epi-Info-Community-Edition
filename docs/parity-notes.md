@@ -452,7 +452,7 @@ The records-list `q` is a case-insensitive "contains" over the grid columns. It 
 
 ## Parity gaps
 
-Four gaps were recorded during the run, all in the check-code `=` operator (`src/EpiInfo.CheckCode/Evaluation/ValueComparer.cs`); the first also covers `NOT`'s comparison with `"true"` (`Evaluator.cs`). `EvaluatorTests` pins the first three; the fourth, whose legacy answer depends on the desktop's date format, has no pinning test. No seeded program reaches any of them: the seeded comparisons are `Sex = "1"`, `FeverTemp = (.)` and `Fever = (-)`, and the one seeded `NOT` negates the comparison `FeverTemp = (.)`, a boolean (`testdata/sql/03_forms.sql:metaViews`).
+Five gaps were recorded during the run. Four are in the check-code `=` operator (`src/EpiInfo.CheckCode/Evaluation/ValueComparer.cs`); the first also covers `NOT`'s comparison with `"true"` (`Evaluator.cs`). `EvaluatorTests` pins the first three; the fourth, whose legacy answer depends on the desktop's date format, has no pinning test. No seeded program reaches any of them: the seeded comparisons are `Sex = "1"`, `FeverTemp = (.)` and `Fever = (-)`, and the one seeded `NOT` negates the comparison `FeverTemp = (.)`, a boolean (`testdata/sql/03_forms.sql:metaViews`). The fifth is in the Legal Values options; `SqlMetadataReaderTests` pins it, and no seeded field reaches it.
 
 ### `=` on two texts: the desktop culture
 
@@ -477,6 +477,12 @@ Four gaps were recorded during the run, all in the check-code `=` operator (`src
 - **Legacy:** a date and text are compared by the string forms of both sides, untrimmed, with `StringComparer.CurrentCultureIgnoreCase` (`Epi.Core.EnterInterpreter/Rules/Rule_CompareExp.cs:191-217`). The date's form is `DateTime.ToString()` in the desktop's current culture, such as `1/15/2011 12:00:00 AM` under en-US.
 - **Kept:** the invariant string forms of both sides, a date as `yyyy-MM-dd` (C-15), untrimmed, compared linguistically with the invariant culture, ignoring case. So text `"2011-01-15"` equals the date 2011-01-15, and text `"1/15/2011 12:00:00 AM"` does not.
 - **Why not equal:** the server does not know the desktop's date format, and dates are ISO `YYYY-MM-DD` on the wire (C-15). No seeded program compares a date with text.
+
+### Legal Values options
+
+- **Legacy:** the whole code table is read without `ORDER BY`, the exact-distinct texts of `TextColumnName` are kept with `DataView.ToTable(true, ...)`, which compares values with `Equals`, and a `NULL` row shows as an empty item. With `Sort` = 1 the ComboBox sorts under the process's current culture with `CompareOptions.StringSort`, case-sensitive (`Epi.Core/Services/Fields/TableBasedDropdownField.cs:79-110`; `Epi.Windows.Enter/PresentationLogic/ControlFactory.cs:506, 537-541`).
+- **Kept:** the same unsorted rows, every code table of a request read in one batch; the exact-distinct texts as stored, empty and white-space texts included; with `Sort` = 1, one sort by the metadata reader under the API process's current culture with `StringSort`, whose order the form definition keeps (`src/EpiInfo.Data/Metadata/SqlMetadataReader.cs`).
+- **Why not equal:** a `NULL` row is not offered, because an option's value and label are both its stored text and a `NULL` has none; leaving the field empty still saves `NULL`, as legacy saves its empty item. Texts the culture ranks equal, such as a decomposed and a precomposed `é`, are ordered ordinally, where legacy's order for them depends on the order of insertion. The seeded Legal Values fields (`FoodHistory` `Sex`, `EthnicityGroup` and `LooseStoolsPerDay`) all have `Sort` = 0, and their code tables hold no `NULL`, blank or case-variant row.
 
 These checks would record further gaps, with their state at the snapshot:
 

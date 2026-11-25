@@ -20,8 +20,11 @@ internal static class MetadataQueries
     /// <summary>Name of the table-name list parameter: a JSON array of strings, bound as <c>DbType.String</c> with size -1 (<c>nvarchar(max)</c>).</summary>
     public const string NamesParameter = "@names";
 
-    /// <summary>Name of the session temporary table parameter, including its leading <c>#</c>, bound as <c>DbType.String</c>.</summary>
+    /// <summary>Name of the session temporary table parameter: the whole session name, including its single leading <c>#</c>, bound as <c>DbType.String</c> and quoted as one identifier part by the statement.</summary>
     public const string TableNameParameter = "@tableName";
+
+    /// <summary>Name of the <c>tempdb</c> object id parameter, the id <see cref="TempTableObjectId"/> resolved, bound as <c>DbType.Int32</c>.</summary>
+    public const string ObjectIdParameter = "@objectId";
 
     /// <summary>No parameters; returns <c>ViewId</c>, <c>Name</c>, <c>PageCount</c>, one row per <c>metaViews</c> row ordered by <c>ViewId</c>.</summary>
     /// <remarks>Related views are listed too: legacy does not filter on <c>IsRelatedView</c>.</remarks>
@@ -94,7 +97,7 @@ internal static class MetadataQueries
         ORDER BY f.[FieldId];
         """;
 
-    /// <summary>Takes <c>@names</c>; returns <c>TableName</c>, <c>SchemaName</c> (the schema the name resolved in), <c>ColumnName</c>, <c>TypeName</c>, <c>MaxLengthBytes</c>, <c>IsNullable</c>, <c>IsIdentity</c>, <c>ColumnId</c> for each named table that its unqualified name reaches for the caller, ordered by table, then <c>ColumnId</c>.</summary>
+    /// <summary>Takes <c>@names</c>; returns <c>TableName</c>, <c>ColumnName</c>, <c>TypeName</c>, <c>MaxLengthBytes</c>, <c>IsNullable</c>, <c>IsIdentity</c>, <c>ColumnId</c> for each named table that its unqualified name reaches for the caller, ordered by table, then <c>ColumnId</c>.</summary>
     /// <remarks>
     /// <para>
     /// The names arrive as one JSON array, so the text stays constant and the list stays a single typed parameter;
@@ -120,16 +123,15 @@ internal static class MetadataQueries
     /// The reader prefers an exact ordinal match among the rows returned.
     /// </para>
     /// <para>
-    /// A catalogue table is returned only when its own bracket-quoted name, written unqualified, reaches that very
-    /// table for the caller: <c>OBJECT_ID</c> resolves a one-part name in the caller's default schema first, then in
-    /// <c>dbo</c>, as SQL Server resolves every unqualified reference. The unqualified <c>meta*</c> reads of this
-    /// class and the one-part identifiers the reader builds from the returned names resolve the same way, so
-    /// descriptors, catalogue rows and record or code-table SQL always reach one object. <c>SchemaName</c> reports
-    /// the schema that resolution chose, so the two-part name it forms with <c>TableName</c> reaches the same table
-    /// as the one-part name; the reader carries <c>SchemaName</c> with the table it builds, so validation and later
-    /// SQL reuse the same binding. A table, view or synonym of the same name in the default schema shadows a
-    /// <c>dbo</c> table: a shadowing table is the one returned, and a shadowing view or synonym, which is not in
-    /// <c>sys.tables</c>, leaves the name with no row.
+    /// A catalogue table is returned only when its own bracket-quoted one-part name,
+    /// <c>OBJECT_ID(QUOTENAME(t.[name]))</c>, reaches that very table for the caller: <c>OBJECT_ID</c> resolves a
+    /// one-part name in the caller's default schema first, then in <c>dbo</c>, as SQL Server resolves every
+    /// unqualified reference. No schema is returned. The reader keeps only that one-part catalogue name, and the
+    /// one-part identifiers it builds from it in later SQL, like the unqualified <c>meta*</c> reads of this class,
+    /// resolve the same way, so descriptors, catalogue rows and record or code-table SQL always reach one object.
+    /// A table, view or synonym of the same name in the default schema shadows a <c>dbo</c> table: a shadowing
+    /// table is the one returned, and a shadowing view or synonym, which is not in <c>sys.tables</c>, leaves the name
+    /// with no row.
     /// </para>
     /// <para>
     /// <c>sys.types</c> is joined on <c>user_type_id</c>, so a column of an alias type reports the alias name, which
@@ -139,7 +141,6 @@ internal static class MetadataQueries
     internal const string Columns = """
         IF (SELECT d.[compatibility_level] FROM sys.databases AS d WHERE d.[database_id] = DB_ID()) >= 130
             SELECT t.[name] AS TableName,
-                   SCHEMA_NAME(t.[schema_id]) AS SchemaName,
                    c.[name] AS ColumnName,
                    ty.[name] AS TypeName,
                    c.[max_length] AS MaxLengthBytes,
@@ -194,7 +195,6 @@ internal static class MetadataQueries
                   AND m.[At] IS NOT NULL
             )
             SELECT t.[name] AS TableName,
-                   SCHEMA_NAME(t.[schema_id]) AS SchemaName,
                    c.[name] AS ColumnName,
                    ty.[name] AS TypeName,
                    c.[max_length] AS MaxLengthBytes,
@@ -218,16 +218,24 @@ internal static class MetadataQueries
         WHERE [ViewId] = @viewId;
         """;
 
-    /// <summary>Takes <c>@tableName</c>; returns one unnamed column, the <c>tempdb</c> object id of the session temporary table, or <c>NULL</c> when it does not exist.</summary>
-    /// <remarks>Used only by the reserved-word test fixture, so a missing <c>#</c> table fails with a clear message.</remarks>
+    /// <summary>Takes <c>@tableName</c>; returns one unnamed <c>int</c> column, the <c>tempdb</c> object id of the calling session's temporary user table of that name, or <c>NULL</c> when the session has none.</summary>
+    /// <remarks>
+    /// Used only by the reserved-word test fixture, so a missing <c>#</c> table fails with a clear message. The
+    /// reader admits only a session-local name: a single <c>#</c> and at most 116 characters, short enough that
+    /// <c>QUOTENAME</c> quotes it whole as one bracket-quoted part with any <c>]</c> doubled. A <c>.</c> or <c>]</c>
+    /// in the name therefore cannot split it into other name parts, and the <c>U</c> type restricts the result to a
+    /// user table. SQL Server resolves a <c>#</c> name only among the calling session's own temporary tables.
+    /// </remarks>
     internal const string TempTableObjectId = """
-        SELECT OBJECT_ID(N'tempdb..' + @tableName);
+        SELECT OBJECT_ID(N'tempdb..' + QUOTENAME(@tableName), N'U');
         """;
 
-    /// <summary>Takes <c>@tableName</c>; returns <c>ColumnName</c>, <c>TypeName</c>, <c>MaxLengthBytes</c>, <c>IsNullable</c>, <c>IsIdentity</c>, <c>ColumnId</c> of the session temporary table, ordered by <c>ColumnId</c>.</summary>
+    /// <summary>Takes <c>@objectId</c>; returns <c>ColumnName</c>, <c>TypeName</c>, <c>MaxLengthBytes</c>, <c>IsNullable</c>, <c>IsIdentity</c>, <c>ColumnId</c> of the <c>tempdb</c> table with that object id, ordered by <c>ColumnId</c>.</summary>
     /// <remarks>
-    /// Used only by the reserved-word test fixture. No <c>TableName</c> column is returned: the <c>tempdb</c>
-    /// catalogue holds a mangled name, so the reader keeps the session name it was given.
+    /// Used only by the reserved-word test fixture, with the id <see cref="TempTableObjectId"/> resolved on the same
+    /// session, so the columns come from the very table that name resolution found and the name is not resolved a
+    /// second time. No <c>TableName</c> column is returned: the <c>tempdb</c> catalogue holds a mangled name, so the
+    /// reader keeps the session name it was given.
     /// </remarks>
     internal const string TempdbColumns = """
         SELECT c.[name] AS ColumnName,
@@ -238,7 +246,7 @@ internal static class MetadataQueries
                c.[column_id] AS ColumnId
         FROM tempdb.sys.columns AS c
         INNER JOIN tempdb.sys.types AS ty ON ty.[user_type_id] = c.[user_type_id]
-        WHERE c.[object_id] = OBJECT_ID(N'tempdb..' + @tableName)
+        WHERE c.[object_id] = @objectId
         ORDER BY c.[column_id];
         """;
 }

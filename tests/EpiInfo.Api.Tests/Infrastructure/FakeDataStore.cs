@@ -374,7 +374,6 @@ public sealed class FakeDataStore : IDataStore
         nameof(IDataStore.CountAsync),
         nameof(IDataStore.GetAtPositionAsync),
         nameof(IDataStore.GetByIdAsync),
-        nameof(IDataStore.GetPositionAsync),
         nameof(IDataStore.GetSetPositionAsync),
         nameof(IDataStore.ListAsync),
         nameof(IDataStore.SearchAsync),
@@ -722,10 +721,15 @@ public sealed class FakeDataStore : IDataStore
                 foreach (var field in state.DataFields.Where(field => field.FieldType == FieldType.LegalValues))
                 {
                     IEnumerable<FieldOption> configured = FindOptions(state.Form, field.Name);
-                    // The ordering the SQL metadata reader applies when metaFields.Sort is set.
+                    // Mirrors SqlMetadataReader, the one owner of the Sort = 1 ordering: the current culture read at
+                    // the call, with StringSort, case-sensitive, then ordinal for texts the culture ranks equal.
                     if (field.Field.Sort)
                     {
-                        configured = configured.OrderBy(option => option.Label, StringComparer.InvariantCultureIgnoreCase);
+                        StringComparer comparer =
+                            CultureInfo.CurrentCulture.CompareInfo.GetStringComparer(CompareOptions.StringSort);
+                        configured = configured
+                            .OrderBy(option => option.Label, comparer)
+                            .ThenBy(option => option.Label, StringComparer.Ordinal);
                     }
 
                     options.TryAdd(field.Name, Array.AsReadOnly(configured.ToArray()));
@@ -759,12 +763,12 @@ public sealed class FakeDataStore : IDataStore
         });
 
     /// <inheritdoc />
-    public Task<StoredRecord?> GetAtPositionAsync(
+    public Task<RecordDto?> GetAtPositionAsync(
         FormMetadata form,
         int position,
         bool includeDeleted,
         CancellationToken cancellationToken) =>
-        Complete<StoredRecord?>(() =>
+        Complete<RecordDto?>(() =>
         {
             ArgumentNullException.ThrowIfNull(form);
             lock (_gate)
@@ -776,18 +780,20 @@ public sealed class FakeDataStore : IDataStore
                     return null;
                 }
 
+                // The row and its intrinsic coordinates are read under one hold of the lock, the fake's one
+                // consistent read, as the SQL store reads them in one statement.
                 var selected = state.Selected(includeDeleted);
                 var offset = RecordQueryRules.PositionToOffset(position);
-                return offset < selected.Count ? Stored(state, selected[(int)offset]) : null;
+                return offset < selected.Count ? Dto(state, selected[(int)offset]) : null;
             }
         });
 
     /// <inheritdoc />
-    public Task<StoredRecord?> GetByIdAsync(
+    public Task<RecordDto?> GetByIdAsync(
         FormMetadata form,
         string globalRecordId,
         CancellationToken cancellationToken) =>
-        Complete<StoredRecord?>(() =>
+        Complete<RecordDto?>(() =>
         {
             ArgumentNullException.ThrowIfNull(form);
             ArgumentNullException.ThrowIfNull(globalRecordId);
@@ -795,24 +801,7 @@ public sealed class FakeDataStore : IDataStore
             {
                 BeginRead(nameof(GetByIdAsync), cancellationToken);
                 var state = Resolve(form);
-                return state.Find(globalRecordId) is { } row ? Stored(state, row) : null;
-            }
-        });
-
-    /// <inheritdoc />
-    public Task<(int Position, int Count)> GetPositionAsync(
-        FormMetadata form,
-        StoredRecord record,
-        CancellationToken cancellationToken) =>
-        Complete(() =>
-        {
-            ArgumentNullException.ThrowIfNull(form);
-            ArgumentNullException.ThrowIfNull(record);
-            lock (_gate)
-            {
-                BeginRead(nameof(GetPositionAsync), cancellationToken);
-                var selected = Resolve(form).Selected(RecordQueryRules.IntrinsicIncludesDeleted(record.RecStatus));
-                return (PositionOf(selected, record.UniqueKey), selected.Count);
+                return state.Find(globalRecordId) is { } row ? Dto(state, row) : null;
             }
         });
 
@@ -1181,7 +1170,8 @@ public sealed class FakeDataStore : IDataStore
     private static StoredRecord Stored(FormState state, StoredRow row) =>
         new(row.GlobalRecordId, row.UniqueKey, row.RecStatus, Snapshot(state, row));
 
-    // The response snapshot of a write, with the record's intrinsic coordinates.
+    // A record with its intrinsic coordinates, for the record reads and the response snapshot of a write. Callers hold
+    // the lock, so the row and its coordinates come from one state.
     private static RecordDto Dto(FormState state, StoredRow row)
     {
         var selected = state.Selected(RecordQueryRules.IntrinsicIncludesDeleted(row.RecStatus));

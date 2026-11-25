@@ -19,8 +19,9 @@ namespace EpiInfo.Data.Metadata;
 /// <para>
 /// Nothing is cached: every call reads the metadata and the catalogue again, so a changed form or column type is seen
 /// by the next request. Every statement is a <c>SELECT</c>, runs through <see cref="SqlExecution"/> with the configured
-/// command timeout and the command observer, and binds every value as a typed parameter. The one statement with
-/// dynamic text, the code-table read, names only a table and a column this class built from the catalogue.
+/// command timeout and the command observer, and binds every value as a typed parameter. The one command with
+/// dynamic text, the code-table read, holds one <c>SELECT</c> per distinct code-table column a request needs, and
+/// names only tables and columns this class built from the catalogue.
 /// </para>
 /// <para>
 /// Failures to open a connection or to run a command are not caught here: <see cref="SqlConnectionFactory"/> and the
@@ -47,10 +48,15 @@ internal sealed class SqlMetadataReader(
     // Fixed messages: the redaction policy keeps identifiers, values and SQL out of exception text.
     private const string DataTableNameMessage = "The form metadata does not name exactly one data table.";
     private const string BaseTableMissingMessage = "The form's data table was not found in the database catalogue.";
+    private const string CodeTableResultsMessage = "The code-table read returned fewer result sets than it requested.";
     private const string TempTableMissingMessage = "The temporary table was not found.";
     private const string ConnectionNotOpenMessage = "The connection must be open before a temporary table is read.";
-    private const string TempTableNameMessage = "A session temporary table name must be non-blank and start with '#'.";
+    private const string TempTableNameMessage =
+        "A session temporary table name must be one '#' followed by 1 to 115 characters that neither start nor end with white space.";
     private const string NullTableNameMessage = "A requested table name is null.";
+
+    // SQL Server's length limit for a local temporary table name, its '#' included.
+    private const int MaxTempTableNameLength = 116;
 
     private static readonly IReadOnlyList<FieldOption> NoOptions = Array.AsReadOnly(Array.Empty<FieldOption>());
     private static readonly IReadOnlyList<SqlParameterValue> NoParameters =
@@ -121,13 +127,19 @@ internal sealed class SqlMetadataReader(
     /// Reads the options of every Legal Values field of <paramref name="form"/>: one entry per field that
     /// <see cref="FieldTypeMapper.Map"/> maps to a supported <see cref="FieldType.LegalValues"/>.
     /// </summary>
+    /// <remarks>
+    /// At most two commands are sent, whatever the number of fields: one catalogue read resolves every code table
+    /// the fields name, then one batch holds a <c>SELECT</c> of each distinct resolved table and column, so fields
+    /// sharing a code table read it once. Nothing is kept for a later call.
+    /// </remarks>
     /// <param name="form">The form's metadata, as <see cref="GetFormMetadataAsync"/> returned it.</param>
     /// <param name="cancellationToken">The request's abort token.</param>
     /// <returns>
     /// The options keyed by canonical field name, keys compared ignoring case. A field without a usable code table
-    /// has an empty list. No connection is opened when the form has no Legal Values field.
+    /// has an empty list. No connection is opened when no Legal Values field names both a code table and a column.
     /// </returns>
     /// <exception cref="ArgumentNullException"><paramref name="form"/> is null.</exception>
+    /// <exception cref="InvalidOperationException">The code-table batch returned fewer result sets than it holds.</exception>
     public async Task<IReadOnlyDictionary<string, IReadOnlyList<FieldOption>>> GetOptionsAsync(
         FormMetadata form,
         CancellationToken cancellationToken)
@@ -147,7 +159,8 @@ internal sealed class SqlMetadataReader(
             }
         }
 
-        if (legalValuesFields.Count == 0)
+        // A field that names no code table or no column keeps its empty list without any read.
+        if (!legalValuesFields.Exists(field => CodeTableReference(field) is not null))
         {
             return optionsByField.AsReadOnly();
         }
@@ -157,33 +170,16 @@ internal sealed class SqlMetadataReader(
             .ConfigureAwait(false);
         await using (connection.ConfigureAwait(false))
         {
-            // One catalogue read resolves every code table of the form; each field then reads its own column.
-            var codeTableNames = new List<string>(legalValuesFields.Count);
-            foreach (FieldMetadata field in legalValuesFields)
-            {
-                if (CodeTableReference(field) is { } reference)
-                {
-                    codeTableNames.Add(reference.Table);
-                }
-            }
-
-            IReadOnlyList<TableSchema> tables = await ReadTablesAsync(
+            IReadOnlyList<FieldOption>[] fieldOptions = await ReadOptionsCoreAsync(
                     connection,
                     transaction: null,
-                    codeTableNames,
-                    ReadOptionsOperation,
+                    legalValuesFields,
                     cancellationToken)
                 .ConfigureAwait(false);
 
-            foreach (FieldMetadata field in legalValuesFields)
+            for (int index = 0; index < fieldOptions.Length; index++)
             {
-                optionsByField[field.Name] = await ReadOptionsCoreAsync(
-                        connection,
-                        transaction: null,
-                        field,
-                        tables,
-                        cancellationToken)
-                    .ConfigureAwait(false);
+                optionsByField[legalValuesFields[index].Name] = fieldOptions[index];
             }
         }
 
@@ -373,17 +369,18 @@ internal sealed class SqlMetadataReader(
     }
 
     /// <summary>
-    /// Reads the options of one Legal Values field from its code table, on a connection the caller owns.
+    /// Reads the options of one Legal Values field from its code table, on a connection the caller owns, with the
+    /// same catalogue read and code-table read <see cref="GetOptionsAsync"/> batches for a whole form.
     /// </summary>
     /// <param name="connection">An open connection; this method neither opens nor closes it.</param>
     /// <param name="transaction">The transaction every command joins, or <see langword="null"/>.</param>
     /// <param name="field">The field whose <c>SourceTableName</c> and <c>TextColumnName</c> name the code table.</param>
     /// <param name="cancellationToken">The request's abort token.</param>
     /// <returns>
-    /// The distinct non-blank texts of the code-table column, each as <c>new FieldOption(FieldValue.FromText(text),
-    /// text)</c>, in the order SQL Server returned them, or sorted by text when <see cref="FieldMetadata.Sort"/> is
-    /// set. An empty list when either name is missing, or the table, or a character column of that name, is not in
-    /// the catalogue.
+    /// The code-table column's texts as <see cref="ToOptions"/> builds them: every distinct non-null text exactly as
+    /// stored, empty and white-space texts included, in the order SQL Server returned them, or sorted by text under
+    /// <see cref="CultureInfo.CurrentCulture"/> when <see cref="FieldMetadata.Sort"/> is set. An empty list when either
+    /// name is missing, or the table, or a character column of that name, is not in the catalogue.
     /// </returns>
     /// <exception cref="ArgumentNullException"><paramref name="connection"/> or <paramref name="field"/> is null.</exception>
     internal async Task<IReadOnlyList<FieldOption>> ReadOptionsAsync(
@@ -395,21 +392,14 @@ internal sealed class SqlMetadataReader(
         ArgumentNullException.ThrowIfNull(connection);
         ArgumentNullException.ThrowIfNull(field);
 
-        if (CodeTableReference(field) is not { } reference)
-        {
-            return NoOptions;
-        }
-
-        IReadOnlyList<TableSchema> tables = await ReadTablesAsync(
+        IReadOnlyList<FieldOption>[] fieldOptions = await ReadOptionsCoreAsync(
                 connection,
                 transaction,
-                [reference.Table],
-                ReadOptionsOperation,
+                [field],
                 cancellationToken)
             .ConfigureAwait(false);
 
-        return await ReadOptionsCoreAsync(connection, transaction, field, tables, cancellationToken)
-            .ConfigureAwait(false);
+        return fieldOptions[0];
     }
 
     /// <summary>
@@ -469,20 +459,33 @@ internal sealed class SqlMetadataReader(
     /// <summary>
     /// Builds the catalogue schema of a session temporary table, for the reserved-word identifier test fixture only.
     /// </summary>
+    /// <remarks>
+    /// Only a session-local name is admitted, so the fixture never reaches a global <c>##</c> table, which every
+    /// session can see. The name is resolved once, as a single bracket-quoted part restricted to a user table, among
+    /// the session's own temporary tables, and the columns are then read by the resolved <c>tempdb</c> object id.
+    /// </remarks>
     /// <param name="open">
     /// An open connection with no pending transaction: the commands run without one. It is the session that owns
     /// the temporary table.
     /// </param>
-    /// <param name="tempTableName">The session name of the table, starting with <c>#</c>, such as <c>#Reserved</c>.</param>
+    /// <param name="tempTableName">
+    /// The session name of the table: one <c>#</c> followed by 1 to 115 characters that neither start nor end with
+    /// white space, such as <c>#Reserved</c>. A <c>.</c> or <c>]</c> in it is part of the one name.
+    /// </param>
     /// <param name="cancellationToken">The caller's abort token.</param>
     /// <returns>
     /// The table under its session name, because the <c>tempdb</c> catalogue holds a mangled one, with its columns in
     /// <c>column_id</c> order.
     /// </returns>
     /// <exception cref="ArgumentNullException"><paramref name="open"/> is null.</exception>
-    /// <exception cref="ArgumentException"><paramref name="tempTableName"/> is blank or does not start with <c>#</c>.</exception>
+    /// <exception cref="ArgumentException">
+    /// <paramref name="tempTableName"/> is null, is not a session-local name (it lacks the leading <c>#</c> or starts
+    /// with <c>##</c>), has nothing or white space just after the <c>#</c>, ends with white space, or is longer than
+    /// the 116 characters SQL Server allows a local temporary table name. No command is sent.
+    /// </exception>
     /// <exception cref="InvalidOperationException">
-    /// The connection is not open, or the session has no such temporary table or the table has no column.
+    /// The connection is not open, or the session has no temporary table of that name, including one that only
+    /// another session holds, or the table has no column.
     /// </exception>
     internal async Task<TableSchema> ReadTempTableSchemaAsync(
         SqlConnection open,
@@ -491,31 +494,28 @@ internal sealed class SqlMetadataReader(
     {
         ArgumentNullException.ThrowIfNull(open);
 
+        if (!IsSessionTempTableName(tempTableName))
+        {
+            throw new ArgumentException(TempTableNameMessage, nameof(tempTableName));
+        }
+
         if (open.State != ConnectionState.Open)
         {
             throw new InvalidOperationException(ConnectionNotOpenMessage);
         }
 
-        if (string.IsNullOrWhiteSpace(tempTableName) || !tempTableName.StartsWith('#'))
-        {
-            throw new ArgumentException(TempTableNameMessage, nameof(tempTableName));
-        }
-
-        SqlParameterValue[] tableNameParameter =
-        [
-            ColumnValueConverter.Text(MetadataQueries.TableNameParameter, tempTableName),
-        ];
-
         int? objectId = await SqlExecution.ExecuteScalarAsync<int?>(
                 open,
                 transaction: null,
                 ReadTempTableOperation,
-                new SqlStatement(MetadataQueries.TempTableObjectId, tableNameParameter),
+                new SqlStatement(
+                    MetadataQueries.TempTableObjectId,
+                    [ColumnValueConverter.Text(MetadataQueries.TableNameParameter, tempTableName)]),
                 options.CommandTimeoutSeconds,
                 observer,
                 cancellationToken)
             .ConfigureAwait(false);
-        if (objectId is null)
+        if (objectId is not { } tempdbObjectId)
         {
             throw new InvalidOperationException(TempTableMissingMessage);
         }
@@ -524,7 +524,9 @@ internal sealed class SqlMetadataReader(
                 open,
                 transaction: null,
                 ReadTempTableOperation,
-                new SqlStatement(MetadataQueries.TempdbColumns, tableNameParameter),
+                new SqlStatement(
+                    MetadataQueries.TempdbColumns,
+                    [ColumnValueConverter.Int32(MetadataQueries.ObjectIdParameter, tempdbObjectId)]),
                 cancellationToken)
             .ConfigureAwait(false);
         if (rows.Count == 0)
@@ -534,6 +536,15 @@ internal sealed class SqlMetadataReader(
 
         return new TableSchema(tempTableName, ToColumns(rows));
     }
+
+    // A session-local temporary table name: one '#', then a name that neither starts nor ends with white space, at
+    // most MaxTempTableNameLength characters in all. A second leading '#' would name a global temporary table.
+    private static bool IsSessionTempTableName(string? name) =>
+        name is { Length: >= 2 and <= MaxTempTableNameLength }
+        && name[0] == '#'
+        && name[1] != '#'
+        && !char.IsWhiteSpace(name[1])
+        && !char.IsWhiteSpace(name[^1]);
 
     // Resolves table names against the catalogue in one statement. Each returned table carries the catalogue's own
     // spelling of its table and column names; a name the catalogue does not know is simply absent from the result.
@@ -615,57 +626,203 @@ internal sealed class SqlMetadataReader(
         return caseInsensitiveCount == 1 ? caseInsensitiveMatch : null;
     }
 
-    // The code table and text column a Legal Values field names, trimmed as legacy trims TextColumnName, or null when
-    // either is missing or blank.
+    // The code table and text column a Legal Values field names, or null when either is missing or blank. Legacy looks
+    // the table up by SourceTableName exactly as stored and trims only TextColumnName (ControlFactory.GetControls), so
+    // a padded table name is kept as it is and matches no catalogue table, rather than reaching the unpadded one.
     private static (string Table, string Column)? CodeTableReference(FieldMetadata field)
     {
-        string? table = field.SourceTableName?.Trim();
+        string? table = field.SourceTableName;
         string? column = field.TextColumnName?.Trim();
-        return string.IsNullOrEmpty(table) || string.IsNullOrEmpty(column) ? null : (table, column);
+        return string.IsNullOrWhiteSpace(table) || string.IsNullOrEmpty(column) ? null : (table, column);
     }
 
-    // Reads the field's code-table column once its table has been resolved from the catalogue. Legacy reads the whole
-    // table without ORDER BY (SqlDatabase.GetTableData), keeps the distinct texts of TextColumnName under a
-    // case-insensitive DataTable, and sorts the list only when the field's Sort flag is set.
-    private async Task<IReadOnlyList<FieldOption>> ReadOptionsCoreAsync(
+    // Resolves the code table and text column of every field with one catalogue read, then reads each distinct
+    // resolved column once, all in one batch. Legacy reads the whole code table without ORDER BY
+    // (SqlDatabase.GetTableData) for each field; one read of a table two fields share returns the same rows. The
+    // result holds one list per field, in the order of fields.
+    private async Task<IReadOnlyList<FieldOption>[]> ReadOptionsCoreAsync(
         SqlConnection connection,
         SqlTransaction? transaction,
-        FieldMetadata field,
-        IReadOnlyList<TableSchema> tables,
+        IReadOnlyList<FieldMetadata> fields,
         CancellationToken cancellationToken)
     {
-        if (CodeTableReference(field) is not { } reference
-            || MatchTable(tables, reference.Table) is not { } table
-            || table.FindColumn(reference.Column) is not { } column
-            || column.Metadata.Family != ColumnFamily.Character)
+        var fieldOptions = new IReadOnlyList<FieldOption>[fields.Count];
+        Array.Fill(fieldOptions, NoOptions);
+
+        var references = new (string Table, string Column)?[fields.Count];
+        var codeTableNames = new List<string>(fields.Count);
+        for (int index = 0; index < fields.Count; index++)
         {
-            // Includes legacy's "<form> - <page>" references to a form used as a code table, which are not supported.
-            return NoOptions;
+            references[index] = CodeTableReference(fields[index]);
+            if (references[index] is { } reference)
+            {
+                codeTableNames.Add(reference.Table);
+            }
         }
 
-        // The only statement with dynamic text: both identifiers are catalogue names this reader built.
-        string text = "SELECT " + SqlIdentifier.Quote(column) + " FROM " + SqlIdentifier.Quote(table) + ";";
-        IReadOnlyList<string?> values = await QueryAsync<string?>(
+        if (codeTableNames.Count == 0)
+        {
+            return fieldOptions;
+        }
+
+        IReadOnlyList<TableSchema> tables = await ReadTablesAsync(
                 connection,
                 transaction,
+                codeTableNames,
                 ReadOptionsOperation,
-                new SqlStatement(text, NoParameters),
                 cancellationToken)
             .ConfigureAwait(false);
 
-        var seen = new HashSet<string>(StringComparer.InvariantCultureIgnoreCase);
-        var texts = new List<string>(values.Count);
-        foreach (string? value in values)
+        // Each resolved pair is read once. The key holds the catalogue spellings, which a value tuple of strings
+        // compares ordinally, so fields that reach one column through differently cased metadata share its read.
+        var pairs = new List<(TableSchema Table, ColumnSchema Column)>();
+        var pairIndexes = new Dictionary<(string Table, string Column), int>();
+        var fieldPairs = new int?[fields.Count];
+        for (int index = 0; index < fields.Count; index++)
         {
-            // Each text is kept exactly as stored, untrimmed, because a saved legal value must equal an option.
-            if (!string.IsNullOrWhiteSpace(value) && seen.Add(value))
+            if (references[index] is not { } reference
+                || MatchTable(tables, reference.Table) is not { } table
+                || table.FindColumn(reference.Column) is not { } column
+                || column.Metadata.Family != ColumnFamily.Character)
+            {
+                // Includes legacy's "<form> - <page>" references to a form used as a code table, which are not supported.
+                continue;
+            }
+
+            if (!pairIndexes.TryGetValue((table.Name, column.Name), out int pairIndex))
+            {
+                pairIndex = pairs.Count;
+                pairIndexes.Add((table.Name, column.Name), pairIndex);
+                pairs.Add((table, column));
+            }
+
+            fieldPairs[index] = pairIndex;
+        }
+
+        if (pairs.Count == 0)
+        {
+            return fieldOptions;
+        }
+
+        IReadOnlyList<string?>[] storedTexts = await ReadCodeTableColumnsAsync(
+                connection,
+                transaction,
+                pairs,
+                cancellationToken)
+            .ConfigureAwait(false);
+
+        // Legacy sorts under the current culture of the process running data entry; the API process is the local
+        // user's own, so its current culture is read here, when the lists are built, and never kept.
+        CultureInfo culture = CultureInfo.CurrentCulture;
+        for (int index = 0; index < fields.Count; index++)
+        {
+            if (fieldPairs[index] is int pairIndex)
+            {
+                fieldOptions[index] = ToOptions(storedTexts[pairIndex], fields[index].Sort, culture);
+            }
+        }
+
+        return fieldOptions;
+    }
+
+    // The only command with dynamic text: one SELECT per pair, each naming a catalogue table and column this reader
+    // built, with no ORDER BY, as legacy reads a code table. The result sets are read in the order of the pairs, and a
+    // SQL NULL text arrives as null.
+    private Task<IReadOnlyList<string?>[]> ReadCodeTableColumnsAsync(
+        SqlConnection connection,
+        SqlTransaction? transaction,
+        IReadOnlyList<(TableSchema Table, ColumnSchema Column)> pairs,
+        CancellationToken cancellationToken)
+    {
+        var statements = new string[pairs.Count];
+        for (int index = 0; index < statements.Length; index++)
+        {
+            (TableSchema table, ColumnSchema column) = pairs[index];
+            statements[index] = "SELECT " + SqlIdentifier.Quote(column) + " FROM " + SqlIdentifier.Quote(table) + ";";
+        }
+
+        return SqlExecution.ReadAsync(
+            connection,
+            transaction,
+            ReadOptionsOperation,
+            new SqlStatement(string.Join('\n', statements), NoParameters),
+            options.CommandTimeoutSeconds,
+            observer,
+            cancellationToken,
+            async (reader, token) =>
+            {
+                var columns = new IReadOnlyList<string?>[pairs.Count];
+                for (int index = 0; index < columns.Length; index++)
+                {
+                    if (index > 0 && !await reader.NextResultAsync(token).ConfigureAwait(false))
+                    {
+                        throw new InvalidOperationException(CodeTableResultsMessage);
+                    }
+
+                    var texts = new List<string?>();
+                    while (await reader.ReadAsync(token).ConfigureAwait(false))
+                    {
+                        texts.Add(reader.IsDBNull(0) ? null : reader.GetString(0));
+                    }
+
+                    columns[index] = texts.AsReadOnly();
+                }
+
+                return columns;
+            });
+    }
+
+    /// <summary>
+    /// Turns the texts of one code-table column, in the order SQL Server returned them, into a field's options.
+    /// </summary>
+    /// <remarks>
+    /// Legacy keeps the distinct texts with <c>DataView.ToTable(true, ...)</c>, which compares values with
+    /// <c>Equals</c>, so case variants stay apart, and it lists blank texts. Each text here is likewise kept exactly
+    /// as stored, untrimmed, and only an exact repeat is collapsed, because a saved legal value must equal an option
+    /// ordinally. A SQL <c>NULL</c> is no stored text, so it is never offered as a choice.
+    /// <para>
+    /// Legacy sorts a <c>Sort</c> = 1 list with <c>ComboBox.Sorted</c>, whose item comparer calls the current culture
+    /// of the process running data entry with <see cref="CompareOptions.StringSort"/>, case-sensitively. The reader
+    /// passes the API process's current culture, so the list sorts as legacy sorts it on the same machine.
+    /// </para>
+    /// </remarks>
+    /// <param name="storedTexts">The column's texts, <see langword="null"/> for a SQL <c>NULL</c>.</param>
+    /// <param name="sort">The field's <see cref="FieldMetadata.Sort"/> flag.</param>
+    /// <param name="culture">
+    /// The culture a sorted list is compared under; it does not affect an unsorted list.
+    /// </param>
+    /// <returns>
+    /// One <c>new FieldOption(FieldValue.FromText(text), text)</c> per distinct non-null text, the empty text and
+    /// white-space texts included, at its first occurrence in the given order. When <paramref name="sort"/> is set
+    /// they are sorted by text instead: <paramref name="culture"/> with <see cref="CompareOptions.StringSort"/>,
+    /// case-sensitive, then ordinal for texts the culture ranks equal, whose order legacy leaves undefined.
+    /// </returns>
+    /// <exception cref="ArgumentNullException">
+    /// <paramref name="storedTexts"/> or <paramref name="culture"/> is null.
+    /// </exception>
+    internal static IReadOnlyList<FieldOption> ToOptions(
+        IEnumerable<string?> storedTexts,
+        bool sort,
+        CultureInfo culture)
+    {
+        ArgumentNullException.ThrowIfNull(storedTexts);
+        ArgumentNullException.ThrowIfNull(culture);
+
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var texts = new List<string>();
+        foreach (string? value in storedTexts)
+        {
+            if (value is not null && seen.Add(value))
             {
                 texts.Add(value);
             }
         }
 
-        IEnumerable<string> ordered = field.Sort
-            ? texts.OrderBy(value => value, StringComparer.InvariantCultureIgnoreCase)
+        // The one sort of a Legal Values list: the form definition keeps this order as given. The ordinal tie-break
+        // gives a fixed order to distinct texts the culture ranks equal, such as "e\u0301" and "\u00e9".
+        IEnumerable<string> ordered = sort
+            ? texts.OrderBy(value => value, culture.CompareInfo.GetStringComparer(CompareOptions.StringSort))
+                .ThenBy(value => value, StringComparer.Ordinal)
             : texts;
 
         return Array.AsReadOnly(ordered.Select(value => new FieldOption(FieldValue.FromText(value), value)).ToArray());

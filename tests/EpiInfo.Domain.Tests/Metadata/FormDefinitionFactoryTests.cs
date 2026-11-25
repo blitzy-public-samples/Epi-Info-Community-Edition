@@ -1123,7 +1123,7 @@ public sealed class FormDefinitionFactoryTests
     }
 
     /// <summary>
-    /// Each seeded Legal Values field gets its own code-table rows, in the order given, because <c>Sort</c> is 0.
+    /// Each seeded Legal Values field gets its own code-table rows, in the order given.
     /// </summary>
     [Theory]
     [InlineData("Sex")]
@@ -1153,8 +1153,12 @@ public sealed class FormDefinitionFactoryTests
             sex.Options);
     }
 
+    /// <summary>
+    /// The store owns the one sort of a <c>Sort</c> = 1 list, so the factory keeps the store's order exactly, even
+    /// when that order is not by text.
+    /// </summary>
     [Fact]
-    public void Create_SortedLegalValues_AreOrderedByText()
+    public void Create_SortedLegalValues_KeepTheStoreOrder()
     {
         FieldMetadata sorted = Field(1, "Sex", "Legal Values", tabIndex: 1, sqlType: "nvarchar(255)", sort: true);
         Dictionary<string, IReadOnlyList<FieldOption>> options = new(StringComparer.Ordinal)
@@ -1164,7 +1168,7 @@ public sealed class FormDefinitionFactoryTests
 
         FieldDefinition field = Assert.Single(Assert.Single(Create(SinglePageForm(sorted), options).Pages).Fields);
 
-        Assert.Equal([TextOption("F-Female"), TextOption("M-Male"), TextOption("U-Unknown")], field.Options);
+        Assert.Equal([TextOption("U-Unknown"), TextOption("F-Female"), TextOption("M-Male")], field.Options);
     }
 
     [Fact]

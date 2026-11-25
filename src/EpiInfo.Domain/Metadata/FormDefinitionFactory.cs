@@ -111,8 +111,9 @@ public static class FormDefinitionFactory
     /// </summary>
     /// <param name="form">The form's metadata, as read on this request.</param>
     /// <param name="legalValueOptions">
-    /// The options of each Legal Values field, keyed by field name, in the order the store returned the code-table
-    /// rows. A field with no entry gets an empty list.
+    /// The options of each Legal Values field, keyed by field name, in the order the store returned them: the
+    /// code-table row order, already sorted by the store when <c>Sort</c> is set. That order is kept as given; the
+    /// factory never reorders it. A field with no entry gets an empty list.
     /// </param>
     /// <param name="unsupportedCheckCode">The static check-code diagnostics of the form's program.</param>
     /// <param name="canInsert">The insert-permission flag, or <see langword="null"/> when not checked.</param>
@@ -303,8 +304,8 @@ public static class FormDefinitionFactory
         };
     }
 
-    // The store's row order is kept, as legacy reads the code table unsorted; Sort = 1 sorts by text, as the legacy
-    // dropdown's Sorted property does. OrderBy is stable, so equal labels keep the store's order.
+    // The store's order is kept exactly as given: it is the code table's row order, already sorted by the store when
+    // Sort = 1. The store owns that one sort, so the factory never reorders the list; it only takes a read-only copy.
     private static IReadOnlyList<FieldOption> LegalValueOptions(
         FieldMetadata field,
         IReadOnlyDictionary<string, IReadOnlyList<FieldOption>> legalValueOptions)
@@ -314,10 +315,7 @@ public static class FormDefinitionFactory
             return ReadOnlyCollection<FieldOption>.Empty;
         }
 
-        var snapshot = field.Sort
-            ? options.OrderBy(option => option.Label, StringComparer.InvariantCulture).ToArray()
-            : options.ToArray();
-        return Array.AsReadOnly(snapshot);
+        return Array.AsReadOnly(options.ToArray());
     }
 
     private static IReadOnlyList<FieldOption>? FindLegalValueOptions(

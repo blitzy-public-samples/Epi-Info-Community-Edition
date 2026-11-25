@@ -559,13 +559,14 @@ public sealed class FieldTypeMapperTests
         Assert.Empty(FieldTypeMapper.ParseOptionItems(list));
     }
 
-    // FormDefinitionFactory sorts with StringComparer.InvariantCulture, a culture-aware comparer that orders letters
-    // before case, so "alpha" precedes "Mid". A plain ordinal sort would give Mid, Zeta, alpha.
+    // The store (SqlMetadataReader) applies the Sort = 1 ordering before it hands the list over, so the form
+    // definition never reorders it: the options keep the store's order whatever the Sort flag says.
     [Theory]
-    [InlineData(true, new[] { "alpha", "Mid", "Zeta" })]
-    [InlineData(false, new[] { "Zeta", "alpha", "Mid" })]
-    public void Create_LegalValuesSortFlag_SortsOptionsByTextOrKeepsStoreOrder(bool sort, string[] expectedLabels)
+    [InlineData(true)]
+    [InlineData(false)]
+    public void Create_LegalValuesSortFlag_KeepsTheStoreOrder(bool sort)
     {
+        string[] storeOrder = ["Zeta", "alpha", "Mid"];
         FieldMetadata colour = new()
         {
             FieldId = 1,
@@ -587,7 +588,7 @@ public sealed class FieldTypeMapperTests
             Fields: [colour]);
         Dictionary<string, IReadOnlyList<FieldOption>> legalValueOptions = new()
         {
-            ["Colour"] = new[] { "Zeta", "alpha", "Mid" }
+            ["Colour"] = storeOrder
                 .Select(text => new FieldOption(FieldValue.FromText(text), text))
                 .ToArray(),
         };
@@ -598,10 +599,9 @@ public sealed class FieldTypeMapperTests
         AssertSupported(FieldType.LegalValues, (field.FieldType, field.Unsupported, field.UnsupportedType));
         IReadOnlyList<FieldOption>? options = field.Options;
         Assert.NotNull(options);
-        Assert.Equal(expectedLabels, options.Select(option => option.Label));
-        Assert.Equal(expectedLabels.Select(FieldValue.FromText), options.Select(option => option.Value));
+        Assert.Equal(storeOrder, options.Select(option => option.Label));
+        Assert.Equal(storeOrder.Select(FieldValue.FromText), options.Select(option => option.Value));
     }
-
 
     [Fact]
     public void Map_EveryCaseReportFieldOfFormsJson_IsSupportedTextNumberOrDate()
