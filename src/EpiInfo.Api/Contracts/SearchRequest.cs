@@ -21,11 +21,13 @@ namespace EpiInfo.Api.Contracts;
 /// reach SQL Server only as parameters.
 /// </para>
 /// <para>
-/// Binding relies on the JSON options of JsonSetup. FieldValueJsonConverter reads each criterion <c>value</c>, and
-/// <c>RespectRequiredConstructorParameters</c> and <c>RespectNullableAnnotations</c> keep their default
-/// <see langword="false"/>, so a missing member binds as <see langword="null"/> instead of failing binding, and a
-/// missing <c>criteria</c> reaches its documented 400. ScalarSchemaTransformer publishes <c>criteria[].value</c> as the
-/// <c>FieldValue</c> scalar union
+/// Binding relies on the JSON options of JsonSetup. FieldValueJsonConverter reads each criterion <c>value</c>.
+/// <c>RespectRequiredConstructorParameters</c> keeps its default <see langword="false"/>, so a missing
+/// <c>criteria</c>, <c>includeDeleted</c>, <c>excludeGlobalRecordId</c> or criterion <c>field</c> binds as
+/// <see langword="null"/> instead of failing binding, and a missing <c>criteria</c> reaches its documented 400. The one
+/// exception is a criterion's <c>value</c>, which JsonSetup marks required: a criterion without it fails binding, and
+/// ApiExceptionHandler answers with the request-level 400, while <c>"value": null</c> binds as the blank criterion.
+/// ScalarSchemaTransformer publishes <c>criteria[].value</c> as the <c>FieldValue</c> scalar union
 /// <c>string | number | boolean | null</c>, so no member of the <see cref="EpiInfo.Domain.Values.FieldValue"/> struct
 /// appears in the OpenAPI document.
 /// </para>
@@ -38,16 +40,18 @@ namespace EpiInfo.Api.Contracts;
 /// and the wildcards <c>*</c> and <c>%</c>. Each <c>value</c> is the raw JSON scalar, read as a field value of kind
 /// <see cref="EpiInfo.Domain.Values.FieldValueKind.Null"/>, <see cref="EpiInfo.Domain.Values.FieldValueKind.Text"/>,
 /// <see cref="EpiInfo.Domain.Values.FieldValueKind.Number"/> or
-/// <see cref="EpiInfo.Domain.Values.FieldValueKind.Boolean"/>; an object or array <c>value</c> fails binding with a
-/// 400.
+/// <see cref="EpiInfo.Domain.Values.FieldValueKind.Boolean"/>; kind
+/// <see cref="EpiInfo.Domain.Values.FieldValueKind.Null"/> always means the caller sent <c>"value": null</c>. An
+/// object or array <c>value</c>, or a criterion that omits <c>value</c>, fails binding with the request-level 400.
 /// </para>
 /// <para>
 /// The interpretation per field type, trimming, the six-field limit, the rejection of a field named twice and of an
 /// unknown or unsearchable field all belong to SearchCriteriaParser, each answered with a 400. A missing or
 /// <c>null</c> <c>criteria</c>, or an empty array, is the request-level 400 "<c>criteria</c> must not be empty", which
 /// RecordService raises; binding never rejects it. The serializer materialises the list as a
-/// <see cref="List{T}"/>, and leaves <see cref="SearchCriterion.Field"/> <see langword="null"/> for a criterion that
-/// omits <c>field</c>, because it does not enforce nullable annotations; the parser rejects that name as unknown.
+/// <see cref="List{T}"/>. It leaves <see cref="SearchCriterion.Field"/> <see langword="null"/> for a criterion that
+/// omits <c>field</c>, because it does not enforce required constructor parameters, and for <c>"field": null</c>,
+/// because it does not enforce nullable annotations; the parser rejects a null name as unknown.
 /// </para>
 /// </param>
 /// <param name="IncludeDeleted">

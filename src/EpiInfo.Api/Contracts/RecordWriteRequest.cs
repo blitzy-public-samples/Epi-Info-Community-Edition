@@ -21,35 +21,43 @@ namespace EpiInfo.Api.Contracts;
 /// document.
 /// </para>
 /// <para>
-/// The contract relies on the serializer options <c>RespectRequiredConstructorParameters</c> and
-/// <c>RespectNullableAnnotations</c> keeping their default <see langword="false"/>. With either on, a missing or
-/// <c>null</c> <c>values</c> would fail binding instead of reaching the documented 400 <c>detail</c>.
+/// A missing <c>values</c> binds as <see langword="null"/> because the serializer option
+/// <c>RespectRequiredConstructorParameters</c> keeps its default <see langword="false"/>. Turned on, it would fail
+/// binding on a missing <c>values</c> instead of letting the documented 400 <c>detail</c> answer it. That option
+/// concerns missing parameters only: an explicit <c>null</c> binds as <see langword="null"/> either way. Nor does
+/// <c>RespectNullableAnnotations</c> reject it, because that option applies to non-nullable reference members and
+/// <c>JsonElement?</c> is a nullable value type.
 /// </para>
 /// <para>
 /// A missing body, or an empty one sent as <c>application/json</c>, never reaches this type:
-/// <c>JsonContentTypeMiddleware</c> answers it with the request-level 400 "request body is required". Malformed JSON
-/// fails binding with a <c>BadHttpRequestException</c>, which <c>ApiExceptionHandler</c> maps to the request-level
-/// 400 "malformed JSON".
+/// <c>JsonContentTypeMiddleware</c> answers it with the request-level 400 "request body is required", and a body
+/// that is the JSON literal <c>null</c> binds no request and gets the same 400. Malformed or truncated JSON, and a
+/// body that is a JSON array, string, number or boolean rather than an object, fail binding with a
+/// <c>BadHttpRequestException</c>, which <c>ApiExceptionHandler</c> maps to the request-level 400 "malformed JSON".
 /// </para>
 /// </remarks>
 /// <param name="Values">
 /// <para>
-/// The submitted field values keyed by field name, kept as the raw JSON the caller sent. A typed dictionary would make
-/// binding fail on a missing, <c>null</c> or non-object <c>values</c>, and would collapse keys that differ only by
-/// letter case, so neither case could reach the validator and its documented response.
+/// The submitted field values keyed by field name, kept as the raw JSON the caller sent. A typed nullable dictionary
+/// would also bind a missing or <c>null</c> <c>values</c> as <see langword="null"/> and keep keys that differ only by
+/// letter case, but binding would fail on a non-object <c>values</c> and on a member value that is an array or an
+/// object, so those requests would get "malformed JSON" instead of their documented 400, and a key repeated exactly
+/// would collapse into its last occurrence. The raw element lets every malformed shape reach the service and its
+/// documented response, and keeps every property occurrence, exact repeats included.
 /// </para>
 /// <list type="bullet">
 /// <item><description>
-/// A missing <c>values</c> is <see langword="null"/>. An explicit <c>null</c> is <see langword="null"/> or an element
-/// whose <see cref="JsonElement.ValueKind"/> is <see cref="JsonValueKind.Null"/>, and an array, string, number or
-/// boolean is an element of that kind. <c>RecordService</c> answers every one of them alike, with the request-level
-/// 400 whose <c>detail</c> is <see cref="EpiInfo.Domain.Validation.ValidationMessages.ValuesMustBeObject"/> and which
+/// A missing <c>values</c> and an explicit <c>null</c> are both <see langword="null"/>, never an element whose
+/// <see cref="JsonElement.ValueKind"/> is <see cref="JsonValueKind.Null"/>, and an array, string, number or boolean
+/// is an element of that kind. <c>RecordService</c> answers every one of them alike, with the request-level 400
+/// whose <c>detail</c> is <see cref="EpiInfo.Domain.Validation.ValidationMessages.ValuesMustBeObject"/> and which
 /// carries no <c>errors</c> map.
 /// </description></item>
 /// <item><description>
-/// Keys that differ only by letter case, such as <c>lastName</c> and <c>LastName</c>, both survive. <c>ValuesReader</c>
-/// reads the object's properties in document order, and the record validator rejects the duplicate as a field-level
-/// 400.
+/// Keys that differ only by letter case, such as <c>lastName</c> and <c>LastName</c>, both survive, as does a key
+/// repeated exactly. <c>ValuesReader</c> reads every property occurrence in document order, and the record validator
+/// rejects a field named more than once, exactly or differing only by case, with a field-level 400 keyed by its
+/// canonical name and carrying <see cref="EpiInfo.Domain.Validation.ValidationMessages.DuplicateField"/>.
 /// </description></item>
 /// <item><description>
 /// A field absent from the object is left unchanged by <c>PUT</c> and stored as <c>null</c> by <c>POST</c>. An empty

@@ -1,7 +1,10 @@
+using System.Reflection;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Text.Json.Serialization.Metadata;
 using EpiInfo.Domain.Diagnostics;
 using EpiInfo.Domain.Forms;
+using EpiInfo.Domain.Records;
 using EpiInfo.Domain.Storage;
 using Microsoft.Extensions.DependencyInjection;
 
@@ -38,9 +41,21 @@ namespace EpiInfo.Api.Json;
 /// </list>
 /// <para>
 /// The web defaults left in place are part of the contract: <c>null</c> members are written, not omitted; duplicate
-/// properties are allowed, so keys of <c>values</c> that differ only by case reach the record validator; unknown
-/// members are skipped; and <c>RespectRequiredConstructorParameters</c> and <c>RespectNullableAnnotations</c> stay off,
-/// so a missing or <c>null</c> request member reaches its documented 400 instead of failing binding.
+/// properties are allowed, so a <c>values</c> key repeated exactly reaches the record validator, while keys that
+/// differ only by case are distinct names whatever this setting; and unknown members are skipped.
+/// <c>RespectRequiredConstructorParameters</c> stays off, so a request member the caller omits
+/// binds as <see langword="null"/> and reaches its documented 400 instead of failing binding.
+/// <c>RespectNullableAnnotations</c> stays off, so an explicit <c>null</c> binds even into a non-nullable reference
+/// member such as a criterion's <c>field</c>. It never affects the <c>JsonElement?</c> members of the record-write and
+/// field-event bodies, which are nullable value types and accept <c>null</c> either way.
+/// </para>
+/// <para>
+/// The one presence check is a criterion's <c>value</c>, which <see cref="Apply"/> marks required on
+/// <see cref="SearchCriterion"/> alone. <c>null</c> is a legal value there, the blank criterion, so only presence
+/// tells it from an omission. A criterion without <c>value</c> fails deserialisation with a
+/// <see cref="JsonException"/>, which minimal-API binding reports as a 400 <c>BadHttpRequestException</c>;
+/// <c>"value": null</c> still reaches <see cref="FieldValueJsonConverter"/> and becomes
+/// <see cref="EpiInfo.Domain.Values.FieldValue.Null"/>.
 /// </para>
 /// </remarks>
 public static class JsonSetup
@@ -61,8 +76,11 @@ public static class JsonSetup
     }
 
     /// <summary>
-    /// Applies the API's wire settings to <paramref name="options"/>. Calling it again on the same options changes
-    /// nothing, because each converter is added only when no converter of its type is present.
+    /// Applies the API's wire settings to <paramref name="options"/>: the naming, number and converter settings, and a
+    /// type-info resolver that wraps the current one, or a new <see cref="DefaultJsonTypeInfoResolver"/> when none is
+    /// set, and marks a criterion's <c>value</c> required. Calling it again on the same options changes nothing,
+    /// because each converter is added only when no converter of its type is present and the resolver is wrapped only
+    /// once.
     /// </summary>
     /// <param name="options">
     /// Options created from <see cref="JsonSerializerDefaults.Web"/> that have not been used yet: options become
@@ -77,6 +95,13 @@ public static class JsonSetup
         options.PropertyNamingPolicy = JsonNamingPolicy.CamelCase;
         options.DictionaryKeyPolicy = null;
         options.NumberHandling = JsonNumberHandling.Strict;
+
+        // Plain web options have no resolver until first use; the minimal-API options already hold the default one.
+        if (options.TypeInfoResolver is not CriterionValueRequiredResolver)
+        {
+            options.TypeInfoResolver = new CriterionValueRequiredResolver(
+                options.TypeInfoResolver ?? new DefaultJsonTypeInfoResolver());
+        }
 
         var converters = options.Converters;
         AddOnce(
@@ -115,6 +140,39 @@ public static class JsonSetup
         }
 
         converters.Add(create());
+    }
+
+    /// <summary>
+    /// Returns every contract exactly as the wrapped resolver builds it, except that the <c>value</c> member of
+    /// <see cref="SearchCriterion"/> is required, so a criterion that omits it fails deserialisation while an explicit
+    /// <c>null</c> still reaches <see cref="FieldValueJsonConverter"/>.
+    /// </summary>
+    /// <remarks>
+    /// The member is matched by its CLR property, not by its wire name, so the rule holds whatever the naming policy.
+    /// Every other request member keeps binding a missing value as <see langword="null"/>. The type also marks options
+    /// that <see cref="Apply"/> has already wrapped.
+    /// </remarks>
+    /// <param name="inner">The resolver the options held before <see cref="Apply"/>.</param>
+    private sealed class CriterionValueRequiredResolver(IJsonTypeInfoResolver inner) : IJsonTypeInfoResolver
+    {
+        public JsonTypeInfo? GetTypeInfo(Type type, JsonSerializerOptions options)
+        {
+            var typeInfo = inner.GetTypeInfo(type, options);
+            if (typeInfo is null || typeInfo.Type != typeof(SearchCriterion))
+            {
+                return typeInfo;
+            }
+
+            foreach (var property in typeInfo.Properties)
+            {
+                if (property.AttributeProvider is PropertyInfo { Name: nameof(SearchCriterion.Value) })
+                {
+                    property.IsRequired = true;
+                }
+            }
+
+            return typeInfo;
+        }
     }
 
     /// <summary>

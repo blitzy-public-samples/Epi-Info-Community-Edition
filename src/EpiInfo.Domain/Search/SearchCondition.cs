@@ -4,16 +4,23 @@ using EpiInfo.Domain.Values;
 namespace EpiInfo.Domain.Search;
 
 /// <summary>
-/// How a search alternative compares a column with its value. The six comparisons are the ones the legacy
-/// Find dialog reads from a leading prefix of the typed value (<c>Epi.Windows.Enter/Dialogs/FindRecordDialog.cs</c>,
-/// lines 708-771). The other three are the predicate shapes the legacy query picks by field kind and value
-/// (<c>Epi.Core/Data/Services/CollectedDataProvider.cs</c>, lines 1973-2249).
+/// How a search alternative compares a column with its value. The first six comparisons are the ones the legacy
+/// Find dialog reads from the typed value: a leading <c>&lt;=</c>, <c>&gt;=</c>, <c>&lt;&gt;</c>, <c>&gt;</c> or
+/// <c>&lt;</c>, tested in that order, selects one of the five prefix comparisons, and <see cref="Equal"/> is the
+/// default when none leads (<c>Epi.Windows.Enter/Dialogs/FindRecordDialog.cs</c>, lines 708-771). The prefix is the
+/// operator only for number, date, Phone Number and <c>GlobalRecordId</c> alternatives; the others ignore it or,
+/// for a checkbox, reject it. The other three are the predicate shapes the legacy query picks by field kind and
+/// value (<c>Epi.Core/Data/Services/CollectedDataProvider.cs</c>, lines 1973-2249).
 /// </summary>
 public enum SearchOperator
 {
     /// <summary>
-    /// The column equals the value. This is the comparison when the value carries no prefix, and the only one for
-    /// the field kinds whose prefix legacy ignores or rejects: text family, option, checkbox and <c>RecStatus</c>.
+    /// The column equals the value. This is the comparison when no prefix leads the value, and the only one of the
+    /// first six where legacy strips and ignores the prefix: option, <c>RecStatus</c>, and text, multiline and
+    /// legal-values fields other than Phone Number, whose values with <c>%</c>, <c>*</c> or <c>?</c> take
+    /// <see cref="Like"/> and whose other multiline values take <see cref="PrefixEqual255"/> instead. It is also
+    /// the only one for a checkbox, whose alternative legacy rejects when it carries a prefix. Phone Number takes
+    /// its operator from the prefix, as number, date and <c>GlobalRecordId</c> do.
     /// </summary>
     Equal,
 
@@ -34,7 +41,10 @@ public enum SearchOperator
 
     /// <summary>
     /// The column holds no value, and the alternative carries none. Legacy chooses it for a blank number or date
-    /// criterion, and for an alternative that is only a prefix, left empty once the prefix is stripped.
+    /// criterion; a number or date alternative that is only a prefix is rejected instead, because what follows the
+    /// prefix must parse as a number or a date (the dialog's lines 418-510). On a text, multiline, legal-values,
+    /// Phone Number or <c>GlobalRecordId</c> criterion, legacy also chooses it for an alternative that is only a
+    /// prefix, left empty once the prefix is stripped (the query's lines 2068-2082, 2118-2131 and 2186-2193).
     /// </summary>
     IsNull,
 
