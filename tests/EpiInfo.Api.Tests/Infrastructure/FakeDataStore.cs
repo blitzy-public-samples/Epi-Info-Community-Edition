@@ -394,6 +394,7 @@ public sealed class FakeDataStore : IDataStore
         new(StringComparer.Ordinal);
 
     private Exception? _failureForAll;
+    private bool _pingAnswered = true;
 
     /// <summary>Creates a store that holds no form.</summary>
     public FakeDataStore()
@@ -598,6 +599,20 @@ public sealed class FakeDataStore : IDataStore
         lock (_gate)
         {
             Resolve(viewId).Permissions = permissions;
+        }
+    }
+
+    /// <summary>
+    /// Sets the answer <see cref="PingAsync"/> returns once its call is logged and no injected failure or cancellation
+    /// applies: <see langword="true"/>, the default, for a database that answered, or <see langword="false"/>, the
+    /// negative answer the <see cref="IDataStore.PingAsync"/> contract permits a store to report instead of throwing.
+    /// </summary>
+    /// <param name="answered">Whether the database answered.</param>
+    public void SetPingResult(bool answered)
+    {
+        lock (_gate)
+        {
+            _pingAnswered = answered;
         }
     }
 
@@ -916,7 +931,7 @@ public sealed class FakeDataStore : IDataStore
             lock (_gate)
             {
                 BeginRead(nameof(PingAsync), cancellationToken);
-                return true;
+                return _pingAnswered;
             }
         });
 

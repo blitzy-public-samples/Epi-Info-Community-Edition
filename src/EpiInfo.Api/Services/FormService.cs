@@ -21,16 +21,21 @@ namespace EpiInfo.Api.Services;
 public sealed record LoadedForm(FormMetadata Metadata, FormDefinition Definition);
 
 /// <summary>
-/// Serves the forms list and the form definitions, and loads a form for the services that read or write its records.
-/// It takes over the form loading and render preparation of the legacy Enter canvas, view explorer and control
-/// factory, as stateless reads.
+/// Serves the forms list and the form definitions, and loads a form's metadata and definition for the create and
+/// update validation of <see cref="RecordService"/>. It takes over the form loading and render preparation of the
+/// legacy Enter canvas, view explorer and control factory, as stateless reads.
 /// </summary>
 /// <remarks>
 /// <para>
-/// Every member reads the metadata, the code tables, the check-code text and the permissions through
-/// <see cref="IDataStore"/> on each call and caches nothing, so a metadata change applies to the next request. Every
-/// read is a <c>SELECT</c>: nothing is written, and check code is analysed but never run, so loading a form definition
-/// changes nothing in the database (scenario <c>DATA-01</c>).
+/// Each member reads only what its result needs, through <see cref="IDataStore"/> on each call, and caches nothing, so
+/// a metadata change applies to the next request. <see cref="ListAsync"/> reads the forms list alone
+/// (<see cref="IDataStore.ListFormsAsync"/>). <see cref="GetDefinitionAsync"/> reads the metadata, the Legal Values
+/// options (skipped when the form has no Legal Values field), the check-code text for
+/// <see cref="ICheckCodeEngine.Analyze"/>, and the permissions (<see cref="IDataStore.GetPermissionsAsync"/>) behind
+/// the <c>canInsert</c>, <c>canUpdate</c> and <c>canDelete</c> flags. <see cref="LoadFormAsync"/>, the validation
+/// prelude of a record create or update, reads the metadata and the Legal Values options only. Every read is a
+/// <c>SELECT</c>: nothing is written, and check code is analysed but never run, so loading a form definition changes
+/// nothing in the database (scenario <c>DATA-01</c>).
 /// </para>
 /// <para>
 /// Page order, field order, group members, option lists, bounds and field types are assembled only by
@@ -65,13 +70,22 @@ public sealed partial class FormService(IDataStore store, ICheckCodeEngine check
     }
 
     /// <summary>
-    /// Loads a form's metadata and builds its definition with the Legal Values options, for the record and field-event
-    /// services.
+    /// Loads a form's metadata and builds its definition with the Legal Values options, for the create and update
+    /// validation of <see cref="RecordService"/>.
     /// </summary>
     /// <remarks>
-    /// This is the single place a service outside this class obtains a form definition, so the record services never
-    /// assemble one themselves. It neither reads nor analyses the check-code program and reads no permissions: record
-    /// reads and writes need neither, and skipping them keeps their reads to the metadata and code tables.
+    /// <para>
+    /// Its only callers are <see cref="RecordService.CreateAsync"/> and <see cref="RecordService.UpdateAsync"/>, which
+    /// run it as the validation prelude of a write: the definition feeds the <c>RecordValidator</c> of that write, so
+    /// the record service never assembles a definition itself.
+    /// </para>
+    /// <para>
+    /// It neither reads nor analyses the check-code program and reads no permissions. The record reads,
+    /// <see cref="RecordService.DeleteAsync"/> and <see cref="FieldEventService"/> do not call it; they read the
+    /// metadata directly through <see cref="IDataStore.GetFormMetadataAsync"/>. Writes do need permissions, but the
+    /// record service reads them itself on every write, uncached, through
+    /// <see cref="IDataStore.GetPermissionsAsync"/>, so this method leaves them out.
+    /// </para>
     /// </remarks>
     /// <param name="viewId">A <c>metaViews.ViewId</c>.</param>
     /// <param name="cancellationToken">The request's abort token.</param>

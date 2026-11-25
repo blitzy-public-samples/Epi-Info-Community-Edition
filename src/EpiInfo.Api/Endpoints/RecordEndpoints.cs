@@ -35,12 +35,15 @@ namespace EpiInfo.Api.Endpoints;
 /// <c>JsonContentTypeMiddleware</c> answers 415 for any media type other than <c>application/json</c> and the
 /// request-level 400 for an empty body; the body limit gives 413. Body parameters are nullable, so a JSON
 /// <c>null</c> body reaches the service's request-level 400, and malformed JSON surfaces as a
-/// <c>BadHttpRequestException</c> that the exception handler maps.
+/// <c>BadHttpRequestException</c> that the exception handler maps. The OpenAPI document still publishes each body as
+/// required and non-null, and each body route's 400 as either shape: the request-level ProblemDetails or the
+/// field-level <see cref="HttpValidationProblemDetails"/>. The query routes' 400 is the field-level shape only.
 /// </para>
 /// <para>
-/// <b>Write failures.</b> Create, update and delete carry <see cref="WriteEndpointMetadata"/>, from which the exception
+/// <b>Write failures.</b> Create, update and delete declare the 403 ProblemDetails the service returns when the
+/// database permission check denies the write. They carry <see cref="WriteEndpointMetadata"/>, from which the exception
 /// handler adds <c>writeOutcome</c> to their 500 and 503 bodies, documented as <see cref="WriteProblemDetails"/>.
-/// Search writes nothing and carries neither, so its 500 and 503 are plain ProblemDetails.
+/// Search writes nothing and carries neither, so it has no 403 and its 500 and 503 are plain ProblemDetails.
 /// </para>
 /// <para>
 /// The handlers are named static methods with explicit binding sources, so the build-time OpenAPI document is
@@ -334,10 +337,12 @@ public static class RecordEndpoints
             .ProducesProblem(StatusCodes.Status413PayloadTooLarge, ApiProblems.ProblemContentType)
             .ProducesProblem(StatusCodes.Status415UnsupportedMediaType, ApiProblems.ProblemContentType);
 
-    // A record write's 500 and 503 carry writeOutcome; ScalarSchemaTransformer repoints the same two responses to the
+    // The permission check's 403, and a record write's 500 and 503, shared by create, update and delete and by no other
+    // route. The 500 and 503 carry writeOutcome; ScalarSchemaTransformer repoints the same two responses to the
     // WriteProblemDetails component for any endpoint with WriteEndpointMetadata, so both declare one schema.
     private static RouteHandlerBuilder ProducesWriteFailures(this RouteHandlerBuilder builder) =>
         builder
+            .ProducesProblem(StatusCodes.Status403Forbidden, ApiProblems.ProblemContentType)
             .Produces<WriteProblemDetails>(StatusCodes.Status500InternalServerError, ApiProblems.ProblemContentType)
             .Produces<WriteProblemDetails>(StatusCodes.Status503ServiceUnavailable, ApiProblems.ProblemContentType);
 }

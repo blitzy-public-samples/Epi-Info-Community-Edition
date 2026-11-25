@@ -5,15 +5,18 @@ using System.Text.Json.Serialization;
 using System.Text.Json.Serialization.Metadata;
 using EpiInfo.Api.Contracts;
 using EpiInfo.Api.Errors;
+using EpiInfo.Api.Hosting;
 using EpiInfo.Domain.Diagnostics;
 using EpiInfo.Domain.Events;
 using EpiInfo.Domain.Forms;
 using EpiInfo.Domain.Records;
 using EpiInfo.Domain.Storage;
 using EpiInfo.Domain.Values;
+using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Mvc.ModelBinding;
 using Microsoft.AspNetCore.OpenApi;
 using Microsoft.AspNetCore.WebUtilities;
+using Microsoft.Net.Http.Headers;
 using Microsoft.OpenApi;
 
 namespace EpiInfo.Api.OpenApi;
@@ -37,12 +40,26 @@ namespace EpiInfo.Api.OpenApi;
 /// <c>FieldValue</c>, <c>event</c> the string enum <c>FieldBefore</c>, <c>FieldAfter</c>, <c>FieldClick</c>, and
 /// <c>fieldName</c> a string, each required, so no <see cref="JsonElement"/> component exists. The search body's
 /// <c>criteria</c> is a required, non-null array; its <c>includeDeleted</c> and <c>excludeGlobalRecordId</c> stay
-/// optional.
+/// optional. The four operations carrying <see cref="JsonBodyMetadata"/> publish their body as required and as a plain
+/// <c>$ref</c> to its component, without the <c>null</c> branch of their nullable binding, because a missing or
+/// <c>null</c> body is a 400.
 /// </description></item>
 /// <item><description>
 /// The camelCase string enums <c>FieldType</c> and <c>DiagnosticSeverity</c>, and the <c>writeOutcome</c> enum
 /// <c>notWritten</c>, <c>unknown</c>, <c>written</c> of <c>WriteProblemDetails</c>, the schema of the 500 and 503
 /// responses of the three record writes and of no other response.
+/// </description></item>
+/// <item><description>
+/// <c>ProblemDetails</c>, <c>HttpValidationProblemDetails</c> and <c>WriteProblemDetails</c> with <c>type</c>,
+/// <c>title</c>, <c>status</c>, <c>detail</c> and the <c>traceId</c> extension as required, non-null members, and
+/// <c>errors</c> required on the validation variant; <c>instance</c> stays optional. The plain variant never carries
+/// <c>errors</c>, so it publishes <c>not: {required: ["errors"]}</c> while every other extension stays open. The 400
+/// of each JSON-body operation is <c>anyOf</c> the plain and the validation variant, because it answers with either;
+/// every other 400 keeps the validation variant its endpoint declares.
+/// </description></item>
+/// <item><description>
+/// The required <c>Location</c> header, a <c>uri-reference</c> string, on the 201 of the record create and of no other
+/// response.
 /// </description></item>
 /// <item><description>
 /// <c>NavigationPosition</c> as <c>{position: integer | null, count: integer}</c>, and every Domain DTO member the API
@@ -69,6 +86,10 @@ public sealed class ScalarSchemaTransformer :
     /// <summary>The component id of the ProblemDetails of a failed record write.</summary>
     public const string WriteProblemDetailsSchemaId = "WriteProblemDetails";
 
+    // The component ids the framework gives the plain and the field-level ProblemDetails: their type names.
+    private const string ProblemDetailsSchemaId = nameof(ProblemDetails);
+    private const string ValidationProblemDetailsSchemaId = nameof(HttpValidationProblemDetails);
+
     // Metadata keys of Microsoft.AspNetCore.OpenApi: a node holding the first becomes the component of that id, and a
     // property node holding the second is wrapped as oneOf [null, $ref] when it is resolved.
     private const string SchemaIdMetadataKey = "x-schema-id";
@@ -79,9 +100,17 @@ public sealed class ScalarSchemaTransformer :
     private const string FieldValueKindSchemaId = nameof(FieldValueKind);
 
     private const string Int32Format = "int32";
+    private const string UriReferenceFormat = "uri-reference";
+
+    private const string CreatedLocationDescription =
+        "The relative URI of the created record, /api/forms/{viewId}/records/{globalRecordId}, with the id "
+        + "percent-encoded.";
 
     // The JSON name WriteProblemDetails declares for its outcome member.
     private const string WriteOutcomeProperty = "writeOutcome";
+
+    // The JSON name HttpValidationProblemDetails declares for its field-error map.
+    private const string ErrorsProperty = "errors";
 
     private const JsonSchemaType FieldValueTypes =
         JsonSchemaType.String | JsonSchemaType.Number | JsonSchemaType.Boolean | JsonSchemaType.Null;
@@ -111,6 +140,9 @@ public sealed class ScalarSchemaTransformer :
         WriteOutcomeExtensions.WireWritten,
     ];
 
+    // The JSON names ProblemDetails declares for the members ApiProblems always writes, in declaration order.
+    private static readonly string[] ProblemNonNullProperties = ["type", "title", "status", "detail"];
+
     private static readonly int[] WriteFailureStatuses =
     [
         StatusCodes.Status500InternalServerError,
@@ -122,8 +154,9 @@ public sealed class ScalarSchemaTransformer :
     /// <c>AddOpenApi</c>, alongside <c>options.AddOperationTransformer&lt;ParameterSchemaTransformer&gt;()</c>.
     /// </summary>
     /// <remarks>
-    /// The schema role does the essential work; the operation role repoints the write 500 and 503 responses and the
-    /// document role drops helper components. Each role is correct on its own, so none depends on the order in which
+    /// The schema role does the essential work; the operation role corrects the JSON request bodies and their 400, adds
+    /// the create's <c>Location</c> header and repoints the write 500 and 503 responses, and the document role drops
+    /// helper components. Each role is correct on its own, so none depends on the order in which
     /// the framework runs them.
     /// </remarks>
     /// <param name="options">The options of the default <c>v1</c> document.</param>
@@ -234,9 +267,9 @@ public sealed class ScalarSchemaTransformer :
         {
             AddRequired(schema, [CriteriaProperty]);
         }
-        else if (typeof(WriteProblemDetails).IsAssignableFrom(type))
+        else if (typeof(ProblemDetails).IsAssignableFrom(type))
         {
-            AddRequired(schema, [WriteOutcomeProperty]);
+            ApplyProblemDetails(schema, type);
         }
         else if (type == typeof(NavigationPosition))
         {
@@ -255,6 +288,48 @@ public sealed class ScalarSchemaTransformer :
         if (IsAlwaysSerialisedDomainObject(type, typeInfo))
         {
             AddRequired(schema, AlwaysSerialisedProperties(schema, typeInfo));
+        }
+    }
+
+    // ApiProblems writes every /api error body with a type, title, status and detail and adds the traceId extension, so
+    // each ProblemDetails variant publishes those five as required, non-null members. traceId lives in the extension
+    // data, which the exporter does not describe, so it is declared here. instance is never written and stays optional.
+    // The plain variant never carries errors, because CreateProblem adds none and Customize strips every extension but
+    // traceId; it excludes the member, so only the validation variant admits a field-error map.
+    private static void ApplyProblemDetails(OpenApiSchema schema, Type type)
+    {
+        if (schema.Properties is not { } properties)
+        {
+            return;
+        }
+
+        foreach (var name in ProblemNonNullProperties)
+        {
+            if (properties.TryGetValue(name, out var member) && member is OpenApiSchema { Type: { } memberType } node)
+            {
+                node.Type = memberType & ~JsonSchemaType.Null;
+            }
+        }
+
+        properties[ApiProblems.TraceIdKey] = new OpenApiSchema { Type = JsonSchemaType.String };
+        AddRequired(schema, [.. ProblemNonNullProperties, ApiProblems.TraceIdKey]);
+
+        if (typeof(HttpValidationProblemDetails).IsAssignableFrom(type))
+        {
+            AddRequired(schema, [ErrorsProperty]);
+        }
+        else if (typeof(WriteProblemDetails).IsAssignableFrom(type))
+        {
+            AddRequired(schema, [WriteOutcomeProperty]);
+        }
+        else if (type == typeof(ProblemDetails))
+        {
+            // not, rather than a closed schema, so traceId and any other extension stay allowed while a body carrying
+            // errors, whatever its value, can only match the validation variant.
+            schema.Not = new OpenApiSchema
+            {
+                Required = new SortedSet<string>([ErrorsProperty], StringComparer.Ordinal),
+            };
         }
     }
 
@@ -307,9 +382,12 @@ public sealed class ScalarSchemaTransformer :
     }
 
     /// <summary>
-    /// Points the 500 and 503 responses of a record write at <c>WriteProblemDetails</c>, as
-    /// <c>application/problem+json</c>. Only operations carrying <see cref="WriteEndpointMetadata"/> are touched, and
-    /// no other status, so every other error response keeps the ProblemDetails schema its endpoint declares.
+    /// Rewrites the parts of an operation that endpoint metadata cannot express. An operation carrying
+    /// <see cref="JsonBodyMetadata"/> gets a required, non-null request body and a 400 that is <c>anyOf</c>
+    /// <c>ProblemDetails</c> and <c>HttpValidationProblemDetails</c>. An operation carrying
+    /// <see cref="WriteEndpointMetadata"/> gets its 500 and 503 pointed at <c>WriteProblemDetails</c>, and the create,
+    /// <see cref="WriteEndpointMetadata.Insert"/>, the required <c>Location</c> header on its 201. Every problem body is
+    /// <c>application/problem+json</c>, and every other response keeps the schema its endpoint declares.
     /// </summary>
     /// <param name="operation">The operation to rewrite in place.</param>
     /// <param name="context">The endpoint description and the document being built.</param>
@@ -326,31 +404,52 @@ public sealed class ScalarSchemaTransformer :
         ArgumentNullException.ThrowIfNull(operation);
         ArgumentNullException.ThrowIfNull(context);
 
-        if (!IsRecordWrite(context.Description.ActionDescriptor.EndpointMetadata))
+        var endpointMetadata = context.Description.ActionDescriptor.EndpointMetadata;
+        if (HasMetadata<JsonBodyMetadata>(endpointMetadata))
+        {
+            RequireJsonBody(operation);
+
+            // A body endpoint answers 400 with the request-level ProblemDetails or the field-level
+            // HttpValidationProblemDetails. The plain variant excludes errors and the validation variant requires it,
+            // so any body matches at most one branch.
+            var plain = await ComponentReferenceAsync(
+                    typeof(ProblemDetails),
+                    ProblemDetailsSchemaId,
+                    context,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            var validation = await ComponentReferenceAsync(
+                    typeof(HttpValidationProblemDetails),
+                    ValidationProblemDetailsSchemaId,
+                    context,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            SetProblemResponse(
+                operation,
+                StatusCodes.Status400BadRequest,
+                new OpenApiSchema { AnyOf = [plain, validation] });
+        }
+
+        if (!HasMetadata<WriteEndpointMetadata>(endpointMetadata))
         {
             return;
         }
 
-        // The lookup applies the schema role, so the body carries the writeOutcome enum and its required entry.
-        var schema = await context.GetOrCreateSchemaAsync(typeof(WriteProblemDetails), null, cancellationToken)
-            .ConfigureAwait(false);
-        var problemSchema = WriteProblemDetailsReference(schema, context.Document);
+        if (HasInstance(endpointMetadata, WriteEndpointMetadata.Insert))
+        {
+            AddCreatedLocation(operation);
+        }
 
-        operation.Responses ??= new OpenApiResponses();
+        // The lookup applies the schema role, so the body carries the writeOutcome enum and its required entry.
+        var problemSchema = await ComponentReferenceAsync(
+                typeof(WriteProblemDetails),
+                WriteProblemDetailsSchemaId,
+                context,
+                cancellationToken)
+            .ConfigureAwait(false);
         foreach (var status in WriteFailureStatuses)
         {
-            var key = status.ToString(CultureInfo.InvariantCulture);
-            operation.Responses.TryGetValue(key, out var existing);
-            var response = existing as OpenApiResponse ?? new OpenApiResponse
-            {
-                Description = existing?.Description ?? ReasonPhrases.GetReasonPhrase(status),
-            };
-
-            response.Content = new Dictionary<string, OpenApiMediaType>(StringComparer.Ordinal)
-            {
-                [ApiProblems.ProblemContentType] = new OpenApiMediaType { Schema = problemSchema },
-            };
-            operation.Responses[key] = response;
+            SetProblemResponse(operation, status, problemSchema);
         }
     }
 
@@ -381,11 +480,12 @@ public sealed class ScalarSchemaTransformer :
         return Task.CompletedTask;
     }
 
-    private static bool IsRecordWrite(IList<object> endpointMetadata)
+    private static bool HasMetadata<TMetadata>(IList<object> endpointMetadata)
+        where TMetadata : class
     {
         foreach (var item in endpointMetadata)
         {
-            if (item is WriteEndpointMetadata)
+            if (item is TMetadata)
             {
                 return true;
             }
@@ -394,19 +494,126 @@ public sealed class ScalarSchemaTransformer :
         return false;
     }
 
-    private static IOpenApiSchema WriteProblemDetailsReference(OpenApiSchema schema, OpenApiDocument? document)
+    private static bool HasInstance(IList<object> endpointMetadata, object instance)
     {
+        foreach (var item in endpointMetadata)
+        {
+            if (ReferenceEquals(item, instance))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    // RecordService answers a create with 201 and the Location of the new record, so the declared 201 publishes it as a
+    // required header. A missing 201 is left absent: the body schema belongs to the endpoint's own metadata.
+    private static void AddCreatedLocation(OpenApiOperation operation)
+    {
+        var key = StatusCodes.Status201Created.ToString(CultureInfo.InvariantCulture);
+        if (operation.Responses is null
+            || !operation.Responses.TryGetValue(key, out var existing)
+            || existing is not OpenApiResponse response)
+        {
+            return;
+        }
+
+        response.Headers ??= new Dictionary<string, IOpenApiHeader>(StringComparer.Ordinal);
+        response.Headers[HeaderNames.Location] = new OpenApiHeader
+        {
+            Description = CreatedLocationDescription,
+            Required = true,
+            Schema = new OpenApiSchema { Type = JsonSchemaType.String, Format = UriReferenceFormat },
+        };
+    }
+
+    // The four JSON-body endpoints bind a nullable body, so that a JSON null reaches the service's request-level 400,
+    // and the generator publishes that binding: an optional body whose schema is oneOf [null, $ref]. On the wire the
+    // body is a required, non-null object, so it is marked required and each null branch is dropped.
+    private static void RequireJsonBody(OpenApiOperation operation)
+    {
+        if (operation.RequestBody is not OpenApiRequestBody body)
+        {
+            return;
+        }
+
+        body.Required = true;
+        if (body.Content is not { } content)
+        {
+            return;
+        }
+
+        foreach (var mediaType in content.Values)
+        {
+            if (mediaType.Schema is OpenApiSchema schema && NonNullMember(schema) is { } member)
+            {
+                mediaType.Schema = member;
+            }
+        }
+    }
+
+    // The other member of a oneOf [null, member] wrapper with no shape of its own; null for any other node, which then
+    // stays as generated.
+    private static IOpenApiSchema? NonNullMember(OpenApiSchema schema)
+    {
+        if (schema.Type is not null || schema.OneOf is not { Count: 2 } members)
+        {
+            return null;
+        }
+
+        var firstIsNull = IsNullOnly(members[0]);
+        var secondIsNull = IsNullOnly(members[1]);
+        if (firstIsNull == secondIsNull)
+        {
+            return null;
+        }
+
+        return firstIsNull ? members[1] : members[0];
+    }
+
+    private static bool IsNullOnly(IOpenApiSchema? schema) => schema is OpenApiSchema { Type: JsonSchemaType.Null };
+
+    // A $ref to the component of the type, which is published from the type's schema when no response has published it
+    // yet. The lookup applies the schema role, so the component carries every rule of its type.
+    private static async Task<IOpenApiSchema> ComponentReferenceAsync(
+        Type type,
+        string schemaId,
+        OpenApiOperationTransformerContext context,
+        CancellationToken cancellationToken)
+    {
+        var schema = await context.GetOrCreateSchemaAsync(type, null, cancellationToken).ConfigureAwait(false);
+        var document = context.Document;
         if (document is null)
         {
             return schema;
         }
 
-        if (document.Components?.Schemas?.ContainsKey(WriteProblemDetailsSchemaId) != true)
+        if (document.Components?.Schemas?.ContainsKey(schemaId) != true)
         {
-            document.AddComponent(WriteProblemDetailsSchemaId, schema);
+            document.AddComponent(schemaId, schema);
         }
 
-        return new OpenApiSchemaReference(WriteProblemDetailsSchemaId, document);
+        return new OpenApiSchemaReference(schemaId, document);
+    }
+
+    // Makes the one application/problem+json schema the content of the status's response, adding the response with its
+    // reason phrase when the endpoint declares none.
+    private static void SetProblemResponse(OpenApiOperation operation, int status, IOpenApiSchema schema)
+    {
+        operation.Responses ??= new OpenApiResponses();
+        var key = status.ToString(CultureInfo.InvariantCulture);
+        operation.Responses.TryGetValue(key, out var existing);
+        var response = existing as OpenApiResponse ?? new OpenApiResponse
+        {
+            Description = existing?.Description ?? ReasonPhrases.GetReasonPhrase(status),
+        };
+
+        response.Content = new Dictionary<string, OpenApiMediaType>(StringComparer.Ordinal)
+        {
+            [ApiProblems.ProblemContentType] = new OpenApiMediaType { Schema = schema },
+        };
+        operation.Responses[key] = response;
     }
 
     // A new FieldValue node for a place the generator left without one. It carries the component id rather than being
