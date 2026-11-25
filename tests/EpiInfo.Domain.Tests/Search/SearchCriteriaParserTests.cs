@@ -1003,6 +1003,155 @@ public sealed class SearchCriteriaParserTests
 
     #endregion
 
+    #region SQL Server limits
+
+    // Legacy Find capped fields, never alternatives, and the SQL Server store packs a large set into a few parameters,
+    // so every alternative the body carries is kept, in order, on one field or spread over several.
+    [Theory]
+    [InlineData(5000, 0)]
+    [InlineData(2500, 2500)]
+    public void Limits_AnyNumberOfAlternatives_ParsesWithEveryAlternativeKept(int lastNameCount, int firstNameCount)
+    {
+        SearchCriterion[] criteria = firstNameCount == 0
+            ? [Text("LastName", Alternatives(lastNameCount))]
+            : [Text("LastName", Alternatives(lastNameCount)), Text("FirstName", Alternatives(firstNameCount))];
+
+        SearchParseResult result = Parse(criteria);
+
+        Assert.True(result.IsSuccess);
+        Assert.Empty(result.FieldErrors);
+        int[] expectedCounts = firstNameCount == 0 ? [lastNameCount] : [lastNameCount, firstNameCount];
+        Assert.Equal(expectedCounts.Length, result.Conditions.Count);
+        for (var index = 0; index < expectedCounts.Length; index++)
+        {
+            var expected = Enumerable.Range(0, expectedCounts[index])
+                .Select(alternative => EqualText(AlternativeText(alternative)))
+                .ToArray();
+            AssertAlternatives(result.Conditions[index], expected);
+        }
+    }
+
+    // SQL Server's LIKE pattern limit is 8,000 bytes, 4,000 UTF-16 code units; the stripped prefix does not count. A
+    // pattern within it is kept exactly as written, so its '%' runs are not collapsed.
+    [Theory]
+    [InlineData("LastName", "", PlainPattern)]
+    [InlineData("Notes", "", PlainPattern)]
+    [InlineData("LastName", ">=", PlainPattern)]
+    [InlineData("LastName", "", RunPattern)]
+    [InlineData("Notes", "", BracketPattern)]
+    public void Limits_WildcardPatternAtTheBound_IsALikePatternAsWritten(string field, string prefix, string kind)
+    {
+        var pattern = LongPattern(kind, 4000);
+
+        AssertAlternatives(SingleCondition(Parse(Text(field, prefix + pattern))), LikeText(pattern.Replace('*', '%')));
+    }
+
+    // A longer pattern without '[' has each run of '%' (after '*' becomes '%') collapsed to one, which LIKE matches
+    // identically, and is kept when that brings it within the bound; '_', '?' and quotes stay as written.
+    [Theory]
+    [MemberData(nameof(CollapsiblePatterns))]
+    public void Limits_LongPatternWhosePercentRunsCollapse_IsOneLikeOfTheCollapsedPattern(
+        string field,
+        string written,
+        string expected)
+    {
+        Assert.True(written.Length > RecordQueryRules.MaxLikePatternLength);
+        Assert.True(expected.Length <= RecordQueryRules.MaxLikePatternLength);
+
+        AssertAlternatives(SingleCondition(Parse(Text(field, written))), LikeText(expected));
+    }
+
+    // Over the bound a pattern holding '[' is never rewritten, because inside a set '%' is a member rather than a
+    // wildcard; one without a run of '%', or whose collapse still leaves it too long, cannot be shortened exactly.
+    [Theory]
+    [InlineData("LastName", "", PlainPattern, 4001)]
+    [InlineData("Notes", "", PlainPattern, 4001)]
+    [InlineData("LastName", "Sm* or ", PlainPattern, 4001)]
+    [InlineData("LastName", "", BracketPattern, 4001)]
+    [InlineData("Notes", "", BracketPattern, 4001)]
+    [InlineData("LastName", "", RunPattern, 4002)]
+    [InlineData("Notes", "", RunPattern, 4002)]
+    public void Limits_LongPatternThatDoesNotCollapseToTheBound_IsAFieldError(
+        string field,
+        string leadingAlternative,
+        string kind,
+        int length)
+    {
+        SearchParseResult result = Parse(Text(field, leadingAlternative + LongPattern(kind, length)));
+
+        AssertFieldError(result, field);
+        Assert.Single(result.FieldErrors);
+        Assert.Single(result.FieldErrors[field]);
+        AssertCarriesNoSubmittedText(result);
+    }
+
+    // Equality, the 255-character multiline comparison and the comparisons without a wildcard path bind a value
+    // that no LIKE pattern limit applies to.
+    [Theory]
+    [InlineData("LastName", 'x', SearchOperator.Equal)]
+    [InlineData("Sex", 'x', SearchOperator.Equal)]
+    [InlineData("Notes", 'x', SearchOperator.PrefixEqual255)]
+    [InlineData("PhoneNumber", 'x', SearchOperator.Equal)]
+    [InlineData("PhoneNumber", '*', SearchOperator.Equal)]
+    [InlineData(SearchCriteriaParser.GlobalRecordIdFieldName, '*', SearchOperator.Equal)]
+    public void Limits_TextWithoutAPattern_HasNoLengthBound(string field, char fill, SearchOperator expected)
+    {
+        var value = Sentinel + new string(fill, 20000 - Sentinel.Length);
+
+        AssertAlternatives(SingleCondition(Parse(Text(field, value))), (expected, FieldValue.FromText(value)));
+    }
+
+    // The pattern kinds of the bound tests: one '*' and no run of '%'; a set followed by a run of '*'; and other
+    // characters ending in a run of two '*', so collapsing saves one character.
+    private const string PlainPattern = "plain";
+    private const string BracketPattern = "bracket";
+    private const string RunPattern = "run";
+
+    // Each row is (field, value written, the one LIKE pattern expected); every value is over 4,000 characters.
+    public static TheoryData<string, string, string> CollapsiblePatterns => new()
+    {
+        // 4,001 '%', and 4,001 '*', are each exactly one '%'.
+        { "LastName", new string('%', 4001), "%" },
+        { "Notes", new string('*', 4001), "%" },
+
+        // A mixed run of '*' and '%' between literal text, on a multiline field too.
+        { "LastName", "Sm" + string.Concat(Enumerable.Repeat("*%", 2000)) + "th", "Sm%th" },
+        { "Notes", "Sm" + string.Concat(Enumerable.Repeat("*%", 2000)) + "th", "Sm%th" },
+
+        // Collapsing lands exactly on the bound.
+        { "LastName", new string('x', 3999) + "%%", new string('x', 3999) + "%" },
+
+        // Several runs, with '_', '?' and a quote kept as written.
+        {
+            "LastName",
+            string.Concat(Enumerable.Repeat("O'B_?%%%%", 500)),
+            string.Concat(Enumerable.Repeat("O'B_?%", 500))
+        },
+    };
+
+    // Alternatives that each carry the sentinel, so a message echoing the value would be caught.
+    private static string Alternatives(int count) =>
+        string.Join(" or ", Enumerable.Range(0, count).Select(AlternativeText));
+
+    private static string AlternativeText(int index) => Sentinel + index.ToString(CultureInfo.InvariantCulture);
+
+    // A wildcard pattern of exactly length characters that carries the sentinel, of one of the pattern kinds.
+    private static string LongPattern(string kind, int length) => kind switch
+    {
+        PlainPattern => Sentinel + "*" + new string('x', length - Sentinel.Length - 1),
+        BracketPattern => Sentinel + "[a-%]" + new string('*', length - Sentinel.Length - 5),
+        RunPattern => Sentinel + new string('x', length - Sentinel.Length - 2) + "**",
+        _ => throw new ArgumentOutOfRangeException(nameof(kind), kind, "Unknown pattern kind."),
+    };
+
+    private static void AssertCarriesNoSubmittedText(SearchParseResult result)
+    {
+        Assert.All(AllMessages(result), message => Assert.DoesNotContain(Sentinel, message, StringComparison.Ordinal));
+        Assert.All(result.FieldErrors.Keys, key => Assert.DoesNotContain(Sentinel, key, StringComparison.Ordinal));
+    }
+
+    #endregion
+
     #region Request level
 
     [Fact]

@@ -89,7 +89,7 @@ public sealed partial class RecordService(
     /// <summary>Reads one page of the records list for <c>GET /api/forms/{viewId}/records</c>.</summary>
     /// <param name="viewId">The form's <c>metaViews.ViewId</c> from the route.</param>
     /// <param name="query">
-    /// The coerced filter, deleted toggle and paging, whose bounds the endpoint has checked.
+    /// The coerced filter, deleted toggle and paging, whose paging bounds and filter length the endpoint has checked.
     /// </param>
     /// <param name="cancellationToken">The request's abort token.</param>
     /// <returns>
@@ -248,9 +248,12 @@ public sealed partial class RecordService(
     /// </summary>
     /// <remarks>
     /// <see cref="SearchCriteriaParser"/> owns the criteria rules: trimming, the <c>" or "</c> alternatives, comparison
-    /// prefixes, wildcards, the six-field limit and the rejection of a field named twice. The store applies the
-    /// selected set, removes the open record before counting and capping, orders by <c>UniqueKey</c> and caps the items
-    /// at <see cref="RecordQueryRules.SearchCap"/>.
+    /// prefixes, wildcards, the six-field limit, the rejection of a field named twice and the
+    /// <see cref="RecordQueryRules.MaxLikePatternLength"/> bound on wildcard patterns, so no pattern over SQL Server's
+    /// <c>LIKE</c> pattern limit reaches the store; a longer one is a 400 after the form's metadata is read and before
+    /// any Find statement is sent. Any number of alternatives reaches the store, which binds a large set in packed
+    /// form. The store applies the selected set, removes the open record before counting and capping, orders by
+    /// <c>UniqueKey</c> and caps the items at <see cref="RecordQueryRules.SearchCap"/>.
     /// </remarks>
     /// <param name="viewId">The form's <c>metaViews.ViewId</c> from the route.</param>
     /// <param name="request">

@@ -1,3 +1,4 @@
+using System.Text;
 using EpiInfo.Domain.Forms;
 using EpiInfo.Domain.Metadata;
 using EpiInfo.Domain.Values;
@@ -6,9 +7,10 @@ namespace EpiInfo.Domain.Records;
 
 /// <summary>
 /// The one owner of the record-set rules: which rows a request selects, how they are ordered and numbered, the
-/// paging and search bounds, the grid columns, and the shape of every <c>values</c> map. The record service, the
-/// SQL Server store, its SQL builders and the in-memory test store all call these members instead of deriving the
-/// rules again. Nothing here is SQL: the data layer renders the predicate and the offsets as parameterised SQL.
+/// paging and search bounds, the grid columns, the grid filter's "contains" pattern, and the shape of every
+/// <c>values</c> map. The record service, the SQL Server store, its SQL builders and the in-memory test store all
+/// call these members instead of deriving the rules again. Nothing here is SQL: the data layer renders the predicate
+/// and the offsets as parameterised SQL, and passes the contains pattern as a parameter value, never as SQL text.
 /// </summary>
 /// <remarks>
 /// <para>
@@ -99,6 +101,27 @@ public static class RecordQueryRules
     /// seventh field with a 400.
     /// </summary>
     public const int MaxSearchFields = 6;
+
+    /// <summary>
+    /// The longest <c>LIKE</c> pattern, SQL Server's 8,000-byte pattern limit counted in UTF-16 code units of an
+    /// <c>nvarchar</c> pattern. It applies to Find's wildcard patterns, after the search-criteria parser has collapsed
+    /// each run of <c>%</c> in a pattern without <c>[</c>, and to the grid filter's contains pattern
+    /// (<see cref="ToContainsPattern"/>); Find's equality and its 255-character multiline comparison are not limited.
+    /// </summary>
+    public const int MaxLikePatternLength = 4000;
+
+    /// <summary>
+    /// The escape character of the grid filter's contains pattern, which the list statement declares in its
+    /// <c>ESCAPE</c> clause.
+    /// </summary>
+    public const char ContainsPatternEscape = '\\';
+
+    /// <summary>
+    /// The fixed message for a <c>q</c> whose contains pattern would exceed <see cref="MaxLikePatternLength"/>. It
+    /// never echoes the submitted value.
+    /// </summary>
+    public const string FilterTooLongMessage =
+        "q must be at most 3998 characters long, counting each %, _, [ and \\ as two.";
 
     /// <summary>The number of grid columns a record summary and a search result carry.</summary>
     public const int GridColumnCount = 6;
@@ -244,6 +267,63 @@ public static class RecordQueryRules
     public static bool IsTruncated(int total) => total > SearchCap;
 
     /// <summary>
+    /// Turns the grid filter into the pattern of a case-insensitive "contains": each <c>\</c>, <c>%</c>, <c>_</c> and
+    /// <c>[</c> gets a leading <see cref="ContainsPatternEscape"/>, the escape character the list statement declares,
+    /// and the result is wrapped in <c>%</c>. The backslash is escaped too, so a backslash in the filter matches
+    /// itself.
+    /// </summary>
+    /// <param name="filter">The filter text, unchanged and untrimmed.</param>
+    /// <returns>For example <c>%a\\b\%c\_d\[e%</c> for <c>a\b%c_d[e</c>.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="filter"/> is null.</exception>
+    public static string ToContainsPattern(string filter)
+    {
+        ArgumentNullException.ThrowIfNull(filter);
+
+        var pattern = new StringBuilder(filter.Length + 2);
+        pattern.Append('%');
+        foreach (var character in filter)
+        {
+            if (IsContainsPatternCharacter(character))
+            {
+                pattern.Append(ContainsPatternEscape);
+            }
+
+            pattern.Append(character);
+        }
+
+        return pattern.Append('%').ToString();
+    }
+
+    /// <summary>
+    /// Whether the contains pattern of <paramref name="filter"/>, as <see cref="ToContainsPattern"/> builds it, fits
+    /// <see cref="MaxLikePatternLength"/>: the filter's length, plus one per <c>\</c>, <c>%</c>, <c>_</c> and
+    /// <c>[</c>, plus the two wrapping <c>%</c>. It counts without building the pattern.
+    /// </summary>
+    /// <param name="filter">The filter text, unchanged and untrimmed.</param>
+    /// <returns>Whether the pattern is at most <see cref="MaxLikePatternLength"/> characters long.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="filter"/> is null.</exception>
+    public static bool IsRepresentableFilter(string filter)
+    {
+        ArgumentNullException.ThrowIfNull(filter);
+
+        var length = filter.Length + 2;
+        if (length > MaxLikePatternLength)
+        {
+            return false;
+        }
+
+        foreach (var character in filter)
+        {
+            if (IsContainsPatternCharacter(character) && ++length > MaxLikePatternLength)
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /// <summary>
     /// Whether a data field of <paramref name="type"/> can be a grid column.
     /// </summary>
     /// <param name="type">A mapped field type.</param>
@@ -350,6 +430,10 @@ public static class RecordQueryRules
 
         return projected;
     }
+
+    // The characters a contains pattern escapes: the escape character itself and LIKE's %, _ and [.
+    private static bool IsContainsPatternCharacter(char character) =>
+        character is ContainsPatternEscape or '%' or '_' or '[';
 }
 
 /// <summary>

@@ -1,3 +1,4 @@
+using System.Globalization;
 using EpiInfo.Domain.Forms;
 using EpiInfo.Domain.Metadata;
 using EpiInfo.Domain.Records;
@@ -7,9 +8,9 @@ namespace EpiInfo.Domain.Tests.Records;
 
 /// <summary>
 /// Unit tests of <see cref="RecordQueryRules"/>, the one owner of the record-set rules: the selected-set predicate,
-/// the intrinsic coordinates of a Record DTO, the paging, position and search bounds, the 64-bit offsets and the grid
-/// columns. The API integration tests <c>NavigationTests</c> and <c>ListAndSearchTests</c> prove the SQL those rules
-/// drive; these tests prove the rules themselves.
+/// the intrinsic coordinates of a Record DTO, the paging, position and search bounds, the 64-bit offsets, the grid
+/// columns and the grid filter's contains pattern. The API integration tests <c>NavigationTests</c> and
+/// <c>ListAndSearchTests</c> prove the SQL those rules drive; these tests prove the rules themselves.
 /// </summary>
 /// <remarks>
 /// No database, environment variable or file is used. The seeded forms are rebuilt in code from
@@ -67,6 +68,8 @@ public sealed class RecordQueryRulesTests
         Assert.Equal(200, RecordQueryRules.MaxPageSize);
         Assert.Equal(200, RecordQueryRules.SearchCap);
         Assert.Equal(6, RecordQueryRules.MaxSearchFields);
+        Assert.Equal(4000, RecordQueryRules.MaxLikePatternLength);
+        Assert.Equal('\\', RecordQueryRules.ContainsPatternEscape);
         Assert.Equal(6, RecordQueryRules.GridColumnCount);
         Assert.Equal("page", RecordQueryRules.PageParameter);
         Assert.Equal("pageSize", RecordQueryRules.PageSizeParameter);
@@ -389,6 +392,65 @@ public sealed class RecordQueryRulesTests
 
         Assert.Equal(RecordQueryRules.SearchCap, response.Items.Count);
         Assert.True(Assert.IsAssignableFrom<ICollection<SearchResult>>(response.Items).IsReadOnly);
+    }
+
+    /// <summary>
+    /// The grid filter's contains pattern escapes <c>\</c>, <c>%</c>, <c>_</c> and <c>[</c> with the declared escape
+    /// character and wraps the result in <c>%</c>; every other character, spaces included, is kept as written.
+    /// </summary>
+    [Theory]
+    [InlineData("a\\b%c_d[e", "%a\\\\b\\%c\\_d\\[e%")]
+    [InlineData(" Smith ", "% Smith %")]
+    [InlineData("]^-*?'", "%]^-*?'%")]
+    [InlineData("", "%%")]
+    public void ToContainsPattern_EscapesTheLikeCharactersAndWrapsInPercent(string filter, string expected)
+    {
+        Assert.Equal(expected, RecordQueryRules.ToContainsPattern(filter));
+    }
+
+    /// <summary>
+    /// SQL Server's <c>LIKE</c> pattern is at most 4,000 UTF-16 code units, so a plain filter may hold 3,998
+    /// characters and a filter of escaped characters half as many; the count agrees with the pattern itself.
+    /// </summary>
+    [Theory]
+    [InlineData("a", 3998, true)]
+    [InlineData("a", 3999, false)]
+    [InlineData("%", 1999, true)]
+    [InlineData("%", 2000, false)]
+    [InlineData("_", 1999, true)]
+    [InlineData("[", 2000, false)]
+    [InlineData("\\", 1999, true)]
+    [InlineData("\\", 2000, false)]
+    [InlineData("a%", 1332, true)]
+    [InlineData("a%", 1333, false)]
+    public void IsRepresentableFilter_CountsTheEscapedAndWrappedPattern(string unit, int repeat, bool expected)
+    {
+        var filter = string.Concat(Enumerable.Repeat(unit, repeat));
+
+        Assert.Equal(expected, RecordQueryRules.IsRepresentableFilter(filter));
+        Assert.Equal(
+            expected,
+            RecordQueryRules.ToContainsPattern(filter).Length <= RecordQueryRules.MaxLikePatternLength);
+    }
+
+    [Fact]
+    public void FilterTooLongMessage_StatesTheLongestPlainFilter()
+    {
+        var longest = RecordQueryRules.MaxLikePatternLength - 2;
+
+        Assert.Contains(
+            string.Create(CultureInfo.InvariantCulture, $" {longest} "),
+            RecordQueryRules.FilterTooLongMessage,
+            StringComparison.Ordinal);
+        Assert.True(RecordQueryRules.IsRepresentableFilter(new string('a', longest)));
+        Assert.False(RecordQueryRules.IsRepresentableFilter(new string('a', longest + 1)));
+    }
+
+    [Fact]
+    public void ContainsPatternMembers_NullFilter_Throw()
+    {
+        Assert.Throws<ArgumentNullException>("filter", () => RecordQueryRules.ToContainsPattern(null!));
+        Assert.Throws<ArgumentNullException>("filter", () => RecordQueryRules.IsRepresentableFilter(null!));
     }
 
     [Theory]

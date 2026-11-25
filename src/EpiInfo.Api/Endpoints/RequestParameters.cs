@@ -29,6 +29,11 @@ namespace EpiInfo.Api.Endpoints;
 /// are rejected before the range conversion, and a token outside <see cref="int"/> is a 400.
 /// </para>
 /// <para>
+/// <b>Filter length.</b> A non-blank <c>q</c> must pass <see cref="RecordQueryRules.IsRepresentableFilter"/>, so its
+/// escaped and wrapped contains pattern fits SQL Server's <c>LIKE</c> pattern limit; a longer one is a 400 on
+/// <c>q</c> with <see cref="RecordQueryRules.FilterTooLongMessage"/>.
+/// </para>
+/// <para>
 /// <b>One 400 per request.</b> Every bad parameter of a request is reported in one
 /// <see cref="HttpValidationProblemDetails"/>, one <c>errors</c> key per parameter, built by
 /// <see cref="ApiProblems"/>. Messages are fixed texts that never echo the submitted value, as the redaction policy
@@ -41,7 +46,7 @@ namespace EpiInfo.Api.Endpoints;
 /// </remarks>
 public static class RequestParameters
 {
-    /// <summary>The query parameter name of the records-list filter.</summary>
+    /// <summary>The query parameter name of the records-list filter, the key of its 400 <c>errors</c> entry.</summary>
     public const string Query = "q";
 
     /// <summary>The query parameter name of the deleted toggle, the key of its 400 <c>errors</c> entry.</summary>
@@ -148,11 +153,12 @@ public static class RequestParameters
 
     /// <summary>
     /// Coerces the inputs of the records list, <c>GET .../records</c>, and checks the paging bounds with
-    /// <see cref="RecordQueryRules.ValidatePaging"/>.
+    /// <see cref="RecordQueryRules.ValidatePaging"/> and the filter length with
+    /// <see cref="RecordQueryRules.IsRepresentableFilter"/>.
     /// </summary>
     /// <param name="q">
     /// The grid filter; absent, empty or whitespace means no filter, and any other value is kept unchanged, without
-    /// trimming.
+    /// trimming. Its contains pattern must fit <see cref="RecordQueryRules.MaxLikePatternLength"/>.
     /// </param>
     /// <param name="includeDeleted">
     /// The query occurrences of <c>includeDeleted</c> in the order sent, as <see cref="TryParseIncludeDeleted"/>
@@ -172,9 +178,10 @@ public static class RequestParameters
     /// <param name="query">The coerced query on success; otherwise <see langword="null"/>.</param>
     /// <param name="problem">
     /// <see langword="null"/> on success; otherwise one field-level 400 with an entry per bad parameter, each
-    /// <c>page</c> or <c>pageSize</c> entry carrying either <see cref="IntegerExpectedMessage"/> or its range message.
+    /// <c>page</c> or <c>pageSize</c> entry carrying either <see cref="IntegerExpectedMessage"/> or its range message,
+    /// and a <c>q</c> entry carrying <see cref="RecordQueryRules.FilterTooLongMessage"/>.
     /// </param>
-    /// <returns>Whether every parameter coerced and the paging bounds hold.</returns>
+    /// <returns>Whether every parameter coerced and the paging and filter bounds hold.</returns>
     public static bool TryParseListQuery(
         string? q,
         string[]? includeDeleted,
@@ -184,6 +191,14 @@ public static class RequestParameters
         [NotNullWhen(false)] out IResult? problem)
     {
         Dictionary<string, string[]>? errors = null;
+
+        // Blank stays no filter; any other q is kept untrimmed, so its own length and characters are what count.
+        var filter = string.IsNullOrWhiteSpace(q) ? null : q;
+        if (filter is not null && !RecordQueryRules.IsRepresentableFilter(filter))
+        {
+            AddError(Query, RecordQueryRules.FilterTooLongMessage, ref errors);
+        }
+
         CoerceIncludeDeleted(includeDeleted, out var parsedIncludeDeleted, ref errors);
 
         var pageParsed = TryParseOptionalInteger(page, RecordQueryRules.DefaultPage, out var parsedPage);
@@ -205,7 +220,7 @@ public static class RequestParameters
         }
 
         query = new RecordListQuery(
-            string.IsNullOrWhiteSpace(q) ? null : q,
+            filter,
             parsedIncludeDeleted,
             parsedPage,
             parsedPageSize);

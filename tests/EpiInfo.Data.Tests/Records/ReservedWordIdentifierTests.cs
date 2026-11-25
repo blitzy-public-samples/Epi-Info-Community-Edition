@@ -282,11 +282,11 @@ public sealed class ReservedWordIdentifierTests
             Assert.IsType(expected.GetType(), bound.Value);
             Assert.True(expected.Equals(bound.Value), "The criterion is not bound with the expected value.");
 
-            var found = await SqlExecution.ReadAsync(
+            Task<List<string>> FindAsync(SqlStatement statement) => SqlExecution.ReadAsync(
                 connection,
                 transaction: null,
                 FixtureOperation,
-                search.Statement,
+                statement,
                 fixture.CommandTimeoutSeconds,
                 fixture.Recorder,
                 cancellationToken,
@@ -301,7 +301,23 @@ public sealed class ReservedWordIdentifierTests
                     return ids;
                 });
 
+            var found = await FindAsync(search.Statement);
             Assert.Equal(expectedRows, string.Concat(found.Select(id => labels[id])));
+
+            // Packed, as a search beyond the scalar budget binds it, the criterion travels as a JSON array element and
+            // selects exactly the same rows: bigint and decimal criteria decode to their own exact values.
+            var packed = SearchSqlBuilder.Search(
+                fixture.Schema,
+                fixture.DataFields,
+                RecordQueryRules.GetGridColumns(fixture.DataFields),
+                parsed.Conditions,
+                includeDeleted: false,
+                excludeGlobalRecordId: null,
+                scalarParameterBudget: 0);
+            Assert.Contains("OPENJSON", packed.Statement.Text, StringComparison.Ordinal);
+
+            var packedFound = await FindAsync(packed.Statement);
+            Assert.Equal(expectedRows, string.Concat(packedFound.Select(id => labels[id])));
         }
         finally
         {

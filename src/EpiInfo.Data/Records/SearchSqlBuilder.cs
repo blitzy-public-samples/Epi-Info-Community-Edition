@@ -1,4 +1,8 @@
+using System.Buffers;
+using System.Data;
+using System.Globalization;
 using System.Text;
+using System.Text.Json;
 using EpiInfo.Data.Metadata;
 using EpiInfo.Data.Sql;
 using EpiInfo.Domain.Metadata;
@@ -35,16 +39,18 @@ internal sealed record ListSelect(SqlStatement Statement, IReadOnlyList<Projecte
 /// <remarks>
 /// <para>
 /// <b>Input.</b> Search conditions arrive already parsed by <c>SearchCriteriaParser</c>, which owns every criterion
-/// rule: trimming, the <c>" or "</c> split, the comparison prefixes, per-type coercion, the six-field limit and the
-/// <c>*</c> to <c>%</c> rewrite. This class renders each alternative exactly as given and never reads a value.
+/// rule: trimming, the <c>" or "</c> split, the comparison prefixes, per-type coercion, the six-field limit, the
+/// wildcard-pattern bound and the <c>*</c> to <c>%</c> rewrite. This class renders each alternative exactly as given,
+/// however many a condition holds; it reads a value only to reject, as a programming error, a <c>LIKE</c> pattern over
+/// that bound, and to pack the values of a large search into parameters ("Packed binding" under <c>Search</c>).
 /// </para>
 /// <para>
 /// <b>Identifiers and values.</b> Every table and column name comes from the reader-built <see cref="FormSchema"/>
 /// and reaches the text only through <see cref="SqlIdentifier"/>, by way of the <see cref="RecordSqlBuilder"/>
 /// helpers. The CTE name <c>[n]</c>, its columns <c>[k]</c> and <c>[pos]</c>, the aliases <c>b</c>, <c>n</c>,
-/// <c>p{i}</c> and <c>[c{n}]</c>, the collation name and the escape character are fixed literals. Every value
-/// (criteria, the grid filter, the excluded id, the cap, the offset and the page size) is a positional parameter,
-/// so text that looks like SQL stays inert data.
+/// <c>p{i}</c>, <c>[a]</c> and <c>[c{n}]</c>, the collation name, the escape character and the decoding expressions
+/// of packed values are fixed literals. Every value (criteria, packed or not, the grid filter, the excluded id, the
+/// cap, the offset and the page size) is a positional parameter, so text that looks like SQL stays inert data.
 /// </para>
 /// <para>
 /// Every exception message is fixed text naming no table, column, field, value or id, as the redaction policy
@@ -87,11 +93,57 @@ internal static class SearchSqlBuilder
     // CONVERT style 23 renders a datetime as yyyy-mm-dd, the wire form of a date field.
     private const string IsoDateStyle = "23";
 
-    // The escape character of the grid filter pattern, written into the statement as a fixed literal.
-    private const char ContainsEscape = '\\';
-
     // The sys.types name of the one admitted character type that rejects comparison operators.
     private const string NTextTypeName = "ntext";
+
+    // The most alternatives other than IS NULL a Find statement binds one parameter each; a search with more binds
+    // its values packed, a few JSON-array parameters per condition.
+    private const int ScalarParameterBudget = 2000;
+
+    // SQL Server accepts 2,100 parameters per command, and sp_executesql, which SqlClient sends a parameterised
+    // statement through, takes two of them for the statement text and the parameter declarations.
+    private const int MaxStatementParameters = 2098;
+
+    // The name a criterion's scalar parameter is built under before its value is packed; it is never bound.
+    private const string PackedValueName = "@v";
+
+    // The decoding of one element of a packed array, OPENJSON's [a].[value], into the SQL type and value the scalar
+    // parameter would bind. Text is hexadecimal UTF-16LE, so every code unit, a lone surrogate included, round-trips.
+    private const string PackedTextDecoder = "CAST(CONVERT(varbinary(max), [a].[value], 1) AS nvarchar(max))";
+    private const string PackedByteDecoder = "CAST([a].[value] AS tinyint)";
+    private const string PackedInt16Decoder = "CAST([a].[value] AS smallint)";
+    private const string PackedInt32Decoder = "CAST([a].[value] AS int)";
+    private const string PackedInt64Decoder = "CAST([a].[value] AS bigint)";
+    private const string PackedBooleanDecoder = "CAST([a].[value] AS bit)";
+    private const string PackedDateTimeDecoder = "CONVERT(datetime, [a].[value], 126)";
+
+    // A float element is [sign, biased exponent, fraction], the fields of its IEEE 754 bits, rebuilt by arithmetic
+    // that is exact at every step: the significand, at most 2^53, converts to float exactly, and multiplying it by a
+    // power of two, the original value's own scale, rounds nothing. SQL Server's text-to-float parse is not correctly
+    // rounded and it refuses binary-to-float, so neither decimal text nor the raw bits would be exact.
+    private const string PackedDoubleDecoder =
+        "CASE WHEN CAST(JSON_VALUE([a].[value], '$[0]') AS int) = 1 THEN -1e0 ELSE 1e0 END"
+        + " * CAST(CAST(JSON_VALUE([a].[value], '$[2]') AS bigint)"
+        + " + CASE WHEN CAST(JSON_VALUE([a].[value], '$[1]') AS int) = 0 THEN 0 ELSE 4503599627370496 END AS float)"
+        + " * POWER(CAST(2 AS float), CASE WHEN CAST(JSON_VALUE([a].[value], '$[1]') AS int) = 0 THEN -1074"
+        + " ELSE CAST(JSON_VALUE([a].[value], '$[1]') AS int) - 1075 END)";
+
+    // The date and time form CONVERT style 126 reads exactly.
+    private const string PackedDateTimeFormat = "yyyy-MM-ddTHH:mm:ss.fff";
+
+    // The row limit of the derived table an equality group's array is decoded in, int.MaxValue, so it keeps every
+    // element, and the name its decoded value takes there.
+    private const string PackedFenceRows = "2147483647";
+    private const string PackedFencedValue = "[d].[v]";
+
+    // SQL Server's largest decimal precision, the precision a packed decimal element is read back with.
+    private const int MaxDecimalPrecision = 38;
+
+    // The IEEE 754 binary64 fields and the biased exponent of infinities and NaN, which no SQL float holds.
+    private const int DoubleExponentShift = 52;
+    private const long DoubleExponentMask = 0x7FF;
+    private const long DoubleFractionMask = (1L << DoubleExponentShift) - 1;
+    private const long NonFiniteExponent = 0x7FF;
 
     // Fixed messages: the redaction policy keeps identifiers, field names, values and ids out of exception text.
     private const string NullConditionMessage = "The search conditions must not hold a null entry.";
@@ -102,6 +154,13 @@ internal static class SearchSqlBuilder
     private const string UnknownOperatorMessage = "The search operator is not a defined member.";
     private const string MissingValueMessage = "A search alternative other than IS NULL needs a value.";
     private const string NullGridColumnMessage = "The grid columns must not hold a null entry.";
+    private const string TooManyParametersMessage =
+        "The search conditions need more parameters than one SQL Server statement can bind.";
+    private const string UnpackableTypeMessage = "A search parameter of this type has no packed form.";
+    private const string UnpackableValueMessage = "A search parameter value has no exact packed form.";
+    private const string PatternTooLongMessage = "A search pattern is longer than SQL Server's LIKE pattern limit.";
+    private const string FilterTooLongMessage =
+        "The grid filter's pattern is longer than SQL Server's LIKE pattern limit.";
 
     /// <summary>
     /// Builds the Find statement: the selected set numbered by <c>UniqueKey</c>, joined to every page table, filtered
@@ -161,6 +220,45 @@ internal static class SearchSqlBuilder
     /// <c>ntext</c> column, so a comparison against one is written on <c>CONVERT(nvarchar(max), column)</c>, which
     /// keeps the column's collation and compares the whole text.
     /// </para>
+    /// <para>
+    /// <b>Packed binding.</b> A search binds one parameter per alternative other than <c>IS NULL</c> while it holds at
+    /// most 2,000 of them, so the statement, at most 2,003 parameters with the selected-set status, the cap and the
+    /// excluded id, stays under the 2,098 a <c>sp_executesql</c> command leaves of SQL Server's 2,100. A search with
+    /// more renders every condition packed instead, so its parameter count no longer grows with its alternatives:
+    /// </para>
+    /// <code>
+    /// (column IS NULL OR EXISTS (SELECT 1 FROM OPENJSON(@p2) AS [a] WHERE column LIKE decoded) OR ...)
+    /// </code>
+    /// <para>
+    /// The <c>IS NULL</c> alternatives give one <c>IS NULL</c> term. The other values of a condition are grouped by
+    /// operator and by the type of the scalar parameter each would bind, one type per condition except that a number
+    /// on an integer column binds <c>bigint</c> or <c>decimal</c>, and each group is one <c>nvarchar(max)</c>
+    /// parameter holding a JSON array, at most twelve per condition. The <c>EXISTS</c> applies
+    /// the operator's own predicate to each element of the array, the comparison on the comparable column, <c>LIKE</c>
+    /// with no <c>ESCAPE</c> clause and the 255-character <c>SUBSTRING</c> equality, so an element matches exactly
+    /// when its scalar parameter would. For the two equalities the array is decoded in a
+    /// <c>SELECT TOP (2147483647) ... ORDER BY [a].[key]</c> derived table, which keeps every element; no predicate
+    /// can be pushed below its <c>TOP</c>, so SQL Server matches the decoded set with one hash or merge semi-join
+    /// rather than reading the whole array again for each row, which a list of thousands of values would make take
+    /// seconds; the other operators cannot use such a join and read the array directly. Each value is first built as
+    /// that scalar parameter by
+    /// <see cref="ColumnValueConverter.ToSearchParameter"/>, which checks its kind and range, and then encoded by the
+    /// parameter's type so that its decoding has that same SQL type and value: text as the hexadecimal of its UTF-16LE
+    /// code units, decoded through <c>varbinary(max)</c> to <c>nvarchar(max)</c>, which keeps every code unit and,
+    /// like a parameter, takes the database's coercible-default collation, so a column's collation governs the
+    /// comparison as it does for a parameter; integers and bits as invariant decimal text, cast to their own type;
+    /// a <c>decimal</c> as its invariant text, cast to <c>decimal(38, s)</c> with <c>s</c> the largest scale of its
+    /// array; a date as <c>yyyy-MM-ddTHH:mm:ss.fff</c> read with <c>CONVERT</c> style 126, exact for the midnight values
+    /// search binds; and a float as the sign, exponent and fraction of its IEEE 754 bits, rebuilt by exact
+    /// arithmetic, because SQL Server's text-to-float parse is not correctly rounded. <c>OPENJSON</c> needs database
+    /// compatibility level 130 or higher; the rehearsal database runs at 160.
+    /// </para>
+    /// <para>
+    /// <b>Bounds.</b> A statement that would still bind more than 2,098 parameters, which only conditions beyond the
+    /// parser's six fields can need, is rejected here before it is returned. Each <c>LIKE</c> pattern is at most
+    /// <see cref="RecordQueryRules.MaxLikePatternLength"/> characters, SQL Server's 8,000-byte pattern limit; the
+    /// search-criteria parser enforces it with a 400, and longer input is rejected here before any text is built.
+    /// </para>
     /// </remarks>
     /// <param name="schema">The form's catalogue view.</param>
     /// <param name="dataFields">The form's data fields, to resolve each page-field condition by name.</param>
@@ -175,23 +273,64 @@ internal static class SearchSqlBuilder
     /// </exception>
     /// <exception cref="ArgumentException">
     /// A list holds a null entry; a condition names no data field of the form, names one whose type differs from the
-    /// condition's, or has no alternative; a field or grid column has no column in the form's page tables; or a value
-    /// does not fit its column.
+    /// condition's, or has no alternative; the conditions hold a <c>LIKE</c> pattern longer than
+    /// <see cref="RecordQueryRules.MaxLikePatternLength"/>; a field or grid column has no column in the form's page
+    /// tables; a value does not fit its column; or the statement would bind more than 2,098 parameters.
     /// </exception>
     /// <exception cref="ArgumentOutOfRangeException">A target or an operator is not a defined member.</exception>
-    /// <exception cref="InvalidOperationException">A table lacks a required system or key column.</exception>
+    /// <exception cref="InvalidOperationException">
+    /// A table lacks a required system or key column, or a value to pack has a parameter type or value with no exact
+    /// packed form.
+    /// </exception>
     internal static SearchSelect Search(
         FormSchema schema,
         DataFieldSet dataFields,
         IReadOnlyList<DataFieldMetadata> gridColumns,
         IReadOnlyList<SearchCondition> conditions,
         bool includeDeleted,
-        string? excludeGlobalRecordId)
+        string? excludeGlobalRecordId) =>
+        Search(
+            schema, dataFields, gridColumns, conditions, includeDeleted, excludeGlobalRecordId, ScalarParameterBudget);
+
+    /// <summary>
+    /// Builds the Find statement as the six-argument overload does, with the number of alternatives other than
+    /// <c>IS NULL</c> above which every condition is packed given explicitly, so tests can render the same search
+    /// both ways.
+    /// </summary>
+    /// <param name="schema">The form's catalogue view.</param>
+    /// <param name="dataFields">The form's data fields, to resolve each page-field condition by name.</param>
+    /// <param name="gridColumns">The grid columns to project.</param>
+    /// <param name="conditions">The parsed conditions; AND across conditions, OR across one condition's alternatives.</param>
+    /// <param name="includeDeleted">Whether the selected set holds every row rather than the active set.</param>
+    /// <param name="excludeGlobalRecordId">The open record's id to leave out of the result, or <see langword="null"/>.</param>
+    /// <param name="scalarParameterBudget">
+    /// The most alternatives other than <c>IS NULL</c> that bind one parameter each; 0 packs every search that binds a
+    /// value.
+    /// </param>
+    /// <returns>The statement and its result layout.</returns>
+    /// <exception cref="ArgumentNullException">
+    /// <paramref name="schema"/>, <paramref name="dataFields"/>, <paramref name="gridColumns"/> or
+    /// <paramref name="conditions"/> is null.
+    /// </exception>
+    /// <exception cref="ArgumentException">As for the six-argument overload.</exception>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// <paramref name="scalarParameterBudget"/> is negative, or a target or an operator is not a defined member.
+    /// </exception>
+    /// <exception cref="InvalidOperationException">As for the six-argument overload.</exception>
+    internal static SearchSelect Search(
+        FormSchema schema,
+        DataFieldSet dataFields,
+        IReadOnlyList<DataFieldMetadata> gridColumns,
+        IReadOnlyList<SearchCondition> conditions,
+        bool includeDeleted,
+        string? excludeGlobalRecordId,
+        int scalarParameterBudget)
     {
         ArgumentNullException.ThrowIfNull(schema);
         ArgumentNullException.ThrowIfNull(dataFields);
         ArgumentNullException.ThrowIfNull(gridColumns);
         ArgumentNullException.ThrowIfNull(conditions);
+        ArgumentOutOfRangeException.ThrowIfNegative(scalarParameterBudget);
 
         var uniqueKey = RecordSqlBuilder.Require(schema.UniqueKey);
         var recStatus = RecordSqlBuilder.Require(schema.RecStatus);
@@ -230,14 +369,24 @@ internal static class SearchSqlBuilder
             }
         }
 
+        // Within the budget each alternative binds its own parameter; beyond it every condition is packed, so the
+        // parameter count no longer grows with the alternatives.
+        var packed = CountBindingAlternatives(resolved) > scalarParameterBudget;
         var clause = " WHERE ";
         foreach (var condition in resolved)
         {
             sql.Append(clause).Append('(');
-            for (var index = 0; index < condition.Condition.Alternatives.Count; index++)
+            if (packed)
             {
-                sql.Append(index == 0 ? string.Empty : " OR ");
-                AppendAlternative(sql, condition, condition.Condition.Alternatives[index], parameters);
+                AppendPackedAlternatives(sql, condition, parameters);
+            }
+            else
+            {
+                for (var index = 0; index < condition.Condition.Alternatives.Count; index++)
+                {
+                    sql.Append(index == 0 ? string.Empty : " OR ");
+                    AppendAlternative(sql, condition, condition.Condition.Alternatives[index], parameters);
+                }
             }
 
             sql.Append(')');
@@ -254,6 +403,11 @@ internal static class SearchSqlBuilder
 
         sql.Append(" ORDER BY ");
         AppendBase(sql, uniqueKey);
+
+        if (parameters.Count > MaxStatementParameters)
+        {
+            throw new ArgumentException(TooManyParametersMessage, nameof(conditions));
+        }
 
         return new SearchSelect(parameters.ToStatement(sql.ToString()), columns);
     }
@@ -283,7 +437,9 @@ internal static class SearchSqlBuilder
     /// <exception cref="ArgumentNullException">An argument is null.</exception>
     /// <exception cref="ArgumentOutOfRangeException">The query's paging bounds were not validated.</exception>
     /// <exception cref="ArgumentException">
-    /// <paramref name="gridColumns"/> holds a null entry or a field with no column in the form's page tables.
+    /// <paramref name="gridColumns"/> holds a null entry or a field with no column in the form's page tables; or the
+    /// query's filter fails <see cref="RecordQueryRules.IsRepresentableFilter"/>, so its contains pattern would be
+    /// longer than <see cref="RecordQueryRules.MaxLikePatternLength"/>.
     /// </exception>
     /// <exception cref="InvalidOperationException">A table lacks a required system or key column.</exception>
     internal static ListSelect ListPage(
@@ -335,7 +491,9 @@ internal static class SearchSqlBuilder
     /// <returns>A statement returning one <c>bigint</c>.</returns>
     /// <exception cref="ArgumentNullException">An argument is null.</exception>
     /// <exception cref="ArgumentException">
-    /// <paramref name="gridColumns"/> holds a null entry or a field with no column in the form's page tables.
+    /// <paramref name="gridColumns"/> holds a null entry or a field with no column in the form's page tables; or the
+    /// query's filter fails <see cref="RecordQueryRules.IsRepresentableFilter"/>, so its contains pattern would be
+    /// longer than <see cref="RecordQueryRules.MaxLikePatternLength"/>.
     /// </exception>
     /// <exception cref="InvalidOperationException">A table lacks a required system or key column.</exception>
     internal static SqlStatement ListCount(
@@ -356,35 +514,9 @@ internal static class SearchSqlBuilder
         return parameters.ToStatement(sql.ToString());
     }
 
-    /// <summary>
-    /// Turns the grid filter into the pattern of a case-insensitive "contains": each <c>\</c>, <c>%</c>, <c>_</c> and
-    /// <c>[</c> gets a leading <c>\</c>, the escape character the list statement declares, and the result is wrapped
-    /// in <c>%</c>. The backslash is escaped too, so a backslash in the filter matches itself.
-    /// </summary>
-    /// <param name="filter">The filter text, unchanged and untrimmed.</param>
-    /// <returns>For example <c>%a\\b\%c\_d\[e%</c> for <c>a\b%c_d[e</c>.</returns>
-    /// <exception cref="ArgumentNullException"><paramref name="filter"/> is null.</exception>
-    internal static string EscapeContainsPattern(string filter)
-    {
-        ArgumentNullException.ThrowIfNull(filter);
-
-        var pattern = new StringBuilder(filter.Length + 2);
-        pattern.Append('%');
-        foreach (var character in filter)
-        {
-            if (character is ContainsEscape or '%' or '_' or '[')
-            {
-                pattern.Append(ContainsEscape);
-            }
-
-            pattern.Append(character);
-        }
-
-        return pattern.Append('%').ToString();
-    }
-
     // Resolves every condition to the column text it compares, before any statement text is written. A page field
-    // resolves through the form's data fields and the reader-built schema, a system target to its base column.
+    // resolves through the form's data fields and the reader-built schema, a system target to its base column. The
+    // parser's LIKE pattern bound is checked again here, so a longer pattern fails with no statement built.
     private static IReadOnlyList<ResolvedCondition> ResolveConditions(
         FormSchema schema,
         DataFieldSet dataFields,
@@ -401,6 +533,16 @@ internal static class SearchSqlBuilder
             if (condition.Alternatives.Count == 0)
             {
                 throw new ArgumentException(EmptyAlternativesMessage, nameof(conditions));
+            }
+
+            foreach (var alternative in condition.Alternatives)
+            {
+                if (alternative is { Operator: SearchOperator.Like, Value: { } pattern }
+                    && pattern.TryGetText(out var text)
+                    && text.Length > RecordQueryRules.MaxLikePatternLength)
+                {
+                    throw new ArgumentException(PatternTooLongMessage, nameof(conditions));
+                }
             }
 
             switch (condition.Target)
@@ -448,31 +590,107 @@ internal static class SearchSqlBuilder
         return resolved;
     }
 
-    // One alternative: a comparison, IS NULL, LIKE with no ESCAPE clause, or the 255-character prefix equality.
+    // One alternative: IS NULL, or its operator's predicate on its own positional parameter.
     private static void AppendAlternative(
         StringBuilder sql,
         ResolvedCondition condition,
         SearchAlternative alternative,
         PositionalParameters parameters)
     {
-        switch (alternative.Operator)
+        if (alternative.Operator == SearchOperator.IsNull)
         {
-            case SearchOperator.IsNull:
-                sql.Append(condition.Reference).Append(" IS NULL");
-                return;
+            sql.Append(condition.Reference).Append(" IS NULL");
+            return;
+        }
 
+        AppendPredicate(sql, condition, alternative.Operator, Bind(condition, alternative, parameters));
+    }
+
+    // One condition in packed form: one IS NULL term for its IS NULL alternatives, then, for each operator and scalar
+    // parameter type in the order the alternatives first use them, an EXISTS over the JSON array of their values.
+    private static void AppendPackedAlternatives(
+        StringBuilder sql,
+        ResolvedCondition condition,
+        PositionalParameters parameters)
+    {
+        var matchesNull = false;
+        var groups = new List<PackedGroup>();
+        foreach (var alternative in condition.Condition.Alternatives)
+        {
+            if (alternative.Operator == SearchOperator.IsNull)
+            {
+                matchesNull = true;
+                continue;
+            }
+
+            // Built exactly as the scalar path binds it, so the value is checked the same way and keeps its type.
+            var scalar = ToScalarParameter(condition, alternative, PackedValueName);
+            var group = groups.Find(
+                candidate => candidate.Operator == alternative.Operator && candidate.DbType == scalar.DbType);
+            if (group is null)
+            {
+                group = new PackedGroup(alternative.Operator, scalar.DbType, []);
+                groups.Add(group);
+            }
+
+            group.Values.Add(scalar);
+        }
+
+        var separator = string.Empty;
+        if (matchesNull)
+        {
+            sql.Append(condition.Reference).Append(" IS NULL");
+            separator = " OR ";
+        }
+
+        foreach (var group in groups)
+        {
+            var array = PackValues(group.Values, out var decoder);
+            var name = parameters.Add(n => ColumnValueConverter.Text(n, array));
+            sql.Append(separator).Append("EXISTS (SELECT 1 FROM ");
+            string value;
+            if (group.Operator is SearchOperator.Equal or SearchOperator.PrefixEqual255)
+            {
+                // A predicate cannot be pushed below TOP, so the decoded array stays uncorrelated and SQL Server can
+                // match it with one hash or merge semi-join instead of reading the whole array again for every row.
+                sql.Append("(SELECT TOP (").Append(PackedFenceRows).Append(") ").Append(decoder)
+                    .Append(" AS [v] FROM OPENJSON(").Append(name)
+                    .Append(") AS [a] ORDER BY [a].[key]) AS [d] WHERE ");
+                value = PackedFencedValue;
+            }
+            else
+            {
+                sql.Append("OPENJSON(").Append(name).Append(") AS [a] WHERE ");
+                value = decoder;
+            }
+
+            AppendPredicate(sql, condition, group.Operator, value);
+            sql.Append(')');
+            separator = " OR ";
+        }
+    }
+
+    // An operator's predicate on a value expression, a parameter name or a packed element's decoding: a comparison on
+    // the comparable column text, LIKE with no ESCAPE clause, or the 255-character prefix equality.
+    private static void AppendPredicate(
+        StringBuilder sql,
+        ResolvedCondition condition,
+        SearchOperator comparisonOperator,
+        string value)
+    {
+        switch (comparisonOperator)
+        {
             case SearchOperator.Like:
-                sql.Append(condition.Reference).Append(" LIKE ").Append(Bind(condition, alternative, parameters));
+                sql.Append(condition.Reference).Append(" LIKE ").Append(value);
                 return;
 
             case SearchOperator.PrefixEqual255:
                 sql.Append("SUBSTRING(").Append(condition.Reference).Append(", 1, ").Append(PrefixLength)
-                    .Append(") = SUBSTRING(").Append(Bind(condition, alternative, parameters))
-                    .Append(", 1, ").Append(PrefixLength).Append(')');
+                    .Append(") = SUBSTRING(").Append(value).Append(", 1, ").Append(PrefixLength).Append(')');
                 return;
 
             default:
-                var comparison = alternative.Operator switch
+                var comparison = comparisonOperator switch
                 {
                     SearchOperator.Equal => "=",
                     SearchOperator.NotEqual => "<>",
@@ -480,23 +698,174 @@ internal static class SearchSqlBuilder
                     SearchOperator.LessOrEqual => "<=",
                     SearchOperator.Greater => ">",
                     SearchOperator.GreaterOrEqual => ">=",
-                    _ => throw new ArgumentOutOfRangeException(nameof(alternative), UnknownOperatorMessage),
+                    _ => throw new ArgumentOutOfRangeException(nameof(comparisonOperator), UnknownOperatorMessage),
                 };
-                sql.Append(condition.Comparable).Append(' ').Append(comparison).Append(' ')
-                    .Append(Bind(condition, alternative, parameters));
+                sql.Append(condition.Comparable).Append(' ').Append(comparison).Append(' ').Append(value);
                 return;
         }
     }
 
     // Binds an alternative's value as the next positional parameter, typed for the condition's column.
-    private static string Bind(ResolvedCondition condition, SearchAlternative alternative, PositionalParameters parameters)
+    private static string Bind(ResolvedCondition condition, SearchAlternative alternative, PositionalParameters parameters) =>
+        parameters.Add(name => ToScalarParameter(condition, alternative, name));
+
+    // The scalar parameter of an alternative's value, typed for the condition's column.
+    private static SqlParameterValue ToScalarParameter(
+        ResolvedCondition condition,
+        SearchAlternative alternative,
+        string name)
     {
         var value = alternative.Value ?? throw new ArgumentException(MissingValueMessage, nameof(alternative));
-        var target = condition.Condition.Target;
-        var fieldType = condition.Condition.FieldType;
-        var column = condition.Column;
+        return ColumnValueConverter.ToSearchParameter(
+            name, condition.Condition.Target, condition.Condition.FieldType, condition.Column, value);
+    }
 
-        return parameters.Add(n => ColumnValueConverter.ToSearchParameter(n, target, fieldType, column, value));
+    // The alternatives the scalar path binds a parameter for: every one but IS NULL.
+    private static long CountBindingAlternatives(IReadOnlyList<ResolvedCondition> conditions)
+    {
+        var count = 0L;
+        foreach (var condition in conditions)
+        {
+            foreach (var alternative in condition.Condition.Alternatives)
+            {
+                if (alternative.Operator != SearchOperator.IsNull)
+                {
+                    count++;
+                }
+            }
+        }
+
+        return count;
+    }
+
+    // One packed group's JSON array, and the decoding of one of its elements, which all share the group's type.
+    private static string PackValues(IReadOnlyList<SqlParameterValue> values, out string decoder)
+    {
+        var buffer = new ArrayBufferWriter<byte>();
+        decoder = string.Empty;
+        var decimalScale = DecimalScale(values);
+        using (var writer = new Utf8JsonWriter(buffer))
+        {
+            writer.WriteStartArray();
+            foreach (var value in values)
+            {
+                decoder = WritePackedElement(writer, value, decimalScale);
+            }
+
+            writer.WriteEndArray();
+        }
+
+        return Encoding.UTF8.GetString(buffer.WrittenSpan);
+    }
+
+    // The largest scale among an array's decimal values, the scale each of them is read back with; 0 when it has none.
+    private static int DecimalScale(IReadOnlyList<SqlParameterValue> values)
+    {
+        var scale = 0;
+        foreach (var value in values)
+        {
+            if (value.Value is decimal number)
+            {
+                scale = Math.Max(scale, number.Scale);
+            }
+        }
+
+        return scale;
+    }
+
+    // The number of digits in a decimal's integer part, at least one.
+    private static int IntegerDigits(decimal number)
+    {
+        var integer = decimal.Truncate(Math.Abs(number));
+        return integer == 0m ? 1 : integer.ToString(CultureInfo.InvariantCulture).Length;
+    }
+
+    // The one mapping from a scalar search parameter to its packed form: writes the parameter's value as the next
+    // array element and returns the expression that decodes such an element to the parameter's SQL type and value.
+    // decimalScale is the scale a decimal element is read back with, the largest of its array. Every token written is
+    // ASCII that JSON needs no escape for.
+    private static string WritePackedElement(Utf8JsonWriter writer, SqlParameterValue scalar, int decimalScale)
+    {
+        switch (scalar.DbType, scalar.Value)
+        {
+            case (DbType.String, string text):
+                writer.WriteStringValue(ToUtf16LittleEndianHex(text));
+                return PackedTextDecoder;
+
+            case (DbType.Byte, byte number):
+                writer.WriteStringValue(number.ToString(CultureInfo.InvariantCulture));
+                return PackedByteDecoder;
+
+            case (DbType.Int16, short number):
+                writer.WriteStringValue(number.ToString(CultureInfo.InvariantCulture));
+                return PackedInt16Decoder;
+
+            case (DbType.Int32, int number):
+                writer.WriteStringValue(number.ToString(CultureInfo.InvariantCulture));
+                return PackedInt32Decoder;
+
+            case (DbType.Int64, long number):
+                writer.WriteStringValue(number.ToString(CultureInfo.InvariantCulture));
+                return PackedInt64Decoder;
+
+            // A decimal, an integer column's criterion that holds no exact 64-bit integer, is its invariant text read
+            // back as decimal(38, s), s the largest scale of its array, which keeps every digit while its integer part
+            // fits the other 38 - s digits; the converter's criteria have scale 1 and at most 19 integer digits.
+            case (DbType.Decimal, decimal number) when IntegerDigits(number) <= MaxDecimalPrecision - decimalScale:
+                writer.WriteStringValue(number.ToString(CultureInfo.InvariantCulture));
+                return string.Concat(
+                    "CAST([a].[value] AS decimal(",
+                    MaxDecimalPrecision.ToString(CultureInfo.InvariantCulture),
+                    ", ",
+                    decimalScale.ToString(CultureInfo.InvariantCulture),
+                    "))");
+
+            case (DbType.Boolean, bool flag):
+                writer.WriteStringValue(flag ? "1" : "0");
+                return PackedBooleanDecoder;
+
+            // Search binds dates at midnight; another time of day could round differently as text than as a
+            // parameter, so it is refused rather than packed inexactly.
+            case (DbType.DateTime, DateTime time) when time.TimeOfDay == TimeSpan.Zero:
+                writer.WriteStringValue(time.ToString(PackedDateTimeFormat, CultureInfo.InvariantCulture));
+                return PackedDateTimeDecoder;
+
+            case (DbType.Double, double number):
+                var bits = BitConverter.DoubleToInt64Bits(number);
+                var exponent = (bits >> DoubleExponentShift) & DoubleExponentMask;
+                if (exponent == NonFiniteExponent)
+                {
+                    throw new InvalidOperationException(UnpackableValueMessage);
+                }
+
+                writer.WriteStartArray();
+                writer.WriteNumberValue(bits < 0 ? 1 : 0);
+                writer.WriteNumberValue(exponent);
+                writer.WriteNumberValue(bits & DoubleFractionMask);
+                writer.WriteEndArray();
+                return PackedDoubleDecoder;
+
+            case (DbType.String or DbType.Byte or DbType.Int16 or DbType.Int32 or DbType.Int64 or DbType.Decimal
+                or DbType.Boolean or DbType.DateTime or DbType.Double, _):
+                throw new InvalidOperationException(UnpackableValueMessage);
+
+            default:
+                throw new InvalidOperationException(UnpackableTypeMessage);
+        }
+    }
+
+    // "0x" and the uppercase hexadecimal of the text's UTF-16 code units, low byte first, the form CONVERT style 1
+    // reads as varbinary. The code units are copied, not encoded, so a lone surrogate is kept as it is.
+    private static string ToUtf16LittleEndianHex(string text)
+    {
+        var bytes = new byte[text.Length * sizeof(char)];
+        for (var index = 0; index < text.Length; index++)
+        {
+            bytes[2 * index] = (byte)(text[index] & 0xFF);
+            bytes[(2 * index) + 1] = (byte)(text[index] >> 8);
+        }
+
+        return string.Concat("0x", Convert.ToHexString(bytes));
     }
 
     // Resolves the grid columns to reader-built columns with consecutive ordinals from firstOrdinal.
@@ -523,7 +892,7 @@ internal static class SearchSqlBuilder
     // holding a grid column, the selected set, and the grid filter. The filter is a case-insensitive "contains" over
     // the grid columns that does not depend on the database collation: each column is converted to text (a datetime
     // as yyyy-mm-dd), and both sides are compared under one case-insensitive collation, with the filter's pattern
-    // characters escaped. It has no legacy counterpart.
+    // characters escaped by RecordQueryRules.ToContainsPattern. It has no legacy counterpart.
     private static void AppendListSource(
         StringBuilder sql,
         FormSchema schema,
@@ -555,6 +924,13 @@ internal static class SearchSqlBuilder
             return;
         }
 
+        // Checked whatever the columns, so a filter over SQL Server's LIKE pattern limit always fails the same way.
+        var containsPattern = RecordQueryRules.ToContainsPattern(filter);
+        if (containsPattern.Length > RecordQueryRules.MaxLikePatternLength)
+        {
+            throw new ArgumentException(FilterTooLongMessage, nameof(query));
+        }
+
         sql.Append(filtered ? " AND " : " WHERE ");
         if (columns.Count == 0)
         {
@@ -564,7 +940,7 @@ internal static class SearchSqlBuilder
         }
 
         // One parameter serves every column's term.
-        var pattern = parameters.Add(n => ColumnValueConverter.Text(n, EscapeContainsPattern(filter)));
+        var pattern = parameters.Add(n => ColumnValueConverter.Text(n, containsPattern));
         sql.Append('(');
         for (var index = 0; index < columns.Count; index++)
         {
@@ -578,7 +954,7 @@ internal static class SearchSqlBuilder
 
             sql.Append(") COLLATE ").Append(ContainsCollation)
                 .Append(" LIKE ").Append(pattern).Append(" COLLATE ").Append(ContainsCollation)
-                .Append(" ESCAPE '").Append(ContainsEscape).Append('\'');
+                .Append(" ESCAPE '").Append(RecordQueryRules.ContainsPatternEscape).Append('\'');
         }
 
         sql.Append(')');
@@ -622,4 +998,7 @@ internal static class SearchSqlBuilder
         string Reference,
         string Comparable,
         ColumnMetadata Column);
+
+    // The scalar parameters of one packed array: a condition's values that share an operator and a parameter type.
+    private sealed record PackedGroup(SearchOperator Operator, DbType DbType, List<SqlParameterValue> Values);
 }

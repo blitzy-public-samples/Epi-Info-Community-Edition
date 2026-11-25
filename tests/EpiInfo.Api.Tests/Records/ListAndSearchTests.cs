@@ -17,6 +17,7 @@ using EpiInfo.Domain.Validation;
 using EpiInfo.Domain.Values;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Http.HttpResults;
 using Microsoft.AspNetCore.Http.Json;
 using Microsoft.AspNetCore.Mvc.ApiExplorer;
 using Microsoft.AspNetCore.Mvc.ModelBinding;
@@ -24,6 +25,7 @@ using Microsoft.AspNetCore.Routing;
 using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 
 namespace EpiInfo.Api.Tests.Records;
@@ -106,6 +108,189 @@ public sealed class SearchRequestBindingTests
 }
 
 /// <summary>
+/// The SQL Server bounds of the records-list filter and of Find (AAP 0.3.4.1, 0.3.4.2, 0.3.4.4): a filter or wildcard
+/// pattern over SQL Server's <c>LIKE</c> pattern limit is a field-level 400 before any store call, a request within it
+/// reaches the store whatever its number of alternatives, and the in-memory store keeps the SQL builders' argument
+/// contract for input over the bounds.
+/// </summary>
+/// <remarks>
+/// The class needs no database: it carries no <c>Integration</c> trait and joins no database collection, so
+/// <c>--filter "Category!=Integration"</c> selects it. It calls <see cref="RequestParameters"/> and
+/// <see cref="RecordService"/> directly, the service over <see cref="FakeDataStore"/>.
+/// </remarks>
+public sealed class ListAndSearchBoundsTests
+{
+    private const string Sentinel = "SENTINEL-5c2d";
+
+    private const string AlternativesKind = "alternatives";
+
+    private const string PatternKind = "pattern";
+
+    private const string RunKind = "run";
+
+    private const string BracketKind = "bracket";
+
+    // A q whose contains pattern fits 4,000 characters: 3,998 plain characters, 1,999 escaped ones, or any blank text,
+    // which is no filter however long.
+    [Theory]
+    [InlineData("a", 3998)]
+    [InlineData("%", 1999)]
+    [InlineData(" ", 5000)]
+    public void ListQuery_FilterWithinTheBound_Coerces(string unit, int repeat)
+    {
+        var q = string.Concat(Enumerable.Repeat(unit, repeat));
+
+        Assert.True(RequestParameters.TryParseListQuery(q, null, null, null, out var query, out var problem));
+
+        Assert.Null(problem);
+        Assert.Equal(string.IsNullOrWhiteSpace(q) ? null : q, query.Filter);
+    }
+
+    // A longer q is a 400 on q, in the same single 400 as any other bad parameter.
+    [Theory]
+    [InlineData("a", 3999, null)]
+    [InlineData("%", 2000, null)]
+    [InlineData("a", 3999, "0")]
+    public void ListQuery_FilterOverTheBound_IsA400OnQ(string unit, int repeat, string? page)
+    {
+        var q = string.Concat(Enumerable.Repeat(unit, repeat));
+
+        string[]? pageOccurrences = page is null ? null : [page];
+
+        Assert.False(
+            RequestParameters.TryParseListQuery(q, null, pageOccurrences, null, out var query, out var problem));
+
+        Assert.Null(query);
+        var errors = ValidationErrors(problem);
+        Assert.Equal(new[] { RecordQueryRules.FilterTooLongMessage }, errors[RequestParameters.Query]);
+        string[] expectedKeys =
+            page is null ? [RequestParameters.Query] : [RequestParameters.Page, RequestParameters.Query];
+        Assert.Equal(expectedKeys, errors.Keys.Order(StringComparer.Ordinal).ToArray());
+    }
+
+    // Any number of alternatives reaches the store, which binds a large set packed; so do a 4,000-character pattern,
+    // the longest SQL Server takes, and a longer one whose run of '*' collapses within it.
+    [Theory]
+    [InlineData(AlternativesKind, 5000)]
+    [InlineData(PatternKind, 4000)]
+    [InlineData(RunKind, 4001)]
+    public async Task Search_WithinTheBounds_ReachesTheStore(string kind, int size)
+    {
+        var store = FakeDataStore.WithStandardForms();
+
+        var result = await CreateService(store).SearchAsync(
+            FakeForms.TwoPageViewId, LastNameSearch(kind, size), CancellationToken.None);
+
+        var ok = Assert.IsType<Ok<SearchResponse>>(result);
+        Assert.NotNull(ok.Value);
+        Assert.Contains(store.Calls, call => call.Method == nameof(IDataStore.SearchAsync));
+    }
+
+    // A longer pattern that does not collapse within the bound, with no run of '*' or holding '[', is a fixed
+    // field-level 400 on the field, and the store is never asked to search.
+    [Theory]
+    [InlineData(PatternKind, 4001)]
+    [InlineData(BracketKind, 4001)]
+    public async Task Search_PatternOverTheBound_IsA400BeforeTheStore(string kind, int size)
+    {
+        var store = FakeDataStore.WithStandardForms();
+
+        var result = await CreateService(store).SearchAsync(
+            FakeForms.TwoPageViewId, LastNameSearch(kind, size), CancellationToken.None);
+
+        var errors = ValidationErrors(result);
+        Assert.Equal(new[] { "LastName" }, errors.Keys.ToArray());
+        Assert.All(
+            errors.Values.SelectMany(messages => messages),
+            message => Assert.DoesNotContain(Sentinel, message, StringComparison.Ordinal));
+        Assert.DoesNotContain(store.Calls, call => call.Method == nameof(IDataStore.SearchAsync));
+    }
+
+    // The fake keeps the search builder's contract: a LIKE pattern over the bound, in any condition, is an
+    // ArgumentException.
+    [Fact]
+    public async Task FakeStoreSearch_PatternOverTheBound_ThrowsArgumentException()
+    {
+        var store = FakeDataStore.WithStandardForms();
+        var form = await TwoPageFormAsync(store);
+        SearchCondition[] conditions =
+        [
+            LikeCondition("LastName", 1, 1),
+            LikeCondition("Notes", 1, RecordQueryRules.MaxLikePatternLength + 1),
+        ];
+
+        await Assert.ThrowsAsync<ArgumentException>(
+            "conditions",
+            () => store.SearchAsync(form, conditions, includeDeleted: false, null, CancellationToken.None));
+    }
+
+    // The fake keeps the list builder's contract: a filter whose contains pattern is over the bound is an
+    // ArgumentException, and one at the bound lists.
+    [Fact]
+    public async Task FakeStoreList_FilterOverTheBound_ThrowsArgumentException()
+    {
+        var store = FakeDataStore.WithStandardForms();
+        var form = await TwoPageFormAsync(store);
+
+        await Assert.ThrowsAsync<ArgumentException>(
+            "query",
+            () => store.ListAsync(form, ListQuery(new string('%', 2000)), CancellationToken.None));
+
+        var page = await store.ListAsync(form, ListQuery(new string('%', 1999)), CancellationToken.None);
+        Assert.Empty(page.Items);
+    }
+
+    private static RecordService CreateService(FakeDataStore store) => new(
+        store,
+        new FormService(store, new CheckCodeEngine(), NullLogger<FormService>.Instance),
+        new SaveStampProvider(TimeProvider.System),
+        NullLogger<RecordService>.Instance);
+
+    // A LastName criterion of size alternatives, or a single wildcard pattern of size characters: one '*', a run of '*',
+    // or a set followed by a run of '*'. Each carries the sentinel, so an error message that echoed it would be caught.
+    private static SearchRequest LastNameSearch(string kind, int size)
+    {
+        var value = kind switch
+        {
+            AlternativesKind => string.Join(
+                " or ",
+                Enumerable.Range(0, size).Select(index => Sentinel + index.ToString(CultureInfo.InvariantCulture))),
+            PatternKind => Sentinel + "*" + new string('x', size - Sentinel.Length - 1),
+            RunKind => Sentinel + new string('*', size - Sentinel.Length),
+            BracketKind => Sentinel + "[a-z]" + new string('*', size - Sentinel.Length - 5),
+            _ => throw new ArgumentOutOfRangeException(nameof(kind), kind, "Unknown search kind."),
+        };
+
+        return new SearchRequest([new SearchCriterion("LastName", FieldValue.FromText(value))]);
+    }
+
+    private static SearchCondition LikeCondition(string field, int count, int patternLength) => new(
+        field,
+        SearchTarget.PageField,
+        FieldType.Text,
+        [.. Enumerable.Range(0, count).Select(_ =>
+            new SearchAlternative(SearchOperator.Like, FieldValue.FromText(new string('%', patternLength))))]);
+
+    private static RecordListQuery ListQuery(string q) =>
+        new(q, IncludeDeleted: false, RecordQueryRules.DefaultPage, RecordQueryRules.DefaultPageSize);
+
+    private static async Task<FormMetadata> TwoPageFormAsync(FakeDataStore store)
+    {
+        var form = await store.GetFormMetadataAsync(FakeForms.TwoPageViewId, CancellationToken.None);
+        Assert.NotNull(form);
+        return form;
+    }
+
+    // The errors map of a field-level 400 as ApiProblems builds it.
+    private static IDictionary<string, string[]> ValidationErrors(IResult? result)
+    {
+        var problem = Assert.IsType<ApiProblems.ProblemResult>(result);
+        Assert.Equal(StatusCodes.Status400BadRequest, problem.StatusCode);
+        return Assert.IsType<HttpValidationProblemDetails>(problem.Value).Errors;
+    }
+}
+
+/// <summary>
 /// Pins the Find and list semantics of the in-memory <see cref="FakeDataStore"/> against the
 /// <see cref="IDataStore"/> Find and list contract that AAP 0.3.4.3 and 0.3.4.4 set out: exact comparison on integer
 /// columns and binary64 comparison on float columns, SQL <c>LIKE</c> over the whole text, and one scan that numbers,
@@ -138,9 +323,10 @@ public sealed class FakeDataStoreFindTests
     /// <summary>Text and SQL <c>LIKE</c> patterns, with whether the pattern matches the whole text.</summary>
     public static TheoryData<string, string, bool> LikeCases => new()
     {
-        // Patterns long enough for a regular-expression automaton to exceed its size limit.
-        { new string('a', 4000), new string('a', 4000) + "%", true },
-        { new string('a', 4000), new string('a', 4000) + "_", false },
+        // Patterns long enough for a regular-expression automaton to exceed its size limit, at the store's 4,000
+        // character LIKE pattern bound.
+        { new string('a', 4000), new string('a', 3999) + "%", true },
+        { new string('a', 4000), new string('a', 3998) + "_", false },
         { new string('a', 1000), string.Concat(Enumerable.Repeat("%a", 1000)), true },
         { new string('a', 999), string.Concat(Enumerable.Repeat("%a", 1000)), false },
 

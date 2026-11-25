@@ -1209,3 +1209,577 @@ public sealed class ListAndFindSqlTests
         }
     }
 }
+
+/// <summary>
+/// Integration tests of the SQL Server bounds of the Find statement the repository runs, against the rehearsal
+/// database through <see cref="SqlExecution"/>: a search beyond 2,000 alternatives other than <c>IS NULL</c> binds its
+/// values packed and returns exactly the rows the per-alternative statement returns, the statement never exceeds SQL
+/// Server's parameter limit, and a <c>LIKE</c> pattern is bounded at SQL Server's 4,000 code units before any SQL is
+/// built.
+/// </summary>
+/// <remarks>
+/// <para>
+/// Criteria are written as a client writes them and parsed by <see cref="SearchCriteriaParser"/> over the form's data
+/// fields; their values are read from the database by direct SQL, from active records with a row on every page, so
+/// each search matches something whatever rows the database holds. No count is hard-coded: every expected result is
+/// another statement's result, the per-alternative statement or the union of per-alternative statements over chunks
+/// of the alternatives.
+/// </para>
+/// <para>
+/// The tests only read. Each holds the shared <see cref="DatabaseWriteLock"/>, because it compares the results of
+/// several statements that no writer may change in between.
+/// </para>
+/// </remarks>
+[Collection(DatabaseCollections.Database)]
+[Trait("Category", "Integration")]
+public sealed class SearchStatementBoundsTests : IAsyncLifetime
+{
+    private const string CaseReport = "CaseReport";
+    private const string FoodHistory = "FoodHistory";
+
+    private const string Operation = "tests.searchStatementBounds";
+
+    // The builder's scalar budget and the parameters every Find statement over the active set binds besides its
+    // criteria: the RecStatus of the active set and the TOP cap.
+    private const int ScalarParameterBudget = 2000;
+    private const int FixedActiveSetParameters = 2;
+
+    // Chunks of the threshold searches, run per alternative to build the expected union.
+    private const int ChunkSize = 500;
+
+    // The most rows the threshold searches' seeded values may match, so that each chunk's result and the union stay
+    // under the 200-row cap and are therefore complete.
+    private const int MaxSeededMatches = 120;
+
+    private static readonly TimeSpan TestTimeout = TimeSpan.FromMinutes(10);
+
+    // The joins of each seeded form's complete records: the base table with a row on every page table.
+    private static readonly IReadOnlyDictionary<string, string> CompleteRecords = new Dictionary<string, string>
+    {
+        [CaseReport] = "[CaseReport] b INNER JOIN [CaseReport1] p1 ON p1.[GlobalRecordId] = b.[GlobalRecordId]",
+        [FoodHistory] = "[FoodHistory] b INNER JOIN [FoodHistory2] p1 ON p1.[GlobalRecordId] = b.[GlobalRecordId]"
+            + " INNER JOIN [FoodHistory3] p2 ON p2.[GlobalRecordId] = b.[GlobalRecordId]",
+    };
+
+    public Task InitializeAsync() => TestDatabase.EnsureReachableAsync();
+
+    public Task DisposeAsync() => Task.CompletedTask;
+
+    // Every searchable kind, rendered per alternative and forced into packed form, returns the same rows, positions
+    // and total, in both selected sets.
+    [Theory]
+    [InlineData(CaseReport, false)]
+    [InlineData(CaseReport, true)]
+    [InlineData(FoodHistory, false)]
+    [InlineData(FoodHistory, true)]
+    public async Task Search_PackedStatement_ReturnsExactlyTheRowsOfTheScalarStatement(
+        string formName,
+        bool includeDeleted)
+    {
+        using var cancellation = new CancellationTokenSource(TestTimeout);
+        var token = cancellation.Token;
+        await using var databaseLock = await DatabaseWriteLock.AcquireSharedAsync(token);
+        await using var connection = await TestDatabase.OpenConnectionAsync(token);
+        var form = await ReadFormAsync(connection, formName, token);
+
+        var cases = formName == CaseReport
+            ? await CaseReportCriteriaAsync(connection, token)
+            : await FoodHistoryCriteriaAsync(connection, token);
+
+        foreach (var (label, criteria) in cases)
+        {
+            var conditions = Parse(form, criteria);
+            var scalar = SearchSqlBuilder.Search(
+                form.Schema, form.DataFields, form.GridColumns, conditions, includeDeleted, null);
+            var packed = SearchSqlBuilder.Search(
+                form.Schema, form.DataFields, form.GridColumns, conditions, includeDeleted, null, 0);
+
+            Assert.DoesNotContain("OPENJSON", scalar.Statement.Text, StringComparison.Ordinal);
+            Assert.Contains("OPENJSON", packed.Statement.Text, StringComparison.Ordinal);
+
+            var scalarRows = await RunAsync(connection, scalar, token);
+            var packedRows = await RunAsync(connection, packed, token);
+
+            Assert.True(scalarRows.Count > 0, $"{formName} {label}: the seeded values match no row.");
+            Assert.True(
+                scalarRows.SequenceEqual(packedRows),
+                $"{formName} {label}: {scalarRows.Count} scalar rows (total {scalarRows[0].Total}) and "
+                + $"{packedRows.Count} packed rows differ.");
+        }
+    }
+
+    // Across the scalar budget: 2,000 alternatives bind one parameter each, 2,003 with the active set, the cap and the
+    // excluded id; 2,001 and 5,000 bind packed. Every size, packed or not, returns the union of the per-alternative
+    // statements over chunks of its alternatives.
+    [Theory]
+    [InlineData(2000)]
+    [InlineData(2001)]
+    [InlineData(5000)]
+    public async Task Search_AlternativesAcrossTheScalarBudget_ReturnTheUnionOfChunkedScalarSearches(int size)
+    {
+        using var cancellation = new CancellationTokenSource(TestTimeout);
+        var token = cancellation.Token;
+        await using var databaseLock = await DatabaseWriteLock.AcquireSharedAsync(token);
+        await using var connection = await TestDatabase.OpenConnectionAsync(token);
+        var form = await ReadFormAsync(connection, CaseReport, token);
+
+        var seeded = await SeededLastNamesAsync(connection, token);
+        var excluded = await FirstActiveIdAsync(connection, seeded[0], token);
+        var alternatives = ThresholdAlternatives(seeded, size);
+        var condition = Assert.Single(Parse(form, [Text("LastName", string.Join(" or ", alternatives))]));
+        Assert.Equal(size, condition.Alternatives.Count);
+
+        var bound = SearchSqlBuilder.Search(
+            form.Schema, form.DataFields, form.GridColumns, [condition], includeDeleted: false, excluded);
+        var packed = SearchSqlBuilder.Search(
+            form.Schema, form.DataFields, form.GridColumns, [condition], includeDeleted: false, excluded, 0);
+
+        var operators = condition.Alternatives.Select(alternative => alternative.Operator).Distinct().Count();
+        var packedParameters = FixedActiveSetParameters + operators + 1;
+        if (size <= ScalarParameterBudget)
+        {
+            Assert.Equal(size + FixedActiveSetParameters + 1, bound.Statement.Parameters.Count);
+            Assert.DoesNotContain("OPENJSON", bound.Statement.Text, StringComparison.Ordinal);
+        }
+        else
+        {
+            Assert.Equal(packedParameters, bound.Statement.Parameters.Count);
+            Assert.Contains("OPENJSON", bound.Statement.Text, StringComparison.Ordinal);
+        }
+
+        Assert.Equal(packedParameters, packed.Statement.Parameters.Count);
+
+        var union = new Dictionary<string, SearchRow>(StringComparer.Ordinal);
+        foreach (var chunk in condition.Alternatives.Chunk(ChunkSize))
+        {
+            var part = new SearchCondition(condition.FieldName, condition.Target, condition.FieldType, chunk);
+            var select = SearchSqlBuilder.Search(
+                form.Schema, form.DataFields, form.GridColumns, [part], includeDeleted: false, excluded);
+            Assert.DoesNotContain("OPENJSON", select.Statement.Text, StringComparison.Ordinal);
+
+            var rows = await RunAsync(connection, select, token);
+            Assert.All(rows, row => Assert.Equal(rows.Count, row.Total));
+            foreach (var row in rows)
+            {
+                union[row.Id] = row;
+            }
+        }
+
+        Assert.NotEmpty(union);
+        Assert.True(union.Count <= RecordQueryRules.SearchCap, "The seeded values match more rows than one page.");
+        Assert.DoesNotContain(excluded, union.Keys);
+        var expected = union.Values
+            .OrderBy(row => row.UniqueKey)
+            .Select(row => row with { Total = union.Count })
+            .ToArray();
+
+        Assert.Equal(expected, await RunAsync(connection, bound, token));
+        Assert.Equal(expected, await RunAsync(connection, packed, token));
+    }
+
+    // SQL Server limits an nvarchar LIKE pattern to 4,000 code units: a 4,000-character pattern runs, per alternative
+    // and packed, on an nvarchar and an ntext column, and matches what its collapsed form '%' matches; one more
+    // character is refused before any SQL is built.
+    [Theory]
+    [InlineData(CaseReport, "LastName")]
+    [InlineData(FoodHistory, "BuyLastTenDays")]
+    public async Task Search_LikePatternAtTheLimit_RunsAndOneLongerThrowsBeforeSql(string formName, string fieldName)
+    {
+        using var cancellation = new CancellationTokenSource(TestTimeout);
+        var token = cancellation.Token;
+        await using var databaseLock = await DatabaseWriteLock.AcquireSharedAsync(token);
+        await using var connection = await TestDatabase.OpenConnectionAsync(token);
+        var form = await ReadFormAsync(connection, formName, token);
+        var field = Assert.Single(form.DataFields, candidate => candidate.Name == fieldName);
+
+        SearchCondition Like(int length) => new(
+            field.Name,
+            SearchTarget.PageField,
+            field.FieldType,
+            [new SearchAlternative(SearchOperator.Like, FieldValue.FromText(new string('%', length)))]);
+
+        var collapsed = await RunAsync(
+            connection,
+            SearchSqlBuilder.Search(form.Schema, form.DataFields, form.GridColumns, [Like(1)], false, null),
+            token);
+        Assert.NotEmpty(collapsed);
+
+        foreach (var budget in new[] { ScalarParameterBudget, 0 })
+        {
+            var select = SearchSqlBuilder.Search(
+                form.Schema,
+                form.DataFields,
+                form.GridColumns,
+                [Like(RecordQueryRules.MaxLikePatternLength)],
+                false,
+                null,
+                budget);
+
+            Assert.Equal(collapsed, await RunAsync(connection, select, token));
+        }
+
+        var tooLong = Like(RecordQueryRules.MaxLikePatternLength + 1);
+        Assert.Throws<ArgumentException>(
+            "conditions",
+            () => SearchSqlBuilder.Search(form.Schema, form.DataFields, form.GridColumns, [tooLong], false, null));
+        Assert.Throws<ArgumentException>(
+            "conditions",
+            () => SearchSqlBuilder.Search(form.Schema, form.DataFields, form.GridColumns, [tooLong], false, null, 0));
+    }
+
+    // A command carries at most 2,098 parameters of its own: a statement of exactly 2,098 runs, and the builder refuses
+    // one that would bind 2,099 before it is returned, whatever the scalar budget allows.
+    [Theory]
+    [InlineData(2096, true)]
+    [InlineData(2097, false)]
+    public async Task Search_StatementParameterCount_IsBoundedAtSqlServersLimit(int alternatives, bool builds)
+    {
+        using var cancellation = new CancellationTokenSource(TestTimeout);
+        var token = cancellation.Token;
+        await using var databaseLock = await DatabaseWriteLock.AcquireSharedAsync(token);
+        await using var connection = await TestDatabase.OpenConnectionAsync(token);
+        var form = await ReadFormAsync(connection, CaseReport, token);
+        var field = Assert.Single(form.DataFields, candidate => candidate.Name == "LastName");
+
+        var condition = new SearchCondition(
+            field.Name,
+            SearchTarget.PageField,
+            field.FieldType,
+            [.. Enumerable.Range(0, alternatives).Select(index => new SearchAlternative(
+                SearchOperator.Equal, FieldValue.FromText(NoMatch(index))))]);
+
+        SearchSelect Build() => SearchSqlBuilder.Search(
+            form.Schema, form.DataFields, form.GridColumns, [condition], false, null, int.MaxValue);
+
+        if (!builds)
+        {
+            Assert.Throws<ArgumentException>("conditions", Build);
+            return;
+        }
+
+        var select = Build();
+        Assert.Equal(alternatives + FixedActiveSetParameters, select.Statement.Parameters.Count);
+        Assert.Empty(await RunAsync(connection, select, token));
+    }
+
+    // CaseReport: text equality, LIKE and a bare prefix, Phone Number comparisons, fractional and negative number
+    // comparisons, date comparisons, Comment Legal text, GlobalRecordId and RecStatus, and three fields at once.
+    private static async Task<IReadOnlyList<(string Label, SearchCriterion[] Criteria)>> CaseReportCriteriaAsync(
+        SqlConnection connection,
+        CancellationToken token)
+    {
+        var lastNames = await SampleAsync(connection, CaseReport, "p1.[LastName]", 2, token);
+        var firstNames = await SampleAsync(connection, CaseReport, "p1.[FirstName]", 1, token);
+        var phones = await SampleAsync(connection, CaseReport, "p1.[PhoneNumber]", 2, token);
+        var ages = await SampleAsync(connection, CaseReport, "p1.[Age]", 3, token);
+        var useDays = await SampleAsync(connection, CaseReport, "p1.[AntibioticUseDays]", 2, token);
+        var onsets = await SampleAsync(connection, CaseReport, "p1.[OnsetDate]", 2, token);
+        var sexes = await SampleAsync(connection, CaseReport, "p1.[Sex]", 1, token);
+        var ids = await SampleAsync(connection, CaseReport, "b.[GlobalRecordId]", 2, token);
+        var anchor = await AnchorAsync(connection, CaseReport, ["p1.[LastName]", "p1.[Age]", "p1.[OnsetDate]"], token);
+
+        return
+        [
+            ("text", [Text("LastName", Or([.. lastNames, "Zq*", "?", "*" + lastNames[0][1..], ">"]))]),
+            ("text pattern", [Text("FirstName", Or([firstNames[0], "J*", "*a*"]))]),
+            ("phone", [Text("PhoneNumber", Or([phones[0], ">" + phones[1], "<=(555) 0100", "<>" + phones[0], ">="]))]),
+            ("number", [Text("Age", Or([ages[0], ">=" + ages[1], "<" + ages[2], "<>-3.75", "<=30.5", ">90.25"]))]),
+            ("number days", [Text("AntibioticUseDays", Or([useDays[0], ">" + useDays[1], "<-1.5"]))]),
+            ("date", [Text("OnsetDate", Or([onsets[0], ">=" + onsets[1], "<2007-01-01", "<>1999-12-31"]))]),
+            ("comment legal", [Text("Sex", Or([sexes[0], "2*", ">"]))]),
+            ("global record id", [Text("GlobalRecordId", Or([ids[0], ">=" + ids[1], "<0", "<>" + ids[0]]))]),
+            ("rec status", [Text("RecStatus", "1 or 0")]),
+            (
+                "three fields",
+                [
+                    Text("LastName", Or([anchor[0], "Zq*"])),
+                    Text("Age", Or([anchor[1], ">1000"])),
+                    Text("OnsetDate", Or([anchor[2], "<1800-01-01"])),
+                ]
+            ),
+        ];
+    }
+
+    // FoodHistory: fractional and negative float equality and comparisons, a checkbox, Legal Values, a date, Phone
+    // Number, ntext multiline 255-character equality and LIKE on both pages, GlobalRecordId, and fields of both pages.
+    private static async Task<IReadOnlyList<(string Label, SearchCriterion[] Criteria)>> FoodHistoryCriteriaAsync(
+        SqlConnection connection,
+        CancellationToken token)
+    {
+        var caseIds = await SampleAsync(connection, FoodHistory, "p1.[CaseID]", 2, token);
+        var latitudes = await SampleAsync(connection, FoodHistory, "p1.[Latitude]", 3, token);
+        var longitudes = await SampleAsync(connection, FoodHistory, "p1.[Longitude]", 3, token);
+        var fevers = await SampleAsync(connection, FoodHistory, "p1.[FeverTemp]", 2, token);
+        var sexes = await SampleAsync(connection, FoodHistory, "p1.[Sex]", 1, token);
+        var births = await SampleAsync(connection, FoodHistory, "p1.[DOB]", 2, token);
+        var phones = await SampleAsync(connection, FoodHistory, "p1.[HomePhone]", 1, token);
+        var lastNames = await SampleAsync(connection, FoodHistory, "p1.[LastName]", 2, token);
+        var addresses = await SampleAsync(
+            connection, FoodHistory, "CAST(p1.[PatientAddress] AS nvarchar(max))", 2, token);
+        var purchases = await SampleAsync(
+            connection, FoodHistory, "CAST(p2.[BuyLastTenDays] AS nvarchar(max))", 2, token);
+        var ids = await SampleAsync(connection, FoodHistory, "b.[GlobalRecordId]", 1, token);
+        var anchor = await AnchorAsync(
+            connection,
+            FoodHistory,
+            ["p1.[Latitude]", "p1.[White]", "CAST(p2.[BuyLastTenDays] AS nvarchar(max))"],
+            token);
+
+        return
+        [
+            ("case id", [Text("CaseID", Or([caseIds[0], ">=" + caseIds[1], "<=2", ">300.5"]))]),
+            ("latitude", [Text("Latitude", Or([.. latitudes, ">33.6", "<>-0.1"]))]),
+            ("longitude", [Text("Longitude", Or([.. longitudes, "<-85.5", ">=-81.917"]))]),
+            ("fever", [Text("FeverTemp", Or([fevers[0], "<" + fevers[1], ">101.65"]))]),
+            ("checkbox", [Text("White", "Yes or (-)")]),
+            ("legal values", [Text("Sex", Or([sexes[0], "M*", ">"]))]),
+            ("date", [Text("DOB", Or([births[0], "<" + births[1], ">=2000-02-29"]))]),
+            ("phone", [Text("HomePhone", Or([phones[0], ">(555) 0103", "<=(555) 0100"]))]),
+            ("text", [Text("LastName", Or([.. lastNames, "Ba*", "*e_"]))]),
+            (
+                "multiline page two",
+                [Text("PatientAddress", Or([.. addresses, addresses[0] + new string('x', 300), "*125*", ">"]))]
+            ),
+            ("multiline page three", [Text("BuyLastTenDays", Or([.. purchases, "Synthetic note 9*", "*Days."]))]),
+            ("global record id", [Text("GlobalRecordId", Or([ids[0], "<" + ids[0]]))]),
+            ("rec status", [Text("RecStatus", "0 or 1")]),
+            (
+                "both pages",
+                [
+                    Text("Latitude", Or([anchor[0], ">1000"])),
+                    Text("White", anchor[1]),
+                    Text("BuyLastTenDays", Or([anchor[2], "Zq*"])),
+                ]
+            ),
+        ];
+    }
+
+    // The threshold searches' LastName alternatives: the seeded values, a trailing and a leading wildcard pattern for
+    // each, spread evenly across the list, and values that match nothing in the rest.
+    private static string[] ThresholdAlternatives(IReadOnlyList<string> seeded, int size)
+    {
+        var matching = seeded
+            .SelectMany(value => value.Length > 1
+                ? new[] { value, value + "*", "*" + value[1..] }
+                : new[] { value, value + "*" })
+            .ToArray();
+        Assert.True(matching.Length < size);
+
+        var alternatives = new string[size];
+        var stride = size / matching.Length;
+        var next = 0;
+        for (var index = 0; index < size; index++)
+        {
+            alternatives[index] = next < matching.Length && index == next * stride
+                ? matching[next++]
+                : index % 2 == 0 ? NoMatch(index) : "Zq*" + index.ToString(CultureInfo.InvariantCulture);
+        }
+
+        return alternatives;
+    }
+
+    // Seeded LastName values of active CaseReport records, fewest matches first, while their matches together stay
+    // within MaxSeededMatches; at least two, so excluding one record leaves a match.
+    private static async Task<IReadOnlyList<string>> SeededLastNamesAsync(
+        SqlConnection connection,
+        CancellationToken token)
+    {
+        var sql = "SELECT p1.[LastName], COUNT_BIG(*) FROM " + CompleteRecords[CaseReport]
+            + " WHERE b.[RecStatus] = 1 AND p1.[LastName] IS NOT NULL GROUP BY p1.[LastName]"
+            + " ORDER BY COUNT_BIG(*), p1.[LastName]";
+        await using var command = new SqlCommand(sql, connection);
+        await using var reader = await command.ExecuteReaderAsync(token);
+
+        var values = new List<string>();
+        var matches = 0L;
+        while (await reader.ReadAsync(token))
+        {
+            var value = reader.GetString(0);
+            var count = reader.GetInt64(1);
+            if (!IsPlainCriterionText(value))
+            {
+                continue;
+            }
+
+            if (matches + count > MaxSeededMatches)
+            {
+                break;
+            }
+
+            values.Add(value);
+            matches += count;
+        }
+
+        Assert.True(matches >= 2, "The database holds too few seeded LastName values.");
+        return values;
+    }
+
+    // The GlobalRecordId of the first active record, by UniqueKey, whose LastName is the value.
+    private static async Task<string> FirstActiveIdAsync(
+        SqlConnection connection,
+        string lastName,
+        CancellationToken token)
+    {
+        var sql = "SELECT TOP (1) b.[GlobalRecordId] FROM " + CompleteRecords[CaseReport]
+            + " WHERE b.[RecStatus] = 1 AND p1.[LastName] = @lastName ORDER BY b.[UniqueKey]";
+        await using var command = new SqlCommand(sql, connection);
+        command.Parameters.Add(new SqlParameter("@lastName", SqlDbType.NVarChar, -1) { Value = lastName });
+        var id = await command.ExecuteScalarAsync(token);
+        return Assert.IsType<string>(id);
+    }
+
+    // Up to count distinct values of one column of the form's complete active records, as criterion text.
+    private static async Task<IReadOnlyList<string>> SampleAsync(
+        SqlConnection connection,
+        string formName,
+        string expression,
+        int count,
+        CancellationToken token)
+    {
+        var sql = "SELECT DISTINCT TOP (40) " + expression + " AS [v] FROM " + CompleteRecords[formName]
+            + " WHERE b.[RecStatus] = 1 AND " + expression + " IS NOT NULL ORDER BY [v]";
+        await using var command = new SqlCommand(sql, connection);
+        await using var reader = await command.ExecuteReaderAsync(token);
+
+        var values = new List<string>();
+        while (values.Count < count && await reader.ReadAsync(token))
+        {
+            if (CriterionText(reader.GetValue(0)) is { } text)
+            {
+                values.Add(text);
+            }
+        }
+
+        Assert.True(values.Count == count, $"{formName} holds too few values of {expression}.");
+        return values;
+    }
+
+    // One complete active record's values of the columns, as criterion text, for a multi-field search it must match.
+    private static async Task<IReadOnlyList<string>> AnchorAsync(
+        SqlConnection connection,
+        string formName,
+        IReadOnlyList<string> expressions,
+        CancellationToken token)
+    {
+        var sql = "SELECT TOP (40) " + string.Join(", ", expressions) + " FROM " + CompleteRecords[formName]
+            + " WHERE b.[RecStatus] = 1 AND "
+            + string.Join(" AND ", expressions.Select(expression => expression + " IS NOT NULL"))
+            + " ORDER BY b.[UniqueKey]";
+        await using var command = new SqlCommand(sql, connection);
+        await using var reader = await command.ExecuteReaderAsync(token);
+
+        while (await reader.ReadAsync(token))
+        {
+            var texts = new List<string>(expressions.Count);
+            for (var index = 0; index < expressions.Count; index++)
+            {
+                if (CriterionText(reader.GetValue(index)) is { } text)
+                {
+                    texts.Add(text);
+                }
+            }
+
+            if (texts.Count == expressions.Count)
+            {
+                return texts;
+            }
+        }
+
+        Assert.Fail($"{formName} holds no record with every anchor value.");
+        return [];
+    }
+
+    // A stored value as the text a client would search it with, or null when the parser would not read it back as
+    // the same value: floats round-trip, dates are ISO, checkboxes Yes or No.
+    private static string? CriterionText(object value) => value switch
+    {
+        string text => IsPlainCriterionText(text) ? text : null,
+        double number => number.ToString("R", CultureInfo.InvariantCulture),
+        DateTime date when date.TimeOfDay == TimeSpan.Zero => date.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture),
+        bool flag => flag ? "Yes" : "No",
+        _ => null,
+    };
+
+    // Text the parser keeps as one equality alternative: no wildcard, no " or " separator, no leading comparison
+    // prefix and nothing trimmed.
+    private static bool IsPlainCriterionText(string text) =>
+        text.Length > 0
+        && text == text.Trim()
+        && text.IndexOfAny(['%', '*', '?']) < 0
+        && !text.Contains(" or ", StringComparison.OrdinalIgnoreCase)
+        && !text.StartsWith('<')
+        && !text.StartsWith('>');
+
+    private static string NoMatch(int index) =>
+        "NoMatch-" + index.ToString(CultureInfo.InvariantCulture) + "-" + Guid.NewGuid().ToString("N");
+
+    private static string Or(IEnumerable<string> alternatives) => string.Join(" or ", alternatives);
+
+    private static SearchCriterion Text(string field, string value) => new(field, FieldValue.FromText(value));
+
+    private static IReadOnlyList<SearchCondition> Parse(SeededForm form, SearchCriterion[] criteria)
+    {
+        var result = SearchCriteriaParser.Parse(form.DataFields, criteria);
+        Assert.True(
+            result.IsSuccess,
+            "The criteria did not parse; errors under: " + string.Join(", ", result.FieldErrors.Keys));
+        return result.Conditions;
+    }
+
+    // The form as the store reads it: the reader's metadata and catalogue schema, the data fields and grid columns.
+    private static async Task<SeededForm> ReadFormAsync(
+        SqlConnection connection,
+        string formName,
+        CancellationToken token)
+    {
+        var options = new DatabaseOptions(TestDatabase.ConnectionString);
+        var reader = new SqlMetadataReader(new SqlConnectionFactory(options), options, NullSqlCommandObserver.Instance);
+        var summary = Assert.Single(await reader.ListFormsAsync(token), form => form.Name == formName);
+        var read = await reader.ReadFormAsync(connection, null, summary.ViewId, token);
+        Assert.NotNull(read);
+
+        var (metadata, schema) = read.Value;
+        return new SeededForm(
+            schema,
+            FormDefinitionFactory.GetDataFields(metadata),
+            RecordQueryRules.GetGridColumns(metadata));
+    }
+
+    private static Task<IReadOnlyList<SearchRow>> RunAsync(
+        SqlConnection connection,
+        SearchSelect select,
+        CancellationToken token) =>
+        SqlExecution.ReadAsync(
+            connection,
+            null,
+            Operation,
+            select.Statement,
+            DatabaseOptions.DefaultCommandTimeoutSeconds,
+            NullSqlCommandObserver.Instance,
+            token,
+            ReadRowsAsync);
+
+    private static async Task<IReadOnlyList<SearchRow>> ReadRowsAsync(DbDataReader reader, CancellationToken token)
+    {
+        var rows = new List<SearchRow>();
+        while (await reader.ReadAsync(token))
+        {
+            rows.Add(new SearchRow(
+                reader.GetString(SearchSqlBuilder.IdOrdinal),
+                Convert.ToInt64(reader.GetValue(SearchSqlBuilder.UniqueKeyOrdinal), CultureInfo.InvariantCulture),
+                Convert.ToInt64(reader.GetValue(SearchSqlBuilder.RecStatusOrdinal), CultureInfo.InvariantCulture),
+                reader.GetInt64(SearchSqlBuilder.PositionOrdinal),
+                reader.GetInt64(SearchSqlBuilder.TotalOrdinal)));
+        }
+
+        return rows;
+    }
+
+    private sealed record SeededForm(
+        FormSchema Schema,
+        DataFieldSet DataFields,
+        IReadOnlyList<DataFieldMetadata> GridColumns);
+
+    // One Find result as the statement returns it: id, key, status, navigation position and the uncapped total.
+    private readonly record struct SearchRow(string Id, long UniqueKey, long RecStatus, long Position, long Total);
+}
