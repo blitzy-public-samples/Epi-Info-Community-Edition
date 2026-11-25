@@ -15,6 +15,15 @@ namespace EpiInfo.CheckCode.Lexing;
 /// produce no token, and the list always ends with exactly one <see cref="TokenKind.EndOfInput"/>.
 /// </para>
 /// <para>
+/// Each terminal the grammar admits is one token, chosen by the longest match as the grammar's tokenizer chooses it,
+/// whether or not the parser's subset runs it: a <c>DecLiteral</c> with its <c>U</c>/<c>L</c> suffix and a
+/// <c>HexLiteral</c> are <see cref="TokenKind.Number"/> (lines 38-39), a <c>CharLiteral</c> is
+/// <see cref="TokenKind.Character"/> (line 41), and the <c>File</c> and <c>Url</c> operands are
+/// <see cref="TokenKind.File"/> and <see cref="TokenKind.Url"/> (lines 25-26). Lexing is context free: a
+/// <c>File</c> runs over the printable rest of its line, and a <c>//</c>, a <c>/*</c> or a reserved word inside a
+/// <c>File</c> or <c>Url</c> belongs to that token, so it starts no comment and delimits no block.
+/// </para>
+/// <para>
 /// Every call works on its own scanner and the keyword tables are immutable, so the lexer is safe to call
 /// concurrently.
 /// </para>
@@ -94,6 +103,21 @@ public static class Lexer
 
     private static bool IsDateSeparator(char c) => c is '/' or '-';
 
+    // {Printable} (lines 10-19): U+0020 to U+007E and the no-break space U+00A0.
+    private static bool IsPrintable(char c) => c is (>= ' ' and <= '~') or '\u00A0';
+
+    // {Letter Extended}: the Latin-1 letters U+00C0 to U+00FF, which exclude U+00D7 and U+00F7.
+    private static bool IsLetterExtended(char c) => c is >= '\u00C0' and <= '\u00FF' and not '\u00D7' and not '\u00F7';
+
+    // {Char Ch} (line 11): a printable character or an extended letter, except the single quote.
+    private static bool IsCharLiteralChar(char c) => (IsPrintable(c) || IsLetterExtended(c)) && c != '\'';
+
+    // The [abcdef] of line 39, in either case because the grammar ignores case (line 5).
+    private static bool IsHexLetter(char c) => c is (>= 'a' and <= 'f') or (>= 'A' and <= 'F');
+
+    // {Url Chars} (line 18): a printable character or an extended letter, except whitespace.
+    private static bool IsUrlChar(char c) => (IsPrintable(c) || IsLetterExtended(c)) && !char.IsWhiteSpace(c);
+
     /// <summary>
     /// Whether <paramref name="c"/> may stand inside a string: <c>{String Chars} = {Printable} + {Letter Extended} -
     /// ["] + {Cyrillic}</c> (line 10). <c>{Printable}</c> is U+0020-U+007E and the no-break space U+00A0;
@@ -166,6 +190,24 @@ public static class Lexer
             else if (char.IsAsciiDigit(c) || (c == '.' && char.IsAsciiDigit(Peek(1))))
             {
                 ScanNumeric();
+            }
+            else if (c == '#' && MatchHex() is > 0 and int hexLength)
+            {
+                Emit(TokenKind.Number, hexLength);
+            }
+            else if (c == '\'')
+            {
+                ScanQuote();
+            }
+            else if (MatchUrl() is > 0 and int urlLength)
+            {
+                // Longer than the identifier "http", so the longest match makes it a URL, '//' and all (line 26).
+                Emit(TokenKind.Url, urlLength);
+            }
+            else if (FileHeadLength(0) is > 0 and int headLength)
+            {
+                // Longer than the one-letter identifier, '.' or '\' it starts with (line 25).
+                Emit(TokenKind.File, headLength + PrintableRun(headLength));
             }
             else if (IsIdHead(c))
             {
@@ -497,12 +539,14 @@ public static class Lexer
         /// <summary>
         /// The length of an unsigned decimal or real number at the current position (lines 34-38): digits with an
         /// optional fraction, or a fraction alone, then an optional exponent. A <c>.</c> or exponent belongs to the
-        /// number only when digits complete it, so <c>5.</c> leaves the dot and <c>2E</c> leaves the <c>E</c>. The
-        /// <c>U</c>/<c>L</c> integer suffix is not recognised.
+        /// number only when digits complete it, so <c>5.</c> leaves the dot and <c>2E</c> leaves the <c>E</c>. Digits
+        /// with neither keep the <c>DecLiteral</c> suffix that follows them, <c>U</c>, <c>L</c>, <c>UL</c> or
+        /// <c>LU</c> in either case (line 38), so <c>12L</c> is one token; the parser reports it as unsupported.
         /// </summary>
         private int MatchNumber()
         {
-            int length = DigitRun(0, int.MaxValue);
+            int integerDigits = DigitRun(0, int.MaxValue);
+            int length = integerDigits;
             if (length > 0)
             {
                 if (Peek(length) == '.' && char.IsAsciiDigit(Peek(length + 1)))
@@ -529,7 +573,157 @@ public static class Lexer
                 }
             }
 
-            return length;
+            return length == integerDigits ? length + IntegerSuffixLength(length) : length;
+        }
+
+        /// <summary>
+        /// The length of the <c>DecLiteral</c> suffix at <paramref name="offset"/> (line 38): 1 for <c>U</c> or
+        /// <c>L</c>, 2 for <c>UL</c> or <c>LU</c>, in either case, else 0.
+        /// </summary>
+        private int IntegerSuffixLength(int offset)
+        {
+            char first = char.ToUpperInvariant(Peek(offset));
+            if (first is not 'U' and not 'L')
+            {
+                return 0;
+            }
+
+            char second = char.ToUpperInvariant(Peek(offset + 1));
+            return second is 'U' or 'L' && second != first ? 2 : 1;
+        }
+
+        /// <summary>
+        /// The length of a <c>HexLiteral</c> such as <c>#1a</c> at the current <c>#</c>, or 0: one or more pairs of
+        /// a digit and a letter <c>a</c>-<c>f</c> in either case (line 39). Without a pair, as in <c>#12</c>, the
+        /// <c>#</c> is left to lex as <see cref="TokenKind.Unknown"/>.
+        /// </summary>
+        private int MatchHex()
+        {
+            int length = 1;
+            while (char.IsAsciiDigit(Peek(length)) && IsHexLetter(Peek(length + 1)))
+            {
+                length += 2;
+            }
+
+            return length > 1 ? length : 0;
+        }
+
+        /// <summary>
+        /// The length of a <c>CharLiteral</c> such as <c>'x'</c> at the current <c>'</c>, or 0: exactly one
+        /// <c>{Char Ch}</c> between two single quotes (lines 11, 41). An unmatched <c>'</c> is left to lex as
+        /// <see cref="TokenKind.Unknown"/>.
+        /// </summary>
+        private int MatchCharLiteral() => IsCharLiteralChar(Peek(1)) && Peek(2) == '\'' ? 3 : 0;
+
+        /// <summary>
+        /// Lexes at a <c>'</c> the longer of a <c>CharLiteral</c> and a quoted <c>File</c> (lines 25, 41), the
+        /// <c>CharLiteral</c> on a tie, as <c>'\'</c> is both; with neither, the <c>'</c> alone is
+        /// <see cref="TokenKind.Unknown"/>.
+        /// </summary>
+        private void ScanQuote()
+        {
+            int charLength = MatchCharLiteral();
+            int fileLength = MatchQuotedFile();
+            if (fileLength > charLength)
+            {
+                Emit(TokenKind.File, fileLength);
+            }
+            else if (charLength > 0)
+            {
+                Emit(TokenKind.Character, charLength);
+            }
+            else
+            {
+                Emit(TokenKind.Unknown, 1);
+            }
+        }
+
+        /// <summary>
+        /// The length of a quoted <c>File</c> such as <c>'C:\Data\app.exe'</c> at the current <c>'</c>, or 0: a
+        /// <c>'</c>, a file head (<see cref="FileHeadLength"/>), then the printable characters of its line through
+        /// the last <c>'</c> among them (line 25). The path may itself hold a <c>'</c>, so the grammar's longest
+        /// match ends at the last one, never at the first.
+        /// </summary>
+        private int MatchQuotedFile()
+        {
+            int head = FileHeadLength(1);
+            if (head == 0)
+            {
+                return 0;
+            }
+
+            int bodyStart = 1 + head;
+            int closing = text.AsSpan(index + bodyStart, PrintableRun(bodyStart)).LastIndexOf('\'');
+            return closing < 0 ? 0 : bodyStart + closing + 1;
+        }
+
+        /// <summary>
+        /// The length of the head of an unquoted <c>File</c> at <paramref name="offset"/>, or 0 (line 25): a letter
+        /// <c>A</c>-<c>Z</c> in either case and <c>:</c>, as in <c>C:</c>; <c>..\</c>; <c>.\</c>; or <c>\</c>, which
+        /// also starts a <c>\\server</c> share. The body that follows is any run of printable characters, so the
+        /// longer heads of the grammar, <c>\\server</c> and repeated <c>..\</c>, give the same token.
+        /// </summary>
+        private int FileHeadLength(int offset)
+        {
+            char first = Peek(offset);
+            if (char.IsAsciiLetter(first) && Peek(offset + 1) == ':')
+            {
+                return 2;
+            }
+
+            if (first == '\\')
+            {
+                return 1;
+            }
+
+            if (first != '.')
+            {
+                return 0;
+            }
+
+            if (Peek(offset + 1) == '\\')
+            {
+                return 2;
+            }
+
+            return Peek(offset + 1) == '.' && Peek(offset + 2) == '\\' ? 3 : 0;
+        }
+
+        /// <summary>
+        /// The number of <c>{Printable}</c> characters from <paramref name="offset"/> on: the body of a
+        /// <c>File</c>, <c>(['\']?{Printable}+)*</c> (line 25), which runs over spaces, quotes, reserved words and
+        /// <c>//</c> alike and stops at a line break, a tab or any character outside the set.
+        /// </summary>
+        private int PrintableRun(int offset)
+        {
+            int count = 0;
+            while (IsPrintable(Peek(offset + count)))
+            {
+                count++;
+            }
+
+            return count;
+        }
+
+        /// <summary>
+        /// The length of a <c>Url</c> at the current position, or 0: <c>http://</c> in either case followed by one
+        /// or more <c>{Url Chars}</c>, which stop at whitespace (lines 18, 26).
+        /// </summary>
+        private int MatchUrl()
+        {
+            const string Scheme = "http://";
+            if (!text.AsSpan(index).StartsWith(Scheme, StringComparison.OrdinalIgnoreCase))
+            {
+                return 0;
+            }
+
+            int length = Scheme.Length;
+            while (IsUrlChar(Peek(length)))
+            {
+                length++;
+            }
+
+            return length > Scheme.Length ? length : 0;
         }
 
         private int DigitRun(int offset, int maximum)

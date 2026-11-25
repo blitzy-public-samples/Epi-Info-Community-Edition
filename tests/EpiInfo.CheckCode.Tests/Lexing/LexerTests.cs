@@ -130,14 +130,101 @@ public sealed class LexerTests
     [InlineData(",", TokenKind.Comma, ",")]
     [InlineData("(", TokenKind.LeftParen, "(")]
     [InlineData(")", TokenKind.RightParen, ")")]
+    [InlineData("12L", TokenKind.Number, "12L")]
+    [InlineData("12U", TokenKind.Number, "12U")]
+    [InlineData("12UL", TokenKind.Number, "12UL")]
+    [InlineData("12LU", TokenKind.Number, "12LU")]
+    [InlineData("12lu", TokenKind.Number, "12lu")]
+    [InlineData("0uL", TokenKind.Number, "0uL")]
+    [InlineData("#1a", TokenKind.Number, "#1a")]
+    [InlineData("#1A2b", TokenKind.Number, "#1A2b")]
+    [InlineData("'x'", TokenKind.Character, "'x'")]
+    [InlineData("' '", TokenKind.Character, "' '")]
+    [InlineData("'\"'", TokenKind.Character, "'\"'")]
+    [InlineData("'\u00e9'", TokenKind.Character, "'\u00e9'")]
+    [InlineData("http://example.org/a", TokenKind.Url, "http://example.org/a")]
+    [InlineData("HTTP://Example.org//a//b?q=\"1\"", TokenKind.Url, "HTTP://Example.org//a//b?q=\"1\"")]
+    [InlineData("C:\\Program Files\\End-Field\\app.exe", TokenKind.File, "C:\\Program Files\\End-Field\\app.exe")]
+    [InlineData("c:", TokenKind.File, "c:")]
+    [InlineData("\\\\srv\\share\\End-After\\x.exe", TokenKind.File, "\\\\srv\\share\\End-After\\x.exe")]
+    [InlineData("..\\..\\End-Field\\a.txt \"x\"", TokenKind.File, "..\\..\\End-Field\\a.txt \"x\"")]
+    [InlineData(".\\End-If\\a.txt", TokenKind.File, ".\\End-If\\a.txt")]
+    [InlineData("\\End-Sub\\x.exe // kept", TokenKind.File, "\\End-Sub\\x.exe // kept")]
+    [InlineData("'C:\\End-Field\\x.exe'", TokenKind.File, "'C:\\End-Field\\x.exe'")]
+    [InlineData("'..\\it's.txt'", TokenKind.File, "'..\\it's.txt'")]
     public void SingleTokenSourceGivesThatToken(string source, TokenKind kind, string text)
     {
         // A date is one token, not number, slash, number; a bracketed name loses its brackets and the spaces before
-        // its ']', and keeps its inner spaces.
+        // its ']', and keeps its inner spaces. The legacy literals of lines 37-41 are whole tokens spelled as written:
+        // a DecLiteral keeps its U/L suffix in either case, a HexLiteral its '#' and digit-letter pairs, and a
+        // CharLiteral its quotes. A Url (line 26) keeps any '//' after its scheme, and a File (line 25), from each of
+        // its heads or between quotes, runs over the printable rest of the line, spaces, reserved words and '//'
+        // included.
         var tokens = Lex(source);
 
         Assert.Equal(new[] { kind, TokenKind.EndOfInput }, Kinds(tokens));
         Assert.Equal(text, tokens[0].Text);
+    }
+
+    // The shapes next to the legacy literals lex as they always did: a suffix follows only a bare digit run (line
+    // 38), so a real keeps none and a second U or L starts a word; '#' needs a digit-letter pair (line 39); a quote
+    // needs exactly one other character before its closing quote (line 41); and a dot belongs to a number only with
+    // a digit after it.
+    [Theory]
+    [InlineData("12.5L", "Number 12.5", "Identifier L")]
+    [InlineData("2E3L", "Number 2E3", "Identifier L")]
+    [InlineData("12UU", "Number 12U", "Identifier U")]
+    [InlineData("12LUL", "Number 12LU", "Identifier L")]
+    [InlineData("12.L", "Number 12", "Dot .", "Identifier L")]
+    [InlineData("#1a2", "Number #1a", "Number 2")]
+    [InlineData("#12", "Unknown #", "Number 12")]
+    [InlineData("#", "Unknown #")]
+    [InlineData("#a1", "Unknown #", "Identifier a1")]
+    [InlineData("'", "Unknown '")]
+    [InlineData("''", "Unknown '", "Unknown '")]
+    [InlineData("'xy'", "Unknown '", "Identifier xy", "Unknown '")]
+    [InlineData(".5", "Number .5")]
+    [InlineData("5.", "Number 5", "Dot .")]
+    public void ShapeBesideALegacyLiteralLexesAsBefore(string source, params string[] expected)
+    {
+        var tokens = Lex(source);
+
+        Assert.Equal(expected, tokens.Take(tokens.Count - 1).Select(token => $"{token.Kind} {token.Text}"));
+    }
+
+    // A Url (line 26) ends at whitespace, so a keyword after it on its line is lexed; a File (line 25) ends at its
+    // line break, a tab or a character outside {Printable}, so the next line is lexed as usual. Only a lone letter
+    // before ':' heads a File, 'http:' needs '//' and a character after it to be a Url, '\'' is a CharLiteral rather
+    // than a quoted File, an unclosed quoted path leaves its quote Unknown, and a '//' outside both is a comment.
+    [Theory]
+    [InlineData(
+        "EXECUTE http://example.org/a ASSIGN Z = \"next\"",
+        "Keyword EXECUTE @1", "Url http://example.org/a @1", "Keyword ASSIGN @1", "Identifier Z @1", "Equal = @1",
+        "String next @1")]
+    [InlineData(
+        "EXECUTE C:\\x y\\End-Field\\a.exe /* c\nEnd-Field",
+        "Keyword EXECUTE @1", "File C:\\x y\\End-Field\\a.exe /* c @1", "Keyword End-Field @2")]
+    [InlineData(
+        "EXECUTE 'C:\\End-Field\\x.exe'\r\nASSIGN",
+        "Keyword EXECUTE @1", "File 'C:\\End-Field\\x.exe' @1", "Keyword ASSIGN @2")]
+    [InlineData("C:\\a\tEnd", "File C:\\a @1", "Keyword End @1")]
+    [InlineData("C:\\a\u00e9b", "File C:\\a @1", "Identifier \u00e9b @1")]
+    [InlineData("AB:\\x", "Identifier AB @1", "Colon : @1", "File \\x @1")]
+    [InlineData("5.\\x", "Number 5 @1", "File .\\x @1")]
+    [InlineData("...\\x", "Dot . @1", "File ..\\x @1")]
+    [InlineData("'\\'", "Character '\\' @1")]
+    [InlineData("'C:\\x", "Unknown ' @1", "File C:\\x @1")]
+    [InlineData("http:", "Identifier http @1", "Colon : @1")]
+    [InlineData("http:// x", "Identifier http @1", "Colon : @1")]
+    [InlineData("xhttp://a", "Identifier xhttp @1", "Colon : @1")]
+    [InlineData("A // c", "Identifier A @1")]
+    public void FileAndUrlOperandsEndWhereTheGrammarEndsThem(string source, params string[] expected)
+    {
+        var tokens = Lex(source);
+
+        Assert.Equal(
+            expected,
+            tokens.Take(tokens.Count - 1).Select(token => $"{token.Kind} {token.Text} @{token.Line}"));
     }
 
     [Theory]
@@ -436,6 +523,13 @@ public sealed class LexerTests
     [InlineData("[unterminated")]
     [InlineData("(+")]
     [InlineData("\u0000")]
+    [InlineData("'C:")]
+    [InlineData("'\\")]
+    [InlineData("\\")]
+    [InlineData("..")]
+    [InlineData("http://")]
+    [InlineData("12U")]
+    [InlineData("#1")]
     public void HostileInputNeverThrows(string source)
     {
         Assert.Null(Record.Exception(() => Lexer.Tokenize(source)));
@@ -457,6 +551,11 @@ public sealed class LexerTests
             .Select(token => $"'{token.Text}' on line {token.Line}")
             .ToArray();
         Assert.Empty(unknown);
+
+        // The seeded quotes sit inside strings, so no operand or character literal swallows seeded code.
+        Assert.DoesNotContain(
+            tokens,
+            token => token.Kind is TokenKind.File or TokenKind.Url or TokenKind.Character);
     }
 
     [Fact]

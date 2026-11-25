@@ -14,21 +14,24 @@ namespace EpiInfo.CheckCode.Lexing;
 /// </para>
 /// <para>
 /// The token holds no parsed value: the parser converts <see cref="TokenKind.Number"/> text with
-/// <see cref="CultureInfo.InvariantCulture"/> itself. Record-struct equality compares all four members, which is
-/// how tests compare token sequences.
+/// <see cref="CultureInfo.InvariantCulture"/> itself, so a suffixed or hexadecimal number such as <c>12L</c> or
+/// <c>#1a</c>, which has no such value, is reported as unsupported. Record-struct equality compares all four members,
+/// which is how tests compare token sequences.
 /// </para>
 /// </remarks>
 /// <param name="Kind">The category of the token.</param>
 /// <param name="Text">
-/// The source spelling exactly as written, with these exceptions, all applied by the lexer: a
-/// <see cref="TokenKind.String"/> holds its content without the surrounding double quotes; a bracketed
-/// <see cref="TokenKind.Identifier"/> holds its content without <c>[</c> and <c>]</c>, with its trailing whitespace,
-/// line breaks included, trimmed and its inner whitespace and line breaks kept; an <see cref="TokenKind.Unknown"/>
-/// token holds its raw source text, which for an unterminated string runs from the <c>"</c> to the end of the line,
-/// for a string holding a character outside the grammar's string set is the whole quoted text, for a bracketed name
-/// with whitespace straight after its <c>[</c> runs from the <c>[</c> through the <c>]</c>, and for an unterminated
-/// block comment runs from the <c>/*</c> to the end of the program; and <see cref="TokenKind.EndOfInput"/> holds the
-/// empty string.
+/// The source spelling exactly as written, so a <see cref="TokenKind.Character"/> and a quoted
+/// <see cref="TokenKind.File"/> keep their single quotes, a <see cref="TokenKind.File"/> or <see cref="TokenKind.Url"/>
+/// its spaces and slashes, and a <see cref="TokenKind.Number"/> its suffix or <c>#</c>, with these exceptions, all
+/// applied by the lexer: a <see cref="TokenKind.String"/> holds its content without the surrounding double quotes; a
+/// bracketed <see cref="TokenKind.Identifier"/> holds its content without <c>[</c> and <c>]</c>, with its trailing
+/// whitespace, line breaks included, trimmed and its inner whitespace and line breaks kept; an
+/// <see cref="TokenKind.Unknown"/> token holds its raw source text, which for an unterminated string runs from the
+/// <c>"</c> to the end of the line, for a string holding a character outside the grammar's string set is the whole
+/// quoted text, for a bracketed name with whitespace straight after its <c>[</c> runs from the <c>[</c> through the
+/// <c>]</c>, and for an unterminated block comment runs from the <c>/*</c> to the end of the program; and
+/// <see cref="TokenKind.EndOfInput"/> holds the empty string.
 /// </param>
 /// <param name="Line">
 /// The 1-based line in the program text where the token starts; <c>\r\n</c>, <c>\n</c> and a lone <c>\r</c> each count

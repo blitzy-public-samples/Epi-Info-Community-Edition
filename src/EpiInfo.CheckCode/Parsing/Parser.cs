@@ -19,25 +19,43 @@ namespace EpiInfo.CheckCode.Parsing;
 /// The subset is the <c>Field</c> block with its <c>Before</c>, <c>After</c> and <c>Click</c> event blocks;
 /// <c>IF … THEN … [ELSE …] END-IF | END</c>; <c>ASSIGN</c>, <c>ENABLE</c>, <c>DISABLE</c>, <c>CLEAR</c>,
 /// <c>DIALOG "text" [TITLETEXT = "title"]</c> and <c>GEOCODE</c>; the operators <c>=</c>, <c>NOT</c> and
-/// <c>AND</c>; string and number literals, <c>(.)</c> and <c>(-)</c>; and calls of the functions
-/// <see cref="FunctionNames"/> supports. Everything else yields a <see cref="DiagnosticSeverity.Warning"/> and
-/// is left out of the tree; each <c>GEOCODE</c> statement yields one <see cref="DiagnosticSeverity.Info"/>. The
+/// <c>AND</c>; string literals, unsuffixed decimal and real literals, <c>(.)</c> and <c>(-)</c>; and calls of the
+/// functions <see cref="FunctionNames"/> supports. Everything else yields a <see cref="DiagnosticSeverity.Warning"/>
+/// and is left out of the tree; each <c>GEOCODE</c> statement yields one <see cref="DiagnosticSeverity.Info"/>. The
 /// parser never reports a <see cref="DiagnosticSeverity.Error"/>.
 /// </para>
 /// <para>
-/// Recovery works at grammar boundaries: an unsupported statement is skipped up to the next command or block
-/// terminator, an <c>IF</c> with an unsupported condition or an <c>ELSE-IF</c> is dropped up to its own
-/// <c>END-IF</c> or <c>END</c>, an unsupported block (<c>View</c>, <c>Form</c>, <c>Record</c>, <c>Page</c>,
+/// Recovery works at grammar boundaries: an unsupported statement is skipped up to the next command, block
+/// terminator or implicit assignment (<c>a = 1</c>, line 285), an <c>ASSIGN</c> whose expression does not end the
+/// statement is dropped whole, an <c>IF</c> with an unsupported condition or an <c>ELSE-IF</c> is dropped up to its
+/// own <c>END-IF</c> or <c>END</c>, an unsupported block (<c>View</c>, <c>Form</c>, <c>Record</c>, <c>Page</c>,
 /// <c>DefineVariables</c>, <c>Sub</c>) is skipped up to its <c>End-*</c> keyword, an event block that repeats a
 /// kind or comes after a later kind in its <c>Field</c> block is skipped through its terminator, and the rest of the
 /// program still parses. A <c>/*</c> without its <c>*/</c> (lines 50-51) hides the rest of the program: it is
 /// reported once, at its own line, in place of the terminators it hides, and the statements before it still parse.
 /// </para>
 /// <para>
+/// A <see cref="TokenKind.File"/> or <see cref="TokenKind.Url"/> operand (lines 25-26) is one opaque token that no
+/// supported statement takes: it is skipped with the unsupported statement or block it belongs to, such as
+/// <c>EXECUTE</c>, <c>WAITFOR</c> or <c>COMMANDLINE</c>, so a reserved word inside a path delimits nothing; at a
+/// statement start it is reported as <see cref="Commands.Syntax"/>, and as a value as a malformed expression. The
+/// parser performs no I/O and runs nothing.
+/// </para>
+/// <para>
+/// A keyword position takes only a <see cref="TokenKind.Keyword"/> token: a statement's command, <c>THEN</c>,
+/// <c>TITLETEXT</c> and the built-in values written without parentheses (line 254). A bracketed name is always an
+/// identifier (line 30), so <c>[ASSIGN]</c> starts no statement, <c>[THEN]</c> and <c>[TITLETEXT]</c> delimit
+/// nothing, and <c>[SYSTEMDATE]</c> is the field named <c>SYSTEMDATE</c>. A name slot (the <c>ASSIGN</c> target,
+/// each <c>GEOCODE</c> argument, each name of <c>ENABLE</c>, <c>DISABLE</c> and <c>CLEAR</c>, a name in an
+/// expression) takes any identifier, bracketed keyword names included, or a keyword the parser does not reserve,
+/// so a missing name leaves the keyword of the next statement, event or block unconsumed.
+/// </para>
+/// <para>
 /// Diagnostics carry the form name and the 1-based line of the token where the construct starts. Their
 /// <see cref="Diagnostic.Command"/> and <see cref="Diagnostic.Message"/> come only from fixed text, keyword and
-/// operator spellings and function names, never from string literals, numbers or field names, because the API
-/// logs diagnostics.
+/// operator spellings and function names, never from string, character or number literals, paths, URLs or field
+/// names, because the API logs diagnostics. A literal the subset does not run, such as <c>12L</c>, <c>#1a</c> or
+/// <c>'x'</c> (lines 38-41), is reported once under its kind's pseudo-command and drops its statement.
 /// </para>
 /// <para>
 /// Each call works on its own state and the keyword tables are immutable, so the parser is safe to call
@@ -66,6 +84,11 @@ public static class Parser
         "IOCODE", "GETPATH", "GOTO", "GOTOPAGE", "GOTOFORM", "HELP", "HIDE", "HIGHLIGHT", "QUIT", "UNDEFINE",
         "UNHIDE", "UNHIGHLIGHT", "WAITFOR", "WAITFOREXIT", "WAITFORFILEEXISTS", "SET-REQUIRED", "SET-NOT-REQUIRED",
         "SAVE-RECORD", "DEFINE");
+
+    // Lines 297, 404, 452, 609, 645: the statements that are their command keyword alone, so each is complete
+    // without an operand.
+    private static readonly FrozenSet<string> ZeroOperandCommands = Set(
+        "BEEP", "EXIT", "NEWRECORD", "QUIT", "SAVE-RECORD");
 
     private static readonly FrozenSet<string> CommandKeywords = Set([.. SupportedCommands, .. UnsupportedCommands]);
 
@@ -113,7 +136,8 @@ public static class Parser
     // Inside an IF branch the IF terminators also end the list.
     private static readonly FrozenSet<string> IfStopKeywords = Set([.. EventStopKeywords, .. IfTerminators]);
 
-    // Where a skipped statement ends: the next command, or any keyword that ends a statement list.
+    // The keywords a statement ends before: the next command, or any keyword that ends a statement list.
+    // ParseRun.AtStatementBoundary adds the start of an implicit assignment, which has no keyword.
     private static readonly FrozenSet<string> BoundaryKeywords = Set([.. IfStopKeywords, .. CommandKeywords]);
 
     // Words that cannot stand as a field name outside brackets in a name list or an expression.
@@ -178,8 +202,15 @@ public static class Parser
         /// <summary>A parenthesised expression list such as <c>(a, b)</c> (line 528).</summary>
         public const string ExpressionList = "EXPRESSION-LIST";
 
-        /// <summary>A number literal with no finite invariant-culture value.</summary>
+        /// <summary>
+        /// A number literal with no finite invariant-culture value: a <c>DecLiteral</c> with its <c>U</c>/<c>L</c>
+        /// suffix such as <c>12L</c>, a <c>HexLiteral</c> such as <c>#1a</c> (lines 38-39), or an overflow such as
+        /// <c>1E999</c>.
+        /// </summary>
         public const string NumberLiteral = "NUMBER-LITERAL";
+
+        /// <summary>A character literal such as <c>'x'</c> (line 41).</summary>
+        public const string CharLiteral = "CHAR-LITERAL";
 
         /// <summary>A date literal (line 44).</summary>
         public const string DateLiteral = "DATE-LITERAL";
@@ -361,6 +392,14 @@ public static class Parser
         private Token end = new(TokenKind.EndOfInput, string.Empty, 1, 1);
         private int position;
         private int depth;
+
+        // The lookahead of AlwaysOpensBlock, built by AnalyseClosers for the tokens from closerStart up to the
+        // statement-list stop at closerStop: entry i - closerStart is the first END or END-IF (nextCloser), or the
+        // first END (nextEndCloser), at or after token i that closes a construct opened before token i; -1 for none.
+        private int closerStart = -1;
+        private int closerStop = -1;
+        private int[] nextCloser = [];
+        private int[] nextEndCloser = [];
 
         // A '/*' without its '*/' (lines 50-51), taken off the token list; null when the program has none.
         private Token? danglingComment;
@@ -930,10 +969,15 @@ public static class Parser
                     return null;
             }
 
-            if (token.CanBeName && Peek(1).Kind is TokenKind.Equal or TokenKind.Dot or TokenKind.LeftBracket)
+            int targetLength = ImplicitAssignStartLength();
+            if (targetLength > 0)
             {
                 Warn(token, Commands.ImplicitAssign, $"Assignment without ASSIGN is not supported; {StatementSkipped}");
-                Advance();
+                for (int i = 0; i < targetLength; i++)
+                {
+                    Advance();
+                }
+
                 SkipToBoundary();
                 return null;
             }
@@ -944,16 +988,18 @@ public static class Parser
             Warn(
                 token,
                 CommandOrSyntax(token),
-                IsCommandKeyword(Current)
+                IsCommandKeyword(Current) || ImplicitAssignStartLength() > 0
                     ? "Unrecognised check code; skipped to the next statement"
                     : "Unrecognised check code; rest of the block skipped");
             return null;
         }
 
         /// <summary>
-        /// Skips an unsupported statement after its command keyword. <c>ALWAYS … END</c> is skipped whole, counting
-        /// the <c>IF</c> and <c>ALWAYS</c> blocks nested in it; a trailing <c>ALWAYS</c> of <c>AUTOSEARCH</c> belongs
-        /// to it; any other statement ends at the next command or terminator.
+        /// Skips an unsupported statement after its command keyword. <c>ALWAYS … END</c> is skipped whole
+        /// (<see cref="SkipAlwaysBlock"/>); a trailing <c>ALWAYS</c> of <c>AUTOSEARCH</c> belongs to it when it is the
+        /// modifier rather than a block of its own (<see cref="SkipAutoSearchOperands"/>), and so does the
+        /// <c>WAITFOREXIT</c> or <c>NOWAITFOREXIT</c> written directly after <c>EXECUTE</c> (lines 392-400); any other
+        /// statement ends at the next statement boundary.
         /// </summary>
         private void SkipUnsupportedStatement(string command)
         {
@@ -964,47 +1010,49 @@ public static class Parser
             }
             else if (command == "AUTOSEARCH")
             {
-                // ALWAYS is a command of its own, so it would otherwise end the skip; here it closes the statement.
-                while (true)
-                {
-                    if (Current.IsKeyword("ALWAYS"))
-                    {
-                        Advance();
-                        return;
-                    }
-
-                    if (IsBoundary(Current))
-                    {
-                        return;
-                    }
-
-                    Advance();
-                }
+                SkipAutoSearchOperands([]);
             }
             else
             {
+                // WAITFOREXIT is also a command of its own (line 581), so the skip would otherwise end before it.
+                if (command == "EXECUTE" && (Current.IsKeyword("WAITFOREXIT") || Current.IsKeyword("NOWAITFOREXIT")))
+                {
+                    Advance();
+                }
+
                 SkipToBoundary();
             }
         }
 
         /// <summary>
-        /// Skips the body of <c>ALWAYS &lt;statements&gt; END</c> (line 275) through its matching <c>END</c>. The
-        /// scan stops before an event or block boundary, so an unterminated <c>ALWAYS</c> cannot leave its block.
+        /// Skips the body of <c>ALWAYS &lt;statements&gt; END</c> (line 275) through its matching <c>END</c>, matching
+        /// each construct nested in it against its own production: an <c>IF</c> closes with <c>END-IF</c> or
+        /// <c>END</c> (lines 434-440), a nested <c>ALWAYS</c> only with <c>END</c>, so an <c>END-IF</c> never closes
+        /// an <c>ALWAYS</c>, and the trailing <c>ALWAYS</c> of an <c>AUTOSEARCH</c> (lines 290-293) opens a nested
+        /// block only when <see cref="AlwaysOpensBlock"/> finds that it is not the modifier. The scan stops before an
+        /// event or block boundary, so an unterminated <c>ALWAYS</c> cannot leave its block.
         /// </summary>
         private void SkipAlwaysBlock()
         {
-            int open = 1;
+            // The keyword of each construct still open, the innermost on top.
+            var open = new Stack<string>();
+            open.Push("ALWAYS");
             while (!IsStop(Current, insideIf: false))
             {
                 string? keyword = Advance().Keyword;
-                if (keyword is Commands.If or "ALWAYS")
+                if (keyword == "AUTOSEARCH")
                 {
-                    open++;
+                    // An ALWAYS left unconsumed opens a block: the next pass pushes it.
+                    SkipAutoSearchOperands(open);
                 }
-                else if (keyword is Commands.EndIf or Commands.End)
+                else if (keyword is Commands.If or "ALWAYS")
                 {
-                    open--;
-                    if (open == 0)
+                    open.Push(keyword);
+                }
+                else if (keyword == Commands.End || (keyword == Commands.EndIf && open.Peek() == Commands.If))
+                {
+                    open.Pop();
+                    if (open.Count == 0)
                     {
                         return;
                     }
@@ -1012,13 +1060,283 @@ public static class Parser
             }
         }
 
-        /// <summary>Skips to the next command, terminator or block boundary, which is not consumed.</summary>
-        private void SkipToBoundary()
+        /// <summary>
+        /// Skips the operands of <c>AUTOSEARCH &lt;names&gt; [DISPLAYLIST &lt;names&gt;] [ALWAYS]</c> (lines 290-293)
+        /// after its keyword, and the <c>ALWAYS</c> after them when it is the statement's modifier. The word is also
+        /// the command <c>ALWAYS &lt;statements&gt; END</c> (line 275); when it opens such a block
+        /// (<see cref="AlwaysOpensBlock"/>), it is left as the current token, a statement of its own at statement
+        /// level and a nested block inside an <c>ALWAYS</c> being skipped.
+        /// </summary>
+        /// <param name="open">
+        /// The keywords of the constructs open in the <c>ALWAYS</c> being skipped, innermost first; empty at statement
+        /// level.
+        /// </param>
+        private void SkipAutoSearchOperands(IEnumerable<string> open)
         {
-            while (!IsBoundary(Current))
+            SkipToBoundary();
+            if (Current.IsKeyword("ALWAYS") && !AlwaysOpensBlock(open))
             {
                 Advance();
             }
+        }
+
+        /// <summary>
+        /// Whether the <c>ALWAYS</c> at the cursor, written after the operands of an <c>AUTOSEARCH</c>, opens
+        /// <c>ALWAYS &lt;statements&gt; END</c> (line 275) instead of being the modifier of lines 290-293. The grammar
+        /// gives the word both roles and line breaks carry no meaning, so the structure that follows decides. The word
+        /// opens a block only when its body starts with a statement, since <c>&lt;Statements&gt;</c> is never empty
+        /// (line 74), and when, with the block open, the terminators before the statement-list stop
+        /// (<see cref="IsStop"/>) close the block, every construct in <paramref name="open"/> and every enclosing
+        /// <c>IF</c>, innermost first, with <see cref="SkipAlwaysBlock"/>'s matching: <c>END</c> closes any construct
+        /// and <c>END-IF</c> only an <c>IF</c>. Otherwise it is the modifier, so a terminator the program needs for an
+        /// outer construct is never taken for a block the program does not close.
+        /// </summary>
+        /// <param name="open">The constructs open in the <c>ALWAYS</c> being skipped, innermost first.</param>
+        /// <remarks>
+        /// A later <c>AUTOSEARCH</c>'s <c>ALWAYS</c> counts as its modifier in the lookahead. Deciding it by this rule
+        /// instead gives the same answer: a block there only adds a construct to close, so it never lets the
+        /// constructs close where the modifier does not, and it is a block only when they all close with it open.
+        /// At statement level <see cref="depth"/> counts the enclosing <c>IF</c> statements alone, as parentheses and
+        /// calls raise it only inside an expression. The lookahead is built once per statement list
+        /// (<see cref="AnalyseClosers"/>), and each decision costs one step per construct it closes.
+        /// </remarks>
+        private bool AlwaysOpensBlock(IEnumerable<string> open)
+        {
+            if (IsKeywordIn(Peek(1), IfTerminators))
+            {
+                return false;
+            }
+
+            int from = position + 1;
+            if (from < closerStart || from > closerStop)
+            {
+                AnalyseClosers(from);
+            }
+
+            // The block itself closes only with END.
+            int closing = NextCloser(from, endOnly: true);
+            foreach (string keyword in open)
+            {
+                if (closing < 0)
+                {
+                    return false;
+                }
+
+                closing = NextCloser(closing + 1, endOnly: keyword != Commands.If);
+            }
+
+            for (int i = 0; i < depth && closing >= 0; i++)
+            {
+                closing = NextCloser(closing + 1, endOnly: false);
+            }
+
+            return closing >= 0;
+        }
+
+        /// <summary>
+        /// The first <c>END</c>, or with <paramref name="endOnly"/> false the first <c>END</c> or <c>END-IF</c>, at or
+        /// after token <paramref name="index"/> that closes a construct opened before it, or -1 when the stop comes
+        /// first. <paramref name="index"/> lies between <see cref="closerStart"/> and <see cref="closerStop"/>.
+        /// </summary>
+        private int NextCloser(int index, bool endOnly) =>
+            (endOnly ? nextEndCloser : nextCloser)[index - closerStart];
+
+        /// <summary>
+        /// Builds the lookahead of <see cref="AlwaysOpensBlock"/> for the tokens from <paramref name="start"/> up to
+        /// the statement-list stop. A forward pass pairs each <c>IF</c> and <c>ALWAYS</c> with the terminator that
+        /// closes it, matched as <see cref="SkipAlwaysBlock"/> matches them, and skips each <c>AUTOSEARCH</c>'s
+        /// operands as <see cref="SkipAutoSearchOperands"/> does, its trailing <c>ALWAYS</c> counted as the modifier.
+        /// A backward pass then links each token to the first terminator at or after it outside every construct opened
+        /// from it on, jumping over each closed construct; a construct left open hides every terminator after it.
+        /// The cursor is restored, so nothing is consumed.
+        /// </summary>
+        private void AnalyseClosers(int start)
+        {
+            const int NoConstruct = -2;
+            const int Unclosed = -1;
+
+            int stop = start;
+            while (stop < tokens.Length && !IsStop(tokens[stop], insideIf: false))
+            {
+                stop++;
+            }
+
+            int length = stop - start;
+
+            // For each token that opens a construct, the index of its terminator or Unclosed; NoConstruct for the rest.
+            var closedAt = new int[length];
+            Array.Fill(closedAt, NoConstruct);
+            var opened = new Stack<int>();
+            int resume = position;
+            try
+            {
+                position = start;
+                while (position < stop)
+                {
+                    int index = position;
+                    string? keyword = Advance().Keyword;
+                    if (keyword == "AUTOSEARCH")
+                    {
+                        // The operands end at a boundary keyword, so the skip never passes the stop.
+                        SkipToBoundary();
+                        if (Current.IsKeyword("ALWAYS"))
+                        {
+                            Advance();
+                        }
+                    }
+                    else if (keyword is Commands.If or "ALWAYS")
+                    {
+                        closedAt[index - start] = Unclosed;
+                        opened.Push(index);
+                    }
+                    else if (opened.Count > 0
+                        && (keyword == Commands.End
+                            || (keyword == Commands.EndIf && tokens[opened.Peek()].IsKeyword(Commands.If))))
+                    {
+                        closedAt[opened.Pop() - start] = index;
+                    }
+                }
+            }
+            finally
+            {
+                position = resume;
+            }
+
+            var next = new int[length + 1];
+            var nextEnd = new int[length + 1];
+            next[length] = -1;
+            nextEnd[length] = -1;
+            for (int offset = length - 1; offset >= 0; offset--)
+            {
+                int index = start + offset;
+                int terminator = closedAt[offset];
+                if (terminator == Unclosed)
+                {
+                    next[offset] = -1;
+                    nextEnd[offset] = -1;
+                }
+                else if (terminator != NoConstruct)
+                {
+                    next[offset] = next[terminator + 1 - start];
+                    nextEnd[offset] = nextEnd[terminator + 1 - start];
+                }
+                else if (tokens[index].IsKeyword(Commands.End))
+                {
+                    next[offset] = index;
+                    nextEnd[offset] = index;
+                }
+                else
+                {
+                    next[offset] = tokens[index].IsKeyword(Commands.EndIf) ? index : next[offset + 1];
+                    nextEnd[offset] = nextEnd[offset + 1];
+                }
+            }
+
+            closerStart = start;
+            closerStop = stop;
+            nextCloser = next;
+            nextEndCloser = nextEnd;
+        }
+
+        /// <summary>
+        /// Skips to the next statement boundary as <see cref="AtStatementBoundary"/> defines it: a command, a
+        /// terminator, a block boundary or an implicit assignment, which is not consumed.
+        /// </summary>
+        private void SkipToBoundary()
+        {
+            while (!AtStatementBoundary())
+            {
+                Advance();
+            }
+        }
+
+        /// <summary>
+        /// Whether the statement before the cursor ends at the current token, which a statement or a skip then leaves
+        /// unconsumed: the end of the input; a command or a keyword that ends a statement list
+        /// (<see cref="BoundaryKeywords"/>); or a complete implicit-assignment start (line 285) whose target begins
+        /// with an identifier, plain or bracketed, after a token that can end a statement, as <c>B = 1</c> starts
+        /// after <c>ENABLE A</c> and after <c>BEEP</c>. Following an operator, punctuation or a keyword that takes an
+        /// operand, the same name is that operand instead, as <c>B</c> is in <c>LET B = 1</c> and in
+        /// <c>A &lt;&gt; "1" AND B = "2"</c>. A keyword followed by <c>=</c> is never a target here: the grammar
+        /// builds the target from the <c>Identifier</c> terminal (lines 173-181), and inside a statement such a
+        /// keyword is that statement's option, as <c>VIEWNAME</c> is in
+        /// <c>COMMANDLINE PGMNAME = 'C:\a.prj' VIEWNAME = 'C:\b.prj' : "v"</c> (lines 308-326).
+        /// </summary>
+        private bool AtStatementBoundary()
+        {
+            Token token = Current;
+            return token.Kind == TokenKind.EndOfInput
+                || IsKeywordIn(token, BoundaryKeywords)
+                || (token.Kind == TokenKind.Identifier
+                    && CanEndStatement(position - 1)
+                    && ImplicitAssignStartLength() > 0);
+        }
+
+        /// <summary>
+        /// The number of tokens in the <c>target =</c> start of an implicit assignment at the cursor (line 285), or 0
+        /// when the cursor starts none. The target is a <c>Qualified ID</c> (lines 173-181): a name, any number of
+        /// <c>.name</c> parts, then at most one grid reference <c>[Number, name | Number | String]</c>. Each name is
+        /// one <see cref="IsStrictName"/> accepts, so where a statement starts, a keyword no statement reserves, such
+        /// as <c>NUMERIC</c> in <c>NUMERIC = 1</c>, is the target, as it is a name in every other name slot: no
+        /// statement is in progress there for it to be an option of. Inside a statement,
+        /// <see cref="AtStatementBoundary"/> takes only an identifier as the first name.
+        /// </summary>
+        private int ImplicitAssignStartLength()
+        {
+            if (!IsStrictName(Current))
+            {
+                return 0;
+            }
+
+            int offset = 1;
+            while (Peek(offset).Kind == TokenKind.Dot && IsStrictName(Peek(offset + 1)))
+            {
+                offset += 2;
+            }
+
+            if (Peek(offset).Kind == TokenKind.LeftBracket
+                && Peek(offset + 1).Kind == TokenKind.Number
+                && Peek(offset + 2).Kind == TokenKind.Comma
+                && (IsStrictName(Peek(offset + 3)) || Peek(offset + 3).Kind is TokenKind.Number or TokenKind.String)
+                && Peek(offset + 4).Kind == TokenKind.RightBracket)
+            {
+                offset += 5;
+            }
+
+            return Peek(offset).Kind == TokenKind.Equal ? offset + 1 : 0;
+        }
+
+        /// <summary>
+        /// Whether the token at <paramref name="index"/> can be the last token of a statement: a name, including a
+        /// keyword no statement reserves such as <c>NUMERIC</c>; a literal, character literals included; a
+        /// <c>File</c> or <c>Url</c> operand, as in <c>EXECUTE http://x</c> (lines 25-26, 392-400); a built-in value
+        /// such as <c>SYSTEMDATE</c> (line 254); a command that is a whole statement on its own, as <c>BEEP</c>,
+        /// <c>EXIT</c>, <c>NEWRECORD</c>, <c>QUIT</c> and <c>SAVE-RECORD</c> are (lines 297, 404, 452, 609, 645);
+        /// <c>)</c> or <c>]</c>; or a <c>*</c> written directly after its command, as in <c>UNHIDE *</c> (lines
+        /// 418-428, 468, 476). Operators, other punctuation, the commands that take an operand (<c>LET</c>,
+        /// <c>GOTO</c> and the like) and the keywords that take an operand (<c>AND</c>, <c>THEN</c>, <c>EXCEPT</c>
+        /// and the like) cannot; nor can a missing token.
+        /// </summary>
+        private bool CanEndStatement(int index)
+        {
+            if (index < 0 || index >= tokens.Length)
+            {
+                return false;
+            }
+
+            Token token = tokens[index];
+            return token.Kind switch
+            {
+                TokenKind.Identifier or TokenKind.String or TokenKind.Number or TokenKind.Date or TokenKind.Time
+                    or TokenKind.Character or TokenKind.File or TokenKind.Url
+                    or TokenKind.Plus or TokenKind.Minus or TokenKind.Missing
+                    or TokenKind.RightParen or TokenKind.RightBracket => true,
+                TokenKind.Keyword => !Reserved.Contains(token.Keyword!)
+                    || ZeroArgFunctions.Contains(token.Keyword!)
+                    || ZeroOperandCommands.Contains(token.Keyword!),
+                TokenKind.Asterisk => index > 0 && IsCommandKeyword(tokens[index - 1]),
+                _ => false,
+            };
         }
 
         /// <summary>Raises the nesting depth for one more <c>IF</c>, parenthesis or function call.</summary>
@@ -1052,7 +1370,7 @@ public static class Parser
                 var context = new ExpressionContext(Commands.If, ifToken, IfSkipped);
                 ExpressionNode? condition = ParseExpression(context);
                 bool poisoned = condition is null;
-                if (condition is not null && !IsWord(Current, Commands.Then))
+                if (condition is not null && !Current.IsKeyword(Commands.Then))
                 {
                     Warn(ifToken, Commands.If, $"Malformed IF condition or missing THEN; {IfSkipped}");
                     poisoned = true;
@@ -1115,25 +1433,32 @@ public static class Parser
         }
 
         /// <summary>
-        /// Consumes tokens through the next <c>THEN</c>; without one, stops before the next command or terminator,
-        /// so the statements that follow still parse.
+        /// Consumes tokens through the next <c>THEN</c>; without one, stops before the next statement boundary
+        /// (<see cref="AtStatementBoundary"/>), so the statements that follow still parse.
         /// </summary>
         private void SkipToThen()
         {
-            while (!IsBoundary(Current))
+            while (!AtStatementBoundary())
             {
-                if (IsWord(Advance(), Commands.Then))
+                if (Advance().IsKeyword(Commands.Then))
                 {
                     return;
                 }
             }
         }
 
-        /// <summary><c>ASSIGN &lt;field&gt; = &lt;expression&gt;</c> (line 281).</summary>
+        /// <summary>
+        /// <c>ASSIGN &lt;field&gt; = &lt;expression&gt;</c> (line 281). The statement must end where its expression
+        /// does (<see cref="AtStatementBoundary"/>): anything left before the boundary, as the <c>C</c> of
+        /// <c>ASSIGN A = B C</c>, drops the whole statement with one warning, so a valid prefix of a longer,
+        /// malformed assignment never runs.
+        /// </summary>
         private AssignStatementNode? ParseAssign()
         {
             Token assignToken = Advance();
-            if (!Current.CanBeName)
+
+            // A reserved word is never the target, so a bare ASSIGN leaves the next statement's keyword unconsumed.
+            if (!IsStrictName(Current))
             {
                 return MalformedAssign(assignToken);
             }
@@ -1157,6 +1482,12 @@ public static class Parser
             {
                 SkipToBoundary();
                 return null;
+            }
+
+            // A following implicit assignment is a boundary, so ASSIGN A = B C = 1 keeps A = B and C = 1 is next.
+            if (!AtStatementBoundary())
+            {
+                return MalformedAssign(assignToken);
             }
 
             return new AssignStatementNode(target.Text, value, assignToken.Line);
@@ -1192,8 +1523,9 @@ public static class Parser
                 return null;
             }
 
+            // A name that starts an implicit assignment begins the next statement, so the list ends before it.
             var names = new List<string>();
-            while (IsStrictName(Current))
+            while (IsStrictName(Current) && !AtStatementBoundary())
             {
                 Token name = Advance();
                 if (ReportQualifiedReference(name, StatementSkipped))
@@ -1205,7 +1537,7 @@ public static class Parser
                 names.Add(name.Text);
             }
 
-            if (names.Count == 0 || !IsBoundary(Current))
+            if (names.Count == 0 || !AtStatementBoundary())
             {
                 Warn(commandToken, command, $"Malformed {command} field list; {StatementSkipped}");
                 SkipToBoundary();
@@ -1234,7 +1566,7 @@ public static class Parser
 
             string message = Advance().Text.TrimStart();
             string? title = null;
-            if (IsWord(Current, Commands.TitleText))
+            if (Current.IsKeyword(Commands.TitleText))
             {
                 Advance();
                 if (Current.Kind != TokenKind.Equal || Peek(1).Kind != TokenKind.String)
@@ -1244,12 +1576,12 @@ public static class Parser
 
                 Advance();
                 title = Advance().Text.TrimStart();
-                if (!IsBoundary(Current))
+                if (!AtStatementBoundary())
                 {
                     return MalformedDialog(dialogToken);
                 }
             }
-            else if (!IsBoundary(Current))
+            else if (!AtStatementBoundary())
             {
                 // The forms that read a value into a variable (lines 365-381).
                 Warn(dialogToken, Commands.Dialog, $"Unsupported DIALOG form; {StatementSkipped}");
@@ -1288,7 +1620,8 @@ public static class Parser
                     Advance();
                 }
 
-                if (!Current.CanBeName)
+                // A missing operand leaves a statement, event or block keyword where it stands, unconsumed.
+                if (!IsStrictName(Current))
                 {
                     return MalformedGeocode(geocodeToken);
                 }
@@ -1296,7 +1629,7 @@ public static class Parser
                 arguments.Add(Advance().Text);
             }
 
-            if (!IsBoundary(Current))
+            if (!AtStatementBoundary())
             {
                 return MalformedGeocode(geocodeToken);
             }
@@ -1465,6 +1798,8 @@ public static class Parser
                     return UnsupportedLiteral(token, Commands.DateLiteral, context);
                 case TokenKind.Time:
                     return UnsupportedLiteral(token, Commands.TimeLiteral, context);
+                case TokenKind.Character:
+                    return UnsupportedLiteral(token, Commands.CharLiteral, context);
                 case TokenKind.LeftParen:
                     return ParseParenthesised(context);
                 case TokenKind.PlusSign:
@@ -1475,10 +1810,10 @@ public static class Parser
                     return null;
             }
 
-            if (token.Kind is TokenKind.Identifier or TokenKind.Keyword
-                && ZeroArgFunctions.Contains(token.Text.ToUpperInvariant()))
+            // Only the keyword is the built-in (line 254); a bracketed [SYSTEMDATE] is a field name (line 30).
+            if (IsKeywordIn(token, ZeroArgFunctions))
             {
-                string name = token.Text.ToUpperInvariant();
+                string name = token.Keyword!;
                 Warn(token, name, $"Unsupported function {name}; {context.Suffix}");
                 return null;
             }
@@ -1624,10 +1959,6 @@ public static class Parser
     private static bool IsStop(Token token, bool insideIf) =>
         token.Kind == TokenKind.EndOfInput || IsKeywordIn(token, insideIf ? IfStopKeywords : EventStopKeywords);
 
-    /// <summary>Whether a skipped statement ends before <paramref name="token"/>: a stop token or a command.</summary>
-    private static bool IsBoundary(Token token) =>
-        token.Kind == TokenKind.EndOfInput || IsKeywordIn(token, BoundaryKeywords);
-
     private static bool IsCommandKeyword(Token token) => IsKeywordIn(token, CommandKeywords);
 
     private static bool IsBlockStart(Token token) => token.Keyword is { } keyword && BlockStarts.ContainsKey(keyword);
@@ -1635,8 +1966,9 @@ public static class Parser
     private static bool IsEventStart(Token token) => token.Keyword is { } keyword && EventStarts.ContainsKey(keyword);
 
     /// <summary>
-    /// A name in an identifier list or an expression: an identifier, or a keyword that is none of the parser's
-    /// reserved words, so a field named like a statement keyword needs brackets, as in the grammar.
+    /// A name in an <c>ASSIGN</c> target, a <c>GEOCODE</c> argument, an identifier list or an expression: an
+    /// identifier, or a keyword that is none of the parser's reserved words, so a field named like a statement
+    /// keyword needs brackets, as in the grammar.
     /// </summary>
     private static bool IsStrictName(Token token) =>
         token.CanBeName && (token.Kind == TokenKind.Identifier || !Reserved.Contains(token.Keyword!));
@@ -1650,29 +1982,12 @@ public static class Parser
         token.CanBeName && !IsBlockStart(token) && !IsEventStart(token);
 
     /// <summary>
-    /// Whether the token is the word <paramref name="upperWord"/> written as a keyword or a plain identifier, in any
-    /// letter case, so the match does not depend on which words the lexer reserves.
+    /// The command a statement starting with <paramref name="token"/> runs, or <see langword="null"/>. Only a
+    /// <see cref="TokenKind.Keyword"/> starts a command: an identifier spelled like one, such as the bracketed
+    /// <c>[ASSIGN]</c>, is a name (line 30), so it starts no statement.
     /// </summary>
-    private static bool IsWord(Token token, string upperWord) =>
-        token.Kind is TokenKind.Keyword or TokenKind.Identifier
-        && string.Equals(token.Text, upperWord, StringComparison.OrdinalIgnoreCase);
-
-    /// <summary>
-    /// The command a statement starting with <paramref name="token"/> runs, or <see langword="null"/>. An identifier
-    /// spelled like a command counts too, which matters only if the lexer stops reserving that word: no name can
-    /// start a supported statement.
-    /// </summary>
-    private static string? StatementCommand(Token token)
-    {
-        string? candidate = token.Kind switch
-        {
-            TokenKind.Keyword => token.Keyword,
-            TokenKind.Identifier => token.Text.ToUpperInvariant(),
-            _ => null,
-        };
-
-        return candidate is not null && CommandKeywords.Contains(candidate) ? candidate : null;
-    }
+    private static string? StatementCommand(Token token) =>
+        IsKeywordIn(token, CommandKeywords) ? token.Keyword : null;
 
     /// <summary>
     /// The token's keyword when it belongs to the check-code vocabulary, else <see cref="Commands.Syntax"/>, so a

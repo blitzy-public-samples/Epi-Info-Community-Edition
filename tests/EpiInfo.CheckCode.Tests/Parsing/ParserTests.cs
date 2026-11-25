@@ -19,11 +19,16 @@ namespace EpiInfo.CheckCode.Tests.Parsing;
 /// </summary>
 public sealed class ParserTests
 {
-    // Parser.Commands has no constant for these spellings: an unsupported statement is reported under its own keyword
-    // and an unregistered function under its name, both in upper case.
+    // Parser.Commands has no constant for these spellings: an unsupported statement is reported under its own keyword,
+    // an unregistered function under its name, and a missing event terminator under that terminator, all in upper
+    // case.
     private const string Goto = "GOTO";
     private const string Hide = "HIDE";
+    private const string Always = "ALWAYS";
     private const string Days = "DAYS";
+    private const string SystemDate = "SYSTEMDATE";
+    private const string EndBefore = "END-BEFORE";
+    private const string EndClick = "END-CLICK";
 
     // The nested recovery program: line 3 is the outer IF, 4 the inner IF with OR, 8 its END, 9 the GOTO, 10 the
     // ASSIGN after it, 11 the outer END-IF and 12 the ASSIGN after the outer IF.
@@ -292,7 +297,8 @@ public sealed class ParserTests
         Assert.Equal(new[] { Warning(Parser.Commands.Form, 1) }, Summaries(program.Diagnostics));
     }
 
-    // Each case's skipped construct starts on line 3; the ASSIGN after it must survive the recovery.
+    // Each case's skipped construct starts on line 3; the ASSIGN after it must survive the recovery, and running the
+    // block has no other effect, even with A = "1" and B = "2", under which the XOR case's comparisons both hold.
     [Theory]
     [InlineData(Goto, "GOTO Z")]
     [InlineData(Hide, "HIDE A", "B")]
@@ -302,11 +308,24 @@ public sealed class ParserTests
     [InlineData(Parser.Commands.EnableExcept, "ENABLE * EXCEPT A")]
     [InlineData(Parser.Commands.CheckedLiteral, "IF A = (+) THEN", "ASSIGN Y = \"1\"", "END-IF")]
     [InlineData(Parser.Commands.NotEqual, "IF A <> \"1\" THEN", "ASSIGN Y = \"1\"", "END-IF")]
+    [InlineData(Parser.Commands.DisableExcept, "DISABLE * EXCEPT A")]
+    [InlineData(Parser.Commands.Clear, "CLEAR *")]
+    [InlineData(Parser.Commands.Clear, "CLEAR A, B")]
+    [InlineData(Parser.Commands.Disable, "DISABLE A + B")]
+    [InlineData(Parser.Commands.Dialog, "DIALOG \"m\" B YN")]
+    [InlineData(Parser.Commands.Dialog, "DIALOG B")]
+    [InlineData(Parser.Commands.Xor, "IF A = \"1\" XOR B = \"2\" THEN", "ASSIGN Y = \"1\"", "END-IF")]
+    [InlineData(Parser.Commands.Less, "IF A < 1 THEN", "ASSIGN Y = \"1\"", "END-IF")]
+    [InlineData(Parser.Commands.Greater, "IF A > 1 THEN", "ASSIGN Y = \"1\"", "END-IF")]
+    [InlineData(Parser.Commands.Like, "IF A LIKE \"x\" THEN", "ASSIGN Y = \"1\"", "END-IF")]
+    [InlineData(Parser.Commands.DateLiteral, "ASSIGN Y = 01/15/2011")]
+    [InlineData(Parser.Commands.Or, "ASSIGN Y = A OR B")]
     public void UnsupportedConstructIsDroppedWithOneWarningAndTheNextStatementIsKept(
         string command,
         params string[] skippedLines)
     {
-        ProgramNode program = Parse(InAfterBlock([.. skippedLines, "ASSIGN Z = \"x\""]));
+        string text = InAfterBlock([.. skippedLines, "ASSIGN Z = \"x\""]);
+        ProgramNode program = Parse(text);
 
         EventBlockNode after = OnlyEvent(program);
         AssertAssign(Assert.Single(after.Statements), "Z", "x");
@@ -314,6 +333,17 @@ public sealed class ParserTests
         // One warning only: a name list continued on the next line, such as HIDE's B, is skipped with its statement.
         Assert.Equal(new[] { Warning(command, 3) }, Summaries(after.Diagnostics));
         Assert.Equal(new[] { Warning(command, 3) }, Summaries(program.Diagnostics));
+
+        ICheckCodeEngine engine = new CheckCodeEngine();
+        FieldEventResponse response = engine.Run(
+            text,
+            TextForm("X", "A", "B", "Y", "Z"),
+            FieldEventKind.FieldAfter,
+            "X",
+            TextValues(("A", "1"), ("B", "2")));
+
+        AssertOnlyAssigned(response, ("Z", "x"));
+        Assert.Equal(new[] { Warning(command, 3) }, Summaries(response.Diagnostics));
     }
 
     [Fact]
@@ -332,6 +362,7 @@ public sealed class ParserTests
         Assert.Equal(new[] { Warning(Parser.Commands.NotEqual, 3) }, Summaries(after.Diagnostics));
     }
 
+    // Line 3 holds tokens that start no statement; the ASSIGN on line 4 is where the parse resynchronises.
     [Fact]
     public void UnrecognisedTokensDoNotStopTheBlocksThatFollow()
     {
@@ -356,11 +387,308 @@ public sealed class ParserTests
         Assert.NotNull(program);
         Assert.Contains(program.Diagnostics, diagnostic => diagnostic.Severity == DiagnosticSeverity.Warning);
 
-        // What survives inside X is the recovery's choice; Y must parse untouched.
+        // The junk is one warning and the ASSIGN after it survives; Y must parse untouched.
+        var expected = new[] { Warning(Parser.Commands.Syntax, 3) };
+        Assert.Equal(expected, Summaries(program.Diagnostics));
+        FieldBlockNode x = Assert.Single(program.FieldBlocks, block => block.FieldName == "X");
+        EventBlockNode xAfter = Assert.Single(x.Events);
+        AssertAssign(Assert.Single(xAfter.Statements), "Z", "x");
+        Assert.Equal(expected, Summaries(xAfter.Diagnostics));
+
         FieldBlockNode y = Assert.Single(program.FieldBlocks, block => block.FieldName == "Y");
         EventBlockNode after = Assert.Single(y.Events);
         Assert.Equal(FieldEventKind.FieldAfter, after.Event);
         AssertAssign(Assert.Single(after.Statements), "W", "y");
+        Assert.Empty(after.Diagnostics);
+
+        ICheckCodeEngine engine = new CheckCodeEngine();
+        FormMetadata form = TextForm("X", "Y", "Z", "W");
+
+        FieldEventResponse xResponse = engine.Run(text, form, FieldEventKind.FieldAfter, "X", TextValues());
+        AssertOnlyAssigned(xResponse, ("Z", "x"));
+        Assert.Equal(expected, Summaries(xResponse.Diagnostics));
+
+        FieldEventResponse yResponse = engine.Run(text, form, FieldEventKind.FieldAfter, "Y", TextValues());
+        AssertOnlyAssigned(yResponse, ("W", "y"));
+        Assert.Empty(yResponse.Diagnostics);
+    }
+
+    // The junk on lines 7-8 holds no command and no name, so nothing resynchronises before End-After: the rest of
+    // the After block is skipped with one warning. The statements before it end with an IF closed by END-IF on
+    // line 6, so the junk never trails an ASSIGN expression.
+    [Fact]
+    public void TokensThatCannotBeResynchronisedSkipTheRestOfTheirEventBlockOnly()
+    {
+        const string text = """
+            Field X
+            	After
+            		ASSIGN Z = "before"
+            		IF A = "1" THEN
+            			ASSIGN Y = "if"
+            		END-IF
+            		) ( , = , "s" 5
+            		, 7
+            	End-After
+            	Click
+            		ASSIGN Z = "click"
+            	End-Click
+            End-Field
+            Field Y
+            	After
+            		ASSIGN W = "y"
+            	End-After
+            End-Field
+            """;
+
+        ProgramNode program = Parse(text);
+
+        // One warning, and no missing END-AFTER: the skip stops before the terminator, which closes the block.
+        var expected = new[] { Warning(Parser.Commands.Syntax, 7) };
+        Assert.Equal(expected, Summaries(program.Diagnostics));
+
+        Assert.Equal(new[] { "X", "Y" }, program.FieldBlocks.Select(block => block.FieldName));
+        FieldBlockNode x = program.FieldBlocks[0];
+        Assert.Equal(
+            new[] { FieldEventKind.FieldAfter, FieldEventKind.FieldClick },
+            x.Events.Select(eventBlock => eventBlock.Event));
+        Assert.Collection(
+            x.Events[0].Statements,
+            statement => AssertAssign(statement, "Z", "before"),
+            statement =>
+            {
+                IfStatementNode ifStatement = Assert.IsType<IfStatementNode>(statement);
+                AssertAssign(Assert.Single(ifStatement.Then), "Y", "if");
+                Assert.Null(ifStatement.Else);
+            });
+        Assert.Equal(expected, Summaries(x.Events[0].Diagnostics));
+        AssertAssign(Assert.Single(x.Events[1].Statements), "Z", "click");
+        Assert.Empty(x.Events[1].Diagnostics);
+
+        EventBlockNode yAfter = Assert.Single(program.FieldBlocks[1].Events);
+        AssertAssign(Assert.Single(yAfter.Statements), "W", "y");
+        Assert.Empty(yAfter.Diagnostics);
+
+        ICheckCodeEngine engine = new CheckCodeEngine();
+        FormMetadata form = TextForm("X", "Y", "Z", "W", "A");
+        Dictionary<string, FieldValue> values = TextValues(("A", "1"));
+
+        FieldEventResponse xAfterResponse = engine.Run(text, form, FieldEventKind.FieldAfter, "X", values);
+        AssertOnlyAssigned(xAfterResponse, ("Z", "before"), ("Y", "if"));
+        Assert.Equal(expected, Summaries(xAfterResponse.Diagnostics));
+
+        FieldEventResponse xClickResponse = engine.Run(text, form, FieldEventKind.FieldClick, "X", values);
+        AssertOnlyAssigned(xClickResponse, ("Z", "click"));
+        Assert.Empty(xClickResponse.Diagnostics);
+
+        FieldEventResponse yResponse = engine.Run(text, form, FieldEventKind.FieldAfter, "Y", values);
+        AssertOnlyAssigned(yResponse, ("W", "y"));
+        Assert.Empty(yResponse.Diagnostics);
+    }
+
+    // Parentheses count toward Parser.MaxNestingDepth. One level past it gives one warning on line 4, where the
+    // parentheses open, keeps the statement before it and skips the rest of X's After block, which still closes, so
+    // Field Y (line 8) runs.
+    [Theory]
+    [InlineData(Parser.MaxNestingDepth)]
+    [InlineData(Parser.MaxNestingDepth + 1)]
+    public void NestingCeilingKeepsTheStatementsBeforeItAndTheBlocksAfterIt(int depth)
+    {
+        string text = InAfterBlock(
+                "ASSIGN Z = \"before\"",
+                "ASSIGN Y = " + new string('(', depth) + "1" + new string(')', depth),
+                "ASSIGN W = \"after\"")
+            + "\nField Y\n\tAfter\n\t\tASSIGN V = \"y\"\n\tEnd-After\nEnd-Field";
+        bool exceeded = depth > Parser.MaxNestingDepth;
+
+        ProgramNode program = Parse(text);
+
+        (DiagnosticSeverity Severity, string Command, int Line)[] expected =
+            exceeded ? [Warning(Parser.Commands.Nesting, 4)] : [];
+        Assert.Equal(expected, Summaries(program.Diagnostics));
+        Assert.Equal(new[] { "X", "Y" }, program.FieldBlocks.Select(block => block.FieldName));
+        Assert.Equal(8, program.FieldBlocks[1].Line);
+
+        EventBlockNode xAfter = Assert.Single(program.FieldBlocks[0].Events);
+        Assert.Equal(expected, Summaries(xAfter.Diagnostics));
+        if (exceeded)
+        {
+            AssertAssign(Assert.Single(xAfter.Statements), "Z", "before");
+        }
+        else
+        {
+            Assert.Collection(
+                xAfter.Statements,
+                statement => AssertAssign(statement, "Z", "before"),
+                statement =>
+                {
+                    // The tree has no grouping node, so every parenthesis unwraps to the literal.
+                    AssignStatementNode deep = Assert.IsType<AssignStatementNode>(statement);
+                    Assert.Equal("Y", deep.Target);
+                    LiteralNode value = Assert.IsType<LiteralNode>(deep.Value);
+                    Assert.Equal(LiteralKind.Number, value.Kind);
+                    Assert.Equal(1.0, value.Number);
+                },
+                statement => AssertAssign(statement, "W", "after"));
+        }
+
+        EventBlockNode yAfter = Assert.Single(program.FieldBlocks[1].Events);
+        AssertAssign(Assert.Single(yAfter.Statements), "V", "y");
+        Assert.Empty(yAfter.Diagnostics);
+
+        ICheckCodeEngine engine = new CheckCodeEngine();
+        FormMetadata form = TextForm("X", "Y", "Z", "W", "V");
+
+        FieldEventResponse xResponse = engine.Run(text, form, FieldEventKind.FieldAfter, "X", TextValues());
+        if (exceeded)
+        {
+            AssertOnlyAssigned(xResponse, ("Z", "before"));
+        }
+        else
+        {
+            // The number 1 is assigned to a Text field, so it arrives as its invariant text.
+            AssertOnlyAssigned(xResponse, ("Z", "before"), ("Y", "1"), ("W", "after"));
+        }
+
+        Assert.Equal(expected, Summaries(xResponse.Diagnostics));
+
+        FieldEventResponse yResponse = engine.Run(text, form, FieldEventKind.FieldAfter, "Y", TextValues());
+        AssertOnlyAssigned(yResponse, ("V", "y"));
+        Assert.Empty(yResponse.Diagnostics);
+    }
+
+    // Line 275: ALWAYS … END is one unsupported statement. Skipped inside the IF's THEN branch (lines 4-6), its END
+    // closes only the ALWAYS, so the IF still ends at its own END-IF on line 8 and keeps the ASSIGN on line 7.
+    [Fact]
+    public void AlwaysBlockInsideAnIfBranchIsSkippedWithoutClosingTheIf()
+    {
+        string text = InAfterBlock(
+            "IF A = \"1\" THEN",
+            "ALWAYS",
+            "GOTO B",
+            "END",
+            "ASSIGN Y = \"in\"",
+            "END-IF",
+            "ASSIGN Z = \"x\"");
+
+        ProgramNode program = Parse(text);
+
+        EventBlockNode after = OnlyEvent(program);
+        Assert.Collection(
+            after.Statements,
+            statement =>
+            {
+                IfStatementNode ifStatement = Assert.IsType<IfStatementNode>(statement);
+                AssertAssign(Assert.Single(ifStatement.Then), "Y", "in");
+                Assert.Null(ifStatement.Else);
+            },
+            statement => AssertAssign(statement, "Z", "x"));
+
+        // The GOTO is skipped with the ALWAYS, so it adds no warning of its own.
+        var expected = new[] { Warning(Always, 4) };
+        Assert.Equal(expected, Summaries(after.Diagnostics));
+        Assert.Equal(expected, Summaries(program.Diagnostics));
+
+        ICheckCodeEngine engine = new CheckCodeEngine();
+        FieldEventResponse response = engine.Run(
+            text,
+            TextForm("X", "A", "B", "Y", "Z"),
+            FieldEventKind.FieldAfter,
+            "X",
+            TextValues(("A", "1")));
+
+        AssertOnlyAssigned(response, ("Y", "in"), ("Z", "x"));
+        Assert.Equal(expected, Summaries(response.Diagnostics));
+    }
+
+    // An ALWAYS at event level (line 3) counts the IF nested in it against that IF's END-IF (line 6), so its own END
+    // on line 7 ends the skip and End-After still closes the block.
+    [Fact]
+    public void IfInsideASkippedAlwaysBlockIsSkippedWithIt()
+    {
+        string text = InAfterBlock(
+            "ALWAYS",
+            "IF A = \"1\" THEN",
+            "HIDE B",
+            "END-IF",
+            "END",
+            "ASSIGN Z = \"x\"");
+
+        ProgramNode program = Parse(text);
+
+        // One warning: no HIDE, no stray END and no missing END-AFTER.
+        EventBlockNode after = OnlyEvent(program);
+        AssertAssign(Assert.Single(after.Statements), "Z", "x");
+        var expected = new[] { Warning(Always, 3) };
+        Assert.Equal(expected, Summaries(after.Diagnostics));
+        Assert.Equal(expected, Summaries(program.Diagnostics));
+
+        ICheckCodeEngine engine = new CheckCodeEngine();
+        FieldEventResponse response = engine.Run(
+            text,
+            TextForm("X", "A", "B", "Z"),
+            FieldEventKind.FieldAfter,
+            "X",
+            TextValues(("A", "1")));
+
+        AssertOnlyAssigned(response, ("Z", "x"));
+        Assert.Equal(expected, Summaries(response.Diagnostics));
+    }
+
+    // The skip of an unsupported statement in an IF branch (line 4) stops at the IF's END-IF (line 5), which still
+    // closes the IF, now with an empty THEN branch.
+    [Fact]
+    public void UnsupportedStatementInAnIfBranchStopsAtTheIfTerminator()
+    {
+        string text = InAfterBlock(
+            "IF A = \"1\" THEN",
+            "HIDE B",
+            "END-IF",
+            "ASSIGN Z = \"x\"");
+
+        ProgramNode program = Parse(text);
+
+        EventBlockNode after = OnlyEvent(program);
+        Assert.Collection(
+            after.Statements,
+            statement =>
+            {
+                IfStatementNode ifStatement = Assert.IsType<IfStatementNode>(statement);
+                EqualsNode condition = Assert.IsType<EqualsNode>(ifStatement.Condition);
+                AssertIdentifier(condition.Left, "A");
+                AssertStringLiteral(condition.Right, "1");
+                Assert.Empty(ifStatement.Then);
+                Assert.Null(ifStatement.Else);
+            },
+            statement => AssertAssign(statement, "Z", "x"));
+
+        var expected = new[] { Warning(Hide, 4) };
+        Assert.Equal(expected, Summaries(after.Diagnostics));
+        Assert.Equal(expected, Summaries(program.Diagnostics));
+
+        ICheckCodeEngine engine = new CheckCodeEngine();
+        FieldEventResponse response = engine.Run(
+            text,
+            TextForm("X", "A", "B", "Z"),
+            FieldEventKind.FieldAfter,
+            "X",
+            TextValues(("A", "1")));
+
+        AssertOnlyAssigned(response, ("Z", "x"));
+        Assert.Equal(expected, Summaries(response.Diagnostics));
+    }
+
+    /// <summary>
+    /// Asserts that a field event assigned exactly <paramref name="expected"/>, as text and in that order, and had no
+    /// other effect: nothing enabled, disabled or cleared and no dialog.
+    /// </summary>
+    private static void AssertOnlyAssigned(FieldEventResponse response, params (string Name, string Text)[] expected)
+    {
+        Assert.Empty(response.Enabled);
+        Assert.Empty(response.Disabled);
+        Assert.Empty(response.Cleared);
+        Assert.Empty(response.Dialogs);
+        Assert.Equal(expected.Select(entry => entry.Name), response.Assigned.Keys);
+        Assert.All(expected, entry => Assert.Equal(entry.Text, response.Assigned[entry.Name].AsText()));
     }
 
     [Fact]
@@ -862,10 +1190,397 @@ public sealed class ParserTests
         Assert.Empty(program.Diagnostics);
     }
 
+    // Line 285: an implicit assignment has no keyword, yet it starts the next statement, so a name list ends before
+    // its target and keeps every name in front of it; the qualified and grid targets are the Qualified ID forms of
+    // lines 173-181. The list is line 3, the assignment line 4 and its one warning the only diagnostic.
+    [Theory]
+    [InlineData(Parser.Commands.Enable, "A", "B = 1")]
+    [InlineData(Parser.Commands.Disable, "A", "B = 1")]
+    [InlineData(Parser.Commands.Clear, "A B", "C = 1")]
+    [InlineData(Parser.Commands.Enable, "A", "B.C = 1")]
+    [InlineData(Parser.Commands.Enable, "A", "B[1, C] = 1")]
+    [InlineData(Parser.Commands.Enable, "NUMERIC", "B = 1")]
+    public void NameListEndsBeforeAnImplicitAssignment(string command, string names, string assignment)
+    {
+        string text = InAfterBlock($"{command} {names}", assignment, "ASSIGN Z = \"next\"");
+        ProgramNode program = Parse(text);
+
+        EventBlockNode after = OnlyEvent(program);
+        Assert.Equal(2, after.Statements.Count);
+        IReadOnlyList<string> kept = command switch
+        {
+            Parser.Commands.Enable => Assert.IsType<EnableStatementNode>(after.Statements[0]).Names,
+            Parser.Commands.Disable => Assert.IsType<DisableStatementNode>(after.Statements[0]).Names,
+            _ => Assert.IsType<ClearStatementNode>(after.Statements[0]).Names,
+        };
+        Assert.Equal(names.Split(' '), kept);
+        AssertAssign(after.Statements[1], "Z", "next");
+
+        var expected = new[] { Warning(Parser.Commands.ImplicitAssign, 4) };
+        Assert.Equal(expected, Summaries(after.Diagnostics));
+        Assert.Equal(expected, Summaries(program.Diagnostics));
+
+        FieldEventResponse response = new CheckCodeEngine().Run(
+            text,
+            TextForm("X", "A", "B", "C", "NUMERIC", "Z"),
+            FieldEventKind.FieldAfter,
+            "X",
+            TextValues());
+
+        IReadOnlyList<string> affected = command switch
+        {
+            Parser.Commands.Enable => response.Enabled,
+            Parser.Commands.Disable => response.Disabled,
+            _ => response.Cleared,
+        };
+        Assert.Equal(names.Split(' '), affected);
+        Assert.Equal(new[] { "Z" }, response.Assigned.Keys);
+        Assert.Equal("next", response.Assigned["Z"].AsText());
+        Assert.Equal(expected, Summaries(response.Diagnostics));
+    }
+
+    // DIALOG (lines 364, 385) ends before an implicit assignment on line 4, with or without its title, and still runs.
+    [Theory]
+    [InlineData("DIALOG \"m\"", null)]
+    [InlineData("DIALOG \"m\" TITLETEXT = \"T\"", "T")]
+    public void DialogEndsBeforeAnImplicitAssignment(string statement, string? title)
+    {
+        string text = InAfterBlock(statement, "B = 1", "ASSIGN Z = \"next\"");
+        ProgramNode program = Parse(text);
+
+        EventBlockNode after = OnlyEvent(program);
+        Assert.Collection(
+            after.Statements,
+            kept =>
+            {
+                DialogStatementNode dialog = Assert.IsType<DialogStatementNode>(kept);
+                Assert.Equal(("m", title), (dialog.Message, dialog.Title));
+            },
+            kept => AssertAssign(kept, "Z", "next"));
+
+        var expected = new[] { Warning(Parser.Commands.ImplicitAssign, 4) };
+        Assert.Equal(expected, Summaries(after.Diagnostics));
+        Assert.Equal(expected, Summaries(program.Diagnostics));
+
+        FieldEventResponse response = new CheckCodeEngine().Run(
+            text,
+            TextForm("X", "B", "Z"),
+            FieldEventKind.FieldAfter,
+            "X",
+            TextValues());
+
+        DialogMessage shown = Assert.Single(response.Dialogs);
+        Assert.Equal(("m", title), (shown.Message, shown.Title));
+        Assert.Equal(new[] { "Z" }, response.Assigned.Keys);
+        Assert.Equal("next", response.Assigned["Z"].AsText());
+        Assert.Equal(expected, Summaries(response.Diagnostics));
+    }
+
+    // GEOCODE (line 636) ends before an implicit assignment on line 4: it keeps its node and its one info diagnostic.
+    [Fact]
+    public void GeocodeEndsBeforeAnImplicitAssignment()
+    {
+        string text = InAfterBlock("GEOCODE A, B, C", "D = 1", "ASSIGN Z = \"next\"");
+        ProgramNode program = Parse(text);
+
+        EventBlockNode after = OnlyEvent(program);
+        Assert.Collection(
+            after.Statements,
+            kept => Assert.Equal(new[] { "A", "B", "C" }, Assert.IsType<GeocodeStatementNode>(kept).Arguments),
+            kept => AssertAssign(kept, "Z", "next"));
+
+        var expected = new[]
+        {
+            (DiagnosticSeverity.Info, Parser.Commands.Geocode, 3),
+            Warning(Parser.Commands.ImplicitAssign, 4),
+        };
+        Assert.Equal(expected, Summaries(after.Diagnostics));
+        Assert.Equal(expected, Summaries(program.Diagnostics));
+
+        FieldEventResponse response = new CheckCodeEngine().Run(
+            text,
+            TextForm("X", "A", "B", "C", "D", "Z"),
+            FieldEventKind.FieldAfter,
+            "X",
+            TextValues());
+
+        Assert.Equal(new[] { "Z" }, response.Assigned.Keys);
+        Assert.Equal(expected, Summaries(response.Diagnostics));
+    }
+
+    // A skipped statement on line 3 ends where an implicit assignment starts after a token that can end it: a name, a
+    // literal, character literals included, a File or Url operand (lines 25-26, 41), a built-in value (line 254), a
+    // command that is a whole statement alone (BEEP, EXIT, NEWRECORD, QUIT, SAVE-RECORD; lines 297, 404, 452, 609,
+    // 645), ')' or the '*' of UNHIDE *, SET-REQUIRED *, UNDEFINE * or UNHIGHLIGHT * (lines 422, 427, 468, 476). The
+    // assignment on line 4 is reported once, and the ASSIGN after it runs. Where a statement starts, a keyword no
+    // statement reserves, such as NUMERIC, is the target of an implicit assignment, as it is a name elsewhere.
+    [Theory]
+    [InlineData("BEEP", "BEEP")]
+    [InlineData("EXIT", "EXIT")]
+    [InlineData("NEWRECORD", "NEWRECORD")]
+    [InlineData("QUIT", "QUIT")]
+    [InlineData("SAVE-RECORD", "SAVE-RECORD")]
+    [InlineData(Goto, "GOTO Z")]
+    [InlineData("UNHIDE", "UNHIDE *")]
+    [InlineData("SET-REQUIRED", "SET-REQUIRED *")]
+    [InlineData("UNDEFINE", "UNDEFINE *")]
+    [InlineData("UNHIGHLIGHT", "UNHIGHLIGHT *")]
+    [InlineData(Parser.Commands.Plus, "ASSIGN Y = (1 + 2)")]
+    [InlineData(SystemDate, "ASSIGN Y = SYSTEMDATE")]
+    [InlineData(Parser.Commands.ImplicitAssign, "C = D")]
+    [InlineData(Parser.Commands.ImplicitAssign, "NUMERIC = 1")]
+    [InlineData(Parser.Commands.Syntax, "\"text\"")]
+    [InlineData("EXECUTE", "EXECUTE http://x")]
+    [InlineData("EXECUTE", "EXECUTE 'C:\\a b\\x.exe'")]
+    [InlineData("COMMANDLINE", "COMMANDLINE C:\\x\\p.prj")]
+    [InlineData(Parser.Commands.Syntax, "'x'")]
+    public void SkippedStatementEndsBeforeAnImplicitAssignment(string command, string statement)
+    {
+        string text = InAfterBlock(statement, "B = 1", "ASSIGN Z = \"next\"");
+        ProgramNode program = Parse(text);
+
+        EventBlockNode after = OnlyEvent(program);
+        AssertAssign(Assert.Single(after.Statements), "Z", "next");
+
+        var expected = new[] { Warning(command, 3), Warning(Parser.Commands.ImplicitAssign, 4) };
+        Assert.Equal(expected, Summaries(after.Diagnostics));
+        Assert.Equal(expected, Summaries(program.Diagnostics));
+
+        FieldEventResponse response = new CheckCodeEngine().Run(
+            text,
+            TextForm("X", "B", "C", "D", "Y", "Z"),
+            FieldEventKind.FieldAfter,
+            "X",
+            TextValues());
+
+        Assert.Equal(new[] { "Z" }, response.Assigned.Keys);
+        Assert.Equal(expected, Summaries(response.Diagnostics));
+    }
+
+    // A command that is a whole statement alone (lines 297, 404, 452, 609, 645) ends before an implicit assignment on
+    // its own line as well, so line 3 gives the command's warning and then the assignment's, and only the ASSIGN on
+    // line 4 runs.
+    [Theory]
+    [InlineData("BEEP")]
+    [InlineData("EXIT")]
+    [InlineData("NEWRECORD")]
+    [InlineData("QUIT")]
+    [InlineData("SAVE-RECORD")]
+    public void ZeroOperandCommandEndsBeforeAnImplicitAssignmentOnItsLine(string command)
+    {
+        string text = InAfterBlock($"{command} B = 1", "ASSIGN Z = \"next\"");
+        ProgramNode program = Parse(text);
+
+        EventBlockNode after = OnlyEvent(program);
+        AssertAssign(Assert.Single(after.Statements), "Z", "next");
+
+        var expected = new[] { Warning(command, 3), Warning(Parser.Commands.ImplicitAssign, 3) };
+        Assert.Equal(expected, Summaries(after.Diagnostics));
+        Assert.Equal(expected, Summaries(program.Diagnostics));
+
+        FieldEventResponse response = new CheckCodeEngine().Run(
+            text,
+            TextForm("X", "B", "Z"),
+            FieldEventKind.FieldAfter,
+            "X",
+            TextValues());
+
+        AssertOnlyAssigned(response, ("Z", "next"));
+        Assert.Equal(expected, Summaries(response.Diagnostics));
+    }
+
+    // After an operator, a command or a keyword that takes an operand, "B = ..." is that operand followed by a
+    // comparison, never an implicit assignment, so each case keeps exactly one warning, on line 3. Inside a statement
+    // a keyword followed by '=' is that statement's option, never an assignment target (lines 173-181 build the
+    // target from Identifier): COMMANDLINE takes PGMNAME = File and VIEWNAME = File : String in either order, on one
+    // line or across two (lines 308-326). Neither the dropped IF's ASSIGN nor any skipped assignment runs; the ASSIGN
+    // after the case does.
+    [Theory]
+    [InlineData(Parser.Commands.NotEqual, "IF A <> \"1\" AND B = \"2\" THEN", "ASSIGN Y = \"1\"", "END-IF")]
+    [InlineData(Parser.Commands.Plus, "ASSIGN Y = 1 + A = 2")]
+    [InlineData(Parser.Commands.Multiply, "ASSIGN Y = A * B = 1")]
+    [InlineData("LET", "LET A = 1")]
+    [InlineData("DEFINE", "DEFINE V = 1")]
+    [InlineData(Parser.Commands.Enable, "ENABLE B = 1")]
+    [InlineData(Parser.Commands.ImplicitAssign, "B = C = 1")]
+    [InlineData("COMMANDLINE", "COMMANDLINE PGMNAME = 'C:\\first.prj'", "VIEWNAME = 'C:\\second.prj' : \"v\"")]
+    [InlineData("COMMANDLINE", "COMMANDLINE PGMNAME = 'C:\\first.prj' VIEWNAME = 'C:\\second.prj' : \"v\"")]
+    [InlineData("COMMANDLINE", "COMMANDLINE VIEWNAME = 'C:\\second.prj' : \"v\"", "PGMNAME = 'C:\\first.prj'")]
+    [InlineData("COMMANDLINE", "COMMANDLINE VIEWNAME = 'C:\\second.prj' : \"v\" PGMNAME = 'C:\\first.prj'")]
+    public void NameAfterAnOperatorOrAnOperandKeywordStartsNoImplicitAssignment(
+        string command,
+        params string[] lines)
+    {
+        string text = InAfterBlock([.. lines, "ASSIGN Z = \"next\""]);
+        ProgramNode program = Parse(text);
+
+        EventBlockNode after = OnlyEvent(program);
+        AssertAssign(Assert.Single(after.Statements), "Z", "next");
+
+        var expected = new[] { Warning(command, 3) };
+        Assert.Equal(expected, Summaries(after.Diagnostics));
+        Assert.Equal(expected, Summaries(program.Diagnostics));
+
+        FieldEventResponse response = new CheckCodeEngine().Run(
+            text,
+            TextForm("X", "A", "B", "C", "V", "Y", "Z"),
+            FieldEventKind.FieldAfter,
+            "X",
+            TextValues(("A", "1"), ("B", "2")));
+
+        Assert.Equal(new[] { "Z" }, response.Assigned.Keys);
+        Assert.Equal(expected, Summaries(response.Diagnostics));
+    }
+
+    // The ALWAYS after AUTOSEARCH's operands (lines 290-293) is its modifier unless it opens ALWAYS ... END (line 275):
+    // it does only when a statement starts its body (line 74) and, with it open, the terminators before End-After close
+    // it, the ALWAYS being skipped and every enclosing IF, END closing any construct and END-IF only an IF. Line breaks
+    // carry no meaning. An ALWAYS is skipped whole with one warning, each IF and ALWAYS nested in it matched against
+    // its own terminator, and a statement-level AUTOSEARCH has one warning of its own. Each expected warning is written
+    // COMMAND:line and each assignment Field=text; ASSIGN Z = "next" follows every case, and nothing else runs.
+    [Theory]
+    [InlineData("ALWAYS:3", "Z=next", "ALWAYS", "AUTOSEARCH A ALWAYS", "END")]
+    [InlineData("ALWAYS:3", "Z=next", "ALWAYS", "AUTOSEARCH A DISPLAYLIST B ALWAYS", "END")]
+    [InlineData("ALWAYS:3", "Z=next", "ALWAYS", "IF A = \"1\" THEN", "AUTOSEARCH A ALWAYS", "END-IF", "END")]
+    [InlineData("ALWAYS:3", "Z=next", "ALWAYS", "IF A = \"1\" THEN", "ALWAYS", "HIDE B", "END", "END-IF", "END")]
+    [InlineData("AUTOSEARCH:3", "Z=next", "AUTOSEARCH A DISPLAYLIST B ALWAYS")]
+    [InlineData(
+        "ALWAYS:3",
+        "Z=next",
+        "ALWAYS",
+        "AUTOSEARCH A",
+        "ALWAYS",
+        "ASSIGN B = \"inner\"",
+        "END",
+        "ASSIGN W = \"outer\"",
+        "END")]
+    [InlineData("ALWAYS:3", "Z=next", "ALWAYS AUTOSEARCH A ALWAYS ASSIGN B = \"inner\" END ASSIGN W = \"outer\" END")]
+    [InlineData("ALWAYS:3", "Z=next", "ALWAYS", "AUTOSEARCH A", "ALWAYS", "AUTOSEARCH B ALWAYS", "END", "END")]
+    [InlineData(
+        "ALWAYS:3",
+        "Z=next",
+        "ALWAYS",
+        "AUTOSEARCH A",
+        "ALWAYS",
+        "AUTOSEARCH B",
+        "ALWAYS",
+        "GOTO C",
+        "END",
+        "END",
+        "END")]
+    [InlineData("ALWAYS:4", "Z=next", "IF A = \"1\" THEN", "ALWAYS", "AUTOSEARCH A ALWAYS", "END", "END")]
+    [InlineData(
+        "ALWAYS:4",
+        "Z=next",
+        "IF A = \"1\" THEN",
+        "ALWAYS",
+        "AUTOSEARCH A ALWAYS",
+        "ASSIGN B = \"inner\"",
+        "END",
+        "END")]
+    [InlineData(
+        "ALWAYS:4",
+        "Z=next",
+        "IF A = \"1\" THEN",
+        "ALWAYS",
+        "AUTOSEARCH A",
+        "ALWAYS",
+        "ASSIGN B = \"inner\"",
+        "END",
+        "END",
+        "END-IF")]
+    [InlineData(
+        "ALWAYS:4 END-IF:8",
+        "Z=next",
+        "IF A = \"1\" THEN",
+        "ALWAYS",
+        "AUTOSEARCH A ALWAYS",
+        "END",
+        "END",
+        "END-IF")]
+    [InlineData("AUTOSEARCH:3", "Y=y Z=next", "AUTOSEARCH A ALWAYS", "ASSIGN Y = \"y\"")]
+    [InlineData("AUTOSEARCH:3 ALWAYS:4", "Z=next", "AUTOSEARCH A", "ALWAYS", "GOTO B", "END")]
+    [InlineData("AUTOSEARCH:3 END:4", "Z=next", "AUTOSEARCH A ALWAYS", "END")]
+    [InlineData("AUTOSEARCH:4", "Y=y Z=next", "IF A = \"1\" THEN", "AUTOSEARCH A ALWAYS", "ASSIGN Y = \"y\"", "END")]
+    [InlineData(
+        "AUTOSEARCH:4 ALWAYS:5",
+        "Z=next",
+        "IF A = \"1\" THEN",
+        "AUTOSEARCH A",
+        "ALWAYS",
+        "ASSIGN Y = \"y\"",
+        "END",
+        "END-IF")]
+    public void AutoSearchModifierOpensNoBlockAndAlwaysIsSkippedWhole(
+        string warnings,
+        string assigned,
+        params string[] lines)
+    {
+        string text = InAfterBlock([.. lines, "ASSIGN Z = \"next\""]);
+        ProgramNode program = Parse(text);
+
+        EventBlockNode after = OnlyEvent(program);
+        AssertAssign(after.Statements[^1], "Z", "next");
+
+        (DiagnosticSeverity Severity, string Command, int Line)[] expected =
+        [
+            .. warnings.Split(' ')
+                .Select(entry => entry.Split(':'))
+                .Select(parts => Warning(
+                    parts[0],
+                    int.Parse(parts[1], System.Globalization.CultureInfo.InvariantCulture))),
+        ];
+        Assert.Equal(expected, Summaries(after.Diagnostics));
+        Assert.Equal(expected, Summaries(program.Diagnostics));
+
+        FieldEventResponse response = new CheckCodeEngine().Run(
+            text,
+            TextForm("X", "A", "B", "C", "W", "Y", "Z"),
+            FieldEventKind.FieldAfter,
+            "X",
+            TextValues(("A", "1")));
+
+        AssertOnlyAssigned(
+            response,
+            [.. assigned.Split(' ').Select(entry => entry.Split('=')).Select(parts => (parts[0], parts[1]))]);
+        Assert.Equal(expected, Summaries(response.Diagnostics));
+    }
+
+    // The WAITFOREXIT or NOWAITFOREXIT after EXECUTE is its modifier (lines 392-400), so EXECUTE gets the one warning
+    // on line 3; written first, WAITFOREXIT is its own statement (line 581) with its own one warning.
+    [Theory]
+    [InlineData("EXECUTE", "EXECUTE WAITFOREXIT \"x\"")]
+    [InlineData("EXECUTE", "EXECUTE NOWAITFOREXIT \"x\"")]
+    [InlineData("WAITFOREXIT", "WAITFOREXIT \"a\" \"b\"")]
+    public void ExecuteModifierIsPartOfItsStatement(string command, string statement)
+    {
+        string text = InAfterBlock(statement, "ASSIGN Z = \"next\"");
+        ProgramNode program = Parse(text);
+
+        EventBlockNode after = OnlyEvent(program);
+        AssertAssign(Assert.Single(after.Statements), "Z", "next");
+
+        var expected = new[] { Warning(command, 3) };
+        Assert.Equal(expected, Summaries(after.Diagnostics));
+        Assert.Equal(expected, Summaries(program.Diagnostics));
+
+        FieldEventResponse response = new CheckCodeEngine().Run(
+            text,
+            TextForm("X", "Z"),
+            FieldEventKind.FieldAfter,
+            "X",
+            TextValues());
+
+        Assert.Equal(new[] { "Z" }, response.Assigned.Keys);
+        Assert.Equal("next", response.Assigned["Z"].AsText());
+        Assert.Equal(expected, Summaries(response.Diagnostics));
+    }
+
     [Theory]
     [InlineData("YEARS")]
     [InlineData("years")]
     [InlineData("Years")]
+    [InlineData("[YEARS]")]
     public void YearsCallKeepsItsArgumentsAndAnUpperCaseName(string spelling)
     {
         ProgramNode program = Parse(InAfterBlock($"ASSIGN AGE = {spelling}(DOB, DateofInterview)"));
@@ -922,6 +1637,257 @@ public sealed class ParserTests
         Assert.Equal(expected, Summaries(program.Diagnostics));
     }
 
+    // Line 30 makes a bracketed word an identifier, so it never plays a keyword's role, and a required name slot
+    // (lines 281, 636) never takes the keyword that starts the next statement. Each case starts on line 3, gives
+    // exactly one warning there, and leaves the ASSIGN after it to parse and run; B = "1" would run any IF that
+    // wrongly survived.
+    [Theory]
+    [InlineData(Parser.Commands.ImplicitAssign, "[ASSIGN] = \"1\"")]
+    [InlineData(Parser.Commands.If, "IF B = \"1\" [THEN] ASSIGN Y = \"1\"", "END-IF")]
+    [InlineData(SystemDate, "ASSIGN Y = SYSTEMDATE")]
+    [InlineData(Parser.Commands.Assign, "ASSIGN")]
+    [InlineData(Parser.Commands.Geocode, "GEOCODE")]
+    [InlineData(Parser.Commands.Geocode, "GEOCODE A")]
+    [InlineData(Parser.Commands.Geocode, "GEOCODE A,")]
+    [InlineData(Parser.Commands.Geocode, "GEOCODE A, B")]
+    [InlineData(Parser.Commands.Geocode, "GEOCODE A, B,")]
+    public void KeywordRoleErrorIsReportedOnceAndTheNextStatementRuns(string command, params string[] lines)
+    {
+        string text = InAfterBlock([.. lines, "ASSIGN Z = \"next\""]);
+
+        EventBlockNode after = OnlyEvent(Parse(text));
+        AssertAssign(Assert.Single(after.Statements), "Z", "next");
+        Assert.Equal(new[] { Warning(command, 3) }, Summaries(after.Diagnostics));
+
+        FieldEventResponse response = new CheckCodeEngine().Run(
+            text,
+            TextForm("X", "A", "B", "Y", "Z"),
+            FieldEventKind.FieldAfter,
+            "X",
+            TextValues(("B", "1")));
+
+        Assert.Equal(new[] { "Z" }, response.Assigned.Keys);
+        Assert.Equal("next", response.Assigned["Z"].AsText());
+    }
+
+    // [ASSIGN] is a name, so it starts no statement and A is never assigned: the name alone is junk, and the
+    // A = "1" after it is an implicit assignment (line 285), each reported on line 3 in that order.
+    [Fact]
+    public void BracketedCommandWordStartsNoStatement()
+    {
+        string text = InAfterBlock("[ASSIGN] A = \"1\"", "ASSIGN Z = \"next\"");
+        ProgramNode program = Parse(text);
+
+        EventBlockNode after = OnlyEvent(program);
+        AssertAssign(Assert.Single(after.Statements), "Z", "next");
+
+        var expected = new[] { Warning(Parser.Commands.Syntax, 3), Warning(Parser.Commands.ImplicitAssign, 3) };
+        Assert.Equal(expected, Summaries(after.Diagnostics));
+        Assert.Equal(expected, Summaries(program.Diagnostics));
+
+        FieldEventResponse response = new CheckCodeEngine().Run(
+            text,
+            TextForm("X", "A", "Z"),
+            FieldEventKind.FieldAfter,
+            "X",
+            TextValues());
+
+        AssertOnlyAssigned(response, ("Z", "next"));
+        Assert.Equal(expected, Summaries(response.Diagnostics));
+    }
+
+    // [TITLETEXT] is a name, not the option of line 385, so DIALOG "m" is complete without a title (line 364) and
+    // [TITLETEXT] = "t" after it is an implicit assignment (line 285), reported on line 3.
+    [Fact]
+    public void BracketedTitleTextIsNotTheDialogOption()
+    {
+        string text = InAfterBlock("DIALOG \"m\" [TITLETEXT] = \"t\"", "ASSIGN Z = \"next\"");
+        ProgramNode program = Parse(text);
+
+        EventBlockNode after = OnlyEvent(program);
+        Assert.Collection(
+            after.Statements,
+            kept =>
+            {
+                DialogStatementNode dialog = Assert.IsType<DialogStatementNode>(kept);
+                Assert.Equal("m", dialog.Message);
+                Assert.Null(dialog.Title);
+            },
+            kept => AssertAssign(kept, "Z", "next"));
+
+        var expected = new[] { Warning(Parser.Commands.ImplicitAssign, 3) };
+        Assert.Equal(expected, Summaries(after.Diagnostics));
+        Assert.Equal(expected, Summaries(program.Diagnostics));
+
+        FieldEventResponse response = new CheckCodeEngine().Run(
+            text,
+            TextForm("X", "Z"),
+            FieldEventKind.FieldAfter,
+            "X",
+            TextValues());
+
+        DialogMessage shown = Assert.Single(response.Dialogs);
+        Assert.Equal("m", shown.Message);
+        Assert.Null(shown.Title);
+        Assert.Empty(response.Enabled);
+        Assert.Empty(response.Disabled);
+        Assert.Empty(response.Cleared);
+        Assert.Equal(new[] { "Z" }, response.Assigned.Keys);
+        Assert.Equal("next", response.Assigned["Z"].AsText());
+        Assert.Equal(expected, Summaries(response.Diagnostics));
+    }
+
+    // Only the keyword is the built-in value of line 254; bracketed, SYSTEMDATE is the field of that name (line 30).
+    [Fact]
+    public void BracketedBuiltInWordIsAFieldReference()
+    {
+        string text = InAfterBlock("ASSIGN Y = [SYSTEMDATE]");
+
+        ProgramNode program = Parse(text);
+        AssignStatementNode assign = Assert.IsType<AssignStatementNode>(Assert.Single(OnlyEvent(program).Statements));
+        Assert.Equal("Y", assign.Target);
+        AssertIdentifier(assign.Value, SystemDate);
+        Assert.Empty(program.Diagnostics);
+
+        FieldEventResponse response = new CheckCodeEngine().Run(
+            text,
+            TextForm("X", SystemDate, "Y"),
+            FieldEventKind.FieldAfter,
+            "X",
+            TextValues((SystemDate, "stored")));
+
+        Assert.Equal(new[] { "Y" }, response.Assigned.Keys);
+        Assert.Equal("stored", response.Assigned["Y"].AsText());
+        Assert.Empty(response.Diagnostics);
+    }
+
+    // GEOCODE's missing last operand leaves line 4's After to the field block, so the After block parses and runs;
+    // After also closes the Before block, which reports its missing END-BEFORE there.
+    [Fact]
+    public void GeocodeMissingAnOperandLeavesTheNextEventBlockToRun()
+    {
+        const string text = """
+            Field X
+            	Before
+            		GEOCODE A, B,
+            	After
+            		ASSIGN Z = "1"
+            	End-After
+            End-Field
+            """;
+
+        ProgramNode program = Parse(text);
+
+        Assert.Collection(
+            Assert.Single(program.FieldBlocks).Events,
+            before =>
+            {
+                Assert.Equal(FieldEventKind.FieldBefore, before.Event);
+                Assert.Empty(before.Statements);
+            },
+            after =>
+            {
+                Assert.Equal(FieldEventKind.FieldAfter, after.Event);
+                AssertAssign(Assert.Single(after.Statements), "Z", "1");
+                Assert.Empty(after.Diagnostics);
+            });
+        Assert.Equal(
+            new[] { Warning(Parser.Commands.Geocode, 3), Warning(EndBefore, 4) },
+            Summaries(program.Diagnostics));
+
+        FieldEventResponse response = new CheckCodeEngine().Run(
+            text,
+            TextForm("X", "A", "B", "Z"),
+            FieldEventKind.FieldAfter,
+            "X",
+            TextValues());
+
+        Assert.Equal("1", response.Assigned["Z"].AsText());
+        Assert.Empty(response.Diagnostics);
+    }
+
+    // A GEOCODE without operands leaves line 4's Field to the program, so Field Y is a block of its own that parses
+    // and runs; Field also closes the Click block and Field X, each reporting its missing terminator there.
+    [Fact]
+    public void GeocodeWithoutOperandsLeavesTheNextFieldBlockToRun()
+    {
+        const string text = """
+            Field X
+            	Click
+            		GEOCODE
+            Field Y
+            	After
+            		ASSIGN Z = "1"
+            	End-After
+            End-Field
+            """;
+
+        ProgramNode program = Parse(text);
+
+        Assert.Collection(
+            program.FieldBlocks,
+            x =>
+            {
+                Assert.Equal("X", x.FieldName);
+                EventBlockNode click = Assert.Single(x.Events);
+                Assert.Equal(FieldEventKind.FieldClick, click.Event);
+                Assert.Empty(click.Statements);
+            },
+            y =>
+            {
+                Assert.Equal("Y", y.FieldName);
+                Assert.Equal(4, y.Line);
+                EventBlockNode after = Assert.Single(y.Events);
+                Assert.Equal(FieldEventKind.FieldAfter, after.Event);
+                AssertAssign(Assert.Single(after.Statements), "Z", "1");
+                Assert.Empty(after.Diagnostics);
+            });
+        Assert.Equal(
+            new[] { Warning(Parser.Commands.Geocode, 3), Warning(EndClick, 4), Warning(Parser.Commands.EndField, 4) },
+            Summaries(program.Diagnostics));
+
+        FieldEventResponse response = new CheckCodeEngine().Run(
+            text,
+            TextForm("X", "Y", "Z"),
+            FieldEventKind.FieldAfter,
+            "Y",
+            TextValues());
+
+        Assert.Equal("1", response.Assigned["Z"].AsText());
+        Assert.Empty(response.Diagnostics);
+    }
+
+    // Bracketed, a keyword is a name (line 30), so it fills the ASSIGN target (line 281) and each GEOCODE operand
+    // (line 636).
+    [Fact]
+    public void BracketedKeywordNamesFillTheNameSlots()
+    {
+        string text = InAfterBlock("ASSIGN [Then] = \"1\"", "GEOCODE [Field], [After], [Click]");
+
+        ProgramNode program = Parse(text);
+
+        EventBlockNode after = OnlyEvent(program);
+        Assert.Collection(
+            after.Statements,
+            statement => AssertAssign(statement, "Then", "1"),
+            statement => Assert.Equal(
+                new[] { "Field", "After", "Click" },
+                Assert.IsType<GeocodeStatementNode>(statement).Arguments));
+
+        var expected = new[] { (DiagnosticSeverity.Info, Parser.Commands.Geocode, 4) };
+        Assert.Equal(expected, Summaries(after.Diagnostics));
+        Assert.Equal(expected, Summaries(program.Diagnostics));
+
+        FieldEventResponse response = new CheckCodeEngine().Run(
+            text,
+            TextForm("X", "Then", "Field", "After", "Click"),
+            FieldEventKind.FieldAfter,
+            "X",
+            TextValues());
+
+        Assert.Equal("1", response.Assigned["Then"].AsText());
+    }
+
     // Line 42 gives the boolean literals; (+) is outside the subset and pinned among the recovery cases. A number
     // keeps its spelling, because its double alone cannot tell 2.0000000000000001 from the whole number 2.
     [Theory]
@@ -940,6 +1906,199 @@ public sealed class ParserTests
         Assert.Equal(text, value.Text);
         Assert.Equal(number, value.Number);
         Assert.Empty(program.Diagnostics);
+    }
+
+    // An ASSIGN ends with its expression (line 281), so a token left before the next statement boundary, on its line
+    // or the next, drops the whole statement with one ASSIGN warning on line 3: A is never assigned, even though
+    // each value before the leftover token is valid, and the ASSIGN after it runs.
+    [Theory]
+    [InlineData("ASSIGN A = B C")]
+    [InlineData("ASSIGN A = B", "C")]
+    [InlineData("ASSIGN A = \"1\" THEN")]
+    [InlineData("ASSIGN A = B )")]
+    [InlineData("ASSIGN A = B `")]
+    [InlineData("ASSIGN A = YEARS(B, C) C")]
+    public void AssignFollowedByLeftoverTokensIsDroppedWhole(params string[] lines)
+    {
+        string text = InAfterBlock([.. lines, "ASSIGN Z = \"next\""]);
+        ProgramNode program = Parse(text);
+
+        EventBlockNode after = OnlyEvent(program);
+        AssertAssign(Assert.Single(after.Statements), "Z", "next");
+
+        var expected = new[] { Warning(Parser.Commands.Assign, 3) };
+        Assert.Equal(expected, Summaries(after.Diagnostics));
+        Assert.Equal(expected, Summaries(program.Diagnostics));
+
+        FieldEventResponse response = new CheckCodeEngine().Run(
+            text,
+            TextForm("X", "A", "B", "C", "Z"),
+            FieldEventKind.FieldAfter,
+            "X",
+            TextValues(("B", "b")));
+
+        AssertOnlyAssigned(response, ("Z", "next"));
+        Assert.Equal(expected, Summaries(response.Diagnostics));
+    }
+
+    // An implicit assignment (line 285) is a statement boundary, so ASSIGN A = B C = 1 ends after B and runs, and
+    // C = 1 is the next statement, reported once on line 3 and never run.
+    [Fact]
+    public void AssignEndsBeforeAnImplicitAssignmentOnItsLine()
+    {
+        string text = InAfterBlock("ASSIGN A = B C = 1", "ASSIGN Z = \"next\"");
+        ProgramNode program = Parse(text);
+
+        EventBlockNode after = OnlyEvent(program);
+        Assert.Collection(
+            after.Statements,
+            statement =>
+            {
+                AssignStatementNode assign = Assert.IsType<AssignStatementNode>(statement);
+                Assert.Equal(("A", 3), (assign.Target, assign.Line));
+                AssertIdentifier(assign.Value, "B");
+            },
+            statement => AssertAssign(statement, "Z", "next"));
+
+        var expected = new[] { Warning(Parser.Commands.ImplicitAssign, 3) };
+        Assert.Equal(expected, Summaries(after.Diagnostics));
+        Assert.Equal(expected, Summaries(program.Diagnostics));
+
+        FieldEventResponse response = new CheckCodeEngine().Run(
+            text,
+            TextForm("X", "A", "B", "C", "Z"),
+            FieldEventKind.FieldAfter,
+            "X",
+            TextValues(("B", "b")));
+
+        AssertOnlyAssigned(response, ("A", "b"), ("Z", "next"));
+        Assert.Equal(expected, Summaries(response.Diagnostics));
+    }
+
+    // A legacy literal outside the subset is one token (lines 37-41), so it is reported once, on line 3, under its
+    // kind: a suffixed DecLiteral or a HexLiteral as NUMBER-LITERAL and a CharLiteral as CHAR-LITERAL. Its ASSIGN is
+    // dropped whole, so neither A = 12 nor any other prefix runs, and the ASSIGN after it does. A quote or '#' that
+    // starts no literal stays a malformed ASSIGN expression.
+    [Theory]
+    [InlineData(Parser.Commands.NumberLiteral, "12L")]
+    [InlineData(Parser.Commands.NumberLiteral, "12U")]
+    [InlineData(Parser.Commands.NumberLiteral, "12UL")]
+    [InlineData(Parser.Commands.NumberLiteral, "12lu")]
+    [InlineData(Parser.Commands.NumberLiteral, "#1a")]
+    [InlineData(Parser.Commands.CharLiteral, "'x'")]
+    [InlineData(Parser.Commands.Assign, "'")]
+    [InlineData(Parser.Commands.Assign, "#")]
+    [InlineData(Parser.Commands.Assign, "#12")]
+    public void LegacyLiteralDropsItsAssignWithOneWarning(string command, string literal)
+    {
+        string text = InAfterBlock($"ASSIGN A = {literal}", "ASSIGN Z = \"next\"");
+        ProgramNode program = Parse(text);
+
+        EventBlockNode after = OnlyEvent(program);
+        AssertAssign(Assert.Single(after.Statements), "Z", "next");
+
+        var expected = new[] { Warning(command, 3) };
+        Assert.Equal(expected, Summaries(after.Diagnostics));
+        Assert.Equal(expected, Summaries(program.Diagnostics));
+
+        // The diagnostic names the literal's kind, never its spelling.
+        Diagnostic diagnostic = Assert.Single(program.Diagnostics);
+        Assert.DoesNotContain(literal, diagnostic.Message, StringComparison.Ordinal);
+
+        FieldEventResponse response = new CheckCodeEngine().Run(
+            text,
+            TextForm("X", "A", "Z"),
+            FieldEventKind.FieldAfter,
+            "X",
+            TextValues());
+
+        AssertOnlyAssigned(response, ("Z", "next"));
+        Assert.Equal(expected, Summaries(response.Diagnostics));
+    }
+
+    // A File or Url operand (lines 25-26) is one opaque token, so the reserved words and '//' inside it neither close
+    // the After block nor hide what follows: each case gives exactly one warning, on line 3, for the unsupported
+    // command, or SYNTAX for an operand starting a statement, or ASSIGN for one used as a value, and the ASSIGN Z
+    // after it, on its own line or on the same line after a Url, is kept and runs. Nothing is executed, and no
+    // diagnostic repeats the path or URL.
+    [Theory]
+    [InlineData("EXECUTE", "EXECUTE http://example.org/a ASSIGN Z = \"next\"")]
+    [InlineData("EXECUTE", "EXECUTE HTTP://Example.org//End-After ASSIGN Z = \"next\"")]
+    [InlineData("EXECUTE", "EXECUTE C:\\Program Files\\End-Field\\app.exe", "ASSIGN Z = \"next\"")]
+    [InlineData("EXECUTE", "EXECUTE \\\\srv\\share\\End-After\\x.exe", "ASSIGN Z = \"next\"")]
+    [InlineData("EXECUTE", "EXECUTE 'C:\\End-Field\\x.exe'", "ASSIGN Z = \"next\"")]
+    [InlineData("EXECUTE", "EXECUTE WAITFOREXIT .\\End-If\\x.exe", "ASSIGN Z = \"next\"")]
+    [InlineData("EXECUTE", "EXECUTE \\End-After\\x.exe // a comment", "ASSIGN Z = \"next\"")]
+    [InlineData("WAITFOR", "WAITFOR ..\\End-Field\\a.txt \"x\"", "ASSIGN Z = \"next\"")]
+    [InlineData(Always, "ALWAYS", "EXECUTE C:\\End\\If\\x.exe", "END", "ASSIGN Z = \"next\"")]
+    [InlineData("COMMANDLINE", "COMMANDLINE C:\\x\\End-Sub\\p.prj", "ASSIGN Z = \"next\"")]
+    [InlineData(Parser.Commands.Syntax, "C:\\End-After\\x.exe", "ASSIGN Z = \"next\"")]
+    [InlineData(Parser.Commands.Assign, "ASSIGN A = C:\\End-After\\x.exe", "ASSIGN Z = \"next\"")]
+    [InlineData(Parser.Commands.Assign, "ASSIGN A = http://x/End-After", "ASSIGN Z = \"next\"")]
+    public void FileOrUrlOperandIsSkippedWithItsStatementAndTheNextStatementRuns(string command, params string[] lines)
+    {
+        string text = InAfterBlock(lines);
+        ProgramNode program = Parse(text);
+
+        EventBlockNode after = OnlyEvent(program);
+        AssertAssign(Assert.Single(after.Statements), "Z", "next");
+
+        var expected = new[] { Warning(command, 3) };
+        Assert.Equal(expected, Summaries(after.Diagnostics));
+        Assert.Equal(expected, Summaries(program.Diagnostics));
+
+        Diagnostic diagnostic = Assert.Single(program.Diagnostics);
+        Assert.DoesNotContain("End-", diagnostic.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("\\", diagnostic.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("//", diagnostic.Message, StringComparison.Ordinal);
+
+        FieldEventResponse response = new CheckCodeEngine().Run(
+            text,
+            TextForm("X", "A", "Z"),
+            FieldEventKind.FieldAfter,
+            "X",
+            TextValues());
+
+        AssertOnlyAssigned(response, ("Z", "next"));
+        Assert.Equal(expected, Summaries(response.Diagnostics));
+    }
+
+    // A reserved word inside a path never closes the View block it stands in (line 629), so the View is skipped to
+    // its own End-View on line 5 with its one warning, and Field X after it parses and runs with no diagnostic.
+    [Fact]
+    public void PathInsideAnUnsupportedBlockDoesNotCloseIt()
+    {
+        const string text = """
+            View
+            	Before
+            		EXECUTE C:\x\End-View\y.exe
+            	End-Before
+            End-View
+            Field X
+            	After
+            		ASSIGN Z = "next"
+            	End-After
+            End-Field
+            """;
+
+        ProgramNode program = Parse(text);
+
+        FieldBlockNode block = Assert.Single(program.FieldBlocks);
+        Assert.Equal(("X", 6), (block.FieldName, block.Line));
+        EventBlockNode after = Assert.Single(block.Events);
+        AssertAssign(Assert.Single(after.Statements), "Z", "next");
+        Assert.Empty(after.Diagnostics);
+        Assert.Equal(new[] { Warning(Parser.Commands.View, 1) }, Summaries(program.Diagnostics));
+
+        FieldEventResponse response = new CheckCodeEngine().Run(
+            text,
+            TextForm("X", "Z"),
+            FieldEventKind.FieldAfter,
+            "X",
+            TextValues());
+
+        AssertOnlyAssigned(response, ("Z", "next"));
+        Assert.Empty(response.Diagnostics);
     }
 
     // Keywords are case-insensitive (line 4), and comments produce nothing (lines 49-51), so these programs share one
@@ -1113,11 +2272,16 @@ public sealed class ParserTests
     }
 
     // Cutting the nested program after each token leaves constructs open at every depth, so the sweep reaches each
-    // path that handles a missing terminator.
+    // path that handles a missing terminator. No cut may report an error, point past the last token it kept, or keep
+    // the outer IF (line 3) before its END-IF (line 11), because an unterminated IF never runs.
     [Fact]
     public void EveryTruncationOfTheNestedProgramParsesWithoutThrowing()
     {
         IReadOnlyList<Token> tokens = Lexer.Tokenize(NestedRecoveryProgram);
+
+        // The inner IF closes with END, so the only END-IF is the outer one.
+        int outerEndIf = Enumerable.Range(0, tokens.Count).Single(i => tokens[i].IsKeyword(Parser.Commands.EndIf));
+        Assert.Equal(11, tokens[outerEndIf].Line);
 
         for (int length = 0; length < tokens.Count; length++)
         {
@@ -1131,6 +2295,42 @@ public sealed class ParserTests
 
             Assert.Null(error);
             Assert.NotNull(program);
+
+            int lastLine = end.Line;
+            IEnumerable<EventBlockNode> events = program.FieldBlocks.SelectMany(block => block.Events);
+            Assert.All(
+                program.Diagnostics.Concat(events.SelectMany(eventBlock => eventBlock.Diagnostics)),
+                diagnostic =>
+                {
+                    Assert.Contains(diagnostic.Severity, new[] { DiagnosticSeverity.Warning, DiagnosticSeverity.Info });
+                    Assert.InRange(diagnostic.Line, 1, lastLine);
+                });
+            Assert.All(
+                events.SelectMany(eventBlock => AllStatements(eventBlock.Statements)),
+                statement => Assert.InRange(statement.Line, 1, lastLine));
+            if (length <= outerEndIf)
+            {
+                Assert.All(
+                    events,
+                    eventBlock => Assert.DoesNotContain(
+                        eventBlock.Statements,
+                        statement => statement is IfStatementNode));
+            }
+        }
+
+        static IEnumerable<StatementNode> AllStatements(IEnumerable<StatementNode> statements)
+        {
+            foreach (StatementNode statement in statements)
+            {
+                yield return statement;
+                if (statement is IfStatementNode ifStatement)
+                {
+                    foreach (StatementNode nested in AllStatements(ifStatement.Then.Concat(ifStatement.Else ?? [])))
+                    {
+                        yield return nested;
+                    }
+                }
+            }
         }
     }
 
