@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Numerics;
 using EpiInfo.Domain.Diagnostics;
 using EpiInfo.Domain.Forms;
 using EpiInfo.Domain.Metadata;
@@ -19,8 +20,10 @@ namespace EpiInfo.Domain.Tests.Validation;
 /// These are the Domain half of SC-6; <c>tests/EpiInfo.Api.Tests/Validation/ValidationTests.cs</c> repeats the seeded
 /// cases over HTTP against the database. Here every form is synthetic metadata and no database is used.
 /// <c>MirrorForm</c> copies the seeded fields of <c>testdata/sql/03_forms.sql</c> whose rules the validator enforces;
-/// the other forms cover what no seeded field has: required fields, a field without a prompt, and integer, Option,
-/// <c>ntext</c> and unbounded <c>datetime</c> columns.
+/// the other forms cover what no seeded field has: required fields, a field without a prompt, a field both required
+/// and read-only, one-sided ranges, number bounds beyond 2^53, numbers on <c>tinyint</c> to <c>bigint</c> columns,
+/// <c>ntext</c> and unbounded <c>datetime</c> columns, and Option fields, among them two on <c>tinyint</c>: one whose
+/// 256 items all fit the column and one whose 257th item leaves it unsupported.
 /// </para>
 /// <para>
 /// Submitted values use the raw JSON-scalar kinds the API's values reader hands over (text, number, boolean or
@@ -48,6 +51,7 @@ public sealed class RecordValidatorTests
 
     private const string PatientNamePrompt = "Patient's Name";
     private const string CollectionDatePrompt = "Collection date:";
+    private const string ReporterPrompt = "Reported by:";
     private const string PhoneMask = "###-###-####";
     private const string Sentinel = "SENTINEL-123456";
 
@@ -68,12 +72,17 @@ public sealed class RecordValidatorTests
         new Dictionary<string, IReadOnlyList<FieldOption>>(StringComparer.Ordinal);
 
     /// <summary>
-    /// Fixture A: the seeded fields whose rules the validator enforces, with their seeded metadata. <c>LastName</c>
-    /// (prompt as on <c>FoodHistory</c>), <c>Zip</c>, <c>PhoneNumber</c>, <c>Age</c>, <c>Sex</c> and
-    /// <c>StateIDNumber</c> come from <c>CaseReport</c>; <c>DateofInterview</c>, <c>Asian</c>, <c>FeverTemp</c> and
-    /// <c>OnsetWeek</c> from <c>FoodHistory</c>. <c>FreeNumber</c> carries the blank bounds and pattern of the seeded
-    /// <c>FoodHistory</c> <c>Age</c> row, and <c>Ill</c> is a <c>Yes/No</c> field on <c>tinyint</c>, which maps to
-    /// unsupported. A label, a group and the three system rows complete the form. No field is required.
+    /// Fixture A: the seeded fields whose rules the validator enforces, with their seeded metadata. <c>Zip</c>
+    /// (<c>MaxLength</c> 5), <c>PhoneNumber</c> (mask <c>###-###-####</c>), <c>Age</c> (bounds 0 and 120, pattern
+    /// <c>###</c>) and read-only <c>StateIDNumber</c> come from <c>CaseReport</c>. <c>LastName</c> carries the
+    /// <c>FoodHistory</c> prompt "Last Name" (<c>CaseReport</c> prompts "Patient's Name"). <c>Sex</c> is the
+    /// <c>FoodHistory</c> Legal Values field on <c>codephvs_administrativesex_hl7_2x</c>, not the <c>CaseReport</c>
+    /// Comment Legal <c>Sex</c>. <c>DateofInterview</c>, <c>Asian</c>, <c>FeverTemp</c> and read-only
+    /// <c>OnsetWeek</c> also come from <c>FoodHistory</c>. <c>FreeNumber</c> carries the blank bounds and pattern of
+    /// the seeded <c>FoodHistory</c> <c>Age</c> row, and <c>Ill</c> stands for the <c>FoodHistory</c>
+    /// <c>Yes/No</c> <c>ILL</c> row on <c>tinyint</c>, which maps to unsupported. The field ids and the two-page
+    /// placement are synthetic, not seed positions. A label, a group and the three system rows complete the form.
+    /// No field is required.
     /// </summary>
     private static readonly FormMetadata MirrorForm = new(
         ViewId: 1,
@@ -154,8 +163,12 @@ public sealed class RecordValidatorTests
         ]);
 
     /// <summary>
-    /// Fixture D: the storage ranges of the admitted column types no seeded field exercises: integer number columns,
-    /// Option fields with and without items, an unbounded <c>datetime</c> date, <c>nvarchar(4000)</c> and <c>ntext</c>.
+    /// Fixture D: the storage ranges of the admitted column types no seeded field exercises: number fields on
+    /// <c>tinyint</c>, <c>smallint</c>, <c>int</c> and <c>bigint</c>, Option fields with and without items, an
+    /// unbounded <c>datetime</c> date, <c>nvarchar(4000)</c> and <c>ntext</c>. <c>WideChoice</c> and
+    /// <c>OverfullChoice</c> are Options on <c>tinyint</c>, which stores 0 to 255, with 256 and 257 items. The 256
+    /// indexes of <c>WideChoice</c> all fit the column. The 257th item of <c>OverfullChoice</c> has index 256, which
+    /// <c>tinyint</c> cannot store, so the mapper leaves the field unsupported and no value of it can be written.
     /// </summary>
     private static readonly FormMetadata StorageForm = new(
         ViewId: 4,
@@ -171,6 +184,101 @@ public sealed class RecordValidatorTests
             Row(5, "EventDate", DateType, pageId: 1, DatetimeColumn),
             Row(6, "LongText", TextType, pageId: 1, Nvarchar(4000)),
             Row(7, "Memo", MultilineType, pageId: 1, NTextColumn),
+            Row(8, "TinyCount", NumberType, pageId: 1, TinyIntColumn),
+            Row(9, "BigCount", NumberType, pageId: 1, BigIntColumn),
+            Row(10, "WideChoice", OptionType, pageId: 1, TinyIntColumn) with { List = OptionList(256) },
+            Row(11, "OverfullChoice", OptionType, pageId: 1, TinyIntColumn) with { List = OptionList(257) },
+        ]);
+
+    /// <summary>
+    /// Fixture E: one-sided ranges, because every seeded bounded field sets both bounds. Each number field on
+    /// <c>float</c> and each date field on <c>datetime</c> sets a single bound, dates in the stored <c>MM-DD-YYYY</c>
+    /// form; the other bound is NULL on one field of each kind and blank on the other, the two unset forms
+    /// <c>metaFields</c> holds.
+    /// </summary>
+    private static readonly FormMetadata OneSidedRangeForm = new(
+        ViewId: 11,
+        Name: "OneSidedRange",
+        BaseTableName: "OneSidedRange",
+        Pages: [new PageMetadata(1, "Page 1", 0, "OneSidedRange1")],
+        Fields:
+        [
+            Row(1, "LowerOnlyNumber", NumberType, pageId: 1, FloatColumn) with { Lower = "10.5", Upper = "" },
+            Row(2, "UpperOnlyNumber", NumberType, pageId: 1, FloatColumn) with { Upper = "99.5" },
+            Row(3, "LowerOnlyDate", DateType, pageId: 1, DatetimeColumn) with { Lower = "03-01-2011" },
+            Row(4, "UpperOnlyDate", DateType, pageId: 1, DatetimeColumn) with { Lower = "", Upper = "06-30-2012" },
+        ]);
+
+    /// <summary>
+    /// Fixture F: a field both required and read-only, which no seeded field is, beside a required writable field and
+    /// an optional one. It pins the C-3 reconciliation of the two flags: a read-only field can never be supplied, so
+    /// its required flag never blocks a save, while submitting it is still rejected.
+    /// </summary>
+    private static readonly FormMetadata RequiredReadOnlyForm = new(
+        ViewId: 10,
+        Name: "RequiredReadOnly",
+        BaseTableName: "RequiredReadOnly",
+        Pages: [new PageMetadata(1, "Page 1", 0, "RequiredReadOnly1")],
+        Fields:
+        [
+            Row(1, "AssignedCode", TextType, pageId: 1, Nvarchar(4000)) with
+            {
+                Prompt = "Assigned code:",
+                IsRequired = true,
+                IsReadOnly = true,
+            },
+            Row(2, "Reporter", TextType, pageId: 1, Nvarchar(4000)) with
+            {
+                Prompt = ReporterPrompt,
+                IsRequired = true,
+            },
+            Row(3, "Remarks", TextType, pageId: 1, Nvarchar(4000)),
+        ]);
+
+    /// <summary>
+    /// Fixture G: number bounds a double cannot hold, which no seeded field has. <c>9007199254740993</c> is 2^53 + 1,
+    /// the first integer a double cannot hold, and fits the <c>nvarchar(20)</c> of
+    /// <c>metaFields.Lower</c>/<c>Upper</c>. The first <c>bigint</c> fields set an upper bound only, a lower bound
+    /// only, and both; the first <c>float</c> fields pair an exact integer bound with a fractional one, in each order.
+    /// <c>FloatLowerBig</c> and <c>FloatUpperBig</c> set that integer as a single bound on <c>float</c>, which stores
+    /// the binary64 9007199254740992 for it. The <c>bigint</c> fractional bounds round across an integer as doubles:
+    /// <c>9007199254740992.5</c> and <c>-9007199254740992.5</c> to ±9007199254740992, and <c>9007199254740993.5</c>
+    /// to 9007199254740994; on <c>int</c>, <c>2.0000000000000001</c> rounds to 2. <c>FractionsOnInt</c> has the
+    /// ordinary fractional bounds <c>0.5</c> and <c>99.5</c> on <c>int</c>, so its limits are 1 and 99, and
+    /// <c>LowerBeyondBigint</c> has the lower bound <c>1e30</c>, beyond the <c>bigint</c> range, on <c>bigint</c>.
+    /// </summary>
+    private static readonly FormMetadata BigBoundForm = new(
+        ViewId: 12,
+        Name: "BigBound",
+        BaseTableName: "BigBound",
+        Pages: [new PageMetadata(1, "Page 1", 0, "BigBound1")],
+        Fields:
+        [
+            Row(1, "UpperOnlyBig", NumberType, pageId: 1, BigIntColumn) with { Upper = "9007199254740993" },
+            Row(2, "LowerOnlyBig", NumberType, pageId: 1, BigIntColumn) with { Lower = "9007199254740993" },
+            Row(3, "BothBig", NumberType, pageId: 1, BigIntColumn) with
+            {
+                Lower = "-9007199254740993",
+                Upper = "9007199254740993",
+            },
+            Row(4, "FractionToBig", NumberType, pageId: 1, FloatColumn) with
+            {
+                Lower = "-0.5",
+                Upper = "9007199254740993",
+            },
+            Row(5, "BigToFraction", NumberType, pageId: 1, FloatColumn) with
+            {
+                Lower = "-9007199254740993",
+                Upper = "0.5",
+            },
+            Row(6, "FloatLowerBig", NumberType, pageId: 1, FloatColumn) with { Lower = "9007199254740993" },
+            Row(7, "FloatUpperBig", NumberType, pageId: 1, FloatColumn) with { Upper = "9007199254740993" },
+            Row(8, "UpperFractionBig", NumberType, pageId: 1, BigIntColumn) with { Upper = "9007199254740992.5" },
+            Row(9, "LowerFractionBig", NumberType, pageId: 1, BigIntColumn) with { Lower = "-9007199254740992.5" },
+            Row(10, "UpperFractionPastBig", NumberType, pageId: 1, BigIntColumn) with { Upper = "9007199254740993.5" },
+            Row(11, "LowerNearTwo", NumberType, pageId: 1, IntColumn) with { Lower = "2.0000000000000001" },
+            Row(12, "FractionsOnInt", NumberType, pageId: 1, IntColumn) with { Lower = "0.5", Upper = "99.5" },
+            Row(13, "LowerBeyondBigint", NumberType, pageId: 1, BigIntColumn) with { Lower = "1e30" },
         ]);
 
     // Column catalogue facts as sys.columns.max_length reports them, in bytes: nvarchar(n) is 2·n.
@@ -186,6 +294,8 @@ public sealed class RecordValidatorTests
 
     private static (string SqlType, int MaxLengthBytes) IntColumn => ("int", 4);
 
+    private static (string SqlType, int MaxLengthBytes) BigIntColumn => ("bigint", 8);
+
     private static (string SqlType, int MaxLengthBytes) NTextColumn => ("ntext", 16);
 
     public static TheoryData<string, string[]> FixtureDataFields => new()
@@ -199,7 +309,25 @@ public sealed class RecordValidatorTests
         },
         { "Required", ["PatientName", "Notes", "CollectionDate", "Flag"] },
         { "NullPrompt", ["CaseCode", "Other"] },
-        { "Storage", ["SmallCount", "Choice", "EmptyChoice", "WholeCount", "EventDate", "LongText", "Memo"] },
+
+        // OverfullChoice is absent: the index 256 of its 257th item does not fit tinyint, so it maps to unsupported.
+        {
+            "Storage",
+            [
+                "SmallCount", "Choice", "EmptyChoice", "WholeCount", "EventDate", "LongText", "Memo",
+                "TinyCount", "BigCount", "WideChoice",
+            ]
+        },
+        { "OneSidedRange", ["LowerOnlyNumber", "UpperOnlyNumber", "LowerOnlyDate", "UpperOnlyDate"] },
+        { "RequiredReadOnly", ["AssignedCode", "Reporter", "Remarks"] },
+        {
+            "BigBound",
+            [
+                "UpperOnlyBig", "LowerOnlyBig", "BothBig", "FractionToBig", "BigToFraction", "FloatLowerBig",
+                "FloatUpperBig", "UpperFractionBig", "LowerFractionBig", "UpperFractionPastBig", "LowerNearTwo",
+                "FractionsOnInt", "LowerBeyondBigint",
+            ]
+        },
     };
 
     /// <summary>
@@ -241,6 +369,39 @@ public sealed class RecordValidatorTests
         Assert.True(fields["StateIDNumber"].Validation.ReadOnly);
         Assert.True(fields["OnsetWeek"].Validation.ReadOnly);
         Assert.DoesNotContain("RecStatus", fields.Keys);
+    }
+
+    /// <summary>
+    /// The integer-column cases rely on number fields staying <c>number</c> on <c>tinyint</c> and <c>bigint</c>, on
+    /// <c>WideChoice</c> staying an Option that offers one item per <c>tinyint</c> index, 0 to 255, and on
+    /// <c>OverfullChoice</c> being unsupported: the index 256 of its 257th item does not fit <c>tinyint</c>, so the
+    /// field is named by its <c>metaFieldTypes</c> name, offers no options and can never be written.
+    /// </summary>
+    [Fact]
+    public void StorageForm_MapsTheIntegerColumnsTheCasesRelyOn()
+    {
+        var fields = FormDefinitionFactory.Create(StorageForm, NoLegalValues, Array.Empty<Diagnostic>())
+            .Pages
+            .SelectMany(page => page.Fields)
+            .ToDictionary(field => field.Name, StringComparer.Ordinal);
+
+        Assert.Equal(FieldType.Number, fields["TinyCount"].FieldType);
+        Assert.Equal(FieldType.Number, fields["BigCount"].FieldType);
+        Assert.Equal(FieldType.Option, fields["WideChoice"].FieldType);
+        Assert.False(fields["WideChoice"].Unsupported);
+        Assert.Null(fields["WideChoice"].UnsupportedType);
+        Assert.Equal(ExpectedOptions(256), fields["WideChoice"].Options);
+        Assert.Equal(FieldType.Unsupported, fields["OverfullChoice"].FieldType);
+        Assert.True(fields["OverfullChoice"].Unsupported);
+        Assert.Equal("Option", fields["OverfullChoice"].UnsupportedType);
+        Assert.Null(fields["OverfullChoice"].Options);
+
+        static FieldOption[] ExpectedOptions(int count) =>
+            Enumerable.Range(0, count)
+                .Select(index => new FieldOption(
+                    FieldValue.FromIndex(index),
+                    "L" + index.ToString(CultureInfo.InvariantCulture)))
+                .ToArray();
     }
 
     // ---- Phase 1: ValidateInput ----
@@ -544,6 +705,105 @@ public sealed class RecordValidatorTests
         AssertOnlyFieldError(result, field, ValidationMessages.NumberNotStorable);
     }
 
+    /// <summary>
+    /// The ends of the <c>tinyint</c> and <c>bigint</c> ranges are accepted and kept as the exact integers sent. A
+    /// double would blur them: the nearest double of <c>long.MaxValue</c> is 2^63, past the range, and that of
+    /// 9007199254740993 is 9007199254740992.
+    /// </summary>
+    [Theory]
+    [InlineData("TinyCount", "0", 0L)]
+    [InlineData("TinyCount", "255", 255L)]
+    [InlineData("BigCount", "-9223372036854775808", long.MinValue)]
+    [InlineData("BigCount", "9223372036854775807", long.MaxValue)]
+    [InlineData("BigCount", "9007199254740993", 9007199254740993L)]
+    [InlineData("BigCount", "-9007199254740993", -9007199254740993L)]
+    public void ValidateInput_ExactIntegerInIntegerColumn_IsKeptExact(string field, string literal, long expected)
+    {
+        var values = AssertValid(Validate(Validator(StorageForm), (field, ExactNumber(literal))));
+
+        Assert.True(values[field].TryGetInteger(out var integer));
+        Assert.Equal(expected, integer);
+        Assert.Equal(FieldValue.FromInteger(expected), values[field]);
+    }
+
+    /// <summary>
+    /// One past either end of the <c>tinyint</c> and <c>bigint</c> ranges is a field error. The reader keeps the two
+    /// <c>bigint</c> cases only as their nearest doubles, and that of -9223372036854775809 is -2^63,
+    /// <c>long.MinValue</c> itself, so a check on the double would admit it.
+    /// </summary>
+    [Theory]
+    [InlineData("TinyCount", "-1")]
+    [InlineData("TinyCount", "256")]
+    [InlineData("BigCount", "9223372036854775808")]
+    [InlineData("BigCount", "-9223372036854775809")]
+    public void ValidateInput_ExactNumberOutsideIntegerColumn_IsNotStorable(string field, string literal)
+    {
+        var result = Validate(Validator(StorageForm), (field, ExactNumber(literal)));
+
+        AssertOnlyFieldError(result, field, ValidationMessages.NumberNotStorable);
+    }
+
+    /// <summary>
+    /// <c>2.0000000000000001</c> is not a whole number, though its nearest double is exactly 2. Integer columns and
+    /// option indexes decide on the exact value, so it is neither stored as 2 nor read as the third item.
+    /// </summary>
+    [Theory]
+    [InlineData("TinyCount", ValidationMessages.NumberNotStorable)]
+    [InlineData("SmallCount", ValidationMessages.NumberNotStorable)]
+    [InlineData("WholeCount", ValidationMessages.NumberNotStorable)]
+    [InlineData("BigCount", ValidationMessages.NumberNotStorable)]
+    [InlineData("Choice", ValidationMessages.OptionIndexExpected)]
+    public void ValidateInput_NearIntegralNumber_IsNeverWhole(string field, string expected)
+    {
+        var raw = ExactNumber("2.0000000000000001");
+        Assert.Equal(2d, raw.AsNumber());
+        Assert.False(raw.TryGetInteger(out _));
+
+        var result = Validate(Validator(StorageForm), (field, raw));
+
+        AssertOnlyFieldError(result, field, expected);
+    }
+
+    /// <summary>
+    /// 0 and 255, the smallest and largest indexes <c>tinyint</c> stores, are the first and last items of
+    /// <c>WideChoice</c>.
+    /// </summary>
+    [Theory]
+    [InlineData("WideChoice", 0)]
+    [InlineData("WideChoice", 255)]
+    public void ValidateInput_OptionIndexWithinTinyint_BecomesIndex(string field, int index)
+    {
+        var values = AssertValid(Validate(Validator(StorageForm), (field, FieldValue.FromInteger(index))));
+
+        Assert.Equal(FieldValue.FromIndex(index), values[field]);
+    }
+
+    public static TheoryData<string, int, string> UnwritableOptionIndexOnTinyint => new()
+    {
+        // One past the 256 items of WideChoice: the option count rejects it before the column is consulted.
+        { "WideChoice", 256, ValidationMessages.FormatOptionIndexOutOfRange(256) },
+
+        // OverfullChoice is unsupported, so it holds no value: 255, which tinyint stores, and 256, the index of its
+        // 257th item, are both rejected as not a data field.
+        { "OverfullChoice", 255, ValidationMessages.UnknownField },
+        { "OverfullChoice", 256, ValidationMessages.UnknownField },
+    };
+
+    /// <summary>
+    /// An option index a <c>tinyint</c> field cannot take is one field error under the canonical name, never a storage
+    /// exception. <c>WideChoice</c> rejects 256 on its option count. <c>OverfullChoice</c>, left unsupported because
+    /// the index 256 of its 257th item does not fit <c>tinyint</c>, is not a data field, so any index sent to it is
+    /// the unknown-field error.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(UnwritableOptionIndexOnTinyint))]
+    public void ValidateInput_UnwritableOptionIndexOnTinyint_IsOneFieldError(string field, int index, string expected)
+    {
+        var result = Validate(Validator(StorageForm), (field.ToLowerInvariant(), FieldValue.FromInteger(index)));
+
+        AssertOnlyFieldError(result, field, expected);
+    }
+
     [Theory]
     [InlineData("1753-01-01")]
     [InlineData("9999-12-31")]
@@ -649,6 +909,231 @@ public sealed class RecordValidatorTests
         AssertOnlyFieldError(result, field, ValidationMessages.FormatRangeBetween(lower, upper));
     }
 
+    /// <summary>
+    /// A bound a double cannot hold is inclusive by what the column stores, and every accepted integer keeps its exact
+    /// value. On <c>bigint</c> and <c>int</c> the comparison is exact: the bound itself and the adjacent integer inside
+    /// it are accepted, as is the limit of <c>bigint</c> on the open side, and a fractional bound admits the integers
+    /// up to its floor or down to its ceiling. Through a double the upper bound <c>9007199254740993</c> would read as
+    /// <c>9007199254740992</c> and reject itself. On <c>float</c> value and bound compare as the binary64 the column
+    /// stores, so 9007199254740992 and 9007199254740993, one double, both meet the bound <c>9007199254740993</c>.
+    /// </summary>
+    [Theory]
+    [InlineData("UpperOnlyBig", 9007199254740993L)]
+    [InlineData("UpperOnlyBig", 9007199254740992L)]
+    [InlineData("UpperOnlyBig", long.MinValue)]
+    [InlineData("LowerOnlyBig", 9007199254740993L)]
+    [InlineData("LowerOnlyBig", 9007199254740994L)]
+    [InlineData("LowerOnlyBig", long.MaxValue)]
+    [InlineData("BothBig", 9007199254740993L)]
+    [InlineData("BothBig", -9007199254740993L)]
+    [InlineData("BothBig", 0L)]
+    [InlineData("FractionToBig", 9007199254740993L)]
+    [InlineData("BigToFraction", -9007199254740993L)]
+    [InlineData("FloatLowerBig", 9007199254740992L)]
+    [InlineData("FloatLowerBig", 9007199254740993L)]
+    [InlineData("FloatUpperBig", 9007199254740993L)]
+    [InlineData("FloatUpperBig", 9007199254740992L)]
+    [InlineData("UpperFractionBig", 9007199254740992L)]
+    [InlineData("UpperFractionBig", long.MinValue)]
+    [InlineData("LowerFractionBig", -9007199254740992L)]
+    [InlineData("LowerFractionBig", long.MaxValue)]
+    [InlineData("UpperFractionPastBig", 9007199254740993L)]
+    [InlineData("LowerNearTwo", 3L)]
+    [InlineData("LowerNearTwo", int.MaxValue)]
+    [InlineData("FractionsOnInt", 1L)]
+    [InlineData("FractionsOnInt", 99L)]
+    public void ValidateInput_IntegerWithinBoundADoubleCannotHold_IsAcceptedExactly(string field, long raw)
+    {
+        var values = AssertValid(Validate(Validator(BigBoundForm), (field, FieldValue.FromInteger(raw))));
+
+        Assert.Equal(FieldValue.FromInteger(raw), values[field]);
+        Assert.True(values[field].TryGetInteger(out var integer));
+        Assert.Equal(raw, integer);
+    }
+
+    /// <summary>
+    /// The adjacent integer outside a bound a double cannot hold is rejected with exactly one message, which names
+    /// the limit the check enforces. On <c>bigint</c> and <c>int</c> that is the bound's exact integer limit with
+    /// every digit, never its nearest double: <c>9007199254740993.5</c> reads "at most 9007199254740993", not
+    /// 9007199254740994; <c>2.0000000000000001</c> "at least 3", not 2; <c>0.5</c> to <c>99.5</c> "between 1 and 99".
+    /// Only a limit beyond the signed 64-bit range is named by its bound's shortest round-trip double, so
+    /// <c>1e30</c> rejects even <see cref="long.MaxValue"/> "at least 1E+30". Through a double the lower bound
+    /// <c>9007199254740993</c> would read as <c>9007199254740992</c> and admit that integer on <c>bigint</c>, and the
+    /// upper bound <c>9007199254740992.5</c> would read as <c>9007199254740992</c> and admit 9007199254740993. On
+    /// <c>float</c> the message names the bound as the form definition carries it, an exact integer with every digit
+    /// and a fractional bound as its shortest round-trip double, and the first double outside the bound's binary64
+    /// is rejected: 9007199254740994 above <c>9007199254740993</c>, and 9007199254740990 below it.
+    /// </summary>
+    [Theory]
+    [InlineData("UpperOnlyBig", 9007199254740994L, "The value must be at most 9007199254740993.")]
+    [InlineData("LowerOnlyBig", 9007199254740992L, "The value must be at least 9007199254740993.")]
+    [InlineData("BothBig", 9007199254740994L, "The value must be between -9007199254740993 and 9007199254740993.")]
+    [InlineData("BothBig", -9007199254740994L, "The value must be between -9007199254740993 and 9007199254740993.")]
+    [InlineData("FractionToBig", -1L, "The value must be between -0.5 and 9007199254740993.")]
+    [InlineData("BigToFraction", 1L, "The value must be between -9007199254740993 and 0.5.")]
+    [InlineData("FloatLowerBig", 9007199254740990L, "The value must be at least 9007199254740993.")]
+    [InlineData("FloatUpperBig", 9007199254740994L, "The value must be at most 9007199254740993.")]
+    [InlineData("UpperFractionBig", 9007199254740993L, "The value must be at most 9007199254740992.")]
+    [InlineData("LowerFractionBig", -9007199254740993L, "The value must be at least -9007199254740992.")]
+    [InlineData("UpperFractionPastBig", 9007199254740994L, "The value must be at most 9007199254740993.")]
+    [InlineData("LowerNearTwo", 2L, "The value must be at least 3.")]
+    [InlineData("FractionsOnInt", 0L, "The value must be between 1 and 99.")]
+    [InlineData("FractionsOnInt", 100L, "The value must be between 1 and 99.")]
+    [InlineData("LowerBeyondBigint", long.MaxValue, "The value must be at least 1E+30.")]
+    public void ValidateInput_IntegerBeyondBoundADoubleCannotHold_IsOneRangeError(
+        string field,
+        long raw,
+        string expected)
+    {
+        var result = Validate(Validator(BigBoundForm), (field, FieldValue.FromInteger(raw)));
+
+        AssertOnlyFieldError(result, field, expected);
+    }
+
+    /// <summary>
+    /// On <c>float</c> a fraction is compared as the double the column stores: <c>9007199254740992.5</c> rounds to
+    /// 9007199254740992, the binary64 of the lower bound <c>9007199254740993</c>, so it meets that bound as
+    /// 9007199254740992 does, and it is kept exactly as submitted.
+    /// </summary>
+    [Fact]
+    public void ValidateInput_FractionOnFloatColumnSharingTheBoundsDouble_IsAcceptedAsSubmitted()
+    {
+        var raw = ExactNumber("9007199254740992.5");
+        Assert.Equal(9007199254740992d, raw.AsNumber());
+        Assert.False(raw.TryGetInteger(out _));
+
+        var values = AssertValid(Validate(Validator(BigBoundForm), ("FloatLowerBig", raw)));
+
+        Assert.Equal(raw, values["FloatLowerBig"]);
+    }
+
+    /// <summary>
+    /// An integer column takes its exact limits from the metadata text its definition bound was parsed from. A
+    /// definition built from other metadata, whose bound that text is unset, unreadable or another number for, is
+    /// refused, rather than enforcing and naming limits its bound does not give. <c>9007199254740992</c> is refused
+    /// though its double equals the bound's, because it is an exact integer and the bound is not.
+    /// </summary>
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("NaN")]
+    [InlineData("9007199254740992")]
+    [InlineData("9007199254740993.5")]
+    public void Constructor_IntegerColumnBoundTheMetadataDoesNotState_IsRejected(string? upper)
+    {
+        var definition = FormDefinitionFactory.Create(BigBoundForm, NoLegalValues, Array.Empty<Diagnostic>());
+        var otherMetadata = BigBoundForm with
+        {
+            Fields = BigBoundForm.Fields
+                .Select(field => field.Name == "UpperFractionBig" ? field with { Upper = upper } : field)
+                .ToArray(),
+        };
+
+        Assert.Throws<ArgumentException>("definition", () => new RecordValidator(otherMetadata, definition));
+    }
+
+    // Metadata bound texts beside the exact floor and ceiling an integer column takes from them.
+    public static TheoryData<string, string, string> IntegerLimitsOfBoundText => new()
+    {
+        { "9007199254740993", "9007199254740993", "9007199254740993" },
+        { " 2e3 ", "2000", "2000" },
+        { "9007199254740992.5", "9007199254740992", "9007199254740993" },
+        { "-9007199254740992.5", "-9007199254740993", "-9007199254740992" },
+        { "9007199254740993.5", "9007199254740993", "9007199254740994" },
+        { "2.0000000000000001", "2", "3" },
+        { "12.5e-1", "1", "2" },
+        { "-0.5", "-1", "0" },
+        { ".5", "0", "1" },
+        { "5.", "5", "5" },
+        { "-0.0", "0", "0" },
+        { "-0e-999999999999999999999", "0", "0" },
+        { "1e-400", "0", "1" },
+        { "-1e-400", "-1", "0" },
+        { "1e30", "1000000000000000000000000000000", "1000000000000000000000000000000" },
+        { "-9223372036854775808.5", "-9223372036854775809", "-9223372036854775808" },
+    };
+
+    /// <summary>
+    /// The limits are exact and unbounded: a fraction a double rounds away still moves them, a magnitude below 1 at
+    /// any exponent gives the integers on either side of 0, and a whole number beyond the signed 64-bit range keeps
+    /// every digit. Negative zero is 0.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(IntegerLimitsOfBoundText))]
+    public void TryParseIntegerLimits_FiniteNumberText_GivesTheExactFloorAndCeiling(
+        string text,
+        string floor,
+        string ceiling)
+    {
+        Assert.True(FieldValueCoercion.TryParseIntegerLimits(text, out var actualFloor, out var actualCeiling));
+
+        Assert.Equal(BigInteger.Parse(floor, CultureInfo.InvariantCulture), actualFloor);
+        Assert.Equal(BigInteger.Parse(ceiling, CultureInfo.InvariantCulture), actualCeiling);
+    }
+
+    /// <summary>The limits are read only from a text the number parse accepts as a finite number.</summary>
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("   ")]
+    [InlineData("NaN")]
+    [InlineData("-Infinity")]
+    [InlineData("1e309")]
+    [InlineData("1,000")]
+    [InlineData("1e")]
+    [InlineData("- 5")]
+    public void TryParseIntegerLimits_TextTheNumberParseRefuses_IsRefused(string? text)
+    {
+        Assert.False(FieldValueCoercion.TryParseNumber(text, out _));
+
+        Assert.False(FieldValueCoercion.TryParseIntegerLimits(text, out var floor, out var ceiling));
+        Assert.Equal(BigInteger.Zero, floor);
+        Assert.Equal(BigInteger.Zero, ceiling);
+    }
+
+    // Each range-message helper for an exact integer bound, beside its literal text.
+    public static TheoryData<string, string> ExactIntegerRangeMessages => new()
+    {
+        { ValidationMessages.FormatRangeAtMost(9007199254740993L), "The value must be at most 9007199254740993." },
+        { ValidationMessages.FormatRangeAtLeast(9007199254740993L), "The value must be at least 9007199254740993." },
+        {
+            ValidationMessages.FormatRangeBetween(-9007199254740993L, 9007199254740993L),
+            "The value must be between -9007199254740993 and 9007199254740993."
+        },
+        {
+            ValidationMessages.FormatRangeBetween(-9007199254740993L, 37.5d),
+            "The value must be between -9007199254740993 and 37.5."
+        },
+        {
+            ValidationMessages.FormatRangeBetween(-37.5d, 9007199254740993L),
+            "The value must be between -37.5 and 9007199254740993."
+        },
+        { ValidationMessages.FormatRangeAtMost(long.MinValue), "The value must be at most -9223372036854775808." },
+    };
+
+    /// <summary>
+    /// An exact integer bound keeps every digit, and in a mixed pair the other bound keeps its shortest round-trip
+    /// form, so neither is rounded through the other's type.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(ExactIntegerRangeMessages))]
+    public void RangeMessage_ExactIntegerBound_KeepsEveryDigit(string actual, string expected)
+    {
+        Assert.Equal(expected, actual);
+    }
+
+    /// <summary>The fractional bound of a mixed pair keeps the finite check of every number bound.</summary>
+    [Fact]
+    public void RangeMessage_MixedPairWithNonFiniteBound_IsRejected()
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(
+            "upper",
+            () => ValidationMessages.FormatRangeBetween(9007199254740993L, double.NaN));
+        Assert.Throws<ArgumentOutOfRangeException>(
+            "lower",
+            () => ValidationMessages.FormatRangeBetween(double.NegativeInfinity, 9007199254740993L));
+    }
+
     /// <summary>The bounds are the stored <c>MM-DD-YYYY</c> texts <c>01-15-2011</c> and <c>12-31-2012</c>.</summary>
     [Theory]
     [InlineData("2011-01-15")]
@@ -680,6 +1165,101 @@ public sealed class RecordValidatorTests
     public void ValidateInput_NumberWithBlankBoundsAndPattern_IsUnchecked(double raw)
     {
         AssertValid(Validate(MirrorValidator(), ("FreeNumber", FieldValue.FromNumber(raw))));
+    }
+
+    // The bound itself, the adjacent representable double inside it, and a number far beyond on the open side.
+    public static TheoryData<string, double> NumberWithinOneSidedRange => new()
+    {
+        { "LowerOnlyNumber", 10.5d },
+        { "LowerOnlyNumber", Math.BitIncrement(10.5d) },
+        { "LowerOnlyNumber", 1e300d },
+        { "UpperOnlyNumber", 99.5d },
+        { "UpperOnlyNumber", Math.BitDecrement(99.5d) },
+        { "UpperOnlyNumber", -1e300d },
+    };
+
+    /// <summary>
+    /// A single bound is inclusive and constrains its own side only: the unset bound, NULL or blank, is no limit.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(NumberWithinOneSidedRange))]
+    public void ValidateInput_NumberWithinOneSidedRange_IsAccepted(string field, double raw)
+    {
+        var values = AssertValid(Validate(Validator(OneSidedRangeForm), (field, FieldValue.FromNumber(raw))));
+
+        Assert.Equal(FieldValue.FromNumber(raw), values[field]);
+    }
+
+    // The adjacent representable double outside the bound, and a number far beyond it.
+    public static TheoryData<string, double, string> NumberBeyondOneSidedRange => new()
+    {
+        { "LowerOnlyNumber", Math.BitDecrement(10.5d), ValidationMessages.FormatRangeAtLeast(10.5d) },
+        { "LowerOnlyNumber", -1e300d, ValidationMessages.FormatRangeAtLeast(10.5d) },
+        { "UpperOnlyNumber", Math.BitIncrement(99.5d), ValidationMessages.FormatRangeAtMost(99.5d) },
+        { "UpperOnlyNumber", 1e300d, ValidationMessages.FormatRangeAtMost(99.5d) },
+    };
+
+    /// <summary>A value past the single bound reads only that bound's message, never the two-bound one.</summary>
+    [Theory]
+    [MemberData(nameof(NumberBeyondOneSidedRange))]
+    public void ValidateInput_NumberBeyondOneSidedRange_IsSingleBoundError(string field, double raw, string expected)
+    {
+        var result = Validate(Validator(OneSidedRangeForm), (field, FieldValue.FromNumber(raw)));
+
+        AssertOnlyFieldError(result, field, expected);
+    }
+
+    /// <summary>
+    /// The bounds are the stored <c>MM-DD-YYYY</c> texts <c>03-01-2011</c> and <c>06-30-2012</c>; each value is the
+    /// bound, the day inside it, or the <c>datetime</c> limit on the open side.
+    /// </summary>
+    [Theory]
+    [InlineData("LowerOnlyDate", "2011-03-01")]
+    [InlineData("LowerOnlyDate", "2011-03-02")]
+    [InlineData("LowerOnlyDate", "9999-12-31")]
+    [InlineData("UpperOnlyDate", "2012-06-30")]
+    [InlineData("UpperOnlyDate", "2012-06-29")]
+    [InlineData("UpperOnlyDate", "1753-01-01")]
+    public void ValidateInput_DateWithinOneSidedRange_IsAccepted(string field, string raw)
+    {
+        var values = AssertValid(Validate(Validator(OneSidedRangeForm), (field, FieldValue.FromText(raw))));
+
+        Assert.Equal(IsoDate(raw), values[field]);
+    }
+
+    // The day outside the bound, and the datetime limit beyond it.
+    public static TheoryData<string, string, string> DateBeyondOneSidedRange => new()
+    {
+        { "LowerOnlyDate", "2011-02-28", ValidationMessages.FormatRangeAtLeast(new DateOnly(2011, 3, 1)) },
+        { "LowerOnlyDate", "1753-01-01", ValidationMessages.FormatRangeAtLeast(new DateOnly(2011, 3, 1)) },
+        { "UpperOnlyDate", "2012-07-01", ValidationMessages.FormatRangeAtMost(new DateOnly(2012, 6, 30)) },
+        { "UpperOnlyDate", "9999-12-31", ValidationMessages.FormatRangeAtMost(new DateOnly(2012, 6, 30)) },
+    };
+
+    [Theory]
+    [MemberData(nameof(DateBeyondOneSidedRange))]
+    public void ValidateInput_DateBeyondOneSidedRange_IsSingleBoundError(string field, string raw, string expected)
+    {
+        var result = Validate(Validator(OneSidedRangeForm), (field, FieldValue.FromText(raw)));
+
+        AssertOnlyFieldError(result, field, expected);
+    }
+
+    /// <summary>
+    /// The single-bound messages as the client reads them, numbers in shortest round-trip form and dates as
+    /// <c>YYYY-MM-DD</c>, so a swapped or reworded template fails here even though the cases above take their
+    /// expected text from the same <see cref="ValidationMessages"/> helpers the validator calls.
+    /// </summary>
+    [Theory]
+    [InlineData("LowerOnlyNumber", 10d, "The value must be at least 10.5.")]
+    [InlineData("UpperOnlyNumber", 100d, "The value must be at most 99.5.")]
+    [InlineData("LowerOnlyDate", "2011-02-28", "The value must be at least 2011-03-01.")]
+    [InlineData("UpperOnlyDate", "2012-07-01", "The value must be at most 2012-06-30.")]
+    public void ValidateInput_BeyondOneSidedRange_ReadsTheBound(string field, object raw, string expected)
+    {
+        var result = Validate(Validator(OneSidedRangeForm), (field, Wire(raw)));
+
+        AssertOnlyFieldError(result, field, expected);
     }
 
     [Fact]
@@ -847,6 +1427,21 @@ public sealed class RecordValidatorTests
         Assert.Equal(new[] { "Notes" }, values.Keys);
     }
 
+    /// <summary>
+    /// C-3: the required flag does not make a read-only field writable. Presence alone rejects it under its canonical
+    /// name, whatever the value, an explicit null included, and the required gate never runs on a rejected input.
+    /// </summary>
+    [Theory]
+    [InlineData("AssignedCode", "A-1")]
+    [InlineData("AssignedCode", null)]
+    [InlineData("assignedcode", "A-1")]
+    public void ValidateInput_RequiredReadOnlyFieldPresent_IsRejected(string submittedName, string? raw)
+    {
+        var result = Validate(Validator(RequiredReadOnlyForm), (submittedName, Wire(raw)));
+
+        AssertOnlyFieldError(result, "AssignedCode", ValidationMessages.ReadOnlyField);
+    }
+
 
     // ---- Phase 2 of a POST: CheckNewRecord ----
 
@@ -966,6 +1561,35 @@ public sealed class RecordValidatorTests
         Assert.Equal(RequiredMessage("CaseCode", "Page 1"), result.FieldErrors["CaseCode"][0]);
     }
 
+    /// <summary>
+    /// C-3: a create never includes a read-only field, so a required read-only field is left out of the gate and is
+    /// never listed; the writable required field beside it is still gated. A null
+    /// <paramref name="submittedReporter"/> leaves <c>Reporter</c> out of the create.
+    /// </summary>
+    [Theory]
+    [InlineData("Jones", false)]
+    [InlineData(null, true)]
+    public void CheckNewRecord_RequiredReadOnlyFieldAbsent_IsNeverMissing(
+        string? submittedReporter,
+        bool reporterMissing)
+    {
+        var normalised = submittedReporter is null
+            ? Normalised(("Remarks", FieldValue.FromText("x")))
+            : Normalised(("Remarks", FieldValue.FromText("x")), ("Reporter", FieldValue.FromText(submittedReporter)));
+
+        var result = Validator(RequiredReadOnlyForm).CheckNewRecord(normalised);
+
+        if (reporterMissing)
+        {
+            AssertOnlyFieldError(result, "Reporter", RequiredMessage(ReporterPrompt, "Page 1"));
+            return;
+        }
+
+        var values = AssertValid(result);
+        Assert.Equal(normalised.Keys, values.Keys);
+        Assert.DoesNotContain("AssignedCode", values.Keys);
+    }
+
     // ---- Phase 2 of a PUT: CheckRequired over the stored record ----
 
     /// <summary>
@@ -1015,6 +1639,85 @@ public sealed class RecordValidatorTests
                 : RequiredMessage(CollectionDatePrompt, "Page 2");
             Assert.Equal(new[] { expected }, result.FieldErrors[field]);
         }
+    }
+
+    /// <summary>
+    /// Stored text is read back as it is, never normalised, so an empty string stored in a required field the
+    /// <c>PUT</c> leaves untouched is missing, as legacy tests the value string for null or empty
+    /// (<c>GuiMediator.Events.ViewExplorer.cs</c>, lines 74 and 114). Stored whitespace is a value, a submitted value
+    /// replaces the stored empty string, and an empty string stored in the optional <c>Notes</c> blocks nothing. A null
+    /// <paramref name="submittedPatientName"/> leaves <c>PatientName</c> untouched.
+    /// </summary>
+    [Theory]
+    [InlineData("", "stored note", null, true)]
+    [InlineData("   ", "stored note", null, false)]
+    [InlineData("", "stored note", "Jones", false)]
+    [InlineData("Smith", "", null, false)]
+    public void CheckRequired_StoredEmptyText_IsMissingOnlyOnAnUntouchedRequiredField(
+        string storedPatientName,
+        string storedNotes,
+        string? submittedPatientName,
+        bool patientNameMissing)
+    {
+        var stored = Stored(Normalised(
+            ("PatientName", FieldValue.FromText(storedPatientName)),
+            ("Notes", FieldValue.FromText(storedNotes)),
+            ("CollectionDate", IsoDate("2011-02-01")),
+            ("Flag", FieldValue.FromBoolean(true))));
+        var submitted = submittedPatientName is null
+            ? Normalised(("Flag", FieldValue.FromBoolean(false)))
+            : Normalised(
+                ("Flag", FieldValue.FromBoolean(false)),
+                ("PatientName", FieldValue.FromText(submittedPatientName)));
+
+        var result = Validator(RequiredForm).CheckRequired(stored, submitted);
+
+        Assert.Equal(FieldValue.FromText(storedPatientName), stored.Values["PatientName"]);
+        if (patientNameMissing)
+        {
+            AssertOnlyFieldError(result, "PatientName", RequiredMessage(PatientNamePrompt, "Page 1"));
+            return;
+        }
+
+        var values = AssertValid(result);
+        Assert.Equal(submitted.Keys, values.Keys);
+        Assert.All(submitted, entry => Assert.Equal(entry.Value, values[entry.Key]));
+    }
+
+    /// <summary>
+    /// C-3: an update can never supply a read-only field, so a required read-only field stored as null or as an empty
+    /// string never blocks the save, while the writable required field beside it is still gated on the effective
+    /// record. A null <paramref name="storedAssignedCode"/> stores null; a null <paramref name="submittedReporter"/>
+    /// leaves <c>Reporter</c>, stored as null, untouched.
+    /// </summary>
+    [Theory]
+    [InlineData(null, "Jones", false)]
+    [InlineData("", "Jones", false)]
+    [InlineData("", null, true)]
+    public void CheckRequired_RequiredReadOnlyFieldEmpty_IsNeverMissing(
+        string? storedAssignedCode,
+        string? submittedReporter,
+        bool reporterMissing)
+    {
+        var stored = Stored(Normalised(
+            ("AssignedCode", storedAssignedCode is null ? FieldValue.Null : FieldValue.FromText(storedAssignedCode)),
+            ("Reporter", FieldValue.Null),
+            ("Remarks", FieldValue.FromText("stored remark"))));
+        var submitted = submittedReporter is null
+            ? Normalised(("Remarks", FieldValue.FromText("x")))
+            : Normalised(("Remarks", FieldValue.FromText("x")), ("Reporter", FieldValue.FromText(submittedReporter)));
+
+        var result = Validator(RequiredReadOnlyForm).CheckRequired(stored, submitted);
+
+        if (reporterMissing)
+        {
+            AssertOnlyFieldError(result, "Reporter", RequiredMessage(ReporterPrompt, "Page 1"));
+            return;
+        }
+
+        var values = AssertValid(result);
+        Assert.Equal(submitted.Keys, values.Keys);
+        Assert.All(submitted, entry => Assert.Equal(entry.Value, values[entry.Key]));
     }
 
     /// <summary>A <c>PUT</c> may clear fields: the empty-record rule of a create does not apply to it.</summary>
@@ -1067,6 +1770,9 @@ public sealed class RecordValidatorTests
         "Required" => RequiredForm,
         "NullPrompt" => NullPromptForm,
         "Storage" => StorageForm,
+        "OneSidedRange" => OneSidedRangeForm,
+        "RequiredReadOnly" => RequiredReadOnlyForm,
+        "BigBound" => BigBoundForm,
         _ => throw new ArgumentOutOfRangeException(nameof(name), name, "No fixture form has that name."),
     };
 
@@ -1124,6 +1830,16 @@ public sealed class RecordValidatorTests
         int number => FieldValue.FromNumber(number),
         _ => throw new ArgumentException("A wire value is a string, a number, a boolean or null.", nameof(raw)),
     };
+
+    // A JSON number literal as the API's values reader parses it, its digits kept exact: a whole number within the
+    // signed 64-bit range keeps its integer, and any other number only its nearest double, never as a whole number.
+    // Values beyond 2^53 are built this way, because a double literal would already have rounded them.
+    private static FieldValue ExactNumber(string literal)
+    {
+        Assert.True(FieldValueCoercion.TryParseNumber(literal, out var value));
+        Assert.Equal(FieldValueKind.Number, value.Kind);
+        return value;
+    }
 
     private static FieldValue IsoDate(string text) =>
         FieldValue.FromDate(DateOnly.ParseExact(text, "yyyy-MM-dd", CultureInfo.InvariantCulture));
@@ -1207,6 +1923,11 @@ public sealed class RecordValidatorTests
     }
 
     private static (string SqlType, int MaxLengthBytes) Nvarchar(int characters) => ("nvarchar", 2 * characters);
+
+    // A metaFields.List of count Option items, L0 to L(count - 1), so the item at index i reads Li.
+    private static string OptionList(int count) => string.Join(
+        ',',
+        Enumerable.Range(0, count).Select(index => "L" + index.ToString(CultureInfo.InvariantCulture)));
 
     // metaFieldTypes.Name as seeded by testdata/sql/02_reference_data.sql.
     private static string SeededTypeName(int typeId) => typeId switch

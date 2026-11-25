@@ -778,6 +778,88 @@ public sealed class FormDefinitionFactoryTests
         Assert.Equal(FieldValue.FromNumber(upper), field.Validation.Upper);
     }
 
+    /// <summary>
+    /// A <c>bigint</c> bound beyond 2^53 fits <c>metaFields.Lower</c>/<c>Upper</c> (<c>nvarchar(20)</c>) and keeps its
+    /// exact integer: a double would round <c>9007199254740993</c> to <c>9007199254740992</c>, so an upper bound would
+    /// reject its own endpoint and a lower bound would admit the integer below it.
+    /// </summary>
+    [Theory]
+    [InlineData("9007199254740993", 9007199254740993L)]
+    [InlineData("-9007199254740993", -9007199254740993L)]
+    [InlineData("9223372036854775807", long.MaxValue)]
+    [InlineData("-9223372036854775808", long.MinValue)]
+    public void Create_BigintNumberBound_KeepsItsExactInteger(string stored, long expected)
+    {
+        FieldDefinition field = SingleDefinition(
+            Field(1, "Big", "Number", tabIndex: 1, sqlType: "bigint", lower: stored, upper: stored));
+
+        Assert.Equal(FieldType.Number, field.FieldType);
+        foreach (FieldValue? bound in new[] { field.Validation.Lower, field.Validation.Upper })
+        {
+            Assert.Equal(FieldValue.FromInteger(expected), bound);
+            Assert.True(Assert.NotNull(bound).TryGetInteger(out long integer));
+            Assert.Equal(expected, integer);
+        }
+    }
+
+    /// <summary>
+    /// Number bounds keep the invariant lexical rules (surrounding whitespace, a sign, a point, an exponent): a whole
+    /// number is its exact integer, and any other number its nearest double, never rounded into a whole number.
+    /// </summary>
+    [Theory]
+    [InlineData(" 2e3 ", true, 2000L, 2000d)]
+    [InlineData("+120", true, 120L, 120d)]
+    [InlineData("2.0", true, 2L, 2d)]
+    [InlineData("-0", true, 0L, 0d)]
+    [InlineData("37.5", false, 0L, 37.5d)]
+    [InlineData("-1.5E1", true, -15L, -15d)]
+    [InlineData("2.0000000000000001", false, 0L, 2d)]
+    [InlineData("9223372036854775808", false, 0L, 9223372036854775808d)]
+    public void Create_NumberBoundText_KeepsAnExactIntegerOrItsNearestDouble(
+        string stored,
+        bool isInteger,
+        long integer,
+        double nearest)
+    {
+        FieldDefinition field = SingleDefinition(
+            Field(1, "Bounded", "Number", tabIndex: 1, sqlType: "float", lower: stored, upper: stored));
+
+        foreach (FieldValue? bound in new[] { field.Validation.Lower, field.Validation.Upper })
+        {
+            FieldValue value = Assert.NotNull(bound);
+            Assert.Equal(FieldValueKind.Number, value.Kind);
+            Assert.Equal(isInteger, value.TryGetInteger(out long actualInteger));
+            Assert.Equal(integer, actualInteger);
+            Assert.True(value.TryGetNumber(out double actualNearest));
+            Assert.Equal(nearest, actualNearest);
+            if (isInteger)
+            {
+                Assert.Equal(FieldValue.FromInteger(integer), value);
+            }
+            else if (Math.Truncate(nearest) != nearest)
+            {
+                Assert.Equal(FieldValue.FromNumber(nearest), value);
+            }
+        }
+    }
+
+    /// <summary>Text that is no finite invariant number is no bound, as before.</summary>
+    [Theory]
+    [InlineData("NaN")]
+    [InlineData("Infinity")]
+    [InlineData("1e400")]
+    [InlineData("1,000")]
+    [InlineData("37,5")]
+    [InlineData("abc")]
+    public void Create_UnparseableNumberBound_IsNoBound(string stored)
+    {
+        FieldDefinition field = SingleDefinition(
+            Field(1, "Bounded", "Number", tabIndex: 1, sqlType: "bigint", lower: stored, upper: stored));
+
+        Assert.Null(field.Validation.Lower);
+        Assert.Null(field.Validation.Upper);
+    }
+
     /// <summary>The seeded unset bounds are empty strings, as on <c>AntibioticUseDays</c> and <c>DOB</c>.</summary>
     [Theory]
     [InlineData("CaseReport", "AntibioticUseDays")]
@@ -1267,7 +1349,7 @@ public sealed class FormDefinitionFactoryTests
         int size = sqlType switch
         {
             "ntext" => 16,
-            "float" or "datetime" => 8,
+            "float" or "datetime" or "bigint" => 8,
             "bit" or "tinyint" => 1,
             "smallint" => 2,
             "int" => 4,

@@ -1,5 +1,6 @@
 using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
+using System.Numerics;
 
 namespace EpiInfo.Domain.Values;
 
@@ -79,6 +80,14 @@ public readonly record struct FieldValueCoercionResult(FieldValue Value, FieldVa
 public static class FieldValueCoercion
 {
     private const string MetadataDateFormat = "MM-dd-yyyy";
+
+    // Every finite double is below 2^1024, which is below 10^309, so a number text whose value is at least 10^309
+    // never parses as finite.
+    private const int MaxFiniteDecimalExponent = 308;
+
+    // Exponent digits past this magnitude saturate it: the value is then far beyond every finite double, or nearer
+    // to zero than any text short enough to hold its digits could bring it back from.
+    private const long ExponentSaturation = 1_000_000_000_000L;
 
     /// <summary>
     /// Coerces a raw scalar into a <see cref="FieldValue"/> of the <paramref name="target"/> kind.
@@ -325,6 +334,94 @@ public static class FieldValueCoercion
     }
 
     /// <summary>
+    /// Reads the exact integer limits of a finite number text: the greatest integer at or below the number and the
+    /// least integer at or above it. An integer column decides an inclusive bound with these, because the nearest
+    /// double can cross an integer: <c>9007199254740992.5</c> and <c>9007199254740993.5</c> round to
+    /// <c>9007199254740992</c> and <c>9007199254740994</c>, and <c>2.0000000000000001</c> rounds to 2.
+    /// </summary>
+    /// <param name="text">
+    /// Metadata text, such as <c>120</c> or <c>9007199254740992.5</c>, read with the lexical rules of
+    /// <see cref="TryParseNumber(string, out FieldValue)"/>: the invariant culture, surrounding whitespace, a leading
+    /// sign, ASCII digits on either side of a decimal point, an exponent, and no thousands separators.
+    /// </param>
+    /// <param name="floor">The greatest integer at or below the number, or 0 when parsing fails.</param>
+    /// <param name="ceiling">The least integer at or above the number, or 0 when parsing fails.</param>
+    /// <returns>
+    /// Whether <paramref name="text"/> is a finite number, decided exactly as
+    /// <see cref="TryParseNumber(string, out FieldValue)"/> decides it, so <c>NaN</c>, infinities, values that
+    /// overflow to infinity and text such as <c>1,000</c> are refused. Both limits are exact and unbounded: a whole
+    /// number has equal limits, <c>9007199254740992.5</c> has 9007199254740992 and 9007199254740993, <c>-0.5</c>
+    /// has -1 and 0, <c>1e-400</c> has 0 and 1, <c>1e30</c> has 10^30 twice, and negative zero has 0 twice.
+    /// </returns>
+    public static bool TryParseIntegerLimits(
+        [NotNullWhen(true)] string? text,
+        out BigInteger floor,
+        out BigInteger ceiling)
+    {
+        floor = BigInteger.Zero;
+        ceiling = BigInteger.Zero;
+
+        if (!TryParseNumber(text, out var number))
+        {
+            return false;
+        }
+
+        // A whole number within the signed 64-bit range is already exact.
+        if (number.TryGetInteger(out var integer))
+        {
+            floor = integer;
+            ceiling = integer;
+            return true;
+        }
+
+        if (!TryReadDecimal(text, out var negative, out var significand, out var exponent))
+        {
+            return false;
+        }
+
+        // Zero, negative zero included, has no sign and no fraction, whatever its exponent.
+        if (significand.Length == 0)
+        {
+            return true;
+        }
+
+        // The value is ±significand·10^exponent. A whole value is at least 10^exponent, which a finite number caps,
+        // so the power stays small.
+        if (exponent >= 0)
+        {
+            if (exponent > MaxFiniteDecimalExponent)
+            {
+                return false;
+            }
+
+            var whole = BigInteger.Parse(significand, NumberStyles.None, CultureInfo.InvariantCulture)
+                * BigInteger.Pow(10, (int)exponent);
+            floor = negative ? -whole : whole;
+            ceiling = floor;
+            return true;
+        }
+
+        // With more fraction places than significant digits the magnitude is strictly between 0 and 1, however small
+        // the exponent, so no power of ten is built for it.
+        var fractionPlaces = -exponent;
+        if (fractionPlaces > significand.Length)
+        {
+            floor = negative ? BigInteger.MinusOne : BigInteger.Zero;
+            ceiling = negative ? BigInteger.Zero : BigInteger.One;
+            return true;
+        }
+
+        var quotient = BigInteger.DivRem(
+            BigInteger.Parse(significand, NumberStyles.None, CultureInfo.InvariantCulture),
+            BigInteger.Pow(10, (int)fractionPlaces),
+            out var remainder);
+        var truncated = negative ? -quotient : quotient;
+        floor = negative && !remainder.IsZero ? truncated - BigInteger.One : truncated;
+        ceiling = !negative && !remainder.IsZero ? truncated + BigInteger.One : truncated;
+        return true;
+    }
+
+    /// <summary>
     /// Parses a 32-bit integer with the invariant culture: surrounding whitespace and a leading sign are
     /// allowed, and a decimal point, an exponent or thousands separators are not.
     /// </summary>
@@ -409,6 +506,102 @@ public static class FieldValueCoercion
 
         value = FieldValue.FromNonInt64Number(nearest);
         return true;
+    }
+
+    // Reads the grammar the invariant NumberStyles.Float parse accepts, [ws][+|-]digits[.digits][(e|E)[+|-]digits]
+    // [ws], with ASCII digits on at least one side of the point and the trailing NUL characters .NET number parsing
+    // ignores. The value is ±significand·10^exponent; significand holds the digits without leading zeros and is empty
+    // for zero. An exponent marker without digits is not part of the number, as in .NET, so it is left over and
+    // refused as trailing text.
+    private static bool TryReadDecimal(string text, out bool negative, out string significand, out long exponent)
+    {
+        negative = false;
+        significand = string.Empty;
+        exponent = 0L;
+
+        var index = 0;
+        SkipWhiteSpace(text, ref index);
+
+        if (index < text.Length && text[index] is '+' or '-')
+        {
+            negative = text[index] == '-';
+            index++;
+        }
+
+        var integerDigits = ReadDigits(text, ref index);
+        var fractionDigits = ReadOnlySpan<char>.Empty;
+        if (index < text.Length && text[index] == '.')
+        {
+            index++;
+            fractionDigits = ReadDigits(text, ref index);
+        }
+
+        if (integerDigits.IsEmpty && fractionDigits.IsEmpty)
+        {
+            return false;
+        }
+
+        var statedExponent = 0L;
+        if (index < text.Length && text[index] is 'e' or 'E')
+        {
+            var afterMarker = index + 1;
+            var exponentNegative = false;
+            if (afterMarker < text.Length && text[afterMarker] is '+' or '-')
+            {
+                exponentNegative = text[afterMarker] == '-';
+                afterMarker++;
+            }
+
+            var exponentDigits = ReadDigits(text, ref afterMarker);
+            if (!exponentDigits.IsEmpty)
+            {
+                foreach (var digit in exponentDigits)
+                {
+                    if (statedExponent < ExponentSaturation)
+                    {
+                        statedExponent = (statedExponent * 10L) + (digit - '0');
+                    }
+                }
+
+                statedExponent = exponentNegative ? -statedExponent : statedExponent;
+                index = afterMarker;
+            }
+        }
+
+        SkipWhiteSpace(text, ref index);
+        while (index < text.Length && text[index] == '\0')
+        {
+            index++;
+        }
+
+        if (index != text.Length)
+        {
+            return false;
+        }
+
+        significand = string.Concat(integerDigits, fractionDigits).TrimStart('0');
+        exponent = statedExponent - fractionDigits.Length;
+        return true;
+    }
+
+    private static ReadOnlySpan<char> ReadDigits(string text, scoped ref int index)
+    {
+        var start = index;
+        while (index < text.Length && char.IsAsciiDigit(text[index]))
+        {
+            index++;
+        }
+
+        return text.AsSpan(start, index - start);
+    }
+
+    // The white space .NET number parsing allows around a number: the space and the controls U+0009 to U+000D.
+    private static void SkipWhiteSpace(string text, ref int index)
+    {
+        while (index < text.Length && text[index] is ' ' or (>= '\t' and <= '\r'))
+        {
+            index++;
+        }
     }
 
     private static FieldValueCoercionResult CoerceDate(object raw) => raw switch

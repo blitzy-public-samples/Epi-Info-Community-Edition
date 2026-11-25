@@ -121,7 +121,8 @@ public sealed class JsonContentTypeMiddleware
 
     // Decided from headers only; the body is never read, peeked or buffered. Mixing BodyReader peeks with later Body
     // stream reads can lose data, and RequestBodyLimitMiddleware's counting stream must see every byte. A chunked
-    // body that turns out to be empty therefore reaches binding, which reports the same request-level 400.
+    // body that turns out to be empty therefore reaches binding, and the exception handler answers its JSON failure
+    // with the same request-level 400, because the counting stream reports that the body ended before its first byte.
     private static bool CanHaveBody(HttpContext context)
     {
         if (context.Request.ContentLength == 0)

@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Text.Json;
+using EpiInfo.Api.Hosting;
 using EpiInfo.Data.Sql;
 using EpiInfo.Domain.Storage;
 using Microsoft.AspNetCore.Diagnostics;
@@ -17,19 +18,24 @@ namespace EpiInfo.Api.Errors;
 /// <list type="number">
 /// <item><description>
 /// A client abort (an <see cref="OperationCanceledException"/> or <see cref="IOException"/> while
-/// <see cref="HttpContext.RequestAborted"/> is cancelled): no body, one Information line.
+/// <see cref="HttpContext.RequestAborted"/> is cancelled): no body, one Information line. In the API pipeline
+/// <see cref="ApiExceptionBoundaryMiddleware"/> answers it, because the exception-handler middleware settles a client
+/// abort itself, without calling any handler.
 /// </description></item>
 /// <item><description>
-/// A <see cref="BadHttpRequestException"/> keeps its status: 400 is "malformed JSON" when a
-/// <see cref="JsonException"/> caused it, "request body is required" when the request has no body, and "the request
-/// is invalid" otherwise; 413 and 415 get their fixed bodies; any other 4xx keeps its status with the fixed
-/// invalid-request text.
+/// A <see cref="BadHttpRequestException"/> keeps its status: 400 is "request body is required" when the headers say
+/// the request has no body, or when a <see cref="JsonException"/> caused it and the body guard's
+/// <see cref="IRequestBodyReadFeature"/> saw the body end before its first byte (an empty chunked body); "malformed
+/// JSON" when a <see cref="JsonException"/> caused it otherwise; and "the request is invalid" otherwise. 413 and 415
+/// get their fixed bodies; any other 4xx keeps its status with the fixed invalid-request text. A request-body JSON
+/// failure arrives only in this form, because binding wraps it in a <see cref="BadHttpRequestException"/>.
 /// </description></item>
-/// <item><description>A bare <see cref="JsonException"/> is the 400 "malformed JSON".</description></item>
 /// <item><description>A <see cref="DataStoreUnavailableException"/> is a 503.</description></item>
 /// <item><description>
 /// Anything else, <see cref="DataStoreWriteException"/> and an internal cancellation included, is a 500 with the
-/// fixed generic <c>detail</c>.
+/// fixed generic <c>detail</c>. So is a bare <see cref="JsonException"/>: it comes from server-side work such as
+/// serialising the response, never from the request, and on a record write that can follow the commit, which is then
+/// reported as <c>written</c>.
 /// </description></item>
 /// </list>
 /// <para>
@@ -42,6 +48,11 @@ namespace EpiInfo.Api.Errors;
 /// outcome, a failed rollback's type and SQL error number, and the trace id. The exception object is never given to
 /// the logger and its message is never read, because the inner exception of a store failure can hold SQL text,
 /// values or a connection string. The handler is stateless and safe to share across requests.
+/// </para>
+/// <para>
+/// A failure after the response has started never reaches a handler: the exception-handler middleware would log the
+/// exception object and rethrow it. <see cref="ApiExceptionBoundaryMiddleware"/> answers it under the same redaction,
+/// with one Error line and an aborted response whose sent status and headers stay as they are.
 /// </para>
 /// </remarks>
 internal sealed partial class ApiExceptionHandler(ILogger<ApiExceptionHandler> logger) : IExceptionHandler
@@ -58,11 +69,14 @@ internal sealed partial class ApiExceptionHandler(ILogger<ApiExceptionHandler> l
         ArgumentNullException.ThrowIfNull(httpContext);
         ArgumentNullException.ThrowIfNull(exception);
 
-        var traceId = Activity.Current?.Id ?? httpContext.TraceIdentifier;
+        var traceId = TraceId(httpContext);
         var endpoint = MatchedEndpoint(httpContext);
         var operation = ResolveOperation(exception, endpoint);
         var exceptionType = TypeName(exception);
 
+        // Defensive: in the API pipeline ApiExceptionBoundaryMiddleware answers a client abort first, because the
+        // exception-handler middleware settles one itself, without calling any handler. This branch answers a handler
+        // invoked outside that pipeline the same way.
         if (IsClientAbort(exception, httpContext))
         {
             LogClientAbort(logger, operation, exceptionType, traceId);
@@ -103,6 +117,9 @@ internal sealed partial class ApiExceptionHandler(ILogger<ApiExceptionHandler> l
             rollbackSqlErrorNumber,
             traceId);
 
+        // Defensive: the exception-handler middleware never calls a handler once the response has started, and in the
+        // API pipeline ApiExceptionBoundaryMiddleware answers that failure first. The sent status and headers cannot
+        // change, so a handler invoked outside that pipeline writes no body.
         if (httpContext.Response.HasStarted)
         {
             return true;
@@ -155,7 +172,6 @@ internal sealed partial class ApiExceptionHandler(ILogger<ApiExceptionHandler> l
     private static HandledFailure Classify(HttpContext httpContext, Exception exception) => exception switch
     {
         BadHttpRequestException badRequest => ClassifyBadRequest(httpContext.Request, badRequest),
-        JsonException => new(StatusCodes.Status400BadRequest, LogLevel.Information, ApiProblems.MalformedJson()),
         DataStoreUnavailableException =>
             new(StatusCodes.Status503ServiceUnavailable, LogLevel.Warning, ApiProblems.Unavailable()),
         _ => new(StatusCodes.Status500InternalServerError, LogLevel.Error, ApiProblems.Unexpected()),
@@ -166,8 +182,8 @@ internal sealed partial class ApiExceptionHandler(ILogger<ApiExceptionHandler> l
         var status = exception.StatusCode;
         var body = status switch
         {
+            StatusCodes.Status400BadRequest when IsEmptyBody(request, exception) => ApiProblems.RequestBodyRequired(),
             StatusCodes.Status400BadRequest when HasJsonCause(exception) => ApiProblems.MalformedJson(),
-            StatusCodes.Status400BadRequest when HasNoBody(request) => ApiProblems.RequestBodyRequired(),
             StatusCodes.Status413PayloadTooLarge => ApiProblems.RequestTooLarge(),
             StatusCodes.Status415UnsupportedMediaType => ApiProblems.UnsupportedMediaType(),
             > StatusCodes.Status400BadRequest and < StatusCodes.Status500InternalServerError =>
@@ -200,8 +216,19 @@ internal sealed partial class ApiExceptionHandler(ILogger<ApiExceptionHandler> l
         request.HttpContext.Features.Get<IHttpRequestBodyDetectionFeature>() is { CanHaveBody: false }
         || request.ContentLength == 0;
 
-    private static bool IsClientAbort(Exception exception, HttpContext httpContext) =>
+    // Empty by its headers, or, for a JSON failure, by the body guard's read state: the reads binding made found the
+    // end of the body before its first byte, as with an empty chunked body. Nothing here reads the body, and a host
+    // without the guard is judged by its headers alone.
+    private static bool IsEmptyBody(HttpRequest request, BadHttpRequestException exception) =>
+        HasNoBody(request)
+        || (HasJsonCause(exception)
+            && request.HttpContext.Features.Get<IRequestBodyReadFeature>() is { EndOfBody: true, BytesRead: 0 });
+
+    internal static bool IsClientAbort(Exception exception, HttpContext httpContext) =>
         (exception is OperationCanceledException or IOException) && httpContext.RequestAborted.IsCancellationRequested;
+
+    // The trace id every log line and error body of a request carries.
+    internal static string TraceId(HttpContext httpContext) => Activity.Current?.Id ?? httpContext.TraceIdentifier;
 
     // UseExceptionHandler clears the request's endpoint before it calls any handler and keeps the matched one on
     // IExceptionHandlerFeature, so GetEndpoint() alone would never see WriteEndpointMetadata there. It still answers
@@ -209,7 +236,7 @@ internal sealed partial class ApiExceptionHandler(ILogger<ApiExceptionHandler> l
     private static Endpoint? MatchedEndpoint(HttpContext httpContext) =>
         httpContext.Features.Get<IExceptionHandlerFeature>()?.Endpoint ?? httpContext.GetEndpoint();
 
-    private static string ResolveOperation(Exception exception, Endpoint? endpoint) =>
+    internal static string ResolveOperation(Exception exception, Endpoint? endpoint) =>
         (exception switch
         {
             DataStoreUnavailableException unavailable => unavailable.Operation,
@@ -220,7 +247,7 @@ internal sealed partial class ApiExceptionHandler(ILogger<ApiExceptionHandler> l
         ?? endpoint?.Metadata.GetMetadata<IEndpointNameMetadata>()?.EndpointName
         ?? DefaultOperation;
 
-    private static int? StoreSqlErrorNumber(Exception exception) => exception switch
+    internal static int? StoreSqlErrorNumber(Exception exception) => exception switch
     {
         DataStoreUnavailableException unavailable => unavailable.SqlErrorNumber,
         DataStoreWriteException failed => failed.SqlErrorNumber,
@@ -229,7 +256,7 @@ internal sealed partial class ApiExceptionHandler(ILogger<ApiExceptionHandler> l
 
     // The repository records a failed rollback beside the original failure, as a type name and a SQL error number
     // only; anything else stored under these keys is ignored rather than logged.
-    private static (string? ExceptionType, int? SqlErrorNumber) RollbackFailure(Exception exception)
+    internal static (string? ExceptionType, int? SqlErrorNumber) RollbackFailure(Exception exception)
     {
         var data = exception.Data;
         var type = data.Contains(SqlErrorClassifier.RollbackExceptionTypeKey)
@@ -242,7 +269,7 @@ internal sealed partial class ApiExceptionHandler(ILogger<ApiExceptionHandler> l
         return (type, number);
     }
 
-    private static string TypeName(Exception exception)
+    internal static string TypeName(Exception exception)
     {
         var type = exception.GetType();
         return type.FullName ?? type.Name;
@@ -270,7 +297,7 @@ internal sealed partial class ApiExceptionHandler(ILogger<ApiExceptionHandler> l
         EventName = "RequestAborted",
         Level = LogLevel.Information,
         Message = "Request aborted by the client during {Operation}: {ExceptionType}; TraceId {TraceId}")]
-    private static partial void LogClientAbort(ILogger logger, string operation, string exceptionType, string traceId);
+    internal static partial void LogClientAbort(ILogger logger, string operation, string exceptionType, string traceId);
 
     [LoggerMessage(
         EventId = 3,
@@ -281,4 +308,141 @@ internal sealed partial class ApiExceptionHandler(ILogger<ApiExceptionHandler> l
 
     /// <summary>The status, log level and body chosen for one failure.</summary>
     private readonly record struct HandledFailure(int StatusCode, LogLevel Level, IResult Body);
+}
+
+/// <summary>
+/// The API's exception boundary, just inside <c>UseExceptionHandler()</c>. It answers the two failures the
+/// exception-handler middleware settles itself, before it calls any <see cref="IExceptionHandler"/>, so that neither
+/// escapes the error contract and redaction of <see cref="ApiExceptionHandler"/>. Every other exception passes through
+/// unchanged to that middleware and handler.
+/// </summary>
+/// <remarks>
+/// <list type="bullet">
+/// <item><description>
+/// A client abort (an <see cref="OperationCanceledException"/> or <see cref="IOException"/> while
+/// <see cref="HttpContext.RequestAborted"/> is cancelled), before or after the response started: one Information line,
+/// status 499 when the response has not started, and no body. The middleware itself would log it only at Debug, which
+/// the committed <c>Microsoft.AspNetCore</c> filter drops.
+/// </description></item>
+/// <item><description>
+/// Any other failure after the response started: one Error line, then <see cref="HttpContext.Abort"/>, so the
+/// incomplete response is never completed as if it were whole. The sent status, headers and body are not rewritten.
+/// The middleware itself would log the exception object and rethrow it to the server, which would log it again.
+/// </description></item>
+/// </list>
+/// <para>
+/// Neither case is rethrown. The lines share the handler's log category and argument rules: the exception object is
+/// never given to the logger and its message is never read. The matched endpoint is still on the request here,
+/// because the exception-handler middleware clears it only once it handles an exception itself.
+/// </para>
+/// </remarks>
+internal sealed partial class ApiExceptionBoundaryMiddleware
+{
+    private readonly RequestDelegate _next;
+
+    private readonly ILogger<ApiExceptionHandler> _logger;
+
+    /// <summary>Creates the boundary in front of <paramref name="next"/>.</summary>
+    /// <param name="next">The rest of the pipeline.</param>
+    /// <param name="logger">The exception handler's logger, so every failure line of a request has one category.</param>
+    /// <exception cref="ArgumentNullException">
+    /// <paramref name="next"/> or <paramref name="logger"/> is <see langword="null"/>.
+    /// </exception>
+    public ApiExceptionBoundaryMiddleware(RequestDelegate next, ILogger<ApiExceptionHandler> logger)
+    {
+        ArgumentNullException.ThrowIfNull(next);
+        ArgumentNullException.ThrowIfNull(logger);
+        _next = next;
+        _logger = logger;
+    }
+
+    /// <summary>
+    /// Calls the rest of the pipeline, and answers a client abort, or a failure after the response started, that
+    /// escapes it.
+    /// </summary>
+    /// <param name="httpContext">The current request.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="httpContext"/> is <see langword="null"/>.</exception>
+    public async Task InvokeAsync(HttpContext httpContext)
+    {
+        ArgumentNullException.ThrowIfNull(httpContext);
+
+        try
+        {
+            await _next(httpContext);
+        }
+        catch (Exception exception) when (ApiExceptionHandler.IsClientAbort(exception, httpContext))
+        {
+            ApiExceptionHandler.LogClientAbort(
+                _logger,
+                ApiExceptionHandler.ResolveOperation(exception, httpContext.GetEndpoint()),
+                ApiExceptionHandler.TypeName(exception),
+                ApiExceptionHandler.TraceId(httpContext));
+
+            // The status the exception-handler middleware itself gives an aborted request; nobody receives a body.
+            if (!httpContext.Response.HasStarted)
+            {
+                httpContext.Response.StatusCode = StatusCodes.Status499ClientClosedRequest;
+            }
+        }
+        catch (Exception exception) when (httpContext.Response.HasStarted)
+        {
+            var endpoint = httpContext.GetEndpoint();
+            var writeOutcome = endpoint?.Metadata.GetMetadata<WriteEndpointMetadata>() is null
+                ? null
+                : ApiExceptionHandler.ResolveWriteOutcome(WriteOutcomeFeature.Get(httpContext), exception).ToWireValue();
+            var (rollbackExceptionType, rollbackSqlErrorNumber) = ApiExceptionHandler.RollbackFailure(exception);
+            LogResponseAborted(
+                _logger,
+                httpContext.Response.StatusCode,
+                ApiExceptionHandler.TypeName(exception),
+                ApiExceptionHandler.ResolveOperation(exception, endpoint),
+                ApiExceptionHandler.StoreSqlErrorNumber(exception),
+                writeOutcome,
+                rollbackExceptionType,
+                rollbackSqlErrorNumber,
+                ApiExceptionHandler.TraceId(httpContext));
+
+            // The client already holds a status and part of a body. Aborting the connection, which withholds the final
+            // chunk, keeps it from reading the incomplete response as a whole one.
+            httpContext.Abort();
+        }
+    }
+
+    // Event id 4 continues the numbering of ApiExceptionHandler's events, whose category this line shares.
+    [LoggerMessage(
+        EventId = 4,
+        EventName = "ResponseAborted",
+        Level = LogLevel.Error,
+        Message = "Request failed after the response started, with status {StatusCode}: {ExceptionType} during "
+            + "{Operation}; SQL error {SqlErrorNumber}; write outcome {WriteOutcome}; rollback {RollbackExceptionType} "
+            + "{RollbackSqlErrorNumber}; TraceId {TraceId}")]
+    private static partial void LogResponseAborted(
+        ILogger logger,
+        int statusCode,
+        string exceptionType,
+        string operation,
+        int? sqlErrorNumber,
+        string? writeOutcome,
+        string? rollbackExceptionType,
+        int? rollbackSqlErrorNumber,
+        string traceId);
+}
+
+/// <summary>Pipeline registration for <see cref="ApiExceptionBoundaryMiddleware"/>.</summary>
+internal static class ApiExceptionBoundaryExtensions
+{
+    /// <summary>
+    /// Adds <see cref="ApiExceptionBoundaryMiddleware"/>. Call it right after <c>UseExceptionHandler()</c> and before
+    /// <c>UseStatusCodePages()</c>: inside the exception-handler middleware, so that middleware never settles a client
+    /// abort or a failure after the response started itself, and outside status-code pages, so they never write a body
+    /// for an aborted request.
+    /// </summary>
+    /// <param name="app">The application builder.</param>
+    /// <returns>The same builder, for chaining.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="app"/> is <see langword="null"/>.</exception>
+    public static IApplicationBuilder UseApiExceptionBoundary(this IApplicationBuilder app)
+    {
+        ArgumentNullException.ThrowIfNull(app);
+        return app.UseMiddleware<ApiExceptionBoundaryMiddleware>();
+    }
 }

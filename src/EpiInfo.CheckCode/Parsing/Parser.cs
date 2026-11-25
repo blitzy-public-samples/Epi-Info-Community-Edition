@@ -1382,7 +1382,7 @@ public static class Parser
                         && double.IsFinite(number))
                     {
                         Advance();
-                        return LiteralNode.FromNumber(number, token.Line);
+                        return LiteralNode.FromNumber(token.Text, number, token.Line);
                     }
 
                     return UnsupportedLiteral(token, Commands.NumberLiteral, context);

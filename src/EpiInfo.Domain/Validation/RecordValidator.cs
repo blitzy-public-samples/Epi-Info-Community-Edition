@@ -1,5 +1,6 @@
 using System.Collections.Frozen;
 using System.Diagnostics.CodeAnalysis;
+using System.Numerics;
 using EpiInfo.Domain.Forms;
 using EpiInfo.Domain.Metadata;
 using EpiInfo.Domain.Records;
@@ -59,8 +60,9 @@ public sealed class RecordValidator
     /// </param>
     /// <exception cref="ArgumentNullException"><paramref name="form"/> or <paramref name="definition"/> is null.</exception>
     /// <exception cref="ArgumentException">
-    /// <paramref name="definition"/> describes another form, lacks a data field of <paramref name="form"/>, or gives a
-    /// data field another type than the metadata does.
+    /// <paramref name="definition"/> describes another form, lacks a data field of <paramref name="form"/>, gives a
+    /// data field another type than the metadata does, or gives a number field on an integer column a bound that is
+    /// not the one its metadata text states.
     /// </exception>
     /// <exception cref="InvalidOperationException">A data field's type holds no value kind.</exception>
     public RecordValidator(FormMetadata form, FormDefinition definition)
@@ -258,11 +260,13 @@ public sealed class RecordValidator
     /// <remarks>
     /// <para>
     /// The gate takes, in data-field order, every field whose metadata marks it required and not read-only, and
-    /// reports it missing when its effective value is <see cref="FieldValue.Null"/>. Text was already normalised, so
-    /// empty text is null while whitespace counts as present, as in legacy data entry, which tests the value string
-    /// for null or empty. Every missing field is listed, where legacy stopped at the first, each with the legacy
-    /// <c>FIELD_IS_REQUIRED_LONG</c> wording formatted with the field's prompt (its name when the prompt is blank) and
-    /// its page name.
+    /// reports it missing when its effective value is absent, <see cref="FieldValue.Null"/> or empty text, as in
+    /// legacy data entry, which tests the value string for null or empty. Submitted empty text was already normalised
+    /// to null by <see cref="ValidateInput"/>; stored text is not normalised, so a stored empty string that the
+    /// request leaves untouched is missing too. Whitespace counts as present and nothing is trimmed, and no other
+    /// input check is applied to stored values. Every missing field is listed, where legacy stopped at the first, each
+    /// with the legacy <c>FIELD_IS_REQUIRED_LONG</c> wording formatted with the field's prompt (its name when the
+    /// prompt is blank) and its page name.
     /// </para>
     /// <para>
     /// A read-only field is never treated as required. Read-only fields are rejected whenever they are submitted and
@@ -458,24 +462,37 @@ public sealed class RecordValidator
         _ => ValidationMessages.ValueNotStorable,
     };
 
-    // Inclusive bounds. The rule keeps only bounds of the field's own kind, a number on a number field and a date on
-    // a date field, so a bound of another kind never applies.
-    private static bool IsOutOfRange(FieldRule rule, FieldValue value) =>
-        (rule.Lower is { } lower && Compare(value, lower) < 0)
-        || (rule.Upper is { } upper && Compare(value, upper) > 0);
+    // Inclusive bounds, compared by what the column stores. The rule keeps only bounds of the field's own kind, a
+    // number on a number field and a date on a date field, so a bound of another kind never applies. A number on an
+    // integer column is the exact integer its storage range check admitted, and it is compared with the rule's exact
+    // integer limits, so a bound beyond 2^53 or with a fraction a double rounds away neither admits nor rejects an
+    // integer it should not. Every other value is compared with the bound itself.
+    private static bool IsOutOfRange(FieldRule rule, FieldValue value)
+    {
+        if (rule.UsesIntegerLimits)
+        {
+            if (!value.TryGetInteger(out var integer))
+            {
+                throw new InvalidOperationException(
+                    "A number on an integer column must hold an exact integer once its storage range is checked.");
+            }
 
-    // Numbers compare on their exact integers when both hold one, so a bound beyond 2^53 is not blurred by rounding;
-    // otherwise on their doubles, the precision a float column stores.
+            return (rule.LowerLimit is { } lowerLimit && integer < lowerLimit)
+                || (rule.UpperLimit is { } upperLimit && integer > upperLimit);
+        }
+
+        return (rule.Lower is { } lower && Compare(value, lower) < 0)
+            || (rule.Upper is { } upper && Compare(value, upper) > 0);
+    }
+
+    // Dates compare as calendar dates. A number reaching here is on a float column, which stores a binary64, so value
+    // and bound compare as their nearest doubles, even when both hold exact integers: two numbers the column stores
+    // as one double are on the same side of every bound.
     private static int Compare(FieldValue value, FieldValue bound)
     {
         if (value.TryGetDate(out var date) && bound.TryGetDate(out var boundDate))
         {
             return date.CompareTo(boundDate);
-        }
-
-        if (value.TryGetInteger(out var integer) && bound.TryGetInteger(out var boundInteger))
-        {
-            return integer.CompareTo(boundInteger);
         }
 
         if (value.TryGetNumber(out var number) && bound.TryGetNumber(out var boundNumber))
@@ -527,12 +544,18 @@ public sealed class RecordValidator
         return canonical;
     }
 
+    // A required field is missing when its effective value is absent, null or empty text, as legacy data entry tests
+    // the value string for null or empty. Submitted empty text is already null, but stored text is read back as it is,
+    // so an empty string kept in a page row must count as missing too. Whitespace is a value and nothing is trimmed;
+    // no other rule is applied, so a stored value the request does not touch is never re-validated.
     private void AddMissingRequiredFields(IReadOnlyDictionary<string, FieldValue> effective, FieldErrorCollector errors)
     {
         foreach (var rule in _rules)
         {
             if (rule.RequiredMessage is { } requiredMessage
-                && (!effective.TryGetValue(rule.Name, out var value) || value.IsNull))
+                && (!effective.TryGetValue(rule.Name, out var value)
+                    || value.IsNull
+                    || (value.TryGetText(out var text) && text.Length == 0)))
             {
                 errors.Add(rule.Name, requiredMessage);
             }
@@ -579,6 +602,29 @@ public sealed class RecordValidator
             {
                 Lower = validation.Lower is { } lower && lower.Kind == kind ? lower : null;
                 Upper = validation.Upper is { } upper && upper.Kind == kind ? upper : null;
+            }
+
+            // An integer column stores whole numbers only, so its inclusive limits are the least integer at or above
+            // Lower and the greatest at or below Upper, read exactly from the metadata text: the bound's nearest
+            // double can cross an integer, as 9007199254740992.5 rounds down to 9007199254740992 and
+            // 2.0000000000000001 to 2. Its range message names those limits; any other field's names its bounds.
+            if (kind == FieldValueKind.Number && Column.Family == ColumnFamily.Integer)
+            {
+                UsesIntegerLimits = true;
+                if (Lower is { } lowerBound)
+                {
+                    LowerLimit = ReadIntegerLimits(dataField.Field.Lower, lowerBound, nameof(definition)).Ceiling;
+                }
+
+                if (Upper is { } upperBound)
+                {
+                    UpperLimit = ReadIntegerLimits(dataField.Field.Upper, upperBound, nameof(definition)).Floor;
+                }
+
+                RangeMessage = FormatIntegerRange(Lower, LowerLimit, Upper, UpperLimit);
+            }
+            else
+            {
                 RangeMessage = FormatRange(Lower, Upper);
             }
 
@@ -632,13 +678,44 @@ public sealed class RecordValidator
 
         public string? MaxLengthMessage { get; }
 
-        /// <summary>The inclusive lower bound, kept only when it has the field's own kind.</summary>
+        /// <summary>
+        /// The inclusive lower bound, kept only when it has the field's own kind. A date or a number on a float column
+        /// is compared with it and the range message names it; an integer column compares with, and names,
+        /// <see cref="LowerLimit"/> instead.
+        /// </summary>
         public FieldValue? Lower { get; }
 
-        /// <summary>The inclusive upper bound, kept only when it has the field's own kind.</summary>
+        /// <summary>
+        /// The inclusive upper bound, kept only when it has the field's own kind. A date or a number on a float column
+        /// is compared with it and the range message names it; an integer column compares with, and names,
+        /// <see cref="UpperLimit"/> instead.
+        /// </summary>
         public FieldValue? Upper { get; }
 
-        /// <summary>The range message; <see langword="null"/> when the field has no applicable bound.</summary>
+        /// <summary>
+        /// Whether the range compares the value's exact integer with <see cref="LowerLimit"/> and
+        /// <see cref="UpperLimit"/>, and the range message names them: a number field on an integer column.
+        /// </summary>
+        public bool UsesIntegerLimits { get; }
+
+        /// <summary>
+        /// The least integer at or above the metadata <c>Lower</c> text, set only on an integer column with a
+        /// <see cref="Lower"/> bound. The range message names it, so <c>2.0000000000000001</c> reads "at least 3".
+        /// </summary>
+        public BigInteger? LowerLimit { get; }
+
+        /// <summary>
+        /// The greatest integer at or below the metadata <c>Upper</c> text, set only on an integer column with an
+        /// <see cref="Upper"/> bound. The range message names it, so <c>9007199254740993.5</c> reads
+        /// "at most 9007199254740993".
+        /// </summary>
+        public BigInteger? UpperLimit { get; }
+
+        /// <summary>
+        /// The range message, naming the values the range check enforces: <see cref="LowerLimit"/> and
+        /// <see cref="UpperLimit"/> on an integer column, else <see cref="Lower"/> and <see cref="Upper"/>;
+        /// <see langword="null"/> when the field has no applicable bound.
+        /// </summary>
         public string? RangeMessage { get; }
 
         /// <summary>
@@ -659,32 +736,131 @@ public sealed class RecordValidator
         /// <summary>The out-of-range message of an option field with at least one option.</summary>
         public string? OptionOutOfRangeMessage { get; }
 
-        // The ValidationMessages helpers own bound formatting (invariant; numbers in shortest round-trip form, dates as
-        // yyyy-MM-dd), so a range message reads the same wherever it is built.
+        // The exact integer limits of one bound, read from the metadata text the factory parses it from. That text
+        // must parse to the very bound the definition holds; anything else means the definition was not built from
+        // this metadata, and the limits would enforce, and the range message name, a bound the definition does not
+        // carry.
+        private static (BigInteger Floor, BigInteger Ceiling) ReadIntegerLimits(
+            string? text,
+            FieldValue bound,
+            string paramName)
+        {
+            if (!FieldValueCoercion.TryParseNumber(text, out var parsed)
+                || parsed != bound
+                || !FieldValueCoercion.TryParseIntegerLimits(text, out var floor, out var ceiling))
+            {
+                throw new ArgumentException(
+                    "The form definition gives a number field a bound that the form metadata does not state.",
+                    paramName);
+            }
+
+            return (floor, ceiling);
+        }
+
+        // The range message of a date or of a number on a float column, which names the bounds the range check
+        // compares with. The ValidationMessages helpers own bound formatting (invariant; dates as yyyy-MM-dd, an exact
+        // integer with every digit, and any other number in shortest round-trip form), so a range message reads the
+        // same wherever it is built. A bound that holds an exact integer is passed as that integer, never as its
+        // double, so a bound beyond 2^53 such as 9007199254740993 is named as the metadata states it, not rounded, and
+        // a fractional bound such as 10.5 is named as its shortest round-trip double.
         private static string? FormatRange(FieldValue? lower, FieldValue? upper)
         {
             if (lower is { } lowerBound && upper is { } upperBound)
             {
-                return lowerBound.TryGetDate(out var lowerDate) && upperBound.TryGetDate(out var upperDate)
-                    ? ValidationMessages.FormatRangeBetween(lowerDate, upperDate)
-                    : ValidationMessages.FormatRangeBetween(lowerBound.AsNumber(), upperBound.AsNumber());
+                if (lowerBound.TryGetDate(out var lowerDate) && upperBound.TryGetDate(out var upperDate))
+                {
+                    return ValidationMessages.FormatRangeBetween(lowerDate, upperDate);
+                }
+
+                var lowerIsInteger = lowerBound.TryGetInteger(out var lowerInteger);
+                var upperIsInteger = upperBound.TryGetInteger(out var upperInteger);
+                return (lowerIsInteger, upperIsInteger) switch
+                {
+                    (true, true) => ValidationMessages.FormatRangeBetween(lowerInteger, upperInteger),
+                    (true, false) => ValidationMessages.FormatRangeBetween(lowerInteger, upperBound.AsNumber()),
+                    (false, true) => ValidationMessages.FormatRangeBetween(lowerBound.AsNumber(), upperInteger),
+                    (false, false) =>
+                        ValidationMessages.FormatRangeBetween(lowerBound.AsNumber(), upperBound.AsNumber()),
+                };
             }
 
             if (lower is { } onlyLower)
             {
-                return onlyLower.TryGetDate(out var date)
-                    ? ValidationMessages.FormatRangeAtLeast(date)
+                if (onlyLower.TryGetDate(out var date))
+                {
+                    return ValidationMessages.FormatRangeAtLeast(date);
+                }
+
+                return onlyLower.TryGetInteger(out var integer)
+                    ? ValidationMessages.FormatRangeAtLeast(integer)
                     : ValidationMessages.FormatRangeAtLeast(onlyLower.AsNumber());
             }
 
             if (upper is { } onlyUpper)
             {
-                return onlyUpper.TryGetDate(out var date)
-                    ? ValidationMessages.FormatRangeAtMost(date)
+                if (onlyUpper.TryGetDate(out var date))
+                {
+                    return ValidationMessages.FormatRangeAtMost(date);
+                }
+
+                return onlyUpper.TryGetInteger(out var integer)
+                    ? ValidationMessages.FormatRangeAtMost(integer)
                     : ValidationMessages.FormatRangeAtMost(onlyUpper.AsNumber());
             }
 
             return null;
+        }
+
+        // The range message of a number on an integer column, which names the integer limits the range check
+        // enforces rather than the bounds they come from, whose nearest doubles can cross an integer: Upper
+        // 9007199254740993.5 reads "at most 9007199254740993", Lower 2.0000000000000001 "at least 3" and Lower 0.5
+        // with Upper 99.5 "between 1 and 99". A limit within the signed 64-bit range is passed as that integer, so it
+        // keeps every digit. Only a bound beyond the bigint range, such as 1e30, gives a limit outside it; every value
+        // the column stores is then on one side of it, and it is named by its bound's shortest round-trip double,
+        // 1E+30. Which bounds are set chooses the message, as in FormatRange.
+        private static string? FormatIntegerRange(
+            FieldValue? lower,
+            BigInteger? lowerLimit,
+            FieldValue? upper,
+            BigInteger? upperLimit)
+        {
+            if (lower is { } lowerBound && lowerLimit is { } lowerInteger
+                && upper is { } upperBound && upperLimit is { } upperInteger)
+            {
+                var lowerFits = TryGetInt64(lowerInteger, out var lowerLong);
+                var upperFits = TryGetInt64(upperInteger, out var upperLong);
+                return (lowerFits, upperFits) switch
+                {
+                    (true, true) => ValidationMessages.FormatRangeBetween(lowerLong, upperLong),
+                    (true, false) => ValidationMessages.FormatRangeBetween(lowerLong, upperBound.AsNumber()),
+                    (false, true) => ValidationMessages.FormatRangeBetween(lowerBound.AsNumber(), upperLong),
+                    (false, false) =>
+                        ValidationMessages.FormatRangeBetween(lowerBound.AsNumber(), upperBound.AsNumber()),
+                };
+            }
+
+            if (lower is { } onlyLower && lowerLimit is { } onlyLowerInteger)
+            {
+                return TryGetInt64(onlyLowerInteger, out var integer)
+                    ? ValidationMessages.FormatRangeAtLeast(integer)
+                    : ValidationMessages.FormatRangeAtLeast(onlyLower.AsNumber());
+            }
+
+            if (upper is { } onlyUpper && upperLimit is { } onlyUpperInteger)
+            {
+                return TryGetInt64(onlyUpperInteger, out var integer)
+                    ? ValidationMessages.FormatRangeAtMost(integer)
+                    : ValidationMessages.FormatRangeAtMost(onlyUpper.AsNumber());
+            }
+
+            return null;
+        }
+
+        private static bool TryGetInt64(BigInteger integer, out long value)
+        {
+            var fits = integer >= long.MinValue && integer <= long.MaxValue;
+            value = fits ? (long)integer : 0L;
+            return fits;
         }
     }
 

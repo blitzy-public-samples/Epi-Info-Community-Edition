@@ -145,6 +145,37 @@ public static class ValidationMessages
             FormatBound(lower, nameof(lower)),
             FormatBound(upper, nameof(upper)));
 
+    /// <summary>
+    /// Formats <see cref="RangeBetween"/> for a number field's inclusive bounds when both are exact integers, written
+    /// with every digit, so a <c>bigint</c> bound such as <c>9007199254740993</c> is not rounded as a double would be.
+    /// </summary>
+    public static string FormatRangeBetween(long lower, long upper) =>
+        string.Format(CultureInfo.InvariantCulture, RangeBetween, FormatBound(lower), FormatBound(upper));
+
+    /// <summary>
+    /// Formats <see cref="RangeBetween"/> for a number field's inclusive bounds when only the lower one is an exact
+    /// integer: the lower bound keeps every digit and the upper one takes its shortest round-trip form.
+    /// </summary>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="upper"/> is not a finite number.</exception>
+    public static string FormatRangeBetween(long lower, double upper) =>
+        string.Format(
+            CultureInfo.InvariantCulture,
+            RangeBetween,
+            FormatBound(lower),
+            FormatBound(upper, nameof(upper)));
+
+    /// <summary>
+    /// Formats <see cref="RangeBetween"/> for a number field's inclusive bounds when only the upper one is an exact
+    /// integer: the lower bound takes its shortest round-trip form and the upper one keeps every digit.
+    /// </summary>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="lower"/> is not a finite number.</exception>
+    public static string FormatRangeBetween(double lower, long upper) =>
+        string.Format(
+            CultureInfo.InvariantCulture,
+            RangeBetween,
+            FormatBound(lower, nameof(lower)),
+            FormatBound(upper));
+
     /// <summary>Formats <see cref="RangeBetween"/> for a date field's inclusive bounds, as <c>yyyy-MM-dd</c>.</summary>
     public static string FormatRangeBetween(DateOnly lower, DateOnly upper) =>
         string.Format(CultureInfo.InvariantCulture, RangeBetween, FormatBound(lower), FormatBound(upper));
@@ -154,6 +185,13 @@ public static class ValidationMessages
     public static string FormatRangeAtLeast(double lower) =>
         string.Format(CultureInfo.InvariantCulture, RangeAtLeast, FormatBound(lower, nameof(lower)));
 
+    /// <summary>
+    /// Formats <see cref="RangeAtLeast"/> for a number field's inclusive lower bound when it is an exact integer,
+    /// written with every digit, such as <c>9007199254740993</c>.
+    /// </summary>
+    public static string FormatRangeAtLeast(long lower) =>
+        string.Format(CultureInfo.InvariantCulture, RangeAtLeast, FormatBound(lower));
+
     /// <summary>Formats <see cref="RangeAtLeast"/> for a date field's inclusive lower bound, as <c>yyyy-MM-dd</c>.</summary>
     public static string FormatRangeAtLeast(DateOnly lower) =>
         string.Format(CultureInfo.InvariantCulture, RangeAtLeast, FormatBound(lower));
@@ -162,6 +200,13 @@ public static class ValidationMessages
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="upper"/> is not a finite number.</exception>
     public static string FormatRangeAtMost(double upper) =>
         string.Format(CultureInfo.InvariantCulture, RangeAtMost, FormatBound(upper, nameof(upper)));
+
+    /// <summary>
+    /// Formats <see cref="RangeAtMost"/> for a number field's inclusive upper bound when it is an exact integer,
+    /// written with every digit, such as <c>9007199254740993</c>.
+    /// </summary>
+    public static string FormatRangeAtMost(long upper) =>
+        string.Format(CultureInfo.InvariantCulture, RangeAtMost, FormatBound(upper));
 
     /// <summary>Formats <see cref="RangeAtMost"/> for a date field's inclusive upper bound, as <c>yyyy-MM-dd</c>.</summary>
     public static string FormatRangeAtMost(DateOnly upper) =>
@@ -185,6 +230,9 @@ public static class ValidationMessages
 
         return bound.ToString("R", CultureInfo.InvariantCulture);
     }
+
+    // Every digit of the exact integer, invariant, so a bound beyond 2^53 reads as the metadata states it.
+    private static string FormatBound(long bound) => bound.ToString(CultureInfo.InvariantCulture);
 
     private static string FormatBound(DateOnly bound) => FieldValue.FormatIsoDate(bound);
 }

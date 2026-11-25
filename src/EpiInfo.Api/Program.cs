@@ -2,7 +2,8 @@
 // not bind 127.0.0.1 exactly and answers every request whose Host is not 127.0.0.1 or localhost with a 400
 // (LoopbackBindingGuard), loads the Kestrel endpoints with configuration reload off and applies the configured
 // request body limit, logs through the JSON console provider only, warns at startup when the database connection
-// string is not configured, turns every empty error response into the API's fixed ProblemDetails (ApiProblems), and
+// string is not configured, answers every failure through the API's error contract (ApiExceptionHandler and its
+// exception boundary), turns every empty error response into the API's fixed ProblemDetails (ApiProblems), and
 // serves the built web client with its index.html fallback (ClientAppHosting).
 using EpiInfo.Api.Errors;
 using EpiInfo.Api.Hosting;
@@ -34,6 +35,8 @@ builder.Services.AddSingleton(services => ApiOptions.FromConfiguration(services.
 // Bodies framework writers produce through the ProblemDetails service, such as the Development exception page, keep
 // only the API's fixed texts and traceId.
 builder.Services.AddProblemDetails(options => options.CustomizeProblemDetails = ApiProblems.Customize);
+builder.Services.AddExceptionHandler<ApiExceptionHandler>();
+builder.Services.Configure<RouteHandlerOptions>(options => options.ThrowOnBadRequest = true);
 
 var app = builder.Build();
 
@@ -47,6 +50,12 @@ if (!ApiOptions.FromConfiguration(app.Configuration).HasConnectionString)
         "Configuration key {ConfigurationKey} is not set; database-backed endpoints and /health return 503.",
         ApiOptions.ConnectionStringKey);
 }
+
+app.UseExceptionHandler();
+
+// Inside the exception handler, which would otherwise settle a client abort or a failure after the response started
+// itself, unredacted; outside status-code pages, which would otherwise write a body for an aborted request.
+app.UseApiExceptionBoundary();
 
 // Empty error responses produced inside the pipeline (route miss 404, 405, routing 415) become the fixed
 // ProblemDetails of their status. The API's own writer is passed because the default status-code page goes through

@@ -1,3 +1,5 @@
+using EpiInfo.Domain.Values;
+
 namespace EpiInfo.CheckCode.Syntax;
 
 /// <summary>
@@ -10,7 +12,10 @@ public enum LiteralKind
     /// <summary>A double-quoted string literal; its content is in <see cref="LiteralNode.Text"/>.</summary>
     String,
 
-    /// <summary>A numeric literal; its finite invariant-culture value is in <see cref="LiteralNode.Number"/>.</summary>
+    /// <summary>
+    /// A numeric literal; its finite invariant-culture value is in <see cref="LiteralNode.Number"/> and, when it
+    /// was parsed from source, its spelling as written is in <see cref="LiteralNode.Text"/>.
+    /// </summary>
     Number,
 
     /// <summary>The missing-value literal <c>(.)</c>, which evaluates to no value.</summary>
@@ -67,18 +72,21 @@ public enum LiteralKind
 public abstract record ExpressionNode(int Line);
 
 /// <summary>
-/// A literal value. Build it through <see cref="FromString"/>, <see cref="FromNumber"/>, <see cref="Missing"/>
-/// or <see cref="Unchecked"/>, which keep <see cref="Text"/> and <see cref="Number"/> consistent with
-/// <see cref="Kind"/>: only a <see cref="LiteralKind.String"/> has text and only a
-/// <see cref="LiteralKind.Number"/> has a number. <see cref="Number"/> is always finite: the constructor and a
-/// <see langword="with"/> expression reject NaN and infinities, as <c>FieldValue.FromNumber</c> does for the value
-/// the literal evaluates to.
+/// A literal value. Build it through <see cref="FromString"/>, <see cref="FromNumber(string, double, int)"/>,
+/// <see cref="FromNumber(double, int)"/>, <see cref="Missing"/> or <see cref="Unchecked"/>, which keep
+/// <see cref="Text"/> and <see cref="Number"/> consistent with <see cref="Kind"/>: a
+/// <see cref="LiteralKind.String"/> has text and no number, a <see cref="LiteralKind.Number"/> has a number and,
+/// when it was parsed from source, the text it was spelled with, and the other kinds have neither.
+/// <see cref="Number"/> is always finite: the constructor and a <see langword="with"/> expression reject NaN and
+/// infinities, as <c>FieldValue.FromNumber</c> does for the value the literal evaluates to.
 /// </summary>
 /// <param name="Kind">The literal's kind.</param>
 /// <param name="Text">
 /// For a string literal, its content with the surrounding double quotes removed and nothing else changed: no
-/// trimming and no escape processing, because the grammar's <c>String</c> terminal has no escapes. Otherwise
-/// <see langword="null"/>.
+/// trimming and no escape processing, because the grammar's <c>String</c> terminal has no escapes. For a numeric
+/// literal parsed from source, its spelling as written, such as <c>2.0000000000000001</c>, from which its exact
+/// value is read: <see cref="Number"/> holds only the nearest double, which can be a whole number when the
+/// literal is not. Otherwise <see langword="null"/>, a numeric literal built from a double included.
 /// </param>
 /// <param name="Number">
 /// For a numeric literal, its finite invariant-culture value; otherwise <see langword="null"/>.
@@ -125,6 +133,39 @@ public sealed record LiteralNode(LiteralKind Kind, string? Text, double? Number,
         }
 
         return new LiteralNode(LiteralKind.Number, null, value, line);
+    }
+
+    /// <summary>
+    /// Builds a numeric literal parsed from source: <paramref name="text"/> is its spelling as written and
+    /// <paramref name="value"/> the finite invariant-culture double that spelling parses to.
+    /// </summary>
+    /// <remarks>
+    /// The spelling is kept because the double alone cannot tell whether the literal is a whole number:
+    /// <c>2.0000000000000001</c> and <c>2</c> parse to the same double, and <c>9007199254740993</c> parses to
+    /// 9007199254740992. As for <see cref="FromNumber(double, int)"/>, a caller converting source text tests
+    /// <see cref="double.IsFinite(double)"/> first and reports an overflowing literal such as <c>1E999</c> as an
+    /// unsupported numeric literal instead of building a node.
+    /// </remarks>
+    /// <exception cref="ArgumentNullException"><paramref name="text"/> is <see langword="null"/>.</exception>
+    /// <exception cref="ArgumentException">
+    /// <paramref name="text"/> is empty, or is not an invariant-culture spelling of <paramref name="value"/>.
+    /// </exception>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="value"/> is NaN or infinite.</exception>
+    public static LiteralNode FromNumber(string text, double value, int line)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(text);
+        if (!double.IsFinite(value))
+        {
+            throw new ArgumentOutOfRangeException(nameof(value), NotFiniteMessage);
+        }
+
+        // -0 == 0, so a spelling of zero matches either signed zero.
+        if (!FieldValueCoercion.TryParseInvariantNumber(text, out double spelled) || spelled != value)
+        {
+            throw new ArgumentException("A numeric literal's text must be a spelling of its number.", nameof(text));
+        }
+
+        return new LiteralNode(LiteralKind.Number, text, value, line);
     }
 
     /// <summary>Creates the missing-value literal <c>(.)</c>.</summary>

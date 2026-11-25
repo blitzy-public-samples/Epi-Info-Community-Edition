@@ -869,9 +869,11 @@ public sealed class ParserTests
         Assert.Equal(expected, Summaries(program.Diagnostics));
     }
 
-    // Line 42 gives the boolean literals; (+) is outside the subset and pinned among the recovery cases.
+    // Line 42 gives the boolean literals; (+) is outside the subset and pinned among the recovery cases. A number
+    // keeps its spelling, because its double alone cannot tell 2.0000000000000001 from the whole number 2.
     [Theory]
-    [InlineData("101.2", LiteralKind.Number, null, 101.2)]
+    [InlineData("101.2", LiteralKind.Number, "101.2", 101.2)]
+    [InlineData("2.0000000000000001", LiteralKind.Number, "2.0000000000000001", 2.0)]
     [InlineData("\"x\"", LiteralKind.String, "x", null)]
     [InlineData("(.)", LiteralKind.Missing, null, null)]
     [InlineData("(-)", LiteralKind.Unchecked, null, null)]

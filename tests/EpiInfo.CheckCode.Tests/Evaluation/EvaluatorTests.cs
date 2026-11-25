@@ -1,3 +1,4 @@
+using System.Globalization;
 using EpiInfo.CheckCode;
 using EpiInfo.CheckCode.Evaluation;
 using EpiInfo.CheckCode.Lexing;
@@ -257,22 +258,74 @@ public sealed class EvaluatorTests
         // Rule_CompareExp.cs:81-90: exactly one empty side is never equal.
         { "null vs text", FieldValue.Null, Text("1"), false },
         { "text vs null", Text("1"), FieldValue.Null, false },
-        { "unset checkbox vs (-)", FieldValue.Null, UncheckedLiteralValue(), false },
+        { "unset checkbox vs (-)", FieldValue.Null, Bool(false), false },
 
-        // Rule_CompareExp.cs:224-227: two strings compare trimmed and ignoring case.
+        // Rule_CompareExp.cs:224-227: two strings compare trimmed, ignoring case and linguistically, so a
+        // precomposed accent equals the same letter followed by a combining accent.
         { "trimmed, case-insensitive", Text(" abc "), Text("ABC"), true },
         { "different text", Text("abc"), Text("abd"), false },
+        { "precomposed vs decomposed accent", Text("caf\u00E9"), Text("cafe\u0301"), true },
 
-        // Rule_CompareExp.cs:111-115: two numerics compare as doubles.
+        // Rule_CompareExp.cs:111-115: two numerics, an option index included, compare as doubles.
         { "numbers", N(101.2), N(101.2), true },
+        { "different numbers", N(101.2), N(101.3), false },
+        { "number vs the same option index", N(2), FieldValue.FromIndex(2), true },
+        { "number vs another option index", N(2), FieldValue.FromIndex(1), false },
 
-        // Rule_CompareExp.cs:123-175: numeric text against a number is parsed and compared as a double.
+        // Rule_CompareExp.cs:228-230: two dates compare by value.
+        { "same date", Date(2011, 1, 15), Date(2011, 1, 15), true },
+        { "different dates", Date(2011, 1, 15), Date(2011, 1, 16), false },
+
+        // Rule_CompareExp.cs:123-175: numeric text against a number is parsed with double.TryParse(string), whose
+        // styles allow thousands separators, and compared as a double.
         { "number vs numeric string", N(25), Text("25"), true },
         { "numeric string vs number", Text("25"), N(25), true },
+        { "grouped numeric string vs number", Text("1,000"), N(1000), true },
+        { "number vs grouped numeric string", N(1000), Text("1,000"), true },
+        { "grouped decimal string vs number", Text("1,000.5"), N(1000.5), true },
+
+        // Rule_CompareExp.cs:191-217: text double.TryParse rejects, such as "25" followed by a non-breaking space,
+        // is compared with the number's string form untrimmed, so it is not equal.
+        { "non-breaking-space numeric string vs number", Text("25\u00A0"), N(25), false },
+        { "number vs non-breaking-space numeric string", N(25), Text("25\u00A0"), false },
 
         // Rule_Value.cs:78-81: (-) is boolean false, so it equals an unchecked checkbox and not a checked one.
-        { "false vs (-)", Bool(false), UncheckedLiteralValue(), true },
-        { "true vs (-)", Bool(true), UncheckedLiteralValue(), false },
+        { "false vs (-)", Bool(false), Bool(false), true },
+        { "true vs (-)", Bool(true), Bool(false), false },
+
+        // Rule_CompareExp.cs:119-121: a boolean on the right is compared with "the left side is not empty", so a
+        // non-empty left side never equals (-) and always equals true, whatever it says.
+        { "text vs (-)", Text("x"), Bool(false), false },
+        { "number vs (-)", N(5), Bool(false), false },
+        { "\"No\" vs (-)", Text("No"), Bool(false), false },
+        { "text vs a checked checkbox", Text("x"), Bool(true), true },
+
+        // Rule_CompareExp.cs:182-185 with EnterRule.cs:64-89: a boolean on the left is compared with the right
+        // text converted by ConvertStringToBoolean, in any letter case: (+), YES, Y, TRUE, T are true and (-),
+        // NO, N, FALSE, F are false.
+        { "unchecked vs \"No\"", Bool(false), Text("No"), true },
+        { "checked vs \"No\"", Bool(true), Text("No"), false },
+        { "unchecked vs \"False\"", Bool(false), Text("False"), true },
+        { "unchecked vs \"(-)\"", Bool(false), Text("(-)"), true },
+        { "unchecked vs \"n\"", Bool(false), Text("n"), true },
+        { "unchecked vs \"f\"", Bool(false), Text("f"), true },
+        { "checked vs \"FALSE\"", Bool(true), Text("FALSE"), false },
+        { "checked vs \"yes\"", Bool(true), Text("yes"), true },
+        { "checked vs \"y\"", Bool(true), Text("y"), true },
+        { "checked vs \"True\"", Bool(true), Text("True"), true },
+        { "checked vs \"T\"", Bool(true), Text("T"), true },
+        { "checked vs \"(+)\"", Bool(true), Text("(+)"), true },
+    };
+
+    // Rule_CompareExp.cs:182-185: legacy's ConvertStringToBoolean (EnterRule.cs:64-89) has no value for these right
+    // sides, matching untrimmed text only, so the cast of its null result throws.
+    public static TheoryData<string, FieldValue, FieldValue> UncomparableCases => new()
+    {
+        { "checked vs other text", Bool(true), Text("abc") },
+        { "unchecked vs untrimmed \" No \"", Bool(false), Text(" No ") },
+        { "checked vs number", Bool(true), N(1) },
+        { "unchecked vs date", Bool(false), Date(2011, 1, 15) },
+        { "checked vs option index", Bool(true), FieldValue.FromIndex(0) },
     };
 
     // Whitespace-only text is deliberately absent: legacy treats it as non-empty and the plan does not decide it.
@@ -285,13 +338,41 @@ public sealed class EvaluatorTests
         { Text("x"), false },
     };
 
-    // Rule_Value.cs:72-110: (.) has no value, (-) is false, a number is a double and a string is its text.
+    // Rule_Value.cs:72-110: (.) has no value, (-) is false, a number is a double and a string is its text. A number
+    // parsed from source is typed by its spelling, as the same text in values is, so a whole spelling keeps its exact
+    // integer beyond 2^53, where its double is rounded; text that is not a spelling of the number is ignored.
     public static TheoryData<LiteralNode, FieldValue> LiteralCases => new()
     {
         { LiteralNode.Missing(1), FieldValue.Null },
         { LiteralNode.Unchecked(1), Bool(false) },
         { LiteralNode.FromNumber(25, 1), N(25) },
+        { LiteralNode.FromNumber("2.0", 2, 1), N(2) },
+        { LiteralNode.FromNumber("9007199254740993", 9007199254740992d, 1), FieldValue.FromInteger(9007199254740993) },
+        { new LiteralNode(LiteralKind.Number, "3", 2, 1), N(2) },
         { LiteralNode.FromString("x", 1), Text("x") },
+    };
+
+    // Synthetic: no seeded field is an Option. Opt has three items, so its indexes are 0 to 2, and Num's bigint
+    // column holds integers beyond 2^53 exactly.
+    private static readonly FormMetadata OptionForm = new(
+        ViewId: 98,
+        Name: "SyntheticOption",
+        BaseTableName: "SyntheticOption",
+        Pages: [new PageMetadata(1, "Page 1", 0, "SyntheticOption1")],
+        Fields:
+        [
+            F(1, "Opt", 12, "Option", 1, 1, "smallint", 2, list: "A,B,C"),
+            F(2, "Txt", 1, "Text", 1, 2, "nvarchar", 8000),
+            F(3, "Num", 5, "Number", 1, 3, "bigint", 8),
+        ]);
+
+    // A whole spelling is typed exactly, as the same JSON value is: 2 and 2.0 are option index 2, and
+    // 9007199254740993 is not rounded to the double 9007199254740992.
+    public static TheoryData<string, string, FieldValue> ExactNumberAssignments => new()
+    {
+        { "ASSIGN Opt = 2", "Opt", FieldValue.FromIndex(2) },
+        { "ASSIGN Opt = 2.0", "Opt", FieldValue.FromIndex(2) },
+        { "ASSIGN Num = 9007199254740993", "Num", FieldValue.FromInteger(9007199254740993) },
     };
 
     public static TheoryData<string, string, FieldValue> TypedAssignments => new()
@@ -300,20 +381,102 @@ public sealed class EvaluatorTests
         { "ASSIGN LastName = \"Smith\"", "LastName", Text("Smith") },
         { "ASSIGN White = (-)", "White", Bool(false) },
 
+        // NOT is a boolean outside =, so a checkbox takes it; LastName is absent, so null, which is not true.
+        { "ASSIGN White = NOT LastName", "White", Bool(true) },
+
         // (.) assigns an empty value: it is reported in Assigned, never as a clear.
         { "ASSIGN Age = (.)", "Age", FieldValue.Null },
     };
 
     [Theory]
     [MemberData(nameof(EqualityCases), DisableDiscoveryEnumeration = true)]
-    public void AreEqual_FollowsTheLegacyComparisonRule(
+    public void TryAreEqual_FollowsTheLegacyComparisonRule(
         string caseName, FieldValue left, FieldValue right, bool expected)
     {
-        bool actual = ValueComparer.AreEqual(left, right);
+        bool compared = ValueComparer.TryAreEqual(left, right, out bool actual);
 
+        Assert.True(compared, $"{caseName}: TryAreEqual({left}, {right}) could not compare the operands.");
         Assert.True(
             actual == expected,
-            $"{caseName}: AreEqual({left}, {right}) returned {actual}; expected {expected}.");
+            $"{caseName}: TryAreEqual({left}, {right}) gave {actual}; expected {expected}.");
+    }
+
+    [Theory]
+    [MemberData(nameof(UncomparableCases), DisableDiscoveryEnumeration = true)]
+    public void TryAreEqual_RejectsABooleanOnTheLeftThatLegacyCannotConvert(
+        string caseName, FieldValue left, FieldValue right)
+    {
+        bool compared = ValueComparer.TryAreEqual(left, right, out bool equal);
+
+        Assert.False(compared, $"{caseName}: TryAreEqual({left}, {right}) compared operands legacy cannot compare.");
+        Assert.False(equal, $"{caseName}: TryAreEqual({left}, {right}) gave true without comparing.");
+    }
+
+    [Fact]
+    public void TryAreEqual_DoesNotDependOnTheCurrentCulture()
+    {
+        // de-DE reads "." as the group separator and "," as the decimal point; the comparison reads neither so.
+        CultureInfo culture = CultureInfo.CurrentCulture;
+        CultureInfo uiCulture = CultureInfo.CurrentUICulture;
+        try
+        {
+            CultureInfo.CurrentCulture = CultureInfo.GetCultureInfo("de-DE");
+            CultureInfo.CurrentUICulture = CultureInfo.GetCultureInfo("de-DE");
+
+            Assert.True(ValueComparer.TryAreEqual(Text("37.5"), N(37.5), out bool decimalEqual));
+            Assert.True(decimalEqual, "\"37.5\" must equal 37.5 under de-DE.");
+            Assert.True(ValueComparer.TryAreEqual(Text("1,000"), N(1000), out bool groupedEqual));
+            Assert.True(groupedEqual, "\"1,000\" must equal 1000 under de-DE.");
+        }
+        finally
+        {
+            CultureInfo.CurrentCulture = culture;
+            CultureInfo.CurrentUICulture = uiCulture;
+        }
+    }
+
+    [Theory]
+    [InlineData(false, "T")] // ConvertStringToBoolean reads "No" as false, so an unchecked Fever equals it
+    [InlineData(true, "F")]
+    public void IfCheckboxEqualsYesNoText_ComparesWithTheConvertedText(bool fever, string branch)
+    {
+        FieldEventResponse response = Run(
+            CheckboxAgainstTextProgram("No"),
+            FoodHistoryForm,
+            FieldEventKind.FieldAfter,
+            "FeverTemp",
+            ("Fever", Bool(fever)));
+
+        Assert.Equal(new[] { branch, "post" }, response.Dialogs.Select(dialog => dialog.Message));
+        AssertNoFieldEffects(response);
+        Assert.Empty(response.Diagnostics);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void IfCheckboxEqualsOtherText_ReportsATypeMismatchAndRunsTheNextStatement(bool fever)
+    {
+        // Legacy's conversion of "abc" fails and throws (Rule_CompareExp.cs:182-185); the port reports the IF.
+        string program = CheckboxAgainstTextProgram("abc");
+        Assert.Equal("IF Fever = \"abc\" THEN", ProgramLine(program, 3));
+
+        FieldEventResponse response = RunWithoutThrowing(
+            program,
+            FoodHistoryForm,
+            FieldEventKind.FieldAfter,
+            "FeverTemp",
+            ("Fever", Bool(fever)));
+
+        Diagnostic diagnostic = Assert.Single(response.Diagnostics);
+        Assert.Equal(DiagnosticSeverity.Error, diagnostic.Severity);
+        Assert.Equal("IF", diagnostic.Command);
+        Assert.Equal(3, diagnostic.Line);
+        Assert.Equal("FoodHistory", diagnostic.Form);
+        Assert.False(string.IsNullOrWhiteSpace(diagnostic.Message));
+        Assert.DoesNotContain("abc", diagnostic.Message, StringComparison.Ordinal);
+        Assert.Equal(new[] { "post" }, response.Dialogs.Select(dialog => dialog.Message));
+        AssertNoFieldEffects(response);
     }
 
     [Theory]
@@ -328,6 +491,107 @@ public sealed class EvaluatorTests
     public void LiteralToValue_GivesTheLegacyLiteralValue(LiteralNode literal, FieldValue expected)
     {
         Assert.Equal(expected, ValueComparer.LiteralToValue(literal));
+    }
+
+    // No double builds the expected value: the nearest double of 2.0000000000000001 is the whole number 2, while the
+    // literal is not whole, so the two parts of the value are checked separately.
+    [Fact]
+    public void LiteralToValue_OfANonIntegralSpellingWithAWholeDouble_IsNotAnInteger()
+    {
+        FieldValue value = ValueComparer.LiteralToValue(LiteralNode.FromNumber("2.0000000000000001", 2, 1));
+
+        Assert.Equal(FieldValueKind.Number, value.Kind);
+        Assert.False(value.TryGetInteger(out _));
+        Assert.True(value.TryGetNumber(out double nearest));
+        Assert.Equal(2.0, nearest);
+    }
+
+    [Theory]
+    [InlineData(null, 2d, typeof(ArgumentNullException))]
+    [InlineData("", 2d, typeof(ArgumentException))]
+    [InlineData("3", 2d, typeof(ArgumentException))]
+    [InlineData("two", 2d, typeof(ArgumentException))]
+    [InlineData("1E999", double.PositiveInfinity, typeof(ArgumentOutOfRangeException))]
+    public void FromNumber_WithASpelling_RejectsTextThatIsNotASpellingOfAFiniteNumber(
+        string? text, double value, Type expected)
+    {
+        Exception? exception = Record.Exception(() => LiteralNode.FromNumber(text!, value, 1));
+
+        Assert.NotNull(exception);
+        Assert.IsType(expected, exception);
+    }
+
+    [Fact]
+    public void Assign_OfANonIntegralNumberToAnOption_ReportsAnErrorAndKeepsRunning()
+    {
+        // The JSON value 2.0000000000000001 is no option index, so neither is the literal, whose double is 2.
+        const string Program = """
+            Field Txt
+                After
+                    ASSIGN Opt = 2.0000000000000001
+                    ASSIGN Txt = "post"
+                End-After
+            End-Field
+            """;
+        Assert.Equal("ASSIGN Opt = 2.0000000000000001", ProgramLine(Program, 3));
+
+        FieldEventResponse response = RunWithoutThrowing(Program, OptionForm, FieldEventKind.FieldAfter, "Txt");
+
+        Diagnostic diagnostic = Assert.Single(response.Diagnostics);
+        Assert.Equal(DiagnosticSeverity.Error, diagnostic.Severity);
+        Assert.Equal("ASSIGN", diagnostic.Command);
+        Assert.Equal(3, diagnostic.Line);
+        Assert.Equal("SyntheticOption", diagnostic.Form);
+        Assert.False(string.IsNullOrWhiteSpace(diagnostic.Message));
+
+        // The failing statement assigns nothing, and the statement after it still runs.
+        Assert.Equal(new[] { "Txt" }, response.Assigned.Keys);
+        Assert.Equal(Text("post"), response.Assigned["Txt"]);
+    }
+
+    [Theory]
+    [MemberData(nameof(ExactNumberAssignments), DisableDiscoveryEnumeration = true)]
+    public void Assign_OfAWholeNumberLiteral_KeepsItsExactInteger(string statement, string field, FieldValue expected)
+    {
+        string program = $"""
+            Field Txt
+                After
+                    {statement}
+                End-After
+            End-Field
+            """;
+
+        FieldEventResponse response = Run(program, OptionForm, FieldEventKind.FieldAfter, "Txt");
+
+        Assert.Equal(new[] { field }, response.Assigned.Keys);
+        Assert.Equal(expected, response.Assigned[field]);
+        Assert.Empty(response.Diagnostics);
+    }
+
+    [Fact]
+    public void Equals_OfANonIntegralLiteralWithAWholeDouble_ComparesItsNearestDouble()
+    {
+        // Rule_CompareExp.cs:111-115 compares numerics as doubles, so exact typing leaves "=" unchanged.
+        const string Program = """
+            Field Txt
+                After
+                    IF Num = 2.0000000000000001 THEN
+                        ASSIGN Txt = "equal"
+                    END-IF
+                End-After
+            End-Field
+            """;
+
+        FieldEventResponse response = Run(
+            Program,
+            OptionForm,
+            FieldEventKind.FieldAfter,
+            "Txt",
+            ("Num", FieldValue.FromInteger(2)));
+
+        Assert.Equal(new[] { "Txt" }, response.Assigned.Keys);
+        Assert.Equal(Text("equal"), response.Assigned["Txt"]);
+        Assert.Empty(response.Diagnostics);
     }
 
     [Theory]
@@ -347,6 +611,158 @@ public sealed class EvaluatorTests
         FieldValue result = Evaluator.Evaluate(expression, context, "IF");
 
         Assert.Equal(Bool(expected), result);
+    }
+
+    // Legacy truth is the text "true" in any letter case, untrimmed. Rule_If_Then_Else_End.cs:170 and
+    // Rule_AndExp.cs:41-44 lower the operand's ToString() and compare it ordinally with "true", which isTrue gives;
+    // Rule_NotExp.cs:40 compares it with "true" in a culture comparison that ignores case, which notIsTrue gives. A
+    // null value, which legacy could not turn into text, is not true. The soft-hyphen row is where the two differ:
+    // NOT's culture comparison ignores that character, so NOT finds the text true and is false, while IF and AND
+    // find it not true.
+    [Theory]
+    [InlineData("TRUE", true, true)]
+    [InlineData("true", true, true)]
+    [InlineData("True", true, true)]
+    [InlineData(" true", false, false)]
+    [InlineData("yes", false, false)]
+    [InlineData("1", false, false)]
+    [InlineData("false", false, false)]
+    [InlineData("tr\u00ADue", false, true)]
+    [InlineData(null, false, false)]
+    public void IfNotAndAnd_OverATextField_FollowTheLegacyTextTruth(string? lastName, bool isTrue, bool notIsTrue)
+    {
+        const string Program = """
+            Field LastName
+                After
+                    IF LastName THEN
+                        DIALOG "IF T"
+                    ELSE
+                        DIALOG "IF F"
+                    END-IF
+                    IF NOT LastName THEN
+                        DIALOG "NOT T"
+                    ELSE
+                        DIALOG "NOT F"
+                    END-IF
+                    IF LastName AND Sex = "1" THEN
+                        DIALOG "AND T"
+                    ELSE
+                        DIALOG "AND F"
+                    END-IF
+                    IF Sex = "1" AND LastName THEN
+                        DIALOG "AND-RIGHT T"
+                    ELSE
+                        DIALOG "AND-RIGHT F"
+                    END-IF
+                End-After
+            End-Field
+            """;
+        string holds = isTrue ? "T" : "F";
+        string negated = notIsTrue ? "F" : "T";
+
+        FieldEventResponse response = Run(
+            Program,
+            CaseReportForm,
+            FieldEventKind.FieldAfter,
+            "LastName",
+            ("LastName", TextOrNull(lastName)),
+            ("Sex", Text("1")));
+
+        Assert.Equal(
+            new[] { $"IF {holds}", $"NOT {negated}", $"AND {holds}", $"AND-RIGHT {holds}" },
+            response.Dialogs.Select(dialog => dialog.Message));
+        AssertNoFieldEffects(response);
+        Assert.Empty(response.Diagnostics);
+    }
+
+    [Theory]
+    [InlineData("LastName", false)] // the text "True"
+    [InlineData("Sex", false)] // "TRUE" with a soft hyphen, which NOT's culture comparison ignores
+    [InlineData("Fever", false)] // a checked checkbox
+    [InlineData("White", true)] // an unchecked checkbox
+    [InlineData("Age", true)] // a number is never true
+    [InlineData("DateofInterview", true)] // nor is a date
+    public void Evaluate_Not_IsFalseOnlyForATrueOperand(string field, bool expected)
+    {
+        var expression = new NotNode(new IdentifierNode(field, 1), 1);
+
+        FieldValue result = Evaluator.Evaluate(expression, TruthContext(), "IF");
+
+        Assert.Equal(Bool(expected), result);
+    }
+
+    [Theory]
+    [InlineData("LastName", "Fever", true)]
+    [InlineData("Fever", "LastName", true)]
+    [InlineData("LastName", "LastName", true)]
+    [InlineData("LastName", "White", false)]
+    [InlineData("Age", "LastName", false)]
+    public void Evaluate_And_IsTrueOnlyWhenBothOperandsAreTrue(string left, string right, bool expected)
+    {
+        var expression = new AndNode(new IdentifierNode(left, 1), new IdentifierNode(right, 1), 1);
+
+        FieldValue result = Evaluator.Evaluate(expression, TruthContext(), "IF");
+
+        Assert.Equal(Bool(expected), result);
+    }
+
+    // The operands of the NOT and AND truth cases: the text "True", the text "TRUE" with a soft hyphen, a checked and
+    // an unchecked checkbox, a number and a date.
+    private static EvaluationContext TruthContext() => new(
+        FoodHistoryForm,
+        new Dictionary<string, FieldValue>
+        {
+            ["LastName"] = Text("True"),
+            ["Sex"] = Text("TR\u00ADUE"),
+            ["Fever"] = Bool(true),
+            ["White"] = Bool(false),
+            ["Age"] = N(1),
+            ["DateofInterview"] = Date(2011, 5, 11),
+        });
+
+    // Legacy NOT gives the text "true" or "false" (Rule_NotExp.cs:36-47), which parentheses pass through, so beside =
+    // it is compared as text by Rule_CompareExp: trimmed and ignoring case against text (224-227), as "the left side
+    // is not empty" against a boolean on the right (119-121), converted against a boolean on the left (182-185), and
+    // as a string against a number (191-217). The last four rows guard NOT's boolean outside =.
+    [Theory]
+    [InlineData("\"false\" = (NOT \"true\")", null, null, "T")]
+    [InlineData("(NOT \"true\") = \" false \"", null, null, "T")]
+    [InlineData("(NOT \"true\") = \"FALSE\"", null, null, "T")]
+    [InlineData("(NOT LastName) = (-)", "x", null, "F")] // the text "true" is not empty, so it does not equal (-)
+    [InlineData("(NOT LastName) = Fever", "true", true, "T")] // the text "false" is not empty: equals a checked box
+    [InlineData("Fever = (NOT LastName)", "true", false, "T")] // the text "false" converts to false
+    [InlineData("(NOT LastName) = 1", "x", null, "F")] // "true" is not a number, so the string forms differ
+    [InlineData("NOT LastName", "x", null, "T")]
+    [InlineData("NOT LastName", "true", null, "F")]
+    [InlineData("(NOT LastName) AND Sex = \"1\"", "x", null, "T")]
+    [InlineData("(NOT LastName) AND Sex = \"1\"", "true", null, "F")]
+    public void IfNotBesideEquals_ComparesTheLegacyText(string condition, string? lastName, bool? fever, string branch)
+    {
+        string program = $$"""
+            Field FeverTemp
+                After
+                    IF {{condition}} THEN
+                        DIALOG "T"
+                    ELSE
+                        DIALOG "F"
+                    END-IF
+                    DIALOG "post"
+                End-After
+            End-Field
+            """;
+
+        FieldEventResponse response = Run(
+            program,
+            FoodHistoryForm,
+            FieldEventKind.FieldAfter,
+            "FeverTemp",
+            ("LastName", TextOrNull(lastName)),
+            ("Fever", fever is { } isChecked ? Bool(isChecked) : FieldValue.Null),
+            ("Sex", Text("1")));
+
+        Assert.Equal(new[] { branch, "post" }, response.Dialogs.Select(dialog => dialog.Message));
+        AssertNoFieldEffects(response);
+        Assert.Empty(response.Diagnostics);
     }
 
     [Fact]
@@ -1174,7 +1590,20 @@ public sealed class EvaluatorTests
         Assert.Empty(response.Assigned);
     }
 
-    private static FieldValue UncheckedLiteralValue() => ValueComparer.LiteralToValue(LiteralNode.Unchecked(1));
+    // The checkbox-against-text cases: the IF picks a dialog, and the DIALOG after it shows that the statement
+    // after the IF still runs. Line 3 is the IF.
+    private static string CheckboxAgainstTextProgram(string text) => $$"""
+        Field FeverTemp
+            After
+                IF Fever = "{{text}}" THEN
+                    DIALOG "T"
+                ELSE
+                    DIALOG "F"
+                END-IF
+                DIALOG "post"
+            End-After
+        End-Field
+        """;
 
     private static FieldValue Text(string value) => FieldValue.FromText(value);
 

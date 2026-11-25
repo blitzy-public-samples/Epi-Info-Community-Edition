@@ -452,7 +452,33 @@ The records-list `q` is a case-insensitive "contains" over the grid columns. It 
 
 ## Parity gaps
 
-None recorded during the run. These checks would record one, with their state at the snapshot:
+Four gaps were recorded during the run, all in the check-code `=` operator (`src/EpiInfo.CheckCode/Evaluation/ValueComparer.cs`); the first also covers `NOT`'s comparison with `"true"` (`Evaluator.cs`). `EvaluatorTests` pins the first three; the fourth, whose legacy answer depends on the desktop's date format, has no pinning test. No seeded program reaches any of them: the seeded comparisons are `Sex = "1"`, `FeverTemp = (.)` and `Fever = (-)`, and the one seeded `NOT` negates the comparison `FeverTemp = (.)`, a boolean (`testdata/sql/03_forms.sql:metaViews`).
+
+### `=` on two texts: the desktop culture
+
+- **Legacy:** two strings are trimmed and compared with `StringComparer.CurrentCultureIgnoreCase` (`Epi.Core.EnterInterpreter/Rules/Rule_CompareExp.cs:224-227`), so under the desktop's current culture with Windows NLS collation. `NOT` makes the same kind of comparison: it compares its operand's string form, untrimmed, with `"true"` using `StringComparison.CurrentCultureIgnoreCase` (`Epi.Core.EnterInterpreter/Rules/Rule_NotExp.cs:40`).
+- **Kept:** the same trimming and a linguistic comparison that ignores case, with the invariant culture, so the answer does not depend on the server; `NOT` compares its operand's text, untrimmed, with `"true"` in that comparison (`src/EpiInfo.CheckCode/Evaluation/Evaluator.cs`, `IsTrueForNot`). The two agree on case, trimming, canonically equivalent forms (a precomposed `é` equals `e` followed by a combining acute accent) and ignorable characters. So `NOT` of `tr` + soft hyphen (U+00AD) + `ue` is false, as in legacy, while `IF` and `AND`, which legacy and the port both test by an ordinal comparison of the lowered form with `"true"` (`Rule_If_Then_Else_End.cs:170`; `Rule_AndExp.cs:41-44`), find that text not true.
+- **Why not equal:** the server can run neither the desktop's culture nor NLS. The comparisons differ where NLS treats an expansion as equal, such as `ß` and `ss` (`"straße" = "STRASSE"` holds in legacy and not here), where a desktop culture has its own casing rules, such as the Turkish dotted and dotless `i`, and, for `NOT`'s comparison with `"true"`, wherever NLS and the invariant culture give a character a different collation weight. No seeded program compares such text, and none applies `NOT` to text.
+
+### `=` on numeric text: the desktop culture
+
+- **Legacy:** text against a number is parsed with `double.TryParse(string)` (`Epi.Core.EnterInterpreter/Rules/Rule_CompareExp.cs:123-149, 150-175`), whose styles are `NumberStyles.Float | NumberStyles.AllowThousands`, under the desktop's current culture.
+- **Kept:** the same number styles, thousands separators included, with the invariant culture: `,` groups digits and `.` is the decimal point, as en-US reads them, so `"1,000" = 1000` and `"1,000.5" = 1000.5` hold. A result that is not finite is rejected, as .NET Framework rejected an overflow.
+- **Why not equal:** the server cannot know the desktop's culture. Under a culture that uses `,` as the decimal separator, such as de-DE, legacy reads `"1,5"` as 1.5 and `"1.000"` as 1000, where the server reads 15 and 1.
+
+### `=` with a boolean on the left that legacy cannot convert
+
+- **Legacy:** with a boolean on the left and a non-empty value of another type on the right, the right side's string form is converted with `ConvertStringToBoolean` (`Epi.Core.EnterInterpreter/Rules/Rule_CompareExp.cs:182-185`; `Epi.Core.EnterInterpreter/EnterRule.cs:64-89`). Only `(+)`, `YES`, `Y`, `TRUE`, `T`, `(-)`, `NO`, `N`, `FALSE` and `F` convert, in any letter case and untrimmed. Any other text, and every number, date or option index, converts to `null`, and the cast of that `null` throws. The exception leaves the whole event block, so its remaining statements do not run; it is logged when errors are suppressed and raised otherwise (`Epi.Core.EnterInterpreter/Rules/Rule_Begin_After_Statement.cs:33-47`; `Rule_Begin_Before_Statement.cs:35-49`; `Rule_Begin_Click_Statement.cs:34-48`).
+- **Kept:** the ten spellings convert exactly as in legacy, so `Fever = "No"` holds for an unchecked checkbox and not for a checked one. Every other right side gives one `error` diagnostic, `Type mismatch: a boolean can be compared only with a yes or no value.`, with the statement's line and command. That statement is skipped, the effects of earlier statements stand and the next statement runs, as for `EPIWEEK` without a date.
+- **Why not equal:** a field event reports a runtime error as a diagnostic that keeps earlier effects and never blocks a save; it has no counterpart for an exception that ends the block. No seeded program compares a checkbox on the left with anything but `(-)`.
+
+### `=` between a date and text: the desktop culture
+
+- **Legacy:** a date and text are compared by the string forms of both sides, untrimmed, with `StringComparer.CurrentCultureIgnoreCase` (`Epi.Core.EnterInterpreter/Rules/Rule_CompareExp.cs:191-217`). The date's form is `DateTime.ToString()` in the desktop's current culture, such as `1/15/2011 12:00:00 AM` under en-US.
+- **Kept:** the invariant string forms of both sides, a date as `yyyy-MM-dd` (C-15), untrimmed, compared linguistically with the invariant culture, ignoring case. So text `"2011-01-15"` equals the date 2011-01-15, and text `"1/15/2011 12:00:00 AM"` does not.
+- **Why not equal:** the server does not know the desktop's date format, and dates are ISO `YYYY-MM-DD` on the wire (C-15). No seeded program compares a date with text.
+
+These checks would record further gaps, with their state at the snapshot:
 
 | Check | Gap it would record | State |
 |-------|---------------------|-------|

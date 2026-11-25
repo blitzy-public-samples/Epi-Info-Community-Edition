@@ -33,9 +33,11 @@ namespace EpiInfo.Domain.Forms;
 /// of an <c>nvarchar(4000)</c> column, is the validator's storage-range rule and is not carried here.
 /// </param>
 /// <param name="Lower">
-/// The inclusive lower bound. On a number field it is a number value
-/// (<see cref="FieldValue.FromNumber(double)"/>), such as 0 for the seeded <c>Age</c> or 80 for
-/// <c>FeverTemp</c>. On a date field it is a date value (<see cref="FieldValue.FromDate(DateOnly)"/>) that the
+/// The inclusive lower bound. On a number field it is a number value, such as 0 for the seeded <c>Age</c> or 80
+/// for <c>FeverTemp</c>, parsed exactly from the stored invariant text: a whole number within the signed 64-bit
+/// range keeps its exact integer (<see cref="FieldValue.FromInteger(long)"/>), so a <c>bigint</c> bound such as
+/// <c>9007199254740993</c> is not rounded, and any other number keeps its nearest double without being rounded
+/// into a whole one. On a date field it is a date value (<see cref="FieldValue.FromDate(DateOnly)"/>) that the
 /// factory converts from the stored <c>MM-DD-YYYY</c> text, so <c>01-15-2011</c> is written as
 /// <c>2011-01-15</c>. It is <see langword="null"/> when the stored text is null, empty or whitespace, and on
 /// every other field type. An unset bound is always <see langword="null"/>, never

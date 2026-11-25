@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Runtime.CompilerServices;
 using EpiInfo.CheckCode.Functions;
 using EpiInfo.CheckCode.Syntax;
@@ -34,8 +35,8 @@ namespace EpiInfo.CheckCode.Evaluation;
 /// sending it. Validation belongs to the save path.
 /// </para>
 /// <para>
-/// The class holds no state, performs no I/O and reads no clock or culture, so concurrent calls are safe and every
-/// run of the same blocks over the same values gives the same response.
+/// The class holds no state, performs no I/O and reads no clock or current culture, so concurrent calls are safe and
+/// every run of the same blocks over the same values gives the same response.
 /// </para>
 /// </remarks>
 public static class Evaluator
@@ -52,6 +53,8 @@ public static class Evaluator
     private const string OutOfRangeMessage = "Date arithmetic is out of range.";
     private const string UnsupportedStatementMessage = "Unsupported statement.";
     private const string UnsupportedExpressionMessage = "Unsupported expression.";
+    private const string BooleanComparisonMismatchMessage =
+        "Type mismatch: a boolean can be compared only with a yes or no value.";
     private const string ExpressionTooDeepMessage = "Expression is nested too deeply to evaluate.";
 
     /// <summary>
@@ -221,16 +224,26 @@ public static class Evaluator
     /// A function call evaluates its arguments left to right and calls the registered function.
     /// </description></item>
     /// <item><description>
-    /// <c>NOT</c> is <see langword="false"/> only when its operand is the boolean <see langword="true"/>, so
-    /// <c>NOT</c> of a null value is <see langword="true"/>, as in legacy <c>Rule_NotExp</c>.
+    /// <c>NOT</c> is <see langword="false"/> only when its operand is true as legacy <c>Rule_NotExp</c> reads it:
+    /// the boolean <see langword="true"/>, or text that equals <c>true</c>, untrimmed, in a linguistic comparison
+    /// that ignores case, made with the invariant culture where legacy used the current culture. So <c>NOT</c> of a
+    /// null value, a number, a date, <c>" true"</c> or other text is <see langword="true"/>, while <c>NOT</c> of
+    /// <c>tr</c>, a soft hyphen and <c>ue</c> is <see langword="false"/>, because that comparison ignores the soft
+    /// hyphen. The result is a boolean everywhere except as an operand of <c>=</c>, below.
     /// </description></item>
     /// <item><description>
     /// <c>AND</c> evaluates both operands, with no short circuit, so an error on the right still surfaces, and is
-    /// <see langword="true"/> only when both are the boolean <see langword="true"/>, as in legacy
-    /// <c>Rule_AndExp</c>.
+    /// <see langword="true"/> only when both are true as an <c>IF</c> condition is, as in legacy
+    /// <c>Rule_AndExp</c>: the boolean <see langword="true"/>, or text that equals <c>true</c>, untrimmed, in an
+    /// ordinal comparison that ignores case. That comparison, unlike <c>NOT</c>'s, ignores no character.
     /// </description></item>
     /// <item><description>
-    /// <c>=</c> evaluates left, then right, and compares with <see cref="ValueComparer.AreEqual"/>.
+    /// <c>=</c> evaluates left, then right, and compares with <see cref="ValueComparer.TryAreEqual"/>. An operand
+    /// that is a <c>NOT</c>, which only parentheses can place beside <c>=</c>, is first turned into the text
+    /// <c>"true"</c> or <c>"false"</c>, because legacy <c>Rule_NotExp</c> gives that text and legacy
+    /// <c>Rule_CompareExp</c> compares it as text. So <c>"false" = (NOT "true")</c> holds, and
+    /// <c>(NOT LastName) = 1</c> compares the text with the number and does not hold. A pair it cannot compare, a
+    /// boolean on the left against a value that is not a yes or no spelling, is a type-mismatch runtime error.
     /// </description></item>
     /// </list>
     /// Precedence is already encoded in the tree by the parser, which folds a flat <c>AND</c> or <c>=</c> chain to
@@ -251,8 +264,9 @@ public static class Evaluator
     /// <see langword="null"/>.
     /// </exception>
     /// <exception cref="CheckCodeRuntimeException">
-    /// The expression names an unknown field or an unsupported function, a function call failed, the expression
-    /// is of a kind outside the subset, or it is nested too deeply for the remaining stack.
+    /// The expression names an unknown field or an unsupported function, a function call failed, an <c>=</c>
+    /// compares a boolean on the left with a value that is not a yes or no spelling, the expression is of a kind
+    /// outside the subset, or it is nested too deeply for the remaining stack.
     /// </exception>
     public static FieldValue Evaluate(ExpressionNode expression, EvaluationContext context, string command)
     {
@@ -279,7 +293,7 @@ public static class Evaluator
                 return EvaluateCall(call, context, command);
 
             case NotNode not:
-                return FieldValue.FromBoolean(!IsTrue(Evaluate(not.Operand, context, command)));
+                return FieldValue.FromBoolean(!IsTrueForNot(Evaluate(not.Operand, context, command)));
 
             case AndNode and:
                 return EvaluateAnd(and, context, command);
@@ -313,21 +327,47 @@ public static class Evaluator
     // from the right, so the result is that of the right-associated tree and the chain's length costs no stack.
     private static FieldValue EvaluateEquals(EqualsNode node, EvaluationContext context, string command)
     {
-        var lefts = new List<FieldValue>();
+        // Each comparison keeps its own operator line, which a type mismatch reports.
+        var lefts = new List<(FieldValue Value, int Line)>();
         ExpressionNode current = node;
         while (current is EqualsNode equals)
         {
-            lefts.Add(Evaluate(equals.Left, context, command));
+            lefts.Add((EvaluateComparisonOperand(equals.Left, context, command), equals.Line));
             current = equals.Right;
         }
 
-        FieldValue result = Evaluate(current, context, command);
+        FieldValue result = EvaluateComparisonOperand(current, context, command);
         for (var i = lefts.Count - 1; i >= 0; i--)
         {
-            result = FieldValue.FromBoolean(ValueComparer.AreEqual(lefts[i], result));
+            if (!ValueComparer.TryAreEqual(lefts[i].Value, result, out bool equal))
+            {
+                // Legacy throws from its boolean conversion here (Rule_CompareExp.cs:182-185); the statement
+                // boundary turns this into one error diagnostic and skips only the enclosing statement.
+                throw new CheckCodeRuntimeException(lefts[i].Line, command, BooleanComparisonMismatchMessage);
+            }
+
+            result = FieldValue.FromBoolean(equal);
         }
 
         return result;
+    }
+
+    // An operand of =. Legacy NOT gives the text "true" or "false", not a boolean (Rule_NotExp.cs:36-47), and a
+    // parenthesised NOT, the only way one can stand beside =, passes that text through (Rule_ExprList.cs:32-45).
+    // Rule_CompareExp.cs then compares it as text: trimmed and ignoring case against text (224-227), as "the left side
+    // is not empty" against a boolean on the right (119-121), converted to a boolean against a boolean on the left
+    // (182-185), and as a string against a number, because neither word parses as one (191-217). So the NOT's boolean
+    // becomes that text here. Elsewhere NOT keeps its boolean, which IF and AND read as they read the text, and which
+    // ASSIGN can give a checkbox.
+    private static FieldValue EvaluateComparisonOperand(
+        ExpressionNode operand,
+        EvaluationContext context,
+        string command)
+    {
+        FieldValue value = Evaluate(operand, context, command);
+        return operand is NotNode && value.TryGetBoolean(out bool isTrue)
+            ? FieldValue.FromText(isTrue ? "true" : "false")
+            : value;
     }
 
     private static void ExecuteStatement(
@@ -372,11 +412,12 @@ public static class Evaluator
         }
     }
 
-    // Legacy Rule_If_Then_Else_End: only a true condition runs THEN; false, null, text and numbers run ELSE. A
-    // runtime error in the condition escapes to this statement's boundary, so neither branch runs. Each branch
-    // statement has its own boundary through ExecuteList. In pre-order the IF at index is followed by its THEN
-    // statements and then by its ELSE statements. ExecuteList passes a feed only while it has a diagnostic to add;
-    // without one no index is read, so the skipped THEN is not sized.
+    // Legacy Rule_If_Then_Else_End: a true condition, the boolean true or the text "true" in any letter case, runs
+    // THEN; false, null, numbers, dates and other text run ELSE. A runtime error in the condition escapes to this
+    // statement's boundary, so neither branch runs. Each branch statement has its own boundary through ExecuteList.
+    // In pre-order the IF at index is followed by its THEN statements and then by its ELSE statements. ExecuteList
+    // passes a feed only while it has a diagnostic to add; without one no index is read, so the skipped THEN is not
+    // sized.
     private static void ExecuteIf(
         IfStatementNode node,
         int index,
@@ -591,7 +632,28 @@ public static class Evaluator
     private static string FunctionFailureReason(string name, string error) =>
         error.StartsWith(name, StringComparison.OrdinalIgnoreCase) ? error : $"{name}: {error}";
 
-    private static bool IsTrue(FieldValue value) => value.TryGetBoolean(out bool isTrue) && isTrue;
+    // The truth of an IF condition and of each AND operand. Rule_If_Then_Else_End.cs:170 and Rule_AndExp.cs:41-44
+    // lower the value's ToString() with the invariant culture and compare it ordinally with "true". So the boolean
+    // true ("True") and the text "true" in any letter case are true, untrimmed; every other value, numbers, dates,
+    // option indexes and other text included, is not. OrdinalIgnoreCase matches those ASCII letters without reading a
+    // culture. A null value, which legacy could not turn into text, is not true either and never throws. NOT reads
+    // truth with a culture comparison instead (IsTrueForNot).
+    private static bool IsTrue(FieldValue value) =>
+        value.TryGetBoolean(out bool isTrue)
+            ? isTrue
+            : value.TryGetText(out string? text) && string.Equals(text, "true", StringComparison.OrdinalIgnoreCase);
+
+    // The truth of a NOT operand. Rule_NotExp.cs:40 compares the value's ToString() with "true" using
+    // StringComparison.CurrentCultureIgnoreCase, a linguistic comparison; the invariant culture keeps it, as the text
+    // rule of ValueComparer does, without depending on the server's culture. It ignores characters without collation
+    // weight, such as the soft hyphen, so "tr" + U+00AD + "ue" is true here and not for IF or AND. Only text can
+    // differ from IsTrue: the boolean true is "True", and no number, date or option index spells "true". A null
+    // value, which legacy could not turn into text, is not true either and never throws.
+    private static bool IsTrueForNot(FieldValue value) =>
+        value.TryGetBoolean(out bool isTrue)
+            ? isTrue
+            : value.TryGetText(out string? text)
+                && CultureInfo.InvariantCulture.CompareInfo.Compare(text, "true", CompareOptions.IgnoreCase) == 0;
 
     private static FieldMetadata[] ResolveAll(
         IReadOnlyList<string> names,

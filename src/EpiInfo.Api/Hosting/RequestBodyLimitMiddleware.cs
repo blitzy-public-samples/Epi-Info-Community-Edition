@@ -57,7 +57,8 @@ public sealed class RequestBodyLimitMiddleware
 
     /// <summary>
     /// Rejects a declared length over the limit, otherwise wraps a request body that may exist in the counting
-    /// stream, and calls the rest of the pipeline.
+    /// stream, which it also sets as the request's <see cref="IRequestBodyReadFeature"/>, and calls the rest of the
+    /// pipeline.
     /// </summary>
     /// <param name="context">The current request.</param>
     /// <exception cref="ArgumentNullException"><paramref name="context"/> is <see langword="null"/>.</exception>
@@ -79,7 +80,12 @@ public sealed class RequestBodyLimitMiddleware
         {
             // Wrapped even under a declared length within the limit: in-process hosts do not hold a body to its
             // Content-Length, and the counter costs one addition per read.
-            request.Body = new LimitedReadStream(request.Body, _limit);
+            var stream = new LimitedReadStream(request.Body, _limit);
+            request.Body = stream;
+
+            // The reads binding makes leave their state here, so the exception handler can tell a body that ended
+            // before its first byte from content that is not JSON without reading the body again.
+            context.Features.Set<IRequestBodyReadFeature>(stream);
         }
 
         return _next(context);
@@ -98,9 +104,10 @@ public sealed class RequestBodyLimitMiddleware
 
     /// <summary>
     /// A read-only, forward-only view of the request body that counts the bytes read and fails every read once the
-    /// count exceeds the limit. It is used by one request at a time, as the body stream it wraps is.
+    /// count exceeds the limit, and the request's <see cref="IRequestBodyReadFeature"/>. It is used by one request at
+    /// a time, as the body stream it wraps is.
     /// </summary>
-    private sealed class LimitedReadStream : Stream
+    private sealed class LimitedReadStream : Stream, IRequestBodyReadFeature
     {
         private readonly Stream _inner;
 
@@ -113,6 +120,10 @@ public sealed class RequestBodyLimitMiddleware
             _inner = inner;
             _limit = limit;
         }
+
+        public long BytesRead => _total;
+
+        public bool EndOfBody { get; private set; }
 
         public override bool CanRead => true;
 
@@ -133,13 +144,13 @@ public sealed class RequestBodyLimitMiddleware
         public override int Read(byte[] buffer, int offset, int count)
         {
             ThrowIfOverLimit();
-            return Count(_inner.Read(buffer, offset, count));
+            return Count(_inner.Read(buffer, offset, count), count);
         }
 
         public override int Read(Span<byte> buffer)
         {
             ThrowIfOverLimit();
-            return Count(_inner.Read(buffer));
+            return Count(_inner.Read(buffer), buffer.Length);
         }
 
         public override async Task<int> ReadAsync(
@@ -149,7 +160,9 @@ public sealed class RequestBodyLimitMiddleware
             CancellationToken cancellationToken)
         {
             ThrowIfOverLimit();
-            return Count(await _inner.ReadAsync(buffer, offset, count, cancellationToken).ConfigureAwait(false));
+            return Count(
+                await _inner.ReadAsync(buffer, offset, count, cancellationToken).ConfigureAwait(false),
+                count);
         }
 
         public override async ValueTask<int> ReadAsync(
@@ -157,7 +170,7 @@ public sealed class RequestBodyLimitMiddleware
             CancellationToken cancellationToken = default)
         {
             ThrowIfOverLimit();
-            return Count(await _inner.ReadAsync(buffer, cancellationToken).ConfigureAwait(false));
+            return Count(await _inner.ReadAsync(buffer, cancellationToken).ConfigureAwait(false), buffer.Length);
         }
 
         public override void Flush()
@@ -175,9 +188,16 @@ public sealed class RequestBodyLimitMiddleware
         // routes here as well.
         protected override void Dispose(bool disposing) => base.Dispose(disposing);
 
-        private int Count(int read)
+        // A read that asked for at least one byte and got none found the end of the body. A zero-byte read, which a
+        // pipe reader issues only to wait for data, proves nothing.
+        private int Count(int read, int requested)
         {
             _total += read;
+            if (read == 0 && requested > 0)
+            {
+                EndOfBody = true;
+            }
+
             ThrowIfOverLimit();
             return read;
         }
@@ -191,6 +211,28 @@ public sealed class RequestBodyLimitMiddleware
             }
         }
     }
+}
+
+/// <summary>
+/// What the request's own consumers have read of its body so far, as <see cref="RequestBodyLimitMiddleware"/>'s
+/// counting stream saw it. The exception handler reads it to tell a body that ended before its first byte, such as an
+/// empty chunked body, from content that is not JSON.
+/// </summary>
+/// <remarks>
+/// The feature is set only on a request whose body the guard wraps, and it is never a reason to read: its values come
+/// from reads binding already made, so the body is never read, peeked or buffered twice. Both values only grow, and
+/// they describe the decoded body bytes, never the transfer framing.
+/// </remarks>
+public interface IRequestBodyReadFeature
+{
+    /// <summary>The number of body bytes read so far.</summary>
+    long BytesRead { get; }
+
+    /// <summary>
+    /// <see langword="true"/> once a read that asked for at least one byte returned none, so the body is known to
+    /// have ended. A zero-byte read never sets it.
+    /// </summary>
+    bool EndOfBody { get; }
 }
 
 /// <summary>Pipeline registration for <see cref="RequestBodyLimitMiddleware"/>.</summary>

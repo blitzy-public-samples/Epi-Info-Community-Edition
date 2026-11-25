@@ -265,8 +265,11 @@ public static class FormDefinitionFactory
             string.IsNullOrWhiteSpace(field.Pattern) ? null : field.Pattern);
     }
 
-    // Number bounds are invariant numbers; date bounds are stored MM-DD-YYYY and leave here as dates, written
-    // YYYY-MM-DD on the wire. An unset or unparseable bound, or a bound on any other type, is no bound.
+    // Number bounds are invariant numbers, parsed exactly: a whole number within the signed 64-bit range keeps its
+    // exact integer, so a bigint bound such as 9007199254740993 is not rounded through double, and any other number
+    // keeps its nearest double without being rounded into a whole one. Date bounds are stored MM-DD-YYYY and leave
+    // here as dates, written YYYY-MM-DD on the wire. An unset or unparseable bound, or a bound on any other type, is
+    // no bound.
     private static FieldValue? Bound(string? text, FieldType fieldType)
     {
         if (FieldValueCoercion.IsUnsetBound(text))
@@ -274,9 +277,9 @@ public static class FormDefinitionFactory
             return null;
         }
 
-        if (fieldType == FieldType.Number && FieldValueCoercion.TryParseInvariantNumber(text, out var number))
+        if (fieldType == FieldType.Number && FieldValueCoercion.TryParseNumber(text, out var number))
         {
-            return FieldValue.FromNumber(number);
+            return number;
         }
 
         if (fieldType == FieldType.Date && FieldValueCoercion.TryParseMetadataDate(text, out var date))
