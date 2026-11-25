@@ -1,0 +1,872 @@
+/*
+ * Global stylesheet for the Epi Info web data-entry client.
+ *
+ * The client renders native HTML elements only (no component library, no
+ * CSS framework, no CSS-in-JS), so this file is the one place visual styling
+ * lives. Components use exactly the class names below; renaming one breaks
+ * the components that rely on it.
+ *
+ *   Shell        .app  .forms-list  .form-view  .form-toolbar  .record-navigator
+ *   Pages        .page-tabs with [role="tablist"], [role="tab"], [role="tabpanel"]
+ *   Fields       .page-fields  .field  .field--protected  .field--disabled
+ *                .field-error  .group-section  .label-heading  .unsupported-placeholder
+ *   Grid         .record-grid  .record-grid__row--deleted  .record-grid__paging
+ *   Messages     .banner  .banner--error  .banner--warning  .banner--info
+ *                .validation-summary
+ *   Dialogs      .dialog-backdrop  .dialog  .find-dialog  .find-dialog__fields
+ *                .find-dialog__criterion  .find-dialog__results
+ *   Utilities    .visually-hidden
+ *
+ * State comes from native attributes (disabled, aria-selected, aria-current,
+ * aria-invalid, aria-disabled, hidden), never from rules that hide controls:
+ * Testing Library and Playwright must always find every control.
+ *
+ * Cascade layers order the rules: element defaults (base) < component
+ * classes (components) < single-purpose helpers (utilities). A later layer
+ * wins regardless of selector specificity, so no rule needs !important.
+ */
+
+@layer base, components, utilities;
+
+/* ------------------------------------------------------------------ */
+/* Design tokens                                                       */
+/* ------------------------------------------------------------------ */
+
+/* Contrast against the background each colour is used on (WCAG AA):
+ * text 15.8:1, muted text 6.0:1 or more, accent 5.2:1, danger 6.1:1 or more,
+ * banner texts 9.1:1 or more, control borders 4.3:1 or more (3:1 needed). */
+:root {
+  color-scheme: light;
+
+  --font-family-base: system-ui, sans-serif;
+  --font-size-base: 1rem;
+  --font-size-small: 0.875rem;
+  --line-height-base: 1.5;
+
+  --color-text: #1f2328;
+  --color-text-muted: #57606a;
+  --color-page: #ffffff;
+  --color-surface-muted: #f6f8fa;
+  --color-surface-hover: #eaeef2;
+  --color-surface-disabled: #eaeef2;
+  --color-border: #d0d7de;
+  --color-border-strong: #6e7781;
+
+  --color-accent: #0969da;
+  --color-accent-strong: #0550ae;
+  --color-accent-subtle: #ddf4ff;
+  --color-focus: #0969da;
+
+  --color-danger: #b3261e;
+  --color-danger-border: #cf222e;
+  --color-danger-text: #82071e;
+  --color-danger-subtle: #ffebe9;
+
+  --color-warning-border: #9a6700;
+  --color-warning-text: #4d2d00;
+  --color-warning-subtle: #fff8c5;
+
+  --color-info-border: #0969da;
+  --color-info-text: #0a3069;
+  --color-info-subtle: #ddf4ff;
+
+  --color-backdrop: rgb(31 35 40 / 0.5);
+
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.5rem;
+
+  --radius-small: 6px;
+  --radius-large: 8px;
+  --border-width: 1px;
+  --border-width-accent: 4px;
+  --focus-ring-width: 2px;
+  /* Outline width plus offset: the inset a scroll box needs so the focus
+   * ring of a control at its edge is not clipped. */
+  --focus-ring-room: calc(2 * var(--focus-ring-width));
+
+  /* 44px minimum pointer target for buttons, tabs and inputs. */
+  --target-size: 2.75rem;
+  --control-max-inline-size: 40rem;
+  --content-max-inline-size: 72rem;
+
+  --shadow-dialog: 0 8px 24px rgb(31 35 40 / 0.25);
+  --transition-fast: 150ms ease-out;
+}
+
+/* ------------------------------------------------------------------ */
+/* Base: element defaults                                              */
+/* ------------------------------------------------------------------ */
+
+@layer base {
+  *,
+  *::before,
+  *::after {
+    box-sizing: border-box;
+  }
+
+  body {
+    margin: 0;
+    font-family: var(--font-family-base);
+    font-size: var(--font-size-base);
+    line-height: var(--line-height-base);
+    color: var(--color-text);
+    background-color: var(--color-page);
+  }
+
+  h1,
+  h2,
+  h3 {
+    margin-block: 0;
+    line-height: 1.25;
+    overflow-wrap: break-word;
+  }
+
+  h1 {
+    font-size: 1.75rem;
+  }
+
+  h2 {
+    font-size: 1.375rem;
+  }
+
+  h3 {
+    font-size: 1.0625rem;
+  }
+
+  p {
+    margin-block: 0;
+    overflow-wrap: break-word;
+  }
+
+  button,
+  input,
+  select,
+  textarea {
+    font: inherit;
+    color: inherit;
+  }
+
+  button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: var(--space-2);
+    min-block-size: var(--target-size);
+    min-inline-size: var(--target-size);
+    padding-block: var(--space-2);
+    padding-inline: var(--space-3);
+    border: var(--border-width) solid var(--color-border-strong);
+    border-radius: var(--radius-small);
+    background-color: var(--color-surface-muted);
+    color: var(--color-text);
+    font-weight: 500;
+    line-height: 1.25;
+    cursor: pointer;
+  }
+
+  button:disabled {
+    border-color: var(--color-border);
+    background-color: var(--color-surface-disabled);
+    color: var(--color-text-muted);
+    cursor: not-allowed;
+  }
+
+  /* Text-like controls read their state colours from custom properties, so a
+   * state rule (invalid, disabled) wins without out-ranking this selector. */
+  input:not([type="checkbox"]):not([type="radio"]),
+  select,
+  textarea {
+    inline-size: 100%;
+    max-inline-size: var(--control-max-inline-size);
+    min-block-size: var(--target-size);
+    padding-block: var(--space-2);
+    padding-inline: var(--space-3);
+    border: var(--border-width) solid var(--control-border-color, var(--color-border-strong));
+    border-radius: var(--radius-small);
+    background-color: var(--control-background, var(--color-page));
+    color: var(--control-text, var(--color-text));
+  }
+
+  textarea {
+    min-block-size: 6rem;
+    resize: vertical;
+  }
+
+  input[type="checkbox"],
+  input[type="radio"] {
+    flex: none;
+    inline-size: 1.25rem;
+    block-size: 1.25rem;
+    margin: 0;
+    accent-color: var(--color-accent);
+    cursor: pointer;
+  }
+
+  [aria-invalid="true"] {
+    --control-border-color: var(--color-danger-border);
+  }
+
+  /* Disabled outranks invalid. A disabled fieldset passes the colours on to
+   * the controls it disables. */
+  input:disabled,
+  select:disabled,
+  textarea:disabled,
+  fieldset:disabled {
+    --control-border-color: var(--color-border);
+    --control-background: var(--color-surface-disabled);
+    --control-text: var(--color-text-muted);
+  }
+
+  input:disabled,
+  select:disabled,
+  textarea:disabled {
+    cursor: not-allowed;
+  }
+
+  fieldset:disabled label {
+    color: var(--color-text-muted);
+  }
+
+  label {
+    font-weight: 600;
+  }
+
+  fieldset {
+    margin: 0;
+    padding: 0;
+    border: 0;
+    min-inline-size: 0;
+  }
+
+  legend {
+    padding: 0;
+    font-weight: 600;
+  }
+
+  small {
+    font-size: var(--font-size-small);
+    color: var(--color-text-muted);
+  }
+
+  table {
+    inline-size: 100%;
+    border-collapse: collapse;
+  }
+
+  th,
+  td {
+    padding-block: var(--space-3);
+    padding-inline: var(--space-3);
+    border-block-end: var(--border-width) solid var(--color-border);
+    text-align: start;
+    vertical-align: middle;
+    /* break-word, not anywhere: anywhere lowers the column's min-content
+     * width, so narrow tables would split words instead of scrolling. */
+    overflow-wrap: break-word;
+  }
+
+  thead th {
+    background-color: var(--color-surface-muted);
+    font-weight: 600;
+  }
+
+  :focus-visible {
+    outline: var(--focus-ring-width) solid var(--color-focus);
+    outline-offset: var(--focus-ring-width);
+  }
+
+  /* aria-disabled elements are not natively inert, so pointer input is
+   * blocked here. */
+  [aria-disabled="true"] {
+    pointer-events: none;
+  }
+
+  @media (hover: hover) {
+    button:hover:not(:disabled) {
+      background-color: var(--color-surface-hover);
+    }
+  }
+
+  @media (prefers-reduced-motion: no-preference) {
+    button,
+    input,
+    select,
+    textarea {
+      transition:
+        background-color var(--transition-fast),
+        border-color var(--transition-fast);
+    }
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* Components                                                          */
+/* ------------------------------------------------------------------ */
+
+@layer components {
+  /* Application shell: one centred column, top to bottom. */
+  .app {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-5);
+    max-inline-size: var(--content-max-inline-size);
+    margin-inline: auto;
+    padding-block: var(--space-5);
+    padding-inline: var(--space-4);
+    font-family: var(--font-family-base);
+  }
+
+  /* Forms list: one full-width button per form. */
+  .forms-list {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+  }
+
+  .forms-list ul {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+
+  .forms-list li button {
+    justify-content: flex-start;
+    inline-size: 100%;
+    padding-block: var(--space-3);
+    padding-inline: var(--space-4);
+    text-align: start;
+  }
+
+  /* Form view: toolbar, navigator, messages, page tabs, grid. */
+  .form-view {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-4);
+  }
+
+  .form-toolbar,
+  .record-navigator {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-2);
+    padding: var(--space-2);
+    border: var(--border-width) solid var(--color-border);
+    border-radius: var(--radius-small);
+    background-color: var(--color-surface-muted);
+  }
+
+  /* "[n] of N" or "New record". */
+  .record-navigator [role="status"] {
+    min-inline-size: 7.5rem;
+    padding-inline: var(--space-2);
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    text-align: center;
+  }
+
+  .record-navigator input:not([type="checkbox"]):not([type="radio"]) {
+    inline-size: 5.5rem;
+  }
+
+  .record-navigator .field-error {
+    flex-basis: 100%;
+  }
+
+  /* Page tabs (WAI-ARIA tabs pattern). Panels hide through the native hidden
+   * attribute, so no rule here sets their display. */
+  .page-tabs [role="tablist"] {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-1);
+    padding-inline: var(--space-2);
+    border-block-end: var(--border-width) solid var(--color-border);
+  }
+
+  .page-tabs [role="tab"] {
+    margin-block-end: calc(-1 * var(--border-width));
+    border: var(--border-width) solid transparent;
+    border-start-start-radius: var(--radius-small);
+    border-start-end-radius: var(--radius-small);
+    border-end-start-radius: 0;
+    border-end-end-radius: 0;
+    background-color: transparent;
+    color: var(--color-text);
+  }
+
+  /* Selected: bold accent text, a top bar and a border joined to the panel,
+   * so colour is not the only cue. */
+  .page-tabs [role="tab"][aria-selected="true"] {
+    border-color: var(--color-border);
+    border-block-end-color: var(--color-page);
+    background-color: var(--color-page);
+    box-shadow: inset 0 3px 0 var(--color-accent);
+    color: var(--color-accent-strong);
+    font-weight: 700;
+  }
+
+  .page-tabs [role="tabpanel"] {
+    padding: var(--space-4);
+    border: var(--border-width) solid var(--color-border);
+    border-block-start: 0;
+    border-end-start-radius: var(--radius-small);
+    border-end-end-radius: var(--radius-small);
+    background-color: var(--color-page);
+  }
+
+  @media (hover: hover) {
+    .page-tabs [role="tab"]:hover:not([aria-selected="true"]) {
+      background-color: var(--color-surface-hover);
+    }
+  }
+
+  /* Fields: one per row in tabIndex order. Each child of .field takes a full
+   * row (label, control, hint, errors) except a checkbox, whose label sits
+   * beside it. */
+  .page-fields {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-4);
+  }
+
+  .field {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-1) var(--space-2);
+    min-inline-size: 0;
+  }
+
+  .field > * {
+    flex: 1 1 100%;
+  }
+
+  .field > input[type="checkbox"] {
+    flex: none;
+  }
+
+  .field > input[type="checkbox"] + label {
+    flex: 1 1 0;
+  }
+
+  /* Option group: radios and their labels wrap in a row under the legend.
+   * The label's end padding separates one option from the next and widens
+   * its click target. */
+  .field > fieldset {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-1) var(--space-2);
+  }
+
+  .field > fieldset > legend {
+    margin-block-end: var(--space-1);
+  }
+
+  .field > fieldset > input[type="radio"] + label {
+    display: inline-flex;
+    align-items: center;
+    min-block-size: var(--target-size);
+    padding-inline-end: var(--space-3);
+    font-weight: 400;
+    cursor: pointer;
+  }
+
+  /* Read-only metadata, a deleted record, or an unsupported field. */
+  .field--protected {
+    padding: var(--space-2);
+    border-radius: var(--radius-small);
+    background-color: var(--color-surface-muted);
+  }
+
+  /* Disabled by check code only. Inactive controls are exempt from the
+   * WCAG contrast minimum (1.4.3). */
+  .field--disabled {
+    opacity: 0.6;
+  }
+
+  .field-error {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    color: var(--color-danger);
+    font-size: var(--font-size-small);
+    font-weight: 600;
+  }
+
+  .group-section {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-4);
+    padding: var(--space-4);
+    border: var(--border-width) solid var(--color-border-strong);
+    border-radius: var(--radius-large);
+  }
+
+  .group-section > h3 {
+    padding-block-end: var(--space-2);
+    border-block-end: var(--border-width) solid var(--color-border);
+  }
+
+  .label-heading {
+    padding-block-start: var(--space-2);
+  }
+
+  .unsupported-placeholder {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    padding-block: var(--space-2);
+    padding-inline: var(--space-3);
+    border: var(--border-width) dashed var(--color-border-strong);
+    border-radius: var(--radius-small);
+    color: var(--color-text-muted);
+    font-style: italic;
+  }
+
+  .unsupported-placeholder > :first-child {
+    color: var(--color-text);
+    font-style: normal;
+    font-weight: 600;
+  }
+
+  /* Record grid: search and "Show deleted" share the first row; the table
+   * and the paging row each take a full row. A table wider than the screen
+   * scrolls sideways inside the section; the padding keeps focus rings of
+   * edge controls inside the scroll box. */
+  .record-grid {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-3) var(--space-4);
+    padding: var(--focus-ring-room);
+    overflow-x: auto;
+    scroll-padding-inline: var(--focus-ring-room);
+  }
+
+  /* Data cells stay on one line, as in a spreadsheet: values such as
+   * 1980-05-01 would otherwise break at their hyphens on narrow screens.
+   * Headers still wrap at spaces. */
+  .record-grid td,
+  .find-dialog td {
+    white-space: nowrap;
+  }
+
+  .record-grid > table,
+  .record-grid > div,
+  .record-grid > p,
+  .record-grid > footer,
+  .record-grid > .banner {
+    flex: 1 1 100%;
+  }
+
+  .record-grid input[type="search"] {
+    flex: 1 1 16rem;
+    max-inline-size: 24rem;
+  }
+
+  .record-grid label {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-2);
+    min-block-size: var(--target-size);
+    cursor: pointer;
+  }
+
+  .record-grid tbody tr {
+    cursor: pointer;
+  }
+
+  .record-grid tbody tr:nth-child(even) {
+    background-color: var(--color-surface-muted);
+  }
+
+  .record-grid tbody tr:focus-visible {
+    outline-offset: calc(-1 * var(--focus-ring-width));
+  }
+
+  /* The open record: tinted, bold and marked by a bar on its first cell. */
+  .record-grid tbody td:first-child {
+    border-inline-start: var(--border-width-accent) solid transparent;
+  }
+
+  .record-grid tbody tr[aria-current="true"] {
+    background-color: var(--color-accent-subtle);
+    font-weight: 600;
+  }
+
+  .record-grid tbody tr[aria-current="true"] td:first-child {
+    border-inline-start-color: var(--color-accent);
+  }
+
+  /* recStatus 0 rows, listed only while "Show deleted" is on. */
+  .record-grid__row--deleted td {
+    color: var(--color-text-muted);
+    text-decoration: line-through;
+  }
+
+  .record-grid__paging,
+  .record-grid > footer {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-2) var(--space-3);
+  }
+
+  .record-grid__paging > :first-child,
+  .record-grid > footer > :first-child {
+    margin-inline-end: auto;
+  }
+
+  @media (hover: hover) {
+    .record-grid tbody tr:hover {
+      background-color: var(--color-accent-subtle);
+    }
+  }
+
+  /* Banners: message text grows, action buttons (Retry, Discard edits,
+   * Save again, Dismiss) line up at the inline end. */
+  .banner {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-2) var(--space-4);
+    padding-block: var(--space-3);
+    padding-inline: var(--space-4);
+    border: var(--border-width) solid var(--banner-border, var(--color-border-strong));
+    border-inline-start-width: var(--border-width-accent);
+    border-radius: var(--radius-small);
+    background-color: var(--banner-background, var(--color-surface-muted));
+    color: var(--banner-text, var(--color-text));
+  }
+
+  /* Text keeps its natural width: a long message takes its own line and a
+   * short one shares the line with the trace id and buttons. */
+  .banner > :not(button) {
+    flex: 1 1 auto;
+  }
+
+  .banner > button:first-of-type {
+    margin-inline-start: auto;
+  }
+
+  .banner--error {
+    --banner-border: var(--color-danger-border);
+    --banner-background: var(--color-danger-subtle);
+    --banner-text: var(--color-danger-text);
+  }
+
+  .banner--warning {
+    --banner-border: var(--color-warning-border);
+    --banner-background: var(--color-warning-subtle);
+    --banner-text: var(--color-warning-text);
+  }
+
+  .banner--info {
+    --banner-border: var(--color-info-border);
+    --banner-background: var(--color-info-subtle);
+    --banner-text: var(--color-info-text);
+  }
+
+  /* Field and request-level errors after a rejected save. */
+  .validation-summary {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    padding-block: var(--space-3);
+    padding-inline: var(--space-4);
+    border: var(--border-width) solid var(--color-danger-border);
+    border-inline-start-width: var(--border-width-accent);
+    border-radius: var(--radius-small);
+    background-color: var(--color-danger-subtle);
+    color: var(--color-danger-text);
+  }
+
+  .validation-summary ul {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    margin: 0;
+    padding-inline-start: var(--space-5);
+  }
+
+  /* A field label that jumps to the field: styled as a link. */
+  .validation-summary li button {
+    min-inline-size: 0;
+    padding: 0;
+    border: 0;
+    background-color: transparent;
+    color: inherit;
+    font-weight: 700;
+    text-decoration: underline;
+    text-underline-offset: 2px;
+  }
+
+  @media (hover: hover) {
+    .validation-summary li button:hover:not(:disabled) {
+      background-color: transparent;
+      text-decoration-thickness: 2px;
+    }
+  }
+
+  /* Modal dialogs: plain elements with role="dialog" and aria-modal="true"
+   * (jsdom has no HTMLDialogElement.showModal). Headings, text and forms take
+   * full rows; buttons placed directly in the dialog line up at the end. */
+  .dialog-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 1000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: var(--space-4);
+    overflow-y: auto;
+    background-color: var(--color-backdrop);
+  }
+
+  .dialog {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    align-items: center;
+    gap: var(--space-3);
+    inline-size: 100%;
+    max-inline-size: 32rem;
+    max-block-size: calc(100vh - 2 * var(--space-4));
+    overflow-y: auto;
+    padding: var(--space-5);
+    border: var(--border-width) solid var(--color-border);
+    border-radius: var(--radius-large);
+    background-color: var(--color-page);
+    box-shadow: var(--shadow-dialog);
+    color: var(--color-text);
+  }
+
+  .dialog > :not(button) {
+    flex: 1 1 100%;
+  }
+
+  .dialog > h2 {
+    font-size: 1.25rem;
+  }
+
+  /* Find record: wider panel, field picker, criterion rows, results. */
+  .find-dialog {
+    max-inline-size: 56rem;
+  }
+
+  .find-dialog form {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-4);
+  }
+
+  .find-dialog fieldset,
+  .find-dialog__fields {
+    padding: var(--space-3);
+    border: var(--border-width) solid var(--color-border);
+    border-radius: var(--radius-small);
+  }
+
+  .find-dialog fieldset > legend {
+    padding-inline: var(--space-1);
+  }
+
+  .find-dialog__fields {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(12rem, 1fr));
+    gap: var(--space-1) var(--space-4);
+  }
+
+  /* One child per searchable field: its checkbox, label and description. */
+  .find-dialog fieldset label,
+  .find-dialog__fields > * {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-2);
+    min-block-size: var(--target-size);
+  }
+
+  /* One row per checked field: label, value box, hint, Remove button. */
+  .find-dialog__criterion {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-1) var(--space-3);
+    padding-block: var(--space-2);
+    border-block-end: var(--border-width) solid var(--color-border);
+  }
+
+  .find-dialog__criterion > label {
+    flex: 1 1 100%;
+  }
+
+  .find-dialog__criterion > input:not([type="checkbox"]):not([type="radio"]) {
+    flex: 1 1 16rem;
+  }
+
+  .find-dialog__criterion > small,
+  .find-dialog__criterion > .field-error {
+    flex: 1 1 100%;
+  }
+
+  /* Wrapper around the results table; scrolls sideways on narrow screens. */
+  .find-dialog__results {
+    padding: var(--focus-ring-room);
+    overflow-x: auto;
+    scroll-padding-inline: var(--focus-ring-room);
+  }
+
+  .find-dialog tbody tr {
+    cursor: pointer;
+  }
+
+  .find-dialog tbody tr:nth-child(even) {
+    background-color: var(--color-surface-muted);
+  }
+
+  @media (hover: hover) {
+    .find-dialog tbody tr:hover {
+      background-color: var(--color-accent-subtle);
+    }
+  }
+
+  @media (prefers-reduced-motion: no-preference) {
+    .record-grid tbody tr,
+    .find-dialog tbody tr {
+      transition: background-color var(--transition-fast);
+    }
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* Utilities                                                           */
+/* ------------------------------------------------------------------ */
+
+@layer utilities {
+  /* Author display rules (flex on banners, dialogs, rows) would otherwise
+   * override the user-agent rule behind the hidden attribute. */
+  [hidden] {
+    display: none;
+  }
+
+  /* Present to assistive technology, not drawn on screen. */
+  .visually-hidden {
+    position: absolute;
+    inline-size: 1px;
+    block-size: 1px;
+    margin: -1px;
+    padding: 0;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    clip-path: inset(50%);
+    white-space: nowrap;
+    border: 0;
+  }
+}
