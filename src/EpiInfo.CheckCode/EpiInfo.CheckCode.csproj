@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Check-code engine of the web data-entry server: a hand-written lexer, recursive-descent parser and
+    tree-walking evaluator behind ICheckCodeEngine. It references only EpiInfo.Domain and no package.
+    Target framework, nullable settings and implicit usings come from src/Directory.Build.props.
+  -->
+  <PropertyGroup>
+    <RootNamespace>EpiInfo.CheckCode</RootNamespace>
+    <AssemblyName>EpiInfo.CheckCode</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../EpiInfo.Domain/EpiInfo.Domain.csproj" />
+  </ItemGroup>
+
+</Project>
