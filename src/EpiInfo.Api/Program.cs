@@ -2,7 +2,9 @@
 // not bind 127.0.0.1 exactly and answers every request whose Host is not 127.0.0.1 or localhost with a 400
 // (LoopbackBindingGuard), loads the Kestrel endpoints with configuration reload off and applies the configured
 // request body limit, logs through the JSON console provider only, warns at startup when the database connection
-// string is not configured, and serves the built web client with its index.html fallback (ClientAppHosting).
+// string is not configured, turns every empty error response into the API's fixed ProblemDetails (ApiProblems), and
+// serves the built web client with its index.html fallback (ClientAppHosting).
+using EpiInfo.Api.Errors;
 using EpiInfo.Api.Hosting;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -29,6 +31,10 @@ builder.Logging.AddJsonConsole();
 // Read from the built configuration on first use, so settings a test host applies during Build are honoured.
 builder.Services.AddSingleton(services => ApiOptions.FromConfiguration(services.GetRequiredService<IConfiguration>()));
 
+// Bodies framework writers produce through the ProblemDetails service, such as the Development exception page, keep
+// only the API's fixed texts and traceId.
+builder.Services.AddProblemDetails(options => options.CustomizeProblemDetails = ApiProblems.Customize);
+
 var app = builder.Build();
 
 // Checked again on the built configuration, which also holds sources applied during Build, such as test-host settings.
@@ -41,6 +47,12 @@ if (!ApiOptions.FromConfiguration(app.Configuration).HasConnectionString)
         "Configuration key {ConfigurationKey} is not set; database-backed endpoints and /health return 503.",
         ApiOptions.ConnectionStringKey);
 }
+
+// Empty error responses produced inside the pipeline (route miss 404, 405, routing 415) become the fixed
+// ProblemDetails of their status. The API's own writer is passed because the default status-code page goes through
+// the ProblemDetails service, whose default writer declines an Accept header that admits neither application/json nor
+// application/problem+json, and then falls back to a text/plain body without traceId.
+app.UseStatusCodePages(ApiProblems.WriteStatusCodePageAsync);
 
 // Before routing, the endpoints, OpenAPI and the static client, so a request whose Host is not 127.0.0.1 or localhost
 // is answered 400 before anything is served. Exception handling and status-code pages, when registered, come before

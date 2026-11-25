@@ -11,9 +11,17 @@
  * Importing the module opens no connection: each pool belongs to the function that creates it. The connection
  * is resolved by `connection.ts`, exactly as the .NET tests resolve it. Nothing is written to the console, and
  * no message carries a connection string, a host, a password or a driver message.
+ *
+ * A driver failure, from connecting, a verification query, the lock calls or closing a pool, is reported as a
+ * new `Error` with fixed text naming the part (SQL verifier or test lock), the operation, and either the SQL
+ * Server error number or a driver code from a fixed list of `mssql` and `tedious` codes. The driver's message,
+ * its original and preceding errors and its server name are never copied, and the driver's error is never
+ * attached as the cause, because any of them can name the host, the database or the statement. Errors this
+ * module raises from its own checks, such as a negative `sp_getapplock` return code, and the
+ * `TestDatabaseConfigurationError` of `connection.ts`, propagate unchanged.
  */
 import sql from 'mssql';
-import type { ConnectionPool, Request, Transaction } from 'mssql';
+import type { ConnectionPool, IResult, Request, Transaction } from 'mssql';
 
 import {
   CONNECTION_STRING_VARIABLE,
@@ -113,6 +121,8 @@ export interface ExclusiveTestLock {
   /**
    * Releases the lock, rolls its transaction back and closes its pool, then rethrows the first failure of
    * those steps. Every step runs even when an earlier one fails. Later calls return the first call's promise.
+   * A driver failure is reported as fixed text naming the step and the SQL Server error number or allow-listed
+   * driver code only; a negative `sp_releaseapplock` return code is reported with that code.
    */
   release(): Promise<void>;
 }
@@ -155,6 +165,52 @@ const LIBRARY_USAGE_CODES: ReadonlySet<string> = new Set(['EREQINPROG', 'ENOCONN
 // server holds no transaction-owned lock for it.
 const ENDED_TRANSACTION_CODES: ReadonlySet<string> = new Set(['ENOTBEGUN', 'EABORT']);
 
+// The parts of this module a driver failure message names.
+const VERIFIER_PART = 'SQL verifier';
+const LOCK_PART = 'test lock';
+
+// Every error code mssql 12.8.1 and tedious 20.4.3 assign, and the codes the mssql typings declare. A failure
+// message names a code only when it is in this list, so it never carries text the driver or the OS produced.
+const DRIVER_ERROR_CODES: ReadonlySet<string> = new Set([
+  'ABORT_ERR',
+  'EABORT',
+  'EALREADYBEGUN',
+  'EALREADYCONNECTED',
+  'EALREADYCONNECTING',
+  'EALREADYPREPARED',
+  'EARGS',
+  'ECANCEL',
+  'ECLOSE',
+  'ECLOSING',
+  'ECONNCLOSED',
+  'ECONNECTING',
+  'ECONNRESET',
+  'EDEPRECATED',
+  'EDRIVER',
+  'EDUPEPARAM',
+  'EENCRYPT',
+  'EFEDAUTH',
+  'EINJECT',
+  'EINSTLOOKUP',
+  'EINTERFACENOTSUPP',
+  'EINVALIDSTATE',
+  'EJSON',
+  'ELOGIN',
+  'ENAME',
+  'ENOCONN',
+  'ENOTBEGUN',
+  'ENOTOPEN',
+  'ENOTPREPARED',
+  'EPARAM',
+  'EREQINPROG',
+  'EREQUEST',
+  'ESOCKET',
+  'ETDS',
+  'ETIMEOUT',
+]);
+
+const NO_DRIVER_CODE = 'no driver error code';
+
 const SEEDED_FORMS: readonly string[] = Object.keys(PAGE_TABLES);
 const PAGE_TABLE_NAMES: ReadonlySet<string> = new Set(Object.values(PAGE_TABLES).flat());
 
@@ -162,23 +218,26 @@ const PAGE_TABLE_NAMES: ReadonlySet<string> = new Set(Object.values(PAGE_TABLES)
  * Opens a pool of its own for read-only verification queries; it never shares the lock's pool. Close it with
  * {@link SqlVerifier.close}.
  *
+ * When the driver fails, a method of the returned verifier rejects with an `Error` whose fixed text names the
+ * operation and the SQL Server error number or allow-listed driver code only, never the caller's id or marker.
+ *
  * @throws {TestDatabaseConfigurationError} The database is not configured, or its connection string cannot be
  * used; thrown by `connection.ts` unchanged.
  * @throws {Error} The database cannot be reached. The message names the configuration variables and the
- * driver's error code only.
+ * allow-listed driver error code only.
  */
 export async function openSqlVerifier(): Promise<SqlVerifier> {
   const pool = createPool(VERIFIER_APPLICATION_NAME);
-  await connectPool(pool, 'SQL verifier');
+  await connectPool(pool, VERIFIER_PART);
   let closing: Promise<void> | undefined;
 
   return {
     async countRecords(form: SeededForm, includeDeleted: boolean): Promise<number> {
       assertSeededForm(form);
       const filter = includeDeleted ? '' : ' WHERE [RecStatus] = 1';
-      const result = await pool
-        .request()
-        .query<{ n: number }>(`SELECT COUNT(*) AS n FROM ${quoteTable(form)}${filter};`);
+      const result = await driverCall(VERIFIER_PART, `counting the records of ${form}`, () =>
+        pool.request().query<{ n: number }>(`SELECT COUNT(*) AS n FROM ${quoteTable(form)}${filter};`),
+      );
       const row = result.recordset.at(0);
       if (row === undefined) {
         throw new Error(`The record count of ${form} returned no row.`);
@@ -188,10 +247,12 @@ export async function openSqlVerifier(): Promise<SqlVerifier> {
 
     async baseRowById(form: SeededForm, globalRecordId: string): Promise<BaseRow | null> {
       assertSeededForm(form);
-      const result = await pool
-        .request()
-        .input('id', sql.NVarChar(GLOBAL_RECORD_ID_LENGTH), globalRecordId)
-        .query<BaseRow>(`SELECT ${BASE_ROW_COLUMNS} FROM ${quoteTable(form)} b WHERE b.[GlobalRecordId] = @id;`);
+      const result = await driverCall(VERIFIER_PART, `reading a base row of ${form}`, () =>
+        pool
+          .request()
+          .input('id', sql.NVarChar(GLOBAL_RECORD_ID_LENGTH), globalRecordId)
+          .query<BaseRow>(`SELECT ${BASE_ROW_COLUMNS} FROM ${quoteTable(form)} b WHERE b.[GlobalRecordId] = @id;`),
+      );
       return result.recordset.at(0) ?? null;
     },
 
@@ -199,29 +260,33 @@ export async function openSqlVerifier(): Promise<SqlVerifier> {
       assertSeededForm(form);
       const markerPage = MARKER_PAGE_TABLE[form];
       assertPageTable(markerPage);
-      const result = await pool
-        .request()
-        .input('marker', sql.NVarChar(LAST_NAME_LENGTH), marker)
-        .query<BaseRow>(
-          `SELECT ${BASE_ROW_COLUMNS} FROM ${quoteTable(form)} b ` +
-            `INNER JOIN ${quoteTable(markerPage)} p ON p.[GlobalRecordId] = b.[GlobalRecordId] ` +
-            'WHERE p.[LastName] = @marker ORDER BY b.[UniqueKey];',
-        );
+      const result = await driverCall(VERIFIER_PART, `finding the marked base rows of ${form}`, () =>
+        pool
+          .request()
+          .input('marker', sql.NVarChar(LAST_NAME_LENGTH), marker)
+          .query<BaseRow>(
+            `SELECT ${BASE_ROW_COLUMNS} FROM ${quoteTable(form)} b ` +
+              `INNER JOIN ${quoteTable(markerPage)} p ON p.[GlobalRecordId] = b.[GlobalRecordId] ` +
+              'WHERE p.[LastName] = @marker ORDER BY b.[UniqueKey];',
+          ),
+      );
       return [...result.recordset];
     },
 
     async pageRow(table: PageTable, globalRecordId: string): Promise<PageRow | null> {
       assertPageTable(table);
-      const result = await pool
-        .request()
-        .input('id', sql.NVarChar(GLOBAL_RECORD_ID_LENGTH), globalRecordId)
-        .query<Record<string, SqlCell>>(`SELECT * FROM ${quoteTable(table)} WHERE [GlobalRecordId] = @id;`);
+      const result = await driverCall(VERIFIER_PART, `reading a page row of ${table}`, () =>
+        pool
+          .request()
+          .input('id', sql.NVarChar(GLOBAL_RECORD_ID_LENGTH), globalRecordId)
+          .query<Record<string, SqlCell>>(`SELECT * FROM ${quoteTable(table)} WHERE [GlobalRecordId] = @id;`),
+      );
       const row = result.recordset.at(0);
       return row === undefined ? null : Object.freeze({ ...row });
     },
 
     close(): Promise<void> {
-      closing ??= pool.close();
+      closing ??= driverCall(VERIFIER_PART, 'closing the verifier pool', () => pool.close());
       return closing;
     },
   };
@@ -239,20 +304,29 @@ export async function openSqlVerifier(): Promise<SqlVerifier> {
  * @throws {TestDatabaseConfigurationError} The database is not configured, or its connection string cannot be
  * used; thrown by `connection.ts` unchanged.
  * @throws {Error} The database cannot be reached (the message names the configuration variables and the
- * driver's error code only), or `sp_getapplock` did not grant the lock (the message names its return code and
- * meaning). The pool is closed before either is thrown.
+ * allow-listed driver error code only); beginning the transaction or calling `sp_getapplock` failed in the driver (the
+ * message names the operation and the SQL Server error number or allow-listed driver code only); or
+ * `sp_getapplock` did not grant the lock (the message names its return code and meaning). The transaction is
+ * rolled back and the pool closed before any of them is thrown.
  */
 export async function acquireExclusiveTestLock(): Promise<ExclusiveTestLock> {
   const pool = createPool(LOCK_APPLICATION_NAME, { poolMax: 1, requestTimeoutMs: LOCK_REQUEST_TIMEOUT_MS });
-  await connectPool(pool, 'test lock');
+  await connectPool(pool, LOCK_PART);
 
   const transaction = new sql.Transaction(pool);
   let begun = false;
   try {
-    await transaction.begin();
+    await driverCall(LOCK_PART, 'beginning the lock transaction', () => transaction.begin());
     begun = true;
-    const request = lockRequest(transaction);
-    const code = await returnCode(request, ACQUIRE_STATEMENT, 'sp_getapplock');
+    const request = await driverCall(LOCK_PART, 'preparing the sp_getapplock request', () =>
+      lockRequest(transaction),
+    );
+    const code = selectedReturnCode(
+      await driverCall(LOCK_PART, 'requesting sp_getapplock', () => runLockStatement(request, ACQUIRE_STATEMENT)),
+    );
+    if (code === undefined) {
+      throw missingReturnCode('sp_getapplock');
+    }
     if (code < 0) {
       throw new Error(
         `The exclusive test lock '${TEST_LOCK_RESOURCE}' was not granted: sp_getapplock returned ${code} ` +
@@ -265,7 +339,9 @@ export async function acquireExclusiveTestLock(): Promise<ExclusiveTestLock> {
       await settleQuietly(() => transaction.rollback());
     }
     await settleQuietly(() => pool.close());
-    throw asError(err);
+    // Every driver call above goes through driverCall, so what arrives here is fixed text: a reduced driver
+    // failure or one of this function's own checks.
+    throw err;
   }
 }
 
@@ -309,8 +385,9 @@ async function connectPool(pool: ConnectionPool, purpose: string): Promise<void>
     await pool.connect();
   } catch (err) {
     await settleQuietly(() => pool.close());
-    // Only the code: the driver's message can name the host, so it is neither repeated nor attached as the cause.
-    const code = errorCode(err) ?? 'no driver error code';
+    // Only an allow-listed code: the driver's message can name the host, so it is neither repeated nor attached
+    // as the cause.
+    const code = listedDriverCode(err) ?? NO_DRIVER_CODE;
     throw new Error(
       `The ${DATABASE_NAME} test database cannot be reached for the ${purpose} (${code}). ` +
         `Set ${CONNECTION_STRING_VARIABLE}, or ${SQL_HOST_VARIABLE} and ${PASSWORD_VARIABLE}, to the rehearsal ` +
@@ -326,14 +403,25 @@ function lockRequest(transaction: Transaction): Request {
   return request;
 }
 
-/** Runs a lock statement and returns the procedure's return code, which the statement selects as `rc`. */
-async function returnCode(request: Request, statement: string, procedure: string): Promise<number> {
-  const result = await request.query<{ rc: number }>(statement);
+/** The rows a lock statement selects: one row holding the procedure's return code as `rc`. */
+type LockStatementResult = IResult<{ rc: number }>;
+
+/**
+ * Runs a lock statement. A driver failure rejects with the driver's own error, so the caller can classify it
+ * before it reduces it to fixed text with {@link driverFailure}.
+ */
+async function runLockStatement(request: Request, statement: string): Promise<LockStatementResult> {
+  return await request.query<{ rc: number }>(statement);
+}
+
+/** The procedure's return code that a lock statement selected, or `undefined` when it selected none. */
+function selectedReturnCode(result: LockStatementResult): number | undefined {
   const code = result.recordset.at(0)?.rc;
-  if (typeof code !== 'number' || !Number.isInteger(code)) {
-    throw new Error(`${procedure} completed without a return code.`);
-  }
-  return code;
+  return typeof code === 'number' && Number.isInteger(code) ? code : undefined;
+}
+
+function missingReturnCode(procedure: string): Error {
+  return new Error(`${procedure} completed without a return code.`);
 }
 
 function lockHandle(pool: ConnectionPool, transaction: Transaction, request: Request): ExclusiveTestLock {
@@ -347,17 +435,22 @@ function lockHandle(pool: ConnectionPool, transaction: Transaction, request: Req
 }
 
 async function releaseLock(pool: ConnectionPool, transaction: Transaction, request: Request): Promise<void> {
-  // Each step runs whatever the earlier ones did; the first failure is rethrown once all have run.
+  // Each step runs whatever the earlier ones did; the first failure is rethrown once all have run. A driver
+  // failure is classified on the driver's own error and recorded only as fixed text.
   let releaseFailure: Error | undefined;
+  let releaseDriverError: unknown;
   try {
-    const code = await callRelease(transaction, request);
-    if (code < 0) {
+    const code = selectedReturnCode(await callRelease(transaction, request));
+    if (code === undefined) {
+      releaseFailure = missingReturnCode('sp_releaseapplock');
+    } else if (code < 0) {
       releaseFailure = new Error(
         `Releasing the test lock '${TEST_LOCK_RESOURCE}' failed: sp_releaseapplock returned ${code}.`,
       );
     }
   } catch (err) {
-    releaseFailure = asError(err);
+    releaseDriverError = err;
+    releaseFailure = driverFailure(LOCK_PART, 'calling sp_releaseapplock', err);
   }
 
   let rollbackFailure: Error | undefined;
@@ -368,7 +461,7 @@ async function releaseLock(pool: ConnectionPool, transaction: Transaction, reque
     if (isEndedTransaction(err)) {
       transactionEnded = true;
     } else {
-      rollbackFailure = asError(err);
+      rollbackFailure = driverFailure(LOCK_PART, 'rolling back the lock transaction', err);
     }
   }
 
@@ -376,12 +469,12 @@ async function releaseLock(pool: ConnectionPool, transaction: Transaction, reque
   try {
     await pool.close();
   } catch (err) {
-    closeFailure = asError(err);
+    closeFailure = driverFailure(LOCK_PART, 'closing the lock pool', err);
   }
 
   // A transaction the server already ended released its transaction-owned lock with it, so a release call that
   // failed only because that transaction no longer exists left nothing held.
-  if (transactionEnded && isEndedTransaction(releaseFailure)) {
+  if (transactionEnded && isEndedTransaction(releaseDriverError)) {
     releaseFailure = undefined;
   }
 
@@ -394,17 +487,19 @@ async function releaseLock(pool: ConnectionPool, transaction: Transaction, reque
 /**
  * Calls `sp_releaseapplock` through the request that took the lock. When the library refuses to run that
  * request again, it retries once with a fresh request bound to the same transaction, and so to the same session.
+ * A driver failure rejects with the driver's own error, which {@link releaseLock} classifies before it reduces
+ * it to fixed text.
  */
-async function callRelease(transaction: Transaction, request: Request): Promise<number> {
+async function callRelease(transaction: Transaction, request: Request): Promise<LockStatementResult> {
   try {
-    return await returnCode(request, RELEASE_STATEMENT, 'sp_releaseapplock');
+    return await runLockStatement(request, RELEASE_STATEMENT);
   } catch (err) {
     const code = errorCode(err);
     if (code === undefined || !LIBRARY_USAGE_CODES.has(code)) {
-      throw asError(err);
+      throw err;
     }
   }
-  return await returnCode(lockRequest(transaction), RELEASE_STATEMENT, 'sp_releaseapplock');
+  return await runLockStatement(lockRequest(transaction), RELEASE_STATEMENT);
 }
 
 function isEndedTransaction(err: unknown): boolean {
@@ -435,8 +530,49 @@ function errorCode(err: unknown): string | undefined {
   return err instanceof Error && 'code' in err && typeof err.code === 'string' ? err.code : undefined;
 }
 
-function asError(err: unknown): Error {
-  return err instanceof Error ? err : new Error('The SQL driver failed with a value that is not an Error.');
+/**
+ * Runs one driver call, turning its failure into {@link driverFailure}. Only driver calls are wrapped, so the
+ * errors this module raises from its own checks keep their text.
+ */
+async function driverCall<T>(part: string, operation: string, call: () => T | Promise<T>): Promise<T> {
+  try {
+    return await call();
+  } catch (err) {
+    throw driverFailure(part, operation, err);
+  }
+}
+
+/**
+ * A driver failure as fixed text: the module part, the operation and {@link safeDriverCode}. `operation` names
+ * only fixed objects, such as a seeded table, never a caller's value. Nothing of `err` is kept: its message,
+ * `originalError`, `precedingErrors` and `serverName` can name the host, the database or the statement, so none
+ * is copied and `err` is not attached as the cause.
+ */
+function driverFailure(part: string, operation: string, err: unknown): Error {
+  return new Error(`The ${part} failed while ${operation} (${safeDriverCode(err)}).`);
+}
+
+/**
+ * `SQL Server error <number>` for an `mssql` error carrying a server error number; otherwise the driver code when
+ * {@link DRIVER_ERROR_CODES} lists it; otherwise fixed text.
+ */
+function safeDriverCode(err: unknown): string {
+  if (!(err instanceof Error)) {
+    return 'a thrown value that is not an Error';
+  }
+  if (err instanceof sql.MSSQLError && 'number' in err) {
+    const serverNumber: unknown = err.number;
+    if (typeof serverNumber === 'number' && Number.isInteger(serverNumber) && serverNumber > 0) {
+      return `SQL Server error ${serverNumber}`;
+    }
+  }
+  return listedDriverCode(err) ?? NO_DRIVER_CODE;
+}
+
+/** The driver code of `err` when {@link DRIVER_ERROR_CODES} lists it, otherwise `undefined`. */
+function listedDriverCode(err: unknown): string | undefined {
+  const code = errorCode(err);
+  return code !== undefined && DRIVER_ERROR_CODES.has(code) ? code : undefined;
 }
 
 /** Runs a cleanup step whose failure must not replace the failure the caller is already reporting. */

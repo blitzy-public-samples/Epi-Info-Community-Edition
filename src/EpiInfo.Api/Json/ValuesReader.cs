@@ -1,6 +1,7 @@
 using System.Collections.ObjectModel;
 using System.Runtime.InteropServices;
 using System.Text.Json;
+using EpiInfo.Api.Errors;
 using EpiInfo.Domain.Metadata;
 using EpiInfo.Domain.Validation;
 using EpiInfo.Domain.Values;
@@ -58,7 +59,7 @@ public sealed class RawValuesResult
 
     /// <summary>
     /// The <c>detail</c> of a request-level 400, <see cref="ValidationMessages.ValuesMustBeObject"/> or
-    /// <see cref="ValuesReader.MalformedJson"/>; <see langword="null"/> unless this is a request-level failure.
+    /// <see cref="ApiProblems.MalformedJsonDetail"/>; <see langword="null"/> unless this is a request-level failure.
     /// </summary>
     public string? RequestError { get; }
 
@@ -218,13 +219,6 @@ public static class ValuesReader
     /// <summary>The field-level message for a <c>values</c> member that is a JSON object or array.</summary>
     public const string ScalarValueExpected = "must be a string, number, boolean or null";
 
-    /// <summary>
-    /// The request-level <c>detail</c> for a <c>values</c> object holding a name or string the JSON text cannot
-    /// decode, such as an escaped lone surrogate <c>"\uD800"</c>: the same "malformed JSON" 400 that binding gives that
-    /// text when it is read as a typed value.
-    /// </summary>
-    public const string MalformedJson = "malformed JSON";
-
     /// <summary>Reads the raw entries of a <c>values</c> member.</summary>
     /// <param name="values">
     /// The member as bound: <see langword="null"/> when it is missing or JSON <c>null</c>, otherwise the element sent.
@@ -237,8 +231,9 @@ public static class ValuesReader
     ///     number or a boolean;
     ///   </description></item>
     ///   <item><description>
-    ///     a request-level failure with <see cref="MalformedJson"/> when a property name or string value cannot be
-    ///     decoded;
+    ///     a request-level failure with <see cref="ApiProblems.MalformedJsonDetail"/> when a property name or string
+    ///     value cannot be decoded, such as an escaped lone surrogate <c>"\uD800"</c>: the same "malformed JSON" 400
+    ///     that binding gives that text when it is read as a typed value;
     ///   </description></item>
     ///   <item><description>
     ///     a field-level failure, keyed by the submitted name, with <see cref="ScalarValueExpected"/> for an object or
@@ -267,7 +262,7 @@ public static class ValuesReader
         {
             if (!TryDecodeName(property, out var name))
             {
-                return RawValuesResult.RequestFailure(MalformedJson);
+                return RawValuesResult.RequestFailure(ApiProblems.MalformedJsonDetail);
             }
 
             var value = property.Value;
@@ -281,7 +276,7 @@ public static class ValuesReader
                     // Kept verbatim: trimming and empty-to-null normalisation are validation rules.
                     if (!TryDecodeString(value, out var text))
                     {
-                        return RawValuesResult.RequestFailure(MalformedJson);
+                        return RawValuesResult.RequestFailure(ApiProblems.MalformedJsonDetail);
                     }
 
                     entries.Add(new(name, FieldValue.FromText(text)));

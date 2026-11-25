@@ -42,6 +42,7 @@ internal sealed class SqlMetadataReader(
     private const string ReadOptionsOperation = "metadata.readOptions";
     private const string ReadCheckCodeOperation = "metadata.readCheckCode";
     private const string ReadTempTableOperation = "metadata.readTempTable";
+    private const string ResolveTablesOperation = "metadata.resolveTables";
 
     // Fixed messages: the redaction policy keeps identifiers, values and SQL out of exception text.
     private const string DataTableNameMessage = "The form metadata does not name exactly one data table.";
@@ -49,6 +50,7 @@ internal sealed class SqlMetadataReader(
     private const string TempTableMissingMessage = "The temporary table was not found.";
     private const string ConnectionNotOpenMessage = "The connection must be open before a temporary table is read.";
     private const string TempTableNameMessage = "A session temporary table name must be non-blank and start with '#'.";
+    private const string NullTableNameMessage = "A requested table name is null.";
 
     private static readonly IReadOnlyList<FieldOption> NoOptions = Array.AsReadOnly(Array.Empty<FieldOption>());
     private static readonly IReadOnlyList<SqlParameterValue> NoParameters =
@@ -408,6 +410,60 @@ internal sealed class SqlMetadataReader(
 
         return await ReadOptionsCoreAsync(connection, transaction, field, tables, cancellationToken)
             .ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Resolves table names against the catalogue alone, on a connection the caller owns: one <c>sys.tables</c> and
+    /// <c>sys.columns</c> read for all of them, with no <c>meta*</c> read. The permission reader uses it to confirm a
+    /// form's own base and page tables before it checks them.
+    /// </summary>
+    /// <param name="connection">An open connection; this method neither opens nor closes it.</param>
+    /// <param name="transaction">The transaction the command joins, or <see langword="null"/>.</param>
+    /// <param name="tableNames">
+    /// The names to resolve, in any letter case. Repeats are read once. No command is sent when the list is empty.
+    /// </param>
+    /// <param name="cancellationToken">The request's abort token.</param>
+    /// <returns>
+    /// One entry per requested name, in request order: the table built from the catalogue, under its catalogue
+    /// spelling, as an exact name match or else the one match ignoring case; or <see langword="null"/> when the
+    /// unqualified name reaches no user table, or reaches several that differ only by case and none exactly.
+    /// </returns>
+    /// <exception cref="ArgumentNullException">
+    /// <paramref name="connection"/> or <paramref name="tableNames"/> is null.
+    /// </exception>
+    /// <exception cref="ArgumentException"><paramref name="tableNames"/> holds a null name.</exception>
+    internal async Task<IReadOnlyList<TableSchema?>> ResolveTablesAsync(
+        SqlConnection connection,
+        SqlTransaction? transaction,
+        IReadOnlyList<string> tableNames,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(connection);
+        ArgumentNullException.ThrowIfNull(tableNames);
+
+        foreach (string name in tableNames)
+        {
+            if (name is null)
+            {
+                throw new ArgumentException(NullTableNameMessage, nameof(tableNames));
+            }
+        }
+
+        IReadOnlyList<TableSchema> tables = await ReadTablesAsync(
+                connection,
+                transaction,
+                tableNames,
+                ResolveTablesOperation,
+                cancellationToken)
+            .ConfigureAwait(false);
+
+        var resolved = new TableSchema?[tableNames.Count];
+        for (int index = 0; index < resolved.Length; index++)
+        {
+            resolved[index] = MatchTable(tables, tableNames[index]);
+        }
+
+        return Array.AsReadOnly(resolved);
     }
 
     /// <summary>

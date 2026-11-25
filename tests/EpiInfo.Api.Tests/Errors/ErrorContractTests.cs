@@ -1,5 +1,7 @@
+using System.Diagnostics;
 using System.Globalization;
 using System.Net;
+using System.Text;
 using System.Text.Json;
 using EpiInfo.Api.Endpoints;
 using EpiInfo.Api.Errors;
@@ -12,8 +14,10 @@ using EpiInfo.Domain.Records;
 using EpiInfo.Domain.Storage;
 using EpiInfo.Domain.Values;
 using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Diagnostics;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Http.Features;
+using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Routing;
 using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.DependencyInjection;
@@ -22,6 +26,613 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace EpiInfo.Api.Tests.Errors;
+
+/// <summary>
+/// The error contract of AAP 0.3.4.2: every error response under <c>/api</c> is a ProblemDetails with exactly
+/// <c>type</c>, <c>title</c>, <c>status</c>, <c>detail</c> and <c>traceId</c>, and a 500's <c>detail</c> is the fixed
+/// generic sentence plus that <c>traceId</c>.
+/// </summary>
+/// <remarks>
+/// <para>
+/// Empty error responses produced inside the pipeline, the route miss 404 and the 405, are requested with no
+/// <c>Accept</c> header and with <c>Accept</c> values that admit no JSON type, which the framework's default
+/// ProblemDetails writer declines. Every HTTP case runs in the Production and the Development environment.
+/// </para>
+/// <para>
+/// No case needs a database: each HTTP case starts its own <see cref="ApiFactory"/> with no connection string, and the
+/// 500 and 503 cases execute the <see cref="ApiProblems"/> writers on a <see cref="DefaultHttpContext"/>. The class
+/// carries no <c>Integration</c> trait, joins no database collection and takes no <c>DatabaseWriteLock</c>.
+/// Assertion messages are fixed texts that never quote a response body.
+/// </para>
+/// </remarks>
+public sealed class ErrorContractTests
+{
+    private const string ProblemMediaType = "application/problem+json";
+
+    private const string NotFoundType = "https://tools.ietf.org/html/rfc9110#section-15.5.5";
+
+    private const string MethodNotAllowedType = "https://tools.ietf.org/html/rfc9110#section-15.5.6";
+
+    private const string CustomizePath = "Customize";
+
+    private const string StatusCodePagePath = "StatusCodePage";
+
+    private const string UnavailableSource = "Unavailable";
+
+    private const string UnavailableWriteSource = "UnavailableWrite";
+
+    // The 500 detail written out here rather than read from ApiProblems, so a change to the product's text fails
+    // these cases: one fixed sentence, then the label that introduces the body's traceId.
+    private const string ExpectedUnexpectedSentence = "An unexpected error occurred.";
+
+    private const string ExpectedTraceIdLabel = " Trace id: ";
+
+    // The members of every plain ProblemDetails the API writes, in ordinal order.
+    private static readonly string[] ProblemMembers = ["detail", "status", "title", "traceId", "type"];
+
+    // Accept values that admit neither application/json nor application/problem+json, so the framework's default
+    // ProblemDetails writer declines them; the last is a browser navigation without a */* entry.
+    private static readonly string[] NonJsonAcceptHeaders =
+    [
+        "text/html",
+        "text/plain",
+        "application/xml",
+        "text/html,application/xhtml+xml;q=0.9",
+    ];
+
+    /// <summary>The hosting environments every HTTP case runs in.</summary>
+    public static TheoryData<string> Environments => new() { "Production", "Development" };
+
+    /// <summary>
+    /// Each environment with no <c>Accept</c> header (<see langword="null"/>) and with each non-JSON value.
+    /// </summary>
+    public static TheoryData<string, string?> EnvironmentsAndAcceptHeaders
+    {
+        get
+        {
+            var data = new TheoryData<string, string?>();
+            foreach (string environment in EnvironmentNames)
+            {
+                data.Add(environment, null);
+                foreach (string accept in NonJsonAcceptHeaders)
+                {
+                    data.Add(environment, accept);
+                }
+            }
+
+            return data;
+        }
+    }
+
+    /// <summary>Each environment with each non-JSON <c>Accept</c> value.</summary>
+    public static TheoryData<string, string> EnvironmentsAndNonJsonAcceptHeaders
+    {
+        get
+        {
+            var data = new TheoryData<string, string>();
+            foreach (string environment in EnvironmentNames)
+            {
+                foreach (string accept in NonJsonAcceptHeaders)
+                {
+                    data.Add(environment, accept);
+                }
+            }
+
+            return data;
+        }
+    }
+
+    /// <summary>
+    /// A method the client fallback does not allow on each of its two routes, the root and a client route, in each
+    /// environment, with no <c>Accept</c> header (<see langword="null"/>) and with each non-JSON value.
+    /// </summary>
+    public static TheoryData<string, string, string, string?> WrongMethodCases
+    {
+        get
+        {
+            (string Method, string Path)[] requests = [("POST", "/client/route"), ("PUT", "/")];
+            var data = new TheoryData<string, string, string, string?>();
+            foreach (string environment in EnvironmentNames)
+            {
+                foreach ((string method, string path) in requests)
+                {
+                    data.Add(environment, method, path, null);
+                    foreach (string accept in NonJsonAcceptHeaders)
+                    {
+                        data.Add(environment, method, path, accept);
+                    }
+                }
+            }
+
+            return data;
+        }
+    }
+
+    /// <summary>
+    /// The generic 500 results, <see cref="ApiProblems.Unexpected"/> (<see langword="null"/> outcome) and
+    /// <see cref="ApiProblems.UnexpectedWrite"/> for each outcome, written with and without a current activity.
+    /// </summary>
+    public static TheoryData<WriteOutcome?, bool> UnexpectedResults
+    {
+        get
+        {
+            var data = new TheoryData<WriteOutcome?, bool> { { null, false }, { null, true } };
+            foreach (WriteOutcome outcome in Enum.GetValues<WriteOutcome>())
+            {
+                data.Add(outcome, false);
+                data.Add(outcome, true);
+            }
+
+            return data;
+        }
+    }
+
+    /// <summary>
+    /// The two bodies built from a status alone, a framework body shaped by <see cref="ApiProblems.Customize"/> and a
+    /// status-code page, for 500 and another generic 5xx, with and without a current activity.
+    /// </summary>
+    public static TheoryData<string, int, bool> StatusOnlyServerErrors
+    {
+        get
+        {
+            int[] statuses = [StatusCodes.Status500InternalServerError, StatusCodes.Status502BadGateway];
+            var data = new TheoryData<string, int, bool>();
+            foreach (string path in new[] { CustomizePath, StatusCodePagePath })
+            {
+                foreach (int status in statuses)
+                {
+                    data.Add(path, status, false);
+                    data.Add(path, status, true);
+                }
+            }
+
+            return data;
+        }
+    }
+
+    /// <summary>Every writer of a 503 body.</summary>
+    public static TheoryData<string> UnavailableSources =>
+        new() { UnavailableSource, UnavailableWriteSource, CustomizePath, StatusCodePagePath };
+
+    /// <summary>
+    /// Client-error statuses a status-code page can answer, including the routing 415 no mapped route produces yet,
+    /// with the fixed detail of each; any other 4xx is the generic invalid-request text.
+    /// </summary>
+    public static TheoryData<int, string> StatusCodePageClientErrors => new()
+    {
+        { StatusCodes.Status400BadRequest, ApiProblems.InvalidRequestDetail },
+        { StatusCodes.Status404NotFound, ApiProblems.ResourceNotFoundDetail },
+        { StatusCodes.Status405MethodNotAllowed, ApiProblems.MethodNotAllowedDetail },
+        { StatusCodes.Status413PayloadTooLarge, ApiProblems.RequestTooLargeDetail },
+        { StatusCodes.Status415UnsupportedMediaType, ApiProblems.UnsupportedMediaTypeDetail },
+        { StatusCodes.Status418ImATeapot, ApiProblems.InvalidRequestDetail },
+    };
+
+    /// <summary>A status the page never answers, and an error status of a request the client aborted.</summary>
+    public static TheoryData<int, bool> StatusCodePagesThatWriteNothing => new()
+    {
+        { StatusCodes.Status200OK, false },
+        { StatusCodes.Status404NotFound, true },
+    };
+
+    // TheoryData implements more than one IEnumerable<T>, so LINQ is pointed at its object[] rows.
+    private static IEnumerable<string> EnvironmentNames =>
+        ((IEnumerable<object[]>)Environments).Select(row => (string)row[0]);
+
+    // AAP 0.3.4.2: a route miss is a 404 ProblemDetails whatever the Accept header; the framework's default writer
+    // declines a non-JSON Accept and would leave text/plain without traceId. The client is deliberately absent
+    // (AbsentClientFolder).
+    [Theory]
+    [MemberData(nameof(EnvironmentsAndAcceptHeaders))]
+    public async Task RouteMissIsProblemDetailsWhateverTheAcceptHeader(string environment, string? accept)
+    {
+        await using ApiFactory factory = CreateFactory(environment, AbsentClientFolder());
+        using HttpClient client = factory.CreateClient();
+        using var request = new HttpRequestMessage(HttpMethod.Get, "/api/nope");
+        AddAccept(request, accept);
+
+        using HttpResponseMessage response = await client.SendAsync(request);
+
+        await AssertFixedProblemAsync(
+            response,
+            HttpStatusCode.NotFound,
+            NotFoundType,
+            "Not Found",
+            ApiProblems.ResourceNotFoundDetail);
+    }
+
+    // AAP 0.7.6: a text/plain POST to an unknown /api route is the route miss, never a 415, and with a non-JSON Accept
+    // it is still the 404 ProblemDetails. The client is deliberately absent (AbsentClientFolder).
+    [Theory]
+    [MemberData(nameof(EnvironmentsAndNonJsonAcceptHeaders))]
+    public async Task TextPlainPostToUnknownApiRouteIsNotFound(string environment, string accept)
+    {
+        await using ApiFactory factory = CreateFactory(environment, AbsentClientFolder());
+        using HttpClient client = factory.CreateClient();
+        using var request = new HttpRequestMessage(HttpMethod.Post, "/api/nope")
+        {
+            Content = new StringContent("plain text, not JSON", Encoding.UTF8, "text/plain"),
+        };
+        AddAccept(request, accept);
+
+        using HttpResponseMessage response = await client.SendAsync(request);
+
+        await AssertFixedProblemAsync(
+            response,
+            HttpStatusCode.NotFound,
+            NotFoundType,
+            "Not Found",
+            ApiProblems.ResourceNotFoundDetail);
+    }
+
+    // AAP 0.3.4.2 and 0.3.4.7: a method mismatch stays a 405, becomes the 405 ProblemDetails whatever the Accept
+    // header, and keeps the Allow header routing set. The client fallback (GET and HEAD) is the route used, mapped from
+    // a temporary client folder.
+    [Theory]
+    [MemberData(nameof(WrongMethodCases))]
+    public async Task WrongMethodIsProblemDetailsAndKeepsAllow(
+        string environment,
+        string method,
+        string path,
+        string? accept)
+    {
+        DirectoryInfo clientFolder = Directory.CreateTempSubdirectory("epiinfo-error-contract-");
+        try
+        {
+            await File.WriteAllTextAsync(
+                Path.Combine(clientFolder.FullName, ClientAppHosting.IndexFileName),
+                "<!doctype html><title>client</title>");
+
+            await using ApiFactory factory = CreateFactory(environment, clientFolder.FullName);
+            using HttpClient client = factory.CreateClient();
+            using var request = new HttpRequestMessage(new HttpMethod(method), path);
+            AddAccept(request, accept);
+
+            using HttpResponseMessage response = await client.SendAsync(request);
+
+            await AssertFixedProblemAsync(
+                response,
+                HttpStatusCode.MethodNotAllowed,
+                MethodNotAllowedType,
+                "Method Not Allowed",
+                ApiProblems.MethodNotAllowedDetail);
+
+            ICollection<string> allow = response.Content.Headers.Allow;
+            Assert.True(
+                allow.Contains(HttpMethods.Get) && allow.Contains(HttpMethods.Head),
+                "The 405 lost the Allow header listing GET and HEAD.");
+        }
+        finally
+        {
+            clientFolder.Delete(recursive: true);
+        }
+    }
+
+    // AAP 0.3.4.2: the 500 detail is the fixed generic sentence plus the traceId the same body carries, which is the
+    // current activity's id when there is one and the request's trace identifier otherwise.
+    [Theory]
+    [MemberData(nameof(UnexpectedResults))]
+    public async Task UnexpectedResultsQuoteTheirTraceIdInDetail(WriteOutcome? outcome, bool withActivity)
+    {
+        using Activity? activity = StartActivity(withActivity);
+        IResult result = outcome is { } written ? ApiProblems.UnexpectedWrite(written) : ApiProblems.Unexpected();
+        (DefaultHttpContext context, MemoryStream body) = NewContext();
+
+        await result.ExecuteAsync(context);
+
+        Assert.Equal(StatusCodes.Status500InternalServerError, context.Response.StatusCode);
+        Assert.Equal(ProblemMediaType, context.Response.ContentType);
+        JsonElement problem = ApiTestClient.AssertProblemDetails(Parse(body), StatusCodes.Status500InternalServerError);
+        string? traceId = StringMember(problem, ApiProblems.TraceIdKey);
+        AssertTraceId(traceId, activity, context);
+        AssertUnexpectedDetail(StringMember(problem, "detail"), traceId);
+
+        if (outcome is { } expected)
+        {
+            Assert.True(
+                string.Equals(expected.ToWireValue(), StringMember(problem, "writeOutcome"), StringComparison.Ordinal),
+                "The write 500 does not carry its writeOutcome.");
+        }
+        else
+        {
+            Assert.False(problem.TryGetProperty("writeOutcome", out _), "A non-write 500 carries writeOutcome.");
+        }
+    }
+
+    // A result written again rebuilds its detail from the constant and the trace id of the request it is written to,
+    // never keeping the first request's trace id.
+    [Fact]
+    public async Task UnexpectedResultWrittenTwiceQuotesEachRequestsTraceId()
+    {
+        Activity.Current = null;
+        IResult result = ApiProblems.Unexpected();
+        string[] traceIds = ["first-request", "second-request"];
+
+        foreach (string traceId in traceIds)
+        {
+            (DefaultHttpContext context, MemoryStream body) = NewContext();
+            context.TraceIdentifier = traceId;
+
+            await result.ExecuteAsync(context);
+
+            JsonElement problem = Parse(body);
+            Assert.True(
+                string.Equals(traceId, StringMember(problem, ApiProblems.TraceIdKey), StringComparison.Ordinal),
+                "The traceId member is not the trace identifier of the request written to.");
+            AssertUnexpectedDetail(StringMember(problem, "detail"), traceId);
+        }
+    }
+
+    // AAP 0.3.4.2: the framework and status-code page paths give a generic 5xx the same correlated detail as the
+    // factories.
+    [Theory]
+    [MemberData(nameof(StatusOnlyServerErrors))]
+    public async Task StatusOnlyServerErrorsQuoteTheirTraceIdInDetail(string path, int status, bool withActivity)
+    {
+        using Activity? activity = StartActivity(withActivity);
+        (DefaultHttpContext context, MemoryStream body) = NewContext();
+
+        (string? detail, string? traceId) = await ProduceStatusOnlyProblemAsync(path, status, context, body);
+
+        AssertTraceId(traceId, activity, context);
+        AssertUnexpectedDetail(detail, traceId);
+    }
+
+    // AAP 0.3.4.2: a 503 keeps its fixed unavailable text; only the generic 500 detail carries the trace id.
+    [Theory]
+    [MemberData(nameof(UnavailableSources))]
+    public async Task UnavailableBodiesKeepTheFixedDetail(string source)
+    {
+        Activity.Current = null;
+        (DefaultHttpContext context, MemoryStream body) = NewContext();
+
+        string? detail;
+        string? traceId;
+        switch (source)
+        {
+            case UnavailableSource:
+            case UnavailableWriteSource:
+                IResult result = source == UnavailableSource
+                    ? ApiProblems.Unavailable()
+                    : ApiProblems.UnavailableWrite(WriteOutcome.NotWritten);
+                await result.ExecuteAsync(context);
+                Assert.Equal(StatusCodes.Status503ServiceUnavailable, context.Response.StatusCode);
+                JsonElement problem = ApiTestClient.AssertProblemDetails(
+                    Parse(body),
+                    StatusCodes.Status503ServiceUnavailable);
+                detail = StringMember(problem, "detail");
+                traceId = StringMember(problem, ApiProblems.TraceIdKey);
+                break;
+
+            default:
+                (detail, traceId) = await ProduceStatusOnlyProblemAsync(
+                    source,
+                    StatusCodes.Status503ServiceUnavailable,
+                    context,
+                    body);
+                break;
+        }
+
+        AssertTraceId(traceId, activity: null, context);
+        Assert.True(
+            string.Equals(ApiProblems.UnavailableDetail, detail, StringComparison.Ordinal),
+            "The 503 detail is not the fixed unavailable text.");
+    }
+
+    // AAP 0.3.4.2: a status-code page is the fixed ProblemDetails of its status, as application/problem+json, and
+    // leaves the headers routing set, such as a 405's Allow, as they were.
+    [Theory]
+    [MemberData(nameof(StatusCodePageClientErrors))]
+    public async Task StatusCodePagesWriteTheFixedTextOfTheirStatus(int status, string detail)
+    {
+        (DefaultHttpContext context, MemoryStream body) = NewContext();
+        context.Response.StatusCode = status;
+        context.Response.Headers.Allow = "GET, HEAD";
+
+        await ApiProblems.WriteStatusCodePageAsync(
+            new StatusCodeContext(context, new StatusCodePagesOptions(), _ => Task.CompletedTask));
+
+        Assert.Equal(status, context.Response.StatusCode);
+        Assert.Equal(ProblemMediaType, context.Response.ContentType);
+        Assert.True(
+            string.Equals("GET, HEAD", context.Response.Headers.Allow, StringComparison.Ordinal),
+            "The status-code page changed a header it does not own.");
+        JsonElement problem = ApiTestClient.AssertProblemDetails(Parse(body), status);
+        Assert.True(
+            ProblemMembers.SequenceEqual(
+                problem.EnumerateObject().Select(member => member.Name).Order(StringComparer.Ordinal),
+                StringComparer.Ordinal),
+            "The status-code page does not hold exactly type, title, status, detail and traceId.");
+        Assert.True(
+            string.Equals(detail, StringMember(problem, "detail"), StringComparison.Ordinal),
+            "The status-code page's detail is not the fixed text of its status.");
+        AssertTraceId(StringMember(problem, ApiProblems.TraceIdKey), Activity.Current, context);
+    }
+
+    // A status outside 400 to 599 gets no page, and a client that aborted the request receives no body.
+    [Theory]
+    [MemberData(nameof(StatusCodePagesThatWriteNothing))]
+    public async Task StatusCodePageWritesNothingOutsideAnErrorOrAfterAbort(int status, bool aborted)
+    {
+        (DefaultHttpContext context, MemoryStream body) = NewContext();
+        using var abort = new CancellationTokenSource();
+        if (aborted)
+        {
+            await abort.CancelAsync();
+        }
+
+        context.RequestAborted = abort.Token;
+        context.Response.StatusCode = status;
+
+        await ApiProblems.WriteStatusCodePageAsync(
+            new StatusCodeContext(context, new StatusCodePagesOptions(), _ => Task.CompletedTask));
+
+        Assert.Equal(status, context.Response.StatusCode);
+        Assert.Null(context.Response.ContentType);
+        Assert.Equal(0, body.Length);
+    }
+
+    // Every case names its client folder, so none falls back to the committed default (the repository's web/dist),
+    // whose presence depends on whether the client was built.
+    private static ApiFactory CreateFactory(string environment, string clientFolder) =>
+        new(new ApiFactoryOptions
+        {
+            EnvironmentName = environment,
+            ConnectionMode = ApiConnectionMode.None,
+            ExtraSettings = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
+            {
+                [ApiOptions.ClientPathKey] = clientFolder,
+            },
+        });
+
+    // A client folder that does not exist and is never created, so the host serves no client and maps no client
+    // fallback. The /api miss cases select it so they do not depend on a built web/dist: with the client served, an
+    // /api miss stays a 404 only once the API's own /api routes are mapped.
+    private static string AbsentClientFolder() =>
+        Path.Combine(Path.GetTempPath(), "epiinfo-absent-client-" + Guid.NewGuid().ToString("N"));
+
+    private static void AddAccept(HttpRequestMessage request, string? accept)
+    {
+        if (accept is not null)
+        {
+            Assert.True(request.Headers.TryAddWithoutValidation("Accept", accept), "The Accept header was not added.");
+        }
+    }
+
+    private static async Task AssertFixedProblemAsync(
+        HttpResponseMessage response,
+        HttpStatusCode status,
+        string type,
+        string title,
+        string detail)
+    {
+        Assert.Equal(status, response.StatusCode);
+        Assert.True(
+            string.Equals(ProblemMediaType, response.Content.Headers.ContentType?.MediaType, StringComparison.Ordinal),
+            "The error response is not application/problem+json.");
+
+        JsonElement body = ApiTestClient.AssertProblemDetails(
+            await ApiTestClient.ReadJsonElementAsync(response),
+            (int)status);
+
+        Assert.True(
+            ProblemMembers.SequenceEqual(
+                body.EnumerateObject().Select(member => member.Name).Order(StringComparer.Ordinal),
+                StringComparer.Ordinal),
+            "The error body does not hold exactly type, title, status, detail and traceId.");
+        Assert.True(
+            string.Equals(type, StringMember(body, "type"), StringComparison.Ordinal),
+            "The error body's type is not the status default.");
+        Assert.True(
+            string.Equals(title, StringMember(body, "title"), StringComparison.Ordinal),
+            "The error body's title is not the status default.");
+        Assert.True(
+            string.Equals(detail, StringMember(body, "detail"), StringComparison.Ordinal),
+            "The error body's detail is not the fixed text of its status.");
+    }
+
+    // The detail and trace id a status-only path produces: a framework body shaped by Customize, which writes nothing,
+    // or the status-code page written to an empty response.
+    private static async Task<(string? Detail, string? TraceId)> ProduceStatusOnlyProblemAsync(
+        string path,
+        int status,
+        DefaultHttpContext context,
+        MemoryStream body)
+    {
+        switch (path)
+        {
+            case CustomizePath:
+                var problemContext = new ProblemDetailsContext
+                {
+                    HttpContext = context,
+                    ProblemDetails = new ProblemDetails { Status = status },
+                };
+                ApiProblems.Customize(problemContext);
+                Assert.Equal(status, problemContext.ProblemDetails.Status);
+                return (
+                    problemContext.ProblemDetails.Detail,
+                    problemContext.ProblemDetails.Extensions.TryGetValue(ApiProblems.TraceIdKey, out object? traceId)
+                        ? traceId as string
+                        : null);
+
+            case StatusCodePagePath:
+                context.Response.StatusCode = status;
+                await ApiProblems.WriteStatusCodePageAsync(
+                    new StatusCodeContext(context, new StatusCodePagesOptions(), _ => Task.CompletedTask));
+                Assert.Equal(status, context.Response.StatusCode);
+                Assert.Equal(ProblemMediaType, context.Response.ContentType);
+                JsonElement problem = ApiTestClient.AssertProblemDetails(Parse(body), status);
+                return (StringMember(problem, "detail"), StringMember(problem, ApiProblems.TraceIdKey));
+
+            default:
+                throw new ArgumentOutOfRangeException(nameof(path), path, "Unknown status-only path.");
+        }
+    }
+
+    // The no-activity cases clear any ambient activity, so the request's trace identifier is the expected trace id.
+    private static Activity? StartActivity(bool withActivity)
+    {
+        if (!withActivity)
+        {
+            Activity.Current = null;
+            return null;
+        }
+
+        return new Activity(nameof(ErrorContractTests)).Start();
+    }
+
+    private static void AssertTraceId(string? traceId, Activity? activity, HttpContext context)
+    {
+        string expected = activity?.Id ?? context.TraceIdentifier;
+        Assert.False(string.IsNullOrWhiteSpace(expected), "The expected trace id is blank.");
+        Assert.True(
+            string.Equals(expected, traceId, StringComparison.Ordinal),
+            activity is null
+                ? "The traceId member is not the request's trace identifier."
+                : "The traceId member is not the current activity's id.");
+    }
+
+    private static void AssertUnexpectedDetail(string? detail, string? traceId)
+    {
+        Assert.False(string.IsNullOrWhiteSpace(traceId), "The 500 body has no traceId.");
+        Assert.True(
+            string.Equals(ExpectedUnexpectedSentence, ApiProblems.UnexpectedDetail, StringComparison.Ordinal),
+            "The generic 500 text is not the one fixed sentence.");
+        Assert.True(
+            string.Equals(
+                string.Concat(ExpectedUnexpectedSentence, ExpectedTraceIdLabel, traceId),
+                detail,
+                StringComparison.Ordinal),
+            "The 500 detail is not the fixed sentence followed by the body's traceId.");
+        Assert.True(
+            string.Equals(ApiProblems.UnexpectedDetailFor(traceId), detail, StringComparison.Ordinal),
+            "The 500 detail is not the generic sentence plus the body's traceId.");
+        Assert.True(
+            detail is not null && detail.StartsWith(ApiProblems.UnexpectedDetail, StringComparison.Ordinal),
+            "The 500 detail does not open with the generic sentence.");
+    }
+
+    private static (DefaultHttpContext Context, MemoryStream Body) NewContext()
+    {
+        var body = new MemoryStream();
+        var context = new DefaultHttpContext();
+        context.Response.Body = body;
+        return (context, body);
+    }
+
+    private static JsonElement Parse(MemoryStream body)
+    {
+        using JsonDocument document = JsonDocument.Parse(body.ToArray());
+        return document.RootElement.Clone();
+    }
+
+    private static string? StringMember(JsonElement body, string name) =>
+        body.ValueKind == JsonValueKind.Object
+        && body.TryGetProperty(name, out JsonElement value)
+        && value.ValueKind == JsonValueKind.String
+            ? value.GetString()
+            : null;
+}
 
 /// <summary>
 /// The write-outcome bookkeeping of the three record writes (AAP 0.3.4.2, 0.3.4.6), proved over HTTP through the real

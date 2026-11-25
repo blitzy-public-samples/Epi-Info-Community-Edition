@@ -25,7 +25,12 @@ const webDir = fileURLToPath(new URL('..', import.meta.url));
 const repoRoot = path.resolve(webDir, '..');
 const apiDir = path.join(repoRoot, 'src', 'EpiInfo.Api');
 const apiProject = path.join(apiDir, 'EpiInfo.Api.csproj');
-const openApiCacheMarker = path.join(apiDir, 'obj', 'EpiInfo.Api.OpenApiFiles.cache');
+// The OpenAPI target's incremental marker, its _OpenApiDocumentsCache. Each run pins it into the run's own temporary
+// directory (see generateFresh), so no marker another build owns is read or deleted. The default layout's obj/ marker,
+// which a build without the pin writes, is a leftover that is removed only inside the checkout (see
+// removeObjLeftoverMarker).
+const openApiCacheMarkerName = 'EpiInfo.Api.OpenApiFiles.cache';
+const defaultOpenApiCacheMarker = path.join(apiDir, 'obj', openApiCacheMarkerName);
 const openapiTsPackageJson = path.join(webDir, 'node_modules', 'openapi-typescript', 'package.json');
 
 // The default v1 document is named after the project; the generated client is written beside it.
@@ -49,9 +54,12 @@ export class GenerationError extends Error {
 
 /**
  * Builds the API with document generation forced on, then runs openapi-typescript on the result, all inside a new
- * temporary directory. Returns { json, ts, dir }: the fresh document, the fresh client types and the directory that
- * holds them, which the caller removes with removeFresh(dir). Until then the run holds the checkout's generation lock,
- * which every other run of this checkout waits for. A failed run removes the directory and releases the lock itself.
+ * temporary directory. Generation is forced by pinning the OpenAPI target's incremental marker into that directory, so
+ * the target finds its output missing and runs in every build layout; the only marker deleted is a regular-file
+ * leftover in the checkout's own src/EpiInfo.Api/obj/. Returns { json, ts, dir }: the fresh document, the fresh client
+ * types and the directory that holds them, which the caller removes with removeFresh(dir), marker included. Until then
+ * the run holds the checkout's generation lock, which every other run of this checkout waits for. A failed run removes
+ * the directory and releases the lock itself.
  */
 export async function generateFresh() {
   // Every checkout and temporary path a later step hands to a shell or reads as a URL is checked first (see
@@ -92,18 +100,27 @@ export async function generateFresh() {
 
   const dir = await fs.mkdtemp(path.join(tempRoot, 'epiinfo-openapi-'));
   try {
-    // Runs of one checkout share the API's obj/ and bin/ outputs and the marker below, so a run whose build found the
-    // marker already recreated by another run would skip generation and leave its directory empty. Each run holds the
-    // checkout's generation lock from here until removeFresh(dir), which also covers the caller's publication or
-    // comparison of the committed pair. Every dotnet process that writes those outputs is started with the lock, which
-    // records it, so a run killed while its build goes on leaves a lock that stays until the build ends.
+    // Runs of one checkout share the API's obj/ and bin/ outputs, so concurrent builds would write the same files and
+    // the generator could read an assembly another build is still writing. Each run holds the checkout's generation
+    // lock from here until removeFresh(dir), which also covers the caller's publication or comparison of the committed
+    // pair. Every dotnet process that writes those outputs is started with the lock, which records it, so a run killed
+    // while its build goes on leaves a lock that stays until the build ends.
     const lock = await acquireGenerationLock(dir);
 
+    // The generator target is incremental on its marker, _OpenApiDocumentsCache: while that file is newer than the
+    // assembly, an up-to-date tree neither regenerates the document nor writes it to a new directory. The targets
+    // place it in BaseIntermediateOutputPath, which a redirected or shared intermediate directory can move to where
+    // other builds keep theirs. As a global property the marker is pinned into this run's new directory instead, which
+    // no assignment in the targets or an imported file overrides (the evaluation below confirms it), so the target
+    // finds its output missing and runs in every layout, no other build's marker is read or touched, and
+    // removeFresh(dir) removes it with the directory.
+    const cacheMarker = path.join(dir, openApiCacheMarkerName);
     // The restore, the evaluation and the build get the same global properties, so all three see the same project.
     // cwd is the repository root so the SDK resolves the root global.json.
     const buildProperties = [
       '-p:OpenApiGenerateDocumentsOnBuild=true',
       `-p:OpenApiDocumentsDirectory=${escapeMsbuildPropertyValue(dir)}`,
+      `-p:_OpenApiDocumentsCache=${escapeMsbuildPropertyValue(cacheMarker)}`,
     ];
     // The generator command is built from evaluated MSBuild properties, which are read back and checked before the
     // build can run it. Their evaluation needs the restore's package imports, and the restore writes the shared obj/,
@@ -116,11 +133,11 @@ export async function generateFresh() {
       dotnetStartFailure,
       { lock },
     );
-    await assertGeneratorCommandInputs(checkoutProject, buildProperties, checkout, dir, lock);
+    await assertGeneratorCommandInputs(checkoutProject, buildProperties, checkout, dir, cacheMarker, lock);
 
-    // The generator target is incremental on this marker: while it exists, an up-to-date tree neither regenerates
-    // the document nor writes it to a new directory. Removing it forces a run whose output is byte-identical.
-    await fs.rm(openApiCacheMarker, { force: true });
+    // The marker an earlier build without the pin left in the default layout's obj/ no longer decides anything, so it
+    // is removed only where it is certainly this checkout's own; anything else there is left untouched.
+    await removeObjLeftoverMarker(checkout);
 
     // The build's own restore finds nothing left to do, and the build recompiles first when sources changed, so the
     // generator never reads a stale assembly.
@@ -138,6 +155,16 @@ export async function generateFresh() {
       const found = await fs.readdir(dir);
       throw new GenerationError(
         `OpenAPI generation produced no ${documentFileName} in ${dir}; found: ${found.length > 0 ? found.join(', ') : 'nothing'}`,
+      );
+    }
+    // The generator writes its file list to the marker the target passes it, so a document without the pinned marker
+    // means the installed package no longer takes its marker from _OpenApiDocumentsCache, and a warm run would skip on
+    // a marker outside this directory.
+    if (!(await isFile(cacheMarker))) {
+      throw new GenerationError(
+        `OpenAPI generation wrote no cache marker ${openApiCacheMarkerName} in ${dir}, so the installed ` +
+          'Microsoft.Extensions.ApiDescription.Server no longer reads its marker from _OpenApiDocumentsCache and ' +
+          'generation cannot be forced; check the package version against Directory.Packages.props',
       );
     }
 
@@ -849,9 +876,14 @@ const evaluatedPropertySource =
 
 // Evaluates the API project with the build's own global properties, after the restore that writes the package imports
 // defining NuGetPackageRoot (an evaluation never restores), and refuses every value the generator command could not
-// carry as plain text, before the build runs that command.
-async function assertGeneratorCommandInputs(project, buildProperties, cwd, dir, lock) {
-  const names = [...quotedGeneratorProperties, 'NuGetPackageFolders', 'OpenApiGenerateDocumentsOptions'];
+// carry as plain text, and a cache marker other than the one pinned in marker, before the build runs that command.
+async function assertGeneratorCommandInputs(project, buildProperties, cwd, dir, marker, lock) {
+  const names = [
+    ...quotedGeneratorProperties,
+    'NuGetPackageFolders',
+    'OpenApiGenerateDocumentsOptions',
+    'MSBuildProjectDirectory',
+  ];
   const description = `dotnet msbuild ${toRepoRelative(apiProject)} -getProperty`;
   const output = await runChecked(
     'dotnet',
@@ -895,6 +927,78 @@ async function assertGeneratorCommandInputs(project, buildProperties, cwd, dir, 
   for (const folder of properties.NuGetPackageFolders.split(';')) {
     if (folder !== '') {
       assertEvaluatedProperty('NuGetPackageFolders entry', folder);
+    }
+  }
+  assertPinnedCacheMarker(properties, marker, description);
+}
+
+// Checks that the generator target's cache marker is the one generateFresh pins with -p:_OpenApiDocumentsCache. The
+// target resolves the property, like any path, from the project directory, and on POSIX MSBuild reads a '\' in a path
+// as '/', so the value is compared as the path MSBuild resolves, never as text. A global property wins over every
+// assignment unless the project declares it local (TreatAsLocalProperty), in which case the build would skip on, and
+// write, a marker outside the run's directory.
+function assertPinnedCacheMarker(properties, marker, description) {
+  const projectDir = properties.MSBuildProjectDirectory;
+  const configured = properties._OpenApiDocumentsCache;
+  if (!path.isAbsolute(projectDir)) {
+    throw new GenerationError(
+      `${description} read MSBuildProjectDirectory as ${JSON.stringify(projectDir)}, which is not absolute, so the ` +
+        "OpenAPI generator's cache marker cannot be located",
+    );
+  }
+  const resolved = path.resolve(
+    projectDir,
+    process.platform === 'win32' ? configured : configured.replaceAll('\\', '/'),
+  );
+  if (resolved !== marker) {
+    throw new GenerationError(
+      `the evaluated MSBuild property _OpenApiDocumentsCache ${JSON.stringify(configured)} names ` +
+        `${JSON.stringify(resolved)}, not ${JSON.stringify(marker)}, the cache marker this run pins into its own ` +
+        "directory so that the OpenAPI generator's build step always runs; the project or an imported file declares " +
+        'it a local property (TreatAsLocalProperty), so remove that declaration',
+    );
+  }
+}
+
+// Removes src/EpiInfo.Api/obj/EpiInfo.Api.OpenApiFiles.cache, the marker a build without the pin in generateFresh
+// writes in the default layout. Generation no longer depends on it, so it is deleted only when it is certainly this
+// checkout's own leftover: a regular file in a directory that, symbolic links resolved, lies inside the checkout (the
+// canonical path generateFresh passes in). A missing directory or file, a directory that resolves elsewhere, such as a
+// symlinked or shared obj/, and anything other than a regular file are left untouched, and the run goes on.
+async function removeObjLeftoverMarker(checkout) {
+  const objDir = path.join(checkout, path.relative(repoRoot, path.dirname(defaultOpenApiCacheMarker)));
+  let canonicalObjDir;
+  try {
+    canonicalObjDir = await fs.realpath(objDir);
+  } catch (error) {
+    if (error.code === 'ENOENT' || error.code === 'ENOTDIR') {
+      return;
+    }
+    throw new GenerationError(`could not resolve ${JSON.stringify(objDir)} (${errorMessage(error)})`);
+  }
+  const fromCheckout = path.relative(checkout, canonicalObjDir);
+  if (fromCheckout === '..' || fromCheckout.startsWith(`..${path.sep}`) || path.isAbsolute(fromCheckout)) {
+    return;
+  }
+  // The file is examined and removed through the resolved directory the check above accepted.
+  const leftover = path.join(canonicalObjDir, openApiCacheMarkerName);
+  let stats;
+  try {
+    stats = await fs.lstat(leftover);
+  } catch (error) {
+    if (error.code === 'ENOENT' || error.code === 'ENOTDIR') {
+      return;
+    }
+    throw new GenerationError(`could not examine ${JSON.stringify(leftover)} (${errorMessage(error)})`);
+  }
+  if (!stats.isFile()) {
+    return;
+  }
+  try {
+    await fs.unlink(leftover);
+  } catch (error) {
+    if (error.code !== 'ENOENT') {
+      throw new GenerationError(`could not delete ${JSON.stringify(leftover)} (${errorMessage(error)})`);
     }
   }
 }
