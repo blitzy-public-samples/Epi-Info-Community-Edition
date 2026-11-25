@@ -959,7 +959,14 @@ internal static class RecordSqlBuilder
     private static TableSchema RequireTable(PageTableSchema page) =>
         page.Table ?? throw new ArgumentException(PageWithoutTableMessage, nameof(page));
 
-    private static ColumnSchema RequirePageKey(TableSchema table) =>
+    /// <summary>
+    /// Returns a page table's record key column, the reader-built <c>GlobalRecordId</c> that joins it to the base
+    /// table. Record reads, record writes and <c>SearchSqlBuilder</c> all find the key here.
+    /// </summary>
+    /// <param name="table">The page table from <see cref="PageTableSchema.Table"/>.</param>
+    /// <returns>The key column with its catalogue spelling.</returns>
+    /// <exception cref="InvalidOperationException">The page table lacks its record key column.</exception>
+    internal static ColumnSchema RequirePageKey(TableSchema table) =>
         table.FindColumn(PageKeyColumnName) ?? throw new InvalidOperationException(MissingPageKeyMessage);
 
     // Every column written to a page row must be the reader-built column of that very page table, at most once, and
