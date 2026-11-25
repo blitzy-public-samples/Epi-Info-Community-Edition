@@ -1,3 +1,4 @@
+using System.Globalization;
 using EpiInfo.Domain.Forms;
 using EpiInfo.Domain.Metadata;
 using EpiInfo.Domain.Records;
@@ -489,7 +490,36 @@ public sealed class SearchCriteriaParserTests
         AssertAlternatives(SingleCondition(Parse(Value("Age", FieldValue.Null))), IsNull);
     }
 
-    // Numbers are read with the invariant culture, and the prefix is the operator.
+    // Runs assertions under de-DE, whose decimal separator is a comma, then restores both cultures. Legacy parsed
+    // numbers with the current culture (FindRecordDialog.cs:418-463); the target reads them with the invariant
+    // culture, which a dot-decimal runner alone cannot tell apart. Culture is per async flow, so setting it here
+    // does not leak into tests running in parallel.
+    private static void UnderCommaDecimalCulture(Action assertions)
+    {
+        CultureInfo originalCulture = CultureInfo.CurrentCulture;
+        CultureInfo originalUiCulture = CultureInfo.CurrentUICulture;
+        try
+        {
+            CultureInfo german = new("de-DE");
+            CultureInfo.CurrentCulture = german;
+            CultureInfo.CurrentUICulture = german;
+
+            // Culture-sensitive parsing does change under this culture, reading "18,5" as 18.5 and "18.5" as 185,
+            // so the assertions run under it are meaningful.
+            Assert.Equal(18.5d, double.Parse("18,5", CultureInfo.CurrentCulture));
+            Assert.Equal(185d, double.Parse("18.5", CultureInfo.CurrentCulture));
+
+            assertions();
+        }
+        finally
+        {
+            CultureInfo.CurrentCulture = originalCulture;
+            CultureInfo.CurrentUICulture = originalUiCulture;
+        }
+    }
+
+    // Numbers are read with the invariant culture, and the prefix is the operator, even under a comma-decimal
+    // current culture (CollectedDataProvider.cs:2046-2066).
     [Theory]
     [InlineData(">=18", SearchOperator.GreaterOrEqual, 18d)]
     [InlineData("18.5", SearchOperator.Equal, 18.5d)]
@@ -498,10 +528,22 @@ public sealed class SearchCriteriaParserTests
     [InlineData("<=120", SearchOperator.LessOrEqual, 120d)]
     public void Number_PrefixIsTheOperatorOnAnInvariantNumber(string value, SearchOperator expected, double number)
     {
-        SearchCondition condition = SingleCondition(Parse(Text("Age", value)));
+        UnderCommaDecimalCulture(() =>
+        {
+            SearchCondition condition = SingleCondition(Parse(Text("Age", value)));
 
-        Assert.Equal(FieldType.Number, condition.FieldType);
-        AssertAlternatives(condition, (expected, FieldValue.FromNumber(number)));
+            Assert.Equal(FieldType.Number, condition.FieldType);
+            AssertAlternatives(condition, (expected, FieldValue.FromNumber(number)));
+        });
+    }
+
+    // A comma is never the decimal separator, so the current culture's way of writing 18.5 is not a number.
+    [Theory]
+    [InlineData("18,5")]
+    [InlineData(">=18,5")]
+    public void Number_CommaDecimalUnderCommaDecimalCulture_IsAFieldError(string value)
+    {
+        UnderCommaDecimalCulture(() => AssertFieldError(Parse(Text("Age", value)), "Age"));
     }
 
     [Fact]
@@ -986,6 +1028,44 @@ public sealed class SearchCriteriaParserTests
 
         Assert.True(result.IsSuccess);
         Assert.Equal(new[] { "Age", "LastName" }, result.Conditions.Select(condition => condition.FieldName).ToArray());
+    }
+
+    #endregion
+
+    #region Result immutability
+
+    // A result is immutable: neither the arrays given to FieldFailure nor the arrays or map a read of FieldErrors
+    // returns are the result's own storage, so changing them leaves every later read with the original messages, in
+    // their original key and message order.
+    [Fact]
+    public void Result_ChangingAnInputOrAReturnedErrorArray_LeavesTheFieldErrorsUnchanged()
+    {
+        SearchParseResult parsed = Parse(Text("Bogus", "x"), Text("LastName", ""), Text("Age", "abc"));
+        string[] parsedRead = parsed.FieldErrors["Age"];
+        string ageMessage = Assert.Single(parsedRead);
+
+        parsedRead[0] = Sentinel;
+
+        string[] parsedReread = parsed.FieldErrors["Age"];
+        Assert.NotSame(parsedRead, parsedReread);
+        Assert.Equal(new[] { ageMessage }, parsedReread);
+        Assert.Equal(new[] { SearchCriteriaParser.CriteriaKey, "LastName", "Age" }, parsed.FieldErrors.Keys);
+
+        string[] input = ["First message.", "Second message."];
+        SearchParseResult built = SearchParseResult.FieldFailure(
+            new Dictionary<string, string[]>(StringComparer.Ordinal) { ["LastName"] = input });
+
+        input[0] = Sentinel;
+        string[] firstRead = built.FieldErrors["LastName"];
+        firstRead[1] = Sentinel;
+        var writable = Assert.IsAssignableFrom<IDictionary<string, string[]>>(built.FieldErrors);
+        Assert.Throws<NotSupportedException>(() => writable.Remove("LastName"));
+
+        string[] secondRead = built.FieldErrors["LastName"];
+        Assert.NotSame(firstRead, secondRead);
+        Assert.Equal(new[] { "First message.", "Second message." }, secondRead);
+        Assert.False(built.IsSuccess);
+        Assert.All(AllMessages(built), message => Assert.DoesNotContain(Sentinel, message, StringComparison.Ordinal));
     }
 
     #endregion

@@ -316,9 +316,15 @@ internal static class SearchSqlBuilder
 
     /// <summary>
     /// Counts the records the list filters, for its <c>total</c>: <c>SELECT COUNT_BIG(*)</c> over the same joins and
-    /// the same predicate as <see cref="ListPage"/>, built by the same private code, so the total and the page can
-    /// never disagree.
+    /// the same predicate as <see cref="ListPage"/>, built by the same private code (<see cref="AppendListSource"/>),
+    /// so for one database state the total counts exactly the rows the pages are drawn from.
     /// </summary>
+    /// <remarks>
+    /// The page and the count are two statements, so this builder alone gives them no common snapshot: a write
+    /// committed between them can make the total and a page disagree. A caller that needs them to agree runs both
+    /// under one consistent read, for example one snapshot transaction where the database allows snapshot isolation,
+    /// or one serializable transaction.
+    /// </remarks>
     /// <param name="schema">The form's catalogue view.</param>
     /// <param name="gridColumns">The grid columns the filter searches, the ones passed to <see cref="ListPage"/>.</param>
     /// <param name="query">The coerced list query; its paging is not used.</param>

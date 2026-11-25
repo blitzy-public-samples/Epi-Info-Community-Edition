@@ -1,9 +1,15 @@
+using System.Data;
 using System.Data.Common;
+using System.Globalization;
+using System.Text;
 using EpiInfo.Data.Metadata;
 using EpiInfo.Data.Records;
 using EpiInfo.Data.Sql;
 using EpiInfo.Domain.Forms;
 using EpiInfo.Domain.Metadata;
+using EpiInfo.Domain.Records;
+using EpiInfo.Domain.Search;
+using EpiInfo.Domain.Values;
 using EpiInfo.Tests.Shared;
 using Microsoft.Data.SqlClient;
 
@@ -335,6 +341,871 @@ public sealed class SqlRecordRepositoryTests
             }
 
             return result.AsReadOnly();
+        }
+    }
+}
+
+/// <summary>
+/// Runs the records-list and Find statements that <see cref="SearchSqlBuilder"/> renders against the seeded rows of
+/// the rehearsal database, and checks the rows they return against direct SQL that does not use the builder's
+/// predicate (AAP 0.3.4.4).
+/// </summary>
+/// <remarks>
+/// <para>
+/// The forms, their schemas and their data fields are read through <see cref="SqlMetadataReader"/>, by form name, so
+/// no view id, table or column name is fixed here. The seeded values a case needs are chosen by SQL, and expected
+/// values come from a direct, typed query in the test, never from a hard-coded count.
+/// </para>
+/// <para>
+/// The class is read-only and seed-backed: it creates no record and sends only <c>SELECT</c> statements, the
+/// builder's through <see cref="SqlExecution"/> and the command recorder, and the direct queries. Tests may write only
+/// records created through the API and the few fixtures AAP 0.3.7 ("Data reach of tests") lists, and this assembly
+/// reaches the data layer, not the API. Cases that need a stored literal pattern character therefore belong to
+/// <c>ListAndSearchTests</c>. Each test holds the shared <see cref="DatabaseWriteLock"/> for its whole body, so the
+/// seeded rows its expected values come from cannot move, and ends by asserting that the recorder saw no write.
+/// </para>
+/// </remarks>
+[Trait("Category", "Integration")]
+[Collection(DatabaseCollections.Database)]
+public sealed class ListAndFindSqlTests
+{
+    private const string CaseReportForm = "CaseReport";
+    private const string FoodHistoryForm = "FoodHistory";
+
+    // Seeded FoodHistory fields of the typed Find cases: a date, a checkbox on each page and two numbers.
+    private const string DateField = "DateofInterview";
+    private const string PageTwoCheckbox = "Fever";
+    private const string PageThreeCheckbox = "Grapes";
+    private const string FractionalField = "FeverTemp";
+    private const string ThresholdField = "Age";
+
+    // The catalogue name of every page table's record key, looked up through the reader-built table.
+    private const string PageKeyColumn = "GlobalRecordId";
+
+    // AAP 0.3.4.4 "Records list q": the one collation both sides of the grid filter compare under, the CONVERT style
+    // of a datetime grid column (yyyy-mm-dd), and the escape clause every column's term declares.
+    private const string GridFilterCollation = "Latin1_General_100_CI_AS";
+    private const string IsoDateStyle = "23";
+    private const string GridFilterEscapeClause = @" ESCAPE '\'";
+
+    // The seeded CaseReport text field the Find pattern cases search, and the shortest seeded value they are built
+    // from, long enough for every case's slices.
+    private const string PatternField = "LastName";
+    private const int PatternMinimumLength = 5;
+
+    // A binary collation, under which the set [A-Za-z] is exactly the ASCII letters.
+    private const string BinaryCollation = "Latin1_General_BIN2";
+
+    // Fixed operation names reported to the command observer.
+    private const string ListPageOperation = "test.listPage";
+    private const string ListCountOperation = "test.listCount";
+    private const string FindOperation = "test.find";
+
+    // Covers a wait of up to 300 seconds for the test lock and the work behind it.
+    private static readonly TimeSpan TestTimeout = TimeSpan.FromMinutes(10);
+
+    /// <summary>
+    /// Grid filters holding one pattern character each, chosen so that a pattern reading matches seeded rows, with the
+    /// pattern the list must bind: every <c>\</c>, <c>%</c>, <c>_</c> and <c>[</c> prefixed with <c>\</c>, and the
+    /// whole wrapped in <c>%</c>.
+    /// </summary>
+    public static TheoryData<string, string> GridFilterPatternCharacters => new()
+    {
+        { "a%e", @"%a\%e%" },
+        { "a_e", @"%a\_e%" },
+        { "[a-z]", @"%\[a-z]%" },
+        { @"\a", @"%\\a%" },
+    };
+
+    // AAP 0.3.4.4 "Records list q": a case-insensitive "contains" over the grid columns, each written as
+    // CONVERT(nvarchar(max), column[, 23]) COLLATE Latin1_General_100_CI_AS LIKE @q ... ESCAPE '\', with %, _, [ and \
+    // escaped in @q. Both sides compare under that one collation, so the match is collation-independent by design; it
+    // has no legacy counterpart. The expected rows come from CHARINDEX, which knows no pattern character. The seeded
+    // grid holds none of the four, so each literal match is empty while the pattern reading of the same q matches
+    // seeded rows, and dropping the escaping changes the result. Dropping the ESCAPE clause changes no seeded result,
+    // so the statement text and the bound pattern are checked too. Positive matches against a stored literal need
+    // records created through the API, so they belong to ListAndSearchTests once the record routes can store records in
+    // the database (AAP 0.3.7, "Data reach of tests").
+    [Theory]
+    [MemberData(nameof(GridFilterPatternCharacters))]
+    public async Task GridFilter_MatchesPatternCharactersLiterally(string q, string escapedPattern)
+    {
+        await TestDatabase.EnsureReachableAsync();
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        var cancellationToken = timeout.Token;
+        await using var sharedLock = await DatabaseWriteLock.AcquireSharedAsync(cancellationToken);
+
+        var form = await FormUnderTest.LoadAsync(CaseReportForm, cancellationToken);
+        var expected = await form.ExpectedListAsync(q, cancellationToken);
+
+        // The pattern reading of q, its escaping left out under the list's own ESCAPE clause, matches more rows.
+        var patternReading = await form.PatternReadingListAsync(q, cancellationToken);
+        Assert.True(
+            patternReading.Total > expected.Total,
+            $"The pattern reading of {q} matches {patternReading.Total} active records, no more than its literal match.");
+
+        var list = form.BuildList(q);
+        var listed = await form.ListAsync(list, cancellationToken);
+        Assert.Equal(expected.Ids, listed.Ids);
+        Assert.Equal(expected.Total, listed.Total);
+
+        foreach (var statement in new[] { list.Page, list.Count })
+        {
+            var pattern = Assert.Single(statement.Parameters, parameter => parameter.DbType == DbType.String);
+            Assert.Equal(escapedPattern, Assert.IsType<string>(pattern.Value));
+
+            // Every grid column's term compares with that pattern under the fixed collation and declares ESCAPE '\'.
+            var term = $" LIKE {pattern.Name} COLLATE {GridFilterCollation}{GridFilterEscapeClause}";
+            Assert.Equal(form.Grid.Count, CountOccurrences(statement.Text, term));
+        }
+
+        // The builder's statements are reads: the recorder saw them and no write.
+        Assert.NotEmpty(form.Recorder.ForOperation(ListPageOperation));
+        Assert.NotEmpty(form.Recorder.ForOperation(ListCountOperation));
+        Assert.Empty(form.Recorder.Writes());
+    }
+
+    /// <summary>
+    /// A text criterion on <c>LastName</c>, built from the seeded last name L that
+    /// <see cref="FormUnderTest.MostFrequentLetterValueAsync"/> picks.
+    /// </summary>
+    public enum PatternCriterion
+    {
+        /// <summary>L's first three letters and <c>*</c>: a <c>LIKE</c> prefix.</summary>
+        Prefix,
+
+        /// <summary>
+        /// L's first letter, <c>_</c>, its third and fourth letters and <c>*</c>: <c>_</c> matches any one character.
+        /// </summary>
+        Underscore,
+
+        /// <summary>
+        /// L with its second letter written as the set <c>[x]</c>, and <c>*</c>: the set keeps its SQL meaning.
+        /// </summary>
+        CharacterSet,
+
+        /// <summary>L with <c>?</c> for its second letter, and <c>*</c>: <c>?</c> matches only a stored <c>?</c>.</summary>
+        QuestionMark,
+
+        /// <summary>L with a quote after its first letter, and <c>*</c>: the quote stays in the pattern.</summary>
+        Quote,
+
+        /// <summary>L itself: no wildcard, so an equality.</summary>
+        NoWildcard,
+    }
+
+    /// <summary>Every pattern criterion case.</summary>
+    public static TheoryData<PatternCriterion> PatternCriteria => new()
+    {
+        PatternCriterion.Prefix,
+        PatternCriterion.Underscore,
+        PatternCriterion.CharacterSet,
+        PatternCriterion.QuestionMark,
+        PatternCriterion.Quote,
+        PatternCriterion.NoWildcard,
+    };
+
+    // AAP 0.3.4.4, text row and "Target choices": a value holding %, * or ? is a LIKE pattern with * rewritten to %,
+    // bound as a parameter so its quotes stay; with no ESCAPE clause, _ and [...] keep their SQL meaning and ? matches
+    // itself, as in legacy, which inlined the pattern with its single quotes removed
+    // (Epi.Core/Data/Services/CollectedDataProvider.cs:2195-2206). A value with no wildcard is an equality (:2224-2231).
+    // Find compares under the column's collation, as legacy does, and so does the expected query, which uses SUBSTRING
+    // equality, not LIKE. L is chosen by SQL among the seeded rows. The ? and quote cases match no seeded row, while the
+    // reading the target rejects (? as any one character, the quote removed) matches some.
+    [Theory]
+    [MemberData(nameof(PatternCriteria))]
+    public async Task Find_TextCriterion_KeepsQuotesAndSqlPatternMeaning(PatternCriterion criterion)
+    {
+        await TestDatabase.EnsureReachableAsync();
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        var cancellationToken = timeout.Token;
+        await using var sharedLock = await DatabaseWriteLock.AcquireSharedAsync(cancellationToken);
+
+        var form = await FormUnderTest.LoadAsync(CaseReportForm, cancellationToken);
+        var lastName = await form.MostFrequentLetterValueAsync(PatternField, PatternMinimumLength, cancellationToken);
+        var arranged = ArrangePattern(lastName, criterion);
+
+        var expected = await form.ExpectedTextFindAsync(PatternField, arranged.Expected, cancellationToken);
+        if (arranged.RejectedReading is { } rejectedReading)
+        {
+            // The reading the target rejects selects a record the literal reading does not, so a target that read the
+            // pattern that way would return different rows.
+            var rejected = await form.ExpectedTextFindAsync(PatternField, rejectedReading, cancellationToken);
+            Assert.True(
+                rejected.Ids.Any(id => !expected.Ids.Contains(id, StringComparer.Ordinal)),
+                $"The rejected reading of the {criterion} case selects no record the literal reading does not.");
+        }
+        else
+        {
+            Assert.True(expected.Total > 0, $"No active seeded CaseReport record matches the {criterion} case.");
+        }
+
+        var find = form.BuildFind(PatternField, arranged.Criterion);
+        var found = await form.FindAsync(find, cancellationToken);
+        Assert.Equal(expected.Ids, found.Ids);
+        Assert.Equal(expected.Total, found.Total);
+
+        var operand = Assert.Single(find.Statement.Parameters, parameter => parameter.DbType == DbType.String);
+        Assert.Equal(arranged.Operand, Assert.IsType<string>(operand.Value));
+        Assert.Contains(
+            $"{form.ColumnReference(PatternField)} {arranged.Operator} {operand.Name}",
+            find.Statement.Text,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain("ESCAPE", find.Statement.Text, StringComparison.Ordinal);
+
+        // The builder's statement is a read: the recorder saw it and no write.
+        Assert.NotEmpty(form.Recorder.ForOperation(FindOperation));
+        Assert.Empty(form.Recorder.Writes());
+    }
+
+    // Builds a pattern case from L: the criterion, the comparison and operand the parser must produce, the rows it must
+    // match written without LIKE, and for the ? and quote cases the reading the target rejects.
+    private static PatternCase ArrangePattern(string lastName, PatternCriterion criterion)
+    {
+        var first = lastName[..1];
+        switch (criterion)
+        {
+            case PatternCriterion.Prefix:
+                var prefix = lastName[..3];
+                return new PatternCase(prefix + "*", "LIKE", prefix + "%", TextMatch.WithSegments((1, prefix)), null);
+
+            case PatternCriterion.Underscore:
+                var underscore = first + "_" + lastName[2..4];
+                return new PatternCase(
+                    underscore + "*", "LIKE", underscore + "%", TextMatch.WithSegments((1, first), (3, lastName[2..4])), null);
+
+            case PatternCriterion.CharacterSet:
+                var set = first + "[" + lastName[1] + "]" + lastName[2..];
+                return new PatternCase(set + "*", "LIKE", set + "%", TextMatch.WithSegments((1, lastName)), null);
+
+            case PatternCriterion.QuestionMark:
+                var question = first + "?" + lastName[2..];
+                return new PatternCase(
+                    question + "*",
+                    "LIKE",
+                    question + "%",
+                    TextMatch.WithSegments((1, question)),
+                    TextMatch.WithSegments((1, first), (3, lastName[2..])));
+
+            case PatternCriterion.Quote:
+                var quoted = first + "'" + lastName[1..];
+                return new PatternCase(
+                    quoted + "*",
+                    "LIKE",
+                    quoted + "%",
+                    TextMatch.WithSegments((1, quoted)),
+                    TextMatch.WithSegments((1, lastName)));
+
+            case PatternCriterion.NoWildcard:
+                return new PatternCase(lastName, "=", lastName, TextMatch.Equal(lastName), null);
+
+            default:
+                throw new ArgumentOutOfRangeException(nameof(criterion), criterion, "Unknown pattern criterion.");
+        }
+    }
+
+    /// <summary>A typed Find criterion on a seeded <c>FoodHistory</c> field.</summary>
+    public enum TypedCriterion
+    {
+        /// <summary><c>DateofInterview</c> equal to its most frequent seeded value.</summary>
+        DateEqual,
+
+        /// <summary><c>DateofInterview</c> after its most frequent seeded value.</summary>
+        DateGreater,
+
+        /// <summary>The page-two checkbox <c>Fever</c> searched with <c>Yes</c>.</summary>
+        CheckboxYes,
+
+        /// <summary>The page-three checkbox <c>Grapes</c> searched with <c>(-)</c>.</summary>
+        CheckboxUnchecked,
+
+        /// <summary><c>FeverTemp</c> equal to its most frequent seeded fractional value.</summary>
+        NumberEqual,
+
+        /// <summary><c>Age</c> above 30.</summary>
+        NumberGreater,
+    }
+
+    /// <summary>Every typed criterion case.</summary>
+    public static TheoryData<TypedCriterion> TypedCriteria => new()
+    {
+        TypedCriterion.DateEqual,
+        TypedCriterion.DateGreater,
+        TypedCriterion.CheckboxYes,
+        TypedCriterion.CheckboxUnchecked,
+        TypedCriterion.NumberEqual,
+        TypedCriterion.NumberGreater,
+    };
+
+    // AAP 0.3.4.4, date, checkbox and number rows. A date is YYYY-MM-DD bound as datetime at 00:00:00 with its prefix as
+    // the operator (legacy bound DbType.DateTime, Epi.Core/Data/Services/CollectedDataProvider.cs:2135-2169); a checkbox's
+    // Yes or (+) is = 1 and No or (-) is = 0, bound as a bit (legacy DbType.Boolean, :2022-2045); a number is its
+    // invariant value with the prefix as the operator (legacy inlined it, :2046-2066). The result is the active base rows
+    // with a row on every page, in UniqueKey order, capped, with the total counted before the cap. Seeded rows only.
+    [Theory]
+    [MemberData(nameof(TypedCriteria))]
+    public async Task Find_TypedCriterion_MatchesDirectSqlAndBindsTypedOperand(TypedCriterion criterion)
+    {
+        await TestDatabase.EnsureReachableAsync();
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        var cancellationToken = timeout.Token;
+        await using var sharedLock = await DatabaseWriteLock.AcquireSharedAsync(cancellationToken);
+
+        var form = await FormUnderTest.LoadAsync(FoodHistoryForm, cancellationToken);
+        var arranged = await ArrangeAsync(form, criterion, cancellationToken);
+
+        var expected = await form.ExpectedFindAsync(arranged.FieldName, arranged.Operator, arranged.Operand, cancellationToken);
+        Assert.True(expected.Total > 0, $"No active seeded FoodHistory record matches the {criterion} case.");
+
+        var find = form.BuildFind(arranged.FieldName, arranged.Criterion);
+        var found = await form.FindAsync(find, cancellationToken);
+        Assert.Equal(expected.Ids, found.Ids);
+        Assert.Equal(expected.Total, found.Total);
+
+        var operand = Assert.Single(find.Statement.Parameters, parameter => parameter.DbType == arranged.DbType);
+        Assert.Equal(arranged.Operand, operand.Value);
+        Assert.Contains(
+            $"{form.ColumnReference(arranged.FieldName)} {arranged.Operator} {operand.Name}",
+            find.Statement.Text,
+            StringComparison.Ordinal);
+
+        // The builder's statement is a read: the recorder saw it and no write.
+        Assert.NotEmpty(form.Recorder.ForOperation(FindOperation));
+        Assert.Empty(form.Recorder.Writes());
+    }
+
+    // Chooses each case's field, criterion text and expected operand; seeded values are picked by SQL.
+    private static async Task<TypedCase> ArrangeAsync(
+        FormUnderTest form,
+        TypedCriterion criterion,
+        CancellationToken cancellationToken)
+    {
+        switch (criterion)
+        {
+            case TypedCriterion.DateEqual or TypedCriterion.DateGreater:
+                // A date field is date-only, so the operand equals a stored value only if no stored value has a time.
+                Assert.Equal(0L, await form.CountWithTimeOfDayAsync(DateField, cancellationToken));
+                var day = Assert.IsType<DateTime>(
+                    await form.MostFrequentValueAsync(DateField, fractionalOnly: false, cancellationToken));
+                var dayText = day.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+                return criterion == TypedCriterion.DateEqual
+                    ? new TypedCase(DateField, dayText, "=", DbType.DateTime, day)
+                    : new TypedCase(DateField, ">" + dayText, ">", DbType.DateTime, day);
+
+            case TypedCriterion.CheckboxYes:
+                return new TypedCase(PageTwoCheckbox, "Yes", "=", DbType.Boolean, true);
+
+            case TypedCriterion.CheckboxUnchecked:
+                // The second checkbox sits on another page table, so the criterion reaches a second joined page.
+                Assert.NotEqual(form.Field(PageTwoCheckbox).Page.PageId, form.Field(PageThreeCheckbox).Page.PageId);
+                return new TypedCase(PageThreeCheckbox, "(-)", "=", DbType.Boolean, false);
+
+            case TypedCriterion.NumberEqual:
+                var fraction = Assert.IsType<double>(
+                    await form.MostFrequentValueAsync(FractionalField, fractionalOnly: true, cancellationToken));
+                return new TypedCase(
+                    FractionalField, fraction.ToString("R", CultureInfo.InvariantCulture), "=", DbType.Double, fraction);
+
+            case TypedCriterion.NumberGreater:
+                return new TypedCase(ThresholdField, ">30", ">", DbType.Double, 30d);
+
+            default:
+                throw new ArgumentOutOfRangeException(nameof(criterion), criterion, "Unknown typed criterion.");
+        }
+    }
+
+    // The number of non-overlapping ordinal occurrences of value in text.
+    private static int CountOccurrences(string text, string value)
+    {
+        var count = 0;
+        for (var index = text.IndexOf(value, StringComparison.Ordinal);
+            index >= 0;
+            index = text.IndexOf(value, index + value.Length, StringComparison.Ordinal))
+        {
+            count++;
+        }
+
+        return count;
+    }
+
+    /// <summary>The two list statements the builder renders for one query: a page, and the count of the filtered set.</summary>
+    private sealed record ListStatements(SqlStatement Page, SqlStatement Count);
+
+    /// <summary>The ids of one list page, in the order returned, and the list's total.</summary>
+    private sealed record ListRows(IReadOnlyList<string> Ids, long Total);
+
+    /// <summary>The ids a Find returned, in the order returned, and the total of its matches.</summary>
+    private sealed record FindRows(IReadOnlyList<string> Ids, long Total);
+
+    /// <summary>
+    /// One typed criterion: the field, the criterion text, the comparison it renders, and the type and value of the
+    /// operand it binds, which the direct query binds too (a bit as the literal 1 or 0).
+    /// </summary>
+    private sealed record TypedCase(string FieldName, string Criterion, string Operator, DbType DbType, object Operand);
+
+    /// <summary>
+    /// One pattern case: the criterion text, the comparison and the string operand the Find statement must render, the
+    /// rows the criterion matches, and for the <c>?</c> and quote cases the reading the target rejects.
+    /// </summary>
+    private sealed record PatternCase(
+        string Criterion,
+        string Operator,
+        string Operand,
+        TextMatch Expected,
+        TextMatch? RejectedReading);
+
+    /// <summary>
+    /// The values a text criterion matches, written without <c>LIKE</c>: equal to <see cref="Whole"/>, or holding each
+    /// segment's text at the segment's 1-based start, with any characters between and after the segments.
+    /// </summary>
+    private sealed record TextMatch(string? Whole, IReadOnlyList<(int Start, string Text)> Segments)
+    {
+        /// <summary>The values equal to <paramref name="text"/>.</summary>
+        public static TextMatch Equal(string text) => new(text, []);
+
+        /// <summary>The values that hold every segment's text at its start.</summary>
+        public static TextMatch WithSegments(params (int Start, string Text)[] segments) => new(null, segments);
+    }
+
+    /// <summary>
+    /// One seeded form as the data layer sees it, with the collaborators every statement runs through.
+    /// </summary>
+    private sealed record FormUnderTest(
+        FormSchema Schema,
+        DataFieldSet DataFields,
+        IReadOnlyList<DataFieldMetadata> Grid,
+        DatabaseOptions Options,
+        SqlCommandRecorder Recorder)
+    {
+        /// <summary>Reads a form by name through the metadata reader.</summary>
+        public static async Task<FormUnderTest> LoadAsync(string formName, CancellationToken cancellationToken)
+        {
+            var options = new DatabaseOptions(TestDatabase.ConnectionString);
+            var recorder = new SqlCommandRecorder();
+            var reader = new SqlMetadataReader(new SqlConnectionFactory(options), options, recorder);
+
+            var forms = await reader.ListFormsAsync(cancellationToken);
+            var viewId = Assert.Single(forms, form => string.Equals(form.Name, formName, StringComparison.Ordinal)).ViewId;
+
+            await using var connection = await TestDatabase.OpenConnectionAsync(cancellationToken);
+            var read = await reader.ReadFormAsync(connection, transaction: null, viewId, cancellationToken);
+            Assert.True(read.HasValue, $"The metadata reader returned no form for {formName}.");
+
+            var (form, schema) = read.Value;
+            var dataFields = FormDefinitionFactory.GetDataFields(form);
+            return new FormUnderTest(schema, dataFields, RecordQueryRules.GetGridColumns(dataFields), options, recorder);
+        }
+
+        /// <summary>
+        /// Builds the first list page of the active set, at the largest page size, filtered by <paramref name="q"/>,
+        /// and the count of the same filtered set.
+        /// </summary>
+        public ListStatements BuildList(string q)
+        {
+            var query = new RecordListQuery(q, IncludeDeleted: false, RecordQueryRules.DefaultPage, RecordQueryRules.MaxPageSize);
+            return new ListStatements(
+                SearchSqlBuilder.ListPage(Schema, Grid, query).Statement,
+                SearchSqlBuilder.ListCount(Schema, Grid, query));
+        }
+
+        /// <summary>Runs a list page and its count, and reads the ids the page returns and the total.</summary>
+        public async Task<ListRows> ListAsync(ListStatements list, CancellationToken cancellationToken)
+        {
+            await using var connection = await TestDatabase.OpenConnectionAsync(cancellationToken);
+            var ids = await SqlExecution.ReadAsync(
+                connection,
+                transaction: null,
+                ListPageOperation,
+                list.Page,
+                Options.CommandTimeoutSeconds,
+                Recorder,
+                cancellationToken,
+                ReadIdsAsync);
+            var total = await SqlExecution.ExecuteScalarAsync<long>(
+                connection,
+                transaction: null,
+                ListCountOperation,
+                list.Count,
+                Options.CommandTimeoutSeconds,
+                Recorder,
+                cancellationToken);
+
+            return new ListRows(ids, total);
+        }
+
+        /// <summary>
+        /// The list result computed by a direct query that uses no <c>LIKE</c>: the active base rows, joined with
+        /// <c>LEFT JOIN</c> to each page holding a grid column as the list joins them, where some grid column, converted
+        /// as the list converts it, holds <paramref name="q"/> by <c>CHARINDEX</c> under the grid filter's collation;
+        /// the first <see cref="RecordQueryRules.MaxPageSize"/> ids in <c>UniqueKey</c> order, and the count of every
+        /// match.
+        /// </summary>
+        public Task<ListRows> ExpectedListAsync(string q, CancellationToken cancellationToken) =>
+            DirectListAsync(q, column => $"CHARINDEX(@q COLLATE {GridFilterCollation}, {column}) > 0", cancellationToken);
+
+        /// <summary>
+        /// The list result of <paramref name="q"/> read as a pattern: wrapped in <c>%</c> but not escaped, under the
+        /// list's own conversion, collation and <c>ESCAPE '\'</c> clause, so <c>%</c>, <c>_</c> and <c>[...]</c> are
+        /// wildcards and a <c>\</c> makes the character after it literal. Without the clause a <c>\</c> would match
+        /// only itself, and the reading would not differ from the literal match.
+        /// </summary>
+        public Task<ListRows> PatternReadingListAsync(string q, CancellationToken cancellationToken) =>
+            DirectListAsync(
+                q,
+                column => $"{column} LIKE (N'%' + @q + N'%') COLLATE {GridFilterCollation}{GridFilterEscapeClause}",
+                cancellationToken);
+
+        /// <summary>
+        /// Parses one criterion with the search criteria parser and builds the Find statement over the active set,
+        /// excluding no record.
+        /// </summary>
+        public SearchSelect BuildFind(string fieldName, string criterion)
+        {
+            var parsed = SearchCriteriaParser.Parse(
+                DataFields,
+                [new SearchCriterion(fieldName, FieldValue.FromText(criterion))]);
+            Assert.True(
+                parsed.IsSuccess,
+                $"The {fieldName} criterion did not parse: {parsed.RequestError} " +
+                string.Join(" ", parsed.FieldErrors.Values.SelectMany(messages => messages)));
+
+            return SearchSqlBuilder.Search(
+                Schema, DataFields, Grid, parsed.Conditions, includeDeleted: false, excludeGlobalRecordId: null);
+        }
+
+        /// <summary>Runs a Find statement and reads the ids it returns and the total every row carries.</summary>
+        public async Task<FindRows> FindAsync(SearchSelect find, CancellationToken cancellationToken)
+        {
+            await using var connection = await TestDatabase.OpenConnectionAsync(cancellationToken);
+            return await SqlExecution.ReadAsync(
+                connection,
+                transaction: null,
+                FindOperation,
+                find.Statement,
+                Options.CommandTimeoutSeconds,
+                Recorder,
+                cancellationToken,
+                ReadFindRowsAsync);
+        }
+
+        /// <summary>
+        /// The Find result computed by a direct query: the active base rows joined with <c>INNER JOIN</c> to every page
+        /// table, filtered by <c>column comparison operand</c>, the first <see cref="RecordQueryRules.SearchCap"/> ids
+        /// in <c>UniqueKey</c> order, and the count of every match.
+        /// </summary>
+        public async Task<FindRows> ExpectedFindAsync(
+            string fieldName,
+            string comparison,
+            object operand,
+            CancellationToken cancellationToken)
+        {
+            var (from, criterionColumn) = FindSource(fieldName);
+
+            // A bit is compared with the literal 1 or 0, any other operand with a parameter typed as its column.
+            var operandText = operand is bool flag ? (flag ? "1" : "0") : "@operand";
+            var parameters = new List<SqlParameter>();
+            switch (operand)
+            {
+                case DateTime date:
+                    parameters.Add(new SqlParameter("@operand", SqlDbType.DateTime) { Value = date });
+                    break;
+                case double number:
+                    parameters.Add(new SqlParameter("@operand", SqlDbType.Float) { Value = number });
+                    break;
+                case bool:
+                    break;
+                default:
+                    throw new ArgumentException("The operand is not a date, a number or a checkbox state.", nameof(operand));
+            }
+
+            return await DirectFindAsync(from, $"{criterionColumn} {comparison} {operandText}", parameters, cancellationToken);
+        }
+
+        /// <summary>
+        /// The Find result of a text criterion computed by a direct query that uses no <c>LIKE</c>: the rows of
+        /// <see cref="ExpectedFindAsync"/> whose value, compared under the column's own collation as Find compares it,
+        /// equals <see cref="TextMatch.Whole"/>, or holds each segment as <c>SUBSTRING(column, start, length)</c>.
+        /// </summary>
+        public async Task<FindRows> ExpectedTextFindAsync(
+            string fieldName,
+            TextMatch match,
+            CancellationToken cancellationToken)
+        {
+            var (from, criterionColumn) = FindSource(fieldName);
+            var parameters = new List<SqlParameter>();
+            string predicate;
+            if (match.Whole is { } whole)
+            {
+                parameters.Add(TextParameter("@whole", whole));
+                predicate = $"{criterionColumn} = @whole";
+            }
+            else
+            {
+                Assert.NotEmpty(match.Segments);
+                var terms = new List<string>(match.Segments.Count);
+                foreach (var (start, text) in match.Segments)
+                {
+                    var name = "@segment" + terms.Count.ToString(CultureInfo.InvariantCulture);
+                    parameters.Add(TextParameter(name, text));
+                    terms.Add(string.Create(
+                        CultureInfo.InvariantCulture, $"SUBSTRING({criterionColumn}, {start}, {text.Length}) = {name}"));
+                }
+
+                predicate = string.Join(" AND ", terms);
+            }
+
+            return await DirectFindAsync(from, predicate, parameters, cancellationToken);
+        }
+
+        /// <summary>
+        /// The most frequent non-null stored value of a field among active base rows, ties broken by the smaller
+        /// value; with <paramref name="fractionalOnly"/>, among values that are not whole numbers.
+        /// </summary>
+        public Task<object> MostFrequentValueAsync(
+            string fieldName,
+            bool fractionalOnly,
+            CancellationToken cancellationToken) =>
+            MostFrequentAsync(
+                fieldName,
+                value => fractionalOnly ? $" AND {value} <> FLOOR({value})" : string.Empty,
+                cancellationToken);
+
+        /// <summary>
+        /// The most frequent stored value of a text field among active base rows that is at least
+        /// <paramref name="minimumLength"/> characters long and holds ASCII letters only, ties broken by the smaller
+        /// value.
+        /// </summary>
+        public async Task<string> MostFrequentLetterValueAsync(
+            string fieldName,
+            int minimumLength,
+            CancellationToken cancellationToken) =>
+            Assert.IsType<string>(await MostFrequentAsync(
+                fieldName,
+                value => string.Create(CultureInfo.InvariantCulture, $" AND LEN({value}) >= {minimumLength}") +
+                    $" AND PATINDEX(N'%[^A-Za-z]%', {value} COLLATE {BinaryCollation}) = 0",
+                cancellationToken));
+
+        /// <summary>The number of stored values of a <c>datetime</c> field, in any record, that carry a time of day.</summary>
+        public async Task<long> CountWithTimeOfDayAsync(string fieldName, CancellationToken cancellationToken)
+        {
+            var (table, column) = PageColumn(fieldName);
+            var sql = $"SELECT COUNT_BIG(*) FROM {table} WHERE {column} IS NOT NULL" +
+                $" AND CAST({column} AS time) <> CAST('00:00:00' AS time);";
+
+            await using var connection = await TestDatabase.OpenConnectionAsync(cancellationToken);
+            await using var command = new SqlCommand(sql, connection) { CommandTimeout = Options.CommandTimeoutSeconds };
+            return Assert.IsType<long>(await command.ExecuteScalarAsync(cancellationToken));
+        }
+
+        /// <summary>The qualified reference the Find statement uses for a data field's column, such as <c>p0.[Age]</c>.</summary>
+        public string ColumnReference(string fieldName) =>
+            RecordSqlBuilder.ColumnReference(Schema, RecordSqlBuilder.ResolveDataColumn(Schema, Field(fieldName), ordinal: 0));
+
+        /// <summary>The data field of that name; the test fails when the form has none.</summary>
+        public DataFieldMetadata Field(string fieldName)
+        {
+            var field = DataFields.Find(fieldName);
+            Assert.NotNull(field);
+            return field;
+        }
+
+        private ColumnSchema DataColumn(DataFieldMetadata field)
+        {
+            var column = Schema.FindDataColumn(field);
+            Assert.NotNull(column);
+            return column;
+        }
+
+        // The quoted page table and column that store a data field.
+        private (string Table, string Column) PageColumn(string fieldName)
+        {
+            var field = Field(fieldName);
+            var table = Schema.FindPage(field.Page.PageId)?.Table;
+            Assert.NotNull(table);
+            return (SqlIdentifier.Quote(table), SqlIdentifier.Quote(DataColumn(field)));
+        }
+
+        // The quoted record key of the page table that stores a data field.
+        private string PageKey(string fieldName)
+        {
+            var table = Schema.FindPage(Field(fieldName).Page.PageId)?.Table;
+            Assert.NotNull(table);
+            var key = table.FindColumn(PageKeyColumn);
+            Assert.NotNull(key);
+            return SqlIdentifier.Quote(key);
+        }
+
+        // The most frequent non-null stored value of a field among active base rows that also meet the condition
+        // written on the value's column reference, ties broken by the smaller value.
+        private async Task<object> MostFrequentAsync(
+            string fieldName,
+            Func<string, string> condition,
+            CancellationToken cancellationToken)
+        {
+            var (table, column) = PageColumn(fieldName);
+            var value = $"t.{column}";
+            var baseId = SqlIdentifier.Quote(RecordSqlBuilder.Require(Schema.GlobalRecordId));
+            var recStatus = SqlIdentifier.Quote(RecordSqlBuilder.Require(Schema.RecStatus));
+            var sql = $"SELECT TOP (1) {value} FROM {SqlIdentifier.Quote(Schema.BaseTable)} b" +
+                $" INNER JOIN {table} t ON t.{PageKey(fieldName)} = b.{baseId}" +
+                $" WHERE b.{recStatus} = 1 AND {value} IS NOT NULL" +
+                condition(value) +
+                $" GROUP BY {value} ORDER BY COUNT_BIG(*) DESC, {value};";
+
+            await using var connection = await TestDatabase.OpenConnectionAsync(cancellationToken);
+            await using var command = new SqlCommand(sql, connection) { CommandTimeout = Options.CommandTimeoutSeconds };
+            var result = await command.ExecuteScalarAsync(cancellationToken);
+            Assert.NotNull(result);
+            Assert.IsNotType<DBNull>(result);
+            return result;
+        }
+
+        // FROM the base table joined with INNER JOIN to every page table, as Find joins them, and the qualified column
+        // that stores the field.
+        private (string From, string Column) FindSource(string fieldName)
+        {
+            var field = Field(fieldName);
+            var baseId = SqlIdentifier.Quote(RecordSqlBuilder.Require(Schema.GlobalRecordId));
+            var from = new StringBuilder(" FROM ").Append(SqlIdentifier.Quote(Schema.BaseTable)).Append(" b");
+            string? criterionColumn = null;
+            for (var index = 0; index < Schema.Pages.Count; index++)
+            {
+                if (Schema.Pages[index].Table is not { } table)
+                {
+                    continue;
+                }
+
+                var alias = "t" + index.ToString(CultureInfo.InvariantCulture);
+                var key = table.FindColumn(PageKeyColumn);
+                Assert.NotNull(key);
+                from.Append(" INNER JOIN ").Append(SqlIdentifier.Quote(table)).Append(' ').Append(alias)
+                    .Append(" ON ").Append(alias).Append('.').Append(SqlIdentifier.Quote(key))
+                    .Append(" = b.").Append(baseId);
+                if (Schema.Pages[index].Page.PageId == field.Page.PageId)
+                {
+                    criterionColumn = alias + "." + SqlIdentifier.Quote(DataColumn(field));
+                }
+            }
+
+            Assert.NotNull(criterionColumn);
+            return (from.ToString(), criterionColumn);
+        }
+
+        // A direct Find query over the source: the active set is RecStatus = 1, then the predicate; the first SearchCap
+        // ids in UniqueKey order, and the count of every match.
+        private async Task<FindRows> DirectFindAsync(
+            string from,
+            string predicate,
+            IReadOnlyList<SqlParameter> parameters,
+            CancellationToken cancellationToken)
+        {
+            var baseId = SqlIdentifier.Quote(RecordSqlBuilder.Require(Schema.GlobalRecordId));
+            var where = $" WHERE b.{SqlIdentifier.Quote(RecordSqlBuilder.Require(Schema.RecStatus))} = 1 AND {predicate}";
+            var sql = $"SELECT TOP (@cap) b.{baseId}{from}{where}" +
+                $" ORDER BY b.{SqlIdentifier.Quote(RecordSqlBuilder.Require(Schema.UniqueKey))};" +
+                $" SELECT COUNT_BIG(*){from}{where};";
+
+            var (ids, total) = await ReadIdsAndTotalAsync(
+                sql,
+                [new SqlParameter("@cap", SqlDbType.Int) { Value = RecordQueryRules.SearchCap }, .. parameters],
+                cancellationToken);
+            return new FindRows(ids, total);
+        }
+
+        // A direct list query: the active base rows, joined with LEFT JOIN to each page holding a grid column, where
+        // some grid column, converted as AAP 0.3.4.4 defines (CONVERT(nvarchar(max), column), style 23 for a datetime,
+        // under the grid filter's collation), satisfies the term; the first page of ids in UniqueKey order and the total.
+        private async Task<ListRows> DirectListAsync(string q, Func<string, string> term, CancellationToken cancellationToken)
+        {
+            var baseId = SqlIdentifier.Quote(RecordSqlBuilder.Require(Schema.GlobalRecordId));
+            var from = new StringBuilder(" FROM ").Append(SqlIdentifier.Quote(Schema.BaseTable)).Append(" b");
+            var joinedPages = new HashSet<int>();
+            var terms = new List<string>(Grid.Count);
+            foreach (var field in Grid)
+            {
+                var (table, column) = PageColumn(field.Name);
+                var alias = "t" + field.Page.PageId.ToString(CultureInfo.InvariantCulture);
+                if (joinedPages.Add(field.Page.PageId))
+                {
+                    from.Append(" LEFT JOIN ").Append(table).Append(' ').Append(alias)
+                        .Append(" ON ").Append(alias).Append('.').Append(PageKey(field.Name))
+                        .Append(" = b.").Append(baseId);
+                }
+
+                var isDateTime = DataColumn(field).Metadata.Family == ColumnFamily.DateTime;
+                var style = isDateTime ? ", " + IsoDateStyle : string.Empty;
+                terms.Add(term($"CONVERT(nvarchar(max), {alias}.{column}{style}) COLLATE {GridFilterCollation}"));
+            }
+
+            Assert.NotEmpty(terms);
+            var where = $" WHERE b.{SqlIdentifier.Quote(RecordSqlBuilder.Require(Schema.RecStatus))} = 1" +
+                $" AND ({string.Join(" OR ", terms)})";
+            var sql = $"SELECT TOP (@pageSize) b.{baseId}{from}{where}" +
+                $" ORDER BY b.{SqlIdentifier.Quote(RecordSqlBuilder.Require(Schema.UniqueKey))};" +
+                $" SELECT COUNT_BIG(*){from}{where};";
+
+            var (ids, total) = await ReadIdsAndTotalAsync(
+                sql,
+                [
+                    TextParameter("@q", q),
+                    new SqlParameter("@pageSize", SqlDbType.Int) { Value = RecordQueryRules.MaxPageSize },
+                ],
+                cancellationToken);
+            return new ListRows(ids, total);
+        }
+
+        // Runs a direct query, outside the recorder, whose first result holds ids and whose second holds one count.
+        private async Task<(IReadOnlyList<string> Ids, long Total)> ReadIdsAndTotalAsync(
+            string sql,
+            IReadOnlyList<SqlParameter> parameters,
+            CancellationToken cancellationToken)
+        {
+            await using var connection = await TestDatabase.OpenConnectionAsync(cancellationToken);
+            await using var command = new SqlCommand(sql, connection) { CommandTimeout = Options.CommandTimeoutSeconds };
+            foreach (var parameter in parameters)
+            {
+                command.Parameters.Add(parameter);
+            }
+
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+            var ids = new List<string>();
+            while (await reader.ReadAsync(cancellationToken))
+            {
+                ids.Add(reader.GetString(0));
+            }
+
+            Assert.True(await reader.NextResultAsync(cancellationToken), "The direct query returned no count.");
+            Assert.True(await reader.ReadAsync(cancellationToken), "The direct query returned no count row.");
+            return (ids, reader.GetInt64(0));
+        }
+
+        // A text parameter of a direct query, nvarchar(max), so it takes the collation of the column it is compared with.
+        private static SqlParameter TextParameter(string name, string value) =>
+            new(name, SqlDbType.NVarChar, -1) { Value = value };
+
+        private static async Task<FindRows> ReadFindRowsAsync(DbDataReader reader, CancellationToken cancellationToken)
+        {
+            var ids = new List<string>();
+            var totals = new HashSet<long>();
+            while (await reader.ReadAsync(cancellationToken))
+            {
+                ids.Add(reader.GetString(SearchSqlBuilder.IdOrdinal));
+                totals.Add(reader.GetInt64(SearchSqlBuilder.TotalOrdinal));
+            }
+
+            // Every row carries the same total; a Find with no row has no match.
+            return new FindRows(ids, totals.Count == 0 ? 0 : Assert.Single(totals));
+        }
+
+        private static async Task<IReadOnlyList<string>> ReadIdsAsync(DbDataReader reader, CancellationToken cancellationToken)
+        {
+            var ids = new List<string>();
+            while (await reader.ReadAsync(cancellationToken))
+            {
+                ids.Add(reader.GetString(SearchSqlBuilder.IdOrdinal));
+            }
+
+            return ids;
         }
     }
 }

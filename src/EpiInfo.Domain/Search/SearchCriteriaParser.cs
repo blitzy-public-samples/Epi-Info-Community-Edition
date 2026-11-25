@@ -15,26 +15,32 @@ namespace EpiInfo.Domain.Search;
 /// failure (<see cref="FieldErrors"/>, the <c>errors</c> map of an <c>HttpValidationProblemDetails</c>).
 /// </summary>
 /// <remarks>
-/// Instances are immutable, so one can be read from any thread. No message carries a submitted value, as the
-/// redaction policy requires of every error body.
+/// Instances are immutable, so one can be read from any thread: each factory keeps its own copy of what it is
+/// given, and each read of <see cref="FieldErrors"/> returns a new copy that the caller owns, so changing an input
+/// or a returned array never changes the result. No message carries a submitted value, as the redaction policy
+/// requires of every error body.
 /// </remarks>
 public sealed class SearchParseResult
 {
-    private static readonly IReadOnlyDictionary<string, string[]> NoErrors =
-        new ReadOnlyDictionary<string, string[]>(new Dictionary<string, string[]>(StringComparer.Ordinal));
+    private static readonly ReadOnlyDictionary<string, ReadOnlyCollection<string>> NoErrors =
+        new(new OrderedDictionary<string, ReadOnlyCollection<string>>(StringComparer.Ordinal));
+
+    // The result's own errors: ordinal keys in the order they were reported, each with a message list no caller can
+    // write to. FieldErrors hands out copies of it and never the store itself.
+    private readonly ReadOnlyDictionary<string, ReadOnlyCollection<string>> _fieldErrors;
 
     private SearchParseResult(
         IReadOnlyList<SearchCondition> conditions,
         string? requestError,
-        IReadOnlyDictionary<string, string[]> fieldErrors)
+        ReadOnlyDictionary<string, ReadOnlyCollection<string>> fieldErrors)
     {
         Conditions = conditions;
         RequestError = requestError;
-        FieldErrors = fieldErrors;
+        _fieldErrors = fieldErrors;
     }
 
     /// <summary>Whether the criteria parsed, so <see cref="Conditions"/> holds the search.</summary>
-    public bool IsSuccess => RequestError is null && FieldErrors.Count == 0;
+    public bool IsSuccess => RequestError is null && _fieldErrors.Count == 0;
 
     /// <summary>
     /// One condition per searched field, in the order the criteria named them, each holding its alternatives in
@@ -51,8 +57,22 @@ public sealed class SearchParseResult
     /// <summary>
     /// The <c>errors</c> map of a field-level 400, keyed ordinally by the canonical field name, or by
     /// <see cref="SearchCriteriaParser.CriteriaKey"/> for errors about the criteria list itself; empty otherwise.
+    /// Each read returns a new read-only dictionary of new arrays, in the order the errors were reported, that the
+    /// caller owns: changing a returned array never changes this result.
     /// </summary>
-    public IReadOnlyDictionary<string, string[]> FieldErrors { get; }
+    public IReadOnlyDictionary<string, string[]> FieldErrors
+    {
+        get
+        {
+            var copy = new OrderedDictionary<string, string[]>(_fieldErrors.Count, StringComparer.Ordinal);
+            foreach (var (key, messages) in _fieldErrors)
+            {
+                copy.Add(key, [.. messages]);
+            }
+
+            return new ReadOnlyDictionary<string, string[]>(copy);
+        }
+    }
 
     /// <summary>Creates a successful result.</summary>
     /// <param name="conditions">The parsed conditions; at least one, none null.</param>
@@ -102,7 +122,7 @@ public sealed class SearchParseResult
     {
         ArgumentNullException.ThrowIfNull(errors);
 
-        var copy = new Dictionary<string, string[]>(errors.Count, StringComparer.Ordinal);
+        var copy = new OrderedDictionary<string, ReadOnlyCollection<string>>(errors.Count, StringComparer.Ordinal);
         foreach (var (key, messages) in errors)
         {
             if (messages is not { Length: > 0 } || Array.Exists(messages, string.IsNullOrWhiteSpace))
@@ -110,7 +130,7 @@ public sealed class SearchParseResult
                 throw new ArgumentException("Each error key needs at least one non-blank message.", nameof(errors));
             }
 
-            copy.Add(key, [.. messages]);
+            copy.Add(key, Array.AsReadOnly<string>([.. messages]));
         }
 
         if (copy.Count == 0)
@@ -118,7 +138,7 @@ public sealed class SearchParseResult
             throw new ArgumentException("A field-level failure needs at least one error.", nameof(errors));
         }
 
-        return new SearchParseResult([], null, new ReadOnlyDictionary<string, string[]>(copy));
+        return new SearchParseResult([], null, new ReadOnlyDictionary<string, ReadOnlyCollection<string>>(copy));
     }
 }
 
@@ -241,7 +261,10 @@ public static class SearchCriteriaParser
     /// </summary>
     /// <param name="dataFields">
     /// The form's data fields, from <see cref="FormDefinitionFactory.GetDataFields"/>. Labels, groups, unsupported
-    /// fields and system rows are absent from it, so they are never searchable.
+    /// fields (Yes/No included) and the system rows are absent from it, so labels, groups and unsupported fields are
+    /// never searchable. Of the system rows, only <see cref="GlobalRecordIdFieldName"/> and
+    /// <see cref="RecStatusFieldName"/> are searchable, resolved separately as base-table criteria; <c>UniqueKey</c>
+    /// is not.
     /// </param>
     /// <param name="criteria">The criteria as received, in request order; any entry may be malformed.</param>
     /// <returns>

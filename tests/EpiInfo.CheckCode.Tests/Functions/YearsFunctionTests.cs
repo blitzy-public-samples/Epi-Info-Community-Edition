@@ -16,6 +16,7 @@ public sealed class YearsFunctionTests
     [InlineData(2000, 2, 29, 2011, 2, 28, 11)] // EC-AGE-03: kept legacy defect; a birthday-based age is 10
     [InlineData(2011, 6, 15, 2011, 6, 15, 0)] // EC-AGE-04
     [InlineData(2011, 5, 11, 1986, 1, 1, -25)] // the first date is later, so the count is negated
+    [InlineData(2011, 2, 28, 2000, 2, 29, -11)] // EC-AGE-03 reversed: the kept leap-day defect, negated
     [InlineData(2000, 2, 29, 2010, 2, 28, 10)]
     [InlineData(2000, 1, 1, 2011, 1, 1, 11)]
     public void TwoDatesGiveTheLegacyYearCount(
@@ -35,6 +36,22 @@ public sealed class YearsFunctionTests
         var result = YearsFunction.Invoke([Date(2000, 2, 29), Date(2011, 2, 28)]);
 
         AssertNumber(11, result);
+    }
+
+    [Theory]
+    [InlineData(2011, 1, 2, 2011, 1, 1)] // one day
+    [InlineData(2011, 6, 15, 2011, 1, 1)]
+    [InlineData(2011, 12, 31, 2011, 1, 1)] // 364 days, the longest span the tick-based count makes 0 years
+    public void ReversedSpanUnderAYearGivesPositiveZero(
+        int firstYear, int firstMonth, int firstDay, int secondYear, int secondMonth, int secondDay)
+    {
+        // Legacy negates the integer year count, and an integer has no negative zero, so a later first date
+        // less than a year ahead gives 0. Equality cannot tell 0 from -0, so the sign bit is checked as well.
+        var result = YearsFunction.Invoke([Date(firstYear, firstMonth, firstDay), Date(secondYear, secondMonth, secondDay)]);
+
+        AssertNumber(0, result);
+        Assert.True(result.Value.TryGetNumber(out var number));
+        Assert.False(double.IsNegative(number));
     }
 
     [Fact]
