@@ -1,8 +1,8 @@
 // Composition root of the EpiInfo web API. It builds the ASP.NET Core host, refuses every listen setting that does
-// not bind 127.0.0.1 exactly (LoopbackBindingGuard), loads the Kestrel endpoints with configuration reload off and
-// applies the configured request body limit, logs through the JSON console provider only, warns at startup when the
-// database connection string is not configured, and serves the built web client with its index.html fallback
-// (ClientAppHosting).
+// not bind 127.0.0.1 exactly and answers every request whose Host is not 127.0.0.1 or localhost with a 400
+// (LoopbackBindingGuard), loads the Kestrel endpoints with configuration reload off and applies the configured
+// request body limit, logs through the JSON console provider only, warns at startup when the database connection
+// string is not configured, and serves the built web client with its index.html fallback (ClientAppHosting).
 using EpiInfo.Api.Hosting;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -41,6 +41,11 @@ if (!ApiOptions.FromConfiguration(app.Configuration).HasConnectionString)
         "Configuration key {ConfigurationKey} is not set; database-backed endpoints and /health return 503.",
         ApiOptions.ConnectionStringKey);
 }
+
+// Before routing, the endpoints, OpenAPI and the static client, so a request whose Host is not 127.0.0.1 or localhost
+// is answered 400 before anything is served. Exception handling and status-code pages, when registered, come before
+// it; nothing that serves content does.
+app.UseLoopbackHostGuard();
 
 app.UseRouting();
 

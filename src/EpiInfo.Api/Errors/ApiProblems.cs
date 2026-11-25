@@ -60,6 +60,9 @@ public static class ApiProblems
     /// <summary>The <c>detail</c> of a request-level 400 for any other request the binder rejects.</summary>
     public const string InvalidRequestDetail = "the request is invalid";
 
+    /// <summary>The <c>detail</c> of the request-level 400 for a <c>Host</c> not 127.0.0.1 or localhost.</summary>
+    public const string HostNotAllowedDetail = "the request host is not allowed";
+
     /// <summary>The <c>detail</c> of the 404 for a <c>viewId</c> that is not in <c>metaViews</c>.</summary>
     public const string FormNotFoundDetail = "the form does not exist";
 
@@ -307,6 +310,9 @@ public static class ApiProblems
 
     /// <summary>The request-level 400 <see cref="InvalidRequestDetail"/>.</summary>
     public static IResult InvalidRequest() => RequestLevel(InvalidRequestDetail);
+
+    /// <summary>The request-level 400 <see cref="HostNotAllowedDetail"/>.</summary>
+    public static IResult HostNotAllowed() => RequestLevel(HostNotAllowedDetail);
 
     /// <summary>The 404 <see cref="FormNotFoundDetail"/>.</summary>
     public static IResult FormNotFound() => Create(StatusCodes.Status404NotFound, FormNotFoundDetail);

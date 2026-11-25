@@ -1,3 +1,5 @@
+using EpiInfo.Api.Errors;
+
 namespace EpiInfo.Api.Hosting;
 
 /// <summary>
@@ -5,8 +7,25 @@ namespace EpiInfo.Api.Hosting;
 /// <c>127.0.0.1</c> exactly. It reads configuration only, so it runs before any socket opens and a rejected
 /// setting never listens. For a server that opens sockets, <see cref="FreezeListenSettings"/> then reads the listen
 /// settings once more, fails when none is configured, and gives Kestrel and the host a fixed copy of exactly the
-/// values it verified, so a settings file that changes afterwards cannot alter what is bound.
+/// values it verified, so a settings file that changes afterwards cannot alter what is bound. Once the API runs,
+/// <see cref="UseLoopbackHostGuard"/> answers every request whose HTTP <c>Host</c> is not <see cref="AllowedHost"/>
+/// or <see cref="LocalhostName"/> with a 400, before anything is served.
 /// </summary>
+/// <remarks>
+/// <para>
+/// A loopback socket bounds which machine can connect, not which HTTP authority a request names. Through DNS
+/// rebinding, a page from another site points its own host name at <c>127.0.0.1</c>, so the browser sends the
+/// page's requests to this unauthenticated API and lets the page read the answers as same-origin. Such a request
+/// still carries that other name in its <c>Host</c>, which is why every request's authority is checked as well as
+/// every listen setting.
+/// </para>
+/// <para>
+/// The allowed request hosts are fixed in code and read from no configuration, as the listen settings are pinned, so
+/// no setting or environment variable can widen them. The framework's host filtering is not relied on: it takes its
+/// list from the <c>AllowedHosts</c> setting, allows every host when that is unset, and answers a rejected host with
+/// a body that is not ProblemDetails.
+/// </para>
+/// </remarks>
 public static class LoopbackBindingGuard
 {
     /// <summary>Host key fed by <c>ASPNETCORE_URLS</c>, <c>DOTNET_URLS</c> and <c>--urls</c>; may hold several URLs separated by <c>;</c>.</summary>
@@ -21,8 +40,15 @@ public static class LoopbackBindingGuard
     /// <summary>Section whose named children each carry one Kestrel endpoint <c>Url</c>.</summary>
     public const string KestrelEndpointsSection = "Kestrel:Endpoints";
 
-    /// <summary>The only host a listen URL may name.</summary>
+    /// <summary>The only host a listen URL may name, and one of the two a request <c>Host</c> may carry.</summary>
     public const string AllowedHost = "127.0.0.1";
+
+    /// <summary>
+    /// The client name a request <c>Host</c> may carry besides <see cref="AllowedHost"/>: the default
+    /// <c>E2E_BASE_URL</c> <c>http://localhost:5000</c>, and the Vite development origin <c>localhost:5173</c>, whose
+    /// proxy forwards the browser's <c>Host</c>. It is never allowed as a listen host.
+    /// </summary>
+    public const string LocalhostName = "localhost";
 
     private const string EndpointUrlKey = "Url";
 
@@ -47,6 +73,9 @@ public static class LoopbackBindingGuard
 
     // The host keys the generic web host reads when it starts the server, beside the Kestrel section.
     private static readonly string[] HostListenKeys = [UrlsKey, HttpPortsKey, HttpsPortsKey, PreferHostingUrlsKey];
+
+    // The host names a request may carry, fixed here and never read from configuration, so no setting can widen them.
+    private static readonly string[] AllowedRequestHosts = [AllowedHost, LocalhostName];
 
     /// <summary>
     /// Throws when any listen setting in <paramref name="configuration"/> breaks the loopback rule, naming every
@@ -169,6 +198,43 @@ public static class LoopbackBindingGuard
         }
 
         return SpellsLoopbackUrl(url);
+    }
+
+    /// <summary>
+    /// Whether <paramref name="host"/>, a request's <c>Host</c>, names <see cref="AllowedHost"/> or
+    /// <see cref="LocalhostName"/>. Only the host part is compared, case-insensitively, and any port is ignored. A
+    /// missing or empty value fails, and so does every other name or address: another <c>127.x</c> address,
+    /// <c>[::1]</c>, <c>0.0.0.0</c>, a name that only begins or ends with an allowed one, a name with a trailing dot,
+    /// and a value carrying user information. Never throws.
+    /// </summary>
+    /// <param name="host">The request's <c>Host</c>, as <see cref="HttpRequest.Host"/> holds it.</param>
+    public static bool IsAllowedRequestHost(HostString host)
+    {
+        if (!host.HasValue)
+        {
+            return false;
+        }
+
+        return AllowedRequestHosts.Contains(host.Host, StringComparer.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Adds the per-request authority check: a request whose <c>Host</c> fails <see cref="IsAllowedRequestHost"/> is
+    /// answered with the request-level 400 <see cref="ApiProblems.HostNotAllowedDetail"/>, and the rest of the
+    /// pipeline never runs. Call it after the exception handler and status-code pages and before <c>UseRouting</c>,
+    /// so no endpoint, OpenAPI document or client file is served under any other name. Nothing is logged, and the
+    /// rejected value is never written to the response.
+    /// </summary>
+    /// <param name="app">The application builder.</param>
+    /// <returns>The same builder, for chaining.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="app"/> is <see langword="null"/>.</exception>
+    public static IApplicationBuilder UseLoopbackHostGuard(this IApplicationBuilder app)
+    {
+        ArgumentNullException.ThrowIfNull(app);
+
+        return app.Use(next => context => IsAllowedRequestHost(context.Request.Host)
+            ? next(context)
+            : ApiProblems.WriteAsync(context, ApiProblems.HostNotAllowed()));
     }
 
     // Kestrel does not parse listen URLs with Uri. It takes the scheme as the text before "://" and the host as the
