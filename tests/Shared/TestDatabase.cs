@@ -24,7 +24,10 @@ namespace EpiInfo.Tests.Shared;
 /// <para>
 /// An unconfigured or unreachable database makes an integration test fail with
 /// <see cref="TestDatabaseUnavailableException"/>; integration tests never skip. Messages name the
-/// server and database at most, never the password or the connection string.
+/// server and database at most, never the password or the connection string, plus the failure's type and
+/// SQL error number. The SqlClient exception behind the failure is never attached as the inner exception,
+/// because its text can quote the login or other connection-string content and test runners print every
+/// inner exception.
 /// </para>
 /// </remarks>
 public static class TestDatabase
@@ -59,6 +62,7 @@ public static class TestDatabase
     private const string MarkerPrefix = "T-";
     private const string Login = "sa";
     private const int ProbeTimeoutSeconds = 5;
+    private const string UnreachableSubject = "The rehearsal database is not reachable";
 
     private const string Guidance =
         "Integration tests need the rehearsal database. Set " + ConnectionStringVariable +
@@ -89,7 +93,8 @@ public static class TestDatabase
     /// such as <c>Pooling</c>, <c>ConnectTimeout</c> or <c>ApplicationName</c> without affecting others.
     /// </summary>
     /// <exception cref="TestDatabaseUnavailableException">
-    /// The connection string is not configured, or <see cref="ConnectionStringVariable"/> does not parse.
+    /// The connection string is not configured, or <see cref="ConnectionStringVariable"/> does not parse. The
+    /// parser's exception is not attached, because its message can quote part of the value.
     /// </exception>
     public static SqlConnectionStringBuilder Builder()
     {
@@ -98,20 +103,25 @@ public static class TestDatabase
         {
             return new SqlConnectionStringBuilder(connectionString);
         }
-        catch (ArgumentException failure)
+        catch (Exception failure) when (
+            failure is ArgumentException or FormatException or OverflowException or NotSupportedException)
         {
-            // The parser's message names a keyword or an index, never a value; the value is not repeated.
+            // Every failure the parser raises: a malformed string, an unsupported keyword or an out-of-range value
+            // (ArgumentException), a boolean or integer setting that does not convert (FormatException), an integer
+            // beyond Int32 (OverflowException), or a keyword this platform does not support (NotSupportedException).
+            // Neither the parser's message nor its exception is passed on: an unsupported keyword and a value that
+            // does not convert are quoted in it, and that text can be part of a password that holds an unquoted ';'.
             throw new TestDatabaseUnavailableException(
-                $"The value of {ConnectionStringVariable} is not a valid SQL Server connection string. {Guidance}",
-                failure);
+                $"The value of {ConnectionStringVariable} is not a valid SQL Server connection string. {Guidance}");
         }
     }
 
     /// <summary>Opens a connection to the resolved database; the caller disposes it.</summary>
     /// <param name="cancellationToken">Cancels the open.</param>
     /// <exception cref="TestDatabaseUnavailableException">
-    /// The database is not configured, or the connection cannot be opened; the original failure is the
-    /// inner exception.
+    /// The database is not configured, SqlClient rejects its connection string, or the connection cannot be opened,
+    /// including over a transport this platform does not support. An open failure's message names the server, the
+    /// database, the failure's type and its SQL error number; the SqlClient exception is not attached.
     /// </exception>
     public static Task<SqlConnection> OpenConnectionAsync(CancellationToken cancellationToken = default) =>
         OpenAsync(Builder(), cancellationToken);
@@ -123,7 +133,8 @@ public static class TestDatabase
     /// success or failure, is shared by every later caller.
     /// </summary>
     /// <exception cref="TestDatabaseUnavailableException">
-    /// The database is not configured, not reachable, refuses the login or does not answer in time.
+    /// The database is not configured, SqlClient rejects its connection string, or it is not reachable, refuses the
+    /// login or does not answer in time.
     /// </exception>
     public static Task EnsureReachableAsync() => Probe.Value;
 
@@ -172,7 +183,8 @@ public static class TestDatabase
         SqlConnectionStringBuilder target,
         CancellationToken cancellationToken)
     {
-        var connection = new SqlConnection(target.ConnectionString);
+        // Created before the try: a connection SqlClient rejects was never created, so there is nothing to dispose.
+        SqlConnection connection = CreateConnection(target);
         try
         {
             await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
@@ -180,10 +192,14 @@ public static class TestDatabase
         }
         catch (Exception failure)
         {
-            connection.Dispose();
-            if (failure is SqlException or InvalidOperationException)
+            await DisposeQuietlyAsync(connection).ConfigureAwait(false);
+
+            // NotSupportedException: SqlClient raises PlatformNotSupportedException for a transport this platform
+            // lacks, such as a named pipe or LocalDB on Linux. An OperationCanceledException or any other type is
+            // rethrown unchanged.
+            if (failure is SqlException or InvalidOperationException or NotSupportedException)
             {
-                throw Unreachable(target, failure);
+                throw Unreachable(UnreachableSubject, target, failure);
             }
 
             throw;
@@ -195,8 +211,8 @@ public static class TestDatabase
         SqlConnectionStringBuilder target = Builder();
         target.ConnectTimeout = ProbeTimeoutSeconds;
 
-        await using SqlConnection connection = await OpenAsync(target, CancellationToken.None).ConfigureAwait(false);
-        await using var command = new SqlCommand("SELECT DB_NAME();", connection)
+        SqlConnection connection = await OpenAsync(target, CancellationToken.None).ConfigureAwait(false);
+        var command = new SqlCommand("SELECT DB_NAME();", connection)
         {
             CommandTimeout = ProbeTimeoutSeconds,
         };
@@ -204,30 +220,119 @@ public static class TestDatabase
         {
             _ = await command.ExecuteScalarAsync().ConfigureAwait(false);
         }
-        catch (Exception failure) when (failure is SqlException or InvalidOperationException)
+        catch (Exception failure)
         {
-            throw Unreachable(target, failure);
+            // The probe has failed, so cleanup is best effort: a disposal error must not replace that failure.
+            await DisposeQuietlyAsync(command).ConfigureAwait(false);
+            await DisposeQuietlyAsync(connection).ConfigureAwait(false);
+            if (failure is SqlException or InvalidOperationException)
+            {
+                throw Unreachable(UnreachableSubject, target, failure);
+            }
+
+            throw;
+        }
+
+        try
+        {
+            await command.DisposeAsync().ConfigureAwait(false);
+        }
+        finally
+        {
+            await connection.DisposeAsync().ConfigureAwait(false);
         }
     }
 
-    // Names the server and database only: the password, the full connection string and
-    // SqlConnectionStringBuilder.ToString() never reach a message.
-    private static TestDatabaseUnavailableException Unreachable(SqlConnectionStringBuilder target, Exception failure)
+    /// <summary>
+    /// The one mapping from a failure to open or query the rehearsal database to the failure a test reports,
+    /// shared with <see cref="DatabaseWriteLock"/>, which passes its own <paramref name="subject"/>.
+    /// </summary>
+    /// <remarks>
+    /// Names the server and database only: the password, the full connection string and
+    /// <c>SqlConnectionStringBuilder.ToString()</c> never reach a message.
+    /// </remarks>
+    /// <param name="subject">The start of the message, naming what cannot reach the database.</param>
+    /// <param name="target">The settings of the failed connection; only its server and database are named.</param>
+    /// <param name="failure">The failure; only its type and SQL error number are named.</param>
+    /// <returns>The exception to throw, carrying the setup guidance and no inner exception.</returns>
+    internal static TestDatabaseUnavailableException Unreachable(
+        string subject,
+        SqlConnectionStringBuilder target,
+        Exception failure)
     {
         string server = string.IsNullOrWhiteSpace(target.DataSource) ? "(not set)" : target.DataSource;
         string database = string.IsNullOrWhiteSpace(target.InitialCatalog) ? "(login default)" : target.InitialCatalog;
-        string source = IsSet(ConnectionStringVariable)
-            ? $"from {ConnectionStringVariable}"
-            : $"built from {SqlHostVariable} and {PasswordVariable}";
-        string error = failure is SqlException sqlException
+
+        // The failure is not attached as the inner exception: a SqlClient message can quote the login, such as
+        // "Login failed for user '...'", or other connection-string content, and test runners print every inner
+        // exception of a failed test.
+        return new TestDatabaseUnavailableException(
+            $"{subject}: server '{server}', database '{database}' " +
+            $"(connection string {DescribeSource()}) failed with {DescribeFailure(failure)}. {Guidance}");
+    }
+
+    /// <summary>
+    /// The one place a test connection is created, shared with <see cref="DatabaseWriteLock"/>. SqlClient checks
+    /// some settings only here, after <see cref="Builder"/> has accepted the string: an unknown
+    /// <c>Type System Version</c> or <c>Transaction Binding</c>, a value over its 128-character limit such as a long
+    /// <c>Application Name</c> or password, a <c>Min Pool Size</c> above <c>Max Pool Size</c>, or an
+    /// <c>Authentication</c> setting that conflicts with another.
+    /// </summary>
+    /// <param name="target">The settings to connect with.</param>
+    /// <returns>The connection, not yet open; the caller disposes it.</returns>
+    /// <exception cref="TestDatabaseUnavailableException">
+    /// SqlClient rejects the settings. The message names where the connection string came from and carries the
+    /// setup guidance; it names no setting's value, and SqlClient's exception is not attached.
+    /// </exception>
+    internal static SqlConnection CreateConnection(SqlConnectionStringBuilder target)
+    {
+        try
+        {
+            return new SqlConnection(target.ConnectionString);
+        }
+        catch (Exception failure) when (failure is ArgumentException or NotSupportedException)
+        {
+            // Neither SqlClient's message nor its exception is passed on: either can quote connection-string content,
+            // and test runners print every inner exception.
+            throw new TestDatabaseUnavailableException(
+                $"The connection string {DescribeSource()} is not a valid SQL Server connection string. {Guidance}");
+        }
+    }
+
+    /// <summary>
+    /// Names a failure by its type and, for a <see cref="SqlException"/>, its SQL error number, never by its
+    /// message, which can quote connection-string content.
+    /// </summary>
+    /// <param name="failure">The failure to name.</param>
+    /// <returns>For example <c>SqlException (error number 18456)</c>.</returns>
+    internal static string DescribeFailure(Exception failure) =>
+        failure is SqlException sqlException
             ? string.Create(CultureInfo.InvariantCulture, $"{failure.GetType().Name} (error number {sqlException.Number})")
             : failure.GetType().Name;
 
-        return new TestDatabaseUnavailableException(
-            $"The rehearsal database is not reachable: server '{server}', database '{database}' " +
-            $"(connection string {source}) failed with {error}. {Guidance}",
-            failure);
+    /// <summary>
+    /// Disposes a connection or command on a failure path without throwing, so a disposal error cannot replace
+    /// the failure or cancellation the caller goes on to report.
+    /// </summary>
+    /// <param name="resource">The connection or command to dispose.</param>
+    /// <returns>A task that completes once disposal has finished or failed.</returns>
+    internal static async ValueTask DisposeQuietlyAsync(IAsyncDisposable resource)
+    {
+        try
+        {
+            await resource.DisposeAsync().ConfigureAwait(false);
+        }
+        catch (Exception)
+        {
+            // Deliberately swallowed: the caller rethrows the failure that led here, which this error would replace.
+        }
     }
+
+    // Names where the connection string came from, never its value.
+    private static string DescribeSource() =>
+        IsSet(ConnectionStringVariable)
+            ? $"from {ConnectionStringVariable}"
+            : $"built from {SqlHostVariable} and {PasswordVariable}";
 
     private static bool IsSet(string variable) =>
         !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable(variable));
@@ -248,7 +353,10 @@ public sealed class TestDatabaseUnavailableException : Exception
 
     /// <summary>Creates the exception with its message and the failure that caused it.</summary>
     /// <param name="message">What is missing or failed, and how to provide the database.</param>
-    /// <param name="inner">The original failure.</param>
+    /// <param name="inner">
+    /// The original failure. Pass only an exception whose text carries no connection-string content: test runners
+    /// print every inner exception, so a SqlClient or connection-string parser exception is never passed here.
+    /// </param>
     public TestDatabaseUnavailableException(string message, Exception inner)
         : base(message, inner)
     {

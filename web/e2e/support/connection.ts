@@ -112,9 +112,20 @@ export function hasDatabaseSettings(env: NodeJS.ProcessEnv = process.env): boole
  * Converts an ADO.NET-style SQL Server connection string, such as the one
  * {@link resolveConnectionString} returns, into an `mssql` pool configuration.
  *
- * Recognised keys, case-insensitive and with spaces ignored: `Server` (`Data Source`, `Address`, `Addr`,
+ * Recognised keys, case-insensitive and with whitespace ignored: `Server` (`Data Source`, `Address`, `Addr`,
  * `Network Address`), `Database` (`Initial Catalog`), `User Id` (`UID`, `User`), `Password` (`PWD`),
  * `TrustServerCertificate` and `Encrypt`; other keys are ignored, and the last occurrence of a key wins.
+ * The string is read as `tests/Shared/TestDatabase.cs` reads it through `SqlConnectionStringBuilder`:
+ * - whitespace is the .NET `char.IsWhiteSpace` set, U+0009–U+000D, U+0020, U+0085, U+00A0, U+1680,
+ *   U+2000–U+200A, U+2028, U+2029, U+202F, U+205F and U+3000, so U+0085 is whitespace and U+FEFF is not;
+ * - an unquoted empty value such as a trailing `Encrypt=` leaves its key unset and clears an earlier
+ *   occurrence or alias, while a quoted empty value (`Encrypt=""`) is an empty value and is invalid;
+ * - every non-empty `Encrypt` or `TrustServerCertificate` occurrence, under any alias, must be valid, even
+ *   one that a later occurrence replaces or clears;
+ * - `TrustServerCertificate` takes `true`, `yes`, `false` or `no`, case-insensitive, with edge whitespace
+ *   ignored; `Encrypt` takes `true`, `yes` or `Mandatory`, `false`, `no` or `Optional`, and `Strict`,
+ *   case-insensitive and untrimmed. Neither takes `1` or `0`, which SqlClient rejects.
+ *
  * The server may carry a `tcp:` prefix and a `,port` (default 1433) or a `\instance` name. Encryption is on
  * and the server certificate is verified unless the string says otherwise.
  *
@@ -127,7 +138,8 @@ export function hasDatabaseSettings(env: NodeJS.ProcessEnv = process.env): boole
  * @param options Pool size and request timeout; defaults are 2 connections and 30 seconds.
  * @returns The configuration for `new sql.ConnectionPool(…)`.
  * @throws {TestDatabaseConfigurationError} The string is malformed, lacks the server, database, user or
- * password, or holds an invalid port or boolean. The message names the key only.
+ * password, or holds an invalid port, `Encrypt` or `TrustServerCertificate` value. The message names the
+ * key only.
  * @throws {RangeError} An option is outside its documented range.
  */
 export function toMssqlConfig(connectionString: string, options?: MssqlConfigOptions): MssqlConfig {
@@ -211,13 +223,32 @@ function nonBlank(value: string | undefined): string | undefined {
   return value === undefined || value.trim() === '' ? undefined : value;
 }
 
+// The whitespace of .NET `char.IsWhiteSpace` and `string.Trim`, which SqlClient's connection-string parser
+// uses: U+0009–U+000D, U+0020, U+0085, U+00A0, U+1680, U+2000–U+200A, U+2028, U+2029, U+202F, U+205F and
+// U+3000. Unlike JavaScript's `\s` and `String.prototype.trim`, it includes U+0085 and excludes U+FEFF.
+const DOTNET_WHITESPACE = /^[\t\n\v\f\r \u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]$/;
+
+/** Whether one UTF-16 code unit is .NET whitespace ({@link DOTNET_WHITESPACE}). */
 function isWhitespace(character: string): boolean {
-  return /\s/.test(character);
+  return DOTNET_WHITESPACE.test(character);
+}
+
+/** The text without leading and trailing .NET whitespace, as `string.Trim()` returns it. */
+function trimWhitespace(text: string): string {
+  let start = 0;
+  let end = text.length;
+  while (start < end && isWhitespace(text.charAt(start))) {
+    start += 1;
+  }
+  while (end > start && isWhitespace(text.charAt(end - 1))) {
+    end -= 1;
+  }
+  return text.slice(start, end);
 }
 
 /** Double-quotes a value that `;`, a quote or edge whitespace would otherwise break, doubling inner `"`. */
 function quoteConnectionValue(value: string): string {
-  const needsQuotes = /[;'"]/.test(value) || value !== value.trim();
+  const needsQuotes = /[;'"]/.test(value) || value !== trimWhitespace(value);
   return needsQuotes ? `"${value.replaceAll('"', '""')}"` : value;
 }
 
@@ -230,7 +261,17 @@ function malformed(): TestDatabaseConfigurationError {
 /**
  * Splits a connection string into its recognised settings, following the ADO.NET rules: `;` separates
  * settings outside quotes, a key ends at its first `=`, unquoted keys and values are trimmed, and a value
- * opened by `"` or `'` runs to the matching quote, where a doubled quote is a literal one.
+ * opened by `"` or `'` runs to the matching quote, where a doubled quote is a literal one. Whitespace is the
+ * .NET set SqlClient uses ({@link DOTNET_WHITESPACE}): it includes U+0085 and excludes U+FEFF, unlike
+ * JavaScript's `\s`. The last occurrence of a key or any of its aliases wins. An unquoted value that is empty
+ * or only whitespace means the setting is unset, as `SqlConnectionStringBuilder` reads it: the key is
+ * removed, clearing any earlier occurrence or alias, so its default applies. A quoted empty value (`""` or
+ * `''`) is kept as `''`. Like `SqlConnectionStringBuilder`, which converts every occurrence as it reads it,
+ * each non-empty `Encrypt` or `TrustServerCertificate` occurrence, quoted or not and under any alias, must
+ * be valid on its own: an invalid one throws even when a later occurrence or alias replaces or clears it.
+ *
+ * @throws {TestDatabaseConfigurationError} The string is malformed, or an `Encrypt` or
+ * `TrustServerCertificate` occurrence is invalid. The message names the key only.
  */
 function parseConnectionString(connectionString: string): Map<SettingKey, string> {
   const settings = new Map<SettingKey, string>();
@@ -249,7 +290,12 @@ function parseConnectionString(connectionString: string): Map<SettingKey, string
     if (equals === -1 || (separator !== -1 && separator < equals)) {
       throw malformed();
     }
-    const key = connectionString.slice(index, equals).replace(/\s+/g, '').toLowerCase();
+    const key = connectionString
+      .slice(index, equals)
+      .split('')
+      .filter((keyCharacter) => !isWhitespace(keyCharacter))
+      .join('')
+      .toLowerCase();
     if (key === '') {
       throw malformed();
     }
@@ -259,7 +305,8 @@ function parseConnectionString(connectionString: string): Map<SettingKey, string
       index += 1;
     }
 
-    let value: string;
+    // `undefined` marks an unquoted empty value, which SqlClient reads as no value at all.
+    let value: string | undefined;
     const quote = connectionString.charAt(index);
     if (quote === '"' || quote === "'") {
       [value, index] = readQuotedValue(connectionString, index + 1, quote);
@@ -272,13 +319,19 @@ function parseConnectionString(connectionString: string): Map<SettingKey, string
     } else {
       const end = connectionString.indexOf(';', index);
       const stop = end === -1 ? length : end;
-      value = connectionString.slice(index, stop).trim();
+      const unquoted = trimWhitespace(connectionString.slice(index, stop));
+      value = unquoted === '' ? undefined : unquoted;
       index = stop;
     }
 
     const settingKey = SETTING_KEYS.get(key);
     if (settingKey !== undefined) {
-      settings.set(settingKey, value);
+      if (value === undefined) {
+        settings.delete(settingKey);
+      } else {
+        validateOccurrence(settingKey, value);
+        settings.set(settingKey, value);
+      }
     }
   }
 
@@ -361,33 +414,55 @@ function parseServer(value: string): ServerTarget {
   return instanceName === undefined ? { host, port: DEFAULT_PORT } : { host, instanceName };
 }
 
-function parseBoolean(value: string, keyName: string): boolean {
-  switch (value.trim().toLowerCase()) {
-    case 'true':
-    case 'yes':
-    case '1':
-      return true;
-    case 'false':
-    case 'no':
-    case '0':
-      return false;
-    default:
-      throw new TestDatabaseConfigurationError(
-        withGuidance(`The connection string has an invalid ${keyName} value.`),
-      );
+/**
+ * Checks one non-empty occurrence of a setting that `SqlConnectionStringBuilder` converts as it reads it,
+ * so an invalid occurrence fails even when a later occurrence or alias replaces or clears it.
+ */
+function validateOccurrence(key: SettingKey, value: string): void {
+  if (key === 'encrypt') {
+    parseEncrypt(value);
+  } else if (key === 'trustServerCertificate') {
+    parseBoolean(value, SETTING_NAMES.trustServerCertificate);
   }
 }
 
-/** `Encrypt` also takes the SqlClient 5 spellings `Mandatory`, `Optional` and `Strict` (TDS 8.0). */
+function invalidValue(keyName: string): TestDatabaseConfigurationError {
+  return new TestDatabaseConfigurationError(withGuidance(`The connection string has an invalid ${keyName} value.`));
+}
+
+// SqlClient's boolean spellings, case-insensitive once .NET whitespace is trimmed; it rejects `1` and `0`.
+function parseBoolean(value: string, keyName: string): boolean {
+  switch (trimWhitespace(value).toLowerCase()) {
+    case 'true':
+    case 'yes':
+      return true;
+    case 'false':
+    case 'no':
+      return false;
+    default:
+      throw invalidValue(keyName);
+  }
+}
+
+/**
+ * `Encrypt` takes the spellings of SqlClient 5's `SqlConnectionEncryptOption`: `true`, `yes` or `Mandatory`;
+ * `false`, `no` or `Optional`; and `Strict` (TDS 8.0). Like SqlClient under the invariant culture, it
+ * matches them case-insensitively but untrimmed, so a quoted value with edge whitespace is invalid, as are
+ * `1` and `0`.
+ */
 function parseEncrypt(value: string): boolean | 'strict' {
-  switch (value.trim().toLowerCase()) {
+  switch (value.toLowerCase()) {
+    case 'true':
+    case 'yes':
     case 'mandatory':
       return true;
+    case 'false':
+    case 'no':
     case 'optional':
       return false;
     case 'strict':
       return 'strict';
     default:
-      return parseBoolean(value, SETTING_NAMES.encrypt);
+      throw invalidValue(SETTING_NAMES.encrypt);
   }
 }

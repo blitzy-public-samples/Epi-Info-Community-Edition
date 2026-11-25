@@ -292,7 +292,9 @@ public sealed class SqlSnapshot
     /// Captures every table on a new connection to the test database, which it closes afterwards.
     /// </summary>
     /// <param name="cancellationToken">Cancels the open and the reads.</param>
-    /// <exception cref="TestDatabaseUnavailableException">The test database is not configured or not reachable.</exception>
+    /// <exception cref="TestDatabaseUnavailableException">
+    /// The test database is not configured, SqlClient rejects its connection string, or it is not reachable.
+    /// </exception>
     /// <exception cref="InvalidOperationException">A table holds a <c>NULL</c> or duplicate <c>GlobalRecordId</c>.</exception>
     /// <remarks>
     /// Reads as <see cref="CaptureAsync(SqlConnection, CancellationToken)"/> does, so the same lock rule applies.

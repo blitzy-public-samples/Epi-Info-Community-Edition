@@ -103,7 +103,9 @@ public sealed class DatabaseWriteLock : IAsyncDisposable
     /// </summary>
     /// <param name="cancellationToken">Cancels the connection and the wait.</param>
     /// <returns>The held lock; dispose it to release.</returns>
-    /// <exception cref="TestDatabaseUnavailableException">The database is not configured or not reachable.</exception>
+    /// <exception cref="TestDatabaseUnavailableException">
+    /// The database is not configured, SqlClient rejects its connection string, or it is not reachable.
+    /// </exception>
     /// <exception cref="InvalidOperationException">
     /// <c>sp_getapplock</c> did not grant the lock: it timed out, was cancelled, chose this request as a deadlock
     /// victim, or rejected the call.
@@ -117,7 +119,9 @@ public sealed class DatabaseWriteLock : IAsyncDisposable
     /// </summary>
     /// <param name="cancellationToken">Cancels the connection and the wait.</param>
     /// <returns>The held lock; dispose it to release.</returns>
-    /// <exception cref="TestDatabaseUnavailableException">The database is not configured or not reachable.</exception>
+    /// <exception cref="TestDatabaseUnavailableException">
+    /// The database is not configured, SqlClient rejects its connection string, or it is not reachable.
+    /// </exception>
     /// <exception cref="InvalidOperationException">
     /// <c>sp_getapplock</c> did not grant the lock: it timed out, was cancelled, chose this request as a deadlock
     /// victim, or rejected the call.
@@ -132,7 +136,7 @@ public sealed class DatabaseWriteLock : IAsyncDisposable
     /// <remarks>
     /// A failed release never throws, so it cannot replace an exception the test raised inside its
     /// <c>await using</c> block. Closing the unpooled session has released the lock by then, so the failure is
-    /// only written to <see cref="Trace"/>.
+    /// only written to <see cref="Trace"/>, and a trace listener that throws is ignored.
     /// </remarks>
     public async ValueTask DisposeAsync()
     {
@@ -173,13 +177,13 @@ public sealed class DatabaseWriteLock : IAsyncDisposable
         if (closeFailure is not null)
         {
             string release = releaseFailure is null ? "succeeded" : "also failed (" + releaseFailure + ")";
-            Trace.WriteLine(
+            TraceBestEffort(
                 $"DatabaseWriteLock: closing the session of the {Mode} lock '{ResourceName}' failed ({closeFailure}); " +
                 $"the release {release}.");
         }
         else if (releaseFailure is not null)
         {
-            Trace.WriteLine(
+            TraceBestEffort(
                 $"DatabaseWriteLock: releasing the {Mode} lock '{ResourceName}' failed ({releaseFailure}); " +
                 "closing its unpooled session released the lock.");
         }
@@ -194,7 +198,8 @@ public sealed class DatabaseWriteLock : IAsyncDisposable
         target.Pooling = false;
         target.ApplicationName = SessionApplicationName;
 
-        var connection = new SqlConnection(target.ConnectionString);
+        // Created before the try: a connection SqlClient rejects was never created, so there is nothing to dispose.
+        SqlConnection connection = TestDatabase.CreateConnection(target);
         try
         {
             await OpenAsync(connection, target, cancellationToken).ConfigureAwait(false);
@@ -213,14 +218,19 @@ public sealed class DatabaseWriteLock : IAsyncDisposable
         catch (Exception failure) when (
             cancellationToken.IsCancellationRequested && failure is not OperationCanceledException)
         {
-            // SqlClient reports a cancelled command as a SqlException; the caller asked for cancellation.
-            await connection.DisposeAsync().ConfigureAwait(false);
+            // SqlClient reports a cancelled command as a SqlException; the caller asked for cancellation. The failure
+            // is named, not attached, because a SqlClient message can quote connection-string content; only a
+            // TestDatabaseUnavailableException, already redacted, is kept as the inner exception.
+            await TestDatabase.DisposeQuietlyAsync(connection).ConfigureAwait(false);
             throw new OperationCanceledException(
-                $"Acquiring the {mode} test lock '{ResourceName}' was cancelled.", failure, cancellationToken);
+                $"Acquiring the {mode} test lock '{ResourceName}' was cancelled " +
+                $"({TestDatabase.DescribeFailure(failure)}).",
+                failure as TestDatabaseUnavailableException,
+                cancellationToken);
         }
         catch
         {
-            await connection.DisposeAsync().ConfigureAwait(false);
+            await TestDatabase.DisposeQuietlyAsync(connection).ConfigureAwait(false);
             throw;
         }
     }
@@ -235,9 +245,14 @@ public sealed class DatabaseWriteLock : IAsyncDisposable
             await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
         }
         catch (Exception failure) when (
-            !cancellationToken.IsCancellationRequested && failure is SqlException or InvalidOperationException)
+            !cancellationToken.IsCancellationRequested &&
+            failure is SqlException or InvalidOperationException or NotSupportedException)
         {
-            throw Unreachable(target, failure);
+            // NotSupportedException: SqlClient raises PlatformNotSupportedException for a transport this platform
+            // lacks, such as a named pipe or LocalDB on Linux. A failure once cancellation is requested, and any other
+            // type, propagates unchanged to AcquireAsync.
+            throw TestDatabase.Unreachable(
+                $"The test lock '{ResourceName}' cannot reach the rehearsal database", target, failure);
         }
     }
 
@@ -286,6 +301,20 @@ public sealed class DatabaseWriteLock : IAsyncDisposable
 
     private static string TypeName(Exception exception) => exception.GetType().FullName ?? exception.GetType().Name;
 
+    // Trace calls every registered listener; one that throws must not turn a best-effort diagnostic into an
+    // exception from DisposeAsync. The message names only the mode, the resource, a return code or a type.
+    private static void TraceBestEffort(string message)
+    {
+        try
+        {
+            Trace.WriteLine(message);
+        }
+        catch (Exception)
+        {
+            // Deliberately swallowed: the diagnostic is optional, and the release and close have already run.
+        }
+    }
+
     private static string DescribeRequestCode(int code) => code switch
     {
         -1 => "the request timed out after 300 seconds; another test process or the Playwright smoke test still holds it",
@@ -294,21 +323,4 @@ public sealed class DatabaseWriteLock : IAsyncDisposable
         -999 => "a parameter validation or other call error",
         _ => "an undocumented return code",
     };
-
-    // Names the server and database only: the password and the connection string never reach the message.
-    private static TestDatabaseUnavailableException Unreachable(SqlConnectionStringBuilder target, Exception failure)
-    {
-        string server = string.IsNullOrWhiteSpace(target.DataSource) ? "(not set)" : target.DataSource;
-        string database = string.IsNullOrWhiteSpace(target.InitialCatalog) ? "(login default)" : target.InitialCatalog;
-        string error = failure is SqlException sqlException
-            ? string.Create(CultureInfo.InvariantCulture, $"{failure.GetType().Name} (error number {sqlException.Number})")
-            : failure.GetType().Name;
-
-        return new TestDatabaseUnavailableException(
-            $"The test lock '{ResourceName}' cannot reach the rehearsal database: server '{server}', database " +
-            $"'{database}' failed with {error}. Set {TestDatabase.ConnectionStringVariable} to its connection " +
-            $"string, or set {TestDatabase.SqlHostVariable} (default {TestDatabase.DefaultServer}) and " +
-            $"{TestDatabase.PasswordVariable}; see testdata/README.md.",
-            failure);
-    }
 }
