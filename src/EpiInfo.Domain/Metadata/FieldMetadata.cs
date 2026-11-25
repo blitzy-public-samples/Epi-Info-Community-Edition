@@ -44,10 +44,11 @@ public sealed record FieldMetadata
     public string? Prompt { get; init; }
 
     /// <summary>
-    /// <c>metaFields.TabIndex</c>, which orders the fields of a page; <see langword="null"/> for the
-    /// system rows.
+    /// <c>metaFields.TabIndex</c>, a SQL <c>decimal(18,0)</c> carried exactly as stored, with no
+    /// conversion. It orders the fields of a page, and <see cref="FieldId"/> breaks ties between
+    /// equal values; <see langword="null"/> for the system rows.
     /// </summary>
-    public double? TabIndex { get; init; }
+    public decimal? TabIndex { get; init; }
 
     /// <summary>
     /// <c>metaFields.PageId</c>, the page that shows the field; <see langword="null"/> for the

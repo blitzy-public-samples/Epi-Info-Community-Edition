@@ -38,8 +38,11 @@ namespace EpiInfo.Domain.Forms;
 /// control with it, and it fills the field-name placeholder of the required-field message.
 /// </param>
 /// <param name="TabIndex">
-/// The <c>metaFields.TabIndex</c> (a SQL <c>decimal</c> such as <c>9.0</c> or <c>15.0</c>), converted by the factory.
-/// Fields within a page are ordered by it, and a group's members are rendered sorted by their own tab index.
+/// The <c>metaFields.TabIndex</c>, a SQL <c>decimal(18,0)</c>, carried exactly and written as a JSON number such as
+/// <c>9</c> or <c>9007199254740993</c>. A page lists its fields in exact tab-index order, then by
+/// <c>metaFields.FieldId</c>, and a group's members are rendered sorted by their own tab index. A client that holds
+/// JSON numbers as IEEE doubles cannot tell apart values above 2^53, so for values it sees as equal it keeps the order
+/// in which the page lists the fields rather than re-sorting them into another order.
 /// </param>
 /// <param name="PageId">
 /// The <c>metaFields.PageId</c> of the page the field sits on, the <c>metaPages.PageId</c> of the enclosing page.
@@ -69,7 +72,7 @@ public sealed record FieldDefinition(
     string Name,
     FieldType FieldType,
     string? Prompt,
-    double TabIndex,
+    decimal TabIndex,
     int PageId,
     bool Unsupported,
     string? UnsupportedType,
