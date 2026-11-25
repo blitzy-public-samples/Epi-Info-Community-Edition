@@ -139,6 +139,63 @@ public sealed class EffectAccumulatorTests
     }
 
     [Fact]
+    public void DisableDisableEnableDisable_OrdersDisabledByFirstDisabledEntry()
+    {
+        var accumulator = new EffectAccumulator();
+
+        accumulator.Disable("Zeta");
+        accumulator.Disable("Alpha");
+        accumulator.Enable("Zeta");
+        accumulator.Disable("Zeta");
+        var response = accumulator.ToResponse();
+
+        // Zeta first entered "disabled" before Alpha, so it stays first after leaving and re-entering the list.
+        // Ordering by name, or by each field's latest entry (Zeta re-entered last), would give [Alpha, Zeta].
+        Assert.Equal(new[] { "Zeta", "Alpha" }, response.Disabled);
+        Assert.Empty(response.Enabled);
+        AssertNoValueEffects(response);
+        AssertNoDialogsOrDiagnostics(response);
+        AssertInvariant(response);
+    }
+
+    // Enablement and value are independent axes, so a field can sit in one list of each. Both call orders are run:
+    // a single last-call-wins state shared by the two axes would drop whichever list the earlier call put it in.
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void EnablementAndValueEffectsOnOneField_Coexist(bool enablementFirst)
+    {
+        var accumulator = new EffectAccumulator();
+
+        InCallOrder(() => accumulator.Disable("X"), () => accumulator.Assign("X", N(1)));
+        InCallOrder(() => accumulator.Enable("Y"), () => accumulator.Clear("Y"));
+        var response = accumulator.ToResponse();
+
+        Assert.Equal(new[] { "X" }, response.Disabled);
+        Assert.Equal(new[] { "Y" }, response.Enabled);
+        Assert.Equal(new[] { "Y" }, response.Cleared);
+        var assigned = Assert.Single(response.Assigned);
+        Assert.Equal("X", assigned.Key);
+        Assert.Equal(N(1), assigned.Value);
+        AssertNoDialogsOrDiagnostics(response);
+        AssertInvariant(response);
+
+        void InCallOrder(Action enablementCall, Action valueCall)
+        {
+            if (enablementFirst)
+            {
+                enablementCall();
+                valueCall();
+            }
+            else
+            {
+                valueCall();
+                enablementCall();
+            }
+        }
+    }
+
+    [Fact]
     public void AssignAssign_LaterAssignReplacesValue()
     {
         var accumulator = new EffectAccumulator();

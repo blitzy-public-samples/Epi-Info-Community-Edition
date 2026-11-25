@@ -241,6 +241,158 @@ public sealed class DiagnosticsTests
         AssertNoEffects(before);
     }
 
+    // A Field block answers its field whatever the letter case of either spelling, brackets included.
+    [Theory]
+    [InlineData("x", "X")]
+    [InlineData("X", "x")]
+    [InlineData("[x]", "X")]
+    [InlineData("[X]", "x")]
+    public void Run_MatchesTheFieldBlockToTheEventFieldWithoutRegardToCase(string programName, string requestName)
+    {
+        string program = $"""
+            Field {programName}
+            	After
+            		GOTO Y
+            		ASSIGN Z = "done"
+            	End-After
+            End-Field
+            """;
+        AssertProgramLine(program, 1, "Field " + programName);
+        AssertProgramLine(program, 3, "GOTO Y");
+
+        FieldEventResponse response = engine.Run(
+            program,
+            SyntheticForm,
+            FieldEventKind.FieldAfter,
+            requestName,
+            Values());
+
+        AssertOnlyAssigned(response, "Z", FieldValue.FromText("done"));
+        AssertDiagnostic(Assert.Single(response.Diagnostics), DiagnosticSeverity.Warning, SyntheticForm, 3, "GOTO");
+    }
+
+    // Legacy registration let the last Field block of a name replace every section of an earlier one, so only the
+    // second declaration runs, and an event it lacks finds nothing rather than the first declaration's section.
+    [Fact]
+    public void Run_UsesOnlyTheLastFieldBlockOfAName_WithNoFallBackToAnEarlierOne()
+    {
+        const string program = """
+            Field X
+            	Before
+            		DIALOG "first-before"
+            	End-Before
+            	After
+            		HIDE Y
+            		ASSIGN Z = "first"
+            	End-After
+            End-Field
+
+            Field x
+            	After
+            		GOTO Y
+            		ASSIGN Z = "second"
+            	End-After
+            End-Field
+            """;
+        AssertProgramLine(program, 6, "HIDE Y");
+        AssertProgramLine(program, 11, "Field x");
+        AssertProgramLine(program, 13, "GOTO Y");
+
+        // Both declarations are still analysed: the choice between them is made only when an event runs.
+        Assert.Collection(
+            engine.Analyze(program, SyntheticForm),
+            hide => AssertDiagnostic(hide, DiagnosticSeverity.Warning, SyntheticForm, 6, "HIDE"),
+            unsupported => AssertDiagnostic(unsupported, DiagnosticSeverity.Warning, SyntheticForm, 13, "GOTO"));
+
+        FieldEventResponse after = engine.Run(program, SyntheticForm, FieldEventKind.FieldAfter, "X", Values());
+        AssertOnlyAssigned(after, "Z", FieldValue.FromText("second"));
+        AssertDiagnostic(Assert.Single(after.Diagnostics), DiagnosticSeverity.Warning, SyntheticForm, 13, "GOTO");
+
+        FieldEventResponse before = engine.Run(program, SyntheticForm, FieldEventKind.FieldBefore, "X", Values());
+        AssertNoEffects(before);
+        Assert.Empty(before.Diagnostics);
+    }
+
+    // The section on line 5 breaks the grammar's one Before, then After, then Click (lines 620-627 of
+    // EpiInfo.Enter.Grammar.grm): a second After, or a Before after the After. It is skipped with one warning, so its
+    // ASSIGN runs on no event, and the warning reaches Analyze but not the response of the block that does run.
+    [Theory]
+    [InlineData("After", "End-After", "AFTER")]
+    [InlineData("Before", "End-Before", "BEFORE")]
+    public void Run_NeverExecutesAnEventSectionTheGrammarDoesNotAllow(string keyword, string terminator, string command)
+    {
+        string program = $"""
+            Field X
+            	After
+            		ASSIGN Z = "first"
+            	End-After
+            	{keyword}
+            		ASSIGN Y = "second"
+            	{terminator}
+            End-Field
+            """;
+        AssertProgramLine(program, 2, "After");
+        AssertProgramLine(program, 5, keyword);
+
+        FieldEventResponse after = engine.Run(program, SyntheticForm, FieldEventKind.FieldAfter, "X", Values());
+        AssertOnlyAssigned(after, "Z", FieldValue.FromText("first"));
+        Assert.Empty(after.Diagnostics);
+
+        FieldEventResponse before = engine.Run(program, SyntheticForm, FieldEventKind.FieldBefore, "X", Values());
+        AssertNoEffects(before);
+        Assert.Empty(before.Diagnostics);
+
+        AssertDiagnostic(
+            Assert.Single(engine.Analyze(program, SyntheticForm)),
+            DiagnosticSeverity.Warning,
+            SyntheticForm,
+            5,
+            command);
+    }
+
+    // The After on line 4 repeats the one on line 2, so it is skipped through its own End-After on line 10. The Click
+    // on line 6 stands inside that section's IF, so it belongs to the skipped section: FieldClick runs only the Click
+    // on line 11, and Analyze reports the skipped After alone.
+    [Fact]
+    public void Run_NeverExecutesAnEventSectionInsideASkippedOne()
+    {
+        const string program = """
+            Field X
+            	After
+            	End-After
+            	After
+            		IF (.) THEN
+            			Click
+            				DIALOG "inside skipped section"
+            			End-Click
+            		END-IF
+            	End-After
+            	Click
+            		DIALOG "valid sibling"
+            	End-Click
+            End-Field
+            """;
+        AssertProgramLine(program, 4, "After");
+        AssertProgramLine(program, 6, "Click");
+        AssertProgramLine(program, 10, "End-After");
+        AssertProgramLine(program, 11, "Click");
+
+        FieldEventResponse click = engine.Run(program, SyntheticForm, FieldEventKind.FieldClick, "X", Values());
+        Assert.Equal(new[] { new DialogMessage("valid sibling", null) }, click.Dialogs);
+        Assert.Empty(click.Enabled);
+        Assert.Empty(click.Disabled);
+        Assert.Empty(click.Cleared);
+        Assert.Empty(click.Assigned);
+        Assert.Empty(click.Diagnostics);
+
+        AssertDiagnostic(
+            Assert.Single(engine.Analyze(program, SyntheticForm)),
+            DiagnosticSeverity.Warning,
+            SyntheticForm,
+            4,
+            "AFTER");
+    }
+
     [Fact]
     public void Diagnostics_AreInSourceOrder()
     {
@@ -275,12 +427,56 @@ public sealed class DiagnosticsTests
             hide => AssertDiagnostic(hide, DiagnosticSeverity.Warning, SyntheticForm, 3, "HIDE"),
             unsupported => AssertDiagnostic(unsupported, DiagnosticSeverity.Warning, SyntheticForm, 4, "GOTO"));
 
-        // The block's static warning is collected before the block runs and its runtime error after, so this order
-        // shows that the response is sorted by line rather than by when each diagnostic arose.
+        // The static warning on line 11 follows the ASSIGN that fails at run time on line 10, so it is added after
+        // that statement's runtime error and the two arrive in source order.
         Assert.Collection(
             engine.Run(program, SyntheticForm, FieldEventKind.FieldAfter, "Z", Values()).Diagnostics,
             error => AssertDiagnostic(error, DiagnosticSeverity.Error, SyntheticForm, 10, "ASSIGN"),
             required => AssertDiagnostic(required, DiagnosticSeverity.Warning, SyntheticForm, 11, "SET-REQUIRED"));
+    }
+
+    // Line 3 holds a statement that fails at run time (an unknown field) and a construct the parser skips, so one
+    // diagnostic of each kind shares the line: in either order, at the top level, and inside an IF's condition, its
+    // THEN branch and its ELSE branch. X is empty, so X = (.) holds and X = "1" does not. The diagnostics keep the
+    // order their constructs have on the line, and the ASSIGN on line 4 still runs.
+    [Theory]
+    [InlineData(
+        "ASSIGN NoSuchField = 1 HIDE Y",
+        new[] { DiagnosticSeverity.Error, DiagnosticSeverity.Warning },
+        new[] { "ASSIGN", "HIDE" })]
+    [InlineData(
+        "HIDE Y ASSIGN NoSuchField = 1",
+        new[] { DiagnosticSeverity.Warning, DiagnosticSeverity.Error },
+        new[] { "HIDE", "ASSIGN" })]
+    [InlineData(
+        "IF NoSuchField = 1 THEN GOTO Y END-IF",
+        new[] { DiagnosticSeverity.Error, DiagnosticSeverity.Warning },
+        new[] { "IF", "GOTO" })]
+    [InlineData(
+        "IF X = (.) THEN ASSIGN NoSuchField = 1 GOTO Y END-IF",
+        new[] { DiagnosticSeverity.Error, DiagnosticSeverity.Warning },
+        new[] { "ASSIGN", "GOTO" })]
+    [InlineData(
+        "IF X = \"1\" THEN ENABLE Y GOTO Y ELSE ASSIGN NoSuchField = 1 HIDE Y END-IF",
+        new[] { DiagnosticSeverity.Warning, DiagnosticSeverity.Error, DiagnosticSeverity.Warning },
+        new[] { "GOTO", "ASSIGN", "HIDE" })]
+    public void Run_StaticAndRuntimeDiagnosticsOnOneLine_AreInSourceOrder(
+        string statements,
+        DiagnosticSeverity[] severities,
+        string[] commands)
+    {
+        string program = UnsupportedStatementProgram(statements);
+        AssertProgramLine(program, 3, statements);
+
+        FieldEventResponse response = engine.Run(program, SyntheticForm, FieldEventKind.FieldAfter, "X", Values());
+
+        Assert.Equal(commands, response.Diagnostics.Select(diagnostic => diagnostic.Command));
+        for (int i = 0; i < commands.Length; i++)
+        {
+            AssertDiagnostic(response.Diagnostics[i], severities[i], SyntheticForm, 3, commands[i]);
+        }
+
+        AssertOnlyAssigned(response, "Z", FieldValue.FromText("done"));
     }
 
     [Fact]

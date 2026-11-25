@@ -30,7 +30,9 @@ namespace EpiInfo.CheckCode.Evaluation;
 /// </description></item>
 /// <item><description>
 /// <see cref="FieldEventResponse.Dialogs"/> keep execution order, and <see cref="FieldEventResponse.Diagnostics"/>
-/// keep source order: sorted by line, with diagnostics on the same line in the order they were added.
+/// keep source order. A diagnostic carries a line but no column, so the caller adds static and runtime diagnostics
+/// in source order, as the evaluator does at statement boundaries; the response sorts them by line with a stable
+/// sort, so diagnostics on the same line keep the order they were added in.
 /// </description></item>
 /// </list>
 /// <para>Worked examples, each a sequence of calls and the response it produces:</para>
@@ -132,10 +134,12 @@ public sealed class EffectAccumulator
     }
 
     /// <summary>
-    /// Adds the parser's diagnostics of an executed event block. Call it before the block runs, so a static
-    /// diagnostic precedes a runtime error reported on the same line.
+    /// Adds parser diagnostics of an executed event block. Add diagnostics in source order: the response keeps the
+    /// order of diagnostics on the same line as added, so the evaluator adds each static diagnostic just before the
+    /// first statement to run that starts after it, and a runtime error reported earlier on the same line stays
+    /// ahead of it.
     /// </summary>
-    /// <param name="diagnostics">The block's static diagnostics.</param>
+    /// <param name="diagnostics">Static diagnostics of the block, in source order.</param>
     /// <exception cref="ArgumentNullException"><paramref name="diagnostics"/> is <see langword="null"/>.</exception>
     /// <exception cref="ArgumentException">
     /// An entry of <paramref name="diagnostics"/> is <see langword="null"/>; nothing is added.
@@ -195,7 +199,8 @@ public sealed class EffectAccumulator
             assigned,
             _dialogs.ToArray(),
 
-            // OrderBy is a stable sort, so diagnostics on one line keep the order they were added in.
+            // Callers add diagnostics in source order. OrderBy is a stable sort, so diagnostics on one line keep the
+            // order they were added in, which is the only order a diagnostic without a column can show.
             _diagnostics.OrderBy(diagnostic => diagnostic.Line).ToArray());
     }
 

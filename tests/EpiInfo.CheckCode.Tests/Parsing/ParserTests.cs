@@ -341,6 +341,222 @@ public sealed class ParserTests
         Assert.Empty(program.Diagnostics);
     }
 
+    // Lines 620-627 allow one Before, then one After, then one Click. A section marked "!" repeats a kind or follows a
+    // later kind, so it is skipped with one warning at its keyword, and its GOTO and ASSIGN yield neither a diagnostic
+    // nor a node. Section i (0-based) opens on line 2 + 4i, with its GOTO on line 3 + 4i and its ASSIGN on 4 + 4i.
+    [Theory]
+    [InlineData("After", "After!")]
+    [InlineData("After", "Before!")]
+    [InlineData("Click", "After!")]
+    [InlineData("Before", "After", "Before!")]
+    [InlineData("Click", "Click!")]
+    [InlineData("After", "Before!", "Click")]
+    public void MisplacedEventBlockIsSkippedWithOneWarningAndTheOtherBlocksAreKept(params string[] sections)
+    {
+        string[] keywords = [.. sections.Select(section => section.TrimEnd('!'))];
+        string text = "Field F\n"
+            + string.Concat(keywords.Select((keyword, i) =>
+                $"\t{keyword}\n\t\tGOTO Z\n\t\tASSIGN A = \"s{i}\"\n\tEnd-{keyword}\n"))
+            + "End-Field\nField G\n\tBefore\n\t\tASSIGN B = \"next\"\n\tEnd-Before\nEnd-Field";
+
+        ProgramNode program = Parse(text);
+
+        Assert.Equal(new[] { "F", "G" }, program.FieldBlocks.Select(block => block.FieldName));
+        int[] kept = [.. Enumerable.Range(0, sections.Length).Where(i => !sections[i].EndsWith('!'))];
+        IReadOnlyList<EventBlockNode> events = program.FieldBlocks[0].Events;
+        Assert.Equal(kept.Length, events.Count);
+        foreach ((int index, EventBlockNode eventBlock) in kept.Zip(events))
+        {
+            Assert.Equal(Enum.Parse<FieldEventKind>("Field" + keywords[index]), eventBlock.Event);
+            Assert.Equal(2 + (4 * index), eventBlock.Line);
+            AssertAssign(Assert.Single(eventBlock.Statements), "A", $"s{index}");
+
+            // A kept block reports only its own GOTO: no skip warning lands inside it.
+            Assert.Equal(new[] { Warning(Goto, 3 + (4 * index)) }, Summaries(eventBlock.Diagnostics));
+        }
+
+        Assert.Equal(
+            sections.Select((section, i) => section.EndsWith('!')
+                ? Warning(keywords[i].ToUpperInvariant(), 2 + (4 * i))
+                : Warning(Goto, 3 + (4 * i))),
+            Summaries(program.Diagnostics));
+
+        // The block after the skipped section's field block parses untouched.
+        EventBlockNode next = Assert.Single(program.FieldBlocks[1].Events);
+        Assert.Equal(FieldEventKind.FieldBefore, next.Event);
+        AssertAssign(Assert.Single(next.Statements), "B", "next");
+        Assert.Empty(next.Diagnostics);
+    }
+
+    // A skipped section ends where a parsed one would: before the next event start (line 7), through any event
+    // terminator (End-After closes the Before of line 10), and before End-Field (line 15), which still closes F.
+    [Fact]
+    public void SkippedEventBlockEndsWhereAParsedEventBlockWould()
+    {
+        const string text = """
+            Field F
+            	After
+            		ASSIGN A = "kept"
+            	End-After
+            	After
+            		GOTO Z
+            	Click
+            		ASSIGN A = "click"
+            	End-Click
+            	Before
+            		HIDE Y
+            	End-After
+            	Click
+            		ASSIGN A = "dropped"
+            End-Field
+            Field G
+            	Before
+            		ASSIGN B = "next"
+            	End-Before
+            End-Field
+            """;
+
+        ProgramNode program = Parse(text);
+
+        Assert.Equal(new[] { "F", "G" }, program.FieldBlocks.Select(block => block.FieldName));
+        Assert.Collection(
+            program.FieldBlocks[0].Events,
+            after =>
+            {
+                Assert.Equal(FieldEventKind.FieldAfter, after.Event);
+                AssertAssign(Assert.Single(after.Statements), "A", "kept");
+                Assert.Empty(after.Diagnostics);
+            },
+            click =>
+            {
+                Assert.Equal(FieldEventKind.FieldClick, click.Event);
+                Assert.Equal(7, click.Line);
+                AssertAssign(Assert.Single(click.Statements), "A", "click");
+                Assert.Empty(click.Diagnostics);
+            });
+        AssertAssign(Assert.Single(Assert.Single(program.FieldBlocks[1].Events).Statements), "B", "next");
+
+        // One warning per skipped section; no missing or unexpected terminator, and nothing from their contents.
+        Assert.Equal(
+            new[] { Warning("AFTER", 5), Warning("BEFORE", 10), Warning("CLICK", 13) },
+            Summaries(program.Diagnostics));
+    }
+
+    // The After on line 4 repeats the kept one on line 2 and is skipped; its body is lines 5 to 4 + n, and the Click on
+    // line 5 + n is the field's real Click. The body counts each nested IF against its END-IF or END (lines 434-440),
+    // never below zero, and AUTOSEARCH's trailing ALWAYS (lines 290-293) opens nothing, so the Click and End-Click
+    // inside the IF belong to the skipped section. Rows: the IF closed, then End-After; the IF unterminated before
+    // End-After, which still ends the section; the IF closed by END-IF or by END with End-After missing, so the next
+    // event start ends the section; a stray END-IF before the IF; and an AUTOSEARCH … ALWAYS inside the IF.
+    [Theory]
+    [InlineData("IF (.) THEN", "Click", "DIALOG \"inside skipped section\"", "End-Click", "END-IF", "End-After")]
+    [InlineData("IF (.) THEN", "Click", "DIALOG \"inside skipped section\"", "End-Click", "End-After")]
+    [InlineData("IF (.) THEN", "Click", "DIALOG \"inside skipped section\"", "End-Click", "END-IF")]
+    [InlineData("IF (.) THEN", "Click", "DIALOG \"inside skipped section\"", "End-Click", "END")]
+    [InlineData(
+        "END-IF", "IF (.) THEN", "Click", "DIALOG \"inside skipped section\"", "End-Click", "END-IF", "End-After")]
+    [InlineData(
+        "IF (.) THEN", "AUTOSEARCH Y ALWAYS", "Click", "DIALOG \"inside skipped section\"", "End-Click", "END-IF")]
+    public void EventKeywordsInsideANestedIfBelongToTheSkippedSection(params string[] bodyLines)
+    {
+        string text = "Field X\n\tAfter\n\tEnd-After\n\tAfter\n"
+            + string.Concat(bodyLines.Select(line => "\t\t" + line + "\n"))
+            + "\tClick\n\t\tDIALOG \"valid sibling\"\n\tEnd-Click\nEnd-Field";
+
+        ProgramNode program = Parse(text);
+
+        Assert.Collection(
+            Assert.Single(program.FieldBlocks).Events,
+            after =>
+            {
+                Assert.Equal(FieldEventKind.FieldAfter, after.Event);
+                Assert.Equal(2, after.Line);
+                Assert.Empty(after.Statements);
+                Assert.Empty(after.Diagnostics);
+            },
+            click =>
+            {
+                Assert.Equal(FieldEventKind.FieldClick, click.Event);
+                Assert.Equal(5 + bodyLines.Length, click.Line);
+                DialogStatementNode dialog = Assert.IsType<DialogStatementNode>(Assert.Single(click.Statements));
+                Assert.Equal("valid sibling", dialog.Message);
+                Assert.Empty(click.Diagnostics);
+            });
+
+        // The skipped section's one warning: nothing from its contents, and no missing or unexpected terminator.
+        Assert.Equal(new[] { Warning("AFTER", 4) }, Summaries(program.Diagnostics));
+    }
+
+    // The skipped After on line 4 leaves its IF unterminated and has no End-After, yet End-Field on line 9 still ends
+    // it and closes F, so Field G on line 10 parses untouched.
+    [Fact]
+    public void UnterminatedIfInASkippedSectionNeverPassesEndField()
+    {
+        const string text = """
+            Field F
+            	After
+            	End-After
+            	After
+            		IF (.) THEN
+            			Click
+            				DIALOG "inside skipped section"
+            			End-Click
+            End-Field
+            Field G
+            	Click
+            		DIALOG "next field"
+            	End-Click
+            End-Field
+            """;
+
+        ProgramNode program = Parse(text);
+
+        Assert.Equal(new[] { "F", "G" }, program.FieldBlocks.Select(block => block.FieldName));
+        EventBlockNode after = Assert.Single(program.FieldBlocks[0].Events);
+        Assert.Equal(FieldEventKind.FieldAfter, after.Event);
+        Assert.Empty(after.Statements);
+        EventBlockNode click = Assert.Single(program.FieldBlocks[1].Events);
+        Assert.Equal(FieldEventKind.FieldClick, click.Event);
+        Assert.Equal(11, click.Line);
+        Assert.Equal("next field", Assert.IsType<DialogStatementNode>(Assert.Single(click.Statements)).Message);
+        Assert.Equal(new[] { Warning("AFTER", 4) }, Summaries(program.Diagnostics));
+    }
+
+    // The node keeps the grammar's order itself, through its constructor and through a with expression alike.
+    [Theory]
+    [InlineData(FieldEventKind.FieldAfter, FieldEventKind.FieldAfter)]
+    [InlineData(FieldEventKind.FieldAfter, FieldEventKind.FieldBefore)]
+    [InlineData(FieldEventKind.FieldClick, FieldEventKind.FieldAfter)]
+    [InlineData(FieldEventKind.FieldBefore, FieldEventKind.FieldAfter, FieldEventKind.FieldBefore)]
+    [InlineData(FieldEventKind.FieldClick, FieldEventKind.FieldClick)]
+    [InlineData((FieldEventKind)3)]
+    public void FieldBlockNodeRejectsEventBlocksOutsideTheGrammarOrder(params FieldEventKind[] kinds)
+    {
+        EventBlockNode[] events = [.. kinds.Select((kind, i) => new EventBlockNode(kind, 2 + i, [], []))];
+        var empty = new FieldBlockNode("F", 1, []);
+
+        ArgumentException constructed = Assert.Throws<ArgumentException>(() => new FieldBlockNode("F", 1, events));
+        Assert.Equal(nameof(FieldBlockNode.Events), constructed.ParamName);
+        ArgumentException copied = Assert.Throws<ArgumentException>(() => empty with { Events = events });
+        Assert.Equal(nameof(FieldBlockNode.Events), copied.ParamName);
+    }
+
+    [Theory]
+    [InlineData(FieldEventKind.FieldClick)]
+    [InlineData(FieldEventKind.FieldBefore, FieldEventKind.FieldClick)]
+    [InlineData(FieldEventKind.FieldAfter, FieldEventKind.FieldClick)]
+    [InlineData(FieldEventKind.FieldBefore, FieldEventKind.FieldAfter, FieldEventKind.FieldClick)]
+    public void FieldBlockNodeAcceptsEventBlocksInTheGrammarOrder(params FieldEventKind[] kinds)
+    {
+        EventBlockNode[] events = [.. kinds.Select((kind, i) => new EventBlockNode(kind, 2 + i, [], []))];
+
+        var constructed = new FieldBlockNode("F", 1, events);
+        FieldBlockNode copied = new FieldBlockNode("F", 1, []) with { Events = events };
+
+        Assert.Equal(kinds, constructed.Events.Select(eventBlock => eventBlock.Event));
+        Assert.Equal(constructed, copied);
+    }
+
     /// <summary>How a test hands a caller-owned list to a list member of a syntax record.</summary>
     public enum SnapshotPath
     {
@@ -710,6 +926,61 @@ public sealed class ParserTests
 
         FormMetadata form = TextForm("X", "Z") with { Name = "FoodHistory" };
         Assert.Equal("FoodHistory", Assert.Single(Parser.Parse(Lexer.Tokenize(text), form).Diagnostics).Form);
+    }
+
+    // A one-line IF without END-IF or END: the parser finds the missing terminator only after the statements of the
+    // branch, but reports it at the IF, which stands first on the line, so both lists order it first. The nested case
+    // finds the inner IF's terminator missing before the outer one's.
+    [Theory]
+    [InlineData("IF A = \"1\" THEN HIDE Y", new[] { Parser.Commands.If, Hide })]
+    [InlineData("IF A = \"1\" THEN IF A = \"2\" THEN HIDE Y", new[] { Parser.Commands.If, Parser.Commands.If, Hide })]
+    public void DiagnosticsFoundOutOfOrderOnOneLineAreInSourceOrder(string statement, string[] commands)
+    {
+        ProgramNode program = Parse(InAfterBlock(statement));
+
+        EventBlockNode after = OnlyEvent(program);
+        (DiagnosticSeverity Severity, string Command, int Line)[] expected =
+            [.. commands.Select(command => Warning(command, 3))];
+        Assert.Equal(expected, Summaries(program.Diagnostics));
+        Assert.Equal(expected, Summaries(after.Diagnostics));
+        Assert.Empty(after.Statements);
+    }
+
+    // Tokens no lexer produces: default(Token), and hand-built tokens at line or column 0 or below, without an end
+    // token, so the parser's own end token copies the last token's position, or with an explicit one. Each case
+    // gives the commands its diagnostics carry, in order.
+    public static TheoryData<Token[], string[]> NonPositivePositionCases => new()
+    {
+        { [default], [Parser.Commands.Syntax] },
+        { [new Token(TokenKind.Keyword, "GOTO", 0, 0)], [Goto] },
+        {
+            [
+                new Token(TokenKind.Keyword, "FIELD", 0, 0),
+                new Token(TokenKind.Identifier, "X", 0, 0),
+                new Token(TokenKind.Keyword, "AFTER", 0, 0),
+            ],
+            ["END-AFTER", Parser.Commands.EndField]
+        },
+        {
+            [
+                new Token(TokenKind.Keyword, "FIELD", 1, 1),
+                new Token(TokenKind.Identifier, "X", 1, 7),
+                new Token(TokenKind.Keyword, "AFTER", 1, 9),
+                new Token(TokenKind.EndOfInput, string.Empty, -1, -1),
+            ],
+            ["END-AFTER", Parser.Commands.EndField]
+        },
+    };
+
+    // A diagnostic's line is 1-based, so a position before the first line is reported as line 1.
+    [Theory]
+    [MemberData(nameof(NonPositivePositionCases), DisableDiscoveryEnumeration = true)]
+    public void TokensBeforeTheFirstLineReportLineOne(Token[] tokens, string[] commands)
+    {
+        ProgramNode program = Parser.Parse(tokens, "F");
+
+        Assert.Equal(commands, program.Diagnostics.Select(diagnostic => diagnostic.Command));
+        Assert.All(program.Diagnostics, diagnostic => Assert.Equal(1, diagnostic.Line));
     }
 
     [Fact]

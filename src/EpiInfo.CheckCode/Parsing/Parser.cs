@@ -28,8 +28,9 @@ namespace EpiInfo.CheckCode.Parsing;
 /// Recovery works at grammar boundaries: an unsupported statement is skipped up to the next command or block
 /// terminator, an <c>IF</c> with an unsupported condition or an <c>ELSE-IF</c> is dropped up to its own
 /// <c>END-IF</c> or <c>END</c>, an unsupported block (<c>View</c>, <c>Form</c>, <c>Record</c>, <c>Page</c>,
-/// <c>DefineVariables</c>, <c>Sub</c>) is skipped up to its <c>End-*</c> keyword, and the rest of the program
-/// still parses.
+/// <c>DefineVariables</c>, <c>Sub</c>) is skipped up to its <c>End-*</c> keyword, an event block that repeats a
+/// kind or comes after a later kind in its <c>Field</c> block is skipped through its terminator, and the rest of the
+/// program still parses.
 /// </para>
 /// <para>
 /// Diagnostics carry the form name and the 1-based line of the token where the construct starts. Their
@@ -128,8 +129,9 @@ public static class Parser
     /// The <see cref="Diagnostic.Form"/> of every diagnostic; <see langword="null"/> is treated as empty.
     /// </param>
     /// <returns>
-    /// Every <c>Field</c> block in source order and every static diagnostic in source-line order, or
-    /// <see cref="ProgramNode.Empty"/> when there is neither. Never <see langword="null"/>; the method never throws.
+    /// Every <c>Field</c> block in source order and every static diagnostic in source order, by line and then by
+    /// column, or <see cref="ProgramNode.Empty"/> when there is neither. Never <see langword="null"/>; the method
+    /// never throws.
     /// </returns>
     public static ProgramNode Parse(IReadOnlyList<Token>? tokens, string? formName) =>
         new ParseRun(tokens, formName ?? string.Empty).Execute();
@@ -318,10 +320,17 @@ public static class Parser
     private sealed record EventSyntax(FieldEventKind Kind, string Terminator);
 
     /// <summary>
-    /// What an expression's diagnostics name: the enclosing statement's keyword and line, under which a malformed
-    /// expression is reported, and the suffix saying what is skipped.
+    /// What an expression's diagnostics name: the enclosing statement's command and keyword token, at which a
+    /// malformed expression is reported, and the suffix saying what is skipped.
     /// </summary>
-    private readonly record struct ExpressionContext(string Command, int Line, string Suffix);
+    private readonly record struct ExpressionContext(string Command, Token Keyword, string Suffix);
+
+    /// <summary>
+    /// A reported diagnostic with the column of the token it was reported at. <see cref="Diagnostic"/> carries only
+    /// the line, and a diagnostic can be found after a later one on the same line, as the missing terminator of a
+    /// one-line <c>IF</c> is found after the statements of its branch, so the sinks keep the column to sort by.
+    /// </summary>
+    private readonly record struct PositionedDiagnostic(Diagnostic Diagnostic, int Column);
 
     /// <summary>
     /// Unwinds the parse to the enclosing event block's statement loop once nesting exceeds
@@ -338,10 +347,14 @@ public static class Parser
     private sealed class ParseRun(IReadOnlyList<Token>? source, string form)
     {
         private readonly List<FieldBlockNode> fieldBlocks = [];
-        private readonly List<Diagnostic> programDiagnostics = [];
+        private readonly List<PositionedDiagnostic> programDiagnostics = [];
 
         // The open event block's diagnostics; null outside an event block, so those go to the program list only.
-        private List<Diagnostic>? eventDiagnostics;
+        private List<PositionedDiagnostic>? eventDiagnostics;
+
+        // Where each statement node of the open event block starts. Keyed by reference, because statement records
+        // compare by value and two equal statements can stand on one line.
+        private readonly Dictionary<StatementNode, Token> statementStarts = new(ReferenceEqualityComparer.Instance);
 
         private Token[] tokens = [];
         private Token end = new(TokenKind.EndOfInput, string.Empty, 1, 1);
@@ -364,22 +377,20 @@ public static class Parser
                 // Last-resort net for a defect in this parser; every input it is designed for is handled above.
                 // The blocks completed so far are kept, and the open event block, if any, is abandoned.
                 eventDiagnostics = null;
-                Report(
-                    DiagnosticSeverity.Warning,
-                    Current.Line,
-                    Commands.Syntax,
-                    "Check code could not be parsed; rest of the program skipped");
+                Warn(Current, Commands.Syntax, "Check code could not be parsed; rest of the program skipped");
             }
 
             return fieldBlocks.Count == 0 && programDiagnostics.Count == 0
                 ? ProgramNode.Empty
-                : new ProgramNode(fieldBlocks, SortedByLine(programDiagnostics));
+                : new ProgramNode(fieldBlocks, DiagnosticsOf(InSourceOrder(programDiagnostics)));
         }
 
         /// <summary>
         /// Copies the tokens up to the first <see cref="TokenKind.EndOfInput"/>, which becomes <see cref="end"/>;
         /// without one, a synthetic end token takes the last token's position. A token whose text is
-        /// <see langword="null"/>, as <c>default(Token)</c> has, is read as empty text.
+        /// <see langword="null"/>, as <c>default(Token)</c> has, is read as empty text, and a line or column below 1,
+        /// as <c>default(Token)</c> or a hand-built list can hold, is read as 1, the end token included, so every
+        /// diagnostic carries a 1-based line.
         /// </summary>
         private void Buffer()
         {
@@ -393,9 +404,14 @@ public static class Parser
             for (int i = 0; i < count; i++)
             {
                 Token token = source[i];
-                if (token.Text is null)
+                if (token.Text is null || token.Line < 1 || token.Column < 1)
                 {
-                    token = token with { Text = string.Empty };
+                    token = token with
+                    {
+                        Text = token.Text ?? string.Empty,
+                        Line = Math.Max(1, token.Line),
+                        Column = Math.Max(1, token.Column),
+                    };
                 }
 
                 if (token.Kind == TokenKind.EndOfInput)
@@ -434,15 +450,19 @@ public static class Parser
             return token;
         }
 
-        private void Report(DiagnosticSeverity severity, int line, string command, string message)
+        /// <summary>
+        /// Reports a diagnostic at the position of <paramref name="at"/>, the token where the construct starts, to
+        /// the program's list and to the open event block's list, if any.
+        /// </summary>
+        private void Report(DiagnosticSeverity severity, Token at, string command, string message)
         {
-            var diagnostic = new Diagnostic(severity, form, line, command, message);
-            programDiagnostics.Add(diagnostic);
-            eventDiagnostics?.Add(diagnostic);
+            var entry = new PositionedDiagnostic(new Diagnostic(severity, form, at.Line, command, message), at.Column);
+            programDiagnostics.Add(entry);
+            eventDiagnostics?.Add(entry);
         }
 
         private void Warn(Token at, string command, string message) =>
-            Report(DiagnosticSeverity.Warning, at.Line, command, message);
+            Report(DiagnosticSeverity.Warning, at, command, message);
 
         // ---------------------------------------------------------------------------------------------------------
         // Blocks (lines 620-640)
@@ -503,6 +523,84 @@ public static class Parser
             }
         }
 
+        /// <summary>
+        /// Skips a <c>Before</c>, <c>After</c> or <c>Click</c> section that the <c>Field</c> production does not allow
+        /// where it stands (lines 620-627), with one warning at its keyword. Its statements are not parsed, so they
+        /// yield no node and no diagnostic of their own.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// The scan counts each nested <c>IF</c> against its <c>END-IF</c> or <c>END</c> (lines 434-440), never
+        /// below zero, so an event keyword inside one belongs to the skipped section instead of ending it and
+        /// becoming executable. <c>ALWAYS</c> is not counted, because after <c>AUTOSEARCH</c> it is a modifier that
+        /// no <c>END</c> closes (lines 290-293).
+        /// </para>
+        /// <para>
+        /// Outside a nested <c>IF</c>, the section ends where <see cref="ParseEventBlock"/> would end it: before an
+        /// event start, or through another event terminator, which stands for its own. At any depth, its own terminator
+        /// ends it and is consumed, while <c>End-Field</c>, a block start or terminator and the end of input end it
+        /// and are left to the enclosing field block. An unterminated nested <c>IF</c> therefore swallows neither the
+        /// section's own terminator nor anything after the field block.
+        /// </para>
+        /// </remarks>
+        private void SkipMisplacedEventBlock(string message)
+        {
+            Token eventToken = Advance();
+            string keyword = eventToken.Keyword!;
+            string terminator = EventStarts[keyword].Terminator;
+            Warn(eventToken, keyword, message);
+
+            int ifDepth = 0;
+            while (true)
+            {
+                Token token = Current;
+                if (token.IsKeyword(terminator))
+                {
+                    Advance();
+                    return;
+                }
+
+                if (token.Kind == TokenKind.EndOfInput || IsBlockStart(token) || IsKeywordIn(token, BlockTerminators))
+                {
+                    return;
+                }
+
+                if (ifDepth == 0 && IsEventStart(token))
+                {
+                    return;
+                }
+
+                if (ifDepth == 0 && IsKeywordIn(token, EventTerminators))
+                {
+                    Advance();
+                    return;
+                }
+
+                if (token.IsKeyword(Commands.If))
+                {
+                    ifDepth++;
+                }
+                else if (ifDepth > 0 && (token.IsKeyword(Commands.EndIf) || token.IsKeyword(Commands.End)))
+                {
+                    ifDepth--;
+                }
+
+                Advance();
+            }
+        }
+
+        /// <summary>
+        /// The slot of an event block's kind in a <c>Field</c> block, in the order the grammar sets (lines 620-627):
+        /// <c>Before</c>, then <c>After</c>, then <c>Click</c>.
+        /// </summary>
+        private static int EventSlot(FieldEventKind kind) => kind switch
+        {
+            FieldEventKind.FieldBefore => 0,
+            FieldEventKind.FieldAfter => 1,
+            FieldEventKind.FieldClick => 2,
+            _ => throw new ArgumentOutOfRangeException(nameof(kind), kind, "The value is not a field-event kind."),
+        };
+
         private void ParseFieldBlock()
         {
             Token fieldToken = Advance();
@@ -522,13 +620,29 @@ public static class Parser
 
             Token nameToken = Advance();
             var events = new List<EventBlockNode>();
+
+            // The grammar allows one Before, then one After, then one Click (lines 620-627). A section whose slot is
+            // not past the last kept one is a repeat or out of order, and is skipped rather than kept.
+            int lastSlot = -1;
             while (true)
             {
                 Token token = Current;
                 string? keyword = token.Keyword;
-                if (keyword is not null && EventStarts.ContainsKey(keyword))
+                if (keyword is not null && EventStarts.TryGetValue(keyword, out EventSyntax? eventSyntax))
                 {
-                    events.Add(ParseEventBlock());
+                    int slot = EventSlot(eventSyntax.Kind);
+                    if (slot > lastSlot)
+                    {
+                        events.Add(ParseEventBlock());
+                        lastSlot = slot;
+                    }
+                    else
+                    {
+                        SkipMisplacedEventBlock(
+                            slot == lastSlot
+                                ? $"Second {keyword} block in FIELD; block skipped"
+                                : $"{keyword} block after a later event block in FIELD; block skipped");
+                    }
                 }
                 else if (keyword == Commands.EndField)
                 {
@@ -566,8 +680,9 @@ public static class Parser
             string eventKeyword = eventToken.Keyword!;
             EventSyntax syntax = EventStarts[eventKeyword];
 
-            var diagnostics = new List<Diagnostic>();
+            var diagnostics = new List<PositionedDiagnostic>();
             eventDiagnostics = diagnostics;
+            statementStarts.Clear();
             List<StatementNode> statements;
             try
             {
@@ -595,7 +710,65 @@ public static class Parser
                 eventDiagnostics = null;
             }
 
-            return new EventBlockNode(syntax.Kind, eventToken.Line, statements, SortedByLine(diagnostics));
+            PositionedDiagnostic[] sorted = InSourceOrder(diagnostics);
+            return new EventBlockNode(syntax.Kind, eventToken.Line, statements, DiagnosticsOf(sorted))
+            {
+                DiagnosticAnchors = AnchorsOf(statements, sorted),
+            };
+        }
+
+        /// <summary>
+        /// The <see cref="EventBlockNode.DiagnosticAnchors"/> of a block: for each of its diagnostics, in source
+        /// order, how many of its statements start before it. Statements are counted in the block's pre-order
+        /// (each statement, then its <c>THEN</c> branch, then its <c>ELSE</c> branch), which is their source order;
+        /// the statements of a dropped <c>IF</c> are not in the tree, so they are not counted.
+        /// </summary>
+        private int[] AnchorsOf(IReadOnlyList<StatementNode> statements, PositionedDiagnostic[] sorted)
+        {
+            var starts = new List<(int Line, int Column)>();
+            CollectStatementStarts(statements, starts);
+
+            var anchors = new int[sorted.Length];
+            int before = 0;
+            for (int i = 0; i < sorted.Length; i++)
+            {
+                int line = sorted[i].Diagnostic.Line;
+                int column = sorted[i].Column;
+                while (before < starts.Count
+                    && (starts[before].Line < line || (starts[before].Line == line && starts[before].Column < column)))
+                {
+                    before++;
+                }
+
+                anchors[i] = before;
+            }
+
+            return anchors;
+        }
+
+        /// <summary>Appends the start of each statement of the tree, in pre-order.</summary>
+        private void CollectStatementStarts(
+            IReadOnlyList<StatementNode> statements,
+            List<(int Line, int Column)> starts)
+        {
+            foreach (StatementNode statement in statements)
+            {
+                // Every node of the tree came from ParseStatement, which recorded its start token; the node's own
+                // line, at column 1, would stand in for one that had none.
+                starts.Add(
+                    statementStarts.TryGetValue(statement, out Token start)
+                        ? (start.Line, start.Column)
+                        : (statement.Line, 1));
+
+                if (statement is IfStatementNode ifStatement)
+                {
+                    CollectStatementStarts(ifStatement.Then, starts);
+                    if (ifStatement.Else is { } elseBranch)
+                    {
+                        CollectStatementStarts(elseBranch, starts);
+                    }
+                }
+            }
         }
 
         // ---------------------------------------------------------------------------------------------------------
@@ -657,11 +830,24 @@ public static class Parser
 
         /// <summary>
         /// Parses one statement, or reports and skips it. It always consumes at least one token, and returns
-        /// <see langword="null"/> for a statement that is unsupported or malformed.
+        /// <see langword="null"/> for a statement that is unsupported or malformed. The start token of each node it
+        /// returns, nested ones included, is recorded in <see cref="statementStarts"/>.
         /// </summary>
         private StatementNode? ParseStatement()
         {
-            Token token = Current;
+            Token start = Current;
+            StatementNode? statement = ParseStatementAt(start);
+            if (statement is not null)
+            {
+                statementStarts[statement] = start;
+            }
+
+            return statement;
+        }
+
+        /// <summary>The body of <see cref="ParseStatement"/>; <paramref name="token"/> is the current token.</summary>
+        private StatementNode? ParseStatementAt(Token token)
+        {
             string? command = StatementCommand(token);
             switch (command)
             {
@@ -802,7 +988,7 @@ public static class Parser
             EnterNesting(ifToken);
             try
             {
-                var context = new ExpressionContext(Commands.If, ifToken.Line, IfSkipped);
+                var context = new ExpressionContext(Commands.If, ifToken, IfSkipped);
                 ExpressionNode? condition = ParseExpression(context);
                 bool poisoned = condition is null;
                 if (condition is not null && !IsWord(Current, Commands.Then))
@@ -898,7 +1084,7 @@ public static class Parser
             }
 
             Advance();
-            var context = new ExpressionContext(Commands.Assign, assignToken.Line, StatementSkipped);
+            var context = new ExpressionContext(Commands.Assign, assignToken, StatementSkipped);
             ExpressionNode? value = ParseExpression(context);
             if (value is null)
             {
@@ -1050,7 +1236,7 @@ public static class Parser
 
             Report(
                 DiagnosticSeverity.Info,
-                geocodeToken.Line,
+                geocodeToken,
                 Commands.Geocode,
                 $"GEOCODE is not executed; {StatementSkipped}");
             return new GeocodeStatementNode(arguments, geocodeToken.Line);
@@ -1257,11 +1443,7 @@ public static class Parser
 
         private ExpressionNode? MalformedExpression(ExpressionContext context)
         {
-            Report(
-                DiagnosticSeverity.Warning,
-                context.Line,
-                context.Command,
-                $"Malformed expression in {context.Command}; {context.Suffix}");
+            Warn(context.Keyword, context.Command, $"Malformed expression in {context.Command}; {context.Suffix}");
             return null;
         }
 
@@ -1469,7 +1651,11 @@ public static class Parser
         _ => null,
     };
 
-    // OrderBy is a stable sort, so diagnostics on one line keep the order they were reported in.
-    private static Diagnostic[] SortedByLine(List<Diagnostic> diagnostics) =>
-        [.. diagnostics.OrderBy(diagnostic => diagnostic.Line)];
+    // Source order is line, then column. OrderBy and ThenBy are stable, so diagnostics reported at one position keep
+    // the order they were reported in.
+    private static PositionedDiagnostic[] InSourceOrder(List<PositionedDiagnostic> entries) =>
+        [.. entries.OrderBy(entry => entry.Diagnostic.Line).ThenBy(entry => entry.Column)];
+
+    private static Diagnostic[] DiagnosticsOf(PositionedDiagnostic[] entries) =>
+        [.. entries.Select(entry => entry.Diagnostic)];
 }

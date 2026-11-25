@@ -1,5 +1,7 @@
 using EpiInfo.CheckCode;
 using EpiInfo.CheckCode.Evaluation;
+using EpiInfo.CheckCode.Lexing;
+using EpiInfo.CheckCode.Parsing;
 using EpiInfo.CheckCode.Syntax;
 using EpiInfo.Domain.Diagnostics;
 using EpiInfo.Domain.Events;
@@ -494,6 +496,140 @@ public sealed class EvaluatorTests
         Assert.Contains("Fever", response.Enabled);
         Assert.Contains("Chills", response.Enabled);
         Assert.Empty(response.Diagnostics);
+    }
+
+    [Fact]
+    public void Run_PlacesAParsedBlocksStaticDiagnosticsAmongItsStatements_AndAnUnanchoredBlocksFirst()
+    {
+        // The ASSIGN fails at run time and the HIDE after it on the same line is skipped by the parser.
+        const string Program = """
+            Field Sex
+                After
+                    ASSIGN NoSuchField = 1 HIDE Pregnant
+                End-After
+            End-Field
+            """;
+        Assert.Equal("ASSIGN NoSuchField = 1 HIDE Pregnant", ProgramLine(Program, 3));
+        EventBlockNode parsed = Assert.Single(
+            Assert.Single(Parser.Parse(Lexer.Tokenize(Program), CaseReportForm).FieldBlocks).Events);
+        var values = new Dictionary<string, FieldValue>();
+
+        // The parser places the warning after the ASSIGN that starts before it, so the runtime error comes first.
+        Assert.Equal(
+            new[] { "ASSIGN", "HIDE" },
+            Evaluator.Run(CaseReportForm, new[] { parsed }, values).Diagnostics.Select(d => d.Command));
+
+        // A block built by hand, or rebuilt by a with expression that replaces its diagnostics, carries no placement:
+        // it equals the parsed block, and its static diagnostics are all added before its first statement runs.
+        EventBlockNode[] unanchored =
+        [
+            new EventBlockNode(parsed.Event, parsed.Line, parsed.Statements, parsed.Diagnostics),
+            parsed with { Diagnostics = [.. parsed.Diagnostics] },
+        ];
+        Assert.All(
+            unanchored,
+            block =>
+            {
+                Assert.Equal(parsed, block);
+                Assert.Equal(
+                    new[] { "HIDE", "ASSIGN" },
+                    Evaluator.Run(CaseReportForm, new[] { block }, values).Diagnostics.Select(d => d.Command));
+            });
+    }
+
+    // A branch that does not run is never walked when no static diagnostic waits for a statement index: Execute
+    // places none, a block without diagnostics has none, and an unanchored block adds its diagnostics before its first
+    // statement. However deep the skipped THEN, the ELSE and the statement after the IF still run.
+    [Theory]
+    [InlineData("Execute")]
+    [InlineData("Run")]
+    [InlineData("Run with an unanchored diagnostic")]
+    public void SkippedDeepBranch_DoesNotPreventTheStatementsAfterIt(string path)
+    {
+        // Far deeper than any call stack can recurse; built bottom-up, so building it recurses nowhere.
+        const int Depth = 50_000;
+        StatementNode deepest = new DialogStatementNode("Never shown", null, 4);
+        for (var i = 0; i < Depth; i++)
+        {
+            deepest = new IfStatementNode(LiteralNode.FromNumber(1, 4), [deepest], null, 4);
+        }
+
+        // "1" = "2" is false, so the deep THEN is skipped and the ELSE runs.
+        StatementNode[] statements =
+        [
+            new IfStatementNode(
+                new EqualsNode(LiteralNode.FromString("1", 3), LiteralNode.FromString("2", 3), 3),
+                [deepest],
+                [new DialogStatementNode("Else", null, 5)],
+                3),
+            new DialogStatementNode("After", null, 6),
+        ];
+        var warning = new Diagnostic(DiagnosticSeverity.Warning, CaseReportForm.Name, 7, "HIDE", "Unsupported.");
+        Diagnostic[] diagnostics = path == "Run with an unanchored diagnostic" ? [warning] : [];
+        var values = new Dictionary<string, FieldValue>();
+
+        FieldEventResponse ExecuteAlone()
+        {
+            var effects = new EffectAccumulator();
+            Evaluator.Execute(statements, new EvaluationContext(CaseReportForm, values), effects);
+            return effects.ToResponse();
+        }
+
+        FieldEventResponse? response = null;
+        Exception? exception = Record.Exception(() => response = path switch
+        {
+            "Execute" => ExecuteAlone(),
+            "Run" or "Run with an unanchored diagnostic" => Evaluator.Run(
+                CaseReportForm,
+                new[] { new EventBlockNode(FieldEventKind.FieldAfter, 2, statements, diagnostics) },
+                values),
+            _ => throw new ArgumentOutOfRangeException(nameof(path), path, "Not an evaluator entry point."),
+        });
+
+        Assert.Null(exception);
+        Assert.NotNull(response);
+        Assert.Equal(new[] { "Else", "After" }, response.Dialogs.Select(dialog => dialog.Message));
+        Assert.Equal(diagnostics, response.Diagnostics);
+        AssertNoFieldEffects(response);
+    }
+
+    // An ELSE branch is numbered after every statement of its THEN branch, a nested IF and its own ELSE included, so
+    // a construct the parser skips in the ELSE is placed exactly among the statements there: after the ASSIGN that
+    // fails at run time when it follows it on the line, and before it when it precedes it. A THEN sized one short or
+    // one long would swap one of the two orders.
+    [Theory]
+    [InlineData("ASSIGN NoSuchField = 1 HIDE Pregnant", new[] { "ASSIGN", "HIDE" })]
+    [InlineData("HIDE Pregnant ASSIGN NoSuchField = 1", new[] { "HIDE", "ASSIGN" })]
+    public void Run_NumbersAnElseBranchAfterTheWholeThenBranch(string elseLine, string[] commands)
+    {
+        string program = $"""
+            Field Sex
+                After
+                    IF Sex = "1" THEN
+                        IF Sex = "1" THEN
+                            ENABLE Pregnant
+                        ELSE
+                            DISABLE Pregnant
+                        END-IF
+                        ENABLE Pregnant
+                    ELSE
+                        {elseLine}
+                    END-IF
+                End-After
+            End-Field
+            """;
+        Assert.Equal(elseLine, ProgramLine(program, 11));
+        EventBlockNode parsed = Assert.Single(
+            Assert.Single(Parser.Parse(Lexer.Tokenize(program), CaseReportForm).FieldBlocks).Events);
+
+        // Sex is empty, so the outer THEN, four statements in pre-order, is skipped and the ELSE runs.
+        FieldEventResponse response = Evaluator.Run(
+            CaseReportForm,
+            new[] { parsed },
+            new Dictionary<string, FieldValue>());
+
+        Assert.Equal(commands, response.Diagnostics.Select(diagnostic => diagnostic.Command));
+        AssertNoFieldEffects(response);
     }
 
     [Theory]

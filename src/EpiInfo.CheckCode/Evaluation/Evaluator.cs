@@ -59,10 +59,18 @@ public static class Evaluator
     /// </summary>
     /// <remarks>
     /// <para>
-    /// The caller, <c>CheckCodeEngine.Run</c>, selects the blocks: the event blocks of the event's kind, in source
-    /// order, inside the last <c>Field</c> block whose name matches the event's field without regard to case, because
-    /// a later block of a name replaced the earlier one in legacy Epi Info. Each selected block's static diagnostics
-    /// are added here, ahead of its runtime errors, so the caller must not add them again.
+    /// The caller, <c>CheckCodeEngine.Run</c>, selects the block: the one event block of the event's kind, as the
+    /// grammar allows one of each kind, inside the last <c>Field</c> block whose name matches the event's field
+    /// without regard to case, because a later block of a name replaced the earlier one in legacy Epi Info.
+    /// </para>
+    /// <para>
+    /// Each block's static diagnostics are added here, so the caller must not add them again. They are added at
+    /// statement boundaries, each just before the first statement to run that starts after it in the source, or
+    /// after the block when none does, as <see cref="EventBlockNode.DiagnosticAnchors"/> places them; a block built
+    /// without anchors has them all added before its first statement. Static diagnostics and runtime errors
+    /// therefore reach the response in source order, so a statement that fails before a skipped construct on the
+    /// same line reports its error first. Statement positions are counted only while a block still has a diagnostic
+    /// to add, so a block without diagnostics or anchors never walks a branch it skips, however deeply nested.
     /// </para>
     /// <para>
     /// The blocks run in the given order over one shared <see cref="EvaluationContext"/>, so a later block reads the
@@ -107,8 +115,9 @@ public static class Evaluator
         var effects = new EffectAccumulator();
         foreach (EventBlockNode block in selected)
         {
-            effects.AddStaticDiagnostics(block.Diagnostics);
-            Execute(block.Statements, context, effects);
+            var feed = new StaticDiagnosticFeed(block, effects);
+            ExecuteList(block.Statements, 0, context, effects, feed);
+            feed.AddRemaining();
         }
 
         return effects.ToResponse();
@@ -143,14 +152,34 @@ public static class Evaluator
         ArgumentNullException.ThrowIfNull(context);
         ArgumentNullException.ThrowIfNull(effects);
 
+        ExecuteList(statements, 0, context, effects, feed: null);
+    }
+
+    // Execute's loop. firstIndex is the pre-order index, within its event block, of the first statement (see
+    // EventBlockNode.DiagnosticAnchors). Before each statement runs, the feed adds the block's static diagnostics
+    // that precede it; after the statement, failed or not, the index moves past its whole subtree. Indexes exist only
+    // for the feed, so they are computed only while it still has a diagnostic to add: once it has none it is dropped,
+    // for the rest of this list and for every branch this list runs, and firstIndex and index are no longer read.
+    // Execute has no feed, a block without diagnostics has nothing to add, and a block without covering anchors adds
+    // everything before its first statement, so none of them sizes a subtree, and a skipped branch is never walked.
+    private static void ExecuteList(
+        IReadOnlyList<StatementNode> statements,
+        int firstIndex,
+        EvaluationContext context,
+        EffectAccumulator effects,
+        StaticDiagnosticFeed? feed)
+    {
+        int index = firstIndex;
         for (var i = 0; i < statements.Count; i++)
         {
             StatementNode statement = statements[i]
                 ?? throw new ArgumentException("A statement must not be null.", nameof(statements));
 
+            feed?.AddThrough(index);
+            feed = StaticDiagnosticFeed.WhilePending(feed);
             try
             {
-                ExecuteStatement(statement, context, effects);
+                ExecuteStatement(statement, index, context, effects, feed);
             }
             catch (CheckCodeRuntimeException ex)
             {
@@ -167,6 +196,13 @@ public static class Evaluator
                         statement.Line,
                         CommandOf(statement),
                         OutOfRangeMessage));
+            }
+
+            // A branch of the statement may have added the last diagnostic.
+            feed = StaticDiagnosticFeed.WhilePending(feed);
+            if (feed is not null)
+            {
+                index += EventBlockNode.PreOrderSize(statement);
             }
         }
     }
@@ -294,12 +330,17 @@ public static class Evaluator
         return result;
     }
 
-    private static void ExecuteStatement(StatementNode statement, EvaluationContext context, EffectAccumulator effects)
+    private static void ExecuteStatement(
+        StatementNode statement,
+        int index,
+        EvaluationContext context,
+        EffectAccumulator effects,
+        StaticDiagnosticFeed? feed)
     {
         switch (statement)
         {
             case IfStatementNode node:
-                ExecuteIf(node, context, effects);
+                ExecuteIf(node, index, context, effects, feed);
                 break;
 
             case EnableStatementNode node:
@@ -333,17 +374,25 @@ public static class Evaluator
 
     // Legacy Rule_If_Then_Else_End: only a true condition runs THEN; false, null, text and numbers run ELSE. A
     // runtime error in the condition escapes to this statement's boundary, so neither branch runs. Each branch
-    // statement has its own boundary through Execute.
-    private static void ExecuteIf(IfStatementNode node, EvaluationContext context, EffectAccumulator effects)
+    // statement has its own boundary through ExecuteList. In pre-order the IF at index is followed by its THEN
+    // statements and then by its ELSE statements. ExecuteList passes a feed only while it has a diagnostic to add;
+    // without one no index is read, so the skipped THEN is not sized.
+    private static void ExecuteIf(
+        IfStatementNode node,
+        int index,
+        EvaluationContext context,
+        EffectAccumulator effects,
+        StaticDiagnosticFeed? feed)
     {
         FieldValue condition = Evaluate(node.Condition, context, IfCommand);
         if (IsTrue(condition))
         {
-            Execute(node.Then, context, effects);
+            ExecuteList(node.Then, index + 1, context, effects, feed);
         }
         else if (node.Else is { } elseBranch)
         {
-            Execute(elseBranch, context, effects);
+            int elseIndex = feed is null ? index + 1 : index + 1 + EventBlockNode.PreOrderSize(node.Then);
+            ExecuteList(elseBranch, elseIndex, context, effects, feed);
         }
     }
 
@@ -592,5 +641,49 @@ public static class Evaluator
         }
 
         return typeName.ToUpperInvariant();
+    }
+
+    /// <summary>
+    /// Adds one event block's static diagnostics to the accumulator at statement boundaries, in their source order:
+    /// each one before the first statement to run whose pre-order index is at least its
+    /// <see cref="EventBlockNode.AnchorOf(int)"/>, and the rest once the block has run. Runtime errors added in
+    /// between therefore stay in source order.
+    /// </summary>
+    private sealed class StaticDiagnosticFeed(EventBlockNode block, EffectAccumulator effects)
+    {
+        // The index in block.Diagnostics of the first diagnostic not yet added.
+        private int next;
+
+        /// <summary>Whether a diagnostic is still to be added, and so still needs statement indexes.</summary>
+        public bool HasPending => next < block.Diagnostics.Count;
+
+        /// <summary>
+        /// <paramref name="feed"/> while it still has a diagnostic to add; otherwise <see langword="null"/>, so the
+        /// caller stops computing statement indexes.
+        /// </summary>
+        public static StaticDiagnosticFeed? WhilePending(StaticDiagnosticFeed? feed) =>
+            feed is { HasPending: true } ? feed : null;
+
+        /// <summary>
+        /// Adds, in order, the diagnostics not yet added up to the first whose anchor is past
+        /// <paramref name="statementIndex"/>.
+        /// </summary>
+        public void AddThrough(int statementIndex)
+        {
+            IReadOnlyList<Diagnostic> diagnostics = block.Diagnostics;
+            int first = next;
+            while (next < diagnostics.Count && block.AnchorOf(next) <= statementIndex)
+            {
+                next++;
+            }
+
+            if (next > first)
+            {
+                effects.AddStaticDiagnostics(diagnostics.Skip(first).Take(next - first));
+            }
+        }
+
+        /// <summary>Adds every diagnostic not yet added, once the block has run.</summary>
+        public void AddRemaining() => AddThrough(int.MaxValue);
     }
 }

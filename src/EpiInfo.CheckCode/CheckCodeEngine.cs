@@ -55,10 +55,11 @@ public sealed class CheckCodeEngine : ICheckCodeEngine
     /// <remarks>
     /// <para>
     /// The field's block is the last <c>Field</c> block whose name equals <paramref name="fieldName"/> without
-    /// regard to case, so <c>Field AGE</c> answers field <c>Age</c>. Its event blocks of the
-    /// <paramref name="fieldEvent"/> kind run in source order through <see cref="Evaluator.Run"/>, over one fresh
-    /// evaluation context and effect accumulator. The response holds those blocks' static diagnostics followed by
-    /// their runtime errors, in source order; diagnostics elsewhere in the program are not included.
+    /// regard to case, so <c>Field AGE</c> answers field <c>Age</c>, and an earlier block of the name is never
+    /// consulted. Its one event block of the <paramref name="fieldEvent"/> kind runs through
+    /// <see cref="Evaluator.Run"/>, over one fresh evaluation context and effect accumulator. The response holds that
+    /// block's static diagnostics and its runtime errors, merged in source order; diagnostics elsewhere in the
+    /// program, such as the warning for a section the parser skipped, are not included.
     /// </para>
     /// <para>
     /// With no such block the result is <see cref="FieldEventResponse.Empty"/>, every array empty, diagnostics
@@ -102,23 +103,25 @@ public sealed class CheckCodeEngine : ICheckCodeEngine
         Parser.Parse(Lexer.Tokenize(program), form);
 
     /// <summary>
-    /// Returns the event blocks of <paramref name="fieldEvent"/>'s kind, in source order, inside the last
-    /// <c>Field</c> block named <paramref name="fieldName"/>; empty when there is none.
+    /// Returns the one event block of <paramref name="fieldEvent"/>'s kind inside the last <c>Field</c> block named
+    /// <paramref name="fieldName"/>; empty when there is no such field block or it has no block of that kind.
     /// </summary>
     /// <remarks>
     /// Only the last block of a name counts, as in legacy Epi Info, whose interpreter registered each <c>Field</c>
     /// block under its name and let a later block of the same name replace the earlier one's <c>Before</c>,
-    /// <c>After</c> and <c>Click</c> sections, a section the later block lacks included. Running every block of the
+    /// <c>After</c> and <c>Click</c> sections, a section the later block lacks included: an event the last block has
+    /// no section for selects nothing, even when an earlier block of the name has one. Running every block of the
     /// name would be a behaviour legacy never had, so the legacy rule is kept. The grammar allows one section of each
-    /// kind per block; the parser keeps any repeat, and each one found runs, in source order.
+    /// kind per block, in the order <c>Before</c>, <c>After</c>, <c>Click</c>; the parser reports any other section as
+    /// a warning and skips it, and <see cref="FieldBlockNode"/> holds no second block of a kind, so at most one block
+    /// is selected.
     /// </remarks>
     private static EventBlockNode[] SelectEventBlocks(ProgramNode program, string fieldName, FieldEventKind fieldEvent)
     {
         FieldBlockNode? fieldBlock = program.FieldBlocks.LastOrDefault(
             block => string.Equals(block.FieldName, fieldName, StringComparison.OrdinalIgnoreCase));
 
-        return fieldBlock is null
-            ? []
-            : fieldBlock.Events.Where(block => block.Event == fieldEvent).ToArray();
+        EventBlockNode? eventBlock = fieldBlock?.Events.SingleOrDefault(block => block.Event == fieldEvent);
+        return eventBlock is null ? [] : [eventBlock];
     }
 }
