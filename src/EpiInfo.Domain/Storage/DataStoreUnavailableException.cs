@@ -16,6 +16,12 @@ namespace EpiInfo.Domain.Storage;
 /// 40, 64, 121, 233, 10053, 10054, 10060, 10061 or 11001 (the connection cannot be made, or it broke), 18456 (login
 /// failed), 4060 (cannot open the database), -2 (command timeout) or 1205 (deadlock victim);
 /// </description></item>
+/// <item><description>
+/// a SQL exception that carries none of those numbers and whose primary error is number 0 with severity class 20 or
+/// above: the form in which SqlClient's managed network layer, used on Linux and macOS, reports the connection
+/// failures that Windows reports under the numbers above, such as a refused connection, an unreachable server or an
+/// unresolvable host. <see cref="SqlErrorNumber"/> is then 0;
+/// </description></item>
 /// <item><description>SqlClient connection-pool exhaustion while opening a connection;</description></item>
 /// <item><description>
 /// an absent or blank <c>ConnectionStrings:EpiInfo</c>, detected before any connection is attempted.
