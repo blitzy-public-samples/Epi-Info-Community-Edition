@@ -9,7 +9,8 @@ namespace EpiInfo.Api.Hosting;
 /// The media-type guard of the four JSON body endpoints. On an endpoint carrying <see cref="JsonBodyMetadata"/> it
 /// answers 415 for any <c>Content-Type</c> other than <c>application/json</c> (case-insensitive, with an optional
 /// <c>charset=utf-8</c>), with or without a body, and then the request-level 400 "request body is required" for an
-/// allowed media type with an empty or missing body. Every other request passes through unchanged.
+/// allowed media type with an empty or missing body. An accepted request whose charset value is quoted reaches the
+/// endpoint with the canonical <c>Content-Type</c>; every other request passes through unchanged.
 /// </summary>
 /// <remarks>
 /// <para>
@@ -17,11 +18,20 @@ namespace EpiInfo.Api.Hosting;
 /// <c>application/merge-patch+json</c>, <c>application/vnd.x+json</c> and <c>application/problem+json</c> a 415.
 /// </para>
 /// <para>
-/// <c>Program.cs</c> adds it after <c>UseRouting</c> and <c>RequestBodyLimitMiddleware</c>, so the endpoint is
-/// already matched and nothing has been bound. A request that matches no route, or the 405 endpoint of a method
-/// mismatch, carries no marker and keeps its 404 or 405. Routing may itself reject a <c>text/plain</c> request with an
-/// empty 415 before this guard runs; status-code pages turn that into the same 415 ProblemDetails, so that path is
-/// left alone.
+/// It runs after <c>UseRouting</c> and before the endpoints, so the endpoint is already matched and nothing has been
+/// bound. Its order relative to <see cref="RequestBodyLimitMiddleware"/> changes no status: that guard leaves a media
+/// type rejected here to this guard, so a 415 wins over a 413 whatever the declared length. A request that matches no
+/// route, or the 405 endpoint of a method mismatch, carries no marker and keeps its 404 or 405. Routing may itself
+/// reject a <c>text/plain</c> request with an empty 415 before this guard runs; status-code pages turn that into the
+/// same 415 ProblemDetails, so that path is left alone.
+/// </para>
+/// <para>
+/// A quoted parameter value is the same value as its token form (RFC 9110, section 5.6.6), so
+/// <c>charset="utf-8"</c> is accepted as <c>utf-8</c>. The framework's JSON binding looks the charset up without
+/// removing the quotes and throws, which would be a 500, so such a request's <c>Content-Type</c> is replaced, after
+/// both checks pass and before the endpoint runs, by the fixed canonical spelling
+/// <c>application/json; charset=utf-8</c> of the same media type. Every other accepted spelling binds as sent and is
+/// left as it is.
 /// </para>
 /// <para>
 /// Error bodies come only from <see cref="ApiProblems"/>, which writes fixed text plus <c>traceId</c>; the received
@@ -36,6 +46,8 @@ public sealed class JsonContentTypeMiddleware
 
     private const string Utf8Charset = "utf-8";
 
+    private const string CanonicalUtf8JsonContentType = "application/json; charset=utf-8";
+
     private readonly RequestDelegate _next;
 
     /// <summary>Creates the guard in front of <paramref name="next"/>.</summary>
@@ -48,8 +60,9 @@ public sealed class JsonContentTypeMiddleware
     }
 
     /// <summary>
-    /// Checks the media type, then the presence of a body, on an endpoint marked with <see cref="JsonBodyMetadata"/>,
-    /// and otherwise calls the rest of the pipeline.
+    /// On an endpoint marked with <see cref="JsonBodyMetadata"/>, checks the media type, then the presence of a body,
+    /// and gives an accepted request with a quoted charset value the canonical <c>Content-Type</c> before calling the
+    /// rest of the pipeline. Every other request goes straight to the rest of the pipeline.
     /// </summary>
     /// <param name="context">The current request.</param>
     /// <exception cref="ArgumentNullException"><paramref name="context"/> is <see langword="null"/>.</exception>
@@ -64,7 +77,7 @@ public sealed class JsonContentTypeMiddleware
         }
 
         // The media type is checked first, so a wrong type is a 415 whether or not a body was sent.
-        if (!IsAllowedJsonContentType(context.Request.ContentType))
+        if (!IsAllowedJsonContentType(context.Request.ContentType, out var charsetQuoted))
         {
             await ApiProblems.WriteAsync(context, ApiProblems.UnsupportedMediaType());
             return;
@@ -74,6 +87,14 @@ public sealed class JsonContentTypeMiddleware
         {
             await ApiProblems.WriteAsync(context, ApiProblems.RequestBodyRequired());
             return;
+        }
+
+        // The framework's JSON binding does not unquote the charset, and fails on the quoted "utf-8" that the rule
+        // above accepts, so binding gets the fixed canonical spelling of the same media type. The received value is
+        // never copied, and an unquoted spelling binds as sent.
+        if (charsetQuoted)
+        {
+            context.Request.ContentType = CanonicalUtf8JsonContentType;
         }
 
         await _next(context);
@@ -88,8 +109,13 @@ public sealed class JsonContentTypeMiddleware
     /// <see langword="false"/> for a missing, blank or unparseable value, any other media type (<c>+json</c> types
     /// included), any other parameter, another charset, or a repeated parameter.
     /// </returns>
-    public static bool IsAllowedJsonContentType(string? contentType)
+    public static bool IsAllowedJsonContentType(string? contentType) =>
+        IsAllowedJsonContentType(contentType, out _);
+
+    // The one media-type rule. For an allowed value, charsetQuoted reports whether its charset was a quoted string.
+    private static bool IsAllowedJsonContentType(string? contentType, out bool charsetQuoted)
     {
+        charsetQuoted = false;
         if (string.IsNullOrWhiteSpace(contentType) || !MediaTypeHeaderValue.TryParse(contentType, out var mediaType))
         {
             return false;
@@ -112,11 +138,17 @@ public sealed class JsonContentTypeMiddleware
         }
 
         var parameter = parameters[0];
-        return StringSegment.Equals(parameter.Name, CharsetParameter, StringComparison.OrdinalIgnoreCase)
-            && StringSegment.Equals(
+        if (!StringSegment.Equals(parameter.Name, CharsetParameter, StringComparison.OrdinalIgnoreCase)
+            || !StringSegment.Equals(
                 HeaderUtilities.RemoveQuotes(parameter.Value),
                 Utf8Charset,
-                StringComparison.OrdinalIgnoreCase);
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        charsetQuoted = HeaderUtilities.IsQuoted(parameter.Value);
+        return true;
     }
 
     // Decided from headers only; the body is never read, peeked or buffered. Mixing BodyReader peeks with later Body
@@ -140,8 +172,9 @@ public sealed class JsonContentTypeMiddleware
 public static class JsonContentTypeMiddlewareExtensions
 {
     /// <summary>
-    /// Adds <see cref="JsonContentTypeMiddleware"/>. Call it after <c>UseRouting</c> and the request body limit, so the
-    /// endpoint is matched before the guard reads its metadata and before any body is bound.
+    /// Adds <see cref="JsonContentTypeMiddleware"/>. Call it after <c>UseRouting</c> and before the endpoints, so the
+    /// endpoint is matched before the guard reads its metadata and before any body is bound. Either side of the request
+    /// body limit gives the same statuses.
     /// </summary>
     /// <param name="app">The application builder.</param>
     /// <returns>The same builder, for chaining.</returns>
