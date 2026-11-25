@@ -126,6 +126,9 @@ public sealed record RecordedCommand(
 /// </remarks>
 public sealed partial class SqlCommandRecorder : ISqlCommandObserver
 {
+    // SQL Server ends a "--" comment at a carriage return or a line feed, and at no other character.
+    private static readonly char[] LineCommentTerminators = ['\r', '\n'];
+
     private readonly Lock _gate = new();
     private readonly List<Entry> _entries = [];
 
@@ -265,8 +268,9 @@ public sealed partial class SqlCommandRecorder : ISqlCommandObserver
 
     /// <summary>
     /// Splits T-SQL text into code and the spans that cannot hold a statement keyword: bracketed and
-    /// double-quoted identifiers, string literals, <c>--</c> comments and nested <c>/* */</c> comments. Each
-    /// span becomes one space in <paramref name="code"/>; bracketed names are added, unescaped, to
+    /// double-quoted identifiers, string literals, <c>--</c> comments and nested <c>/* */</c> comments. A
+    /// <c>--</c> comment ends at the first carriage return or line feed, which stays in the code. Each span
+    /// becomes one space in <paramref name="code"/>; bracketed names are added, unescaped, to
     /// <paramref name="identifiers"/>. An unterminated span runs to the end of the text, as SQL Server reads it.
     /// </summary>
     /// <remarks>
@@ -299,7 +303,7 @@ public sealed partial class SqlCommandRecorder : ISqlCommandObserver
             }
             else if (current == '-' && next == '-')
             {
-                var lineEnd = text.IndexOf('\n', index + 2);
+                var lineEnd = text.IndexOfAny(LineCommentTerminators, index + 2);
                 index = lineEnd < 0 ? text.Length : lineEnd;
                 code?.Append(' ');
             }

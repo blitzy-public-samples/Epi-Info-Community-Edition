@@ -1,3 +1,4 @@
+using System.Globalization;
 using Microsoft.Extensions.Logging;
 
 namespace EpiInfo.Api.Tests.Infrastructure;
@@ -17,8 +18,12 @@ namespace EpiInfo.Api.Tests.Infrastructure;
 /// <c>("State", state.ToString())</c>.
 /// </param>
 /// <param name="Scopes">
-/// The text of each scope active at the call, outermost first; a scope that is a key/value sequence is followed by
-/// one <c>key=value</c> item per pair.
+/// The text of each scope active at the call, outermost first, as the JSON console writes it: a plain scope as
+/// <see cref="Convert.ToString(object, IFormatProvider)"/> in the invariant culture, and a key/value scope as its own
+/// <see cref="object.ToString"/> text followed by one <c>key=value</c> item per pair, each value as the console writes
+/// a structured value (<c>true</c> or <c>false</c> for a <see cref="bool"/>, empty for <see langword="null"/>, and
+/// otherwise the invariant text). An item that cannot be converted is <c>&lt;scope capture failed&gt;</c>, or
+/// <c>key=&lt;scope capture failed&gt;</c> for a pair value, and the other scopes are kept.
 /// </param>
 /// <param name="ExceptionType">The full type name of the logged exception, or <see langword="null"/>.</param>
 /// <param name="ExceptionMessage">
@@ -33,7 +38,15 @@ public sealed record CapturedLogEntry(
     IReadOnlyList<KeyValuePair<string, object?>> State,
     IReadOnlyList<string> Scopes,
     string? ExceptionType,
-    string? ExceptionMessage);
+    string? ExceptionMessage)
+{
+    /// <summary>
+    /// The state's own <see cref="object.ToString"/> text when it differs from <see cref="Message"/>, which the JSON
+    /// console then writes as <c>State.Message</c>; <see langword="null"/> when the two are equal or there is no state,
+    /// and <c>&lt;state capture failed&gt;</c> when <c>ToString</c> threw.
+    /// </summary>
+    public string? StateMessage { get; init; }
+}
 
 /// <summary>
 /// An in-memory logger provider that records everything the API's logging pipeline lets through, so tests can
@@ -115,8 +128,12 @@ public sealed class CapturingLoggerProvider : ILoggerProvider, ISupportExternalS
     }
 
     /// <summary>
-    /// Whether any captured entry holds <paramref name="text"/>, compared ordinally, in its message, the text of any
-    /// state value, any scope item, its exception type or its full exception text.
+    /// Whether any captured entry holds <paramref name="text"/>, compared ordinally, in any text the JSON console
+    /// writes for it: its category, its message, its state's own text (<see cref="CapturedLogEntry.StateMessage"/>),
+    /// the key or the value of any state pair, any scope item, its exception type or its full exception text. A state
+    /// value matches as the JSON console writes it (<c>true</c> or <c>false</c> for a <see cref="bool"/>, otherwise
+    /// the invariant text) or as its current-culture <see cref="object.ToString"/> text. A conversion that throws is
+    /// skipped rather than aborting the search, so every other text is still searched.
     /// </summary>
     /// <exception cref="ArgumentException"><paramref name="text"/> is null or empty.</exception>
     public bool ContainsText(string text)
@@ -157,14 +174,21 @@ public sealed class CapturingLoggerProvider : ILoggerProvider, ISupportExternalS
 
     private static bool EntryContains(CapturedLogEntry entry, string text)
     {
-        if (entry.Message.Contains(text, StringComparison.Ordinal))
+        if (entry.Category.Contains(text, StringComparison.Ordinal)
+            || entry.Message.Contains(text, StringComparison.Ordinal)
+            || entry.StateMessage?.Contains(text, StringComparison.Ordinal) == true)
         {
             return true;
         }
 
         foreach (KeyValuePair<string, object?> pair in entry.State)
         {
-            if (pair.Value?.ToString()?.Contains(text, StringComparison.Ordinal) == true)
+            // The JSON console writes each key as a property name and each value as a structured value. Each value
+            // text is produced only when the checks before it fail, and neither conversion throws.
+            if (pair.Key?.Contains(text, StringComparison.Ordinal) == true
+                || (TryGetConsoleValueText(pair.Value, out string? consoleValue)
+                    && consoleValue?.Contains(text, StringComparison.Ordinal) == true)
+                || CurrentCultureText(pair.Value)?.Contains(text, StringComparison.Ordinal) == true)
             {
                 return true;
             }
@@ -180,6 +204,48 @@ public sealed class CapturingLoggerProvider : ILoggerProvider, ISupportExternalS
 
         return entry.ExceptionType?.Contains(text, StringComparison.Ordinal) == true
             || entry.ExceptionMessage?.Contains(text, StringComparison.Ordinal) == true;
+    }
+
+    /// <summary>
+    /// The text the JSON console writes for the value of a structured state or scope pair. Its formatter writes a
+    /// <see cref="bool"/> as the JSON literal <c>true</c> or <c>false</c>, a numeric primitive as a JSON number whose
+    /// text equals the invariant text, <see langword="null"/> as the JSON literal <c>null</c>, which yields no text
+    /// here, and any other value as <see cref="Convert.ToString(object, IFormatProvider)"/> in the invariant culture,
+    /// which prefers <see cref="IConvertible"/> over <see cref="IFormattable"/>.
+    /// </summary>
+    /// <returns><see langword="false"/>, with no text, when the value's conversion throws.</returns>
+    private static bool TryGetConsoleValueText(object? value, out string? text)
+    {
+        try
+        {
+            text = value switch
+            {
+                null => null,
+                bool flag => flag ? "true" : "false",
+                _ => Convert.ToString(value, CultureInfo.InvariantCulture),
+            };
+            return true;
+        }
+        catch (Exception)
+        {
+            text = null;
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// The value's current-culture <see cref="object.ToString"/> text; <see langword="null"/> when it throws.
+    /// </summary>
+    private static string? CurrentCultureText(object? value)
+    {
+        try
+        {
+            return value?.ToString();
+        }
+        catch (Exception)
+        {
+            return null;
+        }
     }
 
     private sealed class CapturingLogger(string category, CapturingLoggerProvider provider) : ILogger
@@ -203,15 +269,20 @@ public sealed class CapturingLoggerProvider : ILoggerProvider, ISupportExternalS
                 return;
             }
 
+            string message = FormatMessage(state, exception, formatter);
+            string? stateMessage = DescribeState(state);
             provider.Append(new CapturedLogEntry(
                 category,
                 logLevel,
                 eventId,
-                FormatMessage(state, exception, formatter),
+                message,
                 CaptureState(state),
                 CaptureScopes(provider._scopeProvider),
                 exception?.GetType().FullName,
-                exception is null ? null : DescribeException(exception)));
+                exception is null ? null : DescribeException(exception))
+            {
+                StateMessage = string.Equals(message, stateMessage, StringComparison.Ordinal) ? null : stateMessage,
+            });
         }
 
         private static string FormatMessage<TState>(
@@ -243,29 +314,24 @@ public sealed class CapturingLoggerProvider : ILoggerProvider, ISupportExternalS
             }
         }
 
+        private static string? DescribeState<TState>(TState state)
+        {
+            try
+            {
+                return state?.ToString();
+            }
+            catch (Exception)
+            {
+                return StateCaptureFailed;
+            }
+        }
+
         private static string[] CaptureScopes(IExternalScopeProvider scopeProvider)
         {
             var scopes = new List<string>();
             try
             {
-                scopeProvider.ForEachScope(
-                    static (scope, items) =>
-                    {
-                        if (scope is null)
-                        {
-                            return;
-                        }
-
-                        items.Add(scope.ToString() ?? string.Empty);
-                        if (scope is IEnumerable<KeyValuePair<string, object?>> pairs)
-                        {
-                            foreach (KeyValuePair<string, object?> pair in pairs)
-                            {
-                                items.Add($"{pair.Key}={pair.Value}");
-                            }
-                        }
-                    },
-                    scopes);
+                scopeProvider.ForEachScope(CaptureScope, scopes);
             }
             catch (Exception)
             {
@@ -273,6 +339,53 @@ public sealed class CapturingLoggerProvider : ILoggerProvider, ISupportExternalS
             }
 
             return scopes.ToArray();
+        }
+
+        // Formatted as the JSON console writes scopes: a key/value scope as its own ToString text, then key=value for
+        // each pair with the value as the console writes a structured value; a plain scope as its invariant text. Each
+        // item that cannot be converted becomes the marker, so it never drops the items and scopes after it.
+        private static void CaptureScope(object? scope, List<string> items)
+        {
+            if (scope is null)
+            {
+                return;
+            }
+
+            if (scope is IEnumerable<KeyValuePair<string, object?>> pairs)
+            {
+                try
+                {
+                    items.Add(scope.ToString() ?? string.Empty);
+                }
+                catch (Exception)
+                {
+                    items.Add(ScopeCaptureFailed);
+                }
+
+                try
+                {
+                    foreach (KeyValuePair<string, object?> pair in pairs)
+                    {
+                        items.Add(pair.Key + "="
+                            + (TryGetConsoleValueText(pair.Value, out string? value) ? value : ScopeCaptureFailed));
+                    }
+                }
+                catch (Exception)
+                {
+                    items.Add(ScopeCaptureFailed);
+                }
+
+                return;
+            }
+
+            try
+            {
+                items.Add(Convert.ToString(scope, CultureInfo.InvariantCulture) ?? string.Empty);
+            }
+            catch (Exception)
+            {
+                items.Add(ScopeCaptureFailed);
+            }
         }
 
         private static string DescribeException(Exception exception)

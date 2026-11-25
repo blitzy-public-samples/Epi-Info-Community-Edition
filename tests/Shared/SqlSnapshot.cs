@@ -674,4 +674,3 @@ internal sealed class SnapshotRowValues(SnapshotColumns columns, object?[] value
 
     IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
 }
-
