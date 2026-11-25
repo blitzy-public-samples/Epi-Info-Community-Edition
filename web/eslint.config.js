@@ -3,8 +3,9 @@
 // Application TypeScript (src/ and e2e/) is linted with type information so that
 // an `any` fails `npm run lint` whether it is written explicitly or arrives from
 // a library or an inferred expression such as JSON.parse. The generated
-// src/api/schema.ts is ignored. vite.config.ts and playwright.config.ts match no
-// `files` pattern below, so they are not linted; `tsc --noEmit` type-checks them.
+// src/api/schema.ts is ignored. The TypeScript tooling configs, vite.config.ts and
+// playwright.config.ts, stay outside that type-aware scope: they are linted without
+// type information, and `tsc --noEmit` type-checks them.
 import js from '@eslint/js';
 import { defineConfig, globalIgnores } from 'eslint/config';
 import tseslint from 'typescript-eslint';
@@ -32,6 +33,16 @@ export default defineConfig([
         URL: 'readonly',
         Buffer: 'readonly',
       },
+    },
+  },
+
+  // The TypeScript tooling configs: typescript-eslint without type information.
+  {
+    files: ['vite.config.ts', 'playwright.config.ts'],
+    extends: [js.configs.recommended, tseslint.configs.recommended],
+    rules: {
+      // TypeScript resolves identifiers itself, including Node globals such as process.
+      'no-undef': 'off',
     },
   },
 
