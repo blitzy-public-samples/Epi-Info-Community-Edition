@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <ProjectReference Include="../EpiInfo.Domain/EpiInfo.Domain.csproj" />
+  </ItemGroup>
+
+  <!-- Versions are pinned centrally in the root Directory.Packages.props. -->
+  <ItemGroup>
+    <PackageReference Include="Dapper" />
+    <PackageReference Include="Microsoft.Data.SqlClient" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="EpiInfo.Data.Tests" />
+  </ItemGroup>
+
+</Project>
