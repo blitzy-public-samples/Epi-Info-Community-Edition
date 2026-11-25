@@ -13,7 +13,7 @@
  *   Grid         .record-grid  .record-grid__row--deleted  .record-grid__paging
  *   Messages     .banner  .banner--error  .banner--warning  .banner--info
  *                .validation-summary
- *   Dialogs      .dialog-backdrop  .dialog  .find-dialog  .find-dialog__fields
+ *   Dialogs      .dialog-backdrop  .dialog  .button--danger  .find-dialog  .find-dialog__fields
  *                .find-dialog__criterion  .find-dialog__results
  *   Utilities    .visually-hidden
  *
@@ -40,7 +40,9 @@
  * text 15.8:1, muted text 6.0:1 or more, accent 5.2:1, danger 6.1:1 or more,
  * banner texts 9.1:1 or more, control borders 4.3:1 or more (3:1 needed),
  * hover borders 8.4:1 or more, text on the pressed surface 11.6:1, text
- * 11.6:1 and muted text 4.6:1 on the pressed row tint. */
+ * 11.6:1 and muted text 4.6:1 on the pressed row tint. White text on the
+ * danger button: 6.5:1 at rest (danger), 10.5:1 on hover (danger text) and
+ * 13.3:1 pressed (danger active). */
 :root {
   color-scheme: light;
 
@@ -70,6 +72,7 @@
   --color-danger-border: #cf222e;
   --color-danger-text: #82071e;
   --color-danger-subtle: #ffebe9;
+  --color-danger-active: #660018;
 
   --color-warning-border: #9a6700;
   --color-warning-text: #4d2d00;
@@ -839,6 +842,29 @@
 
   .dialog > h2 {
     font-size: 1.25rem;
+  }
+
+  /* Destructive confirmation, such as a dialog's Delete record button. White
+   * on --color-danger is 6.5:1. Disabled keeps the base button:disabled look,
+   * and focus keeps the base :focus-visible ring. */
+  .button--danger:not(:disabled) {
+    border-color: var(--color-danger);
+    background-color: var(--color-danger);
+    color: var(--color-page);
+  }
+
+  @media (hover: hover) {
+    .button--danger:hover:not(:disabled) {
+      border-color: var(--color-danger-text);
+      background-color: var(--color-danger-text);
+    }
+  }
+
+  /* Pressed: the danger counterpart of the base pressed surface, darker
+   * than hover; it follows and out-ranks the hover rule. */
+  .button--danger:active:not(:disabled):not([aria-disabled="true"]) {
+    border-color: var(--color-danger-active);
+    background-color: var(--color-danger-active);
   }
 
   /* Find record: wider panel, field picker, criterion rows, results. */
