@@ -358,7 +358,7 @@ public sealed class RecordValidator
             valid = false;
         }
 
-        if (rule.PatternMessage is { } patternMessage && !MaskPattern.IsSatisfiedBy(rule.Pattern, rule.FieldType, value))
+        if (rule.PatternMessage is { } patternMessage && !rule.Mask.IsSatisfiedBy(value))
         {
             errors.Add(rule.Name, patternMessage);
             valid = false;
@@ -582,11 +582,10 @@ public sealed class RecordValidator
                 RangeMessage = FormatRange(Lower, Upper);
             }
 
-            Pattern = validation.Pattern;
-            if (MaskPattern.Classify(Pattern, FieldType) is MaskPatternKind.TextDigitMask or MaskPatternKind.NumberMask
-                && !string.IsNullOrEmpty(Pattern))
+            Mask = MaskPattern.Parse(validation.Pattern, FieldType, Column.Family);
+            if (Mask.IsChecked)
             {
-                PatternMessage = ValidationMessages.FormatPatternMismatch(Pattern);
+                PatternMessage = ValidationMessages.FormatPatternMismatch(Mask.Pattern);
             }
 
             if (FieldType == FieldType.LegalValues)
@@ -642,7 +641,11 @@ public sealed class RecordValidator
         /// <summary>The range message; <see langword="null"/> when the field has no applicable bound.</summary>
         public string? RangeMessage { get; }
 
-        public string? Pattern { get; }
+        /// <summary>
+        /// The metadata pattern, interpreted once here for the field type and column, so a save-time check never
+        /// parses it again.
+        /// </summary>
+        public ParsedMask Mask { get; }
 
         /// <summary>The pattern message; <see langword="null"/> when the pattern is one the server does not check.</summary>
         public string? PatternMessage { get; }

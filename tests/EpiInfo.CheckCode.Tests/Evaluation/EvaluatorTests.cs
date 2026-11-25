@@ -12,7 +12,8 @@ namespace EpiInfo.CheckCode.Tests.Evaluation;
 /// Pins the tree-walking evaluator of the check-code subset against legacy Epi Info: the <c>=</c> rule and literal
 /// values of <c>Rule_CompareExp</c> and <c>Rule_Value</c>, <c>NOT</c> and <c>AND</c>, <c>IF/ELSE</c>,
 /// <c>ENABLE</c>, <c>DISABLE</c> and <c>CLEAR</c> with group expansion, typed <c>ASSIGN</c> with <c>YEARS</c> and
-/// <c>EPIWEEK</c>, <c>DIALOG</c>, case-insensitive identifiers, runtime-error recovery and statelessness.
+/// <c>EPIWEEK</c>, <c>DIALOG</c>, case-insensitive identifiers, runtime-error recovery, bounded stack use for long
+/// chains and deep nesting, and statelessness.
 /// </summary>
 /// <remarks>
 /// Scenario values from <c>testdata/scenarios/check_code_scenarios.json</c> are restated inline and the file is never
@@ -24,6 +25,12 @@ public sealed class EvaluatorTests
 {
     private const string FeverDialogMessage =
         "Warning: A fever temperature has been entered, but 'fever' was not selected as a symptom.";
+
+    // Far past the roughly 9,000 terms at which evaluation that recursed once per term overflowed a pool thread.
+    private const int LongChainTerms = 100_000;
+
+    // An explicit stack for the long-chain cases, so their outcome never depends on the host's default thread size.
+    private const int SmallStackBytes = 1024 * 1024;
 
     // A verbatim copy of the seeded metaViews.CheckCode of CaseReport (ViewId 1), tabs and final newline included,
     // so its line numbers are the seeded ones [testdata/sql/03_forms.sql:26-54].
@@ -194,6 +201,8 @@ public sealed class EvaluatorTests
         Fields:
         [
             F(6, "LastName", 1, "Text", 1, 2, "nvarchar", 8000),
+            F(7, "FirstName", 1, "Text", 1, 3, "nvarchar", 8000),
+            F(10, "City", 1, "Text", 1, 5, "nvarchar", 8000),
             F(16, "Age", 5, "Number", 1, 15, "float", 8),
             F(17, "Sex", 19, "Comment Legal", 1, 16, "nvarchar", 510),
             F(43, "Pregnant", 19, "Comment Legal", 1, 41, "nvarchar", 510),
@@ -731,6 +740,116 @@ public sealed class EvaluatorTests
         Assert.Empty(response.Disabled);
     }
 
+    [Theory]
+    // Every term holds, so the whole AND chain does.
+    [InlineData("Sex = \"1\"", " AND ", "Sex = \"1\"", LongChainTerms, "then")]
+    // n (-) operands folded to the right, Eq(a, Eq(b, ...)), are true exactly when n is even.
+    [InlineData("(-)", " = ", "(-)", LongChainTerms, "then")]
+    [InlineData("(-)", " = ", "(-)", LongChainTerms - 1, "else")]
+    // Right association: (.) is compared with the boolean the rest gives, and one empty side is never equal. A left
+    // fold, Eq(Eq((.), (-)), (-)) ..., would be true for an odd operand count.
+    [InlineData("(.)", " = ", "(-)", 3, "else")]
+    [InlineData("(.)", " = ", "(-)", LongChainTerms + 1, "else")]
+    public void FlatChain_GivesTheRightFoldWithoutExhaustingASmallStack(
+        string first, string separator, string term, int terms, string branch)
+    {
+        string program = ChainProgram(Chain(first, separator, term, terms));
+
+        FieldEventResponse response = RunOnSmallStack(
+            () => Run(program, CaseReportForm, FieldEventKind.FieldAfter, "LastName", ("Sex", Text("1"))));
+
+        Assert.Equal(new[] { "FirstName", "City" }, response.Assigned.Keys);
+        Assert.Equal(Text(branch), response.Assigned["FirstName"]);
+        Assert.Equal(Text("post"), response.Assigned["City"]);
+        Assert.Empty(response.Diagnostics);
+    }
+
+    [Fact]
+    public void LongAndChain_EvaluatesEveryTerm_SoAnErrorInTheLastFailsTheIf()
+    {
+        // The first term is already false; with no short circuit the unknown field in the last term still surfaces.
+        string program = ChainProgram(
+            Chain("Sex = \"2\"", " AND ", "Sex = \"1\"", LongChainTerms - 1) + " AND NoSuchField = \"1\"");
+        Assert.StartsWith("IF Sex = \"2\" AND Sex = \"1\" AND", ProgramLine(program, 3), StringComparison.Ordinal);
+
+        FieldEventResponse response = RunOnSmallStack(
+            () => Run(program, CaseReportForm, FieldEventKind.FieldAfter, "LastName", ("Sex", Text("1"))));
+
+        Diagnostic diagnostic = Assert.Single(response.Diagnostics);
+        Assert.Equal(DiagnosticSeverity.Error, diagnostic.Severity);
+        Assert.Equal("IF", diagnostic.Command);
+        Assert.Equal(3, diagnostic.Line);
+        Assert.Equal("CaseReport", diagnostic.Form);
+        Assert.False(string.IsNullOrWhiteSpace(diagnostic.Message));
+
+        // Neither branch ran, and the statement after the IF still did.
+        Assert.Equal(new[] { "City" }, response.Assigned.Keys);
+        Assert.Equal(Text("post"), response.Assigned["City"]);
+    }
+
+    [Theory]
+    [InlineData("AND", "IF")]
+    [InlineData("AND", "ASSIGN")]
+    [InlineData("=", "IF")]
+    [InlineData("=", "ASSIGN")]
+    [InlineData("NOT", "IF")]
+    [InlineData("NOT", "ASSIGN")]
+    public void NestingDeeperThanTheStack_FailsOnlyItsStatement(string shape, string command)
+    {
+        // Left-nested, which the parser never builds from a flat chain, so the evaluator must recurse into it. The
+        // tree is never printed or compared: its synthesized ToString and Equals would recurse as deep.
+        const int Depth = 200_000;
+        const int DeepLine = 4;
+        var leaf = new IdentifierNode("Sex", DeepLine);
+        ExpressionNode deep = leaf;
+        for (var i = 0; i < Depth; i++)
+        {
+            deep = shape switch
+            {
+                "AND" => new AndNode(deep, leaf, DeepLine),
+                "=" => new EqualsNode(deep, leaf, DeepLine),
+                "NOT" => new NotNode(deep, DeepLine),
+                _ => throw new ArgumentOutOfRangeException(nameof(shape), shape, "Not a nesting shape."),
+            };
+        }
+
+        StatementNode middle = command switch
+        {
+            "IF" => new IfStatementNode(
+                deep,
+                new StatementNode[] { new AssignStatementNode("LastName", LiteralNode.FromString("then", 5), 5) },
+                null,
+                DeepLine),
+            "ASSIGN" => new AssignStatementNode("LastName", deep, DeepLine),
+            _ => throw new ArgumentOutOfRangeException(nameof(command), command, "Not a statement under test."),
+        };
+        var block = new EventBlockNode(
+            FieldEventKind.FieldAfter,
+            2,
+            new StatementNode[]
+            {
+                new AssignStatementNode("FirstName", LiteralNode.FromString("before", 3), 3),
+                middle,
+                new AssignStatementNode("City", LiteralNode.FromString("after", 7), 7),
+            },
+            Array.Empty<Diagnostic>());
+        var values = new Dictionary<string, FieldValue> { ["Sex"] = Text("1") };
+
+        FieldEventResponse response = RunOnSmallStack(() => Evaluator.Run(CaseReportForm, new[] { block }, values));
+
+        Diagnostic diagnostic = Assert.Single(response.Diagnostics);
+        Assert.Equal(DiagnosticSeverity.Error, diagnostic.Severity);
+        Assert.Equal(command, diagnostic.Command);
+        Assert.Equal(DeepLine, diagnostic.Line);
+        Assert.Equal("CaseReport", diagnostic.Form);
+        Assert.Equal("Expression is nested too deeply to evaluate.", diagnostic.Message);
+
+        // The statements before and after the failing one both took effect.
+        Assert.Equal(new[] { "FirstName", "City" }, response.Assigned.Keys);
+        Assert.Equal(Text("before"), response.Assigned["FirstName"]);
+        Assert.Equal(Text("after"), response.Assigned["City"]);
+    }
+
     [Fact]
     public void AsianClick_UnchecksTheOtherRaceCheckboxesInProgramOrder()
     {
@@ -874,6 +993,39 @@ public sealed class EvaluatorTests
         Assert.NotNull(response);
         return response;
     }
+
+    // Runs on a dedicated thread with a small, explicit stack, so a run whose stack use grew with a chain's length
+    // would overflow here on any host. A stack overflow cannot be caught: it ends the test process and fails the run.
+    private static FieldEventResponse RunOnSmallStack(Func<FieldEventResponse> run)
+    {
+        FieldEventResponse? response = null;
+        Exception? exception = null;
+        var thread = new Thread(() => exception = Record.Exception(() => response = run()), SmallStackBytes);
+        thread.Start();
+        thread.Join();
+
+        Assert.Null(exception);
+        Assert.NotNull(response);
+        return response;
+    }
+
+    // first, then count - 1 more terms, each after the separator: "first SEP term SEP term ...".
+    private static string Chain(string first, string separator, string term, int count) =>
+        string.Join(separator, Enumerable.Repeat(term, count - 1).Prepend(first));
+
+    // The IF over the chain stands on line 3; the ASSIGN after it runs whatever the condition gives.
+    private static string ChainProgram(string condition) => $"""
+        Field LastName
+            After
+                IF {condition} THEN
+                    ASSIGN FirstName = "then"
+                ELSE
+                    ASSIGN FirstName = "else"
+                END-IF
+                ASSIGN City = "post"
+            End-After
+        End-Field
+        """;
 
     // Line numbers are 1-based, as diagnostics report them; indentation is not part of the statement.
     private static string ProgramLine(string program, int line) => program.Split('\n')[line - 1].Trim();

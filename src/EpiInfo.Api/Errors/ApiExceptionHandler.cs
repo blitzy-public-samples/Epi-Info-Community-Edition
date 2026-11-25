@@ -128,8 +128,8 @@ internal sealed partial class ApiExceptionHandler(ILogger<ApiExceptionHandler> l
     /// <summary>
     /// The <c>writeOutcome</c> of a failed record write, by this precedence: <see cref="WriteOutcome.Written"/> once
     /// the store reported a commit; otherwise the store exception's own <c>Outcome</c>; otherwise
-    /// <see cref="WriteOutcome.NotWritten"/> when no store write call was issued; otherwise
-    /// <see cref="WriteOutcome.Unknown"/>.
+    /// <see cref="WriteOutcome.NotWritten"/> when no store write call is outstanding: none was issued, or the store
+    /// reported that it wrote nothing; otherwise <see cref="WriteOutcome.Unknown"/>.
     /// </summary>
     /// <param name="feature">The request's write record, or <see langword="null"/> when no write path created one.</param>
     /// <param name="exception">The failure being answered.</param>

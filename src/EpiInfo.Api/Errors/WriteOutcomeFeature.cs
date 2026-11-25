@@ -26,8 +26,12 @@ namespace EpiInfo.Api.Errors;
 /// log line, serialisation and delivery of the DTO already built.
 /// </description></item>
 /// <item><description>
-/// A <c>DELETE</c> of an already-deleted record writes nothing and need not be marked written. Marking it would be
-/// harmless, because that request ends in 204 with no error body.
+/// Call <see cref="MarkNotWritten"/> as soon as <c>UpdateAsync</c> returns any defined status other than
+/// <c>Success</c>, or <c>SoftDeleteAsync</c> returns <c>NotFound</c> or <c>AlreadyDeleted</c>: the store reports
+/// that it wrote nothing, so a failure while that response is written is <c>notWritten</c>, not <c>unknown</c>.
+/// </description></item>
+/// <item><description>
+/// A <c>DELETE</c> of an already-deleted record wrote nothing, so it is marked not written, never written.
 /// </description></item>
 /// </list>
 /// <para>
@@ -44,8 +48,10 @@ namespace EpiInfo.Api.Errors;
 public sealed class WriteOutcomeFeature
 {
     /// <summary>
-    /// True once a store write call is about to be issued. A failure while this is false happened before any data
-    /// could have been written, for example during the metadata read.
+    /// True from <see cref="MarkWriteStarted"/> until the store reports a result that wrote nothing; a reported commit
+    /// keeps it true, because <see cref="Written"/> implies it. While this is false nothing can have been written: no
+    /// store write call was issued, for example because the failure came from the metadata read, or the store reported
+    /// that its call wrote nothing.
     /// </summary>
     public bool WriteStarted { get; private set; }
 
@@ -66,6 +72,20 @@ public sealed class WriteOutcomeFeature
     {
         WriteStarted = true;
         Written = true;
+    }
+
+    /// <summary>
+    /// Records that the store call returned a definitive result that wrote nothing: it rolled back or sent no data
+    /// statement. This clears <see cref="WriteStarted"/> unless <see cref="Written"/> is true, because a commit never
+    /// reverts and <see cref="Written"/> always implies <see cref="WriteStarted"/>. Calling it again has no further
+    /// effect.
+    /// </summary>
+    public void MarkNotWritten()
+    {
+        if (!Written)
+        {
+            WriteStarted = false;
+        }
     }
 
     /// <summary>Returns the request's feature, or <see langword="null"/> when no write path has created one.</summary>

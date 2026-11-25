@@ -18,6 +18,8 @@ namespace EpiInfo.Domain.Tests.Metadata;
 /// columns, in an order that is not <c>TabIndex</c> order, so each field's <c>TabIndex</c> is its list position, and
 /// every page gains one synthetic label and one synthetic group, as the seeded pages hold labels and groups. The
 /// <c>IsReadOnly</c> and <c>MaxLength</c> values forms.json lacks are taken from <c>testdata/sql/03_forms.sql</c>.
+/// A second fixture transcribes every page-bound <c>metaFields</c> row of that SQL file with its stored
+/// <c>TabIndex</c>, so the 61, 55 and 33 rows of the three seeded pages are checked as the database holds them.
 /// No database is used.
 /// </remarks>
 public sealed class FormDefinitionFactoryTests
@@ -99,9 +101,257 @@ public sealed class FormDefinitionFactoryTests
     private static readonly Lazy<JsonElement> FormsJson = new(LoadFormsJson);
 
     /// <summary>
+    /// The seeded <c>metaViews</c> rows by <c>ViewId</c> and <c>Name</c>, with the <c>FieldId</c> of the first of
+    /// each view's three system rows, as <c>testdata/sql/03_forms.sql</c> inserts them.
+    /// </summary>
+    private static readonly (int ViewId, string Name, int FirstSystemFieldId)[] SeededMetaViews =
+    [
+        (1, "CaseReport", 1),
+        (2, "FoodHistory", 1001),
+    ];
+
+    /// <summary>
+    /// The <c>metaPages</c> rows of <c>testdata/sql/03_forms.sql</c>, each with its <c>ViewId</c>. Each page table
+    /// is named from the view's base table and the <c>PageId</c>.
+    /// </summary>
+    private static readonly (int ViewId, PageMetadata Page)[] SeededMetaPages =
+    [
+        (1, new PageMetadata(1, "Page 1", 0, "CaseReport1")),
+        (2, new PageMetadata(2, "Page 1", 0, "FoodHistory2")),
+        (2, new PageMetadata(3, "Page 2", 1, "FoodHistory3")),
+    ];
+
+    /// <summary>
+    /// Every page-bound row of the <c>metaFields</c> INSERT of <c>testdata/sql/03_forms.sql</c>, transcribed in the
+    /// file's <c>FieldId</c> order, which is not <c>TabIndex</c> order on any page: <c>FieldId</c>, <c>Name</c>,
+    /// <c>FieldTypeId</c>, <c>TabIndex</c>, <c>PageId</c> and the group <c>List</c>.
+    /// </summary>
+    /// <remarks>
+    /// The seeded views hold 64 and 91 <c>metaFields</c> rows. Three of each are the system rows (<c>FieldId</c> 1-3
+    /// and 1001-1003), whose <c>PageId</c> is null, so 61 rows sit on <c>CaseReport</c> page 1 and 88 on
+    /// <c>FoodHistory</c>: 55 on page 2 and 33 on page 3. Of those, 43 and 74 own a page-table column, the fields
+    /// <c>testdata/forms.json</c> lists; the rest are labels, groups and a command button. The 43 and 74 columns give
+    /// 43 and 67 data fields, because the seven <c>Yes/No</c> columns of <c>FoodHistory</c> are unsupported.
+    /// </remarks>
+    private static readonly (int FieldId, string Name, int FieldTypeId, decimal TabIndex, int PageId, string? List)[]
+        SeededMetaFieldsRows =
+        [
+            (4, "DottedLine", 2, 6m, 1, null),
+            (5, "Detach", 2, 7m, 1, null),
+            (6, "LastName", 1, 2m, 1, null),
+            (7, "FirstName", 1, 3m, 1, null),
+            (8, "PhoneNumber", 6, 1m, 1, null),
+            (9, "Address", 1, 4m, 1, null),
+            (10, "City", 1, 5m, 1, null),
+            (11, "LymeDiseaseCaseReport", 2, 8m, 1, null),
+            (12, "Underline", 2, 9m, 1, null),
+            (13, "State", 19, 12m, 1, null),
+            (14, "County", 1, 13m, 1, null),
+            (15, "Zip", 1, 14m, 1, null),
+            (16, "Age", 5, 15m, 1, null),
+            (17, "Sex", 19, 16m, 1, null),
+            (18, "Ethnicity", 19, 17m, 1, null),
+            (19, "Race", 19, 18m, 1, null),
+            (20, "DemographicInformation", 21, 11m, 1, "Race,Ethnicity,Sex,Age,Zip,County,State"),
+            (21, "Symptoms", 21, 19m, 1,
+                "DiagnosisDate,ReportDate,OnsetDate,OtherClinical,AtrloventricularBlock,LabelCardiologic,Antibody,"
+                + "CSF,Encephalitis,LymphocyticMeningitis,Radiculoneuropathy,BellsPalsy,LabelNeurologic,Arthritis,"
+                + "LabelRheumatologic,ErythemaMigrans,LabelDermatologic"),
+            (22, "LabelDermatologic", 2, 20m, 1, null),
+            (23, "LabelRheumatologic", 2, 22m, 1, null),
+            (24, "LabelNeurologic", 2, 24m, 1, null),
+            (25, "LabelCardiologic", 2, 31m, 1, null),
+            (26, "ErythemaMigrans", 19, 21m, 1, null),
+            (27, "Arthritis", 19, 23m, 1, null),
+            (28, "BellsPalsy", 19, 25m, 1, null),
+            (29, "Radiculoneuropathy", 19, 26m, 1, null),
+            (30, "LymphocyticMeningitis", 19, 27m, 1, null),
+            (31, "Encephalitis", 19, 28m, 1, null),
+            (32, "CSF", 19, 29m, 1, null),
+            (33, "Antibody", 19, 30m, 1, null),
+            (34, "AtrloventricularBlock", 19, 32m, 1, null),
+            (35, "OtherClinical", 1, 33m, 1, null),
+            (36, "OnsetDate", 7, 34m, 1, null),
+            (37, "DiagnosisDate", 7, 36m, 1, null),
+            (38, "ReportDate", 7, 35m, 1, null),
+            (40, "Hospitalized", 19, 38m, 1, null),
+            (41, "Antibiotics", 1, 39m, 1, null),
+            (42, "AntibioticUseDays", 5, 40m, 1, null),
+            (43, "Pregnant", 19, 41m, 1, null),
+            (44, "Wherewasthepatientmostlikelyexposed", 2, 42m, 1, null),
+            (45, "ExposedCounty", 1, 43m, 1, null),
+            (46, "ExposedState", 19, 44m, 1, null),
+            (47, "OtherHistory", 21, 37m, 1,
+                "ExposedState,ExposedCounty,Wherewasthepatientmostlikelyexposed,Pregnant,AntibioticUseDays,"
+                + "Antibiotics,Hospitalized"),
+            (48, "SerologicResults", 19, 46m, 1, null),
+            (49, "CultureResults", 19, 47m, 1, null),
+            (50, "OtherLabResult", 1, 48m, 1, null),
+            (51, "PhysicianName", 1, 49m, 1, null),
+            (52, "PhysicianPhone", 6, 50m, 1, null),
+            (53, "PhysicianAddress", 1, 51m, 1, null),
+            (54, "PersonCompletingForm", 1, 52m, 1, null),
+            (55, "PersonCompletingFormPhone", 6, 53m, 1, null),
+            (56, "PersonCompletingFormAddress", 1, 54m, 1, null),
+            (57, "LaboratoryResults", 21, 45m, 1,
+                "PersonCompletingFormAddress,PersonCompletingFormPhone,PersonCompletingForm,PhysicianAddress,"
+                + "PhysicianPhone,PhysicianName,OtherLabResult,CultureResults,SerologicResults"),
+            (58, "StateIDNumber", 1, 55m, 1, null),
+            (59, "CDCIDNumber", 1, 56m, 1, null),
+            (60, "ReportedToCDCDate", 7, 57m, 1, null),
+            (61, "FooterLabel", 2, 58m, 1, null),
+            (62, "FormBasedonCDC5260Rev052004", 2, 59m, 1, null),
+            (63, "CenterFooter", 2, 60m, 1, null),
+            (64, "Page1", 2, 61m, 1, null),
+            (65, "Alldatacontainedinthisformisfictional", 2, 10m, 1, null),
+            (1004, "CaseID", 5, 6m, 2, null),
+            (1005, "DateofInterview", 7, 7m, 2, null),
+            (1006, "DemographicInformation", 21, 9m, 2,
+                "HomePhone,EmailAddress,Occupation,Longitude,Latitude,State,GetCoordinates,PatientAddress,"
+                + "Multiracial,Asian,AmericanIndianAlaskanNative,Black,UnknownOther,"
+                + "NativeHawaiianOtherPacificIslander,White,Race,EthnicityGroup,Age,DOB,Sex,LastName,FirstName"),
+            (1007, "FirstName", 1, 10m, 2, null),
+            (1008, "LastName", 1, 11m, 2, null),
+            (1009, "Sex", 17, 12m, 2, null),
+            (1010, "DOB", 7, 13m, 2, null),
+            (1011, "Age", 5, 14m, 2, null),
+            (1012, "EthnicityGroup", 17, 15m, 2, null),
+            (1013, "Race", 2, 16m, 2, null),
+            (1014, "White", 10, 17m, 2, null),
+            (1015, "NativeHawaiianOtherPacificIslander", 10, 18m, 2, null),
+            (1016, "UnknownOther", 10, 19m, 2, null),
+            (1017, "Black", 10, 20m, 2, null),
+            (1018, "AmericanIndianAlaskanNative", 10, 21m, 2, null),
+            (1019, "Asian", 10, 22m, 2, null),
+            (1020, "Multiracial", 10, 23m, 2, null),
+            (1021, "PatientAddress", 4, 24m, 2, null),
+            (1022, "GetCoordinates", 13, 25m, 2, null),
+            (1023, "State", 1, 26m, 2, null),
+            (1024, "Latitude", 5, 27m, 2, null),
+            (1025, "Longitude", 5, 28m, 2, null),
+            (1026, "Occupation", 1, 29m, 2, null),
+            (1027, "EmailAddress", 1, 30m, 2, null),
+            (1028, "HomePhone", 6, 31m, 2, null),
+            (1036, "OnsetDate", 7, 34m, 2, null),
+            (1038, "Symptoms", 21, 32m, 2,
+                "DateOfDeath,Died,Antibiotics,HospitalAdmissionDate,Hospitalized,DoctorVisitDate,DoctorVisit,"
+                + "LooseStoolsPerDay,FeverTemp,Abdominalcramps,Nausea,Irritable,Chills,PoorFeeding,NonBloodyDiarrhea,"
+                + "BloodyDiarrhea,Vomiting,Fever,Headache,SymptomDuration,OnsetWeek,OnsetDate,ILL"),
+            (1039, "Headache", 10, 37m, 2, null),
+            (1040, "Fever", 10, 38m, 2, null),
+            (1041, "Vomiting", 10, 39m, 2, null),
+            (1042, "BloodyDiarrhea", 10, 40m, 2, null),
+            (1043, "NonBloodyDiarrhea", 10, 41m, 2, null),
+            (1062, "FoodHistory", 2, 2m, 2, null),
+            (1063, "EColi", 2, 1m, 2, null),
+            (1064, "ILL", 11, 33m, 2, null),
+            (1065, "SymptomDuration", 1, 36m, 2, null),
+            (1066, "PoorFeeding", 10, 42m, 2, null),
+            (1067, "Chills", 10, 43m, 2, null),
+            (1068, "Irritable", 10, 44m, 2, null),
+            (1069, "Nausea", 10, 45m, 2, null),
+            (1070, "Abdominalcramps", 10, 46m, 2, null),
+            (1071, "LooseStoolsPerDay", 17, 48m, 2, null),
+            (1073, "FoodsEaten", 21, 3m, 3,
+                "Cookedbacon,Butter,Beansprouts,Rawcarrots,Wholemilk,Turkey,Icecream,N2milk,Viennasausages,Sourcream,"
+                + "Beefjerkey,Freshtomatoes,Applejuice,Orangejuice,Strawberries,Americancheese,Peaches,Cheddarcheese,"
+                + "Skimmilk,Breastmilk,Blueberries,Grapes,Freshcelery"),
+            (1108, "DoctorVisit", 11, 49m, 2, null),
+            (1109, "Hospitalized", 11, 51m, 2, null),
+            (1110, "Antibiotics", 11, 53m, 2, null),
+            (1111, "DoctorVisitDate", 7, 50m, 2, null),
+            (1112, "HospitalAdmissionDate", 7, 52m, 2, null),
+            (1113, "EColi1", 2, 1m, 3, null),
+            (1114, "FoodHistory1", 2, 2m, 3, null),
+            (1115, "BuyLastTenDays", 4, 27m, 3, null),
+            (1116, "Breastmilk", 10, 7m, 3, null),
+            (1120, "Beefjerkey", 10, 16m, 3, null),
+            (1121, "Viennasausages", 10, 18m, 3, null),
+            (1122, "Americancheese", 10, 11m, 3, null),
+            (1123, "Cheddarcheese", 10, 9m, 3, null),
+            (1124, "Sourcream", 10, 17m, 3, null),
+            (1125, "Butter", 10, 25m, 3, null),
+            (1126, "Icecream", 10, 20m, 3, null),
+            (1127, "Cookedbacon", 10, 26m, 3, null),
+            (1128, "Turkey", 10, 21m, 3, null),
+            (1129, "Strawberries", 10, 12m, 3, null),
+            (1130, "Grapes", 10, 5m, 3, null),
+            (1131, "Blueberries", 10, 6m, 3, null),
+            (1132, "Peaches", 10, 10m, 3, null),
+            (1133, "Beansprouts", 10, 24m, 3, null),
+            (1134, "Applejuice", 10, 14m, 3, null),
+            (1135, "N2milk", 10, 19m, 3, null),
+            (1136, "Skimmilk", 10, 8m, 3, null),
+            (1137, "Wholemilk", 10, 22m, 3, null),
+            (1138, "Orangejuice", 10, 13m, 3, null),
+            (1139, "Freshtomatoes", 10, 15m, 3, null),
+            (1140, "Freshcelery", 10, 4m, 3, null),
+            (1141, "Rawcarrots", 10, 23m, 3, null),
+            (1142, "Alldatacontainedhereinisfictional", 2, 8m, 2, null),
+            (1143, "Died", 11, 54m, 2, null),
+            (1144, "DateOfDeath", 7, 55m, 2, null),
+            (1145, "FeverTemp", 5, 47m, 2, null),
+            (1146, "StoolSubmitted", 11, 29m, 3, null),
+            (1147, "O157H7isolated", 11, 31m, 3, null),
+            (1148, "StoolCollectionDate", 7, 30m, 3, null),
+            (1149, "Lab", 1, 32m, 3, null),
+            (1150, "LabResults", 1, 33m, 3, null),
+            (1151, "LabTestingandResults", 21, 28m, 3,
+                "LabResults,Lab,O157H7isolated,StoolCollectionDate,StoolSubmitted"),
+            (1152, "N_____", 2, 5m, 2, null),
+            (1153, "USDEPARTMENTOFHEALTHHUMANSERVICES", 2, 3m, 2, null),
+            (1154, "CentersforDiseaseControlandPrevention", 2, 4m, 2, null),
+            (1157, "OnsetWeek", 5, 35m, 2, null),
+        ];
+
+    /// <summary>
+    /// The names of each seeded page's <c>metaFields</c> rows by <c>PageId</c>, in <c>TabIndex</c> order, as
+    /// <c>testdata/sql/03_forms.sql</c> holds them: 61 on page 1, 55 on page 2 and 33 on page 3.
+    /// </summary>
+    private static readonly IReadOnlyDictionary<int, string[]> SeededPageFieldNames = new Dictionary<int, string[]>
+    {
+        [1] =
+        [
+            "PhoneNumber", "LastName", "FirstName", "Address", "City", "DottedLine", "Detach", "LymeDiseaseCaseReport",
+            "Underline", "Alldatacontainedinthisformisfictional", "DemographicInformation", "State", "County", "Zip",
+            "Age", "Sex", "Ethnicity", "Race", "Symptoms", "LabelDermatologic", "ErythemaMigrans", "LabelRheumatologic",
+            "Arthritis", "LabelNeurologic", "BellsPalsy", "Radiculoneuropathy", "LymphocyticMeningitis", "Encephalitis",
+            "CSF", "Antibody", "LabelCardiologic", "AtrloventricularBlock", "OtherClinical", "OnsetDate", "ReportDate",
+            "DiagnosisDate", "OtherHistory", "Hospitalized", "Antibiotics", "AntibioticUseDays", "Pregnant",
+            "Wherewasthepatientmostlikelyexposed", "ExposedCounty", "ExposedState", "LaboratoryResults",
+            "SerologicResults", "CultureResults", "OtherLabResult", "PhysicianName", "PhysicianPhone",
+            "PhysicianAddress", "PersonCompletingForm", "PersonCompletingFormPhone", "PersonCompletingFormAddress",
+            "StateIDNumber", "CDCIDNumber", "ReportedToCDCDate", "FooterLabel", "FormBasedonCDC5260Rev052004",
+            "CenterFooter", "Page1",
+        ],
+        [2] =
+        [
+            "EColi", "FoodHistory", "USDEPARTMENTOFHEALTHHUMANSERVICES", "CentersforDiseaseControlandPrevention",
+            "N_____", "CaseID", "DateofInterview", "Alldatacontainedhereinisfictional", "DemographicInformation",
+            "FirstName", "LastName", "Sex", "DOB", "Age", "EthnicityGroup", "Race", "White",
+            "NativeHawaiianOtherPacificIslander", "UnknownOther", "Black", "AmericanIndianAlaskanNative", "Asian",
+            "Multiracial", "PatientAddress", "GetCoordinates", "State", "Latitude", "Longitude", "Occupation",
+            "EmailAddress", "HomePhone", "Symptoms", "ILL", "OnsetDate", "OnsetWeek", "SymptomDuration", "Headache",
+            "Fever", "Vomiting", "BloodyDiarrhea", "NonBloodyDiarrhea", "PoorFeeding", "Chills", "Irritable", "Nausea",
+            "Abdominalcramps", "FeverTemp", "LooseStoolsPerDay", "DoctorVisit", "DoctorVisitDate", "Hospitalized",
+            "HospitalAdmissionDate", "Antibiotics", "Died", "DateOfDeath",
+        ],
+        [3] =
+        [
+            "EColi1", "FoodHistory1", "FoodsEaten", "Freshcelery", "Grapes", "Blueberries", "Breastmilk", "Skimmilk",
+            "Cheddarcheese", "Peaches", "Americancheese", "Strawberries", "Orangejuice", "Applejuice", "Freshtomatoes",
+            "Beefjerkey", "Sourcream", "Viennasausages", "N2milk", "Icecream", "Turkey", "Wholemilk", "Rawcarrots",
+            "Beansprouts", "Butter", "Cookedbacon", "BuyLastTenDays", "LabTestingandResults", "StoolSubmitted",
+            "StoolCollectionDate", "O157H7isolated", "Lab", "LabResults",
+        ],
+    };
+
+    /// <summary>
     /// Adjacent schema-valid tab indexes, lower first, as invariant text because attributes cannot hold decimal
     /// constants: 2^53 and 2^53 + 1, and the largest and the smallest adjacent pair a <c>decimal(18,0)</c> holds.
-    /// One IEEE double holds both values of each pair.
+    /// One IEEE double holds both values of each pair. The rows reach <see cref="FormDefinitionFactory"/> in
+    /// <c>FieldId</c> order with the lower tab index on the higher <c>FieldId</c>; the page it builds must list them
+    /// by exact tab index, and each field it produces must carry its tab index exactly, in the DTO and on the wire.
     /// </summary>
     [Theory]
     [InlineData("9007199254740992", "9007199254740993")]
@@ -123,72 +373,67 @@ public sealed class FormDefinitionFactoryTests
         Assert.Equal(higher, later.TabIndex);
         Assert.NotEqual(earlier.TabIndex, later.TabIndex);
 
-        FieldMetadata[] ordered = new[] { later, earlier }
-            .OrderBy(row => row.TabIndex ?? 0)
-            .ThenBy(row => row.FieldId)
-            .ToArray();
+        FormMetadata form = SinglePageForm(later, earlier);
+        PageDefinition page = Assert.Single(Create(form).Pages);
 
-        Assert.Equal(["Earlier", "Later"], ordered.Select(row => row.Name));
-        Assert.Equal([2, 1], ordered.Select(row => row.FieldId));
+        // Ordering by FieldId, or by the tab indexes as doubles, would list Later first.
+        Assert.Equal(["Earlier", "Later"], page.Fields.Select(field => field.Name));
+        Assert.Equal([lower, higher], page.Fields.Select(field => field.TabIndex));
 
-        FieldDefinition earlierDefinition = Definition(earlier);
-        FieldDefinition laterDefinition = Definition(later);
-
-        Assert.Equal(lower, earlierDefinition.TabIndex);
-        Assert.Equal(higher, laterDefinition.TabIndex);
+        // The factory's own fields, serialized with the API's number settings, keep every digit of each tab index.
         Assert.Contains(
             $"\"tabIndex\":{lowerText},",
-            JsonSerializer.Serialize(earlierDefinition, WireOptions),
+            JsonSerializer.Serialize(page.Fields[0], WireOptions),
             StringComparison.Ordinal);
         Assert.Contains(
             $"\"tabIndex\":{higherText},",
-            JsonSerializer.Serialize(laterDefinition, WireOptions),
+            JsonSerializer.Serialize(page.Fields[1], WireOptions),
             StringComparison.Ordinal);
 
-        FormMetadata form = SinglePageForm(later, earlier);
-        PageDefinition page = Assert.Single(Create(form).Pages);
-        Assert.Equal(["Earlier", "Later"], page.Fields.Select(field => field.Name));
-        Assert.Equal([lower, higher], page.Fields.Select(field => field.TabIndex));
         Assert.Equal(["Earlier", "Later"], FormDefinitionFactory.GetDataFields(form).Select(field => field.Name));
     }
 
     [Fact]
     public void Create_OrdersPagesByPositionAndFieldsByTabIndexThenFieldId()
     {
+        // PageId runs against Position: the Position 0 page has the higher PageId and is listed second, so neither
+        // the input order nor a PageId sort yields Position order. The rows interleave the two pages, so membership
+        // rests on the PageId filter alone, and the Position 1 page's tab indexes sit below every Position 0 tab
+        // index, so a field order that ignores the page's Position would list D and E first.
         FormMetadata form = new(
             7,
             "Synthetic",
             "Syn",
-            [new PageMetadata(20, "Second", 1, "Syn20"), new PageMetadata(10, "First", 0, "Syn10")],
+            [new PageMetadata(10, "Second", 1, "Syn10"), new PageMetadata(20, "First", 0, "Syn20")],
             [
-                Field(1, "A", "Text", pageId: 10, tabIndex: 3, sqlType: "nvarchar(255)"),
-                Field(2, "B", "Text", pageId: 10, tabIndex: 1, sqlType: "nvarchar(255)"),
-                Field(3, "C", "Text", pageId: 10, tabIndex: 2, sqlType: "nvarchar(255)"),
-                Field(9, "D", "Text", pageId: 20, tabIndex: 5, sqlType: "nvarchar(255)"),
-                Field(8, "E", "Text", pageId: 20, tabIndex: 5, sqlType: "nvarchar(255)"),
+                Field(9, "D", "Text", pageId: 10, tabIndex: 0, sqlType: "nvarchar(255)"),
+                Field(1, "A", "Text", pageId: 20, tabIndex: 3, sqlType: "nvarchar(255)"),
+                Field(8, "E", "Text", pageId: 10, tabIndex: 0, sqlType: "nvarchar(255)"),
+                Field(2, "B", "Text", pageId: 20, tabIndex: 1, sqlType: "nvarchar(255)"),
+                Field(3, "C", "Text", pageId: 20, tabIndex: 2, sqlType: "nvarchar(255)"),
             ]);
 
         FormDefinition definition = Create(form);
 
-        Assert.Equal([10, 20], definition.Pages.Select(page => page.PageId));
-        Assert.Equal(["First", "Second"], definition.Pages.Select(page => page.Name));
-        Assert.Equal([0, 1], definition.Pages.Select(page => page.Position));
+        Assert.Equal(
+            [(20, "First", 0), (10, "Second", 1)],
+            definition.Pages.Select(page => (page.PageId, page.Name, page.Position)));
 
         PageDefinition first = definition.Pages[0];
         Assert.Equal(["B", "C", "A"], first.Fields.Select(field => field.Name));
         Assert.Equal([1m, 2m, 3m], first.Fields.Select(field => field.TabIndex));
+        Assert.Equal([20, 20, 20], first.Fields.Select(field => field.PageId));
 
-        // Equal tab indexes fall back to FieldId, whatever order the rows arrive in.
+        // Equal tab indexes fall back to FieldId: D is listed before E, and E's lower FieldId still puts it first.
         PageDefinition second = definition.Pages[1];
         Assert.Equal(["E", "D"], second.Fields.Select(field => field.Name));
-        Assert.Equal([5m, 5m], second.Fields.Select(field => field.TabIndex));
+        Assert.Equal([0m, 0m], second.Fields.Select(field => field.TabIndex));
+        Assert.Equal([10, 10], second.Fields.Select(field => field.PageId));
 
-        Assert.All(definition.Pages, page => Assert.All(page.Fields, field => Assert.Equal(page.PageId, field.PageId)));
-
-        // The data fields keep the same storage order, which the grid columns are taken from.
+        // The data fields keep the same storage order, page Position first, which the grid columns are taken from.
         DataFieldSet dataFields = FormDefinitionFactory.GetDataFields(form);
         Assert.Equal(["B", "C", "A", "E", "D"], dataFields.Select(field => field.Name));
-        Assert.Equal([10, 10, 10, 20, 20], dataFields.Select(field => field.Page.PageId));
+        Assert.Equal([20, 20, 20, 10, 10], dataFields.Select(field => field.Page.PageId));
     }
 
     /// <summary>
@@ -354,6 +599,86 @@ public sealed class FormDefinitionFactoryTests
         Assert.Equal(
             [(2, "Page 1", 0), (3, "Page 2", 1)],
             SeededDefinition("FoodHistory").Pages.Select(page => (page.PageId, page.Name, page.Position)));
+    }
+
+    /// <summary>
+    /// Each seeded page lists exactly its <c>metaFields</c> rows of <c>testdata/sql/03_forms.sql</c>, in
+    /// <c>TabIndex</c> order: 61 on <c>CaseReport</c> page 1, and 55 and 33 on <c>FoodHistory</c> pages 2 and 3. The
+    /// rows arrive in <c>FieldId</c> order, which differs from <c>TabIndex</c> order on every page, so the order
+    /// listed is the factory's own.
+    /// </summary>
+    [Theory]
+    [InlineData("CaseReport", 1, "Page 1", 0, 61)]
+    [InlineData("FoodHistory", 2, "Page 1", 0, 55)]
+    [InlineData("FoodHistory", 3, "Page 2", 1, 33)]
+    public void Create_SeededMetaFieldsRows_ListEachPageInTabIndexOrder(
+        string formName,
+        int pageId,
+        string pageName,
+        int position,
+        int expectedFieldCount)
+    {
+        string[] expectedNames = SeededPageFieldNames[pageId];
+        Assert.Equal(expectedFieldCount, expectedNames.Length);
+
+        FormMetadata form = MetaFieldsForm(formName);
+        string[] inputNames = form.Fields.Where(field => field.PageId == pageId).Select(field => field.Name).ToArray();
+        Assert.Equal(expectedNames.Order(StringComparer.Ordinal), inputNames.Order(StringComparer.Ordinal));
+        Assert.NotEqual(expectedNames, inputNames);
+
+        PageDefinition page = Assert.Single(Create(form).Pages, listed => listed.PageId == pageId);
+
+        Assert.Equal(pageName, page.Name);
+        Assert.Equal(position, page.Position);
+        Assert.Equal(expectedFieldCount, page.Fields.Count);
+        Assert.Equal(expectedNames, page.Fields.Select(field => field.Name));
+        Assert.Equal(
+            Enumerable.Range(1, expectedFieldCount).Select(tabIndex => (decimal)tabIndex),
+            page.Fields.Select(field => field.TabIndex));
+        Assert.All(page.Fields, field => Assert.Equal(pageId, field.PageId));
+    }
+
+    /// <summary>
+    /// The C-7 reconciliation on the transcribed rows: the views hold 64 and 91 <c>metaFields</c> rows; without the
+    /// three system rows of each, 61 and 88 sit on pages and are all listed; 43 and 74 own a page-table column; and 43
+    /// and 67 are data fields, the seven <c>Yes/No</c> columns of <c>FoodHistory</c> being unsupported.
+    /// </summary>
+    [Theory]
+    [InlineData("CaseReport", 64, 61, new[] { 1 }, new[] { 61 }, 43, 43)]
+    [InlineData("FoodHistory", 91, 88, new[] { 2, 3 }, new[] { 55, 33 }, 74, 67)]
+    public void Create_SeededMetaFieldsRows_ReconcileRowPageColumnAndDataFieldTotals(
+        string formName,
+        int expectedRows,
+        int expectedPageBoundRows,
+        int[] expectedPageIds,
+        int[] expectedPageSizes,
+        int expectedColumnRows,
+        int expectedDataFields)
+    {
+        FormMetadata form = MetaFieldsForm(formName);
+
+        Assert.Equal(expectedRows, form.Fields.Count);
+        Assert.Equal(SystemFieldNames, form.Fields.Where(field => field.PageId is null).Select(field => field.Name));
+        Assert.Equal(expectedPageBoundRows, form.Fields.Count(field => field.PageId is not null));
+        Assert.Equal(expectedColumnRows, form.Fields.Count(field => field.Column is not null));
+
+        FormDefinition definition = Create(form);
+        FieldDefinition[] listed = definition.Pages.SelectMany(page => page.Fields).ToArray();
+
+        Assert.Equal(expectedPageIds, definition.Pages.Select(page => page.PageId));
+        Assert.Equal(expectedPageSizes, definition.Pages.Select(page => page.Fields.Count));
+        Assert.Equal(expectedPageBoundRows, listed.Length);
+        Assert.DoesNotContain(listed, field => SystemFieldNames.Contains(field.Name, StringComparer.OrdinalIgnoreCase));
+
+        DataFieldSet dataFields = FormDefinitionFactory.GetDataFields(form);
+        string[] expectedDataFieldNames = form.Fields
+            .Where(field => field.Column is not null)
+            .Select(field => field.Name)
+            .Except(SeededYesNoFields[formName], StringComparer.Ordinal)
+            .Order(StringComparer.Ordinal)
+            .ToArray();
+        Assert.Equal(expectedDataFields, dataFields.Count);
+        Assert.Equal(expectedDataFieldNames, dataFields.Select(field => field.Name).Order(StringComparer.Ordinal));
     }
 
     /// <summary>
@@ -928,18 +1253,6 @@ public sealed class FormDefinitionFactoryTests
         Column = Column(name, "nvarchar(255)"),
     };
 
-    private static FieldDefinition Definition(FieldMetadata row) => new(
-        row.Name,
-        FieldType.Text,
-        row.Prompt,
-        row.TabIndex ?? 0,
-        row.PageId ?? PageId,
-        Unsupported: false,
-        UnsupportedType: null,
-        FieldValidation.None,
-        Options: null,
-        Members: null);
-
     private static FormMetadata SeededForm(string formName) => BuildSeededForm(SeededFormJson(formName));
 
     private static FormDefinition SeededDefinition(string formName) =>
@@ -1046,6 +1359,61 @@ public sealed class FormDefinitionFactoryTests
         }
 
         return options;
+    }
+
+    /// <summary>
+    /// Builds a seeded form from the transcribed <c>metaViews</c>, <c>metaPages</c> and <c>metaFields</c> rows in
+    /// <c>FieldId</c> order: the view's three system rows, then every row of its pages. A row that forms.json lists on
+    /// its page owns that page-table column, and every other row owns none. Each forms.json field must match one
+    /// transcribed row of the same page and <c>FieldTypeId</c>, which guards the transcription.
+    /// </summary>
+    private static FormMetadata MetaFieldsForm(string formName)
+    {
+        (int viewId, _, int firstSystemFieldId) = Assert.Single(SeededMetaViews, view => view.Name == formName);
+        PageMetadata[] pages = SeededMetaPages
+            .Where(entry => entry.ViewId == viewId)
+            .Select(entry => entry.Page)
+            .ToArray();
+
+        JsonElement formJson = SeededFormJson(formName);
+        Assert.Equal(viewId, formJson.GetProperty("viewId").GetInt32());
+        Dictionary<(int PageId, string Name), JsonElement> columnFields = new();
+        foreach (JsonElement page in formJson.GetProperty("pages").EnumerateArray())
+        {
+            int pageId = page.GetProperty("pageId").GetInt32();
+            foreach (JsonElement field in page.GetProperty("fields").EnumerateArray())
+            {
+                columnFields.Add((pageId, RequiredText(field, "name")), field);
+            }
+        }
+
+        List<FieldMetadata> fields = [.. SystemRows(firstSystemFieldId, withBaseTableColumns: false)];
+        IEnumerable<(int FieldId, string Name, int FieldTypeId, decimal TabIndex, int PageId, string? List)> rows =
+            SeededMetaFieldsRows.Where(row => Array.Exists(pages, page => page.PageId == row.PageId));
+        foreach ((int fieldId, string name, int fieldTypeId, decimal tabIndex, int pageId, string? list) in rows)
+        {
+            ColumnMetadata? column = null;
+            if (columnFields.Remove((pageId, name), out JsonElement json))
+            {
+                Assert.Equal(json.GetProperty("fieldTypeId").GetInt32(), fieldTypeId);
+                column = Column(name, RequiredText(json, "sqlType"));
+            }
+
+            fields.Add(new FieldMetadata
+            {
+                FieldId = fieldId,
+                Name = name,
+                FieldTypeId = fieldTypeId,
+                FieldTypeName = SeededTypeNames[fieldTypeId],
+                TabIndex = tabIndex,
+                PageId = pageId,
+                List = list,
+                Column = column,
+            });
+        }
+
+        Assert.Empty(columnFields.Keys);
+        return new FormMetadata(viewId, formName, formName, pages, fields);
     }
 
     private static JsonElement LoadFormsJson()

@@ -42,11 +42,12 @@ public sealed record RecordCountResponse(int Count);
 /// </para>
 /// <para>
 /// <b>Writes.</b> The input checks run outside any transaction, then the store runs the write in one transaction.
-/// <see cref="WriteOutcomeFeature.MarkWriteStarted"/> is recorded immediately before the store write and
-/// <see cref="WriteOutcomeFeature.MarkWritten"/> as soon as the store reports a commit, so the exception handler can
-/// state the <c>writeOutcome</c> of a failure. After the commit the service makes no store call: it writes one log
-/// line, whose own failure cannot change the response, and returns the DTO the store built inside the transaction.
-/// Store failures and client aborts are never caught here; they propagate to the exception handler.
+/// <see cref="WriteOutcomeFeature.MarkWriteStarted"/> is recorded immediately before the store write,
+/// <see cref="WriteOutcomeFeature.MarkWritten"/> as soon as the store reports a commit, and
+/// <see cref="WriteOutcomeFeature.MarkNotWritten"/> as soon as it returns a result that wrote nothing, so the exception
+/// handler can state the <c>writeOutcome</c> of a failure. After the commit the service makes no store call: it
+/// writes one log line, whose own failure cannot change the response, and returns the DTO the store built inside the
+/// transaction. Store failures and client aborts are never caught here; they propagate to the exception handler.
 /// </para>
 /// <para>
 /// <b>Permissions.</b> Each write reads the login's permissions afresh. A store that reports none
@@ -447,16 +448,22 @@ public sealed partial class RecordService(
                 LogWrite(form, UpdateOperation, result.Record.GlobalRecordId, CommittedOutcome);
                 return TypedResults.Ok(result.Record);
 
+            // Each result below means the store wrote nothing, so a failure while its response is written must report
+            // notWritten, not unknown.
             case RecordWriteStatus.NotFound:
+                outcome.MarkNotWritten();
                 return ApiProblems.RecordNotFound();
 
             case RecordWriteStatus.Deleted:
+                outcome.MarkNotWritten();
                 return ApiProblems.RecordDeleted();
 
             case RecordWriteStatus.ValidationFailed when result.Validation is { } validation:
+                outcome.MarkNotWritten();
                 return ApiProblems.FromValidation(validation);
 
             case RecordWriteStatus.Forbidden:
+                outcome.MarkNotWritten();
                 return ApiProblems.Forbidden(ForbiddenAction.Update);
 
             default:
@@ -516,12 +523,15 @@ public sealed partial class RecordService(
                 LogWrite(form, SoftDeleteOperation, globalRecordId, CommittedOutcome);
                 return TypedResults.NoContent();
 
+            // Both results below mean the store wrote nothing, so a failure while the response is written must report
+            // notWritten, not unknown; an already-deleted record is never marked written.
             case SoftDeleteResult.AlreadyDeleted:
-                // Nothing was written, so the request is not marked written.
+                outcome.MarkNotWritten();
                 LogWrite(form, SoftDeleteOperation, globalRecordId, UnchangedOutcome);
                 return TypedResults.NoContent();
 
             case SoftDeleteResult.NotFound:
+                outcome.MarkNotWritten();
                 return ApiProblems.RecordNotFound();
 
             default:

@@ -716,6 +716,44 @@ public sealed class RecordValidatorTests
     }
 
     /// <summary>
+    /// A number mask counts a number as its column stores it. A <c>bigint</c> column stores the exact integer, so the
+    /// 18-digit <c>999999999999999999</c> fits 18 positions and <c>1000000000000000000</c> does not; a <c>float</c>
+    /// column stores the nearest double, <c>1E+18</c>, whose 19 digits do not fit either.
+    /// </summary>
+    [Theory]
+    [InlineData("BigCount", 999999999999999999L, true)]
+    [InlineData("BigCount", 1000000000000000000L, false)]
+    [InlineData("FloatCount", 999999999999999999L, false)]
+    public void ValidateInput_IntegerUnderNumberMask_CountsTheDigitsItsColumnStores(
+        string field,
+        long raw,
+        bool accepted)
+    {
+        const string mask = "##################";
+        var form = new FormMetadata(
+            ViewId: 9,
+            Name: "BigNumber",
+            BaseTableName: "BigNumber",
+            Pages: [new PageMetadata(1, "Page 1", 0, "BigNumber1")],
+            Fields:
+            [
+                Row(1, "BigCount", NumberType, pageId: 1, ("bigint", 8)) with { Pattern = mask },
+                Row(2, "FloatCount", NumberType, pageId: 1, FloatColumn) with { Pattern = mask },
+            ]);
+
+        var result = Validate(Validator(form), (field, FieldValue.FromInteger(raw)));
+
+        if (accepted)
+        {
+            Assert.Equal(FieldValue.FromInteger(raw), AssertValid(result)[field]);
+        }
+        else
+        {
+            AssertOnlyFieldError(result, field, ValidationMessages.FormatPatternMismatch(mask));
+        }
+    }
+
+    /// <summary>
     /// <c>MM-DD-YYYY</c> is a display and entry format for the client; ISO input is not checked against it.
     /// </summary>
     [Fact]

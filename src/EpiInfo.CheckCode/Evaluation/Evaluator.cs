@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using EpiInfo.CheckCode.Functions;
 using EpiInfo.CheckCode.Syntax;
 using EpiInfo.Domain.Diagnostics;
@@ -21,10 +22,11 @@ namespace EpiInfo.CheckCode.Evaluation;
 /// </para>
 /// <para>
 /// Each statement runs inside its own error boundary. A runtime error (an unknown field, a type mismatch, an
-/// assignment to a label, group or unsupported field, a failed <c>YEARS</c> or <c>EPIWEEK</c> call) skips that
-/// statement with one <see cref="DiagnosticSeverity.Error"/> diagnostic, keeps the effects of earlier statements and
-/// continues with the next one, so a check-code error never blocks a save. Diagnostic messages name fields,
-/// functions and constructs only, never a value.
+/// assignment to a label, group or unsupported field, a failed <c>YEARS</c> or <c>EPIWEEK</c> call, an expression
+/// nested deeper than the remaining stack allows) skips that statement with one
+/// <see cref="DiagnosticSeverity.Error"/> diagnostic, keeps the effects of earlier statements and continues with the
+/// next one, so a check-code error never blocks a save. Diagnostic messages name fields, functions and constructs
+/// only, never a value.
 /// </para>
 /// <para>
 /// The evaluator enforces no read-only, range, length, mask, legal-value or required rule: an <c>ASSIGN</c> to a
@@ -50,6 +52,7 @@ public static class Evaluator
     private const string OutOfRangeMessage = "Date arithmetic is out of range.";
     private const string UnsupportedStatementMessage = "Unsupported statement.";
     private const string UnsupportedExpressionMessage = "Unsupported expression.";
+    private const string ExpressionTooDeepMessage = "Expression is nested too deeply to evaluate.";
 
     /// <summary>
     /// Runs the selected event blocks of one field event over a record's values and returns the response.
@@ -194,7 +197,12 @@ public static class Evaluator
     /// <c>=</c> evaluates left, then right, and compares with <see cref="ValueComparer.AreEqual"/>.
     /// </description></item>
     /// </list>
-    /// Precedence is already encoded in the tree by the parser.
+    /// Precedence is already encoded in the tree by the parser, which folds a flat <c>AND</c> or <c>=</c> chain to
+    /// the right. Such a chain is evaluated along its right spine in a loop, operands left to right, so its length
+    /// costs no stack and its result is that of the right-associated tree. Nesting that still recurses, such as
+    /// parentheses, <c>NOT</c> or a hand-built tree, is evaluated while stack remains; deeper nesting throws a
+    /// <see cref="CheckCodeRuntimeException"/> with a fixed message, which <see cref="Execute"/> reports as one
+    /// <see cref="DiagnosticSeverity.Error"/> diagnostic for its statement.
     /// </remarks>
     /// <param name="expression">The expression.</param>
     /// <param name="context">The run's field scope.</param>
@@ -207,14 +215,21 @@ public static class Evaluator
     /// <see langword="null"/>.
     /// </exception>
     /// <exception cref="CheckCodeRuntimeException">
-    /// The expression names an unknown field or an unsupported function, a function call failed, or the expression
-    /// is of a kind outside the subset.
+    /// The expression names an unknown field or an unsupported function, a function call failed, the expression
+    /// is of a kind outside the subset, or it is nested too deeply for the remaining stack.
     /// </exception>
     public static FieldValue Evaluate(ExpressionNode expression, EvaluationContext context, string command)
     {
         ArgumentNullException.ThrowIfNull(expression);
         ArgumentNullException.ThrowIfNull(context);
         ArgumentNullException.ThrowIfNull(command);
+
+        // Nesting that still recurses (parentheses, NOT, a hand-built tree) stops while the stack can still unwind,
+        // so it fails its statement with a diagnostic instead of overflowing the stack and ending the process.
+        if (!RuntimeHelpers.TryEnsureSufficientExecutionStack())
+        {
+            throw new CheckCodeRuntimeException(expression.Line, command, ExpressionTooDeepMessage);
+        }
 
         switch (expression)
         {
@@ -241,19 +256,42 @@ public static class Evaluator
         }
     }
 
+    // The parser folds a flat chain a AND b AND c to the right, And(a, And(b, c)), so the chain is walked along its
+    // right spine in a loop and its length costs no stack. Every operand is evaluated in source order with no short
+    // circuit, as legacy Rule_AndExp evaluated both sides, so an error in any later operand is never hidden.
     private static FieldValue EvaluateAnd(AndNode node, EvaluationContext context, string command)
     {
-        // Both sides first: legacy evaluated both operands, so an error on the right is never hidden.
-        bool left = IsTrue(Evaluate(node.Left, context, command));
-        bool right = IsTrue(Evaluate(node.Right, context, command));
-        return FieldValue.FromBoolean(left && right);
+        bool all = true;
+        ExpressionNode current = node;
+        while (current is AndNode and)
+        {
+            all &= IsTrue(Evaluate(and.Left, context, command));
+            current = and.Right;
+        }
+
+        bool last = IsTrue(Evaluate(current, context, command));
+        return FieldValue.FromBoolean(all && last);
     }
 
+    // a = b = c is Eq(a, Eq(b, c)): the operands are evaluated left to right along the right spine, then compared
+    // from the right, so the result is that of the right-associated tree and the chain's length costs no stack.
     private static FieldValue EvaluateEquals(EqualsNode node, EvaluationContext context, string command)
     {
-        FieldValue left = Evaluate(node.Left, context, command);
-        FieldValue right = Evaluate(node.Right, context, command);
-        return FieldValue.FromBoolean(ValueComparer.AreEqual(left, right));
+        var lefts = new List<FieldValue>();
+        ExpressionNode current = node;
+        while (current is EqualsNode equals)
+        {
+            lefts.Add(Evaluate(equals.Left, context, command));
+            current = equals.Right;
+        }
+
+        FieldValue result = Evaluate(current, context, command);
+        for (var i = lefts.Count - 1; i >= 0; i--)
+        {
+            result = FieldValue.FromBoolean(ValueComparer.AreEqual(lefts[i], result));
+        }
+
+        return result;
     }
 
     private static void ExecuteStatement(StatementNode statement, EvaluationContext context, EffectAccumulator effects)
