@@ -1,0 +1,31 @@
+<Project>
+  <!--
+    Central NuGet versions for the SDK-style projects of EpiInfo.Web.sln; each .csproj
+    references a package without a version.
+
+    NuGet also imports this file into the legacy old-style projects beside it, where
+    UsingMicrosoftNETSdk is empty. Both groups are conditioned on it so central management
+    stays off for them and their own PackageReference versions keep working.
+  -->
+  <PropertyGroup Condition="'$(UsingMicrosoftNETSdk)' == 'true'">
+    <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
+  </PropertyGroup>
+
+  <ItemGroup Condition="'$(UsingMicrosoftNETSdk)' == 'true'">
+    <!-- src/EpiInfo.Data -->
+    <PackageVersion Include="Dapper" Version="2.1.100" />
+    <PackageVersion Include="Microsoft.Data.SqlClient" Version="5.2.3" />
+
+    <!-- src/EpiInfo.Api; ApiDescription.Server is build-time only (PrivateAssets all) -->
+    <PackageVersion Include="Microsoft.AspNetCore.OpenApi" Version="10.0.15" />
+    <PackageVersion Include="Microsoft.Extensions.ApiDescription.Server" Version="10.0.15" />
+
+    <!-- All four test projects -->
+    <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="17.14.2" />
+    <PackageVersion Include="xunit" Version="2.9.3" />
+    <PackageVersion Include="xunit.runner.visualstudio" Version="2.8.2" />
+
+    <!-- tests/EpiInfo.Api.Tests -->
+    <PackageVersion Include="Microsoft.AspNetCore.Mvc.Testing" Version="10.0.15" />
+  </ItemGroup>
+</Project>
