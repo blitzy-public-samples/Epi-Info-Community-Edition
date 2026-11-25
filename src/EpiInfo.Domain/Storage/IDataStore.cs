@@ -638,4 +638,3 @@ public enum SoftDeleteResult
     /// <summary>The <c>GlobalRecordId</c> is not in the base table; the API answers 404.</summary>
     NotFound,
 }
-

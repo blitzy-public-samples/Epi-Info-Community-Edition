@@ -736,4 +736,3 @@ public static class SearchCriteriaParser
         ColumnMetadata? Column,
         CriterionKind Kind);
 }
-

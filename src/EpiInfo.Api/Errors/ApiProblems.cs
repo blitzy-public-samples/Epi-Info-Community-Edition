@@ -669,4 +669,3 @@ public sealed class WriteProblemDetails : ProblemDetails
     [JsonPropertyName("writeOutcome")]
     public string Outcome { get; set; } = WriteOutcomeExtensions.WireUnknown;
 }
-

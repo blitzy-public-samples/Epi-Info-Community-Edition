@@ -729,4 +729,3 @@ internal sealed class SqlMetadataReader(
         public int ColumnId { get; set; }
     }
 }
-

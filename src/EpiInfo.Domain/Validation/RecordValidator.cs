@@ -719,4 +719,3 @@ public sealed class RecordValidator
         }
     }
 }
-

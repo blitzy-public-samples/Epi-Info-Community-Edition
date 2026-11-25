@@ -843,4 +843,3 @@ public sealed class ParserTests
         AssertStringLiteral(assign.Value, text);
     }
 }
-

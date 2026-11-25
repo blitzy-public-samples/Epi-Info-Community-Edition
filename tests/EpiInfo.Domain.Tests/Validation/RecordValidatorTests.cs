@@ -1190,4 +1190,3 @@ public sealed class RecordValidatorTests
         _ => throw new ArgumentOutOfRangeException(nameof(typeId), typeId, "Not a seeded type these fixtures use."),
     };
 }
-

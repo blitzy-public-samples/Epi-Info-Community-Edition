@@ -667,4 +667,3 @@ public sealed class FieldTypeMapperTests
 
     private sealed record FormSweep(int ViewId, IReadOnlyList<MappedField> Fields);
 }
-

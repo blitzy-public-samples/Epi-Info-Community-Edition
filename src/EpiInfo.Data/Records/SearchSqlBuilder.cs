@@ -605,4 +605,3 @@ internal static class SearchSqlBuilder
     // for the comparison operators, which differs from Reference only for an ntext column.
     private sealed record ResolvedCondition(SearchCondition Condition, string Reference, string Comparable);
 }
-
