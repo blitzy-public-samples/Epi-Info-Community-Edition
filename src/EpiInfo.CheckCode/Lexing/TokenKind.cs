@@ -103,7 +103,7 @@ public enum TokenKind
     /// <summary>A reserved word, including hyphenated forms such as <c>END-IF</c> and <c>End-After</c>; <c>Token.Keyword</c> gives its normalised spelling, and the parser may still accept it as a name where the grammar allows one.</summary>
     Keyword,
 
-    /// <summary>A character or run the grammar does not admit, or an unterminated string, so lexing never fails.</summary>
+    /// <summary>A character or run the grammar does not admit, so lexing never fails: an unterminated string, a string holding a character outside <c>{String Chars}</c> (line 10), a bracketed name with whitespace straight after its <c>[</c> (line 30), an unterminated <c>/*</c> comment, or any other character.</summary>
     Unknown,
 
     /// <summary>The end of the program text: always the last token, emitted exactly once.</summary>

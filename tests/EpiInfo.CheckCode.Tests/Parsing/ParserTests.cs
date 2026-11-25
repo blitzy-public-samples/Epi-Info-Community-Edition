@@ -125,6 +125,19 @@ public sealed class ParserTests
         End-Field
         """;
 
+    // The IF on line 3 holds an ASSIGN to the padded name "[ END ]" on line 4 and a valid ASSIGN on line 5; its END-IF
+    // is line 6.
+    private const string PaddedEndProgram = """
+        Field X
+        	After
+        		IF X = "1" THEN
+        			ASSIGN [ END ] = "discard"
+        			ASSIGN Z = "conditional"
+        		END-IF
+        	End-After
+        End-Field
+        """;
+
     [Fact]
     public void NestedProgramKeepsTheStatementsAroundItsSkippedConstructs()
     {
@@ -189,6 +202,46 @@ public sealed class ParserTests
             TextValues(("A", "2")));
 
         Assert.Equal(new[] { "W" }, response.Assigned.Keys);
+    }
+
+    // Page and Record are block keywords (lines 630, 632); bracketed, each is an Identifier (line 30). Each use below
+    // spells the name in a different case, and each resolves to the canonical field.
+    [Fact]
+    public void BracketedReservedWordNamesResolveToTheirCanonicalFields()
+    {
+        const string program = """
+            Field [Page]
+            	After
+            		IF [page] = "1" THEN
+            			ASSIGN [record] = [PAGE]
+            			ENABLE [Record]
+            		END-IF
+            	End-After
+            End-Field
+            """;
+        FormMetadata form = TextForm("Page", "Record");
+        ICheckCodeEngine engine = new CheckCodeEngine();
+
+        Assert.All(new[] { "Page", "Record" }, name =>
+        {
+            Token bare = Lexer.Tokenize(name)[0];
+            Token bracketed = Lexer.Tokenize("[" + name + "]")[0];
+            Assert.Equal((TokenKind.Keyword, name.ToUpperInvariant()), (bare.Kind, bare.Keyword));
+            Assert.Equal((TokenKind.Identifier, name), (bracketed.Kind, bracketed.Text));
+        });
+
+        FieldEventResponse response = engine.Run(
+            program,
+            form,
+            FieldEventKind.FieldAfter,
+            "Page",
+            TextValues(("Page", "1")));
+
+        Assert.Equal(new[] { "Record" }, response.Enabled);
+        KeyValuePair<string, FieldValue> assigned = Assert.Single(response.Assigned);
+        Assert.Equal(("Record", "1"), (assigned.Key, assigned.Value.AsText()));
+        Assert.Empty(response.Diagnostics);
+        Assert.Empty(engine.Analyze(program, form));
     }
 
     [Fact]
@@ -1081,6 +1134,198 @@ public sealed class ParserTests
         }
     }
 
+    // A '/*' without its '*/' (lines 50-51) hides the rest of the program, here a whole Field block, so the one
+    // warning is reported where the comment opens and the hidden block never runs.
+    [Fact]
+    public void UnterminatedBlockCommentAtTheStartIsReportedOnceAndHidesTheProgram()
+    {
+        ICheckCodeEngine engine = new CheckCodeEngine();
+        FormMetadata form = TextForm("X", "Y");
+        string text = "/* never closed\n" + InAfterBlock("ASSIGN Y = \"1\"");
+
+        Assert.Equal(new[] { Warning(Parser.Commands.Syntax, 1) }, Summaries(engine.Analyze(text, form)));
+
+        FieldEventResponse response = engine.Run(text, form, FieldEventKind.FieldAfter, "X", TextValues());
+        Assert.Empty(response.Enabled);
+        Assert.Empty(response.Disabled);
+        Assert.Empty(response.Cleared);
+        Assert.Empty(response.Assigned);
+        Assert.Empty(response.Dialogs);
+    }
+
+    // The comment opening on line 4 swallows End-After and End-Field; it is reported at its opening, and the ASSIGN
+    // before it still runs.
+    [Fact]
+    public void UnterminatedBlockCommentInABlockIsReportedAndTheStatementsBeforeItRun()
+    {
+        ICheckCodeEngine engine = new CheckCodeEngine();
+        FormMetadata form = TextForm("X", "Y");
+        string text = InAfterBlock("ASSIGN Y = \"1\"", "/* never closed");
+
+        Assert.Equal(new[] { Warning(Parser.Commands.Syntax, 4) }, Summaries(engine.Analyze(text, form)));
+
+        FieldEventResponse response = engine.Run(text, form, FieldEventKind.FieldAfter, "X", TextValues());
+        Assert.Equal("1", response.Assigned["Y"].AsText());
+    }
+
+    // The comment on line 4 hides End-After and End-Field. The complete statement on line 3 still runs alone, and the
+    // comment is the one warning, at its own line, in place of the terminators it hides.
+    [Theory]
+    [InlineData("DIALOG \"kept\"", "dialogs: kept")]
+    [InlineData("ENABLE Y", "enabled: Y")]
+    [InlineData("DISABLE Y", "disabled: Y")]
+    [InlineData("CLEAR Y", "cleared: Y")]
+    [InlineData("ASSIGN Y = \"1\"", "assigned: Y=1")]
+    public void StatementBeforeAnUnterminatedBlockCommentRunsAndTheCommentIsTheOneWarning(
+        string statement,
+        string effect)
+    {
+        ICheckCodeEngine engine = new CheckCodeEngine();
+        FormMetadata form = TextForm("X", "Y");
+        string text = InAfterBlock(statement, "/* never closed");
+
+        Assert.Equal(new[] { Warning(Parser.Commands.Syntax, 4) }, Summaries(engine.Analyze(text, form)));
+
+        FieldEventResponse response = engine.Run(text, form, FieldEventKind.FieldAfter, "X", TextValues());
+        Assert.Equal(new[] { effect }, Effects(response));
+        Assert.Equal(new[] { Warning(Parser.Commands.Syntax, 4) }, Summaries(response.Diagnostics));
+    }
+
+    // The comment on line 5 hides the END-IF of the IF on line 3, so that IF stays open and is dropped, and its ASSIGN
+    // never runs. The comment is the one warning: no IF, END-AFTER or END-FIELD is reported missing.
+    [Fact]
+    public void IfLeftOpenByAnUnterminatedBlockCommentIsDroppedAndOnlyTheCommentIsReported()
+    {
+        ICheckCodeEngine engine = new CheckCodeEngine();
+        FormMetadata form = TextForm("X", "Y");
+        string text = InAfterBlock("IF X = \"1\" THEN", "ASSIGN Y = \"1\"", "/* never closed");
+
+        Assert.Equal(new[] { Warning(Parser.Commands.Syntax, 5) }, Summaries(engine.Analyze(text, form)));
+
+        FieldEventResponse response = engine.Run(
+            text,
+            form,
+            FieldEventKind.FieldAfter,
+            "X",
+            TextValues(("X", "1")));
+        Assert.Empty(Effects(response));
+        Assert.Equal(new[] { Warning(Parser.Commands.Syntax, 5) }, Summaries(response.Diagnostics));
+    }
+
+    // Outside an event block the comment is still the one warning, at its own line: on line 5 it hides End-Field, and
+    // on line 6 it follows the closed Field block. Either way the After block ran to its End-After and reports nothing.
+    [Theory]
+    [InlineData("\tEnd-After\n/* never closed\nEnd-Field", 5)]
+    [InlineData("\tEnd-After\nEnd-Field\n/* never closed", 6)]
+    public void UnterminatedBlockCommentAfterAnEventBlockIsTheOneWarningAndTheBlockRuns(string tail, int commentLine)
+    {
+        ICheckCodeEngine engine = new CheckCodeEngine();
+        FormMetadata form = TextForm("X", "Y");
+        string text = "Field X\n\tAfter\n\t\tASSIGN Y = \"1\"\n" + tail;
+
+        Assert.Equal(new[] { Warning(Parser.Commands.Syntax, commentLine) }, Summaries(engine.Analyze(text, form)));
+
+        FieldEventResponse response = engine.Run(text, form, FieldEventKind.FieldAfter, "X", TextValues());
+        Assert.Equal(new[] { "assigned: Y=1" }, Effects(response));
+        Assert.Empty(response.Diagnostics);
+    }
+
+    // U+0001 is outside {String Chars} (line 10), so the quoted text is no String (line 24) and the DIALOG on line 3
+    // is malformed; recovery drops that statement alone.
+    [Fact]
+    public void DialogWithACharacterOutsideTheStringSetIsDroppedAndTheNextStatementRuns()
+    {
+        ICheckCodeEngine engine = new CheckCodeEngine();
+        string text = InAfterBlock("DIALOG \"a\u0001b\"", "ASSIGN Y = \"kept\"");
+
+        FieldEventResponse response = engine.Run(
+            text,
+            TextForm("X", "Y"),
+            FieldEventKind.FieldAfter,
+            "X",
+            TextValues());
+
+        Assert.Empty(response.Dialogs);
+        Assert.Equal("kept", response.Assigned["Y"].AsText());
+        Assert.Contains(Warning(Parser.Commands.Dialog, 3), Summaries(response.Diagnostics));
+    }
+
+    // Line 30 puts an ID head straight after '[', so "[ Y ]" names no field and the ASSIGN on line 3 is malformed;
+    // recovery drops that statement alone.
+    [Fact]
+    public void AssignToABracketPaddedNameIsDroppedAndTheNextStatementRuns()
+    {
+        ICheckCodeEngine engine = new CheckCodeEngine();
+        string text = InAfterBlock("ASSIGN [ Y ] = \"1\"", "ASSIGN Z = \"2\"");
+
+        FieldEventResponse response = engine.Run(
+            text,
+            TextForm("X", "Y", "Z"),
+            FieldEventKind.FieldAfter,
+            "X",
+            TextValues());
+
+        Assert.Equal(new[] { "Z" }, response.Assigned.Keys);
+        Assert.Equal("2", response.Assigned["Z"].AsText());
+        Assert.Contains(
+            response.Diagnostics,
+            diagnostic => diagnostic.Severity == DiagnosticSeverity.Warning && diagnostic.Line == 3);
+    }
+
+    // "[ END ]" is one Unknown token, so its END cannot close the IF on line 3: recovery drops only the ASSIGN on
+    // line 4, and the ASSIGN on line 5 stays inside the IF. Unset, X fails the condition, so nothing is assigned.
+    [Fact]
+    public void PaddedNameHoldingEndKeepsTheEnclosingIfWhenItsConditionFails()
+    {
+        ICheckCodeEngine engine = new CheckCodeEngine();
+
+        FieldEventResponse response = engine.Run(
+            PaddedEndProgram,
+            TextForm("X", "Z"),
+            FieldEventKind.FieldAfter,
+            "X",
+            TextValues());
+
+        Assert.Empty(response.Assigned);
+        Assert.Contains(Warning(Parser.Commands.Assign, 4), Summaries(response.Diagnostics));
+    }
+
+    // The same program with the condition holding runs the kept ASSIGN alone.
+    [Fact]
+    public void PaddedNameHoldingEndKeepsTheEnclosingIfWhenItsConditionHolds()
+    {
+        ICheckCodeEngine engine = new CheckCodeEngine();
+
+        FieldEventResponse response = engine.Run(
+            PaddedEndProgram,
+            TextForm("X", "Z"),
+            FieldEventKind.FieldAfter,
+            "X",
+            TextValues(("X", "1")));
+
+        Assert.Equal(new[] { "Z" }, response.Assigned.Keys);
+        Assert.Equal("conditional", response.Assigned["Z"].AsText());
+    }
+
+    // "[ IF ]" is one Unknown token, so its IF opens no statement that would swallow the ASSIGN on line 4.
+    [Fact]
+    public void PaddedNameHoldingIfIsDroppedAndTheNextStatementRuns()
+    {
+        ICheckCodeEngine engine = new CheckCodeEngine();
+        string text = InAfterBlock("ASSIGN [ IF ] = \"1\"", "ASSIGN Z = \"kept\"");
+
+        FieldEventResponse response = engine.Run(
+            text,
+            TextForm("X", "Z"),
+            FieldEventKind.FieldAfter,
+            "X",
+            TextValues());
+
+        Assert.Equal(new[] { "Z" }, response.Assigned.Keys);
+        Assert.Equal("kept", response.Assigned["Z"].AsText());
+        Assert.Contains(Warning(Parser.Commands.Assign, 3), Summaries(response.Diagnostics));
+    }
+
     // metaViews.CheckCode of CaseReport, copied from testdata/sql/03_forms.sql lines 26-53 with every line kept: the
     // comment fills program lines 1-5, line 4 holds only a tab, Field Sex is line 6 and Field LastName line 18.
     private const string CaseReportProgram = """
@@ -1278,6 +1523,26 @@ public sealed class ParserTests
     private static (DiagnosticSeverity Severity, string Command, int Line)[] Summaries(
         IEnumerable<Diagnostic> diagnostics) =>
         [.. diagnostics.Select(diagnostic => (diagnostic.Severity, diagnostic.Command, diagnostic.Line))];
+
+    // Each non-empty effect list of a response as "<list>: <entries>", so one comparison also pins the empty lists.
+    private static string[] Effects(FieldEventResponse response)
+    {
+        (string List, IEnumerable<string> Entries)[] lists =
+        [
+            ("enabled", response.Enabled),
+            ("disabled", response.Disabled),
+            ("cleared", response.Cleared),
+            ("assigned", response.Assigned.Select(pair => $"{pair.Key}={pair.Value.AsText()}")),
+            ("dialogs", response.Dialogs.Select(dialog => dialog.Message)),
+        ];
+
+        return
+        [
+            .. lists
+                .Where(list => list.Entries.Any())
+                .Select(list => $"{list.List}: {string.Join(", ", list.Entries)}"),
+        ];
+    }
 
     private static void AssertIdentifier(ExpressionNode expression, string name) =>
         Assert.Equal(name, Assert.IsType<IdentifierNode>(expression).Name);

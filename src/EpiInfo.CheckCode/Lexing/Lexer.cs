@@ -11,8 +11,8 @@ namespace EpiInfo.CheckCode.Lexing;
 /// <remarks>
 /// <para>
 /// The lexer never fails and reports no diagnostics: anything the grammar does not admit becomes a
-/// <see cref="TokenKind.Unknown"/> token, which the parser reports with its line. Whitespace and comments produce no
-/// token, and the list always ends with exactly one <see cref="TokenKind.EndOfInput"/>.
+/// <see cref="TokenKind.Unknown"/> token, which the parser reports with its line. Whitespace and closed comments
+/// produce no token, and the list always ends with exactly one <see cref="TokenKind.EndOfInput"/>.
 /// </para>
 /// <para>
 /// Every call works on its own scanner and the keyword tables are immutable, so the lexer is safe to call
@@ -21,9 +21,6 @@ namespace EpiInfo.CheckCode.Lexing;
 /// </remarks>
 public static class Lexer
 {
-    // SET-NOT-REQUIRED is the only three-part hyphenated keyword, so no candidate needs more parts.
-    private const int MaxHyphenatedParts = 3;
-
     private static readonly FrozenSet<string> KeywordSet = new[]
     {
         // Blocks (lines 620-640).
@@ -95,9 +92,18 @@ public static class Lexer
 
     private static bool IsLineBreak(char c) => c is '\r' or '\n';
 
-    private static bool IsInlineWhiteSpace(char c) => !IsLineBreak(c) && char.IsWhiteSpace(c);
-
     private static bool IsDateSeparator(char c) => c is '/' or '-';
+
+    /// <summary>
+    /// Whether <paramref name="c"/> may stand inside a string: <c>{String Chars} = {Printable} + {Letter Extended} -
+    /// ["] + {Cyrillic}</c> (line 10). <c>{Printable}</c> is U+0020-U+007E and the no-break space U+00A0;
+    /// <c>{Letter Extended}</c> is U+00C0-U+00FF without U+00D7 and U+00F7; <c>{Cyrillic}</c> is U+0400-U+04FF.
+    /// Tab, the other control codes, DEL, the rest of Latin-1 and every other code unit, surrogates included, are
+    /// rejected. The <c>"</c> never reaches this check, because it ends the string.
+    /// </summary>
+    private static bool IsStringChar(char c) =>
+        c is (>= ' ' and <= '~') or '\u00A0' or (>= '\u00C0' and <= '\u00FF' and not '\u00D7' and not '\u00F7')
+            or (>= '\u0400' and <= '\u04FF');
 
     /// <summary>
     /// One tokenization pass over one text. <see cref="Peek"/> returns <c>'\0'</c> past the end, so lookahead never
@@ -205,6 +211,35 @@ public static class Lexer
             Advance(length);
         }
 
+        /// <summary>
+        /// Adds a token at the current position, then moves past <paramref name="length"/> characters that may hold
+        /// line breaks, counting each one as <see cref="SkipLineBreak"/> does, so the line and column after it equal
+        /// those of a character-by-character scan.
+        /// </summary>
+        /// <remarks>
+        /// The span must not end between the two characters of a <c>\r\n</c> pair; a span ending at a <c>]</c> never
+        /// does.
+        /// </remarks>
+        private void EmitSpanningLines(TokenKind kind, string tokenText, int length)
+        {
+            tokens.Add(new Token(kind, tokenText, line, column));
+
+            int end = index + length;
+            while (index < end)
+            {
+                if (IsLineBreak(text[index]))
+                {
+                    SkipLineBreak();
+                }
+                else
+                {
+                    Advance(1);
+                }
+            }
+
+            Debug.Assert(index == end, "A span must not end between the two characters of a \\r\\n pair.");
+        }
+
         /// <summary>Skips a <c>//</c> comment up to, not including, the line break that ends it (line 49).</summary>
         private void SkipLineComment()
         {
@@ -214,10 +249,15 @@ public static class Lexer
 
         /// <summary>
         /// Skips a <c>/* */</c> comment through the first <c>*/</c> after the opening <c>/*</c>, counting its line
-        /// breaks (lines 50-51). Comments do not nest, and an unterminated one runs to the end of the text.
+        /// breaks (lines 50-51). Comments do not nest. An unterminated one runs to the end of the text and becomes one
+        /// <see cref="TokenKind.Unknown"/> token holding that raw text, at the line and column of its <c>/*</c>.
         /// </summary>
         private void SkipBlockComment()
         {
+            int start = index;
+            int startLine = line;
+            int startColumn = column;
+
             Advance(2);
             while (index < text.Length)
             {
@@ -237,12 +277,18 @@ public static class Lexer
                     Advance(1);
                 }
             }
+
+            // Added after the scan, so the end-of-input position stays just past the last character; nothing follows
+            // the comment, so this token is still the last before EndOfInput.
+            tokens.Add(new Token(TokenKind.Unknown, text.Substring(start), startLine, startColumn));
         }
 
         /// <summary>
         /// Lexes a double-quoted string, which has no escape and ends on its own line (line 24). Its content admits
-        /// every character but <c>"</c> and line breaks. Without a closing quote, the run from the <c>"</c> to the end
-        /// of the line becomes one <see cref="TokenKind.Unknown"/> token.
+        /// only <c>{String Chars}</c> (line 10, see <see cref="IsStringChar"/>). A closed string holding any other
+        /// character becomes one <see cref="TokenKind.Unknown"/> token with the quoted text, quotes included, and
+        /// scanning resumes after its closing quote. Without a closing quote, the run from the <c>"</c> to the end of
+        /// the line becomes one <see cref="TokenKind.Unknown"/> token.
         /// </summary>
         private void ScanString()
         {
@@ -251,7 +297,24 @@ public static class Lexer
 
             if (contentLength >= 0 && text[contentStart + contentLength] == '"')
             {
-                Emit(TokenKind.String, text.Substring(contentStart, contentLength), contentLength + 2);
+                bool valid = true;
+                foreach (char c in text.AsSpan(contentStart, contentLength))
+                {
+                    if (!IsStringChar(c))
+                    {
+                        valid = false;
+                        break;
+                    }
+                }
+
+                if (valid)
+                {
+                    Emit(TokenKind.String, text.Substring(contentStart, contentLength), contentLength + 2);
+                }
+                else
+                {
+                    Emit(TokenKind.Unknown, contentLength + 2);
+                }
             }
             else
             {
@@ -268,34 +331,53 @@ public static class Lexer
         };
 
         /// <summary>
-        /// Lexes <c>[Some Name]</c> as one identifier holding the trimmed content (line 30), or else the <c>[</c>
-        /// alone as <see cref="TokenKind.LeftBracket"/>, as in the grid reference <c>Grid[1,2]</c>. The match never
-        /// crosses a line break, which keeps line accounting exact.
+        /// Lexes <c>[Some Name]</c> as one identifier (line 30): an ID head or <c>#</c> straight after the <c>[</c>,
+        /// then ID tail characters and whitespace up to the <c>]</c>. As everywhere in this lexer, whitespace is any
+        /// <see cref="char.IsWhiteSpace(char)"/> character, which covers the grammar's <c>{WhiteSpace}</c> and its
+        /// line breaks, so a name may span lines. The identifier holds the content with its trailing whitespace, line
+        /// breaks included, removed and its inner whitespace and line breaks kept. The same shape with whitespace
+        /// between the <c>[</c> and its head, as in <c>[ Name ]</c>, is no identifier: the whole span from <c>[</c> to
+        /// <c>]</c> becomes one <see cref="TokenKind.Unknown"/> token holding the raw text, so a reserved word inside
+        /// it, as in <c>[ END ]</c>, never reaches the parser as a keyword. Anything else leaves the <c>[</c> alone as
+        /// <see cref="TokenKind.LeftBracket"/>: no closing <c>]</c>, a character outside the shape before it, or no
+        /// head after the <c>[</c> and its padding, as in the grid reference <c>Grid[1,2]</c> or <c>Grid[ 1,2]</c>.
+        /// Either span token sits at its <c>[</c>, and the line breaks inside it are counted as everywhere else, so the
+        /// line and column after it are exact.
         /// </summary>
         private void ScanBracket()
         {
-            // Line 30 puts an ID head or '#' straight after '['; whitespace before it is accepted here so that
-            // [ Name ] is the identifier Name, which is what trimming the content means. A grid reference is
-            // unaffected, because its first element is a number.
-            int offset = 1;
-            while (IsInlineWhiteSpace(Peek(offset)))
+            int headOffset = 1;
+            while (char.IsWhiteSpace(Peek(headOffset)))
             {
-                offset++;
+                headOffset++;
             }
 
-            char head = Peek(offset);
+            char head = Peek(headOffset);
             if (IsIdHead(head) || head == '#')
             {
-                for (offset++; ; offset++)
+                for (int offset = headOffset + 1; ; offset++)
                 {
                     char c = Peek(offset);
                     if (c == ']')
                     {
-                        Emit(TokenKind.Identifier, text.Substring(index + 1, offset - 1).Trim(), offset + 1);
+                        int length = offset + 1;
+                        if (headOffset == 1)
+                        {
+                            // The head is never whitespace, so only the end of the content can need trimming.
+                            EmitSpanningLines(
+                                TokenKind.Identifier,
+                                text.Substring(index + 1, offset - 1).TrimEnd(),
+                                length);
+                        }
+                        else
+                        {
+                            EmitSpanningLines(TokenKind.Unknown, text.Substring(index, length), length);
+                        }
+
                         return;
                     }
 
-                    if (!IsIdTail(c) && !IsInlineWhiteSpace(c))
+                    if (!IsIdTail(c) && !char.IsWhiteSpace(c))
                     {
                         break;
                     }
@@ -462,29 +544,38 @@ public static class Lexer
         }
 
         /// <summary>
-        /// Lexes a word (lines 15-16, 30). The longest hyphen-joined run of up to three words that is a hyphenated
-        /// keyword, such as <c>End-After</c>, becomes one keyword token; otherwise the first word alone is a keyword
-        /// or an identifier, and a following <c>-</c> lexes as <see cref="TokenKind.MinusSign"/>.
+        /// Lexes a word (lines 15-16, 30), taking the longest match as the grammar's tokenizer does. Identifiers
+        /// cannot hold a <c>-</c>, so when one follows the first word, the longest hyphenated keyword that the text at
+        /// this position starts with, ignoring case, becomes one keyword token spelled as written, even when a word
+        /// character follows it: <c>End-After2</c> gives <c>End-After</c> and the number <c>2</c>, <c>END-IFx</c> gives
+        /// <c>END-IF</c> and the identifier <c>x</c>, and <c>End-Afterwards</c> gives <c>End-After</c> and the
+        /// identifier <c>wards</c>. Without such a keyword the first word alone is a keyword or an identifier and the
+        /// <c>-</c> lexes as <see cref="TokenKind.MinusSign"/>, so <c>SET-NOTX</c> gives <c>SET</c>, <c>-</c> and
+        /// <c>NOTX</c>.
         /// </summary>
         private void ScanWord()
         {
             int firstLength = WordLength(0);
-            int end = firstLength;
-            int keywordLength = 0;
 
-            for (int parts = 1; parts < MaxHyphenatedParts && Peek(end) == '-' && IsIdHead(Peek(end + 1)); parts++)
+            // The first part of every hyphenated keyword is letters, so a keyword can match only when the first word
+            // ends at a '-'.
+            if (Peek(firstLength) == '-')
             {
-                end += 1 + WordLength(end + 1);
-                if (HyphenatedKeywordSet.Contains(text.Substring(index, end)))
+                ReadOnlySpan<char> rest = text.AsSpan(index);
+                int keywordLength = 0;
+                foreach (string keyword in HyphenatedKeywordSet)
                 {
-                    keywordLength = end;
+                    if (keyword.Length > keywordLength && rest.StartsWith(keyword, StringComparison.OrdinalIgnoreCase))
+                    {
+                        keywordLength = keyword.Length;
+                    }
                 }
-            }
 
-            if (keywordLength > 0)
-            {
-                Emit(TokenKind.Keyword, keywordLength);
-                return;
+                if (keywordLength > 0)
+                {
+                    Emit(TokenKind.Keyword, keywordLength);
+                    return;
+                }
             }
 
             string word = text.Substring(index, firstLength);

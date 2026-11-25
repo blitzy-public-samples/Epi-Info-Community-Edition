@@ -75,9 +75,9 @@ public sealed class RecordValidationResult
     /// The field-level errors, never <see langword="null"/> and empty unless this is a field-level failure.
     /// </summary>
     /// <remarks>
-    /// Keys are canonical <c>metaFields.Name</c> values, or the name as submitted when it matches no
-    /// <c>metaFields</c> row, and are compared ordinally. Keys keep the order the validator reported them
-    /// in, and each list holds one or more messages in the order the checks ran.
+    /// Keys are canonical <c>metaFields.Name</c> values, or <c>RecordValidator.ValuesKey</c> for a name that
+    /// matches no <c>metaFields</c> row, and are compared ordinally. Keys keep the order the validator
+    /// reported them in, and each list holds one or more messages in the order the checks ran.
     /// </remarks>
     public IReadOnlyDictionary<string, IReadOnlyList<string>> FieldErrors { get; }
 
@@ -143,8 +143,8 @@ public sealed class RecordValidationResult
 
     /// <summary>Returns a field-level failure holding a copy of <paramref name="errors"/>, in its order.</summary>
     /// <param name="errors">
-    /// The messages per field, keyed by canonical field name (or the submitted name for a name that matches
-    /// no <c>metaFields</c> row), in the order the validator reported them.
+    /// The messages per field, keyed by canonical field name (or <c>RecordValidator.ValuesKey</c> for a name
+    /// that matches no <c>metaFields</c> row), in the order the validator reported them.
     /// </param>
     /// <exception cref="ArgumentException">
     /// <paramref name="errors"/> is <see langword="null"/> or empty; or an entry has a <see langword="null"/>
@@ -161,8 +161,8 @@ public sealed class RecordValidationResult
         var copy = new OrderedDictionary<string, IReadOnlyList<string>>(errors.Count, StringComparer.Ordinal);
         foreach (var (name, messages) in errors)
         {
-            // An empty key stays allowed: an unknown field is keyed by the name as submitted, and JSON
-            // permits "" as a property name.
+            // An empty key stays allowed, as JSON permits "" as a property name. The validator never
+            // produces one: a name with no metaFields row is keyed by RecordValidator.ValuesKey.
             if (name is null)
             {
                 throw new ArgumentException("A field error must be keyed by a field name.", nameof(errors));

@@ -17,36 +17,49 @@ namespace EpiInfo.Api.Json;
 /// <list type="bullet">
 ///   <item><description>
 ///     success (<see cref="Success"/>): <see cref="IsSuccess"/> is <see langword="true"/>, <see cref="Values"/>
-///     holds every entry, <see cref="RequestError"/> is <see langword="null"/> and <see cref="FieldErrors"/> is empty;
+///     holds every entry, <see cref="RequestError"/> is <see langword="null"/> and <see cref="FieldErrorsFor"/>
+///     returns an empty map;
 ///   </description></item>
 ///   <item><description>
 ///     request-level failure (<see cref="RequestFailure"/>): <see cref="RequestError"/> is the <c>detail</c> of a 400
-///     with no <c>errors</c> map, and <see cref="Values"/> and <see cref="FieldErrors"/> are empty;
+///     with no <c>errors</c> map, <see cref="Values"/> is empty and <see cref="FieldErrorsFor"/> returns an empty map;
 ///   </description></item>
 ///   <item><description>
-///     field-level failure (<see cref="FieldFailure"/>): <see cref="FieldErrors"/> is the non-empty <c>errors</c> map
-///     of a validation 400, <see cref="RequestError"/> is <see langword="null"/> and <see cref="Values"/> is empty.
+///     field-level failure (<see cref="FieldFailure"/>): the result holds every property of the object, each with its
+///     fault or none, at least one faulted, and <see cref="FieldErrorsFor"/> resolves them into the non-empty
+///     <c>errors</c> map of a validation 400; <see cref="RequestError"/> is <see langword="null"/> and
+///     <see cref="Values"/> is empty.
 ///   </description></item>
 /// </list>
 /// <para>
 /// Every collection passed to a factory is copied, so instances are immutable and safe to share across threads.
-/// Error texts are fixed, so a failure never carries a submitted value.
+/// Error texts are fixed, so a failure never carries a submitted value. The submitted names of a field-level failure
+/// are kept privately, only to be resolved against the form's metadata, and are never exposed:
+/// <see cref="FieldErrorsFor"/> keys every error by a canonical <c>metaFields.Name</c> or by
+/// <see cref="RecordValidator.ValuesKey"/> (<see cref="RecordValidator.NotADataFieldError"/>).
 /// </para>
 /// </remarks>
 public sealed class RawValuesResult
 {
+    private static readonly IReadOnlyList<KeyValuePair<string, string?>> NoProperties =
+        ReadOnlyCollection<KeyValuePair<string, string?>>.Empty;
+
+    // Every property of a field-level failure as (submitted name, fixed fault message, or null for a property read
+    // without fault), in document order, repeats included; empty unless a field-level failure.
+    private readonly IReadOnlyList<KeyValuePair<string, string?>> _properties;
+
     private RawValuesResult(
         IReadOnlyList<KeyValuePair<string, FieldValue>> values,
         string? requestError,
-        IReadOnlyDictionary<string, string[]> fieldErrors)
+        IReadOnlyList<KeyValuePair<string, string?>> properties)
     {
         Values = values;
         RequestError = requestError;
-        FieldErrors = fieldErrors;
+        _properties = properties;
     }
 
-    /// <summary>Whether the object was read: no request-level error and no field error.</summary>
-    public bool IsSuccess => RequestError is null && FieldErrors.Count == 0;
+    /// <summary>Whether the object was read: no request-level error and no field fault.</summary>
+    public bool IsSuccess => RequestError is null && _properties.Count == 0;
 
     /// <summary>
     /// Every property of the object as (submitted name, raw value), in document order, with exact repeats and
@@ -64,10 +77,68 @@ public sealed class RawValuesResult
     public string? RequestError { get; }
 
     /// <summary>
-    /// The field-level errors keyed by the name as submitted, compared ordinally and in the order they were found;
-    /// never <see langword="null"/>, and empty unless this is a field-level failure.
+    /// Resolves every property of a field-level failure against the form's metadata into the <c>errors</c> map of a
+    /// validation 400, with the precedence the record validator and <see cref="ValuesReader.ToTyped"/> apply, so the
+    /// record-write and field-event paths key and word an error alike.
     /// </summary>
-    public IReadOnlyDictionary<string, string[]> FieldErrors { get; }
+    /// <param name="form">The metadata of the form the request names.</param>
+    /// <returns>
+    /// The map, never <see langword="null"/>, and empty unless this is a field-level failure. Each property, in
+    /// document order, gives the first of:
+    /// <list type="number">
+    ///   <item><description>
+    ///     for a name that is not a data field, whatever its fault, the error
+    ///     <see cref="RecordValidator.NotADataFieldError"/> gives:
+    ///     <see cref="ValidationMessages.UnknownValuesName"/> under <see cref="RecordValidator.ValuesKey"/> when the
+    ///     form has no <c>metaFields</c> row of that name, and <see cref="ValidationMessages.UnknownField"/> under the
+    ///     row's canonical name for a system column, a label, a group or an unsupported field;
+    ///   </description></item>
+    ///   <item><description>
+    ///     for a data field named again, exactly or differing only by letter case, whatever its fault,
+    ///     <see cref="ValidationMessages.DuplicateField"/> under the canonical name;
+    ///   </description></item>
+    ///   <item><description>
+    ///     for the first occurrence of a faulted data field, the fault's own message under the canonical name;
+    ///   </description></item>
+    ///   <item><description>
+    ///     otherwise nothing: the first occurrence of a data field read without fault adds no error.
+    ///   </description></item>
+    /// </list>
+    /// Keys compare ordinally and keep the order they were first found in, and each holds each distinct message once,
+    /// so <c>{"Age":1,"AGE":[]}</c> gives <c>Age</c> the duplicate message alone and <c>{"AGE":[],"Age":1}</c> gives it
+    /// the shape message, then the duplicate message. A submitted name is never a key.
+    /// </returns>
+    /// <exception cref="ArgumentNullException"><paramref name="form"/> is <see langword="null"/>.</exception>
+    public IReadOnlyDictionary<string, string[]> FieldErrorsFor(FormMetadata form)
+    {
+        ArgumentNullException.ThrowIfNull(form);
+
+        if (_properties.Count == 0)
+        {
+            return FieldErrorSet.None;
+        }
+
+        var dataFields = FormDefinitionFactory.GetDataFields(form);
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var errors = new FieldErrorCollector();
+        foreach (var (name, fault) in _properties)
+        {
+            if (!dataFields.TryGet(name, out var field))
+            {
+                errors.AddNotADataField(form, name);
+            }
+            else if (!seen.Add(field.Name))
+            {
+                errors.Add(field.Name, ValidationMessages.DuplicateField);
+            }
+            else if (fault is not null)
+            {
+                errors.Add(field.Name, fault);
+            }
+        }
+
+        return errors.ToDictionary();
+    }
 
     /// <summary>Returns a success holding a copy of <paramref name="values"/>, in its order.</summary>
     /// <param name="values">The entries in document order; an empty list is a valid <c>values: {}</c>.</param>
@@ -89,7 +160,7 @@ public sealed class RawValuesResult
             copy[i] = values[i];
         }
 
-        return new RawValuesResult(Array.AsReadOnly(copy), requestError: null, FieldErrorSet.None);
+        return new RawValuesResult(Array.AsReadOnly(copy), requestError: null, NoProperties);
     }
 
     /// <summary>Returns a request-level failure whose <c>detail</c> is <paramref name="detail"/>.</summary>
@@ -103,20 +174,65 @@ public sealed class RawValuesResult
             throw new ArgumentException("A request-level failure needs a non-blank detail.", nameof(detail));
         }
 
-        return new RawValuesResult(ReadOnlyCollection<KeyValuePair<string, FieldValue>>.Empty, detail, FieldErrorSet.None);
+        return new RawValuesResult(ReadOnlyCollection<KeyValuePair<string, FieldValue>>.Empty, detail, NoProperties);
     }
 
-    /// <summary>Returns a field-level failure holding a copy of <paramref name="errors"/>, in its order.</summary>
-    /// <param name="errors">The fixed messages per submitted name.</param>
+    /// <summary>Returns a field-level failure holding a copy of <paramref name="properties"/>, in its order.</summary>
+    /// <param name="properties">
+    /// Every property of the object as (submitted name, fixed fault message), in document order, with
+    /// <see langword="null"/> as the message of a property read without fault; a name may recur, exactly or differing
+    /// only by letter case. At least one entry carries a fault. The names are kept only for
+    /// <see cref="FieldErrorsFor"/> to resolve.
+    /// </param>
     /// <returns>The failed result.</returns>
     /// <exception cref="ArgumentException">
-    /// <paramref name="errors"/> is <see langword="null"/> or empty, or an entry has a <see langword="null"/> key, a
-    /// <see langword="null"/> or empty message array, or a <see langword="null"/> or blank message.
+    /// <paramref name="properties"/> is <see langword="null"/> or holds no faulted entry, or an entry has a
+    /// <see langword="null"/> name or an empty or whitespace message.
     /// </exception>
-    public static RawValuesResult FieldFailure(IReadOnlyDictionary<string, string[]> errors) => new(
-        ReadOnlyCollection<KeyValuePair<string, FieldValue>>.Empty,
-        requestError: null,
-        FieldErrorSet.Copy(errors, nameof(errors)));
+    public static RawValuesResult FieldFailure(IReadOnlyList<KeyValuePair<string, string?>> properties)
+    {
+        // Null, empty and fault-free are one misuse, so all three raise one exception type with one message.
+        const string NoFaultMessage = "A field-level failure needs at least one faulted property.";
+        if (properties is null)
+        {
+            throw new ArgumentException(NoFaultMessage, nameof(properties));
+        }
+
+        var copy = new KeyValuePair<string, string?>[properties.Count];
+        var faulted = false;
+        for (var i = 0; i < copy.Length; i++)
+        {
+            var (name, fault) = properties[i];
+
+            // An empty name stays allowed: JSON permits "" as a property name, and it resolves to ValuesKey.
+            if (name is null)
+            {
+                throw new ArgumentException("A property must be keyed by its submitted name.", nameof(properties));
+            }
+
+            if (fault is not null)
+            {
+                if (string.IsNullOrWhiteSpace(fault))
+                {
+                    throw new ArgumentException("A fault needs a non-blank message.", nameof(properties));
+                }
+
+                faulted = true;
+            }
+
+            copy[i] = properties[i];
+        }
+
+        if (!faulted)
+        {
+            throw new ArgumentException(NoFaultMessage, nameof(properties));
+        }
+
+        return new RawValuesResult(
+            ReadOnlyCollection<KeyValuePair<string, FieldValue>>.Empty,
+            requestError: null,
+            Array.AsReadOnly(copy));
+    }
 }
 
 /// <summary>
@@ -150,9 +266,10 @@ public sealed class TypedValuesResult
     public IReadOnlyDictionary<string, FieldValue> Values { get; }
 
     /// <summary>
-    /// The field-level errors, compared ordinally and in the order they were found: keyed by canonical field name,
-    /// or by the name as submitted when it names no data field. Never <see langword="null"/>, and empty unless this
-    /// is a failure.
+    /// The field-level errors, compared ordinally and in the order they were found: keyed by canonical
+    /// <c>metaFields.Name</c>, or by <see cref="RecordValidator.ValuesKey"/> for a name the form has no
+    /// <c>metaFields</c> row for (<see cref="RecordValidator.NotADataFieldError"/>), so a submitted name is never a
+    /// key. Never <see langword="null"/>, and empty unless this is a failure.
     /// </summary>
     public IReadOnlyDictionary<string, string[]> FieldErrors { get; }
 
@@ -187,7 +304,9 @@ public sealed class TypedValuesResult
     }
 
     /// <summary>Returns a field-level failure holding a copy of <paramref name="errors"/>, in its order.</summary>
-    /// <param name="errors">The fixed messages per canonical or submitted name.</param>
+    /// <param name="errors">
+    /// The fixed messages per canonical field name or <see cref="RecordValidator.ValuesKey"/>.
+    /// </param>
     /// <returns>The failed result.</returns>
     /// <exception cref="ArgumentException">
     /// <paramref name="errors"/> is <see langword="null"/> or empty, or an entry has a <see langword="null"/> key, a
@@ -210,8 +329,10 @@ public sealed class TypedValuesResult
 /// <see cref="ToTyped"/> for field events.
 /// </para>
 /// <para>
-/// Every message is fixed text. A submitted value never appears in a result; the only submitted text a result can
-/// hold is a field name used as an error key.
+/// Every message is fixed text, and no error carries submitted text: a value never appears in one, and every error
+/// is keyed by a canonical <c>metaFields.Name</c> or, for a name the form has no row for, by
+/// <see cref="RecordValidator.ValuesKey"/> (<see cref="RecordValidator.NotADataFieldError"/>), never by a name as
+/// submitted.
 /// </para>
 /// </remarks>
 public static class ValuesReader
@@ -236,9 +357,12 @@ public static class ValuesReader
     ///     that binding gives that text when it is read as a typed value;
     ///   </description></item>
     ///   <item><description>
-    ///     a field-level failure, keyed by the submitted name, with <see cref="ScalarValueExpected"/> for an object or
-    ///     array value and <see cref="ValidationMessages.NumberExpected"/> for a number that is not finite, such as
-    ///     <c>1e400</c>; every such property is reported;
+    ///     a field-level failure when any property is faulted: <see cref="ScalarValueExpected"/> for an object or array
+    ///     value and <see cref="ValidationMessages.NumberExpected"/> for a number that is not finite, such as
+    ///     <c>1e400</c>. It holds every property, repeats and the properties read without fault included, in document
+    ///     order, so that <see cref="RawValuesResult.FieldErrorsFor"/>, once the form's metadata is known, applies the
+    ///     validator's precedence: a name that is not a data field first, then a repeat of a data field, then the
+    ///     fault itself;
     ///   </description></item>
     ///   <item><description>
     ///     otherwise a success: <c>null</c> as <see cref="FieldValue.Null"/>, a string as verbatim text, a number as an
@@ -254,7 +378,12 @@ public static class ValuesReader
         }
 
         var entries = new List<KeyValuePair<string, FieldValue>>();
-        var errors = new FieldErrorCollector();
+
+        // Every property under its name as sent, with its fault or null, so a field-level failure keeps the properties
+        // read without fault as well: RawValuesResult.FieldErrorsFor needs them to find the names that are not data
+        // fields and the repeats beside a fault once the form's metadata is known.
+        var properties = new List<KeyValuePair<string, string?>>();
+        var faulted = false;
 
         // EnumerateObject yields every property occurrence in document order; nothing here collapses repeats, so
         // RecordValidator can reject a field named twice, exactly or differing only by case.
@@ -265,6 +394,7 @@ public static class ValuesReader
                 return RawValuesResult.RequestFailure(ApiProblems.MalformedJsonDetail);
             }
 
+            string? fault = null;
             var value = property.Value;
             switch (value.ValueKind)
             {
@@ -292,7 +422,7 @@ public static class ValuesReader
                     }
                     else
                     {
-                        errors.Add(name, ValidationMessages.NumberExpected);
+                        fault = ValidationMessages.NumberExpected;
                     }
 
                     break;
@@ -306,13 +436,16 @@ public static class ValuesReader
                     break;
 
                 default:
-                    errors.Add(name, ScalarValueExpected);
+                    fault = ScalarValueExpected;
                     break;
             }
+
+            properties.Add(new(name, fault));
+            faulted |= fault is not null;
         }
 
-        return errors.HasErrors
-            ? RawValuesResult.FieldFailure(errors.ToDictionary())
+        return faulted
+            ? RawValuesResult.FieldFailure(properties)
             : RawValuesResult.Success(entries);
     }
 
@@ -325,14 +458,20 @@ public static class ValuesReader
     /// not applied: the editor sends the whole record state, read-only fields included, and must be able to evaluate
     /// stored values that break current rules, such as a phone number that does not match its mask.
     /// </remarks>
-    /// <param name="dataFields">The data fields of the form.</param>
+    /// <param name="form">
+    /// The form's metadata; its data fields are those <see cref="FormDefinitionFactory.GetDataFields"/> selects.
+    /// </param>
     /// <param name="raw">The entries <see cref="ReadRaw"/> returned, in document order.</param>
     /// <returns>
-    /// A success keyed by canonical name in submitted order, or a field-level failure listing every error:
+    /// A success keyed by canonical name in submitted order, or a field-level failure listing every error, never
+    /// keyed by a name as submitted:
     /// <list type="bullet">
     ///   <item><description>
-    ///     <see cref="ValidationMessages.UnknownField"/>, keyed by the submitted name, for a name that is not a data
-    ///     field (unknown, a system column such as <c>GlobalRecordId</c>, a label, a group or an unsupported field);
+    ///     for a name that is not a data field, <see cref="ValidationMessages.UnknownValuesName"/> under
+    ///     <see cref="RecordValidator.ValuesKey"/> when the form has no <c>metaFields</c> row of that name, and
+    ///     <see cref="ValidationMessages.UnknownField"/> under the row's canonical name for a system column such as
+    ///     <c>GlobalRecordId</c>, a label, a group or an unsupported field, as
+    ///     <see cref="RecordValidator.NotADataFieldError"/> gives them;
     ///   </description></item>
     ///   <item><description>
     ///     <see cref="ValidationMessages.DuplicateField"/>, keyed by the canonical name, for a field named again,
@@ -351,11 +490,12 @@ public static class ValuesReader
     /// </returns>
     /// <exception cref="ArgumentNullException">An argument is <see langword="null"/>.</exception>
     /// <exception cref="ArgumentException">An entry of <paramref name="raw"/> has a <see langword="null"/> name.</exception>
-    public static TypedValuesResult ToTyped(DataFieldSet dataFields, IReadOnlyList<KeyValuePair<string, FieldValue>> raw)
+    public static TypedValuesResult ToTyped(FormMetadata form, IReadOnlyList<KeyValuePair<string, FieldValue>> raw)
     {
-        ArgumentNullException.ThrowIfNull(dataFields);
+        ArgumentNullException.ThrowIfNull(form);
         ArgumentNullException.ThrowIfNull(raw);
 
+        var dataFields = FormDefinitionFactory.GetDataFields(form);
         var typed = new OrderedDictionary<string, FieldValue>(raw.Count, StringComparer.OrdinalIgnoreCase);
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var errors = new FieldErrorCollector();
@@ -369,7 +509,7 @@ public static class ValuesReader
 
             if (!dataFields.TryGet(name, out var field))
             {
-                errors.Add(name, ValidationMessages.UnknownField);
+                errors.AddNotADataField(form, name);
                 continue;
             }
 
@@ -487,7 +627,8 @@ file static class FieldErrorSet
         var copy = new OrderedDictionary<string, string[]>(errors.Count, StringComparer.Ordinal);
         foreach (var (name, messages) in errors)
         {
-            // An empty key stays allowed: JSON permits "" as a property name, and an unknown one is keyed as submitted.
+            // An empty key stays allowed, as JSON permits "" as a property name. The reader never produces one: a name
+            // with no metaFields row is keyed by RecordValidator.ValuesKey.
             if (name is null)
             {
                 throw new ArgumentException("A field error must be keyed by a field name.", paramName);
@@ -530,6 +671,14 @@ file sealed class FieldErrorCollector
         {
             messages.Add(message);
         }
+    }
+
+    // A name that is not a data field, keyed and worded by RecordValidator.NotADataFieldError, the one rule the
+    // validator also reports such a name by; the name check replaces any fault of the value.
+    public void AddNotADataField(FormMetadata form, string name)
+    {
+        var (key, message) = RecordValidator.NotADataFieldError(form, name);
+        Add(key, message);
     }
 
     public IReadOnlyDictionary<string, string[]> ToDictionary()

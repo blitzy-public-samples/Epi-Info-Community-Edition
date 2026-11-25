@@ -118,7 +118,7 @@ public sealed partial class FieldEventService(
 
         var raw = ValuesReader.ReadRaw(request.Values);
         var typed = raw.IsSuccess
-            ? ValuesReader.ToTyped(FormDefinitionFactory.GetDataFields(metadata), raw.Values)
+            ? ValuesReader.ToTyped(metadata, raw.Values)
             : null;
 
         if (fieldName is null || errors.Count > 0)
@@ -126,7 +126,7 @@ public sealed partial class FieldEventService(
             // One field-level 400 lists the event and field-name entries with every per-key values error found, so
             // the caller sees all of them at once. A values member that is not an object adds nothing here: its
             // request-level 400 is reserved for a request whose event and field name are both valid.
-            AddErrors(errors, raw.FieldErrors);
+            AddErrors(errors, raw.FieldErrorsFor(metadata));
             if (typed is not null)
             {
                 AddErrors(errors, typed.FieldErrors);
@@ -144,7 +144,7 @@ public sealed partial class FieldEventService(
 
         if (typed is null)
         {
-            return ApiProblems.ValidationFailed(raw.FieldErrors);
+            return ApiProblems.ValidationFailed(raw.FieldErrorsFor(metadata));
         }
 
         if (!typed.IsSuccess)

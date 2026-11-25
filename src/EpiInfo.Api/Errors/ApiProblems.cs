@@ -192,8 +192,8 @@ public static class ApiProblems
         var copy = new Dictionary<string, string[]>(errors.Count, StringComparer.Ordinal);
         foreach (var (key, messages) in errors)
         {
-            // An empty key stays allowed: JSON permits "" as a property name, and the validator keys an unknown
-            // field by the name as submitted.
+            // An empty key stays allowed, as JSON permits "" as a property name; the validator and the values
+            // reader never produce one, keying a name with no metaFields row by RecordValidator.ValuesKey.
             if (key is null)
             {
                 throw new ArgumentException("A field-level error must be keyed by a name.", nameof(errors));

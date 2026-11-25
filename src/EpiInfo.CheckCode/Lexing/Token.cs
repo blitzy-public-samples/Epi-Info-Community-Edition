@@ -22,12 +22,17 @@ namespace EpiInfo.CheckCode.Lexing;
 /// <param name="Text">
 /// The source spelling exactly as written, with these exceptions, all applied by the lexer: a
 /// <see cref="TokenKind.String"/> holds its content without the surrounding double quotes; a bracketed
-/// <see cref="TokenKind.Identifier"/> holds its content without <c>[</c> and <c>]</c>, trimmed at both ends with
-/// inner whitespace kept; an <see cref="TokenKind.Unknown"/> token from an unterminated string holds the raw text
-/// from the <c>"</c> to the end of the line; and <see cref="TokenKind.EndOfInput"/> holds the empty string.
+/// <see cref="TokenKind.Identifier"/> holds its content without <c>[</c> and <c>]</c>, with its trailing whitespace,
+/// line breaks included, trimmed and its inner whitespace and line breaks kept; an <see cref="TokenKind.Unknown"/>
+/// token holds its raw source text, which for an unterminated string runs from the <c>"</c> to the end of the line,
+/// for a string holding a character outside the grammar's string set is the whole quoted text, for a bracketed name
+/// with whitespace straight after its <c>[</c> runs from the <c>[</c> through the <c>]</c>, and for an unterminated
+/// block comment runs from the <c>/*</c> to the end of the program; and <see cref="TokenKind.EndOfInput"/> holds the
+/// empty string.
 /// </param>
 /// <param name="Line">
-/// The 1-based line in the program text; <c>\r\n</c>, <c>\n</c> and a lone <c>\r</c> each count as one line break.
+/// The 1-based line in the program text where the token starts; <c>\r\n</c>, <c>\n</c> and a lone <c>\r</c> each count
+/// as one line break.
 /// </param>
 /// <param name="Column">
 /// The 1-based column, counted in UTF-16 code units from the start of the line; a tab counts as one.

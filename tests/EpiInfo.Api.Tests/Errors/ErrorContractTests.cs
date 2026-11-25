@@ -1,10 +1,12 @@
 using System.Diagnostics;
 using System.Globalization;
 using System.Net;
+using System.Net.Http.Headers;
 using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using EpiInfo.Api.Contracts;
 using EpiInfo.Api.Endpoints;
 using EpiInfo.Api.Errors;
 using EpiInfo.Api.Hosting;
@@ -2400,3 +2402,256 @@ internal sealed class ErrorPipelineHost : IAsyncDisposable
 /// <param name="Response">Every byte the server sent, as text.</param>
 /// <param name="ConnectionReset">Whether the connection ended with a reset or I/O failure.</param>
 internal sealed record RawExchange(string Response, bool ConnectionReset);
+
+/// <summary>
+/// The write outcome of a record write whose store failure reports its own outcome agrees with the stored data and
+/// the store's write log, proved through <see cref="RecordService"/> and <see cref="ApiExceptionHandler"/> over
+/// <see cref="FakeDataStore"/>.
+/// </summary>
+/// <remarks>
+/// Each case asserts the error response, the stored record and the store's write log together. The class needs no
+/// database: it carries no <c>Integration</c> trait, joins no database collection and takes no database lock.
+/// </remarks>
+public sealed class StoreFailureWriteOutcomeTests
+{
+    private const string Insert = nameof(IDataStore.InsertAsync);
+    private const string Update = nameof(IDataStore.UpdateAsync);
+    private const string SoftDelete = nameof(IDataStore.SoftDeleteAsync);
+
+    private const string Unavailable = nameof(FakeDataStore.Unavailable);
+    private const string WriteFailure = nameof(FakeDataStore.WriteFailure);
+
+    private const string OriginalLastName = "Original";
+    private const string ChangedLastName = "Changed";
+
+    private static readonly string[] WriteMethods = [Insert, Update, SoftDelete];
+
+    // Each store failure kind with the status the handler gives it.
+    private static readonly (string Kind, int Status)[] FailureKinds =
+    [
+        (Unavailable, StatusCodes.Status503ServiceUnavailable),
+        (WriteFailure, StatusCodes.Status500InternalServerError),
+    ];
+
+    /// <summary>
+    /// Every write method and failure kind with each outcome at a stage whose state agrees with it. An unknown outcome
+    /// appears at both stages, because it covers both states: the change lost and the change kept.
+    /// </summary>
+    public static TheoryData<string, string, int, WriteOutcome, FakeFailureStage> CoherentFailures()
+    {
+        var data = new TheoryData<string, string, int, WriteOutcome, FakeFailureStage>();
+        foreach (var method in WriteMethods)
+        {
+            foreach (var (kind, status) in FailureKinds)
+            {
+                data.Add(method, kind, status, WriteOutcome.NotWritten, FakeFailureStage.BeforeWrite);
+                data.Add(method, kind, status, WriteOutcome.Written, FakeFailureStage.AfterWrite);
+                data.Add(method, kind, status, WriteOutcome.Unknown, FakeFailureStage.BeforeWrite);
+                data.Add(method, kind, status, WriteOutcome.Unknown, FakeFailureStage.AfterWrite);
+            }
+        }
+
+        return data;
+    }
+
+    /// <summary>
+    /// Every write method and failure kind with each outcome its injection point's state contradicts: written before
+    /// the write, not written after it, and written through <see cref="FakeDataStore.ThrowOnAny"/>, which raises
+    /// before anything runs. A <see langword="null"/> stage stands for <see cref="FakeDataStore.ThrowOnAny"/>.
+    /// </summary>
+    public static TheoryData<string, string, WriteOutcome, FakeFailureStage?> IncoherentFailures()
+    {
+        var data = new TheoryData<string, string, WriteOutcome, FakeFailureStage?>();
+        foreach (var method in WriteMethods)
+        {
+            foreach (var (kind, _) in FailureKinds)
+            {
+                data.Add(method, kind, WriteOutcome.Written, FakeFailureStage.BeforeWrite);
+                data.Add(method, kind, WriteOutcome.NotWritten, FakeFailureStage.AfterWrite);
+                data.Add(method, kind, WriteOutcome.Written, null);
+            }
+        }
+
+        return data;
+    }
+
+    [Theory]
+    [MemberData(nameof(CoherentFailures))]
+    public async Task FailedWriteReportsTheOutcomeTheStoredDataAndWriteLogShow(
+        string method,
+        string kind,
+        int status,
+        WriteOutcome outcome,
+        FakeFailureStage stage)
+    {
+        var (store, records, id) = CreateServices();
+        var injected = Failure(kind, outcome);
+        store.ThrowOn(method, injected, stage);
+
+        using var services = new ServiceCollection().AddLogging().BuildServiceProvider();
+        using var body = new MemoryStream();
+        var context = WriteContext(method, services, body);
+
+        var thrown = await Assert.ThrowsAnyAsync<Exception>(() => WriteAsync(records, context, method, id));
+        Assert.Same(injected, thrown);
+
+        var handler = new ApiExceptionHandler(NullLogger<ApiExceptionHandler>.Instance);
+        Assert.True(await handler.TryHandleAsync(context, thrown, CancellationToken.None));
+
+        // The response: the failure's status, a problem body, and the outcome the injected failure reports.
+        Assert.Equal(status, context.Response.StatusCode);
+        var contentType = context.Response.ContentType;
+        Assert.NotNull(contentType);
+        Assert.Equal("application/problem+json", MediaTypeHeaderValue.Parse(contentType).MediaType);
+        body.Position = 0;
+        using var problem = await JsonDocument.ParseAsync(body);
+        Assert.Equal(status, problem.RootElement.GetProperty("status").GetInt32());
+        var writeOutcome = problem.RootElement.GetProperty("writeOutcome");
+        Assert.Equal(JsonValueKind.String, writeOutcome.ValueKind);
+        Assert.Equal(WireValue(outcome), writeOutcome.GetString());
+        Assert.Equal(outcome.ToWireValue(), writeOutcome.GetString());
+
+        // The write log: one data-changing call once the change is kept, none before it.
+        var applied = stage == FakeFailureStage.AfterWrite;
+        if (applied)
+        {
+            Assert.Equal(method, Assert.Single(store.WriteCalls).Method);
+        }
+        else
+        {
+            Assert.Empty(store.WriteCalls);
+        }
+
+        // The stored data: exactly the change the write method makes once it is kept, and nothing before it.
+        var inserted = applied && method == Insert;
+        var updated = applied && method == Update;
+        var deleted = applied && method == SoftDelete;
+
+        var stored = store.GetRecords(FakeForms.TwoPageViewId);
+        Assert.Equal(inserted ? 2 : 1, stored.Count);
+        var seeded = Assert.Single(stored, record => record.GlobalRecordId == id);
+        Assert.Equal(updated ? ChangedLastName : OriginalLastName, seeded.Values["LastName"].AsText());
+        Assert.Equal(deleted ? RecordQueryRules.DeletedRecStatus : RecordQueryRules.ActiveRecStatus, seeded.RecStatus);
+        Assert.Null(seeded.FirstSave);
+        if (updated || deleted)
+        {
+            Assert.NotNull(seeded.LastSave);
+        }
+        else
+        {
+            Assert.Null(seeded.LastSave);
+        }
+
+        if (inserted)
+        {
+            var created = Assert.Single(stored, record => record.GlobalRecordId != id);
+            Assert.Equal(ChangedLastName, created.Values["LastName"].AsText());
+            Assert.Equal(RecordQueryRules.ActiveRecStatus, created.RecStatus);
+            Assert.NotNull(created.FirstSave);
+            Assert.NotNull(created.LastSave);
+        }
+    }
+
+    [Theory]
+    [MemberData(nameof(IncoherentFailures))]
+    public async Task IncoherentFailureIsRejectedAndSetsNoFailure(
+        string method,
+        string kind,
+        WriteOutcome outcome,
+        FakeFailureStage? stage)
+    {
+        var (store, records, id) = CreateServices();
+        var injected = Failure(kind, outcome);
+
+        var rejected = Assert.Throws<ArgumentException>(() =>
+        {
+            if (stage is { } injectedAt)
+            {
+                store.ThrowOn(method, injected, injectedAt);
+            }
+            else
+            {
+                store.ThrowOnAny(injected);
+            }
+        });
+        Assert.Equal("exception", rejected.ParamName);
+
+        // No failure was set, so the same write succeeds and logs its one data-changing call.
+        using var services = new ServiceCollection().AddLogging().BuildServiceProvider();
+        using var body = new MemoryStream();
+        var context = WriteContext(method, services, body);
+        var result = await WriteAsync(records, context, method, id);
+
+        var expectedStatus = method switch
+        {
+            Insert => StatusCodes.Status201Created,
+            Update => StatusCodes.Status200OK,
+            _ => StatusCodes.Status204NoContent,
+        };
+        Assert.Equal(expectedStatus, Assert.IsAssignableFrom<IStatusCodeHttpResult>(result).StatusCode);
+        Assert.Equal(method, Assert.Single(store.WriteCalls).Method);
+    }
+
+    // A store holding one active TwoPage record whose LastName is OriginalLastName, and the services over it.
+    private static (FakeDataStore Store, RecordService Records, string Id) CreateServices()
+    {
+        var store = FakeDataStore.WithStandardForms();
+        var id = store.SeedRecord(
+            FakeForms.TwoPageViewId,
+            new Dictionary<string, FieldValue> { ["LastName"] = FieldValue.FromText(OriginalLastName) });
+        var forms = new FormService(store, new CheckCodeEngine(), NullLogger<FormService>.Instance);
+        var records = new RecordService(
+            store,
+            forms,
+            new SaveStampProvider(TimeProvider.System),
+            NullLogger<RecordService>.Instance);
+        return (store, records, id);
+    }
+
+    private static Exception Failure(string kind, WriteOutcome outcome) => kind switch
+    {
+        Unavailable => FakeDataStore.Unavailable(outcome),
+        WriteFailure => FakeDataStore.WriteFailure(outcome),
+        _ => throw new ArgumentOutOfRangeException(nameof(kind)),
+    };
+
+    // The request as routing leaves it for the write endpoint: its metadata, request services and a readable body.
+    private static DefaultHttpContext WriteContext(string method, IServiceProvider services, Stream body)
+    {
+        var (metadata, name) = method switch
+        {
+            Insert => (WriteEndpointMetadata.Insert, "CreateRecord"),
+            Update => (WriteEndpointMetadata.Update, "UpdateRecord"),
+            SoftDelete => (WriteEndpointMetadata.SoftDelete, "DeleteRecord"),
+            _ => throw new ArgumentOutOfRangeException(nameof(method)),
+        };
+
+        var context = new DefaultHttpContext { RequestServices = services };
+        context.Response.Body = body;
+        context.SetEndpoint(new Endpoint(null, new EndpointMetadataCollection(metadata), name));
+        return context;
+    }
+
+    // Each write submits LastName = ChangedLastName; the delete submits nothing.
+    private static Task<IResult> WriteAsync(RecordService records, HttpContext context, string method, string id)
+    {
+        using var values = JsonDocument.Parse($$"""{"LastName":"{{ChangedLastName}}"}""");
+        var request = new RecordWriteRequest(values.RootElement.Clone());
+        return method switch
+        {
+            Insert => records.CreateAsync(context, FakeForms.TwoPageViewId, request, CancellationToken.None),
+            Update => records.UpdateAsync(context, FakeForms.TwoPageViewId, id, request, CancellationToken.None),
+            SoftDelete => records.DeleteAsync(context, FakeForms.TwoPageViewId, id, CancellationToken.None),
+            _ => throw new ArgumentOutOfRangeException(nameof(method)),
+        };
+    }
+
+    // The writeOutcome wire values of the error contract.
+    private static string WireValue(WriteOutcome outcome) => outcome switch
+    {
+        WriteOutcome.NotWritten => "notWritten",
+        WriteOutcome.Unknown => "unknown",
+        WriteOutcome.Written => "written",
+        _ => throw new ArgumentOutOfRangeException(nameof(outcome)),
+    };
+}

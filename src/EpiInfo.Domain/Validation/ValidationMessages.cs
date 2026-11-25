@@ -33,6 +33,12 @@ public static class ValidationMessages
     /// <summary>Unknown-field check: the key names no data field of the form.</summary>
     public const string UnknownField = "This is not a data field of the form.";
 
+    /// <summary>
+    /// Unknown-field check: the message under <see cref="RecordValidator.ValuesKey"/> for a submitted name the form
+    /// has no <c>metaFields</c> row for. The text is fixed and names nothing that was submitted.
+    /// </summary>
+    public const string UnknownValuesName = "values holds a name that is not a field of the form.";
+
     /// <summary>Unknown-field check: two keys name the same field when letter case is ignored.</summary>
     public const string DuplicateField =
         "This field is given more than once; field names are matched without regard to letter case.";

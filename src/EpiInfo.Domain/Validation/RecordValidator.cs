@@ -31,7 +31,8 @@ namespace EpiInfo.Domain.Validation;
 /// Only data fields are accepted, as <see cref="FormDefinitionFactory.GetDataFields"/> defines them, so a caller can
 /// never supply a save stamp, <c>RecStatus</c>, <c>UniqueKey</c>, <c>GlobalRecordId</c> or any other system column,
 /// nor a label, group or unsupported field. Error keys are canonical <c>metaFields.Name</c> values; a name that
-/// matches no <c>metaFields</c> row is keyed as submitted.
+/// matches no <c>metaFields</c> row is reported under <see cref="ValuesKey"/>, so a submitted name never becomes an
+/// error key (<see cref="NotADataFieldError"/>).
 /// </para>
 /// <para>
 /// Every message is a fixed text of <see cref="ValidationMessages"/>, formatted only from metadata (prompt, page
@@ -45,6 +46,12 @@ namespace EpiInfo.Domain.Validation;
 /// </remarks>
 public sealed class RecordValidator
 {
+    /// <summary>
+    /// The <c>errors</c> key for a submitted name that matches no <c>metaFields</c> row: the name of the request's
+    /// <c>values</c> member, a parameter-name key, so a submitted name never reaches an error body.
+    /// </summary>
+    public const string ValuesKey = "values";
+
     private readonly FormMetadata _form;
     private readonly DataFieldSet _dataFields;
     private readonly FieldRule[] _rules;
@@ -127,6 +134,32 @@ public sealed class RecordValidator
     }
 
     /// <summary>
+    /// The field-level error, key and message together, for a submitted name that is not a data field of the form.
+    /// It is the one rule for reporting such a name: <see cref="ValidateInput"/> and the API's values reader both
+    /// report every name that is not a data field through it.
+    /// </summary>
+    /// <remarks>
+    /// A name that matches a <c>metaFields</c> row without regard to letter case, a system column, a label, a group or
+    /// an unsupported field, gives <see cref="ValidationMessages.UnknownField"/> under the row's canonical
+    /// <c>metaFields.Name</c>. Any other name, the empty name included, gives
+    /// <see cref="ValidationMessages.UnknownValuesName"/> under <see cref="ValuesKey"/>. The caller has already found
+    /// that the name is not a data field; this method does not check that again.
+    /// </remarks>
+    /// <param name="form">The form's metadata.</param>
+    /// <param name="submittedName">A name as the request spelled it; an empty name matches no row.</param>
+    /// <returns>The (key, fixed message) pair; neither is ever the submitted text.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="form"/> or <paramref name="submittedName"/> is null.</exception>
+    public static KeyValuePair<string, string> NotADataFieldError(FormMetadata form, string submittedName)
+    {
+        ArgumentNullException.ThrowIfNull(form);
+        ArgumentNullException.ThrowIfNull(submittedName);
+
+        return form.FindField(submittedName) is { } row
+            ? new(row.Name, ValidationMessages.UnknownField)
+            : new(ValuesKey, ValidationMessages.UnknownValuesName);
+    }
+
+    /// <summary>
     /// Runs the phase-1 input checks on the submitted values of a <c>POST</c> or <c>PUT</c>, in submission order.
     /// </summary>
     /// <param name="submitted">
@@ -176,9 +209,9 @@ public sealed class RecordValidator
 
             if (!TryGetRule(name, out var rule))
             {
-                // The canonical spelling when the row exists but holds no value (label, group, unsupported or system
-                // field); the submitted name when the form has no such row at all.
-                errors.Add(_form.FindField(name)?.Name ?? name, ValidationMessages.UnknownField);
+                // Keyed and worded by the one rule for such a name, so the submitted text is never a key.
+                var (key, message) = NotADataFieldError(_form, name);
+                errors.Add(key, message);
                 continue;
             }
 

@@ -30,7 +30,8 @@ namespace EpiInfo.CheckCode.Parsing;
 /// <c>END-IF</c> or <c>END</c>, an unsupported block (<c>View</c>, <c>Form</c>, <c>Record</c>, <c>Page</c>,
 /// <c>DefineVariables</c>, <c>Sub</c>) is skipped up to its <c>End-*</c> keyword, an event block that repeats a
 /// kind or comes after a later kind in its <c>Field</c> block is skipped through its terminator, and the rest of the
-/// program still parses.
+/// program still parses. A <c>/*</c> without its <c>*/</c> (lines 50-51) hides the rest of the program: it is
+/// reported once, at its own line, in place of the terminators it hides, and the statements before it still parse.
 /// </para>
 /// <para>
 /// Diagnostics carry the form name and the 1-based line of the token where the construct starts. Their
@@ -361,6 +362,10 @@ public static class Parser
         private int position;
         private int depth;
 
+        // A '/*' without its '*/' (lines 50-51), taken off the token list; null when the program has none.
+        private Token? danglingComment;
+        private bool danglingCommentReported;
+
         private Token Current => Peek(0);
 
         private bool AtEnd => position >= tokens.Length;
@@ -370,6 +375,7 @@ public static class Parser
             try
             {
                 Buffer();
+                DetachDanglingComment();
                 ParseProgram();
             }
             catch (Exception ex) when (ex is not OutOfMemoryException)
@@ -432,6 +438,50 @@ public static class Parser
             }
         }
 
+        /// <summary>
+        /// Takes off the token list the <see cref="TokenKind.Unknown"/> token the lexer makes of a <c>/*</c> without
+        /// its <c>*/</c> (lines 50-51). That comment runs to the end of the text, so its token is always the last, and
+        /// no other token starts with <c>/*</c>, because <c>/</c> followed by <c>*</c> always opens a comment. Without
+        /// it, the statement before the comment ends at <see cref="end"/> and still parses, and each construct the
+        /// hidden text leaves open reaches <see cref="end"/>, where <see cref="ReportDanglingCommentAt"/> reports the
+        /// comment instead of a missing terminator.
+        /// </summary>
+        private void DetachDanglingComment()
+        {
+            if (tokens.Length > 0
+                && tokens[^1].Kind == TokenKind.Unknown
+                && tokens[^1].Text.StartsWith("/*", StringComparison.Ordinal))
+            {
+                danglingComment = tokens[^1];
+                tokens = tokens[..^1];
+            }
+        }
+
+        /// <summary>
+        /// Reports the unterminated comment (lines 50-51) at its own line when the parse reaches the end of input it
+        /// hid, once for the whole program: the terminators it hid are not reported as missing.
+        /// </summary>
+        /// <param name="token">The token where a terminator was expected.</param>
+        /// <returns>
+        /// <see langword="true"/> when <paramref name="token"/> is the end of input and the program ends in an
+        /// unterminated comment, whether this call or an earlier one reported it; otherwise <see langword="false"/>.
+        /// </returns>
+        private bool ReportDanglingCommentAt(Token token)
+        {
+            if (danglingComment is not { } comment || token.Kind != TokenKind.EndOfInput)
+            {
+                return false;
+            }
+
+            if (!danglingCommentReported)
+            {
+                danglingCommentReported = true;
+                Warn(comment, Commands.Syntax, "Unterminated comment; rest of the program skipped");
+            }
+
+            return true;
+        }
+
         private Token Peek(int offset)
         {
             int index = position + offset;
@@ -491,6 +541,10 @@ public static class Parser
                     }
                 }
             }
+
+            // An unterminated comment (lines 50-51) opened outside any event block, at the top level or in a skipped
+            // block, has not been reported yet.
+            ReportDanglingCommentAt(Current);
         }
 
         /// <summary>
@@ -651,7 +705,12 @@ public static class Parser
                 }
                 else if (token.Kind == TokenKind.EndOfInput || IsBlockStart(token))
                 {
-                    Warn(token, Commands.EndField, "Missing END-FIELD; field block closed");
+                    // An END-FIELD hidden in an unterminated comment (lines 50-51) is reported as that comment.
+                    if (!ReportDanglingCommentAt(token))
+                    {
+                        Warn(token, Commands.EndField, "Missing END-FIELD; field block closed");
+                    }
+
                     break;
                 }
                 else if (keyword is not null && EventTerminators.Contains(keyword))
@@ -693,8 +752,10 @@ public static class Parser
                 {
                     Advance();
                 }
-                else
+                else if (!ReportDanglingCommentAt(token))
                 {
+                    // Reached when the terminator is missing from the text itself; one hidden in an unterminated
+                    // comment (lines 50-51) is reported as that comment by the condition above.
                     Warn(token, syntax.Terminator, $"Missing {syntax.Terminator}; {eventKeyword} block closed");
 
                     // A different event terminator stands for this one; END-FIELD and block or event starts are
@@ -1033,7 +1094,13 @@ public static class Parser
                     }
                     else
                     {
-                        Warn(ifToken, Commands.If, $"IF without END-IF or END; {IfSkipped}");
+                        // An END-IF or END hidden in an unterminated comment (lines 50-51) is reported as that
+                        // comment; the IF never runs either way, because its terminator is not in the program.
+                        if (!ReportDanglingCommentAt(token))
+                        {
+                            Warn(ifToken, Commands.If, $"IF without END-IF or END; {IfSkipped}");
+                        }
+
                         poisoned = true;
                         break;
                     }

@@ -8,8 +8,12 @@ using EpiInfo.Api.Json;
 using EpiInfo.Api.Services;
 using EpiInfo.Api.Tests.Infrastructure;
 using EpiInfo.CheckCode;
+using EpiInfo.Domain.Forms;
+using EpiInfo.Domain.Metadata;
 using EpiInfo.Domain.Records;
+using EpiInfo.Domain.Search;
 using EpiInfo.Domain.Storage;
+using EpiInfo.Domain.Validation;
 using EpiInfo.Domain.Values;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
@@ -99,6 +103,433 @@ public sealed class SearchRequestBindingTests
         Assert.NotNull(criteria);
         return Assert.Single(criteria);
     }
+}
+
+/// <summary>
+/// Pins the Find and list semantics of the in-memory <see cref="FakeDataStore"/> against the
+/// <see cref="IDataStore"/> Find and list contract that AAP 0.3.4.3 and 0.3.4.4 set out: exact comparison on integer
+/// columns and binary64 comparison on float columns, SQL <c>LIKE</c> over the whole text, and one scan that numbers,
+/// filters, counts and pages records as the SQL statements do.
+/// </summary>
+/// <remarks>
+/// The class calls the store's <see cref="IDataStore"/> members directly and needs no database: it carries no
+/// <c>Integration</c> trait, joins no database collection and takes no lock. Its form is synthetic: view 9100 on the
+/// unseeded base table <c>FakeFind</c>, with <c>Count</c> on a <c>bigint</c> column, <c>Weight</c> on a
+/// <c>float</c> column, the text <c>Name</c>, and the Option <c>Choice</c> with items <c>a,b,c</c> on a
+/// <c>smallint</c> column on page 1, and the text <c>Notes</c> on page 2.
+/// </remarks>
+public sealed class FakeDataStoreFindTests
+{
+    private const int ViewId = 9100;
+    private const int FirstPageId = 910001;
+    private const int SecondPageId = 910002;
+    private const string BaseTable = "FakeFind";
+    private const string CountField = "Count";
+    private const string WeightField = "Weight";
+    private const string NameField = "Name";
+    private const string NotesField = "Notes";
+    private const string ChoiceField = "Choice";
+    private const long TwoToThe53 = 9007199254740992;
+
+    private static readonly FormMetadata Form = CreateForm();
+
+    private static readonly string[] GridColumnNames = [CountField, WeightField, NameField, NotesField];
+
+    /// <summary>Text and SQL <c>LIKE</c> patterns, with whether the pattern matches the whole text.</summary>
+    public static TheoryData<string, string, bool> LikeCases => new()
+    {
+        // Patterns long enough for a regular-expression automaton to exceed its size limit.
+        { new string('a', 4000), new string('a', 4000) + "%", true },
+        { new string('a', 4000), new string('a', 4000) + "_", false },
+        { new string('a', 1000), string.Concat(Enumerable.Repeat("%a", 1000)), true },
+        { new string('a', 999), string.Concat(Enumerable.Repeat("%a", 1000)), false },
+
+        // A trailing line feed is a character the pattern must cover.
+        { "abc\n", "ab_", false },
+        { "abc\n", "abc_", true },
+        { "abc\n", "abc%", true },
+
+        // A reversed range matches no character, while the class's other members still match.
+        { "m", "[z-a]", false },
+        { "m", "[z-am]", true },
+
+        // Negation and letter case.
+        { "d", "[^a-c]", true },
+        { "B", "[^a-c]", false },
+        { "aBcDef", "AbC%", true },
+        { "bX", "[A-C]x", true },
+
+        // Every [ opens a class, which the first ] after it closes or, with no such ], the end of the pattern. The
+        // unclosed class of a[b% holds b and %, and [[] holds [.
+        { "ab", "a[b", true },
+        { "a[b", "a[b", false },
+        { "a[b", "a[b%", false },
+        { "a%", "a[%", true },
+        { "ac", "a[a-c", true },
+        { "ad", "a[a-c", false },
+        { "ac", "a[^b", true },
+        { "ab", "a[^b", false },
+        { "abc", "%[c", true },
+        { "[", "[[]", true },
+
+        // A class with no member matches no character.
+        { "[", "[", false },
+        { "a[", "a[", false },
+        { "[]", "[]", false },
+        { "x", "[]", false },
+        { "a", "a[]%", false },
+        { "x", "[]x]", false },
+
+        // A negated class with no member matches any one character.
+        { "a", "[^]", true },
+        { "", "[^]", false },
+        { "a", "[^", true },
+        { "ab", "a[^]", true },
+        { "a]", "[^]]", true },
+        { "]", "[^]]", false },
+    };
+
+    // The parser keeps 9007199254740993 exact, and the three counts from 2^53 share two nearest doubles, so only an
+    // exact comparison keeps them apart.
+    [Theory]
+    [InlineData("9007199254740993", new long[] { TwoToThe53 + 1 })]
+    [InlineData("<>9007199254740993", new long[] { long.MinValue, 2, 3, TwoToThe53, TwoToThe53 + 2, long.MaxValue })]
+    [InlineData("<9007199254740993", new long[] { long.MinValue, 2, 3, TwoToThe53 })]
+    [InlineData("<=9007199254740993", new long[] { long.MinValue, 2, 3, TwoToThe53, TwoToThe53 + 1 })]
+    [InlineData(">9007199254740993", new long[] { TwoToThe53 + 2, long.MaxValue })]
+    [InlineData(">=9007199254740993", new long[] { TwoToThe53 + 1, TwoToThe53 + 2, long.MaxValue })]
+    public async Task IntegerColumnComparesExactly(string criterion, long[] expected)
+    {
+        await AssertCountsFoundAsync(Parse(CountField, criterion), expected);
+    }
+
+    // The fraction 2.5 and the numbers beyond the Int64 range, whose nearest doubles are -1e19 and 2^63, compare
+    // against small and extreme values alike: long.MaxValue rounds to 2^63 as a double, yet is smaller. The conditions
+    // are built directly, because the store's contract for such criteria does not depend on whether the parser admits
+    // them on an integer column.
+    [Theory]
+    [InlineData(SearchOperator.Equal, "2.5", new long[0])]
+    [InlineData(SearchOperator.Less, "2.5", new long[] { long.MinValue, 2 })]
+    [InlineData(SearchOperator.Greater, "2.5", new long[] { 3, TwoToThe53, TwoToThe53 + 1, TwoToThe53 + 2, long.MaxValue })]
+    [InlineData(SearchOperator.Less, "9223372036854775808", new long[] { long.MinValue, 2, 3, TwoToThe53, TwoToThe53 + 1, TwoToThe53 + 2, long.MaxValue })]
+    [InlineData(SearchOperator.GreaterOrEqual, "9223372036854775808", new long[0])]
+    [InlineData(SearchOperator.Greater, "-1e19", new long[] { long.MinValue, 2, 3, TwoToThe53, TwoToThe53 + 1, TwoToThe53 + 2, long.MaxValue })]
+    [InlineData(SearchOperator.Less, "-1e19", new long[0])]
+    public async Task IntegerColumnComparesFractionsAndNumbersBeyondInt64(
+        SearchOperator comparison,
+        string numberText,
+        long[] expected)
+    {
+        Assert.True(FieldValueCoercion.TryParseNumber(numberText, out var number));
+        SearchCondition[] conditions =
+        [
+            new(CountField, SearchTarget.PageField, FieldType.Number, [new SearchAlternative(comparison, number)]),
+        ];
+
+        await AssertCountsFoundAsync(conditions, expected);
+    }
+
+    // A float column compares binary64 doubles, as SQL float comparison does: 2^53 + 1 rounds to 2^53.
+    [Theory]
+    [InlineData("9007199254740993", true)]
+    [InlineData("<9007199254740993", false)]
+    public async Task FloatColumnComparesDoubles(string criterion, bool matches)
+    {
+        var store = CreateStore();
+        Seed(store, WeightField, FieldValue.FromNumber(TwoToThe53));
+
+        var response = await SearchAsync(store, Parse(WeightField, criterion));
+
+        Assert.Equal(matches ? 1 : 0, response.Total);
+    }
+
+    // The conditions are built directly: the parser trims criteria and chooses LIKE only for a value holding a
+    // wildcard, so it cannot express every pattern here.
+    [Theory]
+    [MemberData(nameof(LikeCases))]
+    public async Task LikeMatchesTheWholeTextIgnoringCase(string text, string pattern, bool matches)
+    {
+        var store = CreateStore();
+        Seed(store, NameField, FieldValue.FromText(text));
+        SearchCondition[] conditions =
+        [
+            new(NameField, SearchTarget.PageField, FieldType.Text,
+                [new SearchAlternative(SearchOperator.Like, FieldValue.FromText(pattern))]),
+        ];
+
+        var response = await SearchAsync(store, conditions);
+
+        Assert.Equal(matches ? 1 : 0, response.Total);
+    }
+
+    // Records r1, r2, the deleted rd, r3, r4 and r5, in UniqueKey order.
+    [Theory]
+    [InlineData(null, false, 1, 2, new[] { "r1", "r2" }, 5)]
+    [InlineData(null, false, 3, 2, new[] { "r5" }, 5)]
+    [InlineData(null, true, 2, 2, new[] { "rd", "r3" }, 6)]
+    [InlineData(null, false, int.MaxValue, 200, new string[0], 5)]
+    [InlineData("R2", false, 1, 50, new[] { "r2" }, 1)]
+    [InlineData("D", true, 1, 50, new[] { "rd" }, 1)]
+    [InlineData("D", false, 1, 50, new string[0], 0)]
+    public async Task ListCountsEveryMatchAndProjectsOnlyThePage(
+        string? q,
+        bool includeDeleted,
+        int page,
+        int pageSize,
+        string[] expectedNames,
+        int expectedTotal)
+    {
+        var store = CreateStore();
+        foreach (var name in new[] { "r1", "r2", "rd", "r3", "r4", "r5" })
+        {
+            Seed(
+                store,
+                NameField,
+                FieldValue.FromText(name),
+                name == "rd" ? RecordQueryRules.DeletedRecStatus : RecordQueryRules.ActiveRecStatus);
+        }
+
+        var result = await store.ListAsync(
+            Form, new RecordListQuery(q, includeDeleted, page, pageSize), CancellationToken.None);
+
+        Assert.Equal(expectedTotal, result.Total);
+        Assert.Equal(expectedNames, result.Items.Select(item => item.Values[NameField].AsText()));
+        Assert.All(result.Items, item => Assert.Equal(GridColumnNames, item.Values.Keys));
+    }
+
+    // Records: 0 match, 1 other, 2 match deleted, 3 match missing page 2, 4 match, 5 match. The excluded id is passed
+    // in upper case, since ids match ignoring case.
+    [Theory]
+    [InlineData(false, null, new[] { 0, 4, 5 }, new[] { 1, 4, 5 })]
+    [InlineData(true, null, new[] { 0, 2, 4, 5 }, new[] { 1, 3, 5, 6 })]
+    [InlineData(false, 4, new[] { 0, 5 }, new[] { 1, 5 })]
+    public async Task SearchNumbersPositionsBeforeCriteriaAndExcludesBeforeTheTotal(
+        bool includeDeleted,
+        int? excluded,
+        int[] expectedRecords,
+        int[] expectedPositions)
+    {
+        var store = CreateStore();
+        string[] ids =
+        [
+            Seed(store, NameField, FieldValue.FromText("match")),
+            Seed(store, NameField, FieldValue.FromText("other")),
+            Seed(store, NameField, FieldValue.FromText("match"), RecordQueryRules.DeletedRecStatus),
+            Seed(store, NameField, FieldValue.FromText("match"), missingPageIds: [SecondPageId]),
+            Seed(store, NameField, FieldValue.FromText("match")),
+            Seed(store, NameField, FieldValue.FromText("match")),
+        ];
+        var exclude = excluded is { } index ? ids[index].ToUpperInvariant() : null;
+
+        var response = await store.SearchAsync(
+            Form, Parse(NameField, "match"), includeDeleted, exclude, CancellationToken.None);
+
+        Assert.Equal(expectedRecords.Select(record => ids[record]), response.Items.Select(item => item.GlobalRecordId));
+        Assert.Equal(expectedPositions, response.Items.Select(item => item.Position));
+        Assert.Equal(expectedRecords.Length, response.Total);
+        Assert.False(response.Truncated);
+        Assert.All(response.Items, item => Assert.Equal(GridColumnNames, item.Values.Keys));
+    }
+
+    [Fact]
+    public async Task SearchCapsItemsAndCountsEveryMatch()
+    {
+        var store = CreateStore();
+        const int matches = RecordQueryRules.SearchCap + 5;
+        for (var record = 0; record < matches; record++)
+        {
+            Seed(store, NameField, FieldValue.FromText("match"));
+        }
+
+        var response = await SearchAsync(store, Parse(NameField, "match"));
+
+        Assert.Equal(Enumerable.Range(1, RecordQueryRules.SearchCap), response.Items.Select(item => item.Position));
+        Assert.Equal(matches, response.Total);
+        Assert.True(response.Truncated);
+    }
+
+    // Writes replace rows rather than change them, and later reads see the replacements: an update inserts the
+    // missing page row, so search, which needs every page row, then finds the record, and a soft delete leaves the
+    // active set.
+    [Fact]
+    public async Task WritesPublishRowsThatLaterReadsSee()
+    {
+        var store = CreateStore();
+        var stamp = new SaveStamp("tester", new DateTime(2024, 1, 2, 3, 4, 5, DateTimeKind.Utc));
+        var partial = Seed(store, NameField, FieldValue.FromText("partial"), missingPageIds: [SecondPageId]);
+        var inserted = await store.InsertAsync(
+            Form,
+            new Dictionary<string, FieldValue> { [NameField] = FieldValue.FromText("inserted") },
+            stamp,
+            CancellationToken.None);
+        var criteria = Parse(NameField, "partial or inserted");
+
+        Assert.Equal(new[] { inserted.GlobalRecordId }, await SearchIdsAsync(store, criteria));
+
+        var updated = await store.UpdateAsync(
+            Form,
+            partial,
+            new Dictionary<string, FieldValue> { [NotesField] = FieldValue.FromText("filled") },
+            stamp,
+            _ => RecordValidationResult.Success(new Dictionary<string, FieldValue>()),
+            permissions: null,
+            CancellationToken.None);
+
+        Assert.True(updated.IsSuccess);
+        var state = Assert.IsType<FakeRecordState>(store.GetRecord(ViewId, partial));
+        Assert.Equal(new[] { FirstPageId, SecondPageId }, state.PresentPageIds.Order());
+        Assert.Equal("filled", state.Values[NotesField].AsText());
+        Assert.Equal(stamp, state.LastSave);
+        Assert.Equal(new[] { partial, inserted.GlobalRecordId }, await SearchIdsAsync(store, criteria));
+
+        Assert.Equal(
+            SoftDeleteResult.Deleted,
+            await store.SoftDeleteAsync(Form, inserted.GlobalRecordId, stamp, CancellationToken.None));
+        Assert.Equal(new[] { partial }, await SearchIdsAsync(store, criteria));
+        var all = await store.ListAsync(
+            Form, RecordListQuery.Default with { IncludeDeleted = true }, CancellationToken.None);
+        Assert.Equal(
+            new[] { RecordQueryRules.ActiveRecStatus, RecordQueryRules.DeletedRecStatus },
+            all.Items.Select(item => item.RecStatus));
+    }
+
+    // An option field holds only an option index, as the SQL builders bind it, though its smallint column could also
+    // store the number 1. The parsed criterion "1" is an index, so it finds the stored index 1 and not the index 0,
+    // while the number 1 is rejected before any change, by a seed and by an insert alike.
+    [Theory]
+    [InlineData(FieldValueKind.Index, true)]
+    [InlineData(FieldValueKind.Number, false)]
+    public async Task OptionFieldAdmitsOnlyAnIndex(FieldValueKind kind, bool admitted)
+    {
+        var store = CreateStore();
+        var other = Seed(store, ChoiceField, FieldValue.FromIndex(0));
+        var value = kind == FieldValueKind.Index ? FieldValue.FromIndex(1) : FieldValue.FromInteger(1);
+        var criteria = Parse(ChoiceField, "1");
+        Assert.Equal(FieldValueKind.Index, Assert.Single(Assert.Single(criteria).Alternatives).Value?.Kind);
+
+        var seedFailure = Record.Exception(() => Seed(store, ChoiceField, value));
+        var insertFailure = await Record.ExceptionAsync(() => store.InsertAsync(
+            Form,
+            new Dictionary<string, FieldValue> { [ChoiceField] = value },
+            new SaveStamp("tester", new DateTime(2024, 1, 2, 3, 4, 5, DateTimeKind.Utc)),
+            CancellationToken.None));
+
+        if (admitted)
+        {
+            Assert.Null(seedFailure);
+            Assert.Null(insertFailure);
+        }
+        else
+        {
+            Assert.Equal("values", Assert.IsType<ArgumentException>(seedFailure).ParamName);
+            Assert.Equal("values", Assert.IsType<ArgumentException>(insertFailure).ParamName);
+        }
+
+        var records = store.GetRecords(ViewId).Select(record => record.GlobalRecordId).ToArray();
+        Assert.Equal(admitted ? 3 : 1, records.Length);
+        Assert.Equal(other, records[0]);
+        Assert.Equal(admitted ? 1 : 0, store.WriteCalls.Count);
+        Assert.Equal(records[1..], await SearchIdsAsync(store, criteria));
+    }
+
+    private static FakeDataStore CreateStore() =>
+        new(new FakeForm(Form, new Dictionary<string, IReadOnlyList<FieldOption>>(StringComparer.OrdinalIgnoreCase), null));
+
+    private static string Seed(
+        FakeDataStore store,
+        string field,
+        FieldValue value,
+        int recStatus = RecordQueryRules.ActiveRecStatus,
+        IEnumerable<int>? missingPageIds = null) =>
+        store.SeedRecord(ViewId, new Dictionary<string, FieldValue> { [field] = value }, recStatus, missingPageIds);
+
+    private static IReadOnlyList<SearchCondition> Parse(string field, string criterion)
+    {
+        var result = SearchCriteriaParser.Parse(
+            FormDefinitionFactory.GetDataFields(Form),
+            [new SearchCriterion(field, FieldValue.FromText(criterion))]);
+        Assert.True(result.IsSuccess);
+        return result.Conditions;
+    }
+
+    private static Task<SearchResponse> SearchAsync(FakeDataStore store, IReadOnlyList<SearchCondition> conditions) =>
+        store.SearchAsync(Form, conditions, includeDeleted: false, excludeGlobalRecordId: null, CancellationToken.None);
+
+    private static async Task<string[]> SearchIdsAsync(FakeDataStore store, IReadOnlyList<SearchCondition> conditions) =>
+        [.. (await SearchAsync(store, conditions)).Items.Select(item => item.GlobalRecordId)];
+
+    // Seeds the counts long.MinValue, 2, 3, 2^53, 2^53 + 1, 2^53 + 2 and long.MaxValue, in UniqueKey order, and
+    // asserts that the conditions find exactly the expected counts, in that order.
+    private static async Task AssertCountsFoundAsync(IReadOnlyList<SearchCondition> conditions, long[] expected)
+    {
+        var store = CreateStore();
+        foreach (var count in new[] { long.MinValue, 2, 3, TwoToThe53, TwoToThe53 + 1, TwoToThe53 + 2, long.MaxValue })
+        {
+            Seed(store, CountField, FieldValue.FromInteger(count));
+        }
+
+        var response = await SearchAsync(store, conditions);
+
+        Assert.Equal(expected, response.Items.Select(item => Integer(item.Values[CountField])));
+        Assert.Equal(expected.Length, response.Total);
+    }
+
+    private static long Integer(FieldValue value)
+    {
+        Assert.True(value.TryGetInteger(out var integer));
+        return integer;
+    }
+
+    // The system rows and field-type ids are the seeded metaFields and metaFieldTypes rows, as FakeForms builds them.
+    private static FormMetadata CreateForm()
+    {
+        PageMetadata[] pages =
+        [
+            new(FirstPageId, "Page 1", 0, BaseTable + FirstPageId.ToString(CultureInfo.InvariantCulture)),
+            new(SecondPageId, "Page 2", 1, BaseTable + SecondPageId.ToString(CultureInfo.InvariantCulture)),
+        ];
+        FieldMetadata[] fields =
+        [
+            SystemRow(1, "UniqueKey", 23),
+            SystemRow(2, "RecStatus", 22),
+            SystemRow(3, "GlobalRecordId", 26),
+            PageField(4, FirstPageId, 1m, CountField, 5, "Number", "bigint", 8),
+            PageField(5, FirstPageId, 2m, WeightField, 5, "Number", "float", 8),
+            PageField(6, FirstPageId, 3m, NameField, 1, "Text", "nvarchar", 8000),
+            PageField(7, SecondPageId, 1m, NotesField, 1, "Text", "nvarchar", 8000),
+            PageField(8, FirstPageId, 4m, ChoiceField, 12, "Option", "smallint", 2) with { List = "a,b,c" },
+        ];
+        return new FormMetadata(ViewId, BaseTable, BaseTable, Array.AsReadOnly(pages), Array.AsReadOnly(fields));
+    }
+
+    private static FieldMetadata SystemRow(int ordinal, string name, int fieldTypeId) => new()
+    {
+        FieldId = (ViewId * 1000) + ordinal,
+        Name = name,
+        FieldTypeId = fieldTypeId,
+        FieldTypeName = name,
+        TabIndex = 0m,
+    };
+
+    private static FieldMetadata PageField(
+        int ordinal,
+        int pageId,
+        decimal tabIndex,
+        string name,
+        int fieldTypeId,
+        string fieldTypeName,
+        string sqlTypeName,
+        int maxLengthBytes) => new()
+        {
+            FieldId = (ViewId * 1000) + ordinal,
+            Name = name,
+            FieldTypeId = fieldTypeId,
+            FieldTypeName = fieldTypeName,
+            Prompt = name,
+            TabIndex = tabIndex,
+            PageId = pageId,
+            Column = FieldTypeMapper.DescribeColumn(name, sqlTypeName, maxLengthBytes),
+        };
 }
 
 /// <summary>

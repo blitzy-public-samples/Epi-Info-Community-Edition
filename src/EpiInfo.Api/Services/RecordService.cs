@@ -575,7 +575,7 @@ public sealed partial class RecordService(
 
         if (!raw.IsSuccess)
         {
-            problem = ApiProblems.ValidationFailed(raw.FieldErrors);
+            problem = ApiProblems.ValidationFailed(raw.FieldErrorsFor(loaded.Metadata));
             return false;
         }
 

@@ -1,7 +1,6 @@
+using System.Collections.Immutable;
 using System.Collections.ObjectModel;
 using System.Globalization;
-using System.Text;
-using System.Text.RegularExpressions;
 using EpiInfo.Domain.Forms;
 using EpiInfo.Domain.Metadata;
 using EpiInfo.Domain.Records;
@@ -40,15 +39,36 @@ public sealed record FakeForm(
 /// </param>
 public sealed record FakeStoreCall(string Method, bool IsWrite);
 
-/// <summary>When an injected failure is raised.</summary>
+/// <summary>
+/// When an injected failure is raised, and so which <see cref="WriteOutcome"/> a store exception may report.
+/// </summary>
+/// <remarks>
+/// A <see cref="DataStoreUnavailableException"/> or <see cref="DataStoreWriteException"/> must report an outcome that
+/// the stage's state agrees with, because the API reports that outcome as <c>writeOutcome</c>:
+/// <see cref="WriteOutcome.NotWritten"/> goes with <see cref="BeforeWrite"/>, <see cref="WriteOutcome.Written"/> with
+/// <see cref="AfterWrite"/> on a write method, and <see cref="WriteOutcome.Unknown"/> with either, each stage modelling
+/// one of the two states it covers. <see cref="FakeDataStore.ThrowOn"/> and <see cref="FakeDataStore.ThrowOnAny"/>
+/// reject an incoherent pair with an <see cref="ArgumentException"/>. Any other exception carries no outcome and fits
+/// either stage. A test asserts the resulting state (<see cref="FakeDataStore.GetRecord"/>,
+/// <see cref="FakeDataStore.GetRecords"/>) and the call log (<see cref="FakeDataStore.WriteCalls"/>) as well as the
+/// response.
+/// </remarks>
 public enum FakeFailureStage
 {
-    /// <summary>Before any state change. For a write, at the point its first data statement would be sent.</summary>
+    /// <summary>
+    /// Before any state change. For a write, at the point its first data statement would be sent: nothing is stored
+    /// and <see cref="FakeDataStore.WriteCalls"/> gains no entry, as when no DML was sent. A store exception raised
+    /// here reports <see cref="WriteOutcome.NotWritten"/>, or <see cref="WriteOutcome.Unknown"/> for the unconfirmed
+    /// state in which nothing was kept; never <see cref="WriteOutcome.Written"/>.
+    /// </summary>
     BeforeWrite,
 
     /// <summary>
-    /// For the three write methods, after the change has been applied and logged, as a failure after the commit. Any
-    /// other method treats it as <see cref="BeforeWrite"/>.
+    /// For the three write methods, after the change has been applied and logged, as a failure after the commit: the
+    /// change is stored and <see cref="FakeDataStore.WriteCalls"/> holds its entry. A store exception raised here
+    /// reports <see cref="WriteOutcome.Written"/>, or <see cref="WriteOutcome.Unknown"/> for the unconfirmed state in
+    /// which the change was kept; never <see cref="WriteOutcome.NotWritten"/>. Any other method treats it as
+    /// <see cref="BeforeWrite"/>, with that stage's outcomes.
     /// </summary>
     AfterWrite,
 }
@@ -352,15 +372,17 @@ public static class FakeForms
 /// it: the selected set and <c>UniqueKey</c> order of <see cref="RecordQueryRules"/>, page rows read as a
 /// <c>LEFT JOIN</c> (missing pages give <see cref="FieldValue.Null"/>), search over records that have every page row,
 /// base-only soft delete, delta updates, and the gates of <see cref="UpdateAsync"/> in the interface's order. A
-/// <c>values</c> key that is not a data field, or a value its column cannot store, is an
-/// <see cref="ArgumentException"/> raised before any change, as the SQL builders raise it. Text comparisons, record
-/// ids and the grid filter ignore case ordinally, the common case-insensitive collation; the fake claims no
+/// <c>values</c> key that is not a data field, a value not of its field's kind, or a value its column cannot store,
+/// is an <see cref="ArgumentException"/> raised before any change, as the SQL builders raise it. Text comparisons,
+/// record ids and the grid filter ignore case ordinally, the common case-insensitive collation; the fake claims no
 /// collation parity beyond that.
 /// </para>
 /// <para>
 /// One lock guards all state, and every write runs entirely under it, so concurrent updates serialise and the last
-/// writer wins per field, as the SQL store's <c>UPDLOCK</c> makes them. Every member completes synchronously and
-/// reports failures through the returned task, as an asynchronous store does.
+/// writer wins per field, as the SQL store's <c>UPDLOCK</c> makes them. Rows are immutable and each write publishes
+/// replacements, so <see cref="ListAsync"/> and <see cref="SearchAsync"/> take the form's current rows under the lock
+/// and filter outside it, seeing one consistent state of the form. Every member completes synchronously and reports
+/// failures through the returned task, as an asynchronous store does.
 /// </para>
 /// </remarks>
 public sealed class FakeDataStore : IDataStore
@@ -461,6 +483,15 @@ public sealed class FakeDataStore : IDataStore
     }
 
     /// <summary>An availability failure, which the API maps to 503.</summary>
+    /// <remarks>
+    /// Its outcome fixes the stage it is injected at, as <see cref="FakeFailureStage"/> sets out:
+    /// <see cref="WriteOutcome.NotWritten"/> at <see cref="FakeFailureStage.BeforeWrite"/>,
+    /// <see cref="WriteOutcome.Written"/> at <see cref="FakeFailureStage.AfterWrite"/> on a write method, and
+    /// <see cref="WriteOutcome.Unknown"/> at either, each stage modelling one of the two states it covers.
+    /// <see cref="ThrowOn"/> and <see cref="ThrowOnAny"/> reject any other pairing with an
+    /// <see cref="ArgumentException"/>. A test asserts the resulting state (<see cref="GetRecord"/>,
+    /// <see cref="GetRecords"/>) and the call log (<see cref="WriteCalls"/>) as well as the response.
+    /// </remarks>
     /// <param name="outcome">What the failure reports about the stored data.</param>
     /// <param name="operation">The failed operation's fixed identifier.</param>
     /// <param name="sqlErrorNumber">The SQL error number it reports; -2 is a command timeout.</param>
@@ -470,6 +501,15 @@ public sealed class FakeDataStore : IDataStore
         int? sqlErrorNumber = -2) => new(operation, outcome, sqlErrorNumber);
 
     /// <summary>An unexpected store failure, which the API maps to 500.</summary>
+    /// <remarks>
+    /// Its outcome fixes the stage it is injected at, as <see cref="FakeFailureStage"/> sets out:
+    /// <see cref="WriteOutcome.NotWritten"/> at <see cref="FakeFailureStage.BeforeWrite"/>,
+    /// <see cref="WriteOutcome.Written"/> at <see cref="FakeFailureStage.AfterWrite"/> on a write method, and
+    /// <see cref="WriteOutcome.Unknown"/> at either, each stage modelling one of the two states it covers.
+    /// <see cref="ThrowOn"/> and <see cref="ThrowOnAny"/> reject any other pairing with an
+    /// <see cref="ArgumentException"/>. A test asserts the resulting state (<see cref="GetRecord"/>,
+    /// <see cref="GetRecords"/>) and the call log (<see cref="WriteCalls"/>) as well as the response.
+    /// </remarks>
     /// <param name="outcome">What the failure reports about the stored data.</param>
     /// <param name="operation">The failed operation's fixed identifier.</param>
     /// <param name="sqlErrorNumber">The SQL error number it reports; 547 is a constraint violation.</param>
@@ -511,8 +551,8 @@ public sealed class FakeDataStore : IDataStore
     /// <param name="globalRecordId">The record's id, or <see langword="null"/> for a new GUID.</param>
     /// <returns>The record's <c>GlobalRecordId</c>.</returns>
     /// <exception cref="ArgumentException">
-    /// The form is unknown; a key is not a data field or a value does not fit its column; a page id is not a page of
-    /// the form; or the id is blank or already used.
+    /// The form is unknown; a key is not a data field, a value is not of its field's kind or a value does not fit its
+    /// column; a page id is not a page of the form; or the id is blank or already used.
     /// </exception>
     public string SeedRecord(
         int viewId,
@@ -546,15 +586,23 @@ public sealed class FakeDataStore : IDataStore
                 throw new ArgumentException("The form already holds a record with this id.", nameof(globalRecordId));
             }
 
-            var row = state.AddRow(id, recStatus, present);
+            var stored = new Dictionary<string, FieldValue>(state.DataFields.Count, StringComparer.OrdinalIgnoreCase);
             foreach (var field in state.DataFields)
             {
-                row.Values[field.Name] = present.Contains(field.Page.PageId)
+                stored[field.Name] = present.Contains(field.Page.PageId)
                     && normalised.TryGetValue(field.Name, out var value)
                         ? value
                         : FieldValue.Null;
             }
 
+            state.Add(new StoredRow(
+                id,
+                state.NextUniqueKey(),
+                recStatus,
+                new ReadOnlyDictionary<string, FieldValue>(stored),
+                new ReadOnlySet<int>(present),
+                null,
+                null));
             return id;
         }
     }
@@ -631,10 +679,41 @@ public sealed class FakeDataStore : IDataStore
     /// applied and logged (<see cref="FakeFailureStage.AfterWrite"/>). <c>UpdateAsync</c> and <c>SoftDeleteAsync</c>
     /// reach that stage only for an active record that passes the gates.
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A <see cref="DataStoreUnavailableException"/> or <see cref="DataStoreWriteException"/> must report the outcome
+    /// that the state its stage leaves agrees with, because the API reports that outcome as <c>writeOutcome</c>:
+    /// </para>
+    /// <list type="bullet">
+    /// <item><description>
+    /// <see cref="WriteOutcome.NotWritten"/> at <see cref="FakeFailureStage.BeforeWrite"/>, where nothing has changed;
+    /// </description></item>
+    /// <item><description>
+    /// <see cref="WriteOutcome.Written"/> only at <see cref="FakeFailureStage.AfterWrite"/> of <c>InsertAsync</c>,
+    /// <c>UpdateAsync</c> or <c>SoftDeleteAsync</c>, where the change is applied; every other member treats that stage
+    /// as <see cref="FakeFailureStage.BeforeWrite"/>;
+    /// </description></item>
+    /// <item><description>
+    /// <see cref="WriteOutcome.Unknown"/> at either stage, each modelling one of the two states it covers: the change
+    /// lost at <see cref="FakeFailureStage.BeforeWrite"/>, the change kept at
+    /// <see cref="FakeFailureStage.AfterWrite"/>.
+    /// </description></item>
+    /// </list>
+    /// <para>
+    /// Any other exception carries no outcome, because the API derives one from whether the write call started, so it
+    /// is accepted at either stage. A test asserts the resulting state (<see cref="GetRecord"/> or
+    /// <see cref="GetRecords"/>) and the call log (<see cref="WriteCalls"/>) as well as the response, so the outcome
+    /// the response claims is checked against the data.
+    /// </para>
+    /// </remarks>
     /// <param name="method">An <see cref="IDataStore"/> member name, for example <c>nameof(IDataStore.InsertAsync)</c>.</param>
     /// <param name="exception">The exception to throw.</param>
     /// <param name="stage">When to throw it.</param>
-    /// <exception cref="ArgumentException"><paramref name="method"/> names no <see cref="IDataStore"/> member.</exception>
+    /// <exception cref="ArgumentException">
+    /// <paramref name="method"/> names no <see cref="IDataStore"/> member, or <paramref name="exception"/> is a store
+    /// exception whose outcome contradicts the state <paramref name="stage"/> leaves. No failure is set then, and any
+    /// failure set earlier for <paramref name="method"/> stays.
+    /// </exception>
     public void ThrowOn(string method, Exception exception, FakeFailureStage stage = FakeFailureStage.BeforeWrite)
     {
         ArgumentNullException.ThrowIfNull(method);
@@ -649,6 +728,13 @@ public sealed class FakeDataStore : IDataStore
             throw new ArgumentOutOfRangeException(nameof(stage));
         }
 
+        // Only a write method's AfterWrite follows an applied change; every other member, and every BeforeWrite, raises
+        // before any change.
+        var changeApplied = stage == FakeFailureStage.AfterWrite
+            && method is nameof(IDataStore.InsertAsync) or nameof(IDataStore.UpdateAsync)
+                or nameof(IDataStore.SoftDeleteAsync);
+        ThrowIfOutcomeContradicts(exception, changeApplied);
+
         lock (_gate)
         {
             _failures[method] = (exception, stage);
@@ -658,13 +744,54 @@ public sealed class FakeDataStore : IDataStore
     /// <summary>
     /// Makes every member throw <paramref name="exception"/> before doing anything, its call log entry included.
     /// </summary>
+    /// <remarks>
+    /// Nothing is ever changed, so a <see cref="DataStoreUnavailableException"/> or
+    /// <see cref="DataStoreWriteException"/> reports <see cref="WriteOutcome.NotWritten"/>, or
+    /// <see cref="WriteOutcome.Unknown"/> for the unconfirmed state in which nothing was kept; any other exception is
+    /// accepted. A test asserts the unchanged state (<see cref="GetRecord"/> or <see cref="GetRecords"/>) and the empty
+    /// call log (<see cref="WriteCalls"/>) as well as the response.
+    /// </remarks>
     /// <param name="exception">The exception to throw.</param>
+    /// <exception cref="ArgumentException">
+    /// <paramref name="exception"/> is a store exception that reports <see cref="WriteOutcome.Written"/>. No failure is
+    /// set then, and any failure set earlier stays.
+    /// </exception>
     public void ThrowOnAny(Exception exception)
     {
         ArgumentNullException.ThrowIfNull(exception);
+        ThrowIfOutcomeContradicts(exception, changeApplied: false);
         lock (_gate)
         {
             _failureForAll = exception;
+        }
+    }
+
+    // A store exception's outcome must agree with the state its injection point leaves: written needs the change
+    // applied, notWritten needs it absent. Unknown covers both states, so it fits either, as does an outcome outside
+    // the enum, which the API's error body reports as unknown. Any other exception carries no outcome. The message is
+    // fixed text that names no value.
+    private static void ThrowIfOutcomeContradicts(Exception exception, bool changeApplied)
+    {
+        WriteOutcome? outcome = exception switch
+        {
+            DataStoreUnavailableException unavailable => unavailable.Outcome,
+            DataStoreWriteException failed => failed.Outcome,
+            _ => null,
+        };
+
+        var contradicts = outcome switch
+        {
+            WriteOutcome.Written => !changeApplied,
+            WriteOutcome.NotWritten => changeApplied,
+            _ => false,
+        };
+
+        if (contradicts)
+        {
+            throw new ArgumentException(
+                "The exception's write outcome contradicts the state this stage leaves: written needs AfterWrite on a "
+                + "write method, notWritten needs BeforeWrite.",
+                nameof(exception));
         }
     }
 
@@ -839,33 +966,44 @@ public sealed class FakeDataStore : IDataStore
         {
             ArgumentNullException.ThrowIfNull(form);
             ArgumentNullException.ThrowIfNull(query);
+            FormState state;
+            ImmutableList<StoredRow> rows;
             lock (_gate)
             {
                 BeginRead(nameof(ListAsync), cancellationToken);
-                var state = Resolve(form);
-                var columns = RecordQueryRules.GetGridColumns(state.Form.Metadata);
-                var filter = query.Filter;
-                var filtered = state.Selected(query.IncludeDeleted)
-                    .Select(row => (Row: row, Values: Snapshot(state, row)))
-                    .Where(entry => filter is null || columns.Any(column => Contains(entry.Values[column.Name], filter)))
-                    .ToList();
-
-                // The offset is 64-bit, so a valid page far past the end gives no item rather than overflowing.
-                var offset = query.Offset;
-                RecordSummary[] items = offset >= filtered.Count
-                    ? []
-                    : filtered
-                        .Skip((int)offset)
-                        .Take(query.PageSize)
-                        .Select(entry => new RecordSummary(
-                            entry.Row.GlobalRecordId,
-                            entry.Row.UniqueKey,
-                            entry.Row.RecStatus,
-                            RecordQueryRules.ProjectValues(entry.Values, columns)))
-                        .ToArray();
-
-                return new RecordPage(Array.AsReadOnly(items), filtered.Count, query.Page, query.PageSize);
+                state = Resolve(form);
+                rows = state.Rows;
             }
+
+            // One pass over the rows taken under the lock, outside it: the filter reads only the grid columns, every
+            // match is counted, and only the page's rows are projected. The offset is 64-bit, so a valid page far past
+            // the end gives no item rather than overflowing.
+            var columns = GridColumns(state);
+            var filter = query.Filter;
+            var offset = query.Offset;
+            var items = new List<RecordSummary>(Math.Min(query.PageSize, rows.Count));
+            var total = 0;
+            foreach (var row in rows)
+            {
+                if (!RecordQueryRules.IsInSelectedSet(row.RecStatus, query.IncludeDeleted)
+                    || (filter is not null && !columns.Any(column => Contains(ReadField(row, column.Field), filter))))
+                {
+                    continue;
+                }
+
+                if (total >= offset && items.Count < query.PageSize)
+                {
+                    items.Add(new RecordSummary(
+                        row.GlobalRecordId,
+                        row.UniqueKey,
+                        row.RecStatus,
+                        GridValues(row, columns)));
+                }
+
+                total++;
+            }
+
+            return new RecordPage(items.AsReadOnly(), total, query.Page, query.PageSize);
         });
 
     /// <inheritdoc />
@@ -879,38 +1017,55 @@ public sealed class FakeDataStore : IDataStore
         {
             ArgumentNullException.ThrowIfNull(form);
             ArgumentNullException.ThrowIfNull(conditions);
+            FormState state;
+            ImmutableList<StoredRow> rows;
             lock (_gate)
             {
                 BeginRead(nameof(SearchAsync), cancellationToken);
-                var state = Resolve(form);
-                var resolved = ResolveConditions(state, conditions);
-                var columns = RecordQueryRules.GetGridColumns(state.Form.Metadata);
-                var pageIds = state.Form.Metadata.Pages.Select(page => page.PageId).ToArray();
-
-                // Positions are numbered over the selected set before any criterion, so they equal navigation
-                // positions; the page-row join, the excluded id and the criteria then filter, before the total and
-                // the cap.
-                var matches = state.Selected(includeDeleted)
-                    .Select((row, index) => (Row: row, Position: index + 1))
-                    .Where(entry => pageIds.All(entry.Row.PresentPageIds.Contains))
-                    .Where(entry => excludeGlobalRecordId is null
-                        || !string.Equals(entry.Row.GlobalRecordId, excludeGlobalRecordId, StringComparison.OrdinalIgnoreCase))
-                    .Select(entry => (entry.Row, entry.Position, Values: Snapshot(state, entry.Row)))
-                    .Where(entry => resolved.All(condition => condition.Matches(entry.Row, entry.Values)))
-                    .ToList();
-
-                var items = matches
-                    .Take(RecordQueryRules.SearchCap)
-                    .Select(entry => new SearchResult(
-                        entry.Row.GlobalRecordId,
-                        entry.Row.UniqueKey,
-                        entry.Row.RecStatus,
-                        entry.Position,
-                        RecordQueryRules.ProjectValues(entry.Values, columns)))
-                    .ToArray();
-
-                return SearchResponse.Create(Array.AsReadOnly(items), matches.Count);
+                state = Resolve(form);
+                rows = state.Rows;
             }
+
+            var resolved = ResolveConditions(state, conditions);
+            var columns = GridColumns(state);
+            var pageIds = state.PageIds.ToArray();
+
+            // One pass over the rows taken under the lock, outside it. Positions are numbered over the selected set
+            // before any criterion, so they equal navigation positions; the page-row join, the excluded id and the
+            // criteria, each reading only its own field, then filter before the total and the cap, and only the
+            // capped items are projected.
+            var items = new List<SearchResult>();
+            var position = 0;
+            var total = 0;
+            foreach (var row in rows)
+            {
+                if (!RecordQueryRules.IsInSelectedSet(row.RecStatus, includeDeleted))
+                {
+                    continue;
+                }
+
+                position++;
+                if (!pageIds.All(row.PresentPageIds.Contains)
+                    || (excludeGlobalRecordId is not null
+                        && string.Equals(row.GlobalRecordId, excludeGlobalRecordId, StringComparison.OrdinalIgnoreCase))
+                    || !resolved.All(condition => condition.Matches(row)))
+                {
+                    continue;
+                }
+
+                total++;
+                if (items.Count < RecordQueryRules.SearchCap)
+                {
+                    items.Add(new SearchResult(
+                        row.GlobalRecordId,
+                        row.UniqueKey,
+                        row.RecStatus,
+                        position,
+                        GridValues(row, columns)));
+                }
+            }
+
+            return SearchResponse.Create(items.AsReadOnly(), total);
         });
 
     /// <inheritdoc />
@@ -959,14 +1114,21 @@ public sealed class FakeDataStore : IDataStore
                 cancellationToken.ThrowIfCancellationRequested();
                 _calls.Add(new FakeStoreCall(nameof(InsertAsync), IsWrite: true));
 
-                var row = state.AddRow(NewGlobalRecordId(), RecordQueryRules.ActiveRecStatus, state.PageIds);
+                var stored = new Dictionary<string, FieldValue>(state.DataFields.Count, StringComparer.OrdinalIgnoreCase);
                 foreach (var field in state.DataFields)
                 {
-                    row.Values[field.Name] = normalised.TryGetValue(field.Name, out var value) ? value : FieldValue.Null;
+                    stored[field.Name] = normalised.TryGetValue(field.Name, out var value) ? value : FieldValue.Null;
                 }
 
-                row.FirstSave = stamp;
-                row.LastSave = stamp;
+                var row = new StoredRow(
+                    NewGlobalRecordId(),
+                    state.NextUniqueKey(),
+                    RecordQueryRules.ActiveRecStatus,
+                    new ReadOnlyDictionary<string, FieldValue>(stored),
+                    new ReadOnlySet<int>(new HashSet<int>(state.PageIds)),
+                    stamp,
+                    stamp);
+                state.Add(row);
                 var snapshot = Dto(state, row);
 
                 ThrowInjected(nameof(InsertAsync), FakeFailureStage.AfterWrite);
@@ -1039,7 +1201,9 @@ public sealed class FakeDataStore : IDataStore
                 cancellationToken.ThrowIfCancellationRequested();
                 _calls.Add(new FakeStoreCall(nameof(UpdateAsync), IsWrite: true));
 
-                row.LastSave = stamp;
+                // The published row is never changed: the update builds its replacement from copies.
+                var stored = new Dictionary<string, FieldValue>(row.Values, StringComparer.OrdinalIgnoreCase);
+                var present = new HashSet<int>(row.PresentPageIds);
                 foreach (var field in state.DataFields)
                 {
                     if (!normalised.TryGetValue(field.Name, out var value))
@@ -1048,18 +1212,25 @@ public sealed class FakeDataStore : IDataStore
                     }
 
                     // A missing page row is inserted holding only its key, then updated, so its other fields stay null.
-                    if (row.PresentPageIds.Add(field.Page.PageId))
+                    if (present.Add(field.Page.PageId))
                     {
                         foreach (var pageField in state.DataFields.Where(other => other.Page.PageId == field.Page.PageId))
                         {
-                            row.Values[pageField.Name] = FieldValue.Null;
+                            stored[pageField.Name] = FieldValue.Null;
                         }
                     }
 
-                    row.Values[field.Name] = value;
+                    stored[field.Name] = value;
                 }
 
-                var snapshot = Dto(state, row);
+                var updated = row with
+                {
+                    Values = new ReadOnlyDictionary<string, FieldValue>(stored),
+                    PresentPageIds = new ReadOnlySet<int>(present),
+                    LastSave = stamp,
+                };
+                state.Replace(row, updated);
+                var snapshot = Dto(state, updated);
 
                 ThrowInjected(nameof(UpdateAsync), FakeFailureStage.AfterWrite);
                 return RecordWriteResult.Success(snapshot);
@@ -1100,8 +1271,7 @@ public sealed class FakeDataStore : IDataStore
                 _calls.Add(new FakeStoreCall(nameof(SoftDeleteAsync), IsWrite: true));
 
                 // Base row only: values and page rows are untouched and nothing cascades.
-                row.RecStatus = RecordQueryRules.DeletedRecStatus;
-                row.LastSave = stamp;
+                state.Replace(row, row with { RecStatus = RecordQueryRules.DeletedRecStatus, LastSave = stamp });
 
                 ThrowInjected(nameof(SoftDeleteAsync), FakeFailureStage.AfterWrite);
                 return SoftDeleteResult.Deleted;
@@ -1157,14 +1327,38 @@ public sealed class FakeDataStore : IDataStore
         var values = RecordQueryRules.CreateValuesMap(state.DataFields.Count);
         foreach (var field in state.DataFields)
         {
-            values.TryAdd(
-                field.Name,
-                row.PresentPageIds.Contains(field.Page.PageId) && row.Values.TryGetValue(field.Name, out var value)
-                    ? value
-                    : FieldValue.Null);
+            values.TryAdd(field.Name, ReadField(row, field));
         }
 
         return new ReadOnlyDictionary<string, FieldValue>(values);
+    }
+
+    // One data field of a row as Snapshot reads it: null when the field's page row is missing.
+    private static FieldValue ReadField(StoredRow row, DataFieldMetadata field) =>
+        row.PresentPageIds.Contains(field.Page.PageId) && row.Values.TryGetValue(field.Name, out var value)
+            ? value
+            : FieldValue.Null;
+
+    // The grid columns, each with the data field its name resolves to. Snapshot keys a name by that field, so reading
+    // it gives exactly what RecordQueryRules.ProjectValues takes from a full snapshot.
+    private static (string Name, DataFieldMetadata Field)[] GridColumns(FormState state) =>
+        RecordQueryRules.GetGridColumns(state.DataFields)
+            .Select(column => (column.Name, state.DataFields.Find(column.Name) ?? column))
+            .ToArray();
+
+    // The grid-only values of a returned row, in column order, keyed as RecordQueryRules.ProjectValues keys them: a
+    // name that differs only by case keeps the first column's entry.
+    private static IReadOnlyDictionary<string, FieldValue> GridValues(
+        StoredRow row,
+        (string Name, DataFieldMetadata Field)[] columns)
+    {
+        var values = RecordQueryRules.CreateValuesMap(columns.Length);
+        foreach (var (name, field) in columns)
+        {
+            values.TryAdd(name, ReadField(row, field));
+        }
+
+        return values;
     }
 
     private static StoredRecord Stored(FormState state, StoredRow row) =>
@@ -1199,6 +1393,13 @@ public sealed class FakeDataStore : IDataStore
             if (name is null || !state.DataFields.TryGet(name, out var field))
             {
                 throw new ArgumentException("A value names no data field of the form.", paramName);
+            }
+
+            // The kind is checked before the column, in the SQL builders' order: an integer column admits a number
+            // and an option index alike, yet an option field holds only an index and a number field only a number.
+            if (!value.IsNull && value.Kind != FieldTypeMapper.ValueKind(field.FieldType))
+            {
+                throw new ArgumentException("A value is not of its field's kind.", paramName);
             }
 
             if (!FieldTypeMapper.IsRepresentable(field.Column, value))
@@ -1249,16 +1450,23 @@ public sealed class FakeDataStore : IDataStore
                             "A search condition's field type is not the type of its field.", nameof(conditions));
                     }
 
-                    var name = field.Name;
-                    resolved.Add(new ResolvedCondition(condition, (_, values) => values[name]));
+                    // A float column compares binary64 doubles, as SQL float comparison does; an integer column
+                    // compares exactly.
+                    var numbers = field.Column.Family == ColumnFamily.Float
+                        ? NumericComparison.Binary64
+                        : NumericComparison.Exact;
+                    resolved.Add(new ResolvedCondition(condition, row => ReadField(row, field), numbers));
                     break;
 
                 case SearchTarget.BaseGlobalRecordId:
-                    resolved.Add(new ResolvedCondition(condition, (row, _) => FieldValue.FromText(row.GlobalRecordId)));
+                    resolved.Add(new ResolvedCondition(
+                        condition, row => FieldValue.FromText(row.GlobalRecordId), NumericComparison.Exact));
                     break;
 
+                // RecStatus is an int column, so it compares exactly.
                 case SearchTarget.BaseRecStatus:
-                    resolved.Add(new ResolvedCondition(condition, (row, _) => FieldValue.FromInteger(row.RecStatus)));
+                    resolved.Add(new ResolvedCondition(
+                        condition, row => FieldValue.FromInteger(row.RecStatus), NumericComparison.Exact));
                     break;
 
                 default:
@@ -1269,8 +1477,13 @@ public sealed class FakeDataStore : IDataStore
         return resolved;
     }
 
-    // A null stored value satisfies only IS NULL, as SQL's three-valued comparison gives.
-    private static bool Satisfies(SearchAlternative alternative, FieldValue stored)
+    // A null stored value satisfies only IS NULL, as SQL's three-valued comparison gives. A LIKE alternative matches
+    // through its prepared pattern.
+    private static bool Satisfies(
+        SearchAlternative alternative,
+        LikePattern? pattern,
+        FieldValue stored,
+        NumericComparison numbers)
     {
         if (alternative.Operator == SearchOperator.IsNull)
         {
@@ -1284,18 +1497,16 @@ public sealed class FakeDataStore : IDataStore
 
         return alternative.Operator switch
         {
-            SearchOperator.Like => stored.TryGetText(out var text)
-                && criterion.TryGetText(out var pattern)
-                && MatchesLike(text, pattern),
+            SearchOperator.Like => stored.TryGetText(out var text) && pattern is not null && pattern.IsMatch(text),
             SearchOperator.PrefixEqual255 => stored.TryGetText(out var text)
                 && criterion.TryGetText(out var other)
                 && string.Equals(Prefix255(text), Prefix255(other), StringComparison.OrdinalIgnoreCase),
-            SearchOperator.Equal => Compare(stored, criterion) is 0,
-            SearchOperator.NotEqual => Compare(stored, criterion) is { } order && order != 0,
-            SearchOperator.Less => Compare(stored, criterion) is < 0,
-            SearchOperator.LessOrEqual => Compare(stored, criterion) is <= 0,
-            SearchOperator.Greater => Compare(stored, criterion) is > 0,
-            SearchOperator.GreaterOrEqual => Compare(stored, criterion) is >= 0,
+            SearchOperator.Equal => Compare(stored, criterion, numbers) is 0,
+            SearchOperator.NotEqual => Compare(stored, criterion, numbers) is { } order && order != 0,
+            SearchOperator.Less => Compare(stored, criterion, numbers) is < 0,
+            SearchOperator.LessOrEqual => Compare(stored, criterion, numbers) is <= 0,
+            SearchOperator.Greater => Compare(stored, criterion, numbers) is > 0,
+            SearchOperator.GreaterOrEqual => Compare(stored, criterion, numbers) is >= 0,
             _ => throw new ArgumentOutOfRangeException(nameof(alternative), "The search operator is not a defined member."),
         };
     }
@@ -1303,17 +1514,25 @@ public sealed class FakeDataStore : IDataStore
     private static string Prefix255(string text) =>
         text.Length <= PrefixCompareLength ? text : text[..PrefixCompareLength];
 
-    // The order of two values of comparable kinds, or null when the kinds cannot be compared.
-    private static int? Compare(FieldValue stored, FieldValue criterion)
+    // The order of two values of one comparable kind, or null when the kinds differ, so that no operator matches.
+    // Numbers compare as their column's family stores them, and option indexes, held in integer columns, as integers.
+    private static int? Compare(FieldValue stored, FieldValue criterion, NumericComparison numbers)
     {
         if (stored.TryGetText(out var left) && criterion.TryGetText(out var right))
         {
             return string.Compare(left, right, StringComparison.OrdinalIgnoreCase);
         }
 
-        if (TryGetNumeric(stored, out var leftNumber) && TryGetNumeric(criterion, out var rightNumber))
+        if (stored.TryGetNumber(out var leftNumber) && criterion.TryGetNumber(out var rightNumber))
         {
-            return leftNumber.CompareTo(rightNumber);
+            return numbers == NumericComparison.Binary64
+                ? leftNumber.CompareTo(rightNumber)
+                : CompareExactly(stored, criterion);
+        }
+
+        if (stored.TryGetIndex(out var leftIndex) && criterion.TryGetIndex(out var rightIndex))
+        {
+            return leftIndex.CompareTo(rightIndex);
         }
 
         if (stored.TryGetDate(out var leftDate) && criterion.TryGetDate(out var rightDate))
@@ -1329,101 +1548,44 @@ public sealed class FakeDataStore : IDataStore
         return null;
     }
 
-    // An option index is stored in an integer column, so it compares as a number.
-    private static bool TryGetNumeric(FieldValue value, out double number)
+    // The exact order of two numbers: as integers when both hold one, an integer against the other's double without
+    // rounding either, and as doubles when neither holds an integer.
+    private static int CompareExactly(FieldValue left, FieldValue right)
     {
-        if (value.TryGetNumber(out number))
+        var leftIsInteger = left.TryGetInteger(out var leftInteger);
+        var rightIsInteger = right.TryGetInteger(out var rightInteger);
+        return (leftIsInteger, rightIsInteger) switch
         {
-            return true;
-        }
-
-        if (value.TryGetIndex(out var index))
-        {
-            number = index;
-            return true;
-        }
-
-        number = 0d;
-        return false;
+            (true, true) => leftInteger.CompareTo(rightInteger),
+            (true, false) => CompareWithDouble(leftInteger, right.AsNumber()),
+            (false, true) => -CompareWithDouble(rightInteger, left.AsNumber()),
+            _ => left.AsNumber().CompareTo(right.AsNumber()),
+        };
     }
 
-    // SQL LIKE with no ESCAPE clause: % is any run, _ one character and [...] a character class, matched ignoring
-    // case. The non-backtracking engine keeps patterns with many % linear in the text length.
-    private static bool MatchesLike(string text, string pattern)
+    // The mathematically exact order, -1, 0 or 1, of an integer and a finite double, where converting either to the
+    // other's type could round. -2^63 and 2^63 are exact doubles, and between them the double's floor fits a long.
+    private static int CompareWithDouble(long integer, double number)
     {
-        var regex = new StringBuilder("^");
-        for (var index = 0; index < pattern.Length; index++)
+        if (number >= 9223372036854775808d)
         {
-            var character = pattern[index];
-            switch (character)
-            {
-                case '%':
-                    regex.Append(".*");
-                    break;
-                case '_':
-                    regex.Append('.');
-                    break;
-                case '[' when pattern.IndexOf(']', index + 1) is var close and > 0
-                    && TryAppendCharacterClass(regex, pattern.AsSpan(index + 1, close - index - 1)):
-                    index = close;
-                    break;
-                default:
-                    regex.Append(Regex.Escape(character.ToString()));
-                    break;
-            }
+            return -1;
         }
 
-        regex.Append('$');
-        try
+        if (number < -9223372036854775808d)
         {
-            return Regex.IsMatch(
-                text,
-                regex.ToString(),
-                RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Singleline
-                    | RegexOptions.NonBacktracking);
-        }
-        catch (ArgumentException)
-        {
-            // A class such as [z-a] is no valid range; SQL Server matches no character with it.
-            return false;
-        }
-    }
-
-    // [abc], [a-c] and [^a-c]: a hyphen between two characters is a range, every other character is literal.
-    private static bool TryAppendCharacterClass(StringBuilder regex, ReadOnlySpan<char> content)
-    {
-        var negated = content.Length > 0 && content[0] == '^';
-        var members = negated ? content[1..] : content;
-        if (members.IsEmpty)
-        {
-            return false;
+            return 1;
         }
 
-        regex.Append('[');
-        if (negated)
+        var floor = Math.Floor(number);
+        var whole = (long)floor;
+        if (integer != whole)
         {
-            regex.Append('^');
+            return integer < whole ? -1 : 1;
         }
 
-        for (var index = 0; index < members.Length; index++)
-        {
-            var member = members[index];
-            if (member == '-' && index > 0 && index < members.Length - 1)
-            {
-                regex.Append('-');
-            }
-            else if (member is '\\' or ']' or '[' or '^' or '-')
-            {
-                regex.Append('\\').Append(member);
-            }
-            else
-            {
-                regex.Append(member);
-            }
-        }
-
-        regex.Append(']');
-        return true;
+        // The integer equals the floor, so it is smaller exactly when the double has a fractional part.
+        return floor == number ? 0 : -1;
     }
 
     private FormState Resolve(FormMetadata form) => Resolve(form.ViewId);
@@ -1467,8 +1629,9 @@ public sealed class FakeDataStore : IDataStore
 
         public DataFieldSet DataFields { get; } = FormDefinitionFactory.GetDataFields(form.Metadata);
 
-        // Kept in UniqueKey order: keys only grow, and rows are only appended.
-        public List<StoredRow> Rows { get; } = new();
+        // Kept in UniqueKey order: keys only grow, and rows are only appended. Each write publishes a new list under
+        // the store's lock, so a list a reader has taken never changes.
+        public ImmutableList<StoredRow> Rows { get; private set; } = ImmutableList<StoredRow>.Empty;
 
         public FormPermissions? Permissions { get; set; }
 
@@ -1480,39 +1643,224 @@ public sealed class FakeDataStore : IDataStore
         public IReadOnlyList<StoredRow> Selected(bool includeDeleted) =>
             Rows.Where(row => RecordQueryRules.IsInSelectedSet(row.RecStatus, includeDeleted)).ToArray();
 
-        public StoredRow AddRow(string globalRecordId, int recStatus, IEnumerable<int> presentPageIds)
+        public int NextUniqueKey() => _nextUniqueKey++;
+
+        public void Add(StoredRow row) => Rows = Rows.Add(row);
+
+        // The row is matched by reference, so only the exact row the write read is replaced.
+        public void Replace(StoredRow current, StoredRow updated) =>
+            Rows = Rows.Replace(current, updated, ReferenceEqualityComparer.Instance);
+    }
+
+    // One record, immutable once published: a write replaces the row rather than changing it. Values is keyed ignoring
+    // case and holds every data field; PresentPageIds holds the pages whose page row exists.
+    private sealed record StoredRow(
+        string GlobalRecordId,
+        int UniqueKey,
+        int RecStatus,
+        IReadOnlyDictionary<string, FieldValue> Values,
+        IReadOnlySet<int> PresentPageIds,
+        SaveStamp? FirstSave,
+        SaveStamp? LastSave);
+
+    // How a number condition compares its column: as binary64 doubles for a float column, as SQL float comparison
+    // does, and exactly for an integer column, so adjacent bigint values beyond 2^53 stay distinct.
+    private enum NumericComparison
+    {
+        Exact,
+        Binary64,
+    }
+
+    // Read takes only the condition's own column from a row. Each LIKE pattern is prepared once, when
+    // ResolveConditions builds the condition, rather than once per row.
+    private sealed record ResolvedCondition(
+        SearchCondition Condition,
+        Func<StoredRow, FieldValue> Read,
+        NumericComparison Numbers)
+    {
+        private readonly LikePattern?[] _patterns = [.. Condition.Alternatives.Select(LikePattern.For)];
+
+        public bool Matches(StoredRow row)
         {
-            var row = new StoredRow(globalRecordId, _nextUniqueKey++, recStatus, presentPageIds);
-            Rows.Add(row);
-            return row;
+            var stored = Read(row);
+            for (var index = 0; index < _patterns.Length; index++)
+            {
+                if (Satisfies(Condition.Alternatives[index], _patterns[index], stored, Numbers))
+                {
+                    return true;
+                }
+            }
+
+            return false;
         }
     }
 
-    private sealed class StoredRow(string globalRecordId, int uniqueKey, int recStatus, IEnumerable<int> presentPageIds)
+    // SQL LIKE with no ESCAPE clause, prepared once per alternative: % matches any run of characters, _ any one
+    // character and [...] one character of a class, where a leading ^ negates the class and x-y is a range. Every [
+    // opens a class, which the first ] after it closes or, with no such ], the end of the pattern; inside a class %, _
+    // and [ are members, and outside one a ] is a literal. A class with no member, such as [] or a final [, matches no
+    // character, so the pattern cannot match there; negated, as [^] or a final [^, it matches any one character. The
+    // match must cover the whole text, so a trailing line feed is a character that _ or % has to cover. Each UTF-16
+    // code unit compares ignoring case: a literal by its invariant upper case, a class member by the character or
+    // either of its invariant case forms. That is ordinal case-insensitivity only, with no collation parity, so ranges
+    // and members such as ^ and - follow code-unit order rather than a collation's weights. Matching keeps a single
+    // backtrack point, the last %, so any pattern needs no memory beyond its tokens and at most text length x token
+    // count steps.
+    private sealed class LikePattern
     {
-        public string GlobalRecordId { get; } = globalRecordId;
+        private readonly Token[] _tokens;
 
-        public int UniqueKey { get; } = uniqueKey;
+        private LikePattern(Token[] tokens) => _tokens = tokens;
 
-        public int RecStatus { get; set; } = recStatus;
-
-        public Dictionary<string, FieldValue> Values { get; } = new(StringComparer.OrdinalIgnoreCase);
-
-        public HashSet<int> PresentPageIds { get; } = new(presentPageIds);
-
-        public SaveStamp? FirstSave { get; set; }
-
-        public SaveStamp? LastSave { get; set; }
-    }
-
-    private sealed record ResolvedCondition(
-        SearchCondition Condition,
-        Func<StoredRow, IReadOnlyDictionary<string, FieldValue>, FieldValue> Read)
-    {
-        public bool Matches(StoredRow row, IReadOnlyDictionary<string, FieldValue> values)
+        private enum TokenKind
         {
-            var stored = Read(row, values);
-            return Condition.Alternatives.Any(alternative => Satisfies(alternative, stored));
+            Literal,
+            AnyCharacter,
+            AnyRun,
+            Class,
+        }
+
+        // The prepared pattern of a LIKE alternative, or null for any other operator.
+        public static LikePattern? For(SearchAlternative alternative) =>
+            alternative.Operator == SearchOperator.Like
+            && alternative.Value is { } value
+            && value.TryGetText(out var pattern)
+                ? Parse(pattern)
+                : null;
+
+        public bool IsMatch(string text)
+        {
+            var token = 0;
+            var position = 0;
+
+            // The last % reached, and the text position after the run it has absorbed so far.
+            var run = -1;
+            var resume = 0;
+            while (position < text.Length)
+            {
+                if (token < _tokens.Length && _tokens[token].Kind == TokenKind.AnyRun)
+                {
+                    run = token++;
+                    resume = position;
+                }
+                else if (token < _tokens.Length && _tokens[token].Matches(text[position]))
+                {
+                    token++;
+                    position++;
+                }
+                else if (run >= 0)
+                {
+                    // The last % absorbs one more character, and the tokens after it start again from there.
+                    token = run + 1;
+                    position = ++resume;
+                }
+                else
+                {
+                    return false;
+                }
+            }
+
+            // The whole text is consumed, so only % may remain, each matching an empty run.
+            while (token < _tokens.Length && _tokens[token].Kind == TokenKind.AnyRun)
+            {
+                token++;
+            }
+
+            return token == _tokens.Length;
+        }
+
+        private static LikePattern Parse(string pattern)
+        {
+            var tokens = new List<Token>(pattern.Length);
+            for (var index = 0; index < pattern.Length; index++)
+            {
+                var character = pattern[index];
+                switch (character)
+                {
+                    // Consecutive runs match what one run matches, so they collapse into one.
+                    case '%':
+                        if (tokens.Count == 0 || tokens[^1].Kind != TokenKind.AnyRun)
+                        {
+                            tokens.Add(new Token(TokenKind.AnyRun, default, false, null));
+                        }
+
+                        break;
+
+                    case '_':
+                        tokens.Add(new Token(TokenKind.AnyCharacter, default, false, null));
+                        break;
+
+                    // The first ] after the [ closes the class, or else the end of the pattern does.
+                    case '[':
+                        var close = pattern.IndexOf(']', index + 1);
+                        var end = close >= 0 ? close : pattern.Length;
+                        tokens.Add(ParseClass(pattern.AsSpan(index + 1, end - index - 1)));
+                        index = end;
+                        break;
+
+                    default:
+                        tokens.Add(new Token(TokenKind.Literal, char.ToUpperInvariant(character), false, null));
+                        break;
+                }
+            }
+
+            return new LikePattern([.. tokens]);
+        }
+
+        // [abc], [a-c] and [^a-c]: after an optional leading ^, a hyphen with a member on each side makes a range, and
+        // every other character, %, _ and [ included, is a member.
+        private static Token ParseClass(ReadOnlySpan<char> content)
+        {
+            var negated = content.Length > 0 && content[0] == '^';
+            var members = negated ? content[1..] : content;
+            var ranges = new List<(char Low, char High)>(members.Length);
+            for (var index = 0; index < members.Length; index++)
+            {
+                if (index + 2 < members.Length && members[index + 1] == '-')
+                {
+                    ranges.Add((members[index], members[index + 2]));
+                    index += 2;
+                }
+                else
+                {
+                    ranges.Add((members[index], members[index]));
+                }
+            }
+
+            return new Token(TokenKind.Class, default, negated, [.. ranges]);
+        }
+
+        // One pattern element. Literal is a literal's invariant upper case; Ranges are a class's members, a single
+        // character being the range from itself to itself. A reversed range such as z-a holds no character, as in SQL
+        // Server, while the class's other members still match. A class with no member holds no character, so it
+        // matches none and, negated, matches any one.
+        private readonly record struct Token(TokenKind Kind, char Literal, bool Negated, (char Low, char High)[]? Ranges)
+        {
+            // A run is matched by IsMatch, never one character at a time.
+            public bool Matches(char character) => Kind switch
+            {
+                TokenKind.AnyCharacter => true,
+                TokenKind.Literal => char.ToUpperInvariant(character) == Literal,
+                TokenKind.Class => InClass(character) != Negated,
+                _ => false,
+            };
+
+            private bool InClass(char character)
+            {
+                var upper = char.ToUpperInvariant(character);
+                var lower = char.ToLowerInvariant(character);
+                foreach (var (low, high) in Ranges ?? [])
+                {
+                    if ((character >= low && character <= high)
+                        || (upper >= low && upper <= high)
+                        || (lower >= low && lower <= high))
+                    {
+                        return true;
+                    }
+                }
+
+                return false;
+            }
         }
     }
 }

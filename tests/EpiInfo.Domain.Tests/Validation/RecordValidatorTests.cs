@@ -456,14 +456,49 @@ public sealed class RecordValidatorTests
     }
 
     /// <summary>
-    /// A name the form has no <c>metaFields</c> row for has no canonical spelling, so it is keyed as sent.
+    /// A name the form has no <c>metaFields</c> row for has no canonical spelling, so it is reported under the
+    /// <c>values</c> parameter key with a fixed message: the submitted name reaches neither a key nor a message.
     /// </summary>
     [Fact]
-    public void ValidateInput_UnknownName_IsFieldErrorKeyedAsSubmitted()
+    public void ValidateInput_UnknownName_IsFieldErrorUnderValuesKey()
     {
-        var result = Validate(MirrorValidator(), ("Bogus", FieldValue.FromText("x")));
+        const string submittedName = "SENTINEL-PII-Bogus-4711";
 
-        AssertOnlyFieldError(result, "Bogus", ValidationMessages.UnknownField);
+        var result = Validate(MirrorValidator(), (submittedName, FieldValue.FromText("x")));
+
+        AssertOnlyFieldError(result, RecordValidator.ValuesKey, ValidationMessages.UnknownValuesName);
+        Assert.All(result.FieldErrors.Keys, key => Assert.DoesNotContain("SENTINEL", key, StringComparison.Ordinal));
+        Assert.All(
+            result.FieldErrors.Values.SelectMany(messages => messages),
+            message => Assert.DoesNotContain("SENTINEL", message, StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// The one rule for a name that is not a data field, key and message together: any letter case of a label,
+    /// group, unsupported or system row gives the row's canonical spelling with the not-a-data-field message; a name
+    /// with no row, the empty name included, gives the <c>values</c> parameter key with its own fixed message.
+    /// </summary>
+    [Theory]
+    [InlineData("title1", "Title1", ValidationMessages.UnknownField)]
+    [InlineData("TITLE1", "Title1", ValidationMessages.UnknownField)]
+    [InlineData("namegroup", "NameGroup", ValidationMessages.UnknownField)]
+    [InlineData("NAMEGROUP", "NameGroup", ValidationMessages.UnknownField)]
+    [InlineData("ill", "Ill", ValidationMessages.UnknownField)]
+    [InlineData("recstatus", "RecStatus", ValidationMessages.UnknownField)]
+    [InlineData("UNIQUEKEY", "UniqueKey", ValidationMessages.UnknownField)]
+    [InlineData("GLOBALRECORDID", "GlobalRecordId", ValidationMessages.UnknownField)]
+    [InlineData("globalRecordID", "GlobalRecordId", ValidationMessages.UnknownField)]
+    [InlineData("SENTINEL-PII-Bogus-4711", RecordValidator.ValuesKey, ValidationMessages.UnknownValuesName)]
+    [InlineData("", RecordValidator.ValuesKey, ValidationMessages.UnknownValuesName)]
+    public void NotADataFieldError_SubmittedName_IsCanonicalRowOrValuesKeyWithItsMessage(
+        string submittedName,
+        string expectedKey,
+        string expectedMessage)
+    {
+        var (key, message) = RecordValidator.NotADataFieldError(MirrorForm, submittedName);
+
+        Assert.Equal(expectedKey, key);
+        Assert.Equal(expectedMessage, message);
     }
 
     [Theory]
@@ -1381,11 +1416,11 @@ public sealed class RecordValidatorTests
             ("Bogus", FieldValue.FromText("x")));
 
         AssertFieldFailure(result);
-        Assert.Equal(new[] { "Zip", "Age", "Sex", "Bogus" }, result.FieldErrors.Keys);
+        Assert.Equal(new[] { "Zip", "Age", "Sex", RecordValidator.ValuesKey }, result.FieldErrors.Keys);
         Assert.Equal(new[] { ValidationMessages.FormatMaxLengthExceeded(5) }, result.FieldErrors["Zip"]);
         Assert.Equal(new[] { ValidationMessages.FormatRangeBetween(0d, 120d) }, result.FieldErrors["Age"]);
         Assert.Equal(new[] { ValidationMessages.NotALegalValue }, result.FieldErrors["Sex"]);
-        Assert.Equal(new[] { ValidationMessages.UnknownField }, result.FieldErrors["Bogus"]);
+        Assert.Equal(new[] { ValidationMessages.UnknownValuesName }, result.FieldErrors[RecordValidator.ValuesKey]);
     }
 
     /// <summary>
