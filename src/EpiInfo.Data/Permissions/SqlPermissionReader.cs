@@ -28,6 +28,12 @@ namespace EpiInfo.Data.Permissions;
 /// entry, so it is denied; when no table is confirmed, no permission statement is sent and the result has no entry.
 /// </para>
 /// <para>
+/// Each entry carries the catalogue spelling of its table, and <see cref="FormPermissions.ResolvedTableNames"/> maps
+/// each form table name the catalogue confirmed, as the metadata spells it, to that entry. Lookups are exact, so a
+/// metadata name in another letter case reaches only the table the catalogue confirmed for it, and a name it left
+/// unresolved reaches none.
+/// </para>
+/// <para>
 /// Legacy Epi Info (<c>Epi.Data.SqlServer/SqlDatabase.cs:1804-1935</c>, <c>GetPermissions</c>) first runs one
 /// <c>sys.tables</c> query that computes SELECT on each schema-qualified, <c>QUOTENAME</c>-quoted name as
 /// <c>have_select</c>, and keeps only the table names: that flag decides nothing. It then sends one statement per table
@@ -112,7 +118,9 @@ internal sealed class SqlPermissionReader(
     /// One entry per table that exists in the catalogue, base table first and then the pages in
     /// <c>metaPages.Position</c> order, each named with its catalogue spelling and with a flag set only where
     /// <c>HAS_PERMS_BY_NAME</c> returned 1. A table that is missing, the base table included, has no entry, and two
-    /// names that reach one table give one entry. Never <see langword="null"/>: the nullable return type only mirrors
+    /// names that reach one table give one entry. <see cref="FormPermissions.ResolvedTableNames"/> maps each requested
+    /// name the catalogue confirmed, exactly as the metadata spells it, to its entry's name, so every lookup is exact.
+    /// Never <see langword="null"/>: the nullable return type only mirrors
     /// <see cref="IDataStore.GetPermissionsAsync"/>, where <see langword="null"/> means a store that checks no
     /// permissions.
     /// </returns>
@@ -191,7 +199,19 @@ internal sealed class SqlPermissionReader(
                 permissions[index] = new TablePermission(table.Name, row?.CanInsert == 1, row?.CanUpdate == 1);
             }
 
-            return new FormPermissions(permissions);
+            // Each requested metadata name the catalogue confirmed maps to the entry of the table it reached, so a name
+            // spelled in another letter case finds that entry exactly. A name the catalogue left unresolved, missing or
+            // ambiguous, gets no key and so reaches no entry.
+            var resolvedTableNames = new Dictionary<string, string>(requestedNames.Count, StringComparer.Ordinal);
+            for (int index = 0; index < requestedNames.Count; index++)
+            {
+                if (resolved[index] is { } table)
+                {
+                    resolvedTableNames.TryAdd(requestedNames[index], table.Name);
+                }
+            }
+
+            return new FormPermissions(permissions) { ResolvedTableNames = resolvedTableNames };
         }
     }
 

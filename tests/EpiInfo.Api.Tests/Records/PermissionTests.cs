@@ -78,6 +78,35 @@ public sealed class PermissionTests
         Delete,
     }
 
+    /// <summary>One of the three data tables of the form.</summary>
+    public enum Table
+    {
+        /// <summary>The base table.</summary>
+        Base,
+
+        /// <summary>The first page's table.</summary>
+        FirstPage,
+
+        /// <summary>The second page's table.</summary>
+        SecondPage,
+    }
+
+    /// <summary>
+    /// The entry a <see cref="FormPermissions.ResolvedTableNames"/> case adds for the base table beside the one the map
+    /// leads the base table's name to.
+    /// </summary>
+    public enum Conflict
+    {
+        /// <summary>No further entry.</summary>
+        None,
+
+        /// <summary>An entry spelled exactly as the form's metadata spells the base table.</summary>
+        ExactlySpelledEntry,
+
+        /// <summary>A second entry with the spelling the map leads the base table's name to.</summary>
+        DuplicateEntry,
+    }
+
     /// <summary>
     /// The grants of the base table, the first page table and the second page table, then the <c>canInsert</c>,
     /// <c>canUpdate</c> and <c>canDelete</c> the rule derives from them: INSERT on every table, UPDATE on every table,
@@ -285,6 +314,226 @@ public sealed class PermissionTests
         foreach (var response in new[] { created, updated, deleted })
         {
             Assert.Single(response.Calls, call => call.Method == nameof(IDataStore.GetPermissionsAsync));
+        }
+    }
+
+    /// <summary>
+    /// A table; the grant of its entry spelled exactly as the form's metadata spells it, <see cref="Grant.Missing"/>
+    /// for none; the grant of a second entry spelled in upper case; whether that second entry is listed first; then
+    /// the <c>canInsert</c>, <c>canUpdate</c> and <c>canDelete</c> the rule derives and whether a <c>PUT</c> of the
+    /// second-page field saves on a record lacking its second-page row. The two other tables are fully granted.
+    /// </summary>
+    public static TheoryData<Table, Grant, Grant, bool, bool, bool, bool, bool> OtherLetterCaseCases => new()
+    {
+        // The base table granted exactly and denied in upper case, in either order: every write succeeds.
+        { Table.Base, Grant.Both, Grant.Neither, false, true, true, true, true },
+        { Table.Base, Grant.Both, Grant.Neither, true, true, true, true, true },
+
+        // The base table denied exactly and granted in upper case, in either order: every write is refused.
+        { Table.Base, Grant.Neither, Grant.Both, false, false, false, false, false },
+        { Table.Base, Grant.Neither, Grant.Both, true, false, false, false, false },
+
+        // INSERT granted exactly on the second page and denied in upper case: the PUT inserts the missing row.
+        { Table.SecondPage, Grant.Both, Grant.UpdateOnly, false, true, true, true, true },
+        { Table.SecondPage, Grant.Both, Grant.UpdateOnly, true, true, true, true, true },
+
+        // INSERT denied exactly on the second page and granted in upper case: the PUT is refused after the locked read.
+        { Table.SecondPage, Grant.UpdateOnly, Grant.Both, false, false, true, true, false },
+        { Table.SecondPage, Grant.UpdateOnly, Grant.Both, true, false, true, true, false },
+
+        // Only the upper-case entry: the table itself has no entry, so both permissions on it are denied.
+        { Table.Base, Grant.Missing, Grant.Both, false, false, false, false, false },
+        { Table.FirstPage, Grant.Missing, Grant.Both, false, false, false, true, false },
+        { Table.SecondPage, Grant.Missing, Grant.Both, false, false, false, true, false },
+    };
+
+    // Table names compare ordinally, so an entry spelled in another letter case names another table: whether it is
+    // listed before or after the exactly spelled entry, or is the only entry, it neither grants nor denies anything on
+    // the form's table, and the flags and every write follow the exactly spelled entry alone. That includes the INSERT
+    // the store checks after its locked read for the page whose row is missing.
+    [Theory]
+    [MemberData(nameof(OtherLetterCaseCases))]
+    public async Task AnEntryInAnotherLetterCaseNeitherGrantsNorDenies(
+        Table table,
+        Grant exact,
+        Grant upperCaseEntry,
+        bool upperCaseListedFirst,
+        bool canInsert,
+        bool canUpdate,
+        bool canDelete,
+        bool putSaves)
+    {
+        await using var harness = await Harness.StartAsync();
+        var tables = new List<(string TableName, Grant Grant)>();
+        foreach (var each in new[] { Table.Base, Table.FirstPage, Table.SecondPage })
+        {
+            var name = harness.TableName(each);
+            if (each != table)
+            {
+                tables.Add((name, Grant.Both));
+            }
+            else if (upperCaseListedFirst)
+            {
+                tables.Add((Respelled(name, upperCase: true), upperCaseEntry));
+                tables.Add((name, exact));
+            }
+            else
+            {
+                tables.Add((name, exact));
+                tables.Add((Respelled(name, upperCase: true), upperCaseEntry));
+            }
+        }
+
+        harness.SetPermissions(harness.Permissions([.. tables]));
+
+        await AssertEachWriteFollows(harness, canInsert, canUpdate, canDelete, putSaves);
+    }
+
+    /// <summary>
+    /// The grant of the second page's entry, the entry each case adds for the base table, then the <c>canInsert</c>,
+    /// <c>canUpdate</c> and <c>canDelete</c> the rule derives and whether a <c>PUT</c> of the second-page field saves
+    /// on a record lacking its second-page row.
+    /// </summary>
+    public static TheoryData<Grant, Conflict, bool, bool, bool, bool> ResolvedTableNameCases => new()
+    {
+        // Every entry granted: every write succeeds, including the PUT that inserts the missing second-page row.
+        { Grant.Both, Conflict.None, true, true, true, true },
+
+        // INSERT denied on the second page's entry: POST is refused and the PUT is refused after the locked read.
+        { Grant.UpdateOnly, Conflict.None, false, true, true, false },
+
+        // The base table's name reaches two entries that both grant: they conflict, so every write is refused.
+        { Grant.Both, Conflict.ExactlySpelledEntry, false, false, false, false },
+        { Grant.Both, Conflict.DuplicateEntry, false, false, false, false },
+    };
+
+    // A store whose entries carry another spelling of each table, as the SQL Server store's carry the catalogue's,
+    // maps each form table name to its entry through ResolvedTableNames, which resolves the name to that one entry
+    // before any decision, the missing-page INSERT check after the locked read included. A name the map leads to one
+    // entry while another entry also claims the table decides nothing, so the rule fails closed.
+    [Theory]
+    [MemberData(nameof(ResolvedTableNameCases))]
+    public async Task ResolvedTableNamesLeadEachFormNameToItsEntry(
+        Grant secondPage,
+        Conflict conflict,
+        bool canInsert,
+        bool canUpdate,
+        bool canDelete,
+        bool putSaves)
+    {
+        await using var harness = await Harness.StartAsync();
+        var baseName = harness.Form.BaseTableName;
+        var baseEntry = Respelled(baseName, upperCase: true);
+        var firstEntry = Respelled(harness.FirstPage.TableName, upperCase: false);
+        var secondEntry = Respelled(harness.SecondPage.TableName, upperCase: false);
+
+        var tables = new List<(string TableName, Grant Grant)>
+        {
+            (baseEntry, Grant.Both),
+            (firstEntry, Grant.Both),
+            (secondEntry, secondPage),
+        };
+        switch (conflict)
+        {
+            case Conflict.None:
+                break;
+
+            case Conflict.ExactlySpelledEntry:
+                tables.Add((baseName, Grant.Both));
+                break;
+
+            case Conflict.DuplicateEntry:
+                tables.Add((baseEntry, Grant.Both));
+                break;
+
+            default:
+                throw new ArgumentOutOfRangeException(nameof(conflict));
+        }
+
+        harness.SetPermissions(harness.Permissions([.. tables]) with
+        {
+            ResolvedTableNames = new Dictionary<string, string>
+            {
+                [baseName] = baseEntry,
+                [harness.FirstPage.TableName] = firstEntry,
+                [harness.SecondPage.TableName] = secondEntry,
+            },
+        });
+
+        await AssertEachWriteFollows(harness, canInsert, canUpdate, canDelete, putSaves);
+    }
+
+    // The name in upper or lower case, which must differ from it ordinally, so an entry under it is spelled
+    // differently from the form's own table name.
+    private static string Respelled(string name, bool upperCase)
+    {
+        var respelled = upperCase ? name.ToUpperInvariant() : name.ToLowerInvariant();
+        Assert.NotEqual(name, respelled, StringComparer.Ordinal);
+        return respelled;
+    }
+
+    // With the permissions already set: the form-definition flags, then a POST, a PUT of the second-page field on a
+    // record lacking its second-page row, and a DELETE, each committed when allowed and otherwise its 403 with
+    // nothing written. A PUT the flags allow can still be refused by the store after its locked read, when the missing
+    // page's INSERT is denied; one the flags deny never reaches the store's update.
+    private static async Task AssertEachWriteFollows(
+        Harness harness,
+        bool canInsert,
+        bool canUpdate,
+        bool canDelete,
+        bool putSaves)
+    {
+        var lacking = harness.SeedRecord(harness.SecondPage);
+        var doomed = harness.SeedRecord();
+
+        AssertFlags(await harness.GetDefinitionAsync(), canInsert, canUpdate, canDelete);
+
+        var recordsBefore = harness.RecordCount;
+        var created = await harness.PostAsync(FirstPageField, "Created");
+        if (canInsert)
+        {
+            AssertCreated(harness, created, FirstPageField, "Created", recordsBefore);
+        }
+        else
+        {
+            AssertForbidden(created, ApiProblems.ForbiddenInsertDetail);
+            Assert.Equal(recordsBefore, harness.RecordCount);
+        }
+
+        var beforeUpdate = harness.Snapshot(lacking);
+        Assert.DoesNotContain(harness.SecondPage.PageId, beforeUpdate.PresentPageIds);
+        var updated = await harness.PutAsync(lacking, SecondPageField, "Updated");
+        if (putSaves)
+        {
+            AssertUpdated(harness, updated, lacking, SecondPageField, "Updated");
+            Assert.Contains(harness.SecondPage.PageId, harness.Snapshot(lacking).PresentPageIds);
+        }
+        else
+        {
+            AssertForbidden(updated, ApiProblems.ForbiddenUpdateDetail);
+            if (canUpdate)
+            {
+                Assert.Contains(new FakeStoreCall(nameof(IDataStore.UpdateAsync), IsWrite: false), updated.Calls);
+            }
+            else
+            {
+                Assert.DoesNotContain(updated.Calls, call => call.Method == nameof(IDataStore.UpdateAsync));
+            }
+
+            AssertUnchanged(beforeUpdate, harness.Snapshot(lacking));
+        }
+
+        var beforeDelete = harness.Snapshot(doomed);
+        var deleted = await harness.DeleteAsync(doomed);
+        if (canDelete)
+        {
+            AssertDeleted(harness, deleted, doomed);
+        }
+        else
+        {
+            AssertForbidden(deleted, ApiProblems.ForbiddenDeleteDetail);
+            Assert.DoesNotContain(deleted.Calls, call => call.Method == nameof(IDataStore.SoftDeleteAsync));
+            AssertUnchanged(beforeDelete, harness.Snapshot(doomed));
         }
     }
 
@@ -522,13 +771,29 @@ public sealed class PermissionTests
             return page;
         }
 
+        public string TableName(Table table) => table switch
+        {
+            Table.Base => Form.BaseTableName,
+            Table.FirstPage => FirstPage.TableName,
+            Table.SecondPage => SecondPage.TableName,
+            _ => throw new ArgumentOutOfRangeException(nameof(table)),
+        };
+
         // Builds the per-table entries from the form's own table names, leaving out each table granted Missing.
-        public FormPermissions Permissions(Grant baseTable, Grant firstPage, Grant secondPage)
+        public FormPermissions Permissions(Grant baseTable, Grant firstPage, Grant secondPage) => Permissions(
+            (Form.BaseTableName, baseTable),
+            (FirstPage.TableName, firstPage),
+            (SecondPage.TableName, secondPage));
+
+        // Builds one entry per listed name, in the order listed, leaving out each name granted Missing.
+        public FormPermissions Permissions(params (string TableName, Grant Grant)[] tables)
         {
             var entries = new List<TablePermission>();
-            AddEntry(entries, Form.BaseTableName, baseTable);
-            AddEntry(entries, FirstPage.TableName, firstPage);
-            AddEntry(entries, SecondPage.TableName, secondPage);
+            foreach (var (tableName, grant) in tables)
+            {
+                AddEntry(entries, tableName, grant);
+            }
+
             return new FormPermissions(entries);
         }
 

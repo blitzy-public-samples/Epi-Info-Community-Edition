@@ -53,6 +53,9 @@ public sealed class SqlPermissionReaderTests : IAsyncLifetime
 
         Assert.NotNull(permissions);
         Assert.Equal(expectedTables, permissions.Tables.Select(table => table.TableName));
+        Assert.Equal(
+            expectedTables.Select(table => (table, table)).OrderBy(pair => pair.Item1, StringComparer.Ordinal),
+            Pairs(permissions.ResolvedTableNames));
 
         await using SqlConnection connection = await TestDatabase.OpenConnectionAsync();
         foreach (TablePermission table in permissions.Tables)
@@ -234,7 +237,9 @@ public sealed class SqlPermissionReaderTests : IAsyncLifetime
         Assert.DoesNotContain(PermissionFunction, catalogue.CommandText, StringComparison.OrdinalIgnoreCase);
     }
 
-    // Seeded metadata can spell a table differently from the catalogue, so each entry carries the catalogue spelling.
+    // Seeded metadata can spell a table differently from the catalogue, so each entry carries the catalogue spelling,
+    // and the result maps each requested spelling to it. Lookups are exact: a spelling that was neither requested nor
+    // the catalogue's reaches no entry.
     [Theory]
     [MemberData(nameof(SeededForms))]
     public async Task NamesInAnotherLetterCase_ComeBackInTheCatalogueSpelling(
@@ -258,7 +263,35 @@ public sealed class SqlPermissionReaderTests : IAsyncLifetime
         Assert.True(permissions.CanInsert(form));
         Assert.True(permissions.CanUpdate(form));
         Assert.True(permissions.CanDelete(form));
+        Assert.All(form.Pages, page => Assert.True(permissions.CanInsertInto(page.TableName), page.TableName));
+
+        // The requested names are the base table in upper case and the pages in lower case, in page order.
+        string[] requested =
+        [
+            form.BaseTableName,
+            .. form.Pages.OrderBy(page => page.Position).Select(page => page.TableName),
+        ];
+        Assert.Equal(
+            requested.Zip(expectedTables).OrderBy(pair => pair.First, StringComparer.Ordinal),
+            Pairs(permissions.ResolvedTableNames));
+
+        string[] unrequested =
+        [
+            seeded.BaseTableName.ToLowerInvariant(),
+            .. seeded.Pages.Select(page => page.TableName.ToUpperInvariant()),
+        ];
+        Assert.All(unrequested, name =>
+        {
+            Assert.DoesNotContain(name, requested, StringComparer.Ordinal);
+            Assert.DoesNotContain(name, expectedTables, StringComparer.Ordinal);
+            Assert.Null(permissions.Find(name));
+            Assert.False(permissions.CanInsertInto(name), name);
+        });
     }
+
+    // The map's pairs in ordinal key order, so two maps compare regardless of insertion order.
+    private static IEnumerable<(string Key, string Value)> Pairs(IReadOnlyDictionary<string, string> map) =>
+        map.OrderBy(pair => pair.Key, StringComparer.Ordinal).Select(pair => (pair.Key, pair.Value));
 
     // The reader under test reports its catalogue read and its permission statement to the observer.
     private static SqlPermissionReader CreateReader(ISqlCommandObserver observer)

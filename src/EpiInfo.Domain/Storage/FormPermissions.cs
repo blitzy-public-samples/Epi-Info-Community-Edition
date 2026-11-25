@@ -1,3 +1,4 @@
+using System.Collections.ObjectModel;
 using EpiInfo.Domain.Metadata;
 
 namespace EpiInfo.Domain.Storage;
@@ -7,8 +8,9 @@ namespace EpiInfo.Domain.Storage;
 /// reads them with <c>HAS_PERMS_BY_NAME(&lt;table&gt;, 'OBJECT', 'INSERT')</c> and <c>'UPDATE'</c>.
 /// </summary>
 /// <param name="TableName">
-/// The metadata-derived table name exactly as <see cref="FormMetadata.BaseTableName"/> or
-/// <see cref="PageMetadata.TableName"/> gives it; never <see langword="null"/>, empty or whitespace.
+/// The name of the table the entry describes; the SQL Server store writes the catalogue spelling of the table it
+/// confirmed. Lookups match it ordinally, so entries whose names differ only by letter case describe different
+/// tables. Never <see langword="null"/>, empty or whitespace.
 /// </param>
 /// <param name="CanInsert">Whether the login may insert rows into the table.</param>
 /// <param name="CanUpdate">Whether the login may update rows of the table.</param>
@@ -59,9 +61,17 @@ public sealed record TablePermission(string TableName, bool CanInsert, bool CanU
 /// <item><description>A denied write is a 403 and nothing is written.</description></item>
 /// </list>
 /// <para>
-/// Every derivation fails closed: a table with no entry denies, so an incomplete reader result can never grant
-/// a write. The methods are pure and perform no I/O. The instance is immutable, so it can be shared across
-/// threads.
+/// Table names compare ordinally, never ignoring case. A form's table name, as <see cref="FormMetadata.BaseTableName"/>
+/// or <see cref="PageMetadata.TableName"/> spells it, reaches an entry only when the entry carries exactly that name,
+/// or through <see cref="ResolvedTableNames"/>, where the store records the entry of the table it confirmed for that
+/// name. A decision is therefore made only for the table the entry describes, and a spelling the store did not
+/// confirm reaches no entry.
+/// </para>
+/// <para>
+/// Every derivation fails closed: a table with no entry denies, and so does a name that reaches two entries or one
+/// that <see cref="ResolvedTableNames"/> maps away from an entry carrying that very name, so an incomplete or
+/// conflicting result can never grant a write. The methods are pure and perform no I/O. The instance is immutable,
+/// so it can be shared across threads.
 /// </para>
 /// </remarks>
 /// <param name="Tables">
@@ -71,6 +81,9 @@ public sealed record TablePermission(string TableName, bool CanInsert, bool CanU
 public sealed record FormPermissions(IReadOnlyList<TablePermission> Tables)
 {
     private readonly IReadOnlyList<TablePermission> tables = ValidateTables(Tables);
+
+    private readonly IReadOnlyDictionary<string, string> resolvedTableNames =
+        ReadOnlyDictionary<string, string>.Empty;
 
     /// <summary>The per-table entries, in the order the reader supplied them.</summary>
     /// <exception cref="ArgumentNullException">The value is <see langword="null"/>.</exception>
@@ -83,30 +96,86 @@ public sealed record FormPermissions(IReadOnlyList<TablePermission> Tables)
     }
 
     /// <summary>
-    /// Finds the entry for <paramref name="tableName"/>, ignoring case, so <c>foodhistory3</c> resolves to the
-    /// entry <c>FoodHistory3</c>.
+    /// For each form table name the store was asked about, spelled exactly as <see cref="FormMetadata.BaseTableName"/>
+    /// or <see cref="PageMetadata.TableName"/> gives it, the <see cref="TablePermission.TableName"/> of the entry for
+    /// the table the store confirmed for that name. Empty by default, so every name then has to match an entry
+    /// exactly. Keys compare ordinally; a name the store could not confirm, because the table is missing or the name
+    /// is ambiguous, has no key.
     /// </summary>
-    /// <param name="tableName">A base or page table name.</param>
-    /// <returns>The first matching entry, or <see langword="null"/> when there is none.</returns>
+    /// <remarks>
+    /// The SQL Server store names each entry with the catalogue spelling of the table it confirmed, which can differ
+    /// in letter case from the metadata name the form uses; this map is how that metadata name reaches the entry.
+    /// The pairs are copied, so later changes to the supplied dictionary cannot change a decision.
+    /// </remarks>
+    /// <exception cref="ArgumentNullException">The value is <see langword="null"/>.</exception>
+    /// <exception cref="ArgumentException">
+    /// A key or value is <see langword="null"/>, empty or whitespace, or two keys are the same name.
+    /// </exception>
+    public IReadOnlyDictionary<string, string> ResolvedTableNames
+    {
+        get => resolvedTableNames;
+        // Validated here, so neither an object initializer nor a `with` expression can bypass the rule.
+        init => resolvedTableNames = ValidateResolvedTableNames(value);
+    }
+
+    /// <summary>
+    /// Finds the one entry for <paramref name="tableName"/> by exact identity: the name
+    /// <see cref="ResolvedTableNames"/> maps it to, or else the name itself, compared ordinally with each entry's
+    /// <see cref="TablePermission.TableName"/>. Letter case is never ignored, so a spelling the store did not confirm
+    /// finds nothing.
+    /// </summary>
+    /// <param name="tableName">
+    /// A base or page table name, exactly as <see cref="FormMetadata.BaseTableName"/> or
+    /// <see cref="PageMetadata.TableName"/> gives it.
+    /// </param>
+    /// <returns>
+    /// The single matching entry; or <see langword="null"/> when <paramref name="tableName"/> is
+    /// <see langword="null"/>, when no entry matches, when several do, or when <see cref="ResolvedTableNames"/> maps
+    /// the name to another entry while an entry carries the name itself. Each <see langword="null"/> denies.
+    /// </returns>
     public TablePermission? Find(string tableName)
     {
+        if (tableName is null)
+        {
+            return null;
+        }
+
+        string identity = resolvedTableNames.TryGetValue(tableName, out string? resolved) ? resolved : tableName;
+        bool remapped = !string.Equals(identity, tableName, StringComparison.Ordinal);
+
+        TablePermission? match = null;
         foreach (TablePermission table in tables)
         {
-            if (string.Equals(table.TableName, tableName, StringComparison.OrdinalIgnoreCase))
+            // An entry that carries the name itself while the store resolved that name to another table: the two
+            // disagree about which table the name means, so neither decides.
+            if (remapped && string.Equals(table.TableName, tableName, StringComparison.Ordinal))
             {
-                return table;
+                return null;
+            }
+
+            if (string.Equals(table.TableName, identity, StringComparison.Ordinal))
+            {
+                // Two entries for one table conflict, so neither decides.
+                if (match is not null)
+                {
+                    return null;
+                }
+
+                match = table;
             }
         }
 
-        return null;
+        return match;
     }
 
     /// <summary>
     /// Whether the login may insert a row into <paramref name="tableName"/>. The store checks it inside an update
     /// for each page whose row the locked read found missing, before any statement that changes data.
     /// </summary>
-    /// <param name="tableName">A page table name.</param>
-    /// <returns><see langword="true"/> only when the table has an entry that allows INSERT.</returns>
+    /// <param name="tableName">
+    /// A page table name, exactly as <see cref="PageMetadata.TableName"/> gives it; <see cref="Find"/> resolves it.
+    /// </param>
+    /// <returns><see langword="true"/> only when <see cref="Find"/> returns an entry that allows INSERT.</returns>
     public bool CanInsertInto(string tableName) => Find(tableName)?.CanInsert == true;
 
     /// <summary>
@@ -169,7 +238,7 @@ public sealed record FormPermissions(IReadOnlyList<TablePermission> Tables)
         return true;
     }
 
-    // A table with no entry denies, so the rule fails closed.
+    // A table with no entry, or with conflicting entries, denies, so the rule fails closed.
     private bool Allows(string tableName, Func<TablePermission, bool> allows) =>
         Find(tableName) is { } table && allows(table);
 
@@ -185,5 +254,32 @@ public sealed record FormPermissions(IReadOnlyList<TablePermission> Tables)
         }
 
         return Array.AsReadOnly(copy);
+    }
+
+    // Copies the pairs into an ordinal dictionary. Exception messages are fixed text and never echo a name.
+    private static IReadOnlyDictionary<string, string> ValidateResolvedTableNames(
+        IReadOnlyDictionary<string, string> value)
+    {
+        ArgumentNullException.ThrowIfNull(value, nameof(ResolvedTableNames));
+
+        var copy = new Dictionary<string, string>(value.Count, StringComparer.Ordinal);
+        foreach (KeyValuePair<string, string> pair in value)
+        {
+            if (string.IsNullOrWhiteSpace(pair.Key) || string.IsNullOrWhiteSpace(pair.Value))
+            {
+                throw new ArgumentException(
+                    "A resolved table name is null, empty or whitespace.",
+                    nameof(ResolvedTableNames));
+            }
+
+            if (!copy.TryAdd(pair.Key, pair.Value))
+            {
+                throw new ArgumentException(
+                    "Two resolved table names have the same key.",
+                    nameof(ResolvedTableNames));
+            }
+        }
+
+        return new ReadOnlyDictionary<string, string>(copy);
     }
 }
