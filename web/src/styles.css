@@ -18,8 +18,12 @@
  *   Utilities    .visually-hidden
  *
  * State comes from native attributes (disabled, aria-selected, aria-current,
- * aria-invalid, aria-disabled, hidden), never from rules that hide controls:
- * Testing Library and Playwright must always find every control.
+ * aria-invalid, aria-disabled, hidden), and no rule hides a control because
+ * of its state: disabled and protected controls stay rendered and queryable.
+ * Inactive tab panels stay mounted but carry the native hidden attribute,
+ * which the [hidden] utility keeps at display: none, so Testing Library and
+ * Playwright omit their controls from default role and visibility queries
+ * until their tab is selected.
  *
  * Cascade layers order the rules: element defaults (base) < component
  * classes (components) < single-purpose helpers (utilities). A later layer
@@ -34,7 +38,9 @@
 
 /* Contrast against the background each colour is used on (WCAG AA):
  * text 15.8:1, muted text 6.0:1 or more, accent 5.2:1, danger 6.1:1 or more,
- * banner texts 9.1:1 or more, control borders 4.3:1 or more (3:1 needed). */
+ * banner texts 9.1:1 or more, control borders 4.3:1 or more (3:1 needed),
+ * hover borders 8.4:1 or more, text on the pressed surface 11.6:1, text
+ * 11.6:1 and muted text 4.6:1 on the pressed row tint. */
 :root {
   color-scheme: light;
 
@@ -48,13 +54,16 @@
   --color-page: #ffffff;
   --color-surface-muted: #f6f8fa;
   --color-surface-hover: #eaeef2;
+  --color-surface-active: #d8dee4;
   --color-surface-disabled: #eaeef2;
   --color-border: #d0d7de;
   --color-border-strong: #6e7781;
+  --color-border-hover: #424a53;
 
   --color-accent: #0969da;
   --color-accent-strong: #0550ae;
   --color-accent-subtle: #ddf4ff;
+  --color-accent-muted: #b6e3ff;
   --color-focus: #0969da;
 
   --color-danger: #b3261e;
@@ -89,6 +98,8 @@
 
   /* 44px minimum pointer target for buttons, tabs and inputs. */
   --target-size: 2.75rem;
+  /* Checkbox and radio box; option-group radio tracks use the same size. */
+  --choice-size: 1.25rem;
   --control-max-inline-size: 40rem;
   --content-max-inline-size: 72rem;
 
@@ -198,8 +209,8 @@
   input[type="checkbox"],
   input[type="radio"] {
     flex: none;
-    inline-size: 1.25rem;
-    block-size: 1.25rem;
+    inline-size: var(--choice-size);
+    block-size: var(--choice-size);
     margin: 0;
     accent-color: var(--color-accent);
     cursor: pointer;
@@ -285,9 +296,26 @@
   }
 
   @media (hover: hover) {
-    button:hover:not(:disabled) {
+    button:hover:not(:disabled):not([aria-disabled="true"]) {
       background-color: var(--color-surface-hover);
     }
+
+    /* Enabled text-like controls darken their border under the pointer.
+     * :where() keeps these selectors at zero specificity, so the invalid and
+     * disabled colours above still win. The focus ring is an outline and is
+     * left as it is. */
+    :where(input:not([type="checkbox"]):not([type="radio"]):hover:not(:disabled):not([aria-disabled="true"])),
+    :where(select:hover:not(:disabled):not([aria-disabled="true"])),
+    :where(textarea:hover:not(:disabled):not([aria-disabled="true"])) {
+      --control-border-color: var(--color-border-hover);
+    }
+  }
+
+  /* Pressed: a darker surface than hover. It answers pointer, touch and the
+   * Space key alike, so it sits outside the hover query, and it follows the
+   * hover rule at equal weight, so it wins while both apply. */
+  button:active:not(:disabled):not([aria-disabled="true"]) {
+    background-color: var(--color-surface-active);
   }
 
   @media (prefers-reduced-motion: no-preference) {
@@ -421,9 +449,15 @@
   }
 
   @media (hover: hover) {
-    .page-tabs [role="tab"]:hover:not([aria-selected="true"]) {
+    .page-tabs [role="tab"]:hover:not([aria-selected="true"]):not(:disabled):not([aria-disabled="true"]) {
       background-color: var(--color-surface-hover);
     }
+  }
+
+  /* The tab background is set in this layer, so the base pressed rule does
+   * not reach it. */
+  .page-tabs [role="tab"]:active:not([aria-selected="true"]):not(:disabled):not([aria-disabled="true"]) {
+    background-color: var(--color-surface-active);
   }
 
   /* Fields: one per row in tabIndex order. Each child of .field takes a full
@@ -455,12 +489,20 @@
     flex: 1 1 0;
   }
 
-  /* Option group: radios and their labels wrap in a row under the legend.
-   * The label's end padding separates one option from the next and widens
-   * its click target. */
+  /* Option group: radio-label pairs in equal columns under the legend. The
+   * columns repeat in pairs, a radio track then a label track, and
+   * auto-placement fills them in source order. The layout relies on
+   * OptionGroup rendering each radio immediately followed by its own label:
+   * every radio then lands in a radio track with its label beside it on the
+   * same row, and pairs wrap only as whole pairs. The label track's minimum
+   * is capped at the width left beside the radio, so a narrow screen still
+   * fits one pair per row. The rendered legend is not a grid item. */
   .field > fieldset {
-    display: flex;
-    flex-wrap: wrap;
+    display: grid;
+    grid-template-columns: repeat(
+      auto-fill,
+      var(--choice-size) minmax(min(8rem, 100% - var(--choice-size) - var(--space-2)), 1fr)
+    );
     align-items: center;
     gap: var(--space-1) var(--space-2);
   }
@@ -469,13 +511,23 @@
     margin-block-end: var(--space-1);
   }
 
+  /* The label gives the pair its 44px row and clicks through to the radio.
+   * Its end padding keeps a long label off the next pair, and a word wider
+   * than its column breaks rather than overflowing the fieldset. */
   .field > fieldset > input[type="radio"] + label {
     display: inline-flex;
     align-items: center;
     min-block-size: var(--target-size);
     padding-inline-end: var(--space-3);
     font-weight: 400;
+    overflow-wrap: anywhere;
     cursor: pointer;
+  }
+
+  /* A disabled fieldset disables its radios; their labels then click
+   * through to nothing, so they show the disabled cursor as the radios do. */
+  .field > fieldset > input[type="radio"]:disabled + label {
+    cursor: not-allowed;
   }
 
   /* Read-only metadata, a deleted record, or an unsupported field. */
@@ -485,9 +537,14 @@
     background-color: var(--color-surface-muted);
   }
 
-  /* Disabled by check code only. Inactive controls are exempt from the
-   * WCAG contrast minimum (1.4.3). */
-  .field--disabled {
+  /* Disabled by check code only: the native disabled controls fade, radios
+   * in a disabled fieldset included, as inactive controls are exempt from
+   * the WCAG contrast minimum (1.4.3). The label, legend, hint and error
+   * messages are separate text the exemption does not cover, so the wrapper
+   * itself is not faded and they keep full contrast. */
+  .field--disabled input:disabled,
+  .field--disabled select:disabled,
+  .field--disabled textarea:disabled {
     opacity: 0.6;
   }
 
@@ -495,7 +552,7 @@
     display: flex;
     flex-direction: column;
     gap: var(--space-1);
-    color: var(--color-danger);
+    color: var(--color-danger-text);
     font-size: var(--font-size-small);
     font-weight: 600;
   }
@@ -579,11 +636,24 @@
     cursor: pointer;
   }
 
-  .record-grid tbody tr {
+  /* A label around a disabled control is not a click target. */
+  .record-grid label:has(:disabled) {
+    cursor: not-allowed;
+  }
+
+  /* Rows of the record grid and of the find results open a record on click
+   * and share one stripe, one hover tint and one pressed tint. The stripe
+   * rule precedes the open-record tint below, so at equal selector weight
+   * the open record's tint beats the stripe. The hover rule follows both and
+   * outweighs them, and the pressed rule follows hover at its weight, so a
+   * pressed row shows the pressed tint over all three. */
+  .record-grid tbody tr,
+  .find-dialog tbody tr {
     cursor: pointer;
   }
 
-  .record-grid tbody tr:nth-child(even) {
+  .record-grid tbody tr:nth-child(even),
+  .find-dialog tbody tr:nth-child(even) {
     background-color: var(--color-surface-muted);
   }
 
@@ -625,9 +695,17 @@
   }
 
   @media (hover: hover) {
-    .record-grid tbody tr:hover {
+    .record-grid tbody tr:hover:not([aria-disabled="true"]),
+    .find-dialog tbody tr:hover:not([aria-disabled="true"]) {
       background-color: var(--color-accent-subtle);
     }
+  }
+
+  /* Pressed: a deeper accent tint than hover. Pointer and touch presses
+   * both set it, so it sits outside the hover query. */
+  .record-grid tbody tr:active:not([aria-disabled="true"]),
+  .find-dialog tbody tr:active:not([aria-disabled="true"]) {
+    background-color: var(--color-accent-muted);
   }
 
   /* Banners: message text grows, action buttons (Retry, Discard edits,
@@ -709,10 +787,17 @@
   }
 
   @media (hover: hover) {
-    .validation-summary li button:hover:not(:disabled) {
+    .validation-summary li button:hover:not(:disabled):not([aria-disabled="true"]) {
       background-color: transparent;
       text-decoration-thickness: 2px;
     }
+  }
+
+  /* Pressed: the link keeps its transparent background, which this layer
+   * sets over the base pressed surface, and thickens its underline beyond
+   * the hover state instead. */
+  .validation-summary li button:active:not(:disabled):not([aria-disabled="true"]) {
+    text-decoration-thickness: 3px;
   }
 
   /* Modal dialogs: plain elements with role="dialog" and aria-modal="true"
@@ -778,19 +863,42 @@
     padding-inline: var(--space-1);
   }
 
+  /* As many columns as fit. A column is never wider than the picker, so on a
+   * narrow screen or with enlarged text the picker keeps one full-width
+   * column instead of scrolling sideways. Fields top-align, so the names in
+   * one row line up whatever the length of their descriptions. */
   .find-dialog__fields {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(12rem, 1fr));
+    grid-template-columns: repeat(auto-fill, minmax(min(100%, 12rem), 1fr));
+    align-items: start;
     gap: var(--space-1) var(--space-4);
   }
 
-  /* One child per searchable field: its checkbox, label and description. */
+  /* One child per searchable field (the legend is not one): its checkbox,
+   * then its name with the description under it. The text column shrinks
+   * with the picker and breaks a long field name, so the checkbox stays
+   * beside its name and no field overflows the picker. */
   .find-dialog fieldset label,
-  .find-dialog__fields > * {
-    display: inline-flex;
-    align-items: center;
-    gap: var(--space-2);
+  .find-dialog__fields > :not(legend) {
+    display: inline-grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    align-items: start;
+    align-content: center;
+    column-gap: var(--space-2);
     min-block-size: var(--target-size);
+    overflow-wrap: anywhere;
+  }
+
+  .find-dialog fieldset label > :not(input),
+  .find-dialog__fields > :not(legend) > :not(input) {
+    grid-column: 2;
+  }
+
+  /* Centres the checkbox (a --choice-size square) on the first line of its
+   * name, also when a long name breaks onto more lines. */
+  .find-dialog fieldset label > input,
+  .find-dialog__fields > :not(legend) > input {
+    margin-block-start: calc((1lh - var(--choice-size)) / 2);
   }
 
   /* One row per checked field: label, value box, hint, Remove button. */
@@ -821,20 +929,6 @@
     padding: var(--focus-ring-room);
     overflow-x: auto;
     scroll-padding-inline: var(--focus-ring-room);
-  }
-
-  .find-dialog tbody tr {
-    cursor: pointer;
-  }
-
-  .find-dialog tbody tr:nth-child(even) {
-    background-color: var(--color-surface-muted);
-  }
-
-  @media (hover: hover) {
-    .find-dialog tbody tr:hover {
-      background-color: var(--color-accent-subtle);
-    }
   }
 
   @media (prefers-reduced-motion: no-preference) {
