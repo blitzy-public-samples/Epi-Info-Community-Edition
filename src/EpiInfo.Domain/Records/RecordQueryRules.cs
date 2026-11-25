@@ -387,13 +387,16 @@ public static class RecordQueryRules
     /// <summary>
     /// Creates an empty <c>values</c> map. Every producer of a record's or a DTO's values uses it, so each map
     /// keeps its entries in insertion order, which producers make data-field order (page <c>Position</c>, then
-    /// <c>TabIndex</c>), and finds a key whatever its letter case. Keys are the canonical <c>metaFields.Name</c>.
+    /// <c>TabIndex</c>). Keys are the canonical <c>metaFields.Name</c>, compared ordinally, so two data fields whose
+    /// names differ only by letter case keep one entry each.
     /// </summary>
     /// <param name="capacity">The number of entries to reserve room for; 0 or more.</param>
-    /// <returns>An empty, insertion-ordered map whose keys compare ordinally, ignoring case.</returns>
+    /// <returns>
+    /// An empty, insertion-ordered map whose keys are canonical names compared ordinally, letter case included.
+    /// </returns>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="capacity"/> is negative.</exception>
     public static OrderedDictionary<string, FieldValue> CreateValuesMap(int capacity = 0) =>
-        new(capacity, StringComparer.OrdinalIgnoreCase);
+        new(capacity, StringComparer.Ordinal);
 
     /// <summary>
     /// Projects a record's values onto <paramref name="columns"/>, for the grid-only values of a record summary
@@ -423,8 +426,9 @@ public static class RecordQueryRules
                 throw new ArgumentException("A column must not be null.", nameof(columns));
             }
 
-            // Keys ignore case, so two columns whose names differ only by case share one entry; the first in column
-            // order keeps it, as DataFieldSet resolves such names to the first in storage order.
+            // Keys compare ordinally, so two columns whose names differ only by case keep an entry and a value each.
+            // Only an exact repeat of a name shares one entry; the first in column order keeps it, as DataFieldSet
+            // resolves an exactly repeated name to the first in storage order.
             projected.TryAdd(column.Name, values.TryGetValue(column.Name, out var value) ? value : FieldValue.Null);
         }
 

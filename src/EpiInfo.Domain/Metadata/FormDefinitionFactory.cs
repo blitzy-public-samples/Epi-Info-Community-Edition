@@ -32,22 +32,59 @@ public sealed record DataFieldMetadata(FieldMetadata Field, FieldType FieldType,
 /// <see cref="FormDefinitionFactory.GetDataFields"/>.
 /// </summary>
 /// <remarks>
-/// The set is immutable after construction, so one instance can be read from any number of threads. Name lookups
-/// ignore case and return the canonical entry, so <c>age</c> in a request resolves to <c>Age</c>.
+/// <para>
+/// The set is immutable after construction, so one instance can be read from any number of threads.
+/// </para>
+/// <para>
+/// A data field's identity is its exact canonical <c>metaFields.Name</c>: two fields whose names differ only by
+/// letter case, on different pages for example, are distinct fields with distinct <c>values</c> keys. Every name
+/// lookup follows one rule:
+/// </para>
+/// <list type="number">
+/// <item><description>
+/// A name spelled exactly as a canonical name resolves to the first field in storage order so spelled.
+/// </description></item>
+/// <item><description>
+/// Otherwise, when exactly one distinct canonical spelling equals the name ignoring case, the name resolves to the
+/// first field so spelled, so <c>age</c> in a request resolves to <c>Age</c>. Fields that repeat one spelling
+/// exactly count as that one name.
+/// </description></item>
+/// <item><description>
+/// Otherwise, when two or more distinct canonical spellings equal the name ignoring case, as <c>Age</c> and
+/// <c>AGE</c> both equal <c>age</c>, the name is ambiguous and resolves to no field, because nothing in it says
+/// which field is meant. <see cref="IsAmbiguous"/> tells such a name apart from one the form does not have.
+/// </description></item>
+/// </list>
 /// </remarks>
 public sealed class DataFieldSet : IReadOnlyList<DataFieldMetadata>
 {
     private readonly DataFieldMetadata[] _fields;
-    private readonly Dictionary<string, DataFieldMetadata> _byName;
+    private readonly Dictionary<string, DataFieldMetadata> _byExactName;
+    private readonly Dictionary<string, DataFieldMetadata> _byUnambiguousName;
+    private readonly HashSet<string> _ambiguousNames;
 
     internal DataFieldSet(IEnumerable<DataFieldMetadata> orderedFields)
     {
         _fields = orderedFields.ToArray();
-        _byName = new Dictionary<string, DataFieldMetadata>(_fields.Length, StringComparer.OrdinalIgnoreCase);
+        _byExactName = new Dictionary<string, DataFieldMetadata>(_fields.Length, StringComparer.Ordinal);
+        _byUnambiguousName =
+            new Dictionary<string, DataFieldMetadata>(_fields.Length, StringComparer.OrdinalIgnoreCase);
+        _ambiguousNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var field in _fields)
         {
-            // Two names that differ only by case resolve to the first in storage order.
-            _byName.TryAdd(field.Name, field);
+            // The first field in storage order keeps each exact spelling, so an exact repeat resolves to it and adds
+            // no spelling. A new spelling of a name already held ignoring case is a second distinct spelling, which
+            // makes the name ambiguous.
+            if (_byExactName.TryAdd(field.Name, field) && !_byUnambiguousName.TryAdd(field.Name, field))
+            {
+                _ambiguousNames.Add(field.Name);
+            }
+        }
+
+        // An ambiguous name resolves only through its exact spellings, never ignoring case.
+        foreach (var name in _ambiguousNames)
+        {
+            _byUnambiguousName.Remove(name);
         }
     }
 
@@ -61,13 +98,17 @@ public sealed class DataFieldSet : IReadOnlyList<DataFieldMetadata>
     public int Count => _fields.Length;
 
     /// <summary>
-    /// Finds the data field whose canonical name equals <paramref name="name"/>, ignoring case.
+    /// Finds the data field named <paramref name="name"/>: the first field in storage order whose canonical name
+    /// equals it exactly; or else, when exactly one distinct canonical spelling equals it ignoring case, the first
+    /// field so spelled.
     /// </summary>
     /// <param name="name">A field name in any letter case.</param>
     /// <param name="field">The canonical entry, or <see langword="null"/> when none matches.</param>
     /// <returns>
-    /// Whether a data field matches; <see langword="false"/> for a null or empty name, and for labels, groups,
-    /// unsupported fields, system fields and names the form does not have.
+    /// Whether a data field matches; <see langword="false"/> for a null or empty name, for labels, groups,
+    /// unsupported fields, system fields and names the form does not have, and for an ambiguous name, one that
+    /// equals no canonical name exactly and two or more distinct canonical spellings ignoring case (see
+    /// <see cref="IsAmbiguous"/>).
     /// </returns>
     public bool TryGet(string name, [NotNullWhen(true)] out DataFieldMetadata? field)
     {
@@ -77,15 +118,36 @@ public sealed class DataFieldSet : IReadOnlyList<DataFieldMetadata>
             return false;
         }
 
-        return _byName.TryGetValue(name, out field);
+        return _byExactName.TryGetValue(name, out field) || _byUnambiguousName.TryGetValue(name, out field);
     }
 
     /// <summary>
-    /// Finds the data field whose canonical name equals <paramref name="name"/>, ignoring case.
+    /// Finds the data field named <paramref name="name"/>, as <see cref="TryGet"/> resolves it: the exact canonical
+    /// spelling first, then the one distinct canonical spelling equal to it ignoring case. An ambiguous name finds
+    /// no field.
     /// </summary>
     /// <param name="name">A field name in any letter case.</param>
-    /// <returns>The canonical entry, or <see langword="null"/> when none matches.</returns>
+    /// <returns>
+    /// The canonical entry, or <see langword="null"/> when none matches or <paramref name="name"/> is ambiguous.
+    /// </returns>
     public DataFieldMetadata? Find(string name) => TryGet(name, out var field) ? field : null;
+
+    /// <summary>
+    /// Whether <paramref name="name"/> is ambiguous: it equals no canonical name exactly, and two or more distinct
+    /// canonical spellings equal it ignoring case, as <c>Age</c> and <c>AGE</c> both equal <c>age</c>. Such a name
+    /// resolves to no field, so no caller treats it as a field it might mean: in the <c>values</c> of a record write
+    /// or a field event it is reported under <see cref="Validation.RecordValidator.ValuesKey"/> with
+    /// <see cref="Validation.ValidationMessages.AmbiguousValuesName"/>, unless a row that holds no value is spelled
+    /// exactly so (<see cref="Validation.RecordValidator.NotADataFieldError"/>).
+    /// </summary>
+    /// <param name="name">A field name in any letter case.</param>
+    /// <returns>
+    /// <see langword="true"/> only for an ambiguous name; <see langword="false"/> for a null or empty name, a name
+    /// spelled exactly as a data field, a name equal ignoring case to one distinct canonical spelling only (however
+    /// many fields repeat it exactly), and a name no data field has.
+    /// </returns>
+    public bool IsAmbiguous(string name) =>
+        !string.IsNullOrEmpty(name) && !_byExactName.ContainsKey(name) && _ambiguousNames.Contains(name);
 
     /// <inheritdoc />
     public IEnumerator<DataFieldMetadata> GetEnumerator() => ((IEnumerable<DataFieldMetadata>)_fields).GetEnumerator();
@@ -111,9 +173,11 @@ public static class FormDefinitionFactory
     /// </summary>
     /// <param name="form">The form's metadata, as read on this request.</param>
     /// <param name="legalValueOptions">
-    /// The options of each Legal Values field, keyed by field name, in the order the store returned them: the
-    /// code-table row order, already sorted by the store when <c>Sort</c> is set. That order is kept as given; the
-    /// factory never reorders it. A field with no entry gets an empty list.
+    /// The options of each Legal Values field, keyed by canonical field name, in the order the store returned them:
+    /// the code-table row order, already sorted by the store when <c>Sort</c> is set. That order is kept as given; the
+    /// factory never reorders it. Each field takes only the entry its exact name finds under the map's own comparer,
+    /// so fields whose names differ only by letter case never share a list in an ordinal map. A field with no entry
+    /// gets an empty list.
     /// </param>
     /// <param name="unsupportedCheckCode">The static check-code diagnostics of the form's program.</param>
     /// <param name="canInsert">The insert-permission flag, or <see langword="null"/> when not checked.</param>
@@ -202,6 +266,37 @@ public static class FormDefinitionFactory
         return new DataFieldSet(dataFields);
     }
 
+    /// <summary>
+    /// Resolves the members of a group from its <c>metaFields.List</c>, by the one rule the form definition's
+    /// <c>members</c> also follows. The list is split on commas, each entry is trimmed and empty entries are
+    /// dropped. Each entry resolves among the fields the definition lists (page-bound rows whose page belongs to the
+    /// form) to the first in metadata order spelled exactly so. Otherwise an entry equal ignoring case to the names of
+    /// two or more data fields with distinct spellings is ambiguous, as <see cref="DataFieldSet.IsAmbiguous"/> decides,
+    /// and is left out; any other entry resolves to the first listed field in metadata order equal to it ignoring
+    /// case. An entry that resolves to no listed field, to a row an earlier entry already resolved to, or to the group
+    /// itself is left out.
+    /// </summary>
+    /// <param name="form">The form's metadata.</param>
+    /// <param name="group">A <c>metaFields</c> row of <paramref name="form"/>.</param>
+    /// <returns>
+    /// The member rows in <c>List</c> order (the client sorts them by tab index); empty when
+    /// <paramref name="group"/> does not map to <see cref="FieldType.Group"/> or its <c>List</c> is null or empty.
+    /// </returns>
+    /// <exception cref="ArgumentNullException"><paramref name="form"/> or <paramref name="group"/> is null.</exception>
+    public static IReadOnlyList<FieldMetadata> GetGroupMembers(FormMetadata form, FieldMetadata group)
+    {
+        ArgumentNullException.ThrowIfNull(form);
+        ArgumentNullException.ThrowIfNull(group);
+
+        if (FieldTypeMapper.Map(group).FieldType != FieldType.Group || string.IsNullOrEmpty(group.List))
+        {
+            return ReadOnlyCollection<FieldMetadata>.Empty;
+        }
+
+        var members = ResolveMembers(group, ListedFieldsByName(form));
+        return members.Length == 0 ? ReadOnlyCollection<FieldMetadata>.Empty : Array.AsReadOnly(members);
+    }
+
     private static IEnumerable<PageMetadata> OrderedPages(FormMetadata form) =>
         form.Pages.OrderBy(page => page.Position).ThenBy(page => page.PageId);
 
@@ -212,28 +307,31 @@ public static class FormDefinitionFactory
             .OrderBy(field => field.TabIndex ?? 0m)
             .ThenBy(field => field.FieldId);
 
-    // The fields the definition lists, by name ignoring case, the first in metadata order winning. Group members
-    // resolve against this map only: a name that no page shows, such as a system row, gives the client nothing to
-    // place in the group, so it is dropped like an unknown name.
-    private static Dictionary<string, FieldMetadata> ListedFieldsByName(FormMetadata form)
+    // The fields the definition lists, by exact name and by name ignoring case, the first in metadata order winning in
+    // each, with the form's data fields to tell which names are ambiguous. Group members resolve against these only:
+    // a name that no page shows, such as a system row, gives the client nothing to place in the group, so it is
+    // dropped like an unknown name.
+    private static ListedFields ListedFieldsByName(FormMetadata form)
     {
+        var byExactName = new Dictionary<string, FieldMetadata>(StringComparer.Ordinal);
         var byName = new Dictionary<string, FieldMetadata>(StringComparer.OrdinalIgnoreCase);
         foreach (var field in form.Fields)
         {
             if (field.PageId is { } pageId && form.FindPage(pageId) is not null)
             {
+                byExactName.TryAdd(field.Name, field);
                 byName.TryAdd(field.Name, field);
             }
         }
 
-        return byName;
+        return new ListedFields(byExactName, byName, GetDataFields(form));
     }
 
     private static FieldDefinition Definition(
         FieldMetadata field,
         PageMetadata page,
         IReadOnlyDictionary<string, IReadOnlyList<FieldOption>> legalValueOptions,
-        IReadOnlyDictionary<string, FieldMetadata> listedFieldsByName)
+        ListedFields listedFieldsByName)
     {
         var (fieldType, unsupported, unsupportedType) = FieldTypeMapper.Map(field);
         return new FieldDefinition(
@@ -318,50 +416,72 @@ public static class FormDefinitionFactory
         return Array.AsReadOnly(options.ToArray());
     }
 
+    // A field's options are the entry keyed by its own canonical name, looked up with the map's own comparer. No other
+    // spelling is tried: a key that differs only by letter case belongs to another field, whose code table this field
+    // must never be validated against.
     private static IReadOnlyList<FieldOption>? FindLegalValueOptions(
         string name,
-        IReadOnlyDictionary<string, IReadOnlyList<FieldOption>> legalValueOptions)
+        IReadOnlyDictionary<string, IReadOnlyList<FieldOption>> legalValueOptions) =>
+        legalValueOptions.TryGetValue(name, out var options) ? options : null;
+
+    // The canonical names of the rows ResolveMembers gives, the one membership rule GetGroupMembers also returns.
+    private static IReadOnlyList<string> Members(FieldMetadata group, ListedFields listedFieldsByName)
     {
-        if (legalValueOptions.TryGetValue(name, out var exact))
-        {
-            return exact;
-        }
-
-        foreach (var (key, options) in legalValueOptions)
-        {
-            if (string.Equals(key, name, StringComparison.OrdinalIgnoreCase))
-            {
-                return options;
-            }
-        }
-
-        return null;
+        var members = ResolveMembers(group, listedFieldsByName);
+        return members.Length == 0
+            ? ReadOnlyCollection<string>.Empty
+            : Array.AsReadOnly(Array.ConvertAll(members, member => member.Name));
     }
 
-    // Legacy splits the group's List on commas and drops empty entries. Each entry is trimmed and resolved to the
-    // canonical name of a listed field, keeping List order (the client sorts members by tab index); unknown names,
-    // repeats and the group itself are left out.
-    private static IReadOnlyList<string> Members(
-        FieldMetadata group,
-        IReadOnlyDictionary<string, FieldMetadata> listedFieldsByName)
+    // Legacy splits the group's List on commas and drops empty entries. Each entry is trimmed and resolved to a listed
+    // field, the exact spelling first, keeping List order (the client sorts members by tab index); unknown and
+    // ambiguous names, repeats of a row already resolved and the group itself are left out.
+    private static FieldMetadata[] ResolveMembers(FieldMetadata group, ListedFields listedFieldsByName)
     {
         if (string.IsNullOrEmpty(group.List))
         {
-            return ReadOnlyCollection<string>.Empty;
+            return [];
         }
 
-        var members = new List<string>();
-        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var members = new List<FieldMetadata>();
+        var seen = new HashSet<FieldMetadata>(ReferenceEqualityComparer.Instance);
         foreach (var entry in group.List.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries))
         {
-            if (listedFieldsByName.TryGetValue(entry, out var member)
+            if (listedFieldsByName.TryResolve(entry, out var member)
                 && member.FieldId != group.FieldId
-                && seen.Add(member.Name))
+                && seen.Add(member))
             {
-                members.Add(member.Name);
+                members.Add(member);
             }
         }
 
-        return members.Count == 0 ? ReadOnlyCollection<string>.Empty : Array.AsReadOnly(members.ToArray());
+        return [.. members];
+    }
+
+    // The listed fields indexed by exact name and by name ignoring case. A name resolves to the field spelled exactly
+    // so. Otherwise a name the data fields leave ambiguous, equal ignoring case to two or more of their distinct
+    // spellings, resolves to nothing, as it does in DataFieldSet; any other name resolves to the first listed field in
+    // metadata order equal to it ignoring case. The exact spelling wins, so a label "age" earlier in the metadata
+    // never shadows the field named exactly "Age".
+    private sealed class ListedFields(
+        IReadOnlyDictionary<string, FieldMetadata> byExactName,
+        IReadOnlyDictionary<string, FieldMetadata> byName,
+        DataFieldSet dataFields)
+    {
+        public bool TryResolve(string name, [NotNullWhen(true)] out FieldMetadata? field)
+        {
+            if (byExactName.TryGetValue(name, out field))
+            {
+                return true;
+            }
+
+            if (dataFields.IsAmbiguous(name))
+            {
+                field = null;
+                return false;
+            }
+
+            return byName.TryGetValue(name, out field);
+        }
     }
 }

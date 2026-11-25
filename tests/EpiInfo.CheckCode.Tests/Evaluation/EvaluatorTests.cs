@@ -6,6 +6,7 @@ using EpiInfo.CheckCode.Parsing;
 using EpiInfo.CheckCode.Syntax;
 using EpiInfo.Domain.Diagnostics;
 using EpiInfo.Domain.Events;
+using EpiInfo.Domain.Forms;
 using EpiInfo.Domain.Metadata;
 using EpiInfo.Domain.Values;
 
@@ -254,6 +255,75 @@ public sealed class EvaluatorTests
             F(1, "Symptoms", 21, "Group", 1, 1, null, 0, list: "Fever,Chills"),
             F(2, "Fever", 10, "Checkbox", 1, 2, "bit", 1),
             F(3, "Chills", 10, "Checkbox", 1, 3, "bit", 1),
+        ]);
+
+    // Synthetic: two data fields whose names differ only by case and whose types differ. The page-2 text field AGE
+    // comes first in metadata order, while the page-1 number field Age comes first in storage order, the order the
+    // field-event service types values in.
+    private static readonly FormMetadata CaseVariantForm = new(
+        ViewId: 95,
+        Name: "CaseVariant",
+        BaseTableName: "CaseVariant",
+        Pages: [new PageMetadata(1, "Page 1", 0, "CaseVariant1"), new PageMetadata(2, "Page 2", 1, "CaseVariant2")],
+        Fields:
+        [
+            F(2, "AGE", 1, "Text", 2, 1, "nvarchar", 8000),
+            F(1, "Age", 5, "Number", 1, 1, "float", 8),
+        ]);
+
+    // Synthetic: a label "age" precedes the data field "Age" in metadata order. The group Details lists Age, itself,
+    // a system row and an unknown name; Heading and the off-page Orphan are names only non-data rows carry.
+    private static readonly FormMetadata ShadowedForm = new(
+        ViewId: 94,
+        Name: "Shadowed",
+        BaseTableName: "Shadowed",
+        Pages: [new PageMetadata(1, "Page 1", 0, "Shadowed1")],
+        Fields:
+        [
+            new FieldMetadata
+            {
+                FieldId = 1,
+                Name = "GlobalRecordId",
+                FieldTypeId = 26,
+                FieldTypeName = "GlobalRecordId",
+            },
+            F(2, "age", 2, "Label/Title", 1, 1, null, 0),
+            F(3, "Age", 5, "Number", 1, 2, "float", 8),
+            F(4, "Details", 21, "Group", 1, 3, null, 0, list: "Age,Details,GlobalRecordId,NoSuchField"),
+            F(5, "Heading", 2, "Label/Title", 1, 4, null, 0),
+            F(6, "Orphan", 1, "Text", 9, 1, "nvarchar", 200),
+        ]);
+
+    // Synthetic: the group SECTION lists the data field Member, and the data field Section differs from the group's
+    // name only by case.
+    private static readonly FormMetadata SectionAliasForm = new(
+        ViewId: 93,
+        Name: "SectionAlias",
+        BaseTableName: "SectionAlias",
+        Pages: [new PageMetadata(1, "Page 1", 0, "SectionAlias1")],
+        Fields:
+        [
+            F(1, "SECTION", 21, "Group", 1, 1, null, 0, list: "Member"),
+            F(2, "Section", 1, "Text", 1, 2, "nvarchar", 8000),
+            F(3, "Member", 1, "Text", 1, 3, "nvarchar", 8000),
+        ]);
+
+    // Synthetic: a label "age" first in metadata order, then the data fields Age (number, page 1) and AGE (text,
+    // page 2), whose names differ only by case.
+    private static readonly FormMetadata AmbiguousLabelForm = new(
+        ViewId: 92,
+        Name: "AmbiguousLabel",
+        BaseTableName: "AmbiguousLabel",
+        Pages:
+        [
+            new PageMetadata(1, "Page 1", 0, "AmbiguousLabel1"),
+            new PageMetadata(2, "Page 2", 1, "AmbiguousLabel2"),
+        ],
+        Fields:
+        [
+            F(1, "age", 2, "Label/Title", 1, 1, null, 0),
+            F(2, "Age", 5, "Number", 1, 2, "float", 8),
+            F(3, "AGE", 1, "Text", 2, 1, "nvarchar", 8000),
         ]);
 
     // Synthetic: metaFields.List is free text that legacy GroupField.ChildFieldNameArray splits on commas
@@ -557,6 +627,69 @@ public sealed class EvaluatorTests
         // A date field holds only a date, and a number field only a number or an option index.
         { "ASSIGN Visited = \"Smith\"", "Visited", "Smith", [] },
         { "ASSIGN Score = (-)", "Score", "false", [] },
+    };
+
+    // Each exact spelling binds to its own CaseVariantForm row, as DataFieldSet resolves it. Any other spelling, such
+    // as " age ", equals both rows ignoring case and is ambiguous, so it binds neither (see
+    // Context_CaseVariantDataFields_AmbiguousSpellingIsUnknownAndBindsNoValue).
+    public static TheoryData<string, int, FieldType, FieldValue> CaseVariantBindings => new()
+    {
+        { "Age", 1, FieldType.Number, N(30) },
+        { "AGE", 2, FieldType.Text, Text("x") },
+    };
+
+    // A group stands for the members the form definition lists: Details' own entry, the system row and the unknown
+    // name are dropped, and its "Age" is the data field, not the label "age". CLEAR keeps data fields only.
+    public static TheoryData<string, string[]> ShadowedGroupExpansions => new()
+    {
+        { "ENABLE", ["Details", "Age"] },
+        { "DISABLE", ["Details", "Age"] },
+        { "CLEAR", ["Age"] },
+    };
+
+    // A command names the row spelled exactly so, even the label "age" beside the data field Age. A spelling no row
+    // has exactly names the data field equal to it ignoring case, and otherwise the first other row equal to it.
+    public static TheoryData<string, string, string> ShadowedEnablementTargets => new()
+    {
+        { "ENABLE", "Heading", "Heading" },
+        { "DISABLE", "HEADING", "Heading" },
+        { "ENABLE", "age", "age" },
+        { "ENABLE", "AGE", "Age" },
+        { "DISABLE", "GlobalRecordId", "GlobalRecordId" },
+    };
+
+    // A Field block runs for the field its name designates, and the event's field is resolved the same way; the last
+    // block naming that field wins, as in legacy. Block i shows the dialog "block i". CaseVariantForm has the data
+    // fields Age and AGE, CaseReportForm has Age alone.
+    public static TheoryData<bool, string[], string, string[]> FieldBlockDispatches => new()
+    {
+        // Each case variant runs its own block, in either block order.
+        { true, ["Age", "AGE"], "Age", ["block 0"] },
+        { true, ["Age", "AGE"], "AGE", ["block 1"] },
+        { true, ["AGE", "Age"], "Age", ["block 1"] },
+        { true, ["AGE", "Age"], "AGE", ["block 0"] },
+
+        // The other case variant's block is no block of the field, so the response is the empty envelope.
+        { true, ["AGE"], "Age", [] },
+
+        // aGE equals both Age and AGE ignoring case and neither exactly, so its block names neither.
+        { true, ["aGE"], "Age", [] },
+        { true, ["aGE"], "AGE", [] },
+
+        // With Age alone, any spelling of it names it, and of two blocks naming it the last one runs.
+        { false, ["age"], "Age", ["block 0"] },
+        { false, ["Age", "AGE"], "Age", ["block 1"] },
+    };
+
+    // The group SECTION, spelled exactly so, stands for its member Member, and CLEAR keeps only the data field Member;
+    // the data field Section, spelled exactly so, stands for itself.
+    public static TheoryData<string, string, string[]> SectionAliasTargets => new()
+    {
+        { "ENABLE", "SECTION", ["SECTION", "Member"] },
+        { "DISABLE", "SECTION", ["SECTION", "Member"] },
+        { "CLEAR", "SECTION", ["Member"] },
+        { "ENABLE", "Section", ["Section"] },
+        { "CLEAR", "Section", ["Section"] },
     };
 
     [Theory]
@@ -1515,6 +1648,328 @@ public sealed class EvaluatorTests
         Assert.Equal(FieldValue.Null, context.Read(age));
     }
 
+    [Theory]
+    [MemberData(nameof(CaseVariantBindings), DisableDiscoveryEnumeration = true)]
+    public void Context_CaseVariantDataFields_EachBindItsOwnRowTypeAndValue(
+        string identifier, int fieldId, FieldType type, FieldValue value)
+    {
+        var values = new Dictionary<string, FieldValue> { ["Age"] = N(30), ["AGE"] = Text("x") };
+        var context = new EvaluationContext(CaseVariantForm, values);
+
+        Assert.True(context.TryResolve(identifier, out FieldMetadata? field));
+        Assert.Equal(fieldId, field.FieldId);
+        Assert.True(context.IsDataField(field));
+        Assert.Equal(type, context.GetFieldType(field));
+        Assert.Equal(value, context.Read(field));
+    }
+
+    [Fact]
+    public void Context_CaseVariantDataFields_AmbiguousSpellingIsUnknownAndBindsNoValue()
+    {
+        // " age " equals both Age and AGE ignoring case and neither exactly: as an identifier it names no field, and
+        // as a values key it binds no value to either.
+        var context = new EvaluationContext(CaseVariantForm, new Dictionary<string, FieldValue> { ["age"] = N(30) });
+
+        Assert.False(context.TryResolve(" age ", out FieldMetadata? ambiguous));
+        Assert.Null(ambiguous);
+        Assert.Throws<CheckCodeRuntimeException>(() => context.Resolve(" age ", 1, "IF"));
+        Assert.True(context.TryResolve("Age", out FieldMetadata? age));
+        Assert.True(context.TryResolve("AGE", out FieldMetadata? ageGroup));
+        Assert.Equal(FieldValue.Null, context.Read(age));
+        Assert.Equal(FieldValue.Null, context.Read(ageGroup));
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void Context_KeysBindingToOneDataField_ExactSpellingWinsInEitherOrder(bool exactFirst)
+    {
+        // ShadowedForm has one data field Age: "Age" names it exactly, "AGE" only ignoring case.
+        var values = new Dictionary<string, FieldValue>();
+        if (exactFirst)
+        {
+            values.Add("Age", N(30));
+            values.Add("AGE", N(1));
+        }
+        else
+        {
+            values.Add("AGE", N(1));
+            values.Add("Age", N(30));
+        }
+
+        var context = new EvaluationContext(ShadowedForm, values);
+
+        Assert.Equal(N(30), context.Read("age", 1, "IF"));
+    }
+
+    [Fact]
+    public void CaseVariantDataFields_AreReadAssignedAndToggledAsDistinctFields()
+    {
+        // The condition holds only when each value is bound to its own row and type. A lookup by the first metadata
+        // row would bind both keys to the page-2 text field AGE.
+        const string Program = """
+            Field Age
+                After
+                    IF Age = 30 AND AGE = "x" THEN
+                        ASSIGN Age = 31
+                        ASSIGN AGE = "y"
+                    END-IF
+                    ENABLE Age
+                    DISABLE AGE
+                End-After
+            End-Field
+            """;
+
+        FieldEventResponse response = Run(
+            Program,
+            CaseVariantForm,
+            FieldEventKind.FieldAfter,
+            "Age",
+            ("Age", N(30)),
+            ("AGE", Text("x")));
+
+        Assert.Equal(new[] { "Age", "AGE" }, response.Assigned.Keys);
+        Assert.Equal(N(31), response.Assigned["Age"]);
+        Assert.Equal(Text("y"), response.Assigned["AGE"]);
+        Assert.Equal(new[] { "Age" }, response.Enabled);
+        Assert.Equal(new[] { "AGE" }, response.Disabled);
+        Assert.Empty(response.Cleared);
+        Assert.Empty(response.Diagnostics);
+    }
+
+    [Fact]
+    public void CaseVariantDataFields_AreClearedAsDistinctFields()
+    {
+        // Clearing AGE leaves Age's value in place, and one CLEAR naming both clears both.
+        const string Program = """
+            Field Age
+                After
+                    CLEAR AGE
+                    IF Age = 30 THEN
+                        ENABLE Age
+                    END-IF
+                    CLEAR Age AGE
+                End-After
+            End-Field
+            """;
+
+        FieldEventResponse response = Run(
+            Program,
+            CaseVariantForm,
+            FieldEventKind.FieldAfter,
+            "Age",
+            ("Age", N(30)),
+            ("AGE", Text("x")));
+
+        Assert.Equal(new[] { "Age" }, response.Enabled);
+        Assert.Equal(new[] { "AGE", "Age" }, response.Cleared);
+        Assert.Empty(response.Assigned);
+        Assert.Empty(response.Diagnostics);
+    }
+
+    [Fact]
+    public void LabelShadowingADataField_TakesNeitherItsValueNorItsAssignment()
+    {
+        // The label "age" precedes the data field Age in metadata order; the value, its type and the assignment all
+        // belong to the data field.
+        const string Program = """
+            Field Age
+                After
+                    IF AGE = 30 THEN
+                        ASSIGN AGE = 31
+                    END-IF
+                End-After
+            End-Field
+            """;
+        var context = new EvaluationContext(ShadowedForm, new Dictionary<string, FieldValue> { ["Age"] = N(30) });
+        Assert.True(context.TryResolve("AGE", out FieldMetadata? age));
+        Assert.Equal(3, age.FieldId);
+        Assert.Equal(FieldType.Number, context.GetFieldType(age));
+        Assert.Equal(N(30), context.Read(age));
+
+        FieldEventResponse response = Run(Program, ShadowedForm, FieldEventKind.FieldAfter, "Age", ("Age", N(30)));
+
+        Assert.Equal(new[] { "Age" }, response.Assigned.Keys);
+        Assert.Equal(N(31), response.Assigned["Age"]);
+        Assert.Empty(response.Diagnostics);
+    }
+
+    [Theory]
+    [MemberData(nameof(ShadowedGroupExpansions))]
+    public void GroupName_ExpandsToTheMembersTheFormDefinitionLists(string command, string[] expected)
+    {
+        string program = $"""
+            Field Age
+                After
+                    {command} Details
+                End-After
+            End-Field
+            """;
+
+        FieldEventResponse response = Run(program, ShadowedForm, FieldEventKind.FieldAfter, "Age", ("Age", N(30)));
+
+        Assert.Equal(expected, AffectedBy(command, response));
+        Assert.Empty(response.Diagnostics);
+    }
+
+    [Theory]
+    [MemberData(nameof(ShadowedEnablementTargets))]
+    public void Enablement_NamesTheExactSpellingFirstThenADataFieldThenAnotherRow(
+        string command, string identifier, string expected)
+    {
+        string program = $"""
+            Field Age
+                After
+                    {command} {identifier}
+                End-After
+            End-Field
+            """;
+
+        FieldEventResponse response = Run(program, ShadowedForm, FieldEventKind.FieldAfter, "Age");
+
+        Assert.Equal(new[] { expected }, AffectedBy(command, response));
+        Assert.Empty(response.Diagnostics);
+    }
+
+    [Theory]
+    [MemberData(nameof(SectionAliasTargets))]
+    public void FieldListStatement_NamesTheExactSpelling_SoADataAliasNeverHidesAGroup(
+        string command, string identifier, string[] expected)
+    {
+        string program = $"""
+            Field Member
+                After
+                    {command} {identifier}
+                End-After
+            End-Field
+            """;
+
+        FieldEventResponse response = Run(
+            program,
+            SectionAliasForm,
+            FieldEventKind.FieldAfter,
+            "Member",
+            ("Section", Text("s")),
+            ("Member", Text("m")));
+
+        Assert.Equal(expected, AffectedBy(command, response));
+        Assert.Empty(response.Diagnostics);
+    }
+
+    [Fact]
+    public void ValueIdentifier_SpelledAsAGroup_ReadsAndAssignsTheDataFieldEqualToItIgnoringCase()
+    {
+        // A group holds no value: as a value and as an ASSIGN target, SECTION is the data field Section.
+        const string Program = """
+            Field Member
+                After
+                    ASSIGN Member = SECTION
+                    ASSIGN SECTION = "t"
+                End-After
+            End-Field
+            """;
+
+        FieldEventResponse response = Run(
+            Program,
+            SectionAliasForm,
+            FieldEventKind.FieldAfter,
+            "Member",
+            ("Section", Text("s")));
+
+        Assert.Equal(new[] { "Member", "Section" }, response.Assigned.Keys);
+        Assert.Equal(Text("s"), response.Assigned["Member"]);
+        Assert.Equal(Text("t"), response.Assigned["Section"]);
+        Assert.Empty(response.Diagnostics);
+    }
+
+    [Fact]
+    public void ValueIdentifier_AmbiguousAmongDataFields_IsUnknownEvenBesideALabelEqualToIt()
+    {
+        // aGE equals Age and AGE ignoring case and neither exactly, so it names no field; the label "age", equal to it
+        // only ignoring case, never stands in. Age, spelled exactly, is the number field.
+        const string Program = """
+            Field Age
+                After
+                    ASSIGN aGE = 1
+                    ASSIGN Age = 1
+                End-After
+            End-Field
+            """;
+        Assert.Equal("ASSIGN aGE = 1", ProgramLine(Program, 3));
+
+        FieldEventResponse response = RunWithoutThrowing(Program, AmbiguousLabelForm, FieldEventKind.FieldAfter, "Age");
+
+        Diagnostic diagnostic = Assert.Single(response.Diagnostics);
+        Assert.Equal(DiagnosticSeverity.Error, diagnostic.Severity);
+        Assert.Equal("ASSIGN", diagnostic.Command);
+        Assert.Equal(3, diagnostic.Line);
+        Assert.Equal("Unknown field 'aGE'.", diagnostic.Message);
+        Assert.Equal(new[] { "Age" }, response.Assigned.Keys);
+        Assert.Equal(N(1), response.Assigned["Age"]);
+    }
+
+    [Theory]
+    [MemberData(nameof(FieldBlockDispatches))]
+    public void Run_SelectsTheLastFieldBlockNamingTheEventsField(
+        bool caseVariants, string[] blockNames, string fieldName, string[] expectedDialogs)
+    {
+        string program = string.Join(
+            "\n",
+            blockNames.Select((name, index) => $"""
+                Field {name}
+                    After
+                        DIALOG "block {index}"
+                    End-After
+                End-Field
+                """));
+        FormMetadata form = caseVariants ? CaseVariantForm : CaseReportForm;
+
+        FieldEventResponse response = new CheckCodeEngine().Run(
+            program,
+            form,
+            FieldEventKind.FieldAfter,
+            fieldName,
+            new Dictionary<string, FieldValue>());
+
+        Assert.Equal(expectedDialogs, response.Dialogs.Select(dialog => dialog.Message));
+        AssertNoFieldEffects(response);
+        Assert.Empty(response.Diagnostics);
+    }
+
+    [Fact]
+    public void RowOutsideTheDataSet_BindsNoValueAndIsNeverAssigned()
+    {
+        // Orphan has a text column but no page of the form, so it is not a data field: its request value is ignored
+        // and an ASSIGN to it is a runtime error, never an effect.
+        const string Program = """
+            Field Age
+                After
+                    ASSIGN Orphan = "y"
+                End-After
+            End-Field
+            """;
+        var values = new Dictionary<string, FieldValue> { ["Orphan"] = Text("x") };
+        var context = new EvaluationContext(ShadowedForm, values);
+        Assert.True(context.TryResolve("ORPHAN", out FieldMetadata? orphan));
+        Assert.Equal(6, orphan.FieldId);
+        Assert.False(context.IsDataField(orphan));
+        Assert.Equal(FieldType.Unsupported, context.GetFieldType(orphan));
+        Assert.Equal(FieldValue.Null, context.Read(orphan));
+
+        FieldEventResponse response = RunWithoutThrowing(
+            Program,
+            ShadowedForm,
+            FieldEventKind.FieldAfter,
+            "Age",
+            ("Orphan", Text("x")));
+
+        Diagnostic diagnostic = Assert.Single(response.Diagnostics);
+        Assert.Equal(DiagnosticSeverity.Error, diagnostic.Severity);
+        Assert.Equal("ASSIGN", diagnostic.Command);
+        Assert.Equal(3, diagnostic.Line);
+        Assert.Empty(response.Assigned);
+    }
+
     [Fact]
     public void LaterStatement_ReadsAnEarlierAssign()
     {
@@ -2045,6 +2500,15 @@ public sealed class EvaluatorTests
 
     // Line numbers are 1-based, as diagnostics report them; indentation is not part of the statement.
     private static string ProgramLine(string program, int line) => program.Split('\n')[line - 1].Trim();
+
+    // The response list an ENABLE, DISABLE or CLEAR statement adds its fields to.
+    private static IReadOnlyList<string> AffectedBy(string command, FieldEventResponse response) => command switch
+    {
+        "ENABLE" => response.Enabled,
+        "DISABLE" => response.Disabled,
+        "CLEAR" => response.Cleared,
+        _ => throw new ArgumentOutOfRangeException(nameof(command), command, "Not a field-list statement."),
+    };
 
     // A FoodHistory Sex After block whose IF at ConditionLine enables Age for THEN and disables it for ELSE, between
     // an ENABLE before it and one after it.

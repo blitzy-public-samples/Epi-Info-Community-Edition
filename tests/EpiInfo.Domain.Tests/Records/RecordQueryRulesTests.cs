@@ -594,18 +594,51 @@ public sealed class RecordQueryRulesTests
         Assert.Throws<ArgumentException>("dataFields", () => RecordQueryRules.GetGridColumns(withNullEntry));
     }
 
+    /// <summary>
+    /// Keys are canonical names compared ordinally, one entry per data field, so a name differing only by letter case
+    /// is another key, and only an exact repeat collides.
+    /// </summary>
     [Fact]
-    public void CreateValuesMap_KeepsInsertionOrder_AndFindsKeysIgnoringCase()
+    public void CreateValuesMap_KeepsInsertionOrder_AndComparesKeysOrdinally()
     {
         OrderedDictionary<string, FieldValue> values = RecordQueryRules.CreateValuesMap();
 
         values.Add("Zip", FieldValue.FromText("30333"));
         values.Add("Age", FieldValue.FromNumber(42));
+        values.Add("AGE", FieldValue.FromText("forty-two"));
 
-        Assert.Equal(["Zip", "Age"], values.Keys);
-        Assert.Equal(FieldValue.FromNumber(42), values["AGE"]);
-        Assert.Throws<ArgumentException>(() => values.Add("zip", FieldValue.Null));
+        Assert.Equal(["Zip", "Age", "AGE"], values.Keys);
+        Assert.Equal(FieldValue.FromNumber(42), values["Age"]);
+        Assert.Equal(FieldValue.FromText("forty-two"), values["AGE"]);
+        Assert.False(values.ContainsKey("age"));
+        Assert.Throws<ArgumentException>(() => values.Add("Zip", FieldValue.Null));
         Assert.Throws<ArgumentOutOfRangeException>(() => RecordQueryRules.CreateValuesMap(-1));
+    }
+
+    /// <summary>
+    /// Two data fields on different pages whose canonical names differ only by letter case keep a key and a value
+    /// each, both in a record's full values map and in its grid projection.
+    /// </summary>
+    [Fact]
+    public void CaseVariantFields_KeepTheirOwnKeysInFullAndGridValues()
+    {
+        FormMetadata form = CaseVariantPages();
+        DataFieldSet dataFields = FormDefinitionFactory.GetDataFields(form);
+        OrderedDictionary<string, FieldValue> full = RecordQueryRules.CreateValuesMap(dataFields.Count);
+        foreach (DataFieldMetadata field in dataFields)
+        {
+            full.Add(field.Name, field.Name == "Age" ? FieldValue.FromNumber(42) : FieldValue.FromText("forty-two"));
+        }
+
+        IReadOnlyList<DataFieldMetadata> columns = RecordQueryRules.GetGridColumns(form);
+        IReadOnlyDictionary<string, FieldValue> projected = RecordQueryRules.ProjectValues(full, columns);
+
+        Assert.Equal(["Age", "AGE"], dataFields.Select(field => field.Name));
+        Assert.Equal(["Age", "AGE"], full.Keys);
+        Assert.Equal(["Age", "AGE"], columns.Select(column => column.Name));
+        Assert.Equal(["Age", "AGE"], projected.Keys);
+        Assert.Equal(FieldValue.FromNumber(42), projected["Age"]);
+        Assert.Equal(FieldValue.FromText("forty-two"), projected["AGE"]);
     }
 
     /// <summary>
@@ -618,7 +651,7 @@ public sealed class RecordQueryRulesTests
         IReadOnlyList<DataFieldMetadata> columns = RecordQueryRules.GetGridColumns(CaseReport());
         OrderedDictionary<string, FieldValue> values = RecordQueryRules.CreateValuesMap();
         values.Add("Zip", FieldValue.FromText("30333"));
-        values.Add("city", FieldValue.FromText("Atlanta"));
+        values.Add("City", FieldValue.FromText("Atlanta"));
         values.Add("LastName", FieldValue.FromText("Smith"));
         values.Add("PhoneNumber", FieldValue.FromText("555-014-8636"));
 
@@ -885,6 +918,32 @@ public sealed class RecordQueryRulesTests
             "TabIndexBreaksPagePositionTie",
             "Y",
             [new PageMetadata(pageL, "L", 0, "Y14"), new PageMetadata(pageH, "H", 0, "Y15")],
+            fields);
+    }
+
+    /// <summary>
+    /// Two pages, each holding one grid-eligible data field, whose canonical names differ only by letter case:
+    /// <c>Age</c>, a number on page 1, and <c>AGE</c>, a text field on page 2.
+    /// </summary>
+    private static FormMetadata CaseVariantPages()
+    {
+        const int pageOne = 20;
+        const int pageTwo = 21;
+        FieldMetadata[] fields =
+        [
+            .. SystemRows(firstFieldId: 600),
+            Row(603, "Age", NumberType, pageOne, 1, Float("Age")),
+            Row(604, "AGE", TextType, pageTwo, 1, Nvarchar("AGE", 50)),
+        ];
+
+        return new FormMetadata(
+            15,
+            "CaseVariantPages",
+            "CaseVariantPages",
+            [
+                new PageMetadata(pageOne, "Page 1", 0, "CaseVariantPages20"),
+                new PageMetadata(pageTwo, "Page 2", 1, "CaseVariantPages21"),
+            ],
             fields);
     }
 

@@ -900,6 +900,36 @@ public sealed class SearchCriteriaParserTests
         Assert.All(AllMessages(result), message => Assert.DoesNotContain(submitted, message, StringComparison.Ordinal));
     }
 
+    // Age (page 1) and AGE (page 2) are two data fields whose names differ only by case, and each exact spelling
+    // searches its own field. A spelling equal to both ignoring case and to neither exactly is ambiguous: it names no
+    // searchable field, so it is the same criteria error an unknown name gets, and neither field is searched.
+    [Theory]
+    [InlineData("age")]
+    [InlineData("aGE")]
+    public void FieldName_AmbiguousBetweenCaseVariantFields_IsTheUnknownFieldCriteriaError(string submitted)
+    {
+        PageMetadata page1 = new(1, "Page 1", 0, "CaseVariant1");
+        PageMetadata page2 = new(2, "Page 2", 1, "CaseVariant2");
+        DataFieldSet fields = FormDefinitionFactory.GetDataFields(new FormMetadata(
+            2,
+            "CaseVariant",
+            "CaseVariant",
+            [page1, page2],
+            [
+                PageField(1, "Age", 5, "Number", page1, "float", 8),
+                PageField(2, "AGE", 1, "Text", page2, "nvarchar", 40),
+            ]));
+        Assert.Equal("Age", SingleCondition(SearchCriteriaParser.Parse(fields, [Text("Age", "1")])).FieldName);
+        Assert.Equal("AGE", SingleCondition(SearchCriteriaParser.Parse(fields, [Text("AGE", "1")])).FieldName);
+
+        SearchParseResult result = SearchCriteriaParser.Parse(fields, [Text(submitted, "1")]);
+
+        AssertFieldError(result, SearchCriteriaParser.CriteriaKey);
+        var (key, messages) = Assert.Single(result.FieldErrors);
+        Assert.Equal(SearchCriteriaParser.CriteriaKey, key);
+        Assert.Equal(SearchCriteriaParser.Parse(fields, [Text("Bogus", "1")]).FieldErrors[key], messages);
+    }
+
     // The wire reader can yield a null entry or a null name, whatever the annotations say.
     [Fact]
     public void FieldName_NullEntryOrNullName_IsACriteriaError()

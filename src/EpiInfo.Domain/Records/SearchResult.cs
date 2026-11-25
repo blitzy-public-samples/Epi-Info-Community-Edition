@@ -46,9 +46,9 @@ namespace EpiInfo.Domain.Records;
 /// returns this record. It is not the Record DTO's intrinsic position.
 /// </param>
 /// <param name="Values">
-/// The record's grid-column values only, keyed by canonical field name in grid order, as a record summary carries
-/// them: the projection <see cref="RecordQueryRules.ProjectValues"/> builds over the form's grid columns. A grid
-/// column with no stored value is <see cref="FieldValue.Null"/>.
+/// The record's grid-column values only, keyed by canonical field name in grid order and compared ordinally, as a
+/// record summary carries them: the projection <see cref="RecordQueryRules.ProjectValues"/> builds over the form's
+/// grid columns. A grid column with no stored value is <see cref="FieldValue.Null"/>.
 /// </param>
 public sealed record SearchResult(
     string GlobalRecordId,

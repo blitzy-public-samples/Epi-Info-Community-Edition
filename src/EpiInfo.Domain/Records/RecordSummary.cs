@@ -48,7 +48,7 @@ namespace EpiInfo.Domain.Records;
 /// keyed by canonical <c>metaFields.Name</c> in that column order and holds <see cref="FieldValue.Null"/> for an
 /// empty value. Seeded <c>CaseReport</c> gives <c>PhoneNumber, LastName, FirstName, Address, City, State</c>, and
 /// seeded <c>FoodHistory</c> gives <c>CaseID, DateofInterview, FirstName, LastName, Sex, DOB</c>. Producers build
-/// it with <see cref="RecordQueryRules.ProjectValues"/>, so its key order and case-insensitive lookup match every
+/// it with <see cref="RecordQueryRules.ProjectValues"/>, so its key order and ordinal key comparison match every
 /// other <c>values</c> map.
 /// </param>
 public sealed record RecordSummary(

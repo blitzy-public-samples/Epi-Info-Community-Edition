@@ -53,9 +53,10 @@ namespace EpiInfo.CheckCode.Evaluation;
 /// <item><description><c>ASSIGN X = 1; CLEAR X</c> gives <c>cleared [X]</c> only.</description></item>
 /// </list>
 /// <para>
-/// Field names arrive canonical (<c>metaFields.Name</c>) from the evaluation context and are stored as given. They
-/// are matched without regard to case, so two spellings of one field are one field, reported with the spelling of
-/// its first call for that list.
+/// Field names arrive canonical (<c>metaFields.Name</c>) from the evaluation context, which has already folded each
+/// program spelling to its field, and are stored and compared ordinally. Membership is per field, so two names that
+/// differ only by case, such as <c>Age</c> and <c>AGE</c> on different pages, are two distinct fields with their own
+/// entries in every list and in <see cref="FieldEventResponse.Assigned"/>.
 /// </para>
 /// <para>
 /// One instance serves one evaluator run and holds no static state. An instance is not thread-safe; responses it
@@ -68,15 +69,14 @@ public sealed class EffectAccumulator
 
     // The sequence number of the first time each field entered each list. Set once and never changed, so a later
     // call can move a field out of a list and back without changing where it sorts.
-    private readonly Dictionary<string, long> _enabledFirstEntry = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<string, long> _disabledFirstEntry = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<string, long> _clearedFirstEntry = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<string, long> _assignedFirstEntry = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, long> _enabledFirstEntry = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, long> _disabledFirstEntry = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, long> _clearedFirstEntry = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, long> _assignedFirstEntry = new(StringComparer.Ordinal);
 
     // Final state per axis, decided by the last call: true is enabled, false disabled; Cleared, or assigned Value.
-    private readonly Dictionary<string, bool> _enablement = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<string, (bool Cleared, FieldValue Value)> _valueState =
-        new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, bool> _enablement = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, (bool Cleared, FieldValue Value)> _valueState = new(StringComparer.Ordinal);
 
     private readonly List<DialogMessage> _dialogs = [];
     private readonly List<Diagnostic> _diagnostics = [];
@@ -186,7 +186,7 @@ public sealed class EffectAccumulator
 
         // OrderedDictionary, not Dictionary: the key order of "assigned" is part of the response, and only an ordered
         // dictionary guarantees enumeration in insertion order.
-        var assigned = new OrderedDictionary<string, FieldValue>(StringComparer.OrdinalIgnoreCase);
+        var assigned = new OrderedDictionary<string, FieldValue>(StringComparer.Ordinal);
         foreach (var name in FinalMembersInFirstEntryOrder(_assignedFirstEntry, field => !_valueState[field].Cleared))
         {
             assigned.Add(name, _valueState[name].Value);

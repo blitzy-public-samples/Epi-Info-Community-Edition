@@ -36,9 +36,11 @@ namespace EpiInfo.Domain.Storage;
 /// and column types are read again on every call that needs them.
 /// </para>
 /// <para>
-/// <b>Identifiers.</b> Field names in arguments and results are canonical <c>metaFields.Name</c> values, matched
-/// case-insensitively. Every table and column name a store uses comes from its own catalogue read, never from a
-/// caller's string; in <c>EpiInfo.Data</c> that is the reader-built <c>TableSchema</c>. The
+/// <b>Identifiers.</b> Field names are canonical <c>metaFields.Name</c> values, and results key them ordinally, so
+/// fields whose names differ only by letter case keep their own entries. A field name in an argument names the field
+/// <see cref="DataFieldSet.TryGet"/> resolves it to: the exact spelling, otherwise the one field equal to it ignoring
+/// case; an ambiguous name names none. Every table and column name a store uses comes from its own catalogue read,
+/// never from a caller's string; in <c>EpiInfo.Data</c> that is the reader-built <c>TableSchema</c>. The
 /// <see cref="FormMetadata"/> a record method receives identifies the form, and the store resolves its tables and
 /// columns again for that call.
 /// </para>
@@ -170,8 +172,8 @@ public interface IDataStore
     /// <param name="form">The form's metadata, as <see cref="GetFormMetadataAsync"/> returned it.</param>
     /// <param name="cancellationToken">The request's abort token.</param>
     /// <returns>
-    /// The options keyed by canonical field name, with keys compared ignoring case; the shape
-    /// <see cref="FormDefinitionFactory.Create"/> takes.
+    /// The options keyed by canonical field name, with keys compared ordinally, so fields whose names differ only by
+    /// letter case each have their own entry; the shape <see cref="FormDefinitionFactory.Create"/> takes.
     /// </returns>
     Task<IReadOnlyDictionary<string, IReadOnlyList<FieldOption>>> GetOptionsAsync(
         FormMetadata form,

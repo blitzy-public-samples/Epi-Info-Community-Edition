@@ -65,7 +65,8 @@ namespace EpiInfo.Domain.Records;
 /// <param name="Values">
 /// One entry per data field of the form, keyed by the canonical <c>metaFields.Name</c> and kept in data-field
 /// order (page <c>Position</c>, then <c>TabIndex</c>), as the map from
-/// <see cref="RecordQueryRules.CreateValuesMap"/> holds it. Labels, groups and unsupported fields have no entry. An
+/// <see cref="RecordQueryRules.CreateValuesMap"/> holds it, its keys compared ordinally so that fields whose names
+/// differ only by letter case keep an entry each. Labels, groups and unsupported fields have no entry. An
 /// empty value, from a <c>NULL</c> column or from a page with no row for the record, is
 /// <see cref="FieldValue.Null"/>. Each
 /// entry reaches the client as the scalar its field type sets: a string for text, multiline and legal-values
@@ -85,7 +86,7 @@ public sealed record RecordDto(
     /// </summary>
     /// <remarks>
     /// The values map is taken over as it is, not copied: a <see cref="StoredRecord"/> producer hands over a map it
-    /// no longer changes, so the DTO keeps its data-field order and case-insensitive lookup.
+    /// no longer changes, so the DTO keeps its data-field order and its ordinally compared canonical keys.
     /// </remarks>
     /// <param name="record">The record as the store read it.</param>
     /// <param name="position">

@@ -259,6 +259,7 @@ internal static class RecordSqlBuilder
     private const string ForeignColumnMessage = "The column is not a column of the page table.";
     private const string DuplicateColumnMessage = "A column cannot be written twice in one statement.";
     private const string AmbiguousValueMessage = "Two submitted values name the same field.";
+    private const string ReadOnlyFieldMessage = "A read-only field is never written.";
     private const string NullEntryMessage = "The list must not hold a null entry.";
     private const string UnknownClauseMessage = "The selected-set clause is not a defined member.";
 
@@ -711,24 +712,30 @@ internal static class RecordSqlBuilder
 
     /// <summary>
     /// Inserts a new record's row into one page table: <c>INSERT INTO [page] ([GlobalRecordId], [col1], ...) VALUES
-    /// (@p0, @p1, ...)</c>, naming the key and every data-field column given.
+    /// (@p0, @p1, ...)</c>, naming the key and every writable data-field column given.
     /// </summary>
     /// <remarks>
-    /// The caller passes every data-field column of the page. A column without a submitted value is written
-    /// <c>NULL</c>. Page-table columns that are not data-field columns, such as the seeded <c>Yes/No</c> fields on
-    /// <c>tinyint</c> columns, are never named, so they keep <c>NULL</c>.
+    /// The caller passes every data-field column of the page. A writable column without a submitted value is written
+    /// <c>NULL</c>. A read-only data field (<c>metaFields.IsReadOnly</c>, such as the seeded <c>StateIDNumber</c>,
+    /// <c>CDCIDNumber</c>, <c>ReportedToCDCDate</c> and <c>OnsetWeek</c>) is never written from the client, so its
+    /// column is left out of the statement, as are page-table columns that are not data-field columns, such as the
+    /// seeded <c>Yes/No</c> fields on <c>tinyint</c> columns; each keeps its <c>NULL</c> default.
     /// </remarks>
     /// <param name="page">The page whose table receives the row.</param>
     /// <param name="globalRecordId">The new record's id, as written to the base row.</param>
     /// <param name="pageColumns">The page's data-field columns, from <see cref="ResolveDataColumn"/>.</param>
     /// <param name="values">
-    /// The submitted values keyed by field name; the canonical name is matched exactly first, then ignoring case.
+    /// The submitted values keyed by canonical field name. A column takes only the entry whose key equals its field's
+    /// canonical name ordinally, whatever comparer the dictionary uses, so a key that differs only by case is another
+    /// field's and never this column's value. It may hold the values of other pages' fields, which this page ignores,
+    /// and must hold none for a read-only field.
     /// </param>
     /// <returns>The insert statement.</returns>
     /// <exception cref="ArgumentNullException">An argument is null.</exception>
     /// <exception cref="ArgumentException">
     /// The page has no table; the id is blank or does not fit the key column; a column is not one of the page table's,
-    /// is given twice or is null; two values name the same field ignoring case; or a value does not fit its column.
+    /// is given twice or is null; <paramref name="values"/> enumerates one exact key twice; a value, even null, is
+    /// given for a read-only field of the page (parameter <c>values</c>); or a value does not fit its column.
     /// </exception>
     /// <exception cref="InvalidOperationException">The page table lacks its key column.</exception>
     internal static SqlStatement InsertPage(
@@ -753,9 +760,30 @@ internal static class RecordSqlBuilder
         };
         var sql = new StringBuilder("INSERT INTO ").Append(SqlIdentifier.Quote(table))
             .Append(" (").Append(SqlIdentifier.Quote(key));
+        var exactValues = ExactValues(values);
         foreach (var column in pageColumns)
         {
-            var value = SubmittedValue(values, column.Field.Name);
+            // Only the entry keyed by the field's exact canonical name is its value. A key that differs only by case
+            // is another field's, so an omitted field binds NULL rather than reusing a case-variant sibling's value.
+            var submitted = exactValues.TryGetValue(column.Field.Name, out var value);
+            if (column.Field.Field.IsReadOnly)
+            {
+                // A read-only field is never written from the client, so a new record leaves its column to the
+                // table's default, NULL in the seeded tables. A value submitted for it, even null, is refused rather
+                // than dropped.
+                if (submitted)
+                {
+                    throw new ArgumentException(ReadOnlyFieldMessage, nameof(values));
+                }
+
+                continue;
+            }
+
+            if (!submitted)
+            {
+                value = FieldValue.Null;
+            }
+
             sql.Append(", ").Append(SqlIdentifier.Quote(column.Column));
             names.Add(parameters.Add(n =>
                 ColumnValueConverter.ToParameter(n, column.Column.Metadata, column.Field.FieldType, value)));
@@ -849,12 +877,15 @@ internal static class RecordSqlBuilder
     /// </remarks>
     /// <param name="page">The page whose table holds the row.</param>
     /// <param name="globalRecordId">The record's id, as stored in the locked base row.</param>
-    /// <param name="submitted">The page's submitted columns and their values, in the order to write them.</param>
+    /// <param name="submitted">
+    /// The page's submitted columns and their values, in the order to write them; never a read-only field's column.
+    /// </param>
     /// <returns>The statements in order; empty when nothing is submitted.</returns>
     /// <exception cref="ArgumentNullException">An argument is null.</exception>
     /// <exception cref="ArgumentException">
     /// The page has no table; the id is blank or does not fit the key column; a column is not one of the page table's,
-    /// is given twice or is null; or a value does not fit its column.
+    /// is given twice or is null; a column is a read-only field's, refused before any statement is built (parameter
+    /// <c>submitted</c>); or a value does not fit its column.
     /// </exception>
     /// <exception cref="InvalidOperationException">The page table lacks its key column.</exception>
     internal static IReadOnlyList<SqlStatement> UpdatePageColumns(
@@ -869,6 +900,13 @@ internal static class RecordSqlBuilder
         var table = RequireTable(page);
         var key = RequirePageKey(table);
         EnsurePageColumns(page, table, key, submitted, static entry => entry.Column, nameof(submitted));
+        foreach (var (column, _) in submitted)
+        {
+            if (column.Field.Field.IsReadOnly)
+            {
+                throw new ArgumentException(ReadOnlyFieldMessage, nameof(submitted));
+            }
+        }
 
         var statements = new List<SqlStatement>((submitted.Count + MaxColumnsPerUpdate - 1) / MaxColumnsPerUpdate);
         for (var start = 0; start < submitted.Count; start += MaxColumnsPerUpdate)
@@ -1276,32 +1314,22 @@ internal static class RecordSqlBuilder
         }
     }
 
-    // The submitted value of a field: the exact canonical key first, then a key equal to it ignoring case, so the
-    // lookup does not depend on the dictionary's comparer; FieldValue.Null when the field was not submitted.
-    private static FieldValue SubmittedValue(IReadOnlyDictionary<string, FieldValue> values, string name)
+    // The submitted values keyed ordinally by the keys the caller's dictionary enumerates, so a column's lookup by its
+    // field's canonical name never depends on that dictionary's comparer, which may ignore case: two data fields whose
+    // canonical names differ only by case are distinct columns. A dictionary that enumerates one exact key twice
+    // cannot say which value is the field's, so it is refused rather than one value dropped.
+    private static Dictionary<string, FieldValue> ExactValues(IReadOnlyDictionary<string, FieldValue> values)
     {
-        if (values.TryGetValue(name, out var exact))
+        var exact = new Dictionary<string, FieldValue>(values.Count, StringComparer.Ordinal);
+        foreach (var (name, value) in values)
         {
-            return exact;
-        }
-
-        FieldValue? match = null;
-        foreach (var (key, value) in values)
-        {
-            if (!string.Equals(key, name, StringComparison.OrdinalIgnoreCase))
-            {
-                continue;
-            }
-
-            if (match is not null)
+            if (!exact.TryAdd(name, value))
             {
                 throw new ArgumentException(AmbiguousValueMessage, nameof(values));
             }
-
-            match = value;
         }
 
-        return match ?? FieldValue.Null;
+        return exact;
     }
 
     // The text and layout of a record SELECT before its WHERE and ORDER BY clauses are appended.

@@ -322,6 +322,31 @@ public sealed class EffectAccumulatorTests
         AssertInvariant(response);
     }
 
+    // Canonical names that differ only by case, such as Age on page 1 and AGE on page 2, are distinct fields: no
+    // call on one moves, replaces or merges the other in any list or in the assigned keys.
+    [Fact]
+    public void FieldNames_DifferingOnlyByCase_AreDistinctFields()
+    {
+        var accumulator = new EffectAccumulator();
+
+        accumulator.Enable("Age");
+        accumulator.Disable("AGE");
+        accumulator.Clear("Age");
+        accumulator.Assign("AGE", FieldValue.FromText("x"));
+        accumulator.Assign("age", N(30));
+        var response = accumulator.ToResponse();
+
+        Assert.Equal(new[] { "Age" }, response.Enabled);
+        Assert.Equal(new[] { "AGE" }, response.Disabled);
+        Assert.Equal(new[] { "Age" }, response.Cleared);
+        Assert.Equal(new[] { "AGE", "age" }, response.Assigned.Keys);
+        Assert.Equal(FieldValue.FromText("x"), response.Assigned["AGE"]);
+        Assert.Equal(N(30), response.Assigned["age"]);
+        Assert.False(response.Assigned.ContainsKey("Age"));
+        AssertNoDialogsOrDiagnostics(response);
+        AssertInvariant(response);
+    }
+
     private static FieldValue N(double n) => FieldValue.FromNumber(n);
 
     private static Diagnostic Diag(

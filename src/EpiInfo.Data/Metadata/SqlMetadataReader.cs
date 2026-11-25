@@ -135,8 +135,11 @@ internal sealed class SqlMetadataReader(
     /// <param name="form">The form's metadata, as <see cref="GetFormMetadataAsync"/> returned it.</param>
     /// <param name="cancellationToken">The request's abort token.</param>
     /// <returns>
-    /// The options keyed by canonical field name, keys compared ignoring case. A field without a usable code table
-    /// has an empty list. No connection is opened when no Legal Values field names both a code table and a column.
+    /// The options keyed by canonical field name, compared ordinally, so two fields whose names differ only by letter
+    /// case each have an entry holding their own code table's rows. Each list is in the order SQL Server returned the
+    /// rows, or sorted by text when the field's <see cref="FieldMetadata.Sort"/> is set. A field without a usable code
+    /// table has an empty list. No connection is opened when no Legal Values field names both a code table and a
+    /// column.
     /// </returns>
     /// <exception cref="ArgumentNullException"><paramref name="form"/> is null.</exception>
     /// <exception cref="InvalidOperationException">The code-table batch returned fewer result sets than it holds.</exception>
@@ -146,15 +149,16 @@ internal sealed class SqlMetadataReader(
     {
         ArgumentNullException.ThrowIfNull(form);
 
-        var optionsByField = new Dictionary<string, IReadOnlyList<FieldOption>>(StringComparer.OrdinalIgnoreCase);
+        var optionsByField = new Dictionary<string, IReadOnlyList<FieldOption>>(StringComparer.Ordinal);
         var legalValuesFields = new List<FieldMetadata>();
         foreach (FieldMetadata field in form.Fields)
         {
             if (FieldTypeMapper.Map(field) is (FieldType.LegalValues, false, _)
                 && optionsByField.TryAdd(field.Name, NoOptions))
             {
-                // The key is taken by the first field of that name, so a later row differing only by case cannot
-                // replace its options.
+                // Each exact canonical name is its own field and reads its own code table, so fields whose names
+                // differ only by letter case never share a list. Only an exact repeat of a name is skipped: the
+                // first row so spelled keeps the entry.
                 legalValuesFields.Add(field);
             }
         }

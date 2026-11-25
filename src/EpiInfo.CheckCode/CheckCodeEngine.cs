@@ -1,3 +1,4 @@
+using System.Collections.ObjectModel;
 using EpiInfo.CheckCode.Evaluation;
 using EpiInfo.CheckCode.Lexing;
 using EpiInfo.CheckCode.Parsing;
@@ -54,9 +55,13 @@ public sealed class CheckCodeEngine : ICheckCodeEngine
     /// <inheritdoc />
     /// <remarks>
     /// <para>
-    /// The field's block is the last <c>Field</c> block whose name equals <paramref name="fieldName"/> without
-    /// regard to case, so <c>Field AGE</c> answers field <c>Age</c>, and an earlier block of the name is never
-    /// consulted. Its one event block of the <paramref name="fieldEvent"/> kind runs through
+    /// The field's block is the last <c>Field</c> block naming the same field as <paramref name="fieldName"/>, so
+    /// <c>Field AGE</c> answers field <c>Age</c> when no row is spelled <c>AGE</c>, and an earlier block of the field
+    /// is never consulted. Both names resolve by <see cref="EvaluationContext.TryResolveTarget"/>, the exact spelling
+    /// first, and a block matches when its row has the trigger row's canonical name. A block whose name resolves to
+    /// no field, such as one ambiguous between <c>Age</c> and <c>AGE</c>, answers no field; when
+    /// <paramref name="fieldName"/> itself resolves to no field, the last block whose name equals it ignoring case is
+    /// taken, as in legacy. Its one event block of the <paramref name="fieldEvent"/> kind runs through
     /// <see cref="Evaluator.Run"/>, over one fresh evaluation context and effect accumulator. The response holds that
     /// block's static diagnostics and its runtime errors, merged in source order; diagnostics elsewhere in the
     /// program, such as the warning for a section the parser skipped, are not included.
@@ -95,7 +100,7 @@ public sealed class CheckCodeEngine : ICheckCodeEngine
             return FieldEventResponse.Empty;
         }
 
-        EventBlockNode[] blocks = SelectEventBlocks(Parse(program, form), fieldName, fieldEvent);
+        EventBlockNode[] blocks = SelectEventBlocks(Parse(program, form), form, fieldName, fieldEvent);
         return blocks.Length == 0 ? FieldEventResponse.Empty : Evaluator.Run(form, blocks, values);
     }
 
@@ -103,23 +108,47 @@ public sealed class CheckCodeEngine : ICheckCodeEngine
         Parser.Parse(Lexer.Tokenize(program), form);
 
     /// <summary>
-    /// Returns the one event block of <paramref name="fieldEvent"/>'s kind inside the last <c>Field</c> block named
-    /// <paramref name="fieldName"/>; empty when there is no such field block or it has no block of that kind.
+    /// Returns the one event block of <paramref name="fieldEvent"/>'s kind inside the last <c>Field</c> block naming
+    /// the field <paramref name="fieldName"/> names, by the rule <see cref="Run"/> describes; empty when there is no
+    /// such field block or it has no block of that kind.
     /// </summary>
     /// <remarks>
-    /// Only the last block of a name counts, as in legacy Epi Info, whose interpreter registered each <c>Field</c>
+    /// Only the last block of a field counts, as in legacy Epi Info, whose interpreter registered each <c>Field</c>
     /// block under its name and let a later block of the same name replace the earlier one's <c>Before</c>,
     /// <c>After</c> and <c>Click</c> sections, a section the later block lacks included: an event the last block has
-    /// no section for selects nothing, even when an earlier block of the name has one. Running every block of the
-    /// name would be a behaviour legacy never had, so the legacy rule is kept. The grammar allows one section of each
-    /// kind per block, in the order <c>Before</c>, <c>After</c>, <c>Click</c>; the parser reports any other section as
-    /// a warning and skips it, and <see cref="FieldBlockNode"/> holds no second block of a kind, so at most one block
-    /// is selected.
+    /// no section for selects nothing, even when an earlier block of the field has one. Running every block of the
+    /// field would be a behaviour legacy never had, so the legacy rule is kept, among the blocks that name the same
+    /// field: two fields whose names differ only by case each keep their own block. The grammar allows one section of
+    /// each kind per block, in the order <c>Before</c>, <c>After</c>, <c>Click</c>; the parser reports any other
+    /// section as a warning and skips it, and <see cref="FieldBlockNode"/> holds no second block of a kind, so at
+    /// most one block is selected.
     /// </remarks>
-    private static EventBlockNode[] SelectEventBlocks(ProgramNode program, string fieldName, FieldEventKind fieldEvent)
+    private static EventBlockNode[] SelectEventBlocks(
+        ProgramNode program,
+        FormMetadata form,
+        string fieldName,
+        FieldEventKind fieldEvent)
     {
-        FieldBlockNode? fieldBlock = program.FieldBlocks.LastOrDefault(
-            block => string.Equals(block.FieldName, fieldName, StringComparison.OrdinalIgnoreCase));
+        if (program.FieldBlocks.Count == 0)
+        {
+            return [];
+        }
+
+        // A scope with no values serves name resolution only; it lives for this call, so the engine stays stateless.
+        var scope = new EvaluationContext(form, ReadOnlyDictionary<string, FieldValue>.Empty);
+        FieldBlockNode? fieldBlock;
+        if (scope.TryResolveTarget(fieldName, out FieldMetadata? trigger))
+        {
+            string triggerName = trigger.Name;
+            fieldBlock = program.FieldBlocks.LastOrDefault(
+                block => scope.TryResolveTarget(block.FieldName, out FieldMetadata? named)
+                    && string.Equals(named.Name, triggerName, StringComparison.Ordinal));
+        }
+        else
+        {
+            fieldBlock = program.FieldBlocks.LastOrDefault(
+                block => string.Equals(block.FieldName, fieldName, StringComparison.OrdinalIgnoreCase));
+        }
 
         EventBlockNode? eventBlock = fieldBlock?.Events.SingleOrDefault(block => block.Event == fieldEvent);
         return eventBlock is null ? [] : [eventBlock];

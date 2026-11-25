@@ -76,15 +76,16 @@ public sealed class RecordValidationResult
     /// </summary>
     /// <remarks>
     /// Keys are canonical <c>metaFields.Name</c> values, or <c>RecordValidator.ValuesKey</c> for a name that
-    /// matches no <c>metaFields</c> row, and are compared ordinally. Keys keep the order the validator
-    /// reported them in, and each list holds one or more messages in the order the checks ran.
+    /// matches no <c>metaFields</c> row, or spells none exactly and is ambiguous between data fields, and are
+    /// compared ordinally. Keys keep the order the validator reported them in, and each list holds one or more
+    /// messages in the order the checks ran.
     /// </remarks>
     public IReadOnlyDictionary<string, IReadOnlyList<string>> FieldErrors { get; }
 
     /// <summary>
     /// The normalised values keyed by canonical field name, in the order they were given; set only when
-    /// <see cref="IsValid"/> is <see langword="true"/>. Lookups ignore letter case, which only makes them
-    /// forgiving, because the keys are canonical and unique without regard to case.
+    /// <see cref="IsValid"/> is <see langword="true"/>. Keys compare ordinally, so a lookup must use the
+    /// canonical spelling; no two keys differ only by letter case, because <see cref="Success"/> rejects that.
     /// </summary>
     public IReadOnlyDictionary<string, FieldValue>? Values { get; }
 
@@ -101,7 +102,10 @@ public sealed class RecordValidationResult
     {
         ArgumentNullException.ThrowIfNull(values);
 
-        var copy = new OrderedDictionary<string, FieldValue>(values.Count, StringComparer.OrdinalIgnoreCase);
+        // The copy compares keys ordinally, as every values map does; the repeat check ignores case, so two keys
+        // differing only by letter case are still rejected, as the validator rejects them in a request.
+        var copy = new OrderedDictionary<string, FieldValue>(values.Count, StringComparer.Ordinal);
+        var seen = new HashSet<string>(values.Count, StringComparer.OrdinalIgnoreCase);
         foreach (var (name, value) in values)
         {
             if (name is null)
@@ -109,12 +113,14 @@ public sealed class RecordValidationResult
                 throw new ArgumentException("A value must be keyed by a field name.", nameof(values));
             }
 
-            if (!copy.TryAdd(name, value))
+            if (!seen.Add(name))
             {
                 throw new ArgumentException(
                     "Each field may be given only once; names are compared without regard to letter case.",
                     nameof(values));
             }
+
+            copy.Add(name, value);
         }
 
         return new RecordValidationResult(
@@ -144,7 +150,8 @@ public sealed class RecordValidationResult
     /// <summary>Returns a field-level failure holding a copy of <paramref name="errors"/>, in its order.</summary>
     /// <param name="errors">
     /// The messages per field, keyed by canonical field name (or <c>RecordValidator.ValuesKey</c> for a name
-    /// that matches no <c>metaFields</c> row), in the order the validator reported them.
+    /// that matches no <c>metaFields</c> row, or spells none exactly and is ambiguous between data fields), in
+    /// the order the validator reported them.
     /// </param>
     /// <exception cref="ArgumentException">
     /// <paramref name="errors"/> is <see langword="null"/> or empty; or an entry has a <see langword="null"/>

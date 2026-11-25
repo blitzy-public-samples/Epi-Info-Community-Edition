@@ -1,3 +1,4 @@
+using System.Collections.ObjectModel;
 using System.Data;
 using System.Data.Common;
 using System.Globalization;
@@ -16,22 +17,37 @@ using Microsoft.Data.SqlClient;
 namespace EpiInfo.Data.Tests.Records;
 
 /// <summary>
-/// Integration tests of the record statements the repository runs, against the seeded forms of the rehearsal
-/// database. These cases pin record identity: every lookup by <c>GlobalRecordId</c>, the locked read before a write
-/// included, matches a stored id exactly, so a spelling that differs from it only by trailing spaces, within or beyond
-/// the column's width, finds no row; and the base-row reads return the id as stored, the spelling every later
-/// statement binds.
+/// Integration tests of the record statements the repository builds and runs, against the seeded forms of the
+/// rehearsal database. The metadata reader supplies every form, page, table and column schema, so each identifier a
+/// statement names is one the catalogue returned. The cases pin two contracts:
+/// <list type="bullet">
+/// <item><description>
+/// The page-row statements the repository sends when it creates and updates a record,
+/// <see cref="RecordSqlBuilder.InsertPage"/> and <see cref="RecordSqlBuilder.UpdatePageColumns"/>: they name writable
+/// columns only, and each column binds only its own field's value.
+/// </description></item>
+/// <item><description>
+/// Record identity: every lookup by <c>GlobalRecordId</c>, the locked read before a write included, matches a stored
+/// id exactly, so a spelling that differs from it only by trailing spaces, within or beyond the column's width, finds
+/// no row; and the base-row reads return the id as stored, the spelling every later statement binds.
+/// </description></item>
+/// </list>
 /// </summary>
 /// <remarks>
-/// The tests only read. The locked read runs in a transaction that is rolled back, and the record they look up is the
-/// seeded row with the lowest <c>UniqueKey</c>, chosen by SQL rather than hard-coded. Failure messages are fixed text,
-/// so no id reaches the output except through an equality assertion.
+/// The tests only read. The reader's commands are all <c>SELECT</c>, and the page-row statements are only built, never
+/// sent. The identity lookups run their locked read in a transaction that is rolled back, and the record they look up
+/// is the seeded row with the lowest <c>UniqueKey</c>, chosen by SQL rather than hard-coded. Their failure messages
+/// are fixed text, so no id reaches the output except through an equality assertion.
 /// </remarks>
 [Collection(DatabaseCollections.Database)]
 [Trait("Category", "Integration")]
-public sealed class SqlRecordRepositoryTests
+public sealed class SqlRecordRepositoryTests : IAsyncLifetime
 {
-    // The fixed operation name every command of these tests reports to the recorder.
+    private const string GlobalRecordId = "3f2504e0-4f89-11d3-9a0c-0305e82c3301";
+    private const string ReadOnlyValue = "R-1";
+    private const double ReadOnlyNumber = 17;
+
+    // The fixed operation name every command of the identity tests reports to the recorder.
     private const string Operation = "test.recordIdentity";
 
     // Trailing spaces that keep the padded id within the seeded nvarchar(255) column.
@@ -39,6 +55,8 @@ public sealed class SqlRecordRepositoryTests
 
     // Trailing spaces that take the padded id beyond the seeded nvarchar(255) column.
     private const int OverWidthPadding = 300;
+
+    private static readonly IReadOnlyDictionary<string, FieldValue> NoValues = new Dictionary<string, FieldValue>();
 
     /// <summary>The seeded forms.</summary>
     public static TheoryData<string> Forms => new() { "CaseReport", "FoodHistory" };
@@ -50,6 +68,282 @@ public sealed class SqlRecordRepositoryTests
         { "CaseReport", OverWidthPadding },
         { "FoodHistory", WithinWidthPadding },
         { "FoodHistory", OverWidthPadding },
+    };
+
+    public Task InitializeAsync() => TestDatabase.EnsureReachableAsync();
+
+    public Task DisposeAsync() => Task.CompletedTask;
+
+    // CaseReport1 holds the seeded read-only data fields StateIDNumber, CDCIDNumber and ReportedToCDCDate
+    // (testdata/sql/03_forms.sql) beside the writable Age and LastName.
+    [Fact]
+    public async Task InsertPage_ReadOnlyField_IsLeftOutOfTheColumnAndParameterLists()
+    {
+        ReaderForm form = await ReaderForm.ReadAsync("CaseReport");
+        PageTableSchema page = form.PageOf(form.Column("Age").Field);
+        IReadOnlyList<ProjectedColumn> pageColumns = form.ColumnsOn(page);
+        IReadOnlyDictionary<string, FieldValue> values = Values(
+            ignoreCase: false,
+            ("Age", FieldValue.FromNumber(5)),
+            ("LastName", FieldValue.FromText("Ada")));
+
+        SqlStatement statement = RecordSqlBuilder.InsertPage(page, GlobalRecordId, pageColumns, values);
+
+        IReadOnlyList<(string Column, SqlParameterValue Parameter)> inserted = PageInsert.Columns(statement);
+        string[] writable = pageColumns
+            .Where(column => !column.Field.Field.IsReadOnly)
+            .Select(column => SqlIdentifier.Quote(column.Column))
+            .ToArray();
+        Assert.Equal(writable.Prepend("[GlobalRecordId]"), inserted.Select(entry => entry.Column));
+        Assert.Equal(writable.Length + 1, statement.Parameters.Count);
+        Assert.All(new[] { "StateIDNumber", "CDCIDNumber", "ReportedToCDCDate" }, name =>
+        {
+            Assert.True(form.Column(name).Field.Field.IsReadOnly);
+            Assert.DoesNotContain("[" + name + "]", statement.Text, StringComparison.Ordinal);
+        });
+        Assert.Equal(GlobalRecordId, inserted[0].Parameter.Value);
+        AssertBound(inserted, "[Age]", 5d);
+        Assert.Equal(
+            "Ada",
+            Assert.Single(
+                inserted,
+                entry => string.Equals(entry.Column, "[LastName]", StringComparison.Ordinal)).Parameter.Value);
+        Assert.All(
+            inserted.Skip(1).Where(entry => entry.Column is not ("[Age]" or "[LastName]")),
+            entry => Assert.Same(DBNull.Value, entry.Parameter.Value));
+    }
+
+    // An in-memory form, whose rows are written to no metadata table, joins the reader's CaseReport page (table
+    // CaseReport1) and FoodHistory page (table FoodHistory2), each with its own seeded Age field and column. The
+    // FoodHistory field is renamed AGE, so Age and AGE are distinct canonical fields whose names differ only by case.
+    // Each column takes only the value keyed by its own field's exact name and the other binds NULL, whether the
+    // caller's map compares keys ordinally or ignoring case.
+    [Theory]
+    [InlineData("Age", 5d, true, 5d, null)]
+    [InlineData("Age", 5d, false, 5d, null)]
+    [InlineData("AGE", 7d, true, null, 7d)]
+    [InlineData("AGE", 7d, false, null, 7d)]
+    public async Task InsertPage_CaseVariantFieldsOnTwoPages_EachColumnBindsOnlyItsExactKey(
+        string submittedName,
+        double submittedValue,
+        bool mapIgnoresCase,
+        double? expectedCaseReportAge,
+        double? expectedFoodHistoryAge)
+    {
+        ReaderForm caseReport = await ReaderForm.ReadAsync("CaseReport");
+        ReaderForm foodHistory = await ReaderForm.ReadAsync("FoodHistory");
+        DataFieldMetadata caseReportAge = caseReport.Column("Age").Field;
+        DataFieldMetadata foodHistoryAge = foodHistory.Column("Age").Field;
+        FormMetadata caseVariantForm = caseReport.Metadata with
+        {
+            Pages = [caseReportAge.Page, foodHistoryAge.Page],
+            Fields = [caseReportAge.Field, foodHistoryAge.Field with { Name = "AGE" }],
+        };
+
+        // Each field resolves against its own form's reader-built schema, the only one that holds its page.
+        ProjectedColumn[] columns = FormDefinitionFactory.GetDataFields(caseVariantForm)
+            .Select((field, ordinal) => RecordSqlBuilder.ResolveDataColumn(
+                field.Page.PageId == caseReportAge.Page.PageId ? caseReport.Schema : foodHistory.Schema,
+                field,
+                ordinal))
+            .ToArray();
+        Assert.Equal(new[] { "Age", "AGE" }, columns.Select(column => column.Field.Name));
+        Assert.Same(caseReport.Column("Age").Column, columns[0].Column);
+        Assert.Same(foodHistory.Column("Age").Column, columns[1].Column);
+
+        IReadOnlyDictionary<string, FieldValue> values =
+            Values(mapIgnoresCase, (submittedName, FieldValue.FromNumber(submittedValue)));
+        Assert.Equal(mapIgnoresCase, values.ContainsKey("age"));
+
+        SqlStatement caseReportRow = RecordSqlBuilder.InsertPage(
+            caseReport.PageOf(columns[0].Field),
+            GlobalRecordId,
+            [columns[0]],
+            values);
+        SqlStatement foodHistoryRow = RecordSqlBuilder.InsertPage(
+            foodHistory.PageOf(columns[1].Field),
+            GlobalRecordId,
+            [columns[1]],
+            values);
+
+        // Both seeded columns are spelled Age, so the two rows differ by their table.
+        Assert.StartsWith("INSERT INTO [CaseReport1] (", caseReportRow.Text, StringComparison.Ordinal);
+        Assert.StartsWith("INSERT INTO [FoodHistory2] (", foodHistoryRow.Text, StringComparison.Ordinal);
+        AssertBound(PageInsert.Columns(caseReportRow), "[Age]", expectedCaseReportAge);
+        AssertBound(PageInsert.Columns(foodHistoryRow), "[Age]", expectedFoodHistoryAge);
+    }
+
+    // A read-only field present in values is refused whether its value is of its type or null: presence is the rule.
+    // Seeded StateIDNumber (CaseReport1) is text and OnsetWeek (FoodHistory2) a number; Age shares each page.
+    [Theory]
+    [InlineData("CaseReport", "StateIDNumber", false)]
+    [InlineData("CaseReport", "StateIDNumber", true)]
+    [InlineData("FoodHistory", "OnsetWeek", false)]
+    [InlineData("FoodHistory", "OnsetWeek", true)]
+    public async Task InsertPage_ValueForReadOnlyField_IsRefused(string formName, string readOnlyField, bool submitNull)
+    {
+        ReaderForm form = await ReaderForm.ReadAsync(formName);
+        ProjectedColumn readOnly = form.Column(readOnlyField);
+        Assert.True(readOnly.Field.Field.IsReadOnly);
+        PageTableSchema page = form.PageOf(readOnly.Field);
+        (FieldValue sample, string sampleText) = SampleValue(readOnly.Field);
+        IReadOnlyDictionary<string, FieldValue> values = Values(
+            ignoreCase: false,
+            ("Age", FieldValue.FromNumber(5)),
+            (readOnlyField, submitNull ? FieldValue.Null : sample));
+
+        ArgumentException failure = Assert.Throws<ArgumentException>(() =>
+            RecordSqlBuilder.InsertPage(page, GlobalRecordId, form.ColumnsOn(page), values));
+
+        Assert.Equal("values", failure.ParamName);
+        Assert.DoesNotContain(sampleText, failure.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(readOnlyField, failure.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("CaseReport", "StateIDNumber")]
+    [InlineData("FoodHistory", "OnsetWeek")]
+    public async Task UpdatePageColumns_ReadOnlyColumn_IsRefusedBeforeAnyStatementIsBuilt(
+        string formName,
+        string readOnlyField)
+    {
+        ReaderForm form = await ReaderForm.ReadAsync(formName);
+        ProjectedColumn readOnly = form.Column(readOnlyField);
+        ProjectedColumn lastName = form.Column("LastName");
+        Assert.True(readOnly.Field.Field.IsReadOnly);
+
+        // Both columns are on one page, so the refusal cannot come from a column foreign to the page.
+        Assert.Equal(readOnly.Field.Page.PageId, lastName.Field.Page.PageId);
+        (FieldValue sample, string sampleText) = SampleValue(readOnly.Field);
+        var submitted = new List<(ProjectedColumn Column, FieldValue Value)>
+        {
+            (lastName, FieldValue.FromText("Ada")),
+            (readOnly, sample),
+        };
+
+        ArgumentException failure = Assert.Throws<ArgumentException>(() =>
+            RecordSqlBuilder.UpdatePageColumns(form.PageOf(readOnly.Field), GlobalRecordId, submitted));
+
+        Assert.Equal("submitted", failure.ParamName);
+        Assert.DoesNotContain(sampleText, failure.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(readOnlyField, failure.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task UpdatePageColumns_WritableColumns_SetOnlyTheSubmittedColumns()
+    {
+        ReaderForm form = await ReaderForm.ReadAsync("CaseReport");
+        ProjectedColumn lastName = form.Column("LastName");
+        var submitted = new List<(ProjectedColumn Column, FieldValue Value)>
+        {
+            (lastName, FieldValue.FromText("Ada")),
+        };
+
+        IReadOnlyList<SqlStatement> statements =
+            RecordSqlBuilder.UpdatePageColumns(form.PageOf(lastName.Field), GlobalRecordId, submitted);
+
+        SqlStatement statement = Assert.Single(statements);
+        Assert.Equal("UPDATE [CaseReport1] SET [LastName] = @p0 WHERE [GlobalRecordId] = @p1", statement.Text);
+        Assert.Equal(new object[] { "Ada", GlobalRecordId }, statement.Parameters.Select(parameter => parameter.Value));
+    }
+
+    // The seeded read-only data fields (testdata/sql/03_forms.sql): StateIDNumber, CDCIDNumber and ReportedToCDCDate
+    // on CaseReport1, and OnsetWeek on FoodHistory2.
+    [Theory]
+    [InlineData("CaseReport", new[] { "StateIDNumber", "CDCIDNumber", "ReportedToCDCDate" })]
+    [InlineData("FoodHistory", new[] { "OnsetWeek" })]
+    public async Task InsertPage_EveryDataColumnOfSeededForm_NamesTheWritableColumnsAndNoReadOnlyOne(
+        string formName,
+        string[] readOnlyFields)
+    {
+        ReaderForm form = await ReaderForm.ReadAsync(formName);
+
+        // Each seeded read-only field is a data field handed to the builder, so its absence below is an exclusion.
+        foreach (string name in readOnlyFields)
+        {
+            Assert.True(form.Column(name).Field.Field.IsReadOnly);
+        }
+
+        var texts = new List<string>();
+        foreach (PageTableSchema page in form.Schema.Pages)
+        {
+            if (page.Table is not { } table)
+            {
+                continue;
+            }
+
+            IReadOnlyList<ProjectedColumn> pageColumns = form.ColumnsOn(page);
+            SqlStatement statement = RecordSqlBuilder.InsertPage(
+                page,
+                RecordSqlBuilder.NewGlobalRecordId(),
+                pageColumns,
+                NoValues);
+
+            IReadOnlyList<(string Column, SqlParameterValue Parameter)> inserted = PageInsert.Columns(statement);
+            IEnumerable<string> expected = pageColumns
+                .Where(column => !column.Field.Field.IsReadOnly)
+                .Select(column => SqlIdentifier.Quote(column.Column))
+                .Prepend(SqlIdentifier.Quote(RecordSqlBuilder.RequirePageKey(table)));
+            Assert.Equal(expected, inserted.Select(entry => entry.Column));
+
+            // Provenance: every bracketed column of the INSERT is a column the reader returned for this page table.
+            Assert.All(inserted, entry =>
+                Assert.Contains(entry.Column, table.Columns.Select(column => SqlIdentifier.Quote(column))));
+            texts.Add(statement.Text);
+        }
+
+        Assert.All(readOnlyFields, name =>
+            Assert.All(texts, text => Assert.DoesNotContain("[" + name + "]", text, StringComparison.Ordinal)));
+        Assert.Contains(texts, text => text.Contains("[LastName]", StringComparison.Ordinal));
+    }
+
+    // The float column's parameter holds the expected number, or DBNull when the field was not submitted.
+    private static void AssertBound(
+        IReadOnlyList<(string Column, SqlParameterValue Parameter)> inserted,
+        string column,
+        double? expected)
+    {
+        SqlParameterValue parameter = Assert.Single(
+            inserted,
+            entry => string.Equals(entry.Column, column, StringComparison.Ordinal)).Parameter;
+        Assert.Equal(DbType.Double, parameter.DbType);
+        if (expected is { } number)
+        {
+            Assert.Equal(number, parameter.Value);
+        }
+        else
+        {
+            Assert.Same(DBNull.Value, parameter.Value);
+        }
+    }
+
+    // A read-only values map keyed by canonical field names, whose lookups compare ordinally or ignore case.
+    private static IReadOnlyDictionary<string, FieldValue> Values(
+        bool ignoreCase,
+        params (string Name, FieldValue Value)[] entries)
+    {
+        var values = new Dictionary<string, FieldValue>(
+            entries.Length,
+            ignoreCase ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
+        foreach ((string name, FieldValue value) in entries)
+        {
+            values.Add(name, value);
+        }
+
+        return new ReadOnlyDictionary<string, FieldValue>(values);
+    }
+
+    // A value of the read-only field's own type with its text, so the refusal rests on the field's presence alone.
+    private static (FieldValue Value, string Text) SampleValue(DataFieldMetadata field) => field.FieldType switch
+    {
+        FieldType.Text => (FieldValue.FromText(ReadOnlyValue), ReadOnlyValue),
+        FieldType.Number => (
+            FieldValue.FromNumber(ReadOnlyNumber),
+            ReadOnlyNumber.ToString(CultureInfo.InvariantCulture)),
+        _ => throw new ArgumentOutOfRangeException(
+            nameof(field),
+            field.FieldType,
+            "The tests sample read-only text and number fields only."),
     };
 
     [Theory]
@@ -185,6 +479,79 @@ public sealed class SqlRecordRepositoryTests
 
     // A base row's stored id and key, as a by-id statement returned them.
     private readonly record struct IdRow(string GlobalRecordId, int UniqueKey);
+
+    /// <summary>
+    /// A seeded form exactly as the metadata reader returns it: its metadata, its catalogue schema and the
+    /// reader-built column of each data field, in storage order.
+    /// </summary>
+    private sealed class ReaderForm
+    {
+        private ReaderForm(FormMetadata metadata, FormSchema schema, IReadOnlyList<ProjectedColumn> dataColumns)
+        {
+            Metadata = metadata;
+            Schema = schema;
+            DataColumns = dataColumns;
+        }
+
+        public FormMetadata Metadata { get; }
+
+        public FormSchema Schema { get; }
+
+        public IReadOnlyList<ProjectedColumn> DataColumns { get; }
+
+        /// <summary>
+        /// Finds the form named <paramref name="formName"/> through <c>ListFormsAsync</c> and reads its metadata and
+        /// schema with <c>ReadFormAsync</c>, both of which issue only <c>SELECT</c>.
+        /// </summary>
+        public static async Task<ReaderForm> ReadAsync(string formName)
+        {
+            var options = new DatabaseOptions(TestDatabase.ConnectionString);
+            var reader = new SqlMetadataReader(
+                new SqlConnectionFactory(options),
+                options,
+                NullSqlCommandObserver.Instance);
+            IReadOnlyList<FormSummary> forms = await reader.ListFormsAsync(CancellationToken.None);
+            FormSummary summary = Assert.Single(
+                forms,
+                form => string.Equals(form.Name, formName, StringComparison.Ordinal));
+
+            (FormMetadata Form, FormSchema Schema)? read;
+            await using (SqlConnection connection = await TestDatabase.OpenConnectionAsync())
+            {
+                read = await reader.ReadFormAsync(
+                    connection,
+                    transaction: null,
+                    summary.ViewId,
+                    CancellationToken.None);
+            }
+
+            Assert.NotNull(read);
+            (FormMetadata metadata, FormSchema schema) = read.Value;
+            ProjectedColumn[] dataColumns = FormDefinitionFactory.GetDataFields(metadata)
+                .Select((field, ordinal) => RecordSqlBuilder.ResolveDataColumn(schema, field, ordinal))
+                .ToArray();
+            return new ReaderForm(metadata, schema, dataColumns);
+        }
+
+        /// <summary>
+        /// The reader-built column of the data field whose canonical name is exactly <paramref name="name"/>.
+        /// </summary>
+        public ProjectedColumn Column(string name) =>
+            Assert.Single(DataColumns, column => string.Equals(column.Field.Name, name, StringComparison.Ordinal));
+
+        /// <summary>The reader-built page of this form that holds <paramref name="field"/>, with its table.</summary>
+        public PageTableSchema PageOf(DataFieldMetadata field)
+        {
+            PageTableSchema? page = Schema.FindPage(field.Page.PageId);
+            Assert.NotNull(page);
+            Assert.NotNull(page.Table);
+            return page;
+        }
+
+        /// <summary>The data-field columns on <paramref name="page"/>, in storage order.</summary>
+        public IReadOnlyList<ProjectedColumn> ColumnsOn(PageTableSchema page) =>
+            DataColumns.Where(column => column.Field.Page.PageId == page.Page.PageId).ToArray();
+    }
 
     // One seeded form opened for the record statements: its reader-built schema and data fields, an open connection,
     // and the stored id and key of its seeded row with the lowest UniqueKey.
@@ -342,6 +709,34 @@ public sealed class SqlRecordRepositoryTests
 
             return result.AsReadOnly();
         }
+    }
+}
+
+/// <summary>Reads the column list of a page <c>INSERT</c> together with the parameter bound to each column.</summary>
+internal static class PageInsert
+{
+    private const string ColumnListStart = " (";
+    private const string ValuesClause = ") VALUES (";
+
+    /// <summary>
+    /// Pairs each quoted column of <c>INSERT INTO [t] ([a], [b]) VALUES (@p0, @p1)</c> with its parameter, after
+    /// checking that the statement binds exactly the parameters its value list names, in that order.
+    /// </summary>
+    public static IReadOnlyList<(string Column, SqlParameterValue Parameter)> Columns(SqlStatement statement)
+    {
+        string text = statement.Text;
+        int columnsAt = text.IndexOf(ColumnListStart, StringComparison.Ordinal);
+        int valuesAt = text.IndexOf(ValuesClause, StringComparison.Ordinal);
+        Assert.StartsWith("INSERT INTO ", text, StringComparison.Ordinal);
+        Assert.EndsWith(")", text, StringComparison.Ordinal);
+        Assert.InRange(columnsAt, 0, valuesAt);
+
+        string[] columns = text[(columnsAt + ColumnListStart.Length)..valuesAt].Split(", ");
+        string[] names = text[(valuesAt + ValuesClause.Length)..^1].Split(", ");
+        Assert.Equal(names, statement.Parameters.Select(parameter => parameter.Name));
+        Assert.Equal(columns.Length, names.Length);
+
+        return columns.Zip(statement.Parameters, (column, parameter) => (Column: column, Parameter: parameter)).ToArray();
     }
 }
 

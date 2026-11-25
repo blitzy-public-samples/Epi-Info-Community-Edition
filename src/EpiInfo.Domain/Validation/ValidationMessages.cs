@@ -39,6 +39,15 @@ public static class ValidationMessages
     /// </summary>
     public const string UnknownValuesName = "values holds a name that is not a field of the form.";
 
+    /// <summary>
+    /// Unknown-field check: the message under <see cref="RecordValidator.ValuesKey"/> for a submitted name that spells
+    /// no <c>metaFields</c> row exactly, data field or not, and equals two or more distinct data-field names when
+    /// letter case is ignored, as <c>age</c> equals both <c>Age</c> and <c>AGE</c>. The text is fixed and names
+    /// nothing that was submitted.
+    /// </summary>
+    public const string AmbiguousValuesName =
+        "values holds a name that matches more than one field when letter case is ignored.";
+
     /// <summary>Unknown-field check: two keys name the same field when letter case is ignored.</summary>
     public const string DuplicateField =
         "This field is given more than once; field names are matched without regard to letter case.";

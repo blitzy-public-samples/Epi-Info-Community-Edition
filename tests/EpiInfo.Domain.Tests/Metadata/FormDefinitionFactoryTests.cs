@@ -11,7 +11,8 @@ namespace EpiInfo.Domain.Tests.Metadata;
 /// <summary>
 /// Unit tests of <see cref="FormDefinitionFactory"/>, the one owner of form-definition assembly, group members and
 /// the data-field set: page and field order, which <c>metaFields</c> rows a page lists, the data-field counts of the
-/// seeded forms, validation, options, members and pass-through values.
+/// seeded forms, validation, options, members and pass-through values; and the read-only copies
+/// <see cref="FormMetadata"/> takes of the lists it is assembled from.
 /// </summary>
 /// <remarks>
 /// The seeded forms are rebuilt from <c>testdata/forms.json</c>, read by path. That file holds only the page-table
@@ -531,6 +532,7 @@ public sealed class FormDefinitionFactoryTests
         Assert.False(dataFields.TryGet(name, out DataFieldMetadata? field));
         Assert.Null(field);
         Assert.Null(dataFields.Find(name));
+        Assert.False(dataFields.IsAmbiguous(name));
     }
 
     [Fact]
@@ -546,6 +548,64 @@ public sealed class FormDefinitionFactoryTests
         DataFieldMetadata? found = dataFields.Find("LASTNAME");
         Assert.NotNull(found);
         Assert.Same(lastName, found);
+    }
+
+    /// <summary>
+    /// <c>Age</c> on page 1 and <c>AGE</c> on page 2 are two data fields: each exact spelling resolves to its own
+    /// field. Any other spelling equals both ignoring case, so it is ambiguous and resolves to neither; storage order
+    /// never picks one.
+    /// </summary>
+    [Theory]
+    [InlineData("Age", 11)]
+    [InlineData("AGE", 21)]
+    [InlineData("age", null)]
+    [InlineData("aGE", null)]
+    public void DataFieldSet_CaseVariantNames_ResolveOnlyTheirExactSpellings(string name, int? expectedFieldId)
+    {
+        DataFieldSet dataFields = FormDefinitionFactory.GetDataFields(CaseVariantForm(groupList: "Age,AGE"));
+
+        Assert.Equal(["Age", "AGE"], dataFields.Select(field => field.Name));
+        Assert.Equal(expectedFieldId is not null, dataFields.TryGet(name, out DataFieldMetadata? field));
+        Assert.Equal(expectedFieldId, field?.Field.FieldId);
+        Assert.Same(field, dataFields.Find(name));
+        Assert.Equal(expectedFieldId is null, dataFields.IsAmbiguous(name));
+    }
+
+    /// <summary>
+    /// A name equal ignoring case to one distinct canonical spelling only is not ambiguous, however many fields repeat
+    /// that spelling exactly: <c>lastname</c> resolves to the seeded <c>LastName</c>, and every case of <c>age</c> to
+    /// the first in storage order of two fields both spelled <c>Age</c>. Null, empty and unknown names are not
+    /// ambiguous either.
+    /// </summary>
+    [Fact]
+    public void DataFieldSet_NameWithOneDistinctSpelling_ResolvesAndIsNotAmbiguous()
+    {
+        DataFieldSet seeded = FormDefinitionFactory.GetDataFields(SeededForm("FoodHistory"));
+        Assert.Equal("LastName", seeded.Find("lastname")?.Name);
+        Assert.False(seeded.IsAmbiguous("lastname"));
+        Assert.False(seeded.IsAmbiguous("LastName"));
+
+        DataFieldSet repeated = FormDefinitionFactory.GetDataFields(new FormMetadata(
+            11,
+            "Repeated",
+            "Repeated",
+            [new PageMetadata(PageId, "Page 1", 0, "Repeated1"), new PageMetadata(2, "Page 2", 1, "Repeated2")],
+            [
+                Field(21, "Age", "Number", pageId: 2, tabIndex: 1, sqlType: "float"),
+                Field(11, "Age", "Number", tabIndex: 1, sqlType: "float"),
+            ]));
+
+        Assert.Equal([11, 21], repeated.Select(field => field.Field.FieldId));
+        foreach (string name in new[] { "Age", "age", "AGE" })
+        {
+            Assert.True(repeated.TryGet(name, out DataFieldMetadata? field));
+            Assert.Equal(11, field.Field.FieldId);
+            Assert.False(repeated.IsAmbiguous(name));
+        }
+
+        Assert.False(repeated.IsAmbiguous(null!));
+        Assert.False(repeated.IsAmbiguous(string.Empty));
+        Assert.False(repeated.IsAmbiguous("NoSuchField"));
     }
 
     /// <summary>
@@ -709,8 +769,9 @@ public sealed class FormDefinitionFactoryTests
     }
 
     /// <summary>
-    /// Each <c>List</c> entry is trimmed and resolved, ignoring case, to a field the definition lists; unknown names,
-    /// system rows, repeats and the group itself are dropped, and a group with no list has no members.
+    /// Each <c>List</c> entry is trimmed and resolved to a field the definition lists, the exact spelling first, else
+    /// ignoring case; unknown names, system rows, repeats and the group itself are dropped, and a group with no list
+    /// has no members.
     /// </summary>
     [Fact]
     public void Create_GroupList_ResolvesListedFieldsOnly()
@@ -730,6 +791,63 @@ public sealed class FormDefinitionFactoryTests
         IReadOnlyList<string>? empty = FieldNamed(definition, "Empty").Members;
         Assert.NotNull(empty);
         Assert.Empty(empty);
+    }
+
+    /// <summary>
+    /// A <c>List</c> entry resolves to the listed field spelled exactly so, so <c>Age</c> is the page-1 data field
+    /// and not the label <c>age</c> listed before it. An entry with no exact match that equals the distinct spellings
+    /// of two data fields ignoring case, as <c>aGE</c> equals <c>Age</c> and <c>AGE</c>, is ambiguous and dropped, so
+    /// the label <c>age</c>, the first listed field equal to it ignoring case, never takes it either. Any other entry
+    /// with no exact match, such as <c>EMPTY</c> or <c>blank</c>, resolves to the first listed field in metadata order
+    /// equal to it ignoring case. Unknown names, system rows, the group itself, empty entries and a second entry
+    /// resolving to a row already taken are dropped. The form definition's <c>members</c> are the names of exactly
+    /// these rows.
+    /// </summary>
+    [Theory]
+    [InlineData("Age", new[] { 11 })]
+    [InlineData("AGE", new[] { 21 })]
+    [InlineData("age", new[] { 10 })]
+    [InlineData("aGE", new int[0])]
+    [InlineData("aGE,Age", new[] { 11 })]
+    [InlineData("EMPTY,blank", new[] { 13, 14 })]
+    [InlineData(" Age ,AGE,age,NoSuchField,GlobalRecordId,Ages,,AGE,aGE,Age", new[] { 11, 21, 10 })]
+    public void GetGroupMembers_ResolvesEachEntryExactFirstThenIgnoringCase(string groupList, int[] expectedFieldIds)
+    {
+        FormMetadata form = CaseVariantForm(groupList);
+        FieldMetadata group = Assert.Single(form.Fields, field => field.Name == "Ages");
+
+        IReadOnlyList<FieldMetadata> members = FormDefinitionFactory.GetGroupMembers(form, group);
+
+        Assert.Equal(expectedFieldIds, members.Select(member => member.FieldId));
+        Assert.All(members, member => Assert.Contains(member, form.Fields));
+        Assert.Equal(members.Select(member => member.Name), FieldNamed(Create(form), "Ages").Members);
+    }
+
+    /// <summary>
+    /// Only a group has members: a label carrying a <c>List</c>, a data field, and groups whose <c>List</c> is null or
+    /// holds only empty entries all resolve to none.
+    /// </summary>
+    [Theory]
+    [InlineData("age")]
+    [InlineData("Age")]
+    [InlineData("Empty")]
+    [InlineData("Blank")]
+    public void GetGroupMembers_RowOtherThanAGroupWithEntries_HasNone(string name)
+    {
+        FormMetadata form = CaseVariantForm(groupList: "Age,AGE");
+        FieldMetadata row = Assert.Single(form.Fields, field => field.Name == name);
+
+        Assert.Empty(FormDefinitionFactory.GetGroupMembers(form, row));
+    }
+
+    [Fact]
+    public void GetGroupMembers_NullArgument_IsRejected()
+    {
+        FormMetadata form = CaseVariantForm(groupList: "Age,AGE");
+        FieldMetadata group = Assert.Single(form.Fields, field => field.Name == "Ages");
+
+        Assert.Throws<ArgumentNullException>("form", () => FormDefinitionFactory.GetGroupMembers(null!, group));
+        Assert.Throws<ArgumentNullException>("group", () => FormDefinitionFactory.GetGroupMembers(form, null!));
     }
 
     [Theory]
@@ -1171,23 +1289,53 @@ public sealed class FormDefinitionFactoryTests
         Assert.Equal([TextOption("U-Unknown"), TextOption("F-Female"), TextOption("M-Male")], field.Options);
     }
 
-    [Fact]
-    public void Create_LegalValuesKey_MatchesTheFieldNameIgnoringCase()
+    /// <summary>
+    /// <c>Choice</c> (page 1) and <c>CHOICE</c> (page 2) are two Legal Values fields whose names differ only by letter
+    /// case. In an ordinal map each takes only the entry keyed by its exact canonical name, and gets an empty list
+    /// without one, so neither is ever given the other's code table; a key in a third spelling belongs to neither.
+    /// </summary>
+    [Theory]
+    [InlineData("Choice,CHOICE", "A-Alpha,B-Beta", "Z-Zulu")]
+    [InlineData("Choice", "A-Alpha,B-Beta", "")]
+    [InlineData("CHOICE", "", "Z-Zulu")]
+    [InlineData("choice", "", "")]
+    public void Create_CaseVariantLegalValuesFields_EachGetsOnlyTheEntryOfItsExactName(
+        string configuredKeys,
+        string expectedChoice,
+        string expectedUpperChoice)
     {
-        Dictionary<string, IReadOnlyList<FieldOption>> options = new(StringComparer.Ordinal)
+        Dictionary<string, IReadOnlyList<FieldOption>> codeTables = new(StringComparer.Ordinal)
         {
-            ["sex"] = [TextOption("F-Female")],
+            ["Choice"] = [TextOption("A-Alpha"), TextOption("B-Beta")],
+            ["CHOICE"] = [TextOption("Z-Zulu")],
+            ["choice"] = [TextOption("C-Other")],
         };
-        FormMetadata form = SinglePageForm(
-            Field(1, "Sex", "Legal Values", tabIndex: 1, sqlType: "nvarchar(255)"),
-            Field(2, "Uncoded", "Legal Values", tabIndex: 2, sqlType: "nvarchar(255)"));
+        Dictionary<string, IReadOnlyList<FieldOption>> options = new(StringComparer.Ordinal);
+        foreach (string key in configuredKeys.Split(','))
+        {
+            options.Add(key, codeTables[key]);
+        }
+
+        FormMetadata form = new(
+            11,
+            "LegalValuesCase",
+            "LegalValuesCase",
+            [
+                new PageMetadata(PageId, "Page 1", 0, "LegalValuesCase1"),
+                new PageMetadata(2, "Page 2", 1, "LegalValuesCase2"),
+            ],
+            [
+                Field(1, "Choice", "Legal Values", tabIndex: 1, sqlType: "nvarchar(255)"),
+                Field(2, "CHOICE", "Legal Values", pageId: 2, tabIndex: 1, sqlType: "nvarchar(255)"),
+            ]);
 
         FormDefinition definition = Create(form, options);
 
-        Assert.Equal([TextOption("F-Female")], FieldNamed(definition, "Sex").Options);
-        IReadOnlyList<FieldOption>? uncoded = FieldNamed(definition, "Uncoded").Options;
-        Assert.NotNull(uncoded);
-        Assert.Empty(uncoded);
+        Assert.Equal(Texts(expectedChoice), FieldNamed(definition, "Choice").Options);
+        Assert.Equal(Texts(expectedUpperChoice), FieldNamed(definition, "CHOICE").Options);
+
+        static FieldOption[] Texts(string texts) =>
+            Array.ConvertAll(texts.Split(',', StringSplitOptions.RemoveEmptyEntries), TextOption);
     }
 
     [Fact]
@@ -1256,6 +1404,119 @@ public sealed class FormDefinitionFactoryTests
         Assert.Throws<ArgumentNullException>("form", () => FormDefinitionFactory.GetDataFields(null!));
     }
 
+    /// <summary>
+    /// The metadata keeps its own read-only copies of the lists it is given, by its constructor or by a
+    /// <see langword="with"/> expression, so a caller that later replaces or adds rows in its own lists changes
+    /// neither the lookups nor the form definition and data fields assembled from the metadata.
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void FormMetadata_CallerListsChangedAfterBuilding_ChangeNoLookupOrAssembly(bool throughWith)
+    {
+        List<PageMetadata> pages = [new PageMetadata(PageId, "Page 1", 0, $"Synthetic{PageId}")];
+        List<FieldMetadata> fields = [Field(1, "Name", "Text", tabIndex: 1, sqlType: "nvarchar(255)")];
+        FormMetadata form = throughWith
+            ? SinglePageForm() with { Pages = pages, Fields = fields }
+            : new FormMetadata(9, "Synthetic", "Synthetic", pages, fields);
+
+        pages[0] = new PageMetadata(2, "Replaced", 0, "Synthetic2");
+        pages.Add(new PageMetadata(3, "Added", 1, "Synthetic3"));
+        fields[0] = Field(2, "Replaced", "Text", pageId: 2, tabIndex: 1, sqlType: "nvarchar(255)");
+        fields.Add(Field(3, "Added", "Text", pageId: 3, tabIndex: 1, sqlType: "nvarchar(255)"));
+
+        Assert.NotSame(pages, form.Pages);
+        Assert.NotSame(fields, form.Fields);
+        Assert.Equal([PageId], form.Pages.Select(page => page.PageId));
+        Assert.Equal(["Name"], form.Fields.Select(field => field.Name));
+        Assert.Equal("Page 1", form.FindPage(PageId)?.Name);
+        Assert.Null(form.FindPage(2));
+        Assert.Null(form.FindPage(3));
+        Assert.Equal("Name", form.FindField("NAME")?.Name);
+        Assert.Null(form.FindField("Replaced"));
+        Assert.Null(form.FindField("Added"));
+
+        PageDefinition page = Assert.Single(Create(form).Pages);
+        Assert.Equal(PageId, page.PageId);
+        Assert.Equal(["Name"], page.Fields.Select(field => field.Name));
+        Assert.Equal(["Name"], FormDefinitionFactory.GetDataFields(form).Select(field => field.Name));
+    }
+
+    /// <summary>
+    /// Neither exposed list can be cast back to a writable one: every change through <see cref="IList{T}"/> is
+    /// refused, the rows are untouched and the metadata still assembles the same definition.
+    /// </summary>
+    [Fact]
+    public void FormMetadata_ExposedLists_CannotBeCastBackAndChanged()
+    {
+        FormMetadata form = SeededForm("CaseReport");
+        int[] pageIds = form.Pages.Select(page => page.PageId).ToArray();
+        string[] fieldNames = form.Fields.Select(field => field.Name).ToArray();
+
+        AssertCannotBeChanged(form.Pages, new PageMetadata(999, "Extra", 999, "CaseReport999"));
+        AssertCannotBeChanged(form.Fields, Field(999, "Extra", "Text", tabIndex: 999, sqlType: "nvarchar(255)"));
+
+        Assert.Equal(pageIds, form.Pages.Select(page => page.PageId));
+        Assert.Equal(fieldNames, form.Fields.Select(field => field.Name));
+        Assert.Null(form.FindPage(999));
+        Assert.Null(form.FindField("Extra"));
+        Assert.Equal(43, FormDefinitionFactory.GetDataFields(form).Count);
+    }
+
+    [Theory]
+    [InlineData(nameof(FormMetadata.Pages), false)]
+    [InlineData(nameof(FormMetadata.Fields), false)]
+    [InlineData(nameof(FormMetadata.Pages), true)]
+    [InlineData(nameof(FormMetadata.Fields), true)]
+    public void FormMetadata_NullList_IsRejectedNamingIt(string list, bool throughWith)
+    {
+        Assert.Throws<ArgumentNullException>(list, () => BuildWithInvalidList(list, throughWith, nullRow: false));
+    }
+
+    [Theory]
+    [InlineData(nameof(FormMetadata.Pages), false)]
+    [InlineData(nameof(FormMetadata.Fields), false)]
+    [InlineData(nameof(FormMetadata.Pages), true)]
+    [InlineData(nameof(FormMetadata.Fields), true)]
+    public void FormMetadata_NullRow_IsRejectedNamingItsList(string list, bool throughWith)
+    {
+        Assert.Throws<ArgumentException>(list, () => BuildWithInvalidList(list, throughWith, nullRow: true));
+    }
+
+    // Builds metadata, by the constructor or by a with expression, whose list named by invalidList is null or, with
+    // nullRow, holds a null row after a valid one.
+    private static FormMetadata BuildWithInvalidList(string invalidList, bool throughWith, bool nullRow)
+    {
+        PageMetadata page = new(PageId, "Page 1", 0, $"Synthetic{PageId}");
+        FieldMetadata field = Field(1, "Name", "Text", tabIndex: 1, sqlType: "nvarchar(255)");
+        IReadOnlyList<PageMetadata> pages = invalidList == nameof(FormMetadata.Pages) ? Invalid(page) : [page];
+        IReadOnlyList<FieldMetadata> fields = invalidList == nameof(FormMetadata.Fields) ? Invalid(field) : [field];
+
+        return throughWith
+            ? SinglePageForm(field) with { Pages = pages, Fields = fields }
+            : new FormMetadata(9, "Synthetic", "Synthetic", pages, fields);
+
+        IReadOnlyList<T> Invalid<T>(T row)
+            where T : class => nullRow ? [row, null!] : null!;
+    }
+
+    private static void AssertCannotBeChanged<T>(IReadOnlyList<T> rows, T row)
+        where T : class
+    {
+        IList<T> list = Assert.IsAssignableFrom<IList<T>>(rows);
+        T first = list[0];
+        int count = list.Count;
+
+        Assert.True(list.IsReadOnly);
+        Assert.Throws<NotSupportedException>(() => list[0] = row);
+        Assert.Throws<NotSupportedException>(() => list.Add(row));
+        Assert.Throws<NotSupportedException>(() => list.Insert(0, row));
+        Assert.Throws<NotSupportedException>(() => list.RemoveAt(0));
+        Assert.Throws<NotSupportedException>(list.Clear);
+        Assert.Same(first, rows[0]);
+        Assert.Equal(count, rows.Count);
+    }
+
     private static FormDefinition Create(
         FormMetadata form,
         IReadOnlyDictionary<string, IReadOnlyList<FieldOption>>? legalValueOptions = null) =>
@@ -1274,6 +1535,28 @@ public sealed class FormDefinitionFactoryTests
 
     private static FormMetadata SinglePageForm(params FieldMetadata[] fields) =>
         new(9, "Synthetic", "Synthetic", [new PageMetadata(PageId, "Page 1", 0, $"Synthetic{PageId}")], fields);
+
+    /// <summary>
+    /// Two pages whose data fields <c>Age</c> (page 1, number, field 11) and <c>AGE</c> (page 2, text, field 21) differ
+    /// only by letter case. The metadata lists, in this order, the page-1 label <c>age</c> (field 10, carrying a
+    /// <c>List</c>), <c>AGE</c>, <c>Age</c>, the group <c>Ages</c> whose <c>List</c> is <paramref name="groupList"/>,
+    /// a group <c>Empty</c> with no list, a group <c>Blank</c> whose list holds only empty entries, and the system
+    /// rows.
+    /// </summary>
+    private static FormMetadata CaseVariantForm(string groupList) => new(
+        10,
+        "CaseVariant",
+        "CaseVariant",
+        [new PageMetadata(PageId, "Page 1", 0, "CaseVariant1"), new PageMetadata(2, "Page 2", 1, "CaseVariant2")],
+        [
+            Field(10, "age", "Label/Title", tabIndex: 1, list: "Age,AGE"),
+            Field(21, "AGE", "Text", pageId: 2, tabIndex: 1, sqlType: "nvarchar(255)"),
+            Field(11, "Age", "Number", tabIndex: 2, sqlType: "float"),
+            Field(12, "Ages", "Group", tabIndex: 3, list: groupList),
+            Field(13, "Empty", "Group", tabIndex: 4),
+            Field(14, "Blank", "Group", tabIndex: 5, list: " , ,"),
+            .. SystemRows(firstFieldId: 1, withBaseTableColumns: false),
+        ]);
 
     /// <summary>
     /// A <c>metaFields</c> row of a seeded type. <paramref name="sqlType"/> names its page-table column in the

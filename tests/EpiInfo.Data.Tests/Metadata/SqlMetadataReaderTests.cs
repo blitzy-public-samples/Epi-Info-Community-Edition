@@ -14,8 +14,8 @@ namespace EpiInfo.Data.Tests.Metadata;
 /// <summary>
 /// Integration tests of <see cref="SqlMetadataReader"/> against the rehearsal database. Every expected value comes
 /// from a direct query on a separate verification connection, never from the reader. The tests only read: they send
-/// no DDL or DML, take no <c>DatabaseWriteLock</c>, and build any synthetic field in memory, so no metadata row is
-/// written.
+/// no DDL or DML, take no <c>DatabaseWriteLock</c>, and build any synthetic field or form in memory, so no metadata
+/// row is written.
 /// </summary>
 [Trait("Category", "Integration")]
 [Collection(DatabaseCollections.Database)]
@@ -27,6 +27,14 @@ public sealed class SqlMetadataReaderTests : IAsyncLifetime
     // the catalogue spells the column loosestoolsperday.
     private const string LooseStoolsTable = "codeloosestoolsperday";
     private const string LooseStoolsTextColumn = "LooseStoolsPerDay";
+
+    // Two seeded code tables with nvarchar(255) text columns and no text in common (testdata/sql/04_code_tables.sql):
+    // the administrative-sex table of FoodHistory's Legal Values field Sex, and the state table, named exactly as the
+    // catalogue spells them.
+    private const string SexTable = "codephvs_administrativesex_hl7_2x";
+    private const string SexColumn = "phvs_administrativesex_hl7_2x";
+    private const string StateTable = "codestate";
+    private const string StateColumn = "State";
 
     private static readonly TimeSpan TestTimeout = TimeSpan.FromSeconds(60);
 
@@ -133,6 +141,60 @@ public sealed class SqlMetadataReaderTests : IAsyncLifetime
         Assert.Empty(recorder.Writes());
         Assert.Empty(recorder.Commands);
     }
+
+    /// <summary>
+    /// <c>Choice</c> (page 1) and <c>CHOICE</c> (page 2) are Legal Values fields whose names differ only by letter
+    /// case and that name different code tables. Each key holds the rows of its own field's code table, read directly
+    /// here, and the map compares keys ordinally, so no spelling but the exact one finds either list.
+    /// </summary>
+    [Fact]
+    public async Task GetOptionsAsync_CaseVariantLegalValuesFields_EachKeyHoldsItsOwnCodeTable()
+    {
+        using var cancellation = new CancellationTokenSource(TestTimeout);
+        CancellationToken token = cancellation.Token;
+        var recorder = new SqlCommandRecorder();
+        SqlMetadataReader reader = CreateReader(recorder);
+        await using SqlConnection verification = await TestDatabase.OpenConnectionAsync(token);
+
+        var form = new FormMetadata(
+            ViewId: 9101,
+            Name: "LegalValuesCase",
+            BaseTableName: "LegalValuesCase",
+            Pages:
+            [
+                new PageMetadata(1, "Page 1", 0, "LegalValuesCase1"),
+                new PageMetadata(2, "Page 2", 1, "LegalValuesCase2"),
+            ],
+            Fields:
+            [
+                CaseVariantLegalValuesField(1, "Choice", pageId: 1, SexTable, SexColumn),
+                CaseVariantLegalValuesField(2, "CHOICE", pageId: 2, StateTable, StateColumn),
+            ]);
+        IReadOnlyList<string?> sexRows = await ReadColumnAsync(verification, SexTable, SexColumn, token);
+        IReadOnlyList<string?> stateRows = await ReadColumnAsync(verification, StateTable, StateColumn, token);
+
+        // Preconditions on the seed: both tables hold rows, each row is non-blank and distinct even ignoring case, so
+        // every row is an option, and no text is in both tables, so a shared list cannot pass for either table's.
+        Assert.All(new[] { sexRows, stateRows }, rows =>
+        {
+            Assert.NotEmpty(rows);
+            Assert.All(rows, text => Assert.False(string.IsNullOrWhiteSpace(text)));
+            Assert.Equal(rows.Count, rows.Distinct(StringComparer.OrdinalIgnoreCase).Count());
+        });
+        Assert.Empty(sexRows.Intersect(stateRows, StringComparer.OrdinalIgnoreCase));
+
+        IReadOnlyDictionary<string, IReadOnlyList<FieldOption>> options = await reader.GetOptionsAsync(form, token);
+
+        Assert.Equal(["CHOICE", "Choice"], options.Keys.Order(StringComparer.Ordinal));
+        AssertOptionsAre(sexRows, options["Choice"]);
+        AssertOptionsAre(stateRows, options["CHOICE"]);
+        Assert.False(options.ContainsKey("choice"));
+        Assert.False(options.TryGetValue("cHOICE", out _));
+        Assert.True(recorder.AnyCommandTextContains("[" + SexTable + "]"));
+        Assert.True(recorder.AnyCommandTextContains("[" + StateTable + "]"));
+        Assert.Empty(recorder.Writes());
+    }
+
 
     // The seeded loosestoolsperday texts in two cultures' string sort. The empty name is the invariant culture, which
     // ranks "-" before "0", so "1-3" comes first. Thai collation ignores punctuation, so it compares "10+" as 10 and
@@ -299,6 +361,37 @@ public sealed class SqlMetadataReaderTests : IAsyncLifetime
         TextColumnName = LooseStoolsTextColumn,
         Sort = sort,
     };
+
+    // An in-memory Legal Values row on an nvarchar(255) page-table column, naming its code table and text column.
+    private static FieldMetadata CaseVariantLegalValuesField(
+        int fieldId,
+        string name,
+        int pageId,
+        string table,
+        string column) =>
+        new()
+        {
+            FieldId = fieldId,
+            Name = name,
+            FieldTypeId = 17,
+            FieldTypeName = LegalValuesTypeName,
+            TabIndex = 1,
+            PageId = pageId,
+            SourceTableName = table,
+            CodeColumnName = column,
+            TextColumnName = column,
+            Column = FieldTypeMapper.DescribeColumn(name, "nvarchar", 510),
+        };
+
+    // The code-table rows arrive in the database's own unsorted order, which no second read is promised to repeat, so
+    // the texts are compared as a set; each option's value and label are the stored text.
+    private static void AssertOptionsAre(IReadOnlyList<string?> rows, IReadOnlyList<FieldOption> options)
+    {
+        Assert.Equal(
+            rows.Order(StringComparer.Ordinal),
+            options.Select(option => option.Label).Order(StringComparer.Ordinal));
+        Assert.All(options, option => Assert.Equal(FieldValue.FromText(option.Label), option.Value));
+    }
 
     private static async Task<int> ViewIdAsync(SqlConnection connection, string formName, CancellationToken token)
     {

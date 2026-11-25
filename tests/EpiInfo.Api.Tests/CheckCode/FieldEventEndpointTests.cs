@@ -1,21 +1,29 @@
+using System.Collections.ObjectModel;
+using System.Globalization;
 using System.Net;
 using System.Text;
 using System.Text.Json;
+using EpiInfo.Api.Contracts;
 using EpiInfo.Api.Endpoints;
 using EpiInfo.Api.Errors;
 using EpiInfo.Api.Json;
 using EpiInfo.Api.Services;
 using EpiInfo.Api.Tests.Infrastructure;
 using EpiInfo.CheckCode;
+using EpiInfo.Domain.Events;
+using EpiInfo.Domain.Forms;
 using EpiInfo.Domain.Metadata;
 using EpiInfo.Domain.Storage;
 using EpiInfo.Domain.Validation;
+using EpiInfo.Domain.Values;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Http.HttpResults;
 using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace EpiInfo.Api.Tests.CheckCode;
 
@@ -636,4 +644,384 @@ public sealed class FieldEventEndpointTests
             _timeout.Dispose();
         }
     }
+}
+
+/// <summary>
+/// The identity of the field-event <c>values</c> keys of <c>POST /api/forms/{viewId}/checkcode/field-event</c>
+/// (AAP 0.3.5, "Stateless field-event flow"): every key must be a data field of the form and every value must have
+/// its wire type, and nothing else is checked. A key names the data field <see cref="DataFieldSet.TryGet"/> resolves
+/// it to, so two data fields whose canonical names differ only by letter case are two fields, each typed for its own
+/// type, while two keys that resolve to one field name it twice. <c>fieldName</c> likewise names one field shown on a
+/// page of the form, and the engine runs that field's block only.
+/// </summary>
+/// <remarks>
+/// The class needs no database and no host: it runs <see cref="ValuesReader"/> and <see cref="FieldEventService"/>
+/// directly, the service over <see cref="FakeDataStore"/> and the real <see cref="CheckCodeEngine"/>. It carries no
+/// <c>Integration</c> trait and joins no database collection, so <c>--filter "Category!=Integration"</c> selects it.
+/// The "two keys differing only by case are a 400" rule of AAP 0.3.4.5 belongs to record writes, not to field events.
+/// </remarks>
+public sealed class FieldEventValuesTests
+{
+    private const string CaseVariantFormName = "CaseVariant";
+
+    private const string SingleAgeFormName = "SingleAge";
+
+    private const int CaseVariantViewId = 9101;
+
+    private const int SingleAgeViewId = 9102;
+
+    private const int AgeLastViewId = 9103;
+
+    private const int PagelessVariantViewId = 9104;
+
+    // A page id no form of this class has.
+    private const int OffFormPageId = 999999;
+
+    private const int TextTypeId = 1;
+
+    private const int NumberTypeId = 5;
+
+    // The two canonical names of the case-variant fields, in either order.
+    private const string AgeFirstBody = """{"Age":30,"AGE":"x"}""";
+
+    private const string AgeLastBody = """{"AGE":"x","Age":30}""";
+
+    // One block per case variant, each showing a dialog that names its block.
+    private const string BothBlocksProgram = """
+        Field Age
+            After
+                DIALOG "Age block"
+            End-After
+        End-Field
+        Field AGE
+            After
+                DIALOG "AGE block"
+            End-After
+        End-Field
+        """;
+
+    private const string AgeBlockProgram = """
+        Field Age
+            After
+                DIALOG "Age block"
+            End-After
+        End-Field
+        """;
+
+    /// <summary>
+    /// Bodies whose keys are the canonical names of the two case-variant fields, with the key order the typed values
+    /// must keep.
+    /// </summary>
+    public static TheoryData<string, string[]> CaseVariantBodies => new()
+    {
+        { AgeFirstBody, ["Age", "AGE"] },
+        { AgeLastBody, ["AGE", "Age"] },
+    };
+
+    /// <summary>The same bodies as <see cref="CaseVariantBodies"/>, as field-event <c>values</c>.</summary>
+    public static TheoryData<string> CaseVariantRequestBodies => new() { AgeFirstBody, AgeLastBody };
+
+    /// <summary>
+    /// Rejected bodies: the form, the body, and the expected error keys in order, each with its one message.
+    /// </summary>
+    public static TheoryData<string, string, string[], string[]> RejectedBodies => new()
+    {
+        // Another spelling of the one field Age resolves to it, so the field is named twice; the error carries the
+        // canonical name whichever spelling repeats it.
+        { SingleAgeFormName, """{"Age":1,"age":2}""", ["Age"], [ValidationMessages.DuplicateField] },
+        { SingleAgeFormName, """{"age":1,"Age":2}""", ["Age"], [ValidationMessages.DuplicateField] },
+
+        // An exact repeat, which the raw entries keep.
+        { SingleAgeFormName, """{"Age":1,"Age":2}""", ["Age"], [ValidationMessages.DuplicateField] },
+        { CaseVariantFormName, """{"Age":30,"AGE":"x","Age":31}""", ["Age"], [ValidationMessages.DuplicateField] },
+        { CaseVariantFormName, """{"AGE":"x","Age":30,"AGE":"y"}""", ["AGE"], [ValidationMessages.DuplicateField] },
+
+        // Each case variant is checked against its own field's wire type, never its namesake's.
+        {
+            CaseVariantFormName,
+            """{"Age":"x","AGE":30}""",
+            ["Age", "AGE"],
+            [ValidationMessages.NumberExpected, ValidationMessages.TextExpected]
+        },
+
+        // A name the form has no metaFields row for is keyed by the values member, never as submitted.
+        {
+            CaseVariantFormName,
+            """{"Age":30,"Agee":1}""",
+            [RecordValidator.ValuesKey],
+            [ValidationMessages.UnknownValuesName]
+        },
+
+        // aGE equals Age and AGE ignoring case and neither exactly, so it names no field and is keyed by the values
+        // member, never as submitted nor as either field.
+        {
+            CaseVariantFormName,
+            """{"Age":30,"aGE":"x"}""",
+            [RecordValidator.ValuesKey],
+            [ValidationMessages.AmbiguousValuesName]
+        },
+    };
+
+    // AAP 0.3.5: Age (number, page 1) and AGE (text, page 2) are distinct data fields, so a body naming both is valid.
+    [Theory]
+    [MemberData(nameof(CaseVariantBodies))]
+    public void ToTyped_CaseVariantDataFields_AreTypedAsDistinctFields(string body, string[] expectedKeys)
+    {
+        var raw = ReadRaw(body);
+
+        var typed = ValuesReader.ToTyped(CaseVariantForm(), raw);
+
+        Assert.True(typed.IsSuccess);
+        Assert.Empty(typed.FieldErrors);
+        Assert.Equal(expectedKeys, typed.Values.Keys);
+        Assert.Equal(FieldValueKind.Number, typed.Values["Age"].Kind);
+        Assert.Equal(30d, typed.Values["Age"].AsNumber());
+        Assert.Equal(FieldValueKind.Text, typed.Values["AGE"].Kind);
+        Assert.Equal("x", typed.Values["AGE"].AsText());
+
+        // Lookups are ordinal on the canonical names: a third spelling is neither key.
+        Assert.False(typed.Values.ContainsKey("age"));
+    }
+
+    [Theory]
+    [MemberData(nameof(RejectedBodies))]
+    public void ToTyped_RejectsRepeatsUnknownNamesAndWrongWireTypes(
+        string formName,
+        string body,
+        string[] expectedKeys,
+        string[] expectedMessages)
+    {
+        var form = formName == CaseVariantFormName ? CaseVariantForm() : SingleAgeForm();
+        var raw = ReadRaw(body);
+
+        var typed = ValuesReader.ToTyped(form, raw);
+
+        Assert.False(typed.IsSuccess);
+        Assert.Empty(typed.Values);
+        Assert.Equal(expectedKeys, typed.FieldErrors.Keys);
+        for (var i = 0; i < expectedKeys.Length; i++)
+        {
+            Assert.Equal(new[] { expectedMessages[i] }, typed.FieldErrors[expectedKeys[i]]);
+        }
+    }
+
+    // AAP 0.3.5: the service validates only that every key is a data field and every value has its wire type, so a
+    // body naming both case variants reaches the engine, and each value is read as its own field.
+    [Theory]
+    [MemberData(nameof(CaseVariantRequestBodies))]
+    public async Task RunAsync_CaseVariantDataFields_ReachTheEngine(string body)
+    {
+        const string Program = """
+            Field Age
+                After
+                    IF Age = 30 AND AGE = "x" THEN
+                        ASSIGN AGE = "seen"
+                    END-IF
+                End-After
+            End-Field
+            """;
+        var store = new FakeDataStore(new FakeForm(CaseVariantForm(), NoOptions(), Program));
+        var service = new FieldEventService(store, new CheckCodeEngine(), NullLogger<FieldEventService>.Instance);
+        var request = new FieldEventRequest(Json("\"FieldAfter\""), Json("\"Age\""), Json(body));
+
+        var result = await service.RunAsync(CaseVariantViewId, request, CancellationToken.None);
+
+        var response = Assert.IsType<Ok<FieldEventResponse>>(result).Value;
+        Assert.NotNull(response);
+        Assert.Equal(new[] { "AGE" }, response.Assigned.Keys);
+        Assert.Equal("seen", response.Assigned["AGE"].AsText());
+        Assert.Empty(response.Enabled);
+        Assert.Empty(response.Disabled);
+        Assert.Empty(response.Cleared);
+        Assert.Empty(response.Dialogs);
+        Assert.Empty(response.Diagnostics);
+        Assert.Empty(store.WriteCalls);
+    }
+
+    // AAP 0.3.5: fieldName names one field of the form, its exact spelling first, so with AGE listed before Age each
+    // case variant runs its own block, never the one first in metadata order or last in the program.
+    [Theory]
+    [InlineData("Age", "Age block")]
+    [InlineData("AGE", "AGE block")]
+    public async Task RunAsync_FieldNameSpelledExactly_RunsThatFieldsBlock(string fieldName, string expectedDialog)
+    {
+        var result = await RunEventAsync(AgeLastForm(), BothBlocksProgram, fieldName);
+
+        var response = Assert.IsType<Ok<FieldEventResponse>>(result).Value;
+        Assert.NotNull(response);
+        Assert.Equal(new[] { expectedDialog }, response.Dialogs.Select(dialog => dialog.Message));
+        Assert.Empty(response.Diagnostics);
+    }
+
+    // aGE equals Age and AGE ignoring case and neither exactly, so it names no field of the form.
+    [Fact]
+    public async Task RunAsync_FieldNameAmbiguousAmongDataFields_IsAFieldNameError()
+    {
+        var result = await RunEventAsync(AgeLastForm(), BothBlocksProgram, "aGE");
+
+        var status = Assert.IsAssignableFrom<IStatusCodeHttpResult>(result).StatusCode;
+        Assert.Equal(StatusCodes.Status400BadRequest, status);
+        var problem = Assert.IsType<HttpValidationProblemDetails>(
+            Assert.IsAssignableFrom<IValueHttpResult>(result).Value);
+        Assert.Equal(new[] { FieldEventService.FieldNameKey }, problem.Errors.Keys);
+        Assert.Equal(
+            new[] { FieldEventService.InvalidFieldNameMessage },
+            problem.Errors[FieldEventService.FieldNameKey]);
+    }
+
+    // AAP 0.3.5: "a field without a block gives the empty envelope". The block of Age is not AGE's.
+    [Fact]
+    public async Task RunAsync_FieldWhoseCaseVariantAloneHasABlock_GivesTheEmptyEnvelope()
+    {
+        var result = await RunEventAsync(AgeLastForm(), AgeBlockProgram, "AGE");
+
+        var response = Assert.IsType<Ok<FieldEventResponse>>(result).Value;
+        Assert.NotNull(response);
+        Assert.Empty(response.Enabled);
+        Assert.Empty(response.Disabled);
+        Assert.Empty(response.Cleared);
+        Assert.Empty(response.Assigned);
+        Assert.Empty(response.Dialogs);
+        Assert.Empty(response.Diagnostics);
+    }
+
+    // A row no page of the form shows, with no page or a page outside the form, is no field an event can name, so
+    // listed before the page field Age and spelled AGE, it neither hides Age nor makes its name ambiguous.
+    [Theory]
+    [InlineData(null, "Age")]
+    [InlineData(null, "age")]
+    [InlineData(OffFormPageId, "Age")]
+    [InlineData(OffFormPageId, "age")]
+    public async Task RunAsync_PagelessRowSpelledLikeAPageField_LeavesTheFieldNameValid(
+        int? pagelessRowPageId,
+        string fieldName)
+    {
+        var result = await RunEventAsync(PagelessVariantForm(pagelessRowPageId), AgeBlockProgram, fieldName);
+
+        var response = Assert.IsType<Ok<FieldEventResponse>>(result).Value;
+        Assert.NotNull(response);
+        Assert.Equal(new[] { "Age block" }, response.Dialogs.Select(dialog => dialog.Message));
+        Assert.Empty(response.Diagnostics);
+    }
+
+    // Raises FieldAfter on fieldName with empty values, over the real engine and a store holding only form.
+    private static Task<IResult> RunEventAsync(FormMetadata form, string program, string fieldName)
+    {
+        var store = new FakeDataStore(new FakeForm(form, NoOptions(), program));
+        var service = new FieldEventService(store, new CheckCodeEngine(), NullLogger<FieldEventService>.Instance);
+        var request = new FieldEventRequest(
+            Json("\"FieldAfter\""),
+            Json(JsonSerializer.Serialize(fieldName)),
+            Json("{}"));
+        return service.RunAsync(form.ViewId, request, CancellationToken.None);
+    }
+
+    private static IReadOnlyList<KeyValuePair<string, FieldValue>> ReadRaw(string body)
+    {
+        var raw = ValuesReader.ReadRaw(Json(body));
+        Assert.True(raw.IsSuccess);
+        return raw.Values;
+    }
+
+    private static JsonElement Json(string text)
+    {
+        using var document = JsonDocument.Parse(text);
+        return document.RootElement.Clone();
+    }
+
+    private static ReadOnlyDictionary<string, IReadOnlyList<FieldOption>> NoOptions() =>
+        new(new Dictionary<string, IReadOnlyList<FieldOption>>(StringComparer.OrdinalIgnoreCase));
+
+    // Synthetic: the number field Age on page 1 and the text field AGE on page 2, two data fields whose canonical names
+    // differ only by letter case. Age comes first in metadata and in storage order.
+    private static FormMetadata CaseVariantForm()
+    {
+        const int viewId = CaseVariantViewId;
+        var first = Page(viewId, CaseVariantFormName, 1, "Page 1", 0);
+        var second = Page(viewId, CaseVariantFormName, 2, "Page 2", 1);
+        return new FormMetadata(
+            viewId,
+            CaseVariantFormName,
+            CaseVariantFormName,
+            [first, second],
+            [
+                Field(viewId, 1, first, "Age", NumberTypeId, "Number", "float", 8),
+                Field(viewId, 2, second, "AGE", TextTypeId, "Text", "nvarchar", 8000),
+            ]);
+    }
+
+    // Synthetic: one page with the one number field Age.
+    private static FormMetadata SingleAgeForm()
+    {
+        const int viewId = SingleAgeViewId;
+        var page = Page(viewId, SingleAgeFormName, 1, "Page 1", 0);
+        return new FormMetadata(
+            viewId,
+            SingleAgeFormName,
+            SingleAgeFormName,
+            [page],
+            [Field(viewId, 1, page, "Age", NumberTypeId, "Number", "float", 8)]);
+    }
+
+    // Synthetic: the case-variant fields of CaseVariantForm with the text field AGE (page 2) listed first in metadata
+    // order, while the number field Age (page 1) stays first in storage order.
+    private static FormMetadata AgeLastForm()
+    {
+        const int viewId = AgeLastViewId;
+        var first = Page(viewId, CaseVariantFormName, 1, "Page 1", 0);
+        var second = Page(viewId, CaseVariantFormName, 2, "Page 2", 1);
+        return new FormMetadata(
+            viewId,
+            CaseVariantFormName,
+            CaseVariantFormName,
+            [first, second],
+            [
+                Field(viewId, 2, second, "AGE", TextTypeId, "Text", "nvarchar", 8000),
+                Field(viewId, 1, first, "Age", NumberTypeId, "Number", "float", 8),
+            ]);
+    }
+
+    // Synthetic: a text row AGE on no page of the form (pageId null, as a system row has, or a page the form lacks),
+    // listed before the one page field Age.
+    private static FormMetadata PagelessVariantForm(int? pagelessRowPageId)
+    {
+        const int viewId = PagelessVariantViewId;
+        var page = Page(viewId, SingleAgeFormName, 1, "Page 1", 0);
+        return new FormMetadata(
+            viewId,
+            SingleAgeFormName,
+            SingleAgeFormName,
+            [page],
+            [
+                Field(viewId, 2, page, "AGE", TextTypeId, "Text", "nvarchar", 8000) with { PageId = pagelessRowPageId },
+                Field(viewId, 1, page, "Age", NumberTypeId, "Number", "float", 8),
+            ]);
+    }
+
+    // Page ids are <viewId>01 and <viewId>02, and the page table is the base table name plus the page id.
+    private static PageMetadata Page(int viewId, string baseTable, int ordinal, string name, int position)
+    {
+        var pageId = (viewId * 100) + ordinal;
+        return new PageMetadata(pageId, name, position, baseTable + pageId.ToString(CultureInfo.InvariantCulture));
+    }
+
+    private static FieldMetadata Field(
+        int viewId,
+        int ordinal,
+        PageMetadata page,
+        string name,
+        int fieldTypeId,
+        string fieldTypeName,
+        string sqlTypeName,
+        int maxLengthBytes) => new()
+        {
+            FieldId = (viewId * 1000) + ordinal,
+            Name = name,
+            FieldTypeId = fieldTypeId,
+            FieldTypeName = fieldTypeName,
+            Prompt = name,
+            TabIndex = 1m,
+            PageId = page.PageId,
+            Column = FieldTypeMapper.DescribeColumn(name, sqlTypeName, maxLengthBytes),
+        };
 }

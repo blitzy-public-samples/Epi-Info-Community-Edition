@@ -43,8 +43,9 @@ namespace EpiInfo.Domain.Records;
 /// <param name="Values">
 /// One entry per data field of the form, keyed by the canonical <c>metaFields.Name</c> and inserted in data-field
 /// order (page <c>Position</c>, then <c>TabIndex</c>). Producers build it with
-/// <see cref="RecordQueryRules.CreateValuesMap"/>, so a lookup ignores letter case. A <c>NULL</c> column, or a page
-/// with no row for this <see cref="GlobalRecordId"/>, gives <see cref="FieldValue.Null"/> for each of its fields,
+/// <see cref="RecordQueryRules.CreateValuesMap"/>, so keys compare ordinally and two fields whose names differ only
+/// by letter case keep an entry each. A <c>NULL</c> column, or a page with no row for this
+/// <see cref="GlobalRecordId"/>, gives <see cref="FieldValue.Null"/> for each of its fields,
 /// as the legacy per-page load (<c>CollectedDataProvider.LoadRecordIntoView</c>) nulls every field of a page
 /// that has no row. Label, group and unsupported fields have no entry, because they are never stored or written.
 /// </param>

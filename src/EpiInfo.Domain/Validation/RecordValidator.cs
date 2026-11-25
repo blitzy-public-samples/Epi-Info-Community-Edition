@@ -30,9 +30,12 @@ namespace EpiInfo.Domain.Validation;
 /// <para>
 /// Only data fields are accepted, as <see cref="FormDefinitionFactory.GetDataFields"/> defines them, so a caller can
 /// never supply a save stamp, <c>RecStatus</c>, <c>UniqueKey</c>, <c>GlobalRecordId</c> or any other system column,
-/// nor a label, group or unsupported field. Error keys are canonical <c>metaFields.Name</c> values; a name that
-/// matches no <c>metaFields</c> row is reported under <see cref="ValuesKey"/>, so a submitted name never becomes an
-/// error key (<see cref="NotADataFieldError"/>).
+/// nor a label, group or unsupported field. Error keys are canonical <c>metaFields.Name</c> values or
+/// <see cref="ValuesKey"/>, so a submitted name never becomes an error key. A name that is not a data field is
+/// reported by the first of these that applies (<see cref="NotADataFieldError"/>): a name spelled exactly as a row
+/// holding no value, under that row's canonical name; a name ambiguous between data fields whose names differ only by
+/// letter case, under <see cref="ValuesKey"/>; a name that matches a row ignoring case, under the canonical name of the
+/// first such row; and a name that matches no <c>metaFields</c> row, under <see cref="ValuesKey"/>.
 /// </para>
 /// <para>
 /// Every message is a fixed text of <see cref="ValidationMessages"/>, formatted only from metadata (prompt, page
@@ -47,12 +50,14 @@ namespace EpiInfo.Domain.Validation;
 public sealed class RecordValidator
 {
     /// <summary>
-    /// The <c>errors</c> key for a submitted name that matches no <c>metaFields</c> row: the name of the request's
-    /// <c>values</c> member, a parameter-name key, so a submitted name never reaches an error body.
+    /// The <c>errors</c> key for a submitted name that matches no <c>metaFields</c> row, or that spells no row exactly
+    /// and is ambiguous between data fields: the name of the request's <c>values</c> member, a parameter-name key, so
+    /// a submitted name never reaches an error body.
     /// </summary>
     public const string ValuesKey = "values";
 
-    private readonly FormMetadata _form;
+    private readonly Dictionary<string, string> _canonicalNames;
+    private readonly HashSet<string> _rowNames;
     private readonly DataFieldSet _dataFields;
     private readonly FieldRule[] _rules;
     private readonly Dictionary<DataFieldMetadata, FieldRule> _rulesByField;
@@ -84,7 +89,20 @@ public sealed class RecordValidator
                 nameof(definition));
         }
 
-        _form = form;
+        // The canonical name of every metaFields row, data or not, by its exact spelling, and keyed ignoring case,
+        // where the first row in metadata order keeps a name that later rows repeat in another case, as
+        // FormMetadata.FindField resolves it. The validator keeps these copies, never the caller's metadata.
+        _rowNames = new HashSet<string>(form.Fields.Count, StringComparer.Ordinal);
+        _canonicalNames = new Dictionary<string, string>(form.Fields.Count, StringComparer.OrdinalIgnoreCase);
+        foreach (var field in form.Fields)
+        {
+            if (!string.IsNullOrEmpty(field.Name))
+            {
+                _rowNames.Add(field.Name);
+                _canonicalNames.TryAdd(field.Name, field.Name);
+            }
+        }
+
         _dataFields = FormDefinitionFactory.GetDataFields(form);
 
         var exactDefinitions = new Dictionary<string, FieldDefinition>(StringComparer.Ordinal);
@@ -117,8 +135,9 @@ public sealed class RecordValidator
             var kind = FieldTypeMapper.ValueKind(dataField.FieldType)
                 ?? throw new InvalidOperationException("A data field's type must hold a value kind.");
 
-            // A field whose name differs from an earlier one only by letter case is shadowed: name lookups and value
-            // maps resolve that name to the earlier field, so the shadowed one can never be submitted or carry a
+            // Name lookups resolve an exact spelling to its own field, so a field whose name differs from another
+            // only by letter case keeps its own rule and values key. Only a field whose name repeats an earlier one
+            // exactly is shadowed: its name resolves to the earlier field, so it can never be submitted or carry a
             // value of its own. It gets no rule, so it can neither be written nor block a save as a required field.
             if (!_dataFields.TryGet(dataField.Name, out var resolved) || !ReferenceEquals(resolved, dataField))
             {
@@ -136,14 +155,36 @@ public sealed class RecordValidator
     /// <summary>
     /// The field-level error, key and message together, for a submitted name that is not a data field of the form.
     /// It is the one rule for reporting such a name: <see cref="ValidateInput"/> and the API's values reader both
-    /// report every name that is not a data field through it.
+    /// report every name that is not a data field by it.
     /// </summary>
     /// <remarks>
-    /// A name that matches a <c>metaFields</c> row without regard to letter case, a system column, a label, a group or
-    /// an unsupported field, gives <see cref="ValidationMessages.UnknownField"/> under the row's canonical
-    /// <c>metaFields.Name</c>. Any other name, the empty name included, gives
-    /// <see cref="ValidationMessages.UnknownValuesName"/> under <see cref="ValuesKey"/>. The caller has already found
-    /// that the name is not a data field; this method does not check that again.
+    /// The first of these that applies decides:
+    /// <list type="number">
+    ///   <item><description>
+    ///     A name spelled exactly, compared ordinally, as a <c>metaFields</c> row, a system column, a label, a group
+    ///     or an unsupported field, gives <see cref="ValidationMessages.UnknownField"/> under the canonical
+    ///     <c>metaFields.Name</c> of the first such row in metadata order. An exact spelling is never ambiguous, as
+    ///     in every other name lookup of the form, so a label <c>aGe</c> is reported as itself even beside the data
+    ///     fields <c>Age</c> and <c>AGE</c>.
+    ///   </description></item>
+    ///   <item><description>
+    ///     A name ambiguous among the form's data fields (<see cref="DataFieldSet.IsAmbiguous"/>), one that spells no
+    ///     data field exactly and equals two or more distinct data-field names ignoring case, as <c>age</c> equals
+    ///     <c>Age</c> and <c>AGE</c>, gives <see cref="ValidationMessages.AmbiguousValuesName"/> under
+    ///     <see cref="ValuesKey"/>, so the error never names a field the caller may not have meant.
+    ///   </description></item>
+    ///   <item><description>
+    ///     A name that matches a <c>metaFields</c> row without regard to letter case gives
+    ///     <see cref="ValidationMessages.UnknownField"/> under the canonical <c>metaFields.Name</c> of the first such
+    ///     row in metadata order, as <see cref="FormMetadata.FindField"/> resolves it.
+    ///   </description></item>
+    ///   <item><description>
+    ///     Any other name, the empty name included, gives <see cref="ValidationMessages.UnknownValuesName"/> under
+    ///     <see cref="ValuesKey"/>.
+    ///   </description></item>
+    /// </list>
+    /// The caller has already found that the name is not a data field, so no row spelled exactly as the name is one;
+    /// this method does not check that again.
     /// </remarks>
     /// <param name="form">The form's metadata.</param>
     /// <param name="submittedName">A name as the request spelled it; an empty name matches no row.</param>
@@ -154,9 +195,17 @@ public sealed class RecordValidator
         ArgumentNullException.ThrowIfNull(form);
         ArgumentNullException.ThrowIfNull(submittedName);
 
-        return form.FindField(submittedName) is { } row
-            ? new(row.Name, ValidationMessages.UnknownField)
-            : new(ValuesKey, ValidationMessages.UnknownValuesName);
+        var (exactRow, firstRow, hasAnotherSpelling) = MatchRows(form, submittedName);
+
+        // An exact spelling decides before ambiguity. The data fields are rows of the form, so a name no row spells
+        // exactly can be ambiguous among them only when the rows equal to it ignoring case hold another spelling
+        // besides the first row's. Only then is the data-field set built, so on a form without such rows the rule
+        // costs one scan of the rows per name, however many names a body holds.
+        var isAmbiguous = exactRow is null
+            && hasAnotherSpelling
+            && FormDefinitionFactory.GetDataFields(form).IsAmbiguous(submittedName);
+
+        return ErrorForNameNotADataField(exactRow?.Name, isAmbiguous, firstRow?.Name);
     }
 
     /// <summary>
@@ -177,7 +226,15 @@ public sealed class RecordValidator
     ///   <item><description>
     ///     A field-level failure holding every error found, keys in first-seen order. Per entry, the first failing
     ///     check among name, repeat, read-only, type and storage range is the field's only message; otherwise each
-    ///     failing check among <c>MaxLength</c>, range, pattern and legal values adds its own.
+    ///     failing check among <c>MaxLength</c>, range, pattern and legal values adds its own. A name resolves to a
+    ///     data field as <see cref="DataFieldSet.TryGet"/> resolves it. One that resolves to none is keyed and worded
+    ///     by <see cref="NotADataFieldError"/>, the first that applies deciding:
+    ///     <see cref="ValidationMessages.UnknownField"/> under the canonical name of the first row spelled exactly as
+    ///     it; <see cref="ValidationMessages.AmbiguousValuesName"/> under <see cref="ValuesKey"/> when it is ambiguous
+    ///     (<see cref="DataFieldSet.IsAmbiguous"/>); <see cref="ValidationMessages.UnknownField"/> under the canonical
+    ///     name of the first row it names ignoring case; and <see cref="ValidationMessages.UnknownValuesName"/> under
+    ///     <see cref="ValuesKey"/> when it names no <c>metaFields</c> row. A submitted name is never a key. A name
+    ///     equal to an earlier one ignoring case is a repeat, even when the two spellings name distinct fields.
     ///   </description></item>
     ///   <item><description>
     ///     Otherwise a valid result whose <see cref="RecordValidationResult.Values"/> holds every submitted data field
@@ -197,7 +254,10 @@ public sealed class RecordValidator
         }
 
         var errors = new FieldErrorCollector();
-        var normalised = new OrderedDictionary<string, FieldValue>(submitted.Count, StringComparer.OrdinalIgnoreCase);
+        // Values are keyed by canonical name compared ordinally, so fields whose names differ only by case keep an
+        // entry each. Repeats are found ignoring case: two keys differing only by case are a 400 even when they name
+        // two distinct fields.
+        var normalised = new OrderedDictionary<string, FieldValue>(submitted.Count, StringComparer.Ordinal);
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         foreach (var (name, raw) in submitted)
@@ -209,8 +269,12 @@ public sealed class RecordValidator
 
             if (!TryGetRule(name, out var rule))
             {
-                // Keyed and worded by the one rule for such a name, so the submitted text is never a key.
-                var (key, message) = NotADataFieldError(_form, name);
+                // Keyed and worded by the one rule for such a name, NotADataFieldError's, over the validator's own
+                // snapshot of the canonical names, so the submitted text is never a key.
+                var (key, message) = ErrorForNameNotADataField(
+                    _rowNames.TryGetValue(name, out var exactRowName) ? exactRowName : null,
+                    _dataFields.IsAmbiguous(name),
+                    _canonicalNames.GetValueOrDefault(name));
                 errors.Add(key, message);
                 continue;
             }
@@ -243,8 +307,8 @@ public sealed class RecordValidator
     /// before any write transaction opens: the empty-record rule, then the required gate.
     /// </summary>
     /// <param name="normalised">
-    /// The <see cref="RecordValidationResult.Values"/> of a valid <see cref="ValidateInput"/> result. Keys are matched
-    /// to the data fields without regard to letter case; a field the map does not hold counts as
+    /// The <see cref="RecordValidationResult.Values"/> of a valid <see cref="ValidateInput"/> result. Each key names the
+    /// data field <see cref="DataFieldSet.TryGet"/> resolves it to; a field the map does not hold counts as
     /// <see cref="FieldValue.Null"/>.
     /// </param>
     /// <returns>
@@ -268,7 +332,8 @@ public sealed class RecordValidator
     /// <exception cref="ArgumentNullException"><paramref name="normalised"/> is null.</exception>
     /// <exception cref="ArgumentException">
     /// <paramref name="normalised"/> holds a null key, a key that names no data field of the form, or two keys that
-    /// name the same field; none of these can come from a valid <see cref="ValidateInput"/> result.
+    /// name the same field or differ only by letter case; none of these can come from a valid
+    /// <see cref="ValidateInput"/> result.
     /// </exception>
     public RecordValidationResult CheckNewRecord(IReadOnlyDictionary<string, FieldValue> normalised)
     {
@@ -312,10 +377,15 @@ public sealed class RecordValidator
     /// <c>stored =&gt; validator.CheckRequired(stored, values)</c>.
     /// </para>
     /// </remarks>
-    /// <param name="stored">The record as the locked read returned it; a data field it does not hold counts as null.</param>
+    /// <param name="stored">
+    /// The record as the locked read returned it, keyed by canonical name compared ordinally; a data field it does not
+    /// hold under its exact name counts as null.
+    /// </param>
     /// <param name="submitted">
     /// The <see cref="RecordValidationResult.Values"/> of a valid <see cref="ValidateInput"/> result. Every entry,
-    /// explicit nulls included, replaces the stored value of its field; keys are matched without regard to letter case.
+    /// explicit nulls included, replaces the stored value of its field. Each key names the data field
+    /// <see cref="DataFieldSet.TryGet"/> resolves it to, so fields whose names differ only by letter case are overlaid
+    /// and gated apart.
     /// </param>
     /// <returns>
     /// A field-level failure listing every missing required field, after which the store rolls back before any write;
@@ -324,7 +394,8 @@ public sealed class RecordValidator
     /// <exception cref="ArgumentNullException"><paramref name="stored"/> or <paramref name="submitted"/> is null.</exception>
     /// <exception cref="ArgumentException">
     /// <paramref name="submitted"/> holds a null key, a key that names no data field of the form, or two keys that
-    /// name the same field; none of these can come from a valid <see cref="ValidateInput"/> result.
+    /// name the same field or differ only by letter case; none of these can come from a valid
+    /// <see cref="ValidateInput"/> result.
     /// </exception>
     public RecordValidationResult CheckRequired(StoredRecord stored, IReadOnlyDictionary<string, FieldValue> submitted)
     {
@@ -333,7 +404,7 @@ public sealed class RecordValidator
 
         var values = Canonicalise(submitted, nameof(submitted));
 
-        var effective = new Dictionary<string, FieldValue>(StringComparer.OrdinalIgnoreCase);
+        var effective = new Dictionary<string, FieldValue>(StringComparer.Ordinal);
         foreach (var (name, value) in stored.Values)
         {
             if (name is not null)
@@ -350,6 +421,72 @@ public sealed class RecordValidator
         var errors = new FieldErrorCollector();
         AddMissingRequiredFields(effective, errors);
         return errors.HasErrors ? errors.ToFailure() : RecordValidationResult.Success(values);
+    }
+
+    // The one rule for a name that is not a data field, which NotADataFieldError and ValidateInput both apply, given
+    // the canonical name of a metaFields row spelled exactly as the name, whether the name is ambiguous among the
+    // form's data fields (DataFieldSet.IsAmbiguous), and the canonical name of the first row in metadata order equal to
+    // it ignoring case; each row name is null when the form has no such row. The exact spelling is decided first, as
+    // every other name lookup of the form decides it, so a row spelled exactly so is never reported as ambiguous.
+    // Ambiguity is decided next, so a name equal to two data-field spellings is never keyed by a row it might mean.
+    private static KeyValuePair<string, string> ErrorForNameNotADataField(
+        string? exactRowName,
+        bool isAmbiguous,
+        string? rowNameIgnoringCase)
+    {
+        if (exactRowName is { } exactName)
+        {
+            return new(exactName, ValidationMessages.UnknownField);
+        }
+
+        if (isAmbiguous)
+        {
+            return new(ValuesKey, ValidationMessages.AmbiguousValuesName);
+        }
+
+        return rowNameIgnoringCase is { } rowName
+            ? new(rowName, ValidationMessages.UnknownField)
+            : new(ValuesKey, ValidationMessages.UnknownValuesName);
+    }
+
+    // One scan of the form's rows for a name. It stops at the first row in metadata order spelled exactly so, which
+    // decides alone, and returns that row only. Otherwise it returns the first row equal to the name ignoring case, as
+    // FormMetadata.FindField finds it, and whether a later row equal to it ignoring case is spelled otherwise than that
+    // first row. An empty name matches no row.
+    private static (FieldMetadata? ExactRow, FieldMetadata? FirstRow, bool HasAnotherSpelling) MatchRows(
+        FormMetadata form,
+        string name)
+    {
+        if (name.Length == 0)
+        {
+            return (null, null, false);
+        }
+
+        FieldMetadata? firstRow = null;
+        var hasAnotherSpelling = false;
+        foreach (var field in form.Fields)
+        {
+            if (!string.Equals(field.Name, name, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            if (string.Equals(field.Name, name, StringComparison.Ordinal))
+            {
+                return (field, null, false);
+            }
+
+            if (firstRow is null)
+            {
+                firstRow = field;
+            }
+            else if (!string.Equals(field.Name, firstRow.Name, StringComparison.Ordinal))
+            {
+                hasAnotherSpelling = true;
+            }
+        }
+
+        return (null, firstRow, hasAnotherSpelling);
     }
 
     // Normalisation, type, storage range, MaxLength, range, pattern and legal values for one submitted entry. Returns
@@ -548,12 +685,15 @@ public sealed class RecordValidator
     }
 
     // Re-keys a map of normalised values by canonical name, in its own order, rejecting what a valid ValidateInput
-    // result can never hold. The messages are fixed, so no key or value reaches an exception message.
+    // result can never hold. The map compares canonical names ordinally, so fields whose names differ only by case
+    // keep an entry each; the repeat check ignores case, as ValidateInput's does, so two such keys are still rejected.
+    // The messages are fixed, so no key or value reaches an exception message.
     private OrderedDictionary<string, FieldValue> Canonicalise(
         IReadOnlyDictionary<string, FieldValue> values,
         string paramName)
     {
-        var canonical = new OrderedDictionary<string, FieldValue>(values.Count, StringComparer.OrdinalIgnoreCase);
+        var canonical = new OrderedDictionary<string, FieldValue>(values.Count, StringComparer.Ordinal);
+        var seen = new HashSet<string>(values.Count, StringComparer.OrdinalIgnoreCase);
         foreach (var (name, value) in values)
         {
             if (name is null)
@@ -566,12 +706,14 @@ public sealed class RecordValidator
                 throw new ArgumentException("A value is keyed by a name that is not a data field of the form.", paramName);
             }
 
-            if (!canonical.TryAdd(rule.Name, value))
+            if (!seen.Add(rule.Name))
             {
                 throw new ArgumentException(
                     "Each field may be given only once; names are compared without regard to letter case.",
                     paramName);
             }
+
+            canonical.Add(rule.Name, value);
         }
 
         return canonical;

@@ -52,6 +52,8 @@ public sealed class RecordValidatorTests
     private const string PatientNamePrompt = "Patient's Name";
     private const string CollectionDatePrompt = "Collection date:";
     private const string ReporterPrompt = "Reported by:";
+    private const string AgePrompt = "Age in years";
+    private const string AgeGroupPrompt = "Age group";
     private const string PhoneMask = "###-###-####";
     private const string Sentinel = "SENTINEL-123456";
 
@@ -281,6 +283,43 @@ public sealed class RecordValidatorTests
             Row(13, "LowerBeyondBigint", NumberType, pageId: 1, BigIntColumn) with { Lower = "1e30" },
         ]);
 
+    /// <summary>
+    /// Fixture H: two required data fields on different pages whose names differ only by letter case, which no seeded
+    /// form has: <c>Age</c>, a number on page 1, and <c>AGE</c>, a text field on page 2; plus an optional text field.
+    /// </summary>
+    private static readonly FormMetadata CaseVariantForm = new(
+        ViewId: 6,
+        Name: "CaseVariant",
+        BaseTableName: "CaseVariant",
+        Pages: [new PageMetadata(1, "Page 1", 0, "CaseVariant1"), new PageMetadata(2, "Page 2", 1, "CaseVariant2")],
+        Fields:
+        [
+            Row(1, "Age", NumberType, pageId: 1, FloatColumn) with { Prompt = AgePrompt, IsRequired = true },
+            Row(2, "Notes", TextType, pageId: 1, Nvarchar(4000)),
+            Row(3, "AGE", TextType, pageId: 2, Nvarchar(20)) with { Prompt = AgeGroupPrompt, IsRequired = true },
+        ]);
+
+    /// <summary>
+    /// Fixture I: a label <c>aGe</c>, first in metadata order, beside the data fields <c>Age</c> and <c>AGE</c>, whose
+    /// names make every other spelling of <c>age</c> ambiguous, which no seeded form has. The label is the first row
+    /// equal to each such spelling ignoring case.
+    /// </summary>
+    private static readonly FormMetadata CaseVariantLabelForm = new(
+        ViewId: 7,
+        Name: "CaseVariantLabel",
+        BaseTableName: "CaseVariantLabel",
+        Pages:
+        [
+            new PageMetadata(1, "Page 1", 0, "CaseVariantLabel1"),
+            new PageMetadata(2, "Page 2", 1, "CaseVariantLabel2"),
+        ],
+        Fields:
+        [
+            Row(1, "aGe", LabelType, pageId: 1),
+            Row(2, "Age", NumberType, pageId: 1, FloatColumn),
+            Row(3, "AGE", TextType, pageId: 2, Nvarchar(20)),
+        ]);
+
     // Column catalogue facts as sys.columns.max_length reports them, in bytes: nvarchar(n) is 2·n.
     private static (string SqlType, int MaxLengthBytes) FloatColumn => ("float", 8);
 
@@ -328,6 +367,8 @@ public sealed class RecordValidatorTests
                 "FractionsOnInt", "LowerBeyondBigint",
             ]
         },
+        { "CaseVariant", ["Age", "Notes", "AGE"] },
+        { "CaseVariantLabel", ["Age", "AGE"] },
     };
 
     /// <summary>
@@ -439,7 +480,8 @@ public sealed class RecordValidatorTests
         var values = AssertValid(Validate(MirrorValidator(), ("lastname", FieldValue.FromText("Smith"))));
 
         Assert.Equal(new[] { "LastName" }, values.Keys);
-        Assert.Equal(FieldValue.FromText("Smith"), values["LASTNAME"]);
+        Assert.Equal(FieldValue.FromText("Smith"), values["LastName"]);
+        Assert.False(values.ContainsKey("lastname"));
     }
 
     /// <summary>Only submitted fields are returned, in submission order, so a <c>PUT</c> stays a delta.</summary>
@@ -474,31 +516,48 @@ public sealed class RecordValidatorTests
     }
 
     /// <summary>
-    /// The one rule for a name that is not a data field, key and message together: any letter case of a label,
-    /// group, unsupported or system row gives the row's canonical spelling with the not-a-data-field message; a name
-    /// with no row, the empty name included, gives the <c>values</c> parameter key with its own fixed message.
+    /// The one rule for a name that is not a data field, key and message together, which
+    /// <see cref="RecordValidator.NotADataFieldError"/> and <see cref="RecordValidator.ValidateInput"/> both apply:
+    /// any letter case of a label, group, unsupported or system row gives the row's canonical spelling with the
+    /// not-a-data-field message; a name with no row, the empty name included, gives the <c>values</c> parameter key
+    /// with its own fixed message; and a name ambiguous between the data fields <c>Age</c> and <c>AGE</c>, though it
+    /// equals both rows ignoring case, gives the <c>values</c> parameter key with the ambiguous-name message, never a
+    /// canonical name it might mean. An exact spelling decides before ambiguity, and ambiguity before a match ignoring
+    /// case: the label <c>aGe</c> spelled exactly is reported as itself, while <c>age</c> and <c>AGe</c>, which equal
+    /// that label only ignoring case, are ambiguous.
     /// </summary>
     [Theory]
-    [InlineData("title1", "Title1", ValidationMessages.UnknownField)]
-    [InlineData("TITLE1", "Title1", ValidationMessages.UnknownField)]
-    [InlineData("namegroup", "NameGroup", ValidationMessages.UnknownField)]
-    [InlineData("NAMEGROUP", "NameGroup", ValidationMessages.UnknownField)]
-    [InlineData("ill", "Ill", ValidationMessages.UnknownField)]
-    [InlineData("recstatus", "RecStatus", ValidationMessages.UnknownField)]
-    [InlineData("UNIQUEKEY", "UniqueKey", ValidationMessages.UnknownField)]
-    [InlineData("GLOBALRECORDID", "GlobalRecordId", ValidationMessages.UnknownField)]
-    [InlineData("globalRecordID", "GlobalRecordId", ValidationMessages.UnknownField)]
-    [InlineData("SENTINEL-PII-Bogus-4711", RecordValidator.ValuesKey, ValidationMessages.UnknownValuesName)]
-    [InlineData("", RecordValidator.ValuesKey, ValidationMessages.UnknownValuesName)]
+    [InlineData("Mirror", "title1", "Title1", ValidationMessages.UnknownField)]
+    [InlineData("Mirror", "TITLE1", "Title1", ValidationMessages.UnknownField)]
+    [InlineData("Mirror", "namegroup", "NameGroup", ValidationMessages.UnknownField)]
+    [InlineData("Mirror", "NAMEGROUP", "NameGroup", ValidationMessages.UnknownField)]
+    [InlineData("Mirror", "ill", "Ill", ValidationMessages.UnknownField)]
+    [InlineData("Mirror", "recstatus", "RecStatus", ValidationMessages.UnknownField)]
+    [InlineData("Mirror", "UNIQUEKEY", "UniqueKey", ValidationMessages.UnknownField)]
+    [InlineData("Mirror", "GLOBALRECORDID", "GlobalRecordId", ValidationMessages.UnknownField)]
+    [InlineData("Mirror", "globalRecordID", "GlobalRecordId", ValidationMessages.UnknownField)]
+    [InlineData("Mirror", "SENTINEL-PII-Bogus-4711", RecordValidator.ValuesKey, ValidationMessages.UnknownValuesName)]
+    [InlineData("Mirror", "", RecordValidator.ValuesKey, ValidationMessages.UnknownValuesName)]
+    [InlineData("CaseVariant", "age", RecordValidator.ValuesKey, ValidationMessages.AmbiguousValuesName)]
+    [InlineData("CaseVariantLabel", "aGe", "aGe", ValidationMessages.UnknownField)]
+    [InlineData("CaseVariantLabel", "age", RecordValidator.ValuesKey, ValidationMessages.AmbiguousValuesName)]
+    [InlineData("CaseVariantLabel", "AGe", RecordValidator.ValuesKey, ValidationMessages.AmbiguousValuesName)]
     public void NotADataFieldError_SubmittedName_IsCanonicalRowOrValuesKeyWithItsMessage(
+        string formName,
         string submittedName,
         string expectedKey,
         string expectedMessage)
     {
-        var (key, message) = RecordValidator.NotADataFieldError(MirrorForm, submittedName);
+        var form = FixtureForm(formName);
+
+        var (key, message) = RecordValidator.NotADataFieldError(form, submittedName);
 
         Assert.Equal(expectedKey, key);
         Assert.Equal(expectedMessage, message);
+        AssertOnlyFieldError(
+            Validate(Validator(form, LegalValuesOf(form)), (submittedName, FieldValue.FromText("x"))),
+            expectedKey,
+            expectedMessage);
     }
 
     [Theory]
@@ -530,6 +589,40 @@ public sealed class RecordValidatorTests
         var result = Validate(MirrorValidator(), (submittedName, FieldValue.FromText("1")));
 
         AssertOnlyFieldError(result, expectedKey, ValidationMessages.UnknownField);
+    }
+
+    /// <summary>
+    /// Two non-data rows whose names differ only by letter case: a spelling of either row is keyed by that row, and
+    /// any other spelling by the first row in metadata order, as <see cref="FormMetadata.FindField"/> resolves the
+    /// name. The rows' two spellings make no data field ambiguous, so
+    /// <see cref="RecordValidator.NotADataFieldError"/> gives the same error as the validator.
+    /// </summary>
+    [Theory]
+    [InlineData("notice", "Notice")]
+    [InlineData("NOTICE", "NOTICE")]
+    [InlineData("Notice", "Notice")]
+    public void ValidateInput_NonDataNamesDifferingOnlyByCase_AreRejectedUnderTheExactOrFirstRowsName(
+        string submittedName,
+        string expectedKey)
+    {
+        var form = new FormMetadata(
+            ViewId: 5,
+            Name: "CaseVariants",
+            BaseTableName: "CaseVariants",
+            Pages: [new PageMetadata(1, "Page 1", 0, "CaseVariants1")],
+            Fields:
+            [
+                Row(1, "Notice", LabelType, pageId: 1),
+                Row(2, "NOTICE", LabelType, pageId: 1),
+                Row(3, "LastName", TextType, pageId: 1, Nvarchar(4000)),
+            ]);
+
+        var result = Validate(Validator(form), (submittedName, FieldValue.FromText("1")));
+
+        AssertOnlyFieldError(result, expectedKey, ValidationMessages.UnknownField);
+        Assert.Equal(
+            new KeyValuePair<string, string>(expectedKey, ValidationMessages.UnknownField),
+            RecordValidator.NotADataFieldError(form, submittedName));
     }
 
     /// <summary>C-3: presence alone rejects a read-only field, whatever the value, an explicit null included.</summary>
@@ -1403,6 +1496,60 @@ public sealed class RecordValidatorTests
         AssertOnlyFieldError(result, "Sex", ValidationMessages.NotALegalValue);
     }
 
+    /// <summary>
+    /// <c>Choice</c> (page 1) and <c>CHOICE</c> (page 2) are Legal Values fields whose names differ only by letter
+    /// case, each with its own code table. A value is checked against the submitted field's own options only, so
+    /// <c>A-Alpha</c>, an option of <c>Choice</c> alone, is rejected for <c>CHOICE</c> whether or not the options map
+    /// holds an entry for <c>CHOICE</c>.
+    /// </summary>
+    [Theory]
+    [InlineData(true, "Choice", "A-Alpha", true)]
+    [InlineData(true, "CHOICE", "A-Alpha", false)]
+    [InlineData(true, "CHOICE", "Z-Zulu", true)]
+    [InlineData(true, "Choice", "Z-Zulu", false)]
+    [InlineData(false, "Choice", "A-Alpha", true)]
+    [InlineData(false, "CHOICE", "A-Alpha", false)]
+    public void ValidateInput_CaseVariantLegalValuesFields_EachAcceptsOnlyItsOwnOptions(
+        bool upperHasEntry,
+        string fieldName,
+        string raw,
+        bool accepted)
+    {
+        var form = new FormMetadata(
+            ViewId: 7,
+            Name: "LegalValuesCase",
+            BaseTableName: "LegalValuesCase",
+            Pages:
+            [
+                new PageMetadata(1, "Page 1", 0, "LegalValuesCase1"),
+                new PageMetadata(2, "Page 2", 1, "LegalValuesCase2"),
+            ],
+            Fields:
+            [
+                Row(1, "Choice", LegalValuesType, pageId: 1, Nvarchar(255)),
+                Row(2, "CHOICE", LegalValuesType, pageId: 2, Nvarchar(255)),
+            ]);
+        var legalValues = new Dictionary<string, IReadOnlyList<FieldOption>>(StringComparer.Ordinal)
+        {
+            ["Choice"] = [new FieldOption(FieldValue.FromText("A-Alpha"), "A-Alpha")],
+        };
+        if (upperHasEntry)
+        {
+            legalValues.Add("CHOICE", [new FieldOption(FieldValue.FromText("Z-Zulu"), "Z-Zulu")]);
+        }
+
+        var result = Validate(Validator(form, legalValues), (fieldName, FieldValue.FromText(raw)));
+
+        if (accepted)
+        {
+            Assert.Equal(FieldValue.FromText(raw), AssertValid(result)[fieldName]);
+        }
+        else
+        {
+            AssertOnlyFieldError(result, fieldName, ValidationMessages.NotALegalValue);
+        }
+    }
+
     /// <summary>Every failing entry is reported in one result, in submission order.</summary>
     [Fact]
     public void ValidateInput_SeveralInvalidEntries_ReportsEveryOne()
@@ -1796,6 +1943,167 @@ public sealed class RecordValidatorTests
         Assert.EndsWith("form. ", ValidationMessages.FieldIsRequiredLong, StringComparison.Ordinal);
     }
 
+    // ---- Data fields whose names differ only by letter case ----
+
+    /// <summary>
+    /// <c>Age</c> and <c>AGE</c> are two fields, each with its own rule and its own values key.
+    /// </summary>
+    [Theory]
+    [InlineData("Age", 42d, "Age")]
+    [InlineData("AGE", "40-49", "AGE")]
+    public void ValidateInput_CaseVariantField_IsKeyedByItsOwnName(string name, object raw, string expectedKey)
+    {
+        var values = AssertValid(Validate(Validator(CaseVariantForm), (name, Wire(raw))));
+
+        var (key, value) = Assert.Single(values);
+        Assert.Equal(expectedKey, key);
+        Assert.Equal(Wire(raw), value);
+    }
+
+    /// <summary>
+    /// A spelling equal to both <c>Age</c> and <c>AGE</c> ignoring case and to neither exactly is ambiguous: it names
+    /// no field, so it is reported under the <c>values</c> parameter key with the ambiguous-name message, never under
+    /// the submitted spelling or a canonical name it might mean. An exact spelling sent beside it is still accepted as
+    /// its own field, and a name with no row beside it adds its own message under the same key.
+    /// </summary>
+    [Theory]
+    [InlineData(new[] { "age" }, new[] { ValidationMessages.AmbiguousValuesName })]
+    [InlineData(new[] { "aGE" }, new[] { ValidationMessages.AmbiguousValuesName })]
+    [InlineData(new[] { "age", "AGE" }, new[] { ValidationMessages.AmbiguousValuesName })]
+    [InlineData(new[] { "Age", "aGE" }, new[] { ValidationMessages.AmbiguousValuesName })]
+    [InlineData(new[] { "age", "aGE" }, new[] { ValidationMessages.AmbiguousValuesName })]
+    [InlineData(
+        new[] { "Agee", "age" },
+        new[] { ValidationMessages.UnknownValuesName, ValidationMessages.AmbiguousValuesName })]
+    public void ValidateInput_AmbiguousCaseVariantSpelling_IsAmbiguousNameUnderValuesKey(
+        string[] names,
+        string[] expectedMessages)
+    {
+        var result = Validate(Validator(CaseVariantForm), [.. names.Select(name => (name, FieldValue.Null))]);
+
+        AssertFieldFailure(result);
+        var (key, messages) = Assert.Single(result.FieldErrors);
+        Assert.Equal(RecordValidator.ValuesKey, key);
+        Assert.Equal(expectedMessages, messages);
+    }
+
+    /// <summary>Each case-variant field is type-checked by its own rule, not by its namesake's.</summary>
+    [Theory]
+    [InlineData("AGE", 42d, ValidationMessages.TextExpected)]
+    [InlineData("Age", "40-49", ValidationMessages.NumberExpected)]
+    public void ValidateInput_CaseVariantFieldGivenItsNamesakesType_FailsItsOwnTypeCheck(
+        string name,
+        object raw,
+        string expected)
+    {
+        var result = Validate(Validator(CaseVariantForm), (name, Wire(raw)));
+
+        AssertOnlyFieldError(result, name, expected);
+    }
+
+    /// <summary>
+    /// Two submitted keys that differ only by letter case are a repeat, even though they name two distinct fields; the
+    /// error is keyed by the canonical name the second resolves to. A key that is ambiguous instead names no field
+    /// (see <see cref="ValidateInput_AmbiguousCaseVariantSpelling_IsAmbiguousNameUnderValuesKey"/>).
+    /// </summary>
+    [Theory]
+    [InlineData("Age", "AGE", "AGE")]
+    [InlineData("AGE", "Age", "Age")]
+    public void ValidateInput_CaseVariantFieldsBothSubmitted_IsDuplicateError(
+        string first,
+        string second,
+        string expectedKey)
+    {
+        var result = Validate(Validator(CaseVariantForm), (first, FieldValue.Null), (second, FieldValue.Null));
+
+        AssertOnlyFieldError(result, expectedKey, ValidationMessages.DuplicateField);
+    }
+
+    /// <summary>
+    /// The required gate of a create holds each case-variant field apart: supplying one never satisfies the other.
+    /// </summary>
+    [Theory]
+    [InlineData("Age", 42d, "AGE", AgeGroupPrompt, "Page 2")]
+    [InlineData("AGE", "40-49", "Age", AgePrompt, "Page 1")]
+    public void CheckNewRecord_OneCaseVariantRequiredFieldSupplied_ListsTheOtherAsMissing(
+        string supplied,
+        object raw,
+        string missing,
+        string missingPrompt,
+        string missingPage)
+    {
+        var validator = Validator(CaseVariantForm);
+        var input = AssertValid(Validate(validator, (supplied, Wire(raw))));
+
+        var result = validator.CheckNewRecord(input);
+
+        AssertOnlyFieldError(result, missing, RequiredMessage(missingPrompt, missingPage));
+    }
+
+    /// <summary>
+    /// The overlay of a <c>PUT</c> keeps the stored and submitted values of <c>Age</c> and <c>AGE</c> apart, so each
+    /// field's gate reads only its own effective value. A null stored value or a null
+    /// <paramref name="submittedRaw"/> is an empty value.
+    /// </summary>
+    [Theory]
+    [InlineData(42d, "40-49", "AGE", null, new[] { "AGE" })]
+    [InlineData(42d, "40-49", "Age", null, new[] { "Age" })]
+    [InlineData(42d, null, "Age", 43d, new[] { "AGE" })]
+    [InlineData(null, "40-49", "AGE", "50-59", new[] { "Age" })]
+    [InlineData(null, null, "AGE", "50-59", new[] { "Age" })]
+    [InlineData(42d, "40-49", "Notes", "x", new string[0])]
+    public void CheckRequired_CaseVariantFields_AreOverlaidAndGatedApart(
+        double? storedAge,
+        string? storedAgeGroup,
+        string submittedName,
+        object? submittedRaw,
+        string[] expectedMissing)
+    {
+        var stored = Stored(Normalised(
+            ("Age", storedAge is { } age ? FieldValue.FromNumber(age) : FieldValue.Null),
+            ("Notes", FieldValue.Null),
+            ("AGE", storedAgeGroup is null ? FieldValue.Null : FieldValue.FromText(storedAgeGroup))));
+        var submitted = Normalised((submittedName, Wire(submittedRaw)));
+
+        var result = Validator(CaseVariantForm).CheckRequired(stored, submitted);
+
+        if (expectedMissing.Length == 0)
+        {
+            Assert.Equal(submitted.Keys, AssertValid(result).Keys);
+            return;
+        }
+
+        AssertFieldFailure(result);
+        Assert.Equal(expectedMissing, result.FieldErrors.Keys);
+        foreach (var field in expectedMissing)
+        {
+            var expected = field == "Age"
+                ? RequiredMessage(AgePrompt, "Page 1")
+                : RequiredMessage(AgeGroupPrompt, "Page 2");
+            Assert.Equal(new[] { expected }, result.FieldErrors[field]);
+        }
+    }
+
+    /// <summary>
+    /// Every canonical values map rejects two keys that differ only by letter case, which no valid input can hold,
+    /// with a fixed message that carries no key.
+    /// </summary>
+    [Fact]
+    public void CanonicalMaps_KeysDifferingOnlyByCase_AreRejected()
+    {
+        var validator = Validator(CaseVariantForm);
+        var values = Normalised(("Age", FieldValue.FromNumber(42)), ("AGE", FieldValue.FromText("40-49")));
+
+        var onCreate = Assert.Throws<ArgumentException>("normalised", () => validator.CheckNewRecord(values));
+        var onUpdate = Assert.Throws<ArgumentException>(
+            "submitted",
+            () => validator.CheckRequired(Stored(values), values));
+        var onResult = Assert.Throws<ArgumentException>("values", () => RecordValidationResult.Success(values));
+
+        Assert.All(
+            new[] { onCreate, onUpdate, onResult },
+            exception => Assert.DoesNotContain("AGE", exception.Message, StringComparison.Ordinal));
+    }
 
     // ---- Fixture and assertion helpers ----
 
@@ -1808,6 +2116,8 @@ public sealed class RecordValidatorTests
         "OneSidedRange" => OneSidedRangeForm,
         "RequiredReadOnly" => RequiredReadOnlyForm,
         "BigBound" => BigBoundForm,
+        "CaseVariant" => CaseVariantForm,
+        "CaseVariantLabel" => CaseVariantLabelForm,
         _ => throw new ArgumentOutOfRangeException(nameof(name), name, "No fixture form has that name."),
     };
 
@@ -1843,10 +2153,11 @@ public sealed class RecordValidatorTests
         return result;
     }
 
-    // A map of normalised values, keyed as a valid ValidateInput result or the store's read keys them.
+    // A map of normalised values, keyed as a valid ValidateInput result or the store's read keys them: by canonical
+    // name, compared ordinally.
     private static IReadOnlyDictionary<string, FieldValue> Normalised(params (string Name, FieldValue Value)[] entries)
     {
-        var values = new Dictionary<string, FieldValue>(StringComparer.OrdinalIgnoreCase);
+        var values = new Dictionary<string, FieldValue>(StringComparer.Ordinal);
         foreach (var (name, value) in entries)
         {
             values.Add(name, value);

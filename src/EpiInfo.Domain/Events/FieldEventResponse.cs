@@ -40,7 +40,7 @@ namespace EpiInfo.Domain.Events;
 public sealed record FieldEventResponse
 {
     private const string BlankFieldNameMessage = "A field name must not be null or empty.";
-    private const string DuplicateAssignedFieldMessage = "Each assigned field name must be unique, ignoring case.";
+    private const string DuplicateAssignedFieldMessage = "Each assigned field name must be unique.";
     private const string NullDialogMessage = "A dialog entry must not be null.";
     private const string NullDiagnosticMessage = "A diagnostic must not be null.";
 
@@ -49,16 +49,16 @@ public sealed record FieldEventResponse
     /// <param name="disabled">The fields check code disabled, in the order given.</param>
     /// <param name="cleared">The fields check code cleared, in the order given.</param>
     /// <param name="assigned">
-    /// The fields check code assigned, with their values. Entries are kept in the source's enumeration order and
-    /// looked up without regard to case.
+    /// The fields check code assigned, with their values. Entries are kept in the source's enumeration order, and
+    /// names are compared ordinally: two canonical names that differ only by case are two distinct fields.
     /// </param>
     /// <param name="dialogs">The dialogs to show, in the order given.</param>
     /// <param name="diagnostics">The diagnostics of the executed block, in the order given.</param>
     /// <exception cref="ArgumentNullException">An argument is <see langword="null"/>.</exception>
     /// <exception cref="ArgumentException">
     /// A field name in <paramref name="enabled"/>, <paramref name="disabled"/>, <paramref name="cleared"/> or the
-    /// keys of <paramref name="assigned"/> is <see langword="null"/> or empty; two keys of
-    /// <paramref name="assigned"/> differ only by case; or an entry of <paramref name="dialogs"/> or
+    /// keys of <paramref name="assigned"/> is <see langword="null"/> or empty; <paramref name="assigned"/> enumerates
+    /// the same key twice; or an entry of <paramref name="dialogs"/> or
     /// <paramref name="diagnostics"/> is <see langword="null"/>.
     /// </exception>
     public FieldEventResponse(
@@ -98,7 +98,8 @@ public sealed record FieldEventResponse
     public IReadOnlyList<string> Cleared { get; }
 
     /// <summary>
-    /// The values check code assigned, keyed by canonical field name and enumerated in assignment order.
+    /// The values check code assigned, keyed by canonical field name, compared ordinally, and enumerated in
+    /// assignment order.
     /// <see cref="FieldValue.Null"/> is an assigned empty value, as <c>ASSIGN X = (.)</c> produces. A read-only
     /// field may appear here: the client shows its value and never saves it.
     /// </summary>
@@ -155,7 +156,7 @@ public sealed record FieldEventResponse
 
         // OrderedDictionary, not Dictionary: the JSON key order of "assigned" is the enumeration order, and only an
         // ordered dictionary guarantees that it stays the order the entries were given in.
-        var ordered = new OrderedDictionary<string, FieldValue>(source.Count, StringComparer.OrdinalIgnoreCase);
+        var ordered = new OrderedDictionary<string, FieldValue>(source.Count, StringComparer.Ordinal);
         foreach (var (name, value) in source)
         {
             if (string.IsNullOrEmpty(name))

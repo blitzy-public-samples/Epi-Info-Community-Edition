@@ -32,8 +32,11 @@ namespace EpiInfo.CheckCode;
 /// </description></item>
 /// <item><description>
 /// <b>Form metadata.</b> <c>form</c> supplies identifier resolution, case-insensitive to the canonical
-/// <see cref="FieldMetadata.Name"/> (as <see cref="FormMetadata.FindField"/> resolves <c>AGE</c> to
-/// <c>Age</c>), field types, and group members from <see cref="FieldMetadata.List"/>.
+/// <see cref="FieldMetadata.Name"/>: a value read or <c>ASSIGN</c> takes the data field first (as
+/// <see cref="DataFieldSet.TryGet"/> resolves <c>AGE</c> to <c>Age</c>), while an <c>ENABLE</c>, <c>DISABLE</c> or
+/// <c>CLEAR</c> field, a <c>Field</c> block's name and the event's field take the row spelled exactly so first, and a
+/// name ambiguous among the data fields names no data field. It also supplies field types, and group members from
+/// <see cref="FieldMetadata.List"/> (as <see cref="FormDefinitionFactory.GetGroupMembers"/> resolves them).
 /// <see cref="FormMetadata.Name"/> is the <see cref="Diagnostic.Form"/> of every diagnostic returned.
 /// </description></item>
 /// </list>

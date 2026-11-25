@@ -29,10 +29,12 @@ namespace EpiInfo.Api.Services;
 /// <item><description>A missing body is the request-level 400 of <see cref="ApiProblems.RequestBodyRequired"/>.</description></item>
 /// <item><description>
 /// <c>event</c> must be a JSON string that <see cref="FieldEventKindNames.TryParseExact"/> accepts, and
-/// <c>fieldName</c> a JSON string naming, without regard to case, a field on a page of the form; data fields, labels,
-/// groups and command buttons all qualify. A failure of either is a field-level 400 under <c>errors["event"]</c> or
-/// <c>errors["fieldName"]</c> with a fixed message that never echoes the submitted text, together with every per-key
-/// error <see cref="ValuesReader"/> finds in <c>values</c>.
+/// <c>fieldName</c> a JSON string naming a field on a page of the form: the one spelled exactly so, otherwise the data
+/// field <see cref="DataFieldSet.TryGet"/> finds ignoring case, otherwise the first in metadata order equal to it
+/// ignoring case; a name ambiguous among the data fields (<see cref="DataFieldSet.IsAmbiguous"/>) names none. Data
+/// fields, labels, groups and command buttons all qualify. A failure of either is a field-level 400 under
+/// <c>errors["event"]</c> or <c>errors["fieldName"]</c> with a fixed message that never echoes the submitted text,
+/// together with every per-key error <see cref="ValuesReader"/> finds in <c>values</c>.
 /// </description></item>
 /// <item><description>
 /// With both valid, a <c>values</c> that is not an object is request-level, and a key that is not a data field of the
@@ -110,7 +112,10 @@ public sealed partial class FieldEventService(
             AddError(errors, EventKey, InvalidEventMessage);
         }
 
-        var fieldName = ResolveFieldName(metadata, request.FieldName);
+        // The field name resolves against the data fields ValuesReader.ToTyped selects from the same metadata for the
+        // values keys, so both name fields by one rule.
+        var dataFields = FormDefinitionFactory.GetDataFields(metadata);
+        var fieldName = ResolveFieldName(metadata, dataFields, request.FieldName);
         if (fieldName is null)
         {
             AddError(errors, FieldNameKey, InvalidFieldNameMessage);
@@ -126,7 +131,7 @@ public sealed partial class FieldEventService(
             // One field-level 400 lists the event and field-name entries with every per-key values error found, so
             // the caller sees all of them at once. A values member that is not an object adds nothing here: its
             // request-level 400 is reserved for a request whose event and field name are both valid.
-            AddErrors(errors, raw.FieldErrorsFor(metadata));
+            AddErrors(errors, raw.FieldEventErrorsFor(metadata));
             if (typed is not null)
             {
                 AddErrors(errors, typed.FieldErrors);
@@ -144,7 +149,7 @@ public sealed partial class FieldEventService(
 
         if (typed is null)
         {
-            return ApiProblems.ValidationFailed(raw.FieldErrorsFor(metadata));
+            return ApiProblems.ValidationFailed(raw.FieldEventErrorsFor(metadata));
         }
 
         if (!typed.IsSuccess)
@@ -180,18 +185,46 @@ public sealed partial class FieldEventService(
         return false;
     }
 
-    // The canonical metaFields.Name of a field shown on one of the form's pages, or null. System rows (UniqueKey,
-    // RecStatus, GlobalRecordId) belong to no page, so the browser can never raise an event on them.
-    private static string? ResolveFieldName(FormMetadata form, JsonElement? element)
+    // The canonical metaFields.Name of the field shown on one of the form's pages that the name designates, or null.
+    // Only page-bound rows count: system rows (UniqueKey, RecStatus, GlobalRecordId) and rows on a page outside the
+    // form are never shown, so the browser can never raise an event on them, and they neither hide nor shadow a page
+    // field whose name differs from theirs only by case. The rule is the one the engine resolves the name by again:
+    // the exact spelling; otherwise the data field DataFieldSet.TryGet finds ignoring case; otherwise nothing for a
+    // name ambiguous among the data fields, such as aGE beside Age and AGE; otherwise the first page-bound row in
+    // metadata order equal to it ignoring case, which is then a non-data row, since no data field equals it.
+    private static string? ResolveFieldName(FormMetadata form, DataFieldSet dataFields, JsonElement? element)
     {
         if (!TryReadString(element, out var name) || string.IsNullOrWhiteSpace(name))
         {
             return null;
         }
 
-        return form.FindField(name) is { PageId: { } pageId } field && form.FindPage(pageId) is not null
-            ? field.Name
-            : null;
+        FieldMetadata? firstEqualIgnoringCase = null;
+        foreach (var field in form.Fields)
+        {
+            if (field.PageId is not { } pageId || form.FindPage(pageId) is null)
+            {
+                continue;
+            }
+
+            // Every row spelled exactly so, the data field included, has this one canonical name.
+            if (string.Equals(field.Name, name, StringComparison.Ordinal))
+            {
+                return field.Name;
+            }
+
+            if (firstEqualIgnoringCase is null && string.Equals(field.Name, name, StringComparison.OrdinalIgnoreCase))
+            {
+                firstEqualIgnoringCase = field;
+            }
+        }
+
+        if (dataFields.TryGet(name, out var dataField))
+        {
+            return dataField.Name;
+        }
+
+        return dataFields.IsAmbiguous(name) ? null : firstEqualIgnoringCase?.Name;
     }
 
     // JsonElement.GetString throws InvalidOperationException for text that does not decode, such as an escaped lone

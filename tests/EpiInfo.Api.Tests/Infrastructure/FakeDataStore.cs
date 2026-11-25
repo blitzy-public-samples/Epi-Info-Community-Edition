@@ -17,8 +17,10 @@ namespace EpiInfo.Api.Tests.Infrastructure;
 /// </summary>
 /// <param name="Metadata">The form's metadata, returned by <see cref="IDataStore.GetFormMetadataAsync"/>.</param>
 /// <param name="Options">
-/// The code-table options of the form's Legal Values fields, keyed by field name and matched ignoring case. A Legal
-/// Values field without an entry gets an empty list, as a field without a usable code table does.
+/// The code-table options of the form's Legal Values fields, keyed by field name. A Legal Values field takes the
+/// entry keyed by its exact name; failing that, the one entry whose key equals its name ignoring case, only when no
+/// other key does and no other Legal Values field's name equals that key ignoring case. A Legal Values field without
+/// an entry gets an empty list, as a field without a usable code table does.
 /// </param>
 /// <param name="CheckCode">The <c>metaViews.CheckCode</c> text, or <see langword="null"/> for a NULL column.</param>
 public sealed record FakeForm(
@@ -588,7 +590,7 @@ public sealed class FakeDataStore : IDataStore
                 throw new ArgumentException("The form already holds a record with this id.", nameof(globalRecordId));
             }
 
-            var stored = new Dictionary<string, FieldValue>(state.DataFields.Count, StringComparer.OrdinalIgnoreCase);
+            var stored = new Dictionary<string, FieldValue>(state.DataFields.Count, StringComparer.Ordinal);
             foreach (var field in state.DataFields)
             {
                 stored[field.Name] = present.Contains(field.Page.PageId)
@@ -846,10 +848,19 @@ public sealed class FakeDataStore : IDataStore
             {
                 BeginRead(nameof(GetOptionsAsync), cancellationToken);
                 var state = Resolve(form);
-                var options = new Dictionary<string, IReadOnlyList<FieldOption>>(StringComparer.OrdinalIgnoreCase);
-                foreach (var field in state.DataFields.Where(field => field.FieldType == FieldType.LegalValues))
+                var legalValuesFields = state.DataFields
+                    .Where(field => field.FieldType == FieldType.LegalValues)
+                    .ToArray();
+                var legalValuesNames = new HashSet<string>(
+                    legalValuesFields.Select(field => field.Name),
+                    StringComparer.Ordinal);
+
+                // Keyed as the SQL metadata reader keys its map: by canonical name, compared ordinally, with an entry
+                // for every Legal Values field, so fields whose names differ only by case each keep their own list.
+                var options = new Dictionary<string, IReadOnlyList<FieldOption>>(StringComparer.Ordinal);
+                foreach (var field in legalValuesFields)
                 {
-                    IEnumerable<FieldOption> configured = FindOptions(state.Form, field.Name);
+                    IEnumerable<FieldOption> configured = FindOptions(state.Form, legalValuesNames, field.Name);
                     // Mirrors SqlMetadataReader, the one owner of the Sort = 1 ordering: the current culture read at
                     // the call, with StringSort, case-sensitive, then ordinal for texts the culture ranks equal.
                     if (field.Field.Sort)
@@ -1124,7 +1135,7 @@ public sealed class FakeDataStore : IDataStore
                 cancellationToken.ThrowIfCancellationRequested();
                 _calls.Add(new FakeStoreCall(nameof(InsertAsync), IsWrite: true));
 
-                var stored = new Dictionary<string, FieldValue>(state.DataFields.Count, StringComparer.OrdinalIgnoreCase);
+                var stored = new Dictionary<string, FieldValue>(state.DataFields.Count, StringComparer.Ordinal);
                 foreach (var field in state.DataFields)
                 {
                     stored[field.Name] = normalised.TryGetValue(field.Name, out var value) ? value : FieldValue.Null;
@@ -1212,7 +1223,7 @@ public sealed class FakeDataStore : IDataStore
                 _calls.Add(new FakeStoreCall(nameof(UpdateAsync), IsWrite: true));
 
                 // The published row is never changed: the update builds its replacement from copies.
-                var stored = new Dictionary<string, FieldValue>(row.Values, StringComparer.OrdinalIgnoreCase);
+                var stored = new Dictionary<string, FieldValue>(row.Values, StringComparer.Ordinal);
                 var present = new HashSet<int>(row.PresentPageIds);
                 foreach (var field in state.DataFields)
                 {
@@ -1312,22 +1323,35 @@ public sealed class FakeDataStore : IDataStore
     private static int PositionOf(IReadOnlyList<StoredRow> selected, int uniqueKey) =>
         selected.Count(row => row.UniqueKey <= uniqueKey);
 
-    private static IReadOnlyList<FieldOption> FindOptions(FakeForm form, string fieldName)
+    // The configured options of one Legal Values field: the entry whose key is its exact canonical name, whatever
+    // comparer the configured map uses. A key written in another letter case is taken only when it is the one key equal
+    // to the name ignoring case and no other Legal Values field of the form equals that key ignoring case, its exact
+    // spelling included. Seed keys written in another case keep working, while two fields whose names differ only by
+    // case never share a list: each takes only its own exact key, and a key in a third spelling belongs to neither.
+    private static IReadOnlyList<FieldOption> FindOptions(
+        FakeForm form,
+        IReadOnlySet<string> legalValuesNames,
+        string fieldName)
     {
-        if (form.Options.TryGetValue(fieldName, out var exact))
-        {
-            return exact;
-        }
-
+        IReadOnlyList<FieldOption>? looseOptions = null;
+        var looseKeys = 0;
         foreach (var (name, options) in form.Options)
         {
-            if (string.Equals(name, fieldName, StringComparison.OrdinalIgnoreCase))
+            if (string.Equals(name, fieldName, StringComparison.Ordinal))
             {
                 return options;
             }
+
+            if (string.Equals(name, fieldName, StringComparison.OrdinalIgnoreCase))
+            {
+                looseKeys++;
+                var fieldsSpelledAlike = legalValuesNames.Count(
+                    other => string.Equals(other, name, StringComparison.OrdinalIgnoreCase));
+                looseOptions = fieldsSpelledAlike == 1 ? options : null;
+            }
         }
 
-        return [];
+        return looseKeys == 1 && looseOptions is not null ? looseOptions : [];
     }
 
     // Values as the record methods read them: every data field in storage order, null for a page whose row is
@@ -1356,8 +1380,9 @@ public sealed class FakeDataStore : IDataStore
             .Select(column => (column.Name, state.DataFields.Find(column.Name) ?? column))
             .ToArray();
 
-    // The grid-only values of a returned row, in column order, keyed as RecordQueryRules.ProjectValues keys them: a
-    // name that differs only by case keeps the first column's entry.
+    // The grid-only values of a returned row, in column order, keyed as RecordQueryRules.ProjectValues keys them:
+    // ordinally, so columns whose names differ only by case keep an entry each, and only an exact repeat of a name
+    // keeps the first column's entry.
     private static IReadOnlyDictionary<string, FieldValue> GridValues(
         StoredRow row,
         (string Name, DataFieldMetadata Field)[] columns)
@@ -1391,13 +1416,16 @@ public sealed class FakeDataStore : IDataStore
         row.FirstSave,
         row.LastSave);
 
-    // Resolves values to canonical data-field names, rejecting what the SQL builders reject before any statement.
+    // Resolves values to canonical data-field names, rejecting what the SQL builders reject before any statement. The
+    // map compares canonical names ordinally, so fields whose names differ only by case keep a value each; the repeat
+    // check ignores case, as the validator's does, so two such keys are still rejected.
     private static Dictionary<string, FieldValue> NormaliseValues(
         FormState state,
         IReadOnlyDictionary<string, FieldValue> values,
         string paramName)
     {
-        var normalised = new Dictionary<string, FieldValue>(values.Count, StringComparer.OrdinalIgnoreCase);
+        var normalised = new Dictionary<string, FieldValue>(values.Count, StringComparer.Ordinal);
+        var seen = new HashSet<string>(values.Count, StringComparer.OrdinalIgnoreCase);
         foreach (var (name, value) in values)
         {
             if (name is null || !state.DataFields.TryGet(name, out var field))
@@ -1417,10 +1445,12 @@ public sealed class FakeDataStore : IDataStore
                 throw new ArgumentException("A value does not fit its column.", paramName);
             }
 
-            if (!normalised.TryAdd(field.Name, value))
+            if (!seen.Add(field.Name))
             {
                 throw new ArgumentException("Two values name the same field ignoring case.", paramName);
             }
+
+            normalised.Add(field.Name, value);
         }
 
         return normalised;
@@ -1664,8 +1694,9 @@ public sealed class FakeDataStore : IDataStore
             Rows = Rows.Replace(current, updated, ReferenceEqualityComparer.Instance);
     }
 
-    // One record, immutable once published: a write replaces the row rather than changing it. Values is keyed ignoring
-    // case and holds every data field; PresentPageIds holds the pages whose page row exists.
+    // One record, immutable once published: a write replaces the row rather than changing it. Values is keyed by
+    // canonical data-field name, compared ordinally as every values map is, and holds every data field; PresentPageIds
+    // holds the pages whose page row exists.
     private sealed record StoredRow(
         string GlobalRecordId,
         int UniqueKey,

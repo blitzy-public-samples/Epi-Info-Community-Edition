@@ -64,8 +64,9 @@ public static class Evaluator
     /// <remarks>
     /// <para>
     /// The caller, <c>CheckCodeEngine.Run</c>, selects the block: the one event block of the event's kind, as the
-    /// grammar allows one of each kind, inside the last <c>Field</c> block whose name matches the event's field
-    /// without regard to case, because a later block of a name replaced the earlier one in legacy Epi Info.
+    /// grammar allows one of each kind, inside the last <c>Field</c> block naming the event's field, as
+    /// <see cref="EvaluationContext.TryResolveTarget"/> resolves both names, because a later block of a name replaced
+    /// the earlier one in legacy Epi Info.
     /// </para>
     /// <para>
     /// Each block's static diagnostics are added here, so the caller must not add them again. They are added at
@@ -83,7 +84,10 @@ public static class Evaluator
     /// </remarks>
     /// <param name="form">The metadata of the form whose program runs.</param>
     /// <param name="blocks">The selected event blocks in source order.</param>
-    /// <param name="values">The record's current values, keyed by field name in any letter case. Never changed.</param>
+    /// <param name="values">
+    /// The record's current values keyed by data-field name, each key bound to its field as the
+    /// <see cref="EvaluationContext"/> constructor binds it. Never changed.
+    /// </param>
     /// <returns>
     /// The accumulated effects and diagnostics, or <see cref="FieldEventResponse.Empty"/> when
     /// <paramref name="blocks"/> is empty: with no matching block every array is empty, diagnostics included.
@@ -446,9 +450,10 @@ public static class Evaluator
         }
     }
 
-    // Legacy Enable/Disable: every name, then a group's members, de-duplicated keeping the first occurrence. Any
-    // field kind is accepted, labels and groups included, as legacy ChangeIsEnabled is. All names are resolved
-    // before the first effect, so an unknown name fails the statement whole.
+    // Legacy Enable/Disable: every name, then a group's members, de-duplicated by metadata row keeping the first
+    // occurrence, so fields whose names differ only by case stay distinct targets. Any field kind is accepted, labels
+    // and groups included, as legacy ChangeIsEnabled is. All names are resolved before the first effect, so an
+    // unknown name fails the statement whole.
     private static void ExecuteEnablement(
         IReadOnlyList<string> names,
         int line,
@@ -459,7 +464,7 @@ public static class Evaluator
         FieldMetadata[] fields = ResolveAll(names, line, command, context);
 
         var targets = new List<FieldMetadata>();
-        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var seen = new HashSet<FieldMetadata>(ReferenceEqualityComparer.Instance);
         foreach (FieldMetadata field in fields)
         {
             AddOnce(targets, seen, field);
@@ -482,7 +487,7 @@ public static class Evaluator
         FieldMetadata[] fields = ResolveAll(node.Names, node.Line, ClearCommand, context);
 
         var targets = new List<FieldMetadata>();
-        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var seen = new HashSet<FieldMetadata>(ReferenceEqualityComparer.Instance);
         foreach (FieldMetadata field in fields)
         {
             IReadOnlyList<FieldMetadata> expanded = context.IsGroup(field) ? context.GetGroupMembers(field) : [field];
@@ -684,6 +689,8 @@ public static class Evaluator
             : value.TryGetText(out string? text)
                 && CultureInfo.InvariantCulture.CompareInfo.Compare(text, "true", CompareOptions.IgnoreCase) == 0;
 
+    // ENABLE, DISABLE and CLEAR designate rows, so their names resolve by the target rule: the exact spelling first,
+    // which keeps a group from being taken for a data field whose name differs from it only by case.
     private static FieldMetadata[] ResolveAll(
         IReadOnlyList<string> names,
         int line,
@@ -693,15 +700,16 @@ public static class Evaluator
         var fields = new FieldMetadata[names.Count];
         for (var i = 0; i < fields.Length; i++)
         {
-            fields[i] = context.Resolve(names[i], line, command);
+            fields[i] = context.ResolveTarget(names[i], line, command);
         }
 
         return fields;
     }
 
-    private static void AddOnce(List<FieldMetadata> targets, HashSet<string> seen, FieldMetadata field)
+    // Rows are compared by reference, so two fields whose names differ only by case are both kept.
+    private static void AddOnce(List<FieldMetadata> targets, HashSet<FieldMetadata> seen, FieldMetadata field)
     {
-        if (seen.Add(field.Name))
+        if (seen.Add(field))
         {
             targets.Add(field);
         }
