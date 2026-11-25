@@ -23,8 +23,8 @@ namespace EpiInfo.CheckCode.Evaluation;
 /// </para>
 /// <para>
 /// Each statement runs inside its own error boundary. A runtime error (an unknown field, a type mismatch, an
-/// assignment to a label, group or unsupported field, a failed <c>YEARS</c> or <c>EPIWEEK</c> call, an expression
-/// nested deeper than the remaining stack allows) skips that statement with one
+/// assignment to a label, group or unsupported field, a failed <c>YEARS</c> or <c>EPIWEEK</c> call, a condition with
+/// no value, an expression nested deeper than the remaining stack allows) skips that statement with one
 /// <see cref="DiagnosticSeverity.Error"/> diagnostic, keeps the effects of earlier statements and continues with the
 /// next one, so a check-code error never blocks a save. Diagnostic messages name fields, functions and constructs
 /// only, never a value.
@@ -56,6 +56,7 @@ public static class Evaluator
     private const string BooleanComparisonMismatchMessage =
         "Type mismatch: a boolean can be compared only with a yes or no value.";
     private const string ExpressionTooDeepMessage = "Expression is nested too deeply to evaluate.";
+    private const string MissingConditionValueMessage = "A condition has no value.";
 
     /// <summary>
     /// Runs the selected event blocks of one field event over a record's values and returns the response.
@@ -226,8 +227,8 @@ public static class Evaluator
     /// <item><description>
     /// <c>NOT</c> is <see langword="false"/> only when its operand is true as legacy <c>Rule_NotExp</c> reads it:
     /// the boolean <see langword="true"/>, or text that equals <c>true</c>, untrimmed, in a linguistic comparison
-    /// that ignores case, made with the invariant culture where legacy used the current culture. So <c>NOT</c> of a
-    /// null value, a number, a date, <c>" true"</c> or other text is <see langword="true"/>, while <c>NOT</c> of
+    /// that ignores case, made with the invariant culture where legacy used the current culture. So <c>NOT</c> of an
+    /// empty text field, a number, a date, <c>" true"</c> or other text is <see langword="true"/>, while <c>NOT</c> of
     /// <c>tr</c>, a soft hyphen and <c>ue</c> is <see langword="false"/>, because that comparison ignores the soft
     /// hyphen. The result is a boolean everywhere except as an operand of <c>=</c>, below.
     /// </description></item>
@@ -236,6 +237,12 @@ public static class Evaluator
     /// <see langword="true"/> only when both are true as an <c>IF</c> condition is, as in legacy
     /// <c>Rule_AndExp</c>: the boolean <see langword="true"/>, or text that equals <c>true</c>, untrimmed, in an
     /// ordinal comparison that ignores case. That comparison, unlike <c>NOT</c>'s, ignores no character.
+    /// </description></item>
+    /// <item><description>
+    /// An operand of <c>NOT</c> or <c>AND</c>, like an <c>IF</c> condition, must have a value, because legacy read
+    /// its truth from the value's string form. The one exception is an empty text, multiline or legal-values field,
+    /// which legacy read as empty text and which is not true. Any other operand with no value, such as <c>(.)</c>,
+    /// an empty number, date, checkbox or option field, or a function that gives no value, is a runtime error.
     /// </description></item>
     /// <item><description>
     /// <c>=</c> evaluates left, then right, and compares with <see cref="ValueComparer.TryAreEqual"/>. An operand
@@ -265,8 +272,9 @@ public static class Evaluator
     /// </exception>
     /// <exception cref="CheckCodeRuntimeException">
     /// The expression names an unknown field or an unsupported function, a function call failed, an <c>=</c>
-    /// compares a boolean on the left with a value that is not a yes or no spelling, the expression is of a kind
-    /// outside the subset, or it is nested too deeply for the remaining stack.
+    /// compares a boolean on the left with a value that is not a yes or no spelling, an operand of <c>NOT</c> or
+    /// <c>AND</c> has no value, the expression is of a kind outside the subset, or it is nested too deeply for the
+    /// remaining stack.
     /// </exception>
     public static FieldValue Evaluate(ExpressionNode expression, EvaluationContext context, string command)
     {
@@ -293,7 +301,7 @@ public static class Evaluator
                 return EvaluateCall(call, context, command);
 
             case NotNode not:
-                return FieldValue.FromBoolean(!IsTrueForNot(Evaluate(not.Operand, context, command)));
+                return FieldValue.FromBoolean(!IsTrueForNot(EvaluateCondition(not.Operand, context, command)));
 
             case AndNode and:
                 return EvaluateAnd(and, context, command);
@@ -315,11 +323,11 @@ public static class Evaluator
         ExpressionNode current = node;
         while (current is AndNode and)
         {
-            all &= IsTrue(Evaluate(and.Left, context, command));
+            all &= IsTrue(EvaluateCondition(and.Left, context, command));
             current = and.Right;
         }
 
-        bool last = IsTrue(Evaluate(current, context, command));
+        bool last = IsTrue(EvaluateCondition(current, context, command));
         return FieldValue.FromBoolean(all && last);
     }
 
@@ -413,8 +421,9 @@ public static class Evaluator
     }
 
     // Legacy Rule_If_Then_Else_End: a true condition, the boolean true or the text "true" in any letter case, runs
-    // THEN; false, null, numbers, dates and other text run ELSE. A runtime error in the condition escapes to this
-    // statement's boundary, so neither branch runs. Each branch statement has its own boundary through ExecuteList.
+    // THEN; false, an empty text-family field, numbers, dates and other text run ELSE. Any other condition with no
+    // value is a runtime error (EvaluateCondition). A runtime error in the condition escapes to this statement's
+    // boundary, so neither branch runs. Each branch statement has its own boundary through ExecuteList.
     // In pre-order the IF at index is followed by its THEN statements and then by its ELSE statements. ExecuteList
     // passes a feed only while it has a diagnostic to add; without one no index is read, so the skipped THEN is not
     // sized.
@@ -425,7 +434,7 @@ public static class Evaluator
         EffectAccumulator effects,
         StaticDiagnosticFeed? feed)
     {
-        FieldValue condition = Evaluate(node.Condition, context, IfCommand);
+        FieldValue condition = EvaluateCondition(node.Condition, context, IfCommand);
         if (IsTrue(condition))
         {
             ExecuteList(node.Then, index + 1, context, effects, feed);
@@ -632,12 +641,32 @@ public static class Evaluator
     private static string FunctionFailureReason(string name, string error) =>
         error.StartsWith(name, StringComparison.OrdinalIgnoreCase) ? error : $"{name}: {error}";
 
+    // The value of an IF condition, an AND operand or a NOT operand, whose truth legacy read from its ToString().
+    // Rule_If_Then_Else_End.cs:170, Rule_AndExp.cs:41-44 and Rule_NotExp.cs:40 call ToString() on the value, which
+    // throws for a null one before either branch runs, so a value-less operand fails its statement. The one null value
+    // let through is that of a text, multiline or legal-values field with no value: legacy Rule_Value read such a
+    // field as "", which is simply not true. Every other value-less operand, such as (.), an empty number, date,
+    // checkbox or option field, or a null function result, is a runtime error.
+    private static FieldValue EvaluateCondition(ExpressionNode expression, EvaluationContext context, string command)
+    {
+        FieldValue value = Evaluate(expression, context, command);
+        if (!value.IsNull
+            || (expression is IdentifierNode identifier
+                && context.TryResolve(identifier.Name, out FieldMetadata? field)
+                && FieldTypeMapper.IsTextFamily(context.GetFieldType(field))))
+        {
+            return value;
+        }
+
+        throw new CheckCodeRuntimeException(expression.Line, command, MissingConditionValueMessage);
+    }
+
     // The truth of an IF condition and of each AND operand. Rule_If_Then_Else_End.cs:170 and Rule_AndExp.cs:41-44
     // lower the value's ToString() with the invariant culture and compare it ordinally with "true". So the boolean
     // true ("True") and the text "true" in any letter case are true, untrimmed; every other value, numbers, dates,
     // option indexes and other text included, is not. OrdinalIgnoreCase matches those ASCII letters without reading a
-    // culture. A null value, which legacy could not turn into text, is not true either and never throws. NOT reads
-    // truth with a culture comparison instead (IsTrueForNot).
+    // culture. The null value EvaluateCondition lets through, an empty text-family field that legacy read as "", is
+    // not true. NOT reads truth with a culture comparison instead (IsTrueForNot).
     private static bool IsTrue(FieldValue value) =>
         value.TryGetBoolean(out bool isTrue)
             ? isTrue
@@ -647,8 +676,8 @@ public static class Evaluator
     // StringComparison.CurrentCultureIgnoreCase, a linguistic comparison; the invariant culture keeps it, as the text
     // rule of ValueComparer does, without depending on the server's culture. It ignores characters without collation
     // weight, such as the soft hyphen, so "tr" + U+00AD + "ue" is true here and not for IF or AND. Only text can
-    // differ from IsTrue: the boolean true is "True", and no number, date or option index spells "true". A null
-    // value, which legacy could not turn into text, is not true either and never throws.
+    // differ from IsTrue: the boolean true is "True", and no number, date or option index spells "true". The null value
+    // EvaluateCondition lets through, an empty text-family field that legacy read as "", is not true.
     private static bool IsTrueForNot(FieldValue value) =>
         value.TryGetBoolean(out bool isTrue)
             ? isTrue

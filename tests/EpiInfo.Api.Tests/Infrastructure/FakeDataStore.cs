@@ -1548,8 +1548,10 @@ public sealed class FakeDataStore : IDataStore
         return null;
     }
 
-    // The exact order of two numbers: as integers when both hold one, an integer against the other's double without
-    // rounding either, and as doubles when neither holds an integer.
+    // The exact order of two numbers on an integer column, as the SQL store's integer-column binding gives it: as
+    // integers when both hold one, and an integer against a number holding none by that number's exact floor or, past
+    // the Int64 range, by its side, never by its nearest double. A stored integer-column value always holds an exact
+    // integer, so two numbers holding none never meet in a search; should they, they compare as their nearest doubles.
     private static int CompareExactly(FieldValue left, FieldValue right)
     {
         var leftIsInteger = left.TryGetInteger(out var leftInteger);
@@ -1557,35 +1559,25 @@ public sealed class FakeDataStore : IDataStore
         return (leftIsInteger, rightIsInteger) switch
         {
             (true, true) => leftInteger.CompareTo(rightInteger),
-            (true, false) => CompareWithDouble(leftInteger, right.AsNumber()),
-            (false, true) => -CompareWithDouble(rightInteger, left.AsNumber()),
+            (true, false) => CompareWithNonInteger(leftInteger, right),
+            (false, true) => -CompareWithNonInteger(rightInteger, left),
             _ => left.AsNumber().CompareTo(right.AsNumber()),
         };
     }
 
-    // The mathematically exact order, -1, 0 or 1, of an integer and a finite double, where converting either to the
-    // other's type could round. -2^63 and 2^63 are exact doubles, and between them the double's floor fits a long.
-    private static int CompareWithDouble(long integer, double number)
+    // The exact order, -1 or 1, of an integer and a number that holds no exact Int64 integer, so never equals it. With
+    // a floor f, the number lies strictly inside (f, f + 1), so the integer is the greater exactly when it exceeds f,
+    // even where the nearest double is whole: 1.9999999999999999 has the floor 1 and the nearest double 2. With no
+    // floor in the Int64 range, the number lies beyond the whole range, below it when its nearest double is negative
+    // and above it otherwise, even where that double is -2^63, which equals long.MinValue.
+    private static int CompareWithNonInteger(long integer, FieldValue number)
     {
-        if (number >= 9223372036854775808d)
+        if (number.TryGetFloor(out var floor))
         {
-            return -1;
+            return integer > floor ? 1 : -1;
         }
 
-        if (number < -9223372036854775808d)
-        {
-            return 1;
-        }
-
-        var floor = Math.Floor(number);
-        var whole = (long)floor;
-        if (integer != whole)
-        {
-            return integer < whole ? -1 : 1;
-        }
-
-        // The integer equals the floor, so it is smaller exactly when the double has a fractional part.
-        return floor == number ? 0 : -1;
+        return number.AsNumber() < 0d ? 1 : -1;
     }
 
     private FormState Resolve(FormMetadata form) => Resolve(form.ViewId);
@@ -1664,7 +1656,9 @@ public sealed class FakeDataStore : IDataStore
         SaveStamp? LastSave);
 
     // How a number condition compares its column: as binary64 doubles for a float column, as SQL float comparison
-    // does, and exactly for an integer column, so adjacent bigint values beyond 2^53 stay distinct.
+    // does, and exactly for an integer column, as the SQL store binds its criterion there: adjacent bigint values
+    // beyond 2^53 stay distinct, and a criterion holding no exact integer compares by its exact floor or, past the
+    // Int64 range, by its side, never by its nearest double.
     private enum NumericComparison
     {
         Exact,

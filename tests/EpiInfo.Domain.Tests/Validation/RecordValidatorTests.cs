@@ -1867,7 +1867,8 @@ public sealed class RecordValidatorTests
     };
 
     // A JSON number literal as the API's values reader parses it, its digits kept exact: a whole number within the
-    // signed 64-bit range keeps its integer, and any other number only its nearest double, never as a whole number.
+    // signed 64-bit range keeps its integer, and any other number its nearest double and, when its floor lies within
+    // that range, the exact floor (FieldValue.TryGetFloor), but never an integer, even where the double is whole.
     // Values beyond 2^53 are built this way, because a double literal would already have rounded them.
     private static FieldValue ExactNumber(string literal)
     {

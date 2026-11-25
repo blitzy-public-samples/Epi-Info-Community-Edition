@@ -18,7 +18,9 @@ namespace EpiInfo.Data.Sql;
 /// <see cref="ColumnValueConverter"/> builds every instance from the column type the metadata reader discovered, using
 /// the types SqlClient maps one-to-one onto the admitted SQL Server types: <c>String</c> is <c>nvarchar</c>,
 /// <c>Double</c> <c>float</c>, <c>Byte</c> <c>tinyint</c>, <c>Int16</c> <c>smallint</c>, <c>Int32</c> <c>int</c>,
-/// <c>Int64</c> <c>bigint</c>, <c>Boolean</c> <c>bit</c> and <c>DateTime</c> <c>datetime</c>.
+/// <c>Int64</c> <c>bigint</c>, <c>Boolean</c> <c>bit</c> and <c>DateTime</c> <c>datetime</c>. <c>Decimal</c>, bound
+/// as <c>decimal</c> with the precision and scale of its value, is used only for a number search criterion on an
+/// integer column that holds no exact 64-bit integer, and is never written to a column.
 /// </para>
 /// <para>
 /// The value is field data, which the redaction policy keeps out of logs and error bodies, so <see cref="ToString"/>
@@ -117,7 +119,8 @@ internal sealed record SqlStatement(string Text, IReadOnlyList<SqlParameterValue
 /// <see cref="DbType.Int16"/>, <c>int</c> as <see cref="DbType.Int32"/>, <c>bigint</c> as <see cref="DbType.Int64"/>,
 /// <c>float</c> as <see cref="DbType.Double"/>, <c>datetime</c> as <see cref="DbType.DateTime"/> and <c>bit</c> as
 /// <see cref="DbType.Boolean"/>. These are the types legacy <c>SqlDatabase.CovertToNativeDbType</c> maps onto the same
-/// native types. Any other column type is refused.
+/// native types. Any other column type is refused. Search criteria, which no column stores, are bound by
+/// <see cref="ToSearchParameter"/>, which describes their types, <see cref="DbType.Decimal"/> among them.
 /// </para>
 /// <para>
 /// A value the column cannot hold exactly is refused with an <see cref="ArgumentException"/> before it is bound, by
@@ -358,33 +361,52 @@ internal static class ColumnValueConverter
     }
 
     /// <summary>
-    /// Binds the value of one search alternative. Alternatives that test for <c>IS NULL</c> bind no parameter; the
-    /// search builder renders them itself.
+    /// Binds the value of one search alternative, typed for the column the condition reads. Alternatives that test
+    /// for <c>IS NULL</c> bind no parameter; the search builder renders them itself.
     /// </summary>
     /// <param name="name">The positional parameter name.</param>
-    /// <param name="target">The column the condition reads.</param>
+    /// <param name="target">The kind of column the condition reads.</param>
     /// <param name="fieldType">
     /// The data field's type for a page field; <see langword="null"/> for a system target.
+    /// </param>
+    /// <param name="column">
+    /// The reader-built column the condition reads: for a page field its page-table column, which must admit the
+    /// field type and whose type decides how a number is bound; for <c>GlobalRecordId</c> a character column; for
+    /// <c>RecStatus</c> an integer column.
     /// </param>
     /// <param name="value">The alternative's value, of the kind the search criteria parser gives the target.</param>
     /// <returns>
     /// For <c>GlobalRecordId</c> and text, multiline and legal-values fields, Phone Number included, a
     /// <see cref="DbType.String"/> of size <c>-1</c>, so the whole criterion reaches SQL Server even against a shorter
     /// column and <c>SUBSTRING(@p, 1, 255)</c> sees all of it. For <c>RecStatus</c>, its integer as
-    /// <see cref="DbType.Int32"/>. For a number, <see cref="DbType.Double"/>; a date, <see cref="DbType.DateTime"/> at
-    /// 00:00:00; a checkbox, <see cref="DbType.Boolean"/>; an option, its index as <see cref="DbType.Int32"/>.
+    /// <see cref="DbType.Int32"/>. For a date, <see cref="DbType.DateTime"/> at 00:00:00; a checkbox,
+    /// <see cref="DbType.Boolean"/>; an option, its index as <see cref="DbType.Int32"/>. For a number on a
+    /// <c>float</c> column, its nearest double as <see cref="DbType.Double"/>. For a number on an integer column, a
+    /// parameter SQL Server compares exactly, without converting the column to <c>float</c>, which would round
+    /// distinct <c>bigint</c> values beyond 2^53 onto one double: the exact 64-bit integer as
+    /// <see cref="DbType.Int64"/> when the number holds one; otherwise, as <see cref="DbType.Decimal"/>, its floor
+    /// plus 0.5 when that floor lies within the <c>bigint</c> range (<c>9007199254740992.5</c> for
+    /// <c>9007199254740992.5</c>, 2.5 for <c>2.0000000000000001</c>), and for a number beyond the range
+    /// <c>-9223372036854775808.5</c> or <c>9223372036854775807.5</c> by its sign. Each lies between the same two
+    /// consecutive integers as the criterion, or beyond every <c>bigint</c> on the same side, so every comparison
+    /// operator gives every column value the answer the exact criterion gives.
     /// </returns>
+    /// <exception cref="ArgumentNullException"><paramref name="column"/> is null.</exception>
     /// <exception cref="ArgumentException">
     /// <paramref name="name"/> is blank; the value is the null value; the target and field type name no searchable
-    /// column; the value's kind does not fit the column; or a <c>RecStatus</c> number is not an <c>int</c> or a date
-    /// is outside the <c>datetime</c> range.
+    /// column; the column is not one the target reads, or a page field's column does not admit its field type; the
+    /// value's kind does not fit the column; or a <c>RecStatus</c> number is not an <c>int</c> or a date is outside
+    /// the <c>datetime</c> range.
     /// </exception>
     internal static SqlParameterValue ToSearchParameter(
         string name,
         SearchTarget target,
         FieldType? fieldType,
+        ColumnMetadata column,
         FieldValue value)
     {
+        ArgumentNullException.ThrowIfNull(column);
+
         if (value.IsNull)
         {
             throw new ArgumentException(SearchNullMessage, nameof(value));
@@ -392,20 +414,24 @@ internal static class ColumnValueConverter
 
         var (dbType, kind) = (target, fieldType) switch
         {
-            (SearchTarget.BaseGlobalRecordId, null) => (DbType.String, FieldValueKind.Text),
-            (SearchTarget.BaseRecStatus, null) => (DbType.Int32, FieldValueKind.Number),
-            (SearchTarget.PageField, { } type) when FieldTypeMapper.IsTextFamily(type) =>
+            (SearchTarget.BaseGlobalRecordId, null) when column.Family == ColumnFamily.Character =>
                 (DbType.String, FieldValueKind.Text),
-            (SearchTarget.PageField, FieldType.Number) => (DbType.Double, FieldValueKind.Number),
-            (SearchTarget.PageField, FieldType.Date) => (DbType.DateTime, FieldValueKind.Date),
-            (SearchTarget.PageField, FieldType.Checkbox) => (DbType.Boolean, FieldValueKind.Boolean),
-            (SearchTarget.PageField, FieldType.Option) => (DbType.Int32, FieldValueKind.Index),
-            _ => throw new ArgumentException(SearchTargetMessage, nameof(target)),
+            (SearchTarget.BaseRecStatus, null) when column.Family == ColumnFamily.Integer =>
+                (DbType.Int32, FieldValueKind.Number),
+            (SearchTarget.PageField, { } type) => PageFieldSearchType(column, type),
+            _ => throw new ArgumentException(SearchTargetMessage, nameof(column)),
         };
 
         if (value.Kind != kind)
         {
             throw new ArgumentException(SearchKindMismatchMessage, nameof(value));
+        }
+
+        // A page-field number carries its column's type: float is bound below, an integer type here.
+        if (target == SearchTarget.PageField && kind == FieldValueKind.Number && dbType != DbType.Double)
+        {
+            var (integerColumnType, integerColumnValue) = IntegerColumnCriterion(value);
+            return new SqlParameterValue(name, integerColumnType, integerColumnValue, null);
         }
 
         // Each arm is boxed as its own type, so the bound CLR type always matches the DbType.
@@ -425,6 +451,51 @@ internal static class ColumnValueConverter
         };
 
         return new SqlParameterValue(name, dbType, bound, dbType == DbType.String ? MaxSize : null);
+    }
+
+    // The parameter type and value kind of a page-field criterion. FieldBinding checks that the column admits the
+    // field type; a number takes the column's own type, which decides how it is bound, while text is bound at full
+    // length whatever the column's size and the other types as their fixed criterion types.
+    private static (DbType DbType, FieldValueKind Kind) PageFieldSearchType(ColumnMetadata column, FieldType fieldType)
+    {
+        var columnType = FieldBinding(column, fieldType).DbType;
+        return fieldType switch
+        {
+            FieldType.Number => (columnType, FieldValueKind.Number),
+            FieldType.Date => (DbType.DateTime, FieldValueKind.Date),
+            FieldType.Checkbox => (DbType.Boolean, FieldValueKind.Boolean),
+            FieldType.Option => (DbType.Int32, FieldValueKind.Index),
+            _ when FieldTypeMapper.IsTextFamily(fieldType) => (DbType.String, FieldValueKind.Text),
+            _ => throw new ArgumentException(SearchTargetMessage, nameof(fieldType)),
+        };
+    }
+
+    // A number criterion on an integer column. Its nearest double would make SQL Server convert the column to float,
+    // which beyond 2^53 rounds adjacent bigint values onto one double, and the double itself may have lost which
+    // integers the criterion lies between (9007199254740992.5 has the nearest double 9007199254740992). Against
+    // integers, a criterion that holds no exact integer compares only by the integer interval it lies strictly inside,
+    // so every arm binds a value SQL Server compares exactly, converting the integer column to bigint or decimal:
+    // - an exact 64-bit integer as that bigint;
+    // - otherwise, with a floor f within the bigint range, the decimal f + 0.5, strictly inside the same interval
+    //   (f, f + 1), so =, <>, <, <=, > and >= give every integer the answer the exact criterion gives;
+    // - otherwise the number lies beyond the bigint range, and the decimal just beyond its end on the number's side,
+    //   -2^63 - 0.5 or 2^63 - 0.5, lies on the same side of every column value.
+    // Each arm is boxed as its own type, so the bound CLR type always matches the DbType.
+    private static (DbType DbType, object Value) IntegerColumnCriterion(FieldValue value)
+    {
+        if (value.TryGetInteger(out var whole))
+        {
+            return (DbType.Int64, (object)whole);
+        }
+
+        if (value.TryGetFloor(out var floor))
+        {
+            return (DbType.Decimal, (object)(floor + 0.5m));
+        }
+
+        return (DbType.Decimal, (object)(value.AsNumber() < 0d
+            ? (decimal)long.MinValue - 0.5m
+            : (decimal)long.MaxValue + 0.5m));
     }
 
     // The binding of a data field's value: the column's type, which the mapper's column-family rule must admit for the

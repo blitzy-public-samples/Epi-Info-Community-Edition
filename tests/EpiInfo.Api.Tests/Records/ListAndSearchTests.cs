@@ -203,16 +203,24 @@ public sealed class FakeDataStoreFindTests
         await AssertCountsFoundAsync(Parse(CountField, criterion), expected);
     }
 
-    // The fraction 2.5 and the numbers beyond the Int64 range, whose nearest doubles are -1e19 and 2^63, compare
-    // against small and extreme values alike: long.MaxValue rounds to 2^63 as a double, yet is smaller. The conditions
-    // are built directly, because the store's contract for such criteria does not depend on whether the parser admits
-    // them on an integer column.
+    // A criterion holding no exact integer compares by its exact floor, never by its nearest double, as the SQL store
+    // binds it: 2.5, 9007199254740992.5, 2.0000000000000001 and 1.9999999999999999 each lie strictly between their
+    // floor and the next integer, though the last three have the whole nearest doubles 2^53, 2 and 2. A number beyond
+    // the Int64 range lies beyond every value on its side, even where its nearest double is a value's own:
+    // long.MaxValue rounds to 2^63, the nearest double of 9223372036854775808, yet is smaller, and long.MinValue is
+    // -2^63, the nearest double of -9223372036854775809, yet is larger. The conditions are built directly, because the
+    // store's contract for such criteria does not depend on whether the parser admits them on an integer column.
     [Theory]
     [InlineData(SearchOperator.Equal, "2.5", new long[0])]
     [InlineData(SearchOperator.Less, "2.5", new long[] { long.MinValue, 2 })]
     [InlineData(SearchOperator.Greater, "2.5", new long[] { 3, TwoToThe53, TwoToThe53 + 1, TwoToThe53 + 2, long.MaxValue })]
+    [InlineData(SearchOperator.Equal, "9007199254740992.5", new long[0])]
+    [InlineData(SearchOperator.Equal, "2.0000000000000001", new long[0])]
+    [InlineData(SearchOperator.LessOrEqual, "1.9999999999999999", new long[] { long.MinValue })]
     [InlineData(SearchOperator.Less, "9223372036854775808", new long[] { long.MinValue, 2, 3, TwoToThe53, TwoToThe53 + 1, TwoToThe53 + 2, long.MaxValue })]
     [InlineData(SearchOperator.GreaterOrEqual, "9223372036854775808", new long[0])]
+    [InlineData(SearchOperator.Equal, "-9223372036854775809", new long[0])]
+    [InlineData(SearchOperator.Greater, "-9223372036854775809", new long[] { long.MinValue, 2, 3, TwoToThe53, TwoToThe53 + 1, TwoToThe53 + 2, long.MaxValue })]
     [InlineData(SearchOperator.Greater, "-1e19", new long[] { long.MinValue, 2, 3, TwoToThe53, TwoToThe53 + 1, TwoToThe53 + 2, long.MaxValue })]
     [InlineData(SearchOperator.Less, "-1e19", new long[0])]
     public async Task IntegerColumnComparesFractionsAndNumbersBeyondInt64(

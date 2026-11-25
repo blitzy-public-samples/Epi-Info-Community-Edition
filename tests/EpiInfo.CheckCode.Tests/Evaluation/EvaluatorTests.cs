@@ -14,15 +14,16 @@ namespace EpiInfo.CheckCode.Tests.Evaluation;
 /// <summary>
 /// Pins the tree-walking evaluator of the check-code subset against legacy Epi Info: the <c>=</c> rule and literal
 /// values of <c>Rule_CompareExp</c> and <c>Rule_Value</c>, <c>NOT</c> and <c>AND</c>, <c>IF/ELSE</c>,
-/// <c>ENABLE</c>, <c>DISABLE</c> and <c>CLEAR</c> with group expansion, typed <c>ASSIGN</c> with <c>YEARS</c> and
-/// <c>EPIWEEK</c>, <c>DIALOG</c>, case-insensitive identifiers, runtime-error recovery, bounded stack use for long
-/// chains and deep nesting, and statelessness.
+/// <c>ENABLE</c>, <c>DISABLE</c> and <c>CLEAR</c> with group expansion, typed <c>ASSIGN</c> with its conversions,
+/// option bounds and rejected targets, <c>YEARS</c> and <c>EPIWEEK</c>, <c>DIALOG</c>, case-insensitive identifiers,
+/// runtime-error recovery, bounded stack use for long chains and deep nesting, and statelessness.
 /// </summary>
 /// <remarks>
 /// Scenario values from <c>testdata/scenarios/check_code_scenarios.json</c> are restated inline and the file is never
 /// read, so this stays a pure unit test. The seeded programs are verbatim copies of <c>metaViews.CheckCode</c> in
 /// <c>testdata/sql/03_forms.sql</c>, and the form metadata mirrors the seeded <c>metaFields</c> rows and page-table
-/// columns of the fields those programs touch.
+/// columns of the fields those programs touch. Synthetic forms stand in where no seeded field or program reaches a
+/// case.
 /// </remarks>
 public sealed class EvaluatorTests
 {
@@ -34,6 +35,12 @@ public sealed class EvaluatorTests
 
     // An explicit stack for the long-chain cases, so their outcome never depends on the host's default thread size.
     private const int SmallStackBytes = 1024 * 1024;
+
+    // The fixed, value-free reason of a condition or NOT/AND operand with no value.
+    private const string MissingConditionValueReason = "A condition has no value.";
+
+    // The line of the IF in ConditionProgram.
+    private const int ConditionLine = 4;
 
     // A verbatim copy of the seeded metaViews.CheckCode of CaseReport (ViewId 1), tabs and final newline included,
     // so its line numbers are the seeded ones [testdata/sql/03_forms.sql:26-54].
@@ -249,6 +256,52 @@ public sealed class EvaluatorTests
             F(3, "Chills", 10, "Checkbox", 1, 3, "bit", 1),
         ]);
 
+    // Synthetic: metaFields.List is free text that legacy GroupField.ChildFieldNameArray splits on commas
+    // [Epi.Core/Services/Fields/GrouplField.cs:126-133]. This List pads, changes letter case, repeats a member and
+    // holds an unknown name and empty items, in an order unlike the fields' own. The label Heading and the group Signs
+    // are members with no value, and Signs' own member Rash is not a member of Symptoms. Cough lies outside both
+    // groups, and the Option WorstSymptom has a List that names fields.
+    private static readonly FormMetadata MessyGroupForm = new(
+        ViewId: 96,
+        Name: "SyntheticMessyGroup",
+        BaseTableName: "SyntheticMessyGroup",
+        Pages: [new PageMetadata(1, "Page 1", 0, "SyntheticMessyGroup1")],
+        Fields:
+        [
+            F(1, "Symptoms", 21, "Group", 1, 1, null, 0, list: " chills , FEVER,Chills,NoSuchField,, ,Heading, signs "),
+            F(2, "Heading", 2, "Label/Title", 1, 2, null, 0),
+            F(3, "Fever", 10, "Checkbox", 1, 3, "bit", 1),
+            F(4, "Chills", 10, "Checkbox", 1, 4, "bit", 1),
+            F(5, "Cough", 10, "Checkbox", 1, 5, "bit", 1),
+            F(6, "WorstSymptom", 12, "Option", 1, 6, "smallint", 2, list: "Fever,Chills"),
+            F(7, "Signs", 21, "Group", 1, 7, null, 0, list: "Rash"),
+            F(8, "Rash", 10, "Checkbox", 1, 8, "bit", 1),
+        ]);
+
+    // Synthetic: no seeded field is an Option and no seeded program assigns a label, group or unsupported field, so
+    // typed ASSIGN needs its own form. Colour's items are the List items before "||", Red, Green and Blue at indexes
+    // 0 to 2 [Epi.Core/Services/Fields/OptionField.cs:84-102], in a smallint column as legacy stores them
+    // [Epi.Core/Services/Fields/OptionField.cs:45-56]. Command Button is always unsupported, and Yes/No is
+    // unsupported on its tinyint column.
+    private static readonly FormMetadata TypedForm = new(
+        ViewId: 97,
+        Name: "SyntheticTypes",
+        BaseTableName: "SyntheticTypes",
+        Pages: [new PageMetadata(1, "Page 1", 0, "SyntheticTypes1")],
+        Fields:
+        [
+            F(1, "Heading", 2, "Label/Title", 1, 1, null, 0),
+            F(2, "Contact", 21, "Group", 1, 2, null, 0, list: "LastName,Score"),
+            F(3, "LastName", 1, "Text", 1, 3, "nvarchar", 8000),
+            F(4, "Remarks", 4, "Multiline", 1, 4, "ntext", 16),
+            F(5, "Score", 5, "Number", 1, 5, "float", 8),
+            F(6, "Visited", 7, "Date", 1, 6, "datetime", 8),
+            F(7, "Seen", 7, "Date", 1, 7, "datetime", 8),
+            F(8, "Colour", 12, "Option", 1, 8, "smallint", 2, list: "Red,Green,Blue||10,20"),
+            F(9, "Locate", 13, "Command Button", 1, 9, null, 0),
+            F(10, "Consent", 11, "Yes/No", 1, 10, "tinyint", 1),
+        ]);
+
     public static TheoryData<string, FieldValue, FieldValue, bool> EqualityCases => new()
     {
         // Rule_CompareExp.cs:73-76: both sides empty under "=" are equal; Util.IsEmpty counts "" as empty.
@@ -315,6 +368,34 @@ public sealed class EvaluatorTests
         { "checked vs \"True\"", Bool(true), Text("True"), true },
         { "checked vs \"T\"", Bool(true), Text("T"), true },
         { "checked vs \"(+)\"", Bool(true), Text("(+)"), true },
+
+        // Util.cs:995-1001: IsEmpty tests string.IsNullOrEmpty, so whitespace-only text is a non-empty side, which
+        // Rule_CompareExp.cs:81-90 never makes equal to an empty one.
+        { "whitespace-only text vs null", Text(" "), FieldValue.Null, false },
+        { "null vs whitespace-only text", FieldValue.Null, Text(" "), false },
+
+        // Rule_CompareExp.cs:111-115: an option index on the left compares with a number as a double too.
+        { "option index vs the same number", FieldValue.FromIndex(2), N(2), true },
+        { "option index vs another number", FieldValue.FromIndex(2), N(25), false },
+
+        // Rule_CompareExp.cs:123-175: double.TryParse accepts surrounding white space, and text that does not parse
+        // falls through to the string comparison of lines 191-217.
+        { "padded numeric string vs number", Text(" 25 "), N(25), true },
+        { "number vs padded numeric string", N(25), Text(" 25 "), true },
+        { "non-numeric string vs number", Text("abc"), N(25), false },
+        { "number vs non-numeric string", N(25), Text("abc"), false },
+
+        // Rule_CompareExp.cs:191-217: a date against text compares the string forms of both sides, untrimmed. A
+        // date's form is DateTime.ToString(), which carries a time, so a date never equals date-only text, its own
+        // ISO form included, on either side. The server writes that form in the invariant culture.
+        { "date vs text of another date", Date(2011, 1, 15), Text("2011-01-16"), false },
+        { "text of another date vs date", Text("2011-01-16"), Date(2011, 1, 15), false },
+        { "date vs its ISO text", Date(2011, 1, 15), Text("2011-01-15"), false },
+        { "its ISO text vs date", Text("2011-01-15"), Date(2011, 1, 15), false },
+        { "date vs its invariant date-and-time text", Date(2011, 1, 15), Text("01/15/2011 00:00:00"), true },
+        { "its invariant date-and-time text vs date", Text("01/15/2011 00:00:00"), Date(2011, 1, 15), true },
+        { "date vs padded date-and-time text", Date(2011, 1, 15), Text(" 01/15/2011 00:00:00 "), false },
+        { "date vs en-US date-and-time text", Date(2011, 1, 15), Text("1/15/2011 12:00:00 AM"), false },
     };
 
     // Rule_CompareExp.cs:182-185: legacy's ConvertStringToBoolean (EnterRule.cs:64-89) has no value for these right
@@ -326,6 +407,50 @@ public sealed class EvaluatorTests
         { "checked vs number", Bool(true), N(1) },
         { "unchecked vs date", Bool(false), Date(2011, 1, 15) },
         { "checked vs option index", Bool(true), FieldValue.FromIndex(0) },
+    };
+
+    // Rule_If_Then_Else_End.cs:170 runs THEN when the condition's ToString().ToLowerInvariant() is "true", which a
+    // checked checkbox gives and an unchecked one, a number, a date and an option index never give. A text,
+    // multiline or legal-values field with no value reads as "" (Rule_Value.cs:400-407), so, like empty text, it
+    // runs ELSE without an error. A field absent from the values has no value. The text that is true is pinned by
+    // IfNotAndAnd_OverATextField_FollowTheLegacyTextTruth.
+    public static TheoryData<FormMetadata, string, FieldValue?, bool> IfConditionCases => new()
+    {
+        { FoodHistoryForm, "Fever", Bool(true), true },
+        { FoodHistoryForm, "Fever", Bool(false), false },
+        { FoodHistoryForm, "LastName", Text(""), false },
+        { FoodHistoryForm, "FeverTemp", N(101.2), false },
+        { FoodHistoryForm, "OnsetDate", Date(2011, 1, 15), false },
+        { TypedForm, "Colour", FieldValue.FromIndex(1), false },
+        { FoodHistoryForm, "Sex", null, false },
+        { TypedForm, "Remarks", null, false },
+    };
+
+    // Rule_If_Then_Else_End.cs:170 calls ToString() on the condition, which throws for a null value before either
+    // branch runs. Rule_Value.cs:358-386 reads an empty checkbox, number or date field as null, Rule_Value.cs:72-110
+    // makes (.) null, and YEARS without two dates returns null (Rule_Years.cs).
+    public static TheoryData<ExpressionNode> ValuelessConditionCases => new()
+    {
+        new IdentifierNode("Fever", 3),
+        new IdentifierNode("FeverTemp", 3),
+        new IdentifierNode("OnsetDate", 3),
+        LiteralNode.Missing(3),
+        new FunctionCallNode(
+            "YEARS",
+            new ExpressionNode[] { new IdentifierNode("DOB", 3), new IdentifierNode("DateofInterview", 3) },
+            3),
+    };
+
+    // Rule_NotExp.cs:39 and Rule_AndExp.cs:41-42 call ToString() on each operand, which throws for the empty
+    // checkbox Fever (Rule_Value.cs:358-367). The left operand is converted before the right one runs, so an empty
+    // left operand fails before the unknown field on the right is reached, and a false left operand still lets an
+    // empty right one fail.
+    public static TheoryData<string, (string, FieldValue)[]> ValuelessOperandCases => new()
+    {
+        { "NOT Fever", [] },
+        { "Fever AND LastName", [("LastName", Text("true"))] },
+        { "Fever AND NoSuchField", [] },
+        { "LastName AND Fever", [("LastName", Text("1"))] },
     };
 
     // Whitespace-only text is deliberately absent: legacy treats it as non-empty and the plan does not decide it.
@@ -375,17 +500,63 @@ public sealed class EvaluatorTests
         { "ASSIGN Num = 9007199254740993", "Num", FieldValue.FromInteger(9007199254740993) },
     };
 
-    public static TheoryData<string, string, FieldValue> TypedAssignments => new()
+    public static TheoryData<FormMetadata, string, string, FieldValue, (string, FieldValue)[]> TypedAssignments => new()
     {
-        { "ASSIGN Age = 25", "Age", N(25) },
-        { "ASSIGN LastName = \"Smith\"", "LastName", Text("Smith") },
-        { "ASSIGN White = (-)", "White", Bool(false) },
+        { FoodHistoryForm, "ASSIGN Age = 25", "Age", N(25), [] },
+        { FoodHistoryForm, "ASSIGN LastName = \"Smith\"", "LastName", Text("Smith"), [] },
+        { FoodHistoryForm, "ASSIGN White = (-)", "White", Bool(false), [] },
 
-        // NOT is a boolean outside =, so a checkbox takes it; LastName is absent, so null, which is not true.
-        { "ASSIGN White = NOT LastName", "White", Bool(true) },
+        // NOT is a boolean outside =, so a checkbox takes it; LastName is absent, an empty text field, which is not
+        // true.
+        { FoodHistoryForm, "ASSIGN White = NOT LastName", "White", Bool(true), [] },
 
         // (.) assigns an empty value: it is reported in Assigned, never as a clear.
-        { "ASSIGN Age = (.)", "Age", FieldValue.Null },
+        { FoodHistoryForm, "ASSIGN Age = (.)", "Age", FieldValue.Null, [] },
+
+        // ASSIGN types its value as values does: a date field holds a date, carried as YYYY-MM-DD.
+        { TypedForm, "ASSIGN Seen = Visited", "Seen", Date(2011, 1, 15), [("Visited", Date(2011, 1, 15))] },
+
+        // A text-family field holds a string: a number as its invariant round-trip text, a whole one without a
+        // decimal point, and a date as the YYYY-MM-DD text a date has in values.
+        { TypedForm, "ASSIGN LastName = 37.5", "LastName", Text("37.5"), [] },
+        { TypedForm, "ASSIGN LastName = 25", "LastName", Text("25"), [] },
+        { TypedForm, "ASSIGN LastName = Visited", "LastName", Text("2011-01-15"), [("Visited", Date(2011, 1, 15))] },
+        { TypedForm, "ASSIGN Remarks = Visited", "Remarks", Text("2011-01-15"), [("Visited", Date(2011, 1, 15))] },
+
+        // An option holds the 0-based index of its item [Epi.Windows.Enter/Forms/canvas.render.cs:184-200], from 0
+        // to the item count minus 1, and a whole number, written or read from a number field, is that index.
+        { TypedForm, "ASSIGN Colour = 0", "Colour", FieldValue.FromIndex(0), [] },
+        { TypedForm, "ASSIGN Colour = 2", "Colour", FieldValue.FromIndex(2), [] },
+        { TypedForm, "ASSIGN Colour = Score", "Colour", FieldValue.FromIndex(1), [("Score", N(1))] },
+
+        // A number field reads an option as its index.
+        { TypedForm, "ASSIGN Score = Colour", "Score", N(2), [("Colour", FieldValue.FromIndex(2))] },
+    };
+
+    // Each statement has no exact conversion to its target (see TypedForm), so it fails with an error diagnostic.
+    // The string is the assigned value's text, which the message must not carry.
+    public static TheoryData<string, string, string, (string, FieldValue)[]> RejectedAssignments => new()
+    {
+        // An option index is a whole number from 0 to the item count minus 1. Colour has three items, so 3 is out of
+        // range even though the List holds five comma-separated items once its "||" tail is counted. A negative
+        // index comes from a number field, because the subset has no unary minus.
+        { "ASSIGN Colour = 1.5", "Colour", "1.5", [] },
+        { "ASSIGN Colour = 3", "Colour", "3", [] },
+        { "ASSIGN Colour = Score", "Colour", "-1", [("Score", N(-1))] },
+
+        // An option holds an index, never text, even numeric text, or a boolean.
+        { "ASSIGN Colour = \"1\"", "Colour", "1", [] },
+        { "ASSIGN Colour = (-)", "Colour", "false", [] },
+
+        // Labels, groups and unsupported fields are not data fields: they have no value to assign.
+        { "ASSIGN Heading = \"Smith\"", "Heading", "Smith", [] },
+        { "ASSIGN Contact = 7", "Contact", "7", [] },
+        { "ASSIGN Locate = \"Smith\"", "Locate", "Smith", [] },
+        { "ASSIGN Consent = 1", "Consent", "1", [] },
+
+        // A date field holds only a date, and a number field only a number or an option index.
+        { "ASSIGN Visited = \"Smith\"", "Visited", "Smith", [] },
+        { "ASSIGN Score = (-)", "Score", "false", [] },
     };
 
     [Theory]
@@ -427,6 +598,12 @@ public sealed class EvaluatorTests
             Assert.True(decimalEqual, "\"37.5\" must equal 37.5 under de-DE.");
             Assert.True(ValueComparer.TryAreEqual(Text("1,000"), N(1000), out bool groupedEqual));
             Assert.True(groupedEqual, "\"1,000\" must equal 1000 under de-DE.");
+
+            // de-DE writes the date 15.01.2011 00:00:00; the comparison writes it in the invariant culture.
+            Assert.True(ValueComparer.TryAreEqual(Date(2011, 1, 15), Text("01/15/2011 00:00:00"), out bool dateEqual));
+            Assert.True(dateEqual, "The invariant date-and-time text must equal the date under de-DE.");
+            Assert.True(ValueComparer.TryAreEqual(Date(2011, 1, 15), Text("15.01.2011 00:00:00"), out bool localEqual));
+            Assert.False(localEqual, "The de-DE date-and-time text must not equal the date.");
         }
         finally
         {
@@ -616,9 +793,9 @@ public sealed class EvaluatorTests
     // Legacy truth is the text "true" in any letter case, untrimmed. Rule_If_Then_Else_End.cs:170 and
     // Rule_AndExp.cs:41-44 lower the operand's ToString() and compare it ordinally with "true", which isTrue gives;
     // Rule_NotExp.cs:40 compares it with "true" in a culture comparison that ignores case, which notIsTrue gives. A
-    // null value, which legacy could not turn into text, is not true. The soft-hyphen row is where the two differ:
-    // NOT's culture comparison ignores that character, so NOT finds the text true and is false, while IF and AND
-    // find it not true.
+    // text field with no value, which legacy read as "" (Rule_Value.cs:400-407), is not true. The soft-hyphen row is
+    // where the two differ: NOT's culture comparison ignores that character, so NOT finds the text true and is false,
+    // while IF and AND find it not true.
     [Theory]
     [InlineData("TRUE", true, true)]
     [InlineData("true", true, true)]
@@ -915,6 +1092,139 @@ public sealed class EvaluatorTests
     }
 
     [Fact]
+    public void GetGroupMembers_ReadsTheListAsCanonicalFieldsOnceInFirstOccurrenceOrder()
+    {
+        // Each List item resolves case-insensitively to its canonical metaFields.Name; unknown and empty items are
+        // dropped, a repeated member keeps its first place, and a member group is returned without its own members.
+        var context = new EvaluationContext(MessyGroupForm, new Dictionary<string, FieldValue>());
+
+        IReadOnlyList<FieldMetadata> members = context.GetGroupMembers(MessyGroupForm.FindField("Symptoms")!);
+
+        Assert.Equal(new[] { "Chills", "Fever", "Heading", "Signs" }, members.Select(member => member.Name));
+    }
+
+    [Theory]
+    [InlineData("Cough")] // a checkbox without a List
+    [InlineData("WorstSymptom")] // an Option whose List names fields of the form
+    public void GetGroupMembers_OfAFieldThatIsNotAGroup_IsEmpty(string field)
+    {
+        var context = new EvaluationContext(MessyGroupForm, new Dictionary<string, FieldValue>());
+
+        Assert.Empty(context.GetGroupMembers(MessyGroupForm.FindField(field)!));
+    }
+
+    [Theory]
+    [InlineData("ENABLE")]
+    [InlineData("DISABLE")]
+    public void EnablementOfAGroup_TargetsOnlyItsCanonicalMembersOnItsOwnAxis(string command)
+    {
+        // GuiMediator.IEnterCheckCode.cs:2086-2220: ENABLE and DISABLE take the named field, then each member once in
+        // List order whatever its kind, so the label Heading and the group Signs are targets and Signs' member Rash
+        // is not. The group's own entry is left unpinned.
+        string program = $"""
+            Field Cough
+                Click
+                    {command} Symptoms
+                End-Click
+            End-Field
+            """;
+
+        FieldEventResponse response = Run(
+            program,
+            MessyGroupForm,
+            FieldEventKind.FieldClick,
+            "Cough",
+            ("Fever", Bool(true)),
+            ("Chills", Bool(false)),
+            ("Cough", Bool(true)),
+            ("Rash", Bool(true)));
+
+        (IReadOnlyList<string> affected, IReadOnlyList<string> other) = command switch
+        {
+            "ENABLE" => (response.Enabled, response.Disabled),
+            "DISABLE" => (response.Disabled, response.Enabled),
+            _ => throw new ArgumentOutOfRangeException(nameof(command), command, "Not an enablement statement."),
+        };
+        Assert.Equal(new[] { "Chills", "Fever", "Heading", "Signs" }, affected.Where(name => name != "Symptoms"));
+        Assert.Empty(other);
+        Assert.Empty(response.Cleared);
+        Assert.Empty(response.Assigned);
+        Assert.Empty(response.Dialogs);
+        Assert.Empty(response.Diagnostics);
+    }
+
+    [Fact]
+    public void ClearOfAGroup_ClearsOnlyItsDataMembers()
+    {
+        // GuiMediator.IEnterCheckCode.cs:1631-1694: CLEAR of a group clears its IInputField members only, so the
+        // group, its label Heading, its member group Signs, Signs' member Rash and Cough, outside it, keep their state.
+        const string Program = """
+            Field Cough
+                Click
+                    CLEAR Symptoms
+                End-Click
+            End-Field
+            """;
+
+        FieldEventResponse response = Run(
+            Program,
+            MessyGroupForm,
+            FieldEventKind.FieldClick,
+            "Cough",
+            ("Fever", Bool(true)),
+            ("Chills", Bool(false)),
+            ("Cough", Bool(true)),
+            ("Rash", Bool(true)));
+
+        Assert.Equal(new[] { "Chills", "Fever" }, response.Cleared);
+        Assert.Empty(response.Enabled);
+        Assert.Empty(response.Disabled);
+        Assert.Empty(response.Assigned);
+        Assert.Empty(response.Dialogs);
+        Assert.Empty(response.Diagnostics);
+    }
+
+    [Fact]
+    public void Run_WithAHandBuiltClearOfAGroup_ClearsItsDataMembersForLaterStatements()
+    {
+        // The CLEAR expansion without the parser. The IF reads the cleared Fever as missing and Cough, outside the
+        // group, as still set.
+        var feverIsMissing = new EqualsNode(new IdentifierNode("Fever", 4), LiteralNode.Missing(4), 4);
+        var coughIsSet = new NotNode(new EqualsNode(new IdentifierNode("Cough", 4), LiteralNode.Missing(4), 4), 4);
+        var block = new EventBlockNode(
+            FieldEventKind.FieldClick,
+            2,
+            new StatementNode[]
+            {
+                new ClearStatementNode(new[] { "Symptoms" }, 3),
+                new IfStatementNode(
+                    new AndNode(feverIsMissing, coughIsSet, 4),
+                    new StatementNode[] { new DialogStatementNode("Fever was cleared.", null, 5) },
+                    null,
+                    4),
+            },
+            Array.Empty<Diagnostic>());
+
+        FieldEventResponse response = Evaluator.Run(
+            MessyGroupForm,
+            new[] { block },
+            new Dictionary<string, FieldValue>
+            {
+                ["Fever"] = Bool(true),
+                ["Chills"] = Bool(false),
+                ["Cough"] = Bool(true),
+                ["Rash"] = Bool(true),
+            });
+
+        Assert.Equal(new[] { "Chills", "Fever" }, response.Cleared);
+        Assert.Equal(new DialogMessage("Fever was cleared.", null), Assert.Single(response.Dialogs));
+        Assert.Empty(response.Enabled);
+        Assert.Empty(response.Disabled);
+        Assert.Empty(response.Assigned);
+        Assert.Empty(response.Diagnostics);
+    }
+
+    [Fact]
     public void Run_PlacesAParsedBlocksStaticDiagnosticsAmongItsStatements_AndAnUnanchoredBlocksFirst()
     {
         // The ASSIGN fails at run time and the HIDE after it on the same line is skipped by the parser.
@@ -1050,7 +1360,8 @@ public sealed class EvaluatorTests
 
     [Theory]
     [MemberData(nameof(TypedAssignments), DisableDiscoveryEnumeration = true)]
-    public void Assign_StoresTheValueTypedByTheTargetField(string statement, string field, FieldValue expected)
+    public void Assign_StoresTheValueTypedByTheTargetField(
+        FormMetadata form, string statement, string field, FieldValue expected, (string, FieldValue)[] values)
     {
         string program = $"""
             Field LastName
@@ -1060,12 +1371,49 @@ public sealed class EvaluatorTests
             End-Field
             """;
 
-        FieldEventResponse response = Run(program, FoodHistoryForm, FieldEventKind.FieldAfter, "LastName");
+        FieldEventResponse response = Run(program, form, FieldEventKind.FieldAfter, "LastName", values);
 
         Assert.Equal(new[] { field }, response.Assigned.Keys);
         Assert.Equal(expected, response.Assigned[field]);
         Assert.Empty(response.Cleared);
         Assert.Empty(response.Diagnostics);
+    }
+
+    [Theory]
+    [MemberData(nameof(RejectedAssignments), DisableDiscoveryEnumeration = true)]
+    public void Assign_WithNoExactConversion_ReportsAnErrorAndKeepsRunning(
+        string statement, string target, string valueText, (string, FieldValue)[] values)
+    {
+        string program = $"""
+            Field LastName
+                After
+                    {statement}
+                    ASSIGN Remarks = "after"
+                End-After
+            End-Field
+            """;
+        Assert.Equal(statement, ProgramLine(program, 3));
+
+        FieldEventResponse response = RunWithoutThrowing(
+            program,
+            TypedForm,
+            FieldEventKind.FieldAfter,
+            "LastName",
+            values);
+
+        Diagnostic diagnostic = Assert.Single(response.Diagnostics);
+        Assert.Equal(DiagnosticSeverity.Error, diagnostic.Severity);
+        Assert.Equal("ASSIGN", diagnostic.Command);
+        Assert.Equal(3, diagnostic.Line);
+        Assert.Equal("SyntheticTypes", diagnostic.Form);
+        Assert.False(string.IsNullOrWhiteSpace(diagnostic.Message));
+        Assert.DoesNotContain(valueText, diagnostic.Message, StringComparison.Ordinal);
+
+        // The failing statement assigns nothing, and the statement after it still runs.
+        Assert.DoesNotContain(target, response.Assigned.Keys);
+        Assert.Equal(new[] { "Remarks" }, response.Assigned.Keys);
+        Assert.Equal(Text("after"), response.Assigned["Remarks"]);
+        Assert.Empty(response.Cleared);
     }
 
     [Fact]
@@ -1293,6 +1641,93 @@ public sealed class EvaluatorTests
     }
 
     [Theory]
+    [MemberData(nameof(IfConditionCases), DisableDiscoveryEnumeration = true)]
+    public void Run_WithAHandBuiltIf_RunsThenOnlyForATrueCondition(
+        FormMetadata form, string conditionField, FieldValue? value, bool runsThen)
+    {
+        // A bare field as the condition, built without the parser, so its value reaches the IF as it is. Each
+        // branch enables or disables that same field, which every form here has.
+        var values = new Dictionary<string, FieldValue>();
+        if (value is { } present)
+        {
+            values.Add(conditionField, present);
+        }
+
+        var statement = new IfStatementNode(
+            new IdentifierNode(conditionField, 3),
+            new StatementNode[] { new EnableStatementNode(new[] { conditionField }, 4) },
+            new StatementNode[] { new DisableStatementNode(new[] { conditionField }, 6) },
+            3);
+        var block = new EventBlockNode(
+            FieldEventKind.FieldAfter,
+            2,
+            new StatementNode[] { statement },
+            Array.Empty<Diagnostic>());
+
+        FieldEventResponse response = Evaluator.Run(form, new[] { block }, values);
+
+        string[] thenEffect = runsThen ? [conditionField] : [];
+        string[] elseEffect = runsThen ? [] : [conditionField];
+        Assert.Equal(thenEffect, response.Enabled);
+        Assert.Equal(elseEffect, response.Disabled);
+        Assert.Empty(response.Cleared);
+        Assert.Empty(response.Assigned);
+        Assert.Empty(response.Diagnostics);
+    }
+
+    [Theory]
+    [MemberData(nameof(ValuelessConditionCases), DisableDiscoveryEnumeration = true)]
+    public void Run_WithAHandBuiltIfWhoseConditionHasNoValue_ReportsAnErrorAndRunsNeitherBranch(
+        ExpressionNode condition)
+    {
+        // No field has a value. The ENABLE before the IF must stand and the one after it must still run.
+        var statements = new StatementNode[]
+        {
+            new EnableStatementNode(new[] { "DOB" }, 2),
+            new IfStatementNode(
+                condition,
+                new StatementNode[] { new EnableStatementNode(new[] { "Age" }, 4) },
+                new StatementNode[] { new DisableStatementNode(new[] { "Age" }, 6) },
+                3),
+            new EnableStatementNode(new[] { "LastName" }, 8),
+        };
+        var block = new EventBlockNode(FieldEventKind.FieldAfter, 1, statements, Array.Empty<Diagnostic>());
+
+        FieldEventResponse response = Evaluator.Run(
+            FoodHistoryForm,
+            new[] { block },
+            new Dictionary<string, FieldValue>());
+
+        AssertMissingConditionValueError(response, 3);
+        Assert.Equal(new[] { "DOB", "LastName" }, response.Enabled);
+        Assert.Empty(response.Disabled);
+        Assert.Empty(response.Cleared);
+        Assert.Empty(response.Assigned);
+    }
+
+    [Theory]
+    [MemberData(nameof(ValuelessOperandCases), DisableDiscoveryEnumeration = true)]
+    public void NotAndAnd_WithAnOperandThatHasNoValue_ReportAnErrorAndRunNeitherBranch(
+        string condition, (string, FieldValue)[] values)
+    {
+        string program = ConditionProgram(condition);
+        Assert.Equal($"IF {condition} THEN", ProgramLine(program, ConditionLine));
+
+        FieldEventResponse response = RunWithoutThrowing(
+            program,
+            FoodHistoryForm,
+            FieldEventKind.FieldAfter,
+            "Sex",
+            values);
+
+        AssertMissingConditionValueError(response, ConditionLine);
+        Assert.Equal(new[] { "DOB", "OnsetDate" }, response.Enabled);
+        Assert.Empty(response.Disabled);
+        Assert.Empty(response.Cleared);
+        Assert.Empty(response.Assigned);
+    }
+
+    [Theory]
     // Every term holds, so the whole AND chain does.
     [InlineData("Sex = \"1\"", " AND ", "Sex = \"1\"", LongChainTerms, "then")]
     // n (-) operands folded to the right, Eq(a, Eq(b, ...)), are true exactly when n is even.
@@ -1457,33 +1892,62 @@ public sealed class EvaluatorTests
     }
 
     [Fact]
-    public void Run_RepeatedOnOneEngine_GivesTheSameResponse()
+    public void Run_OnOneEngine_GivesEachCallItsOwnInputsAndEffects()
     {
+        // One engine runs one block three times. The first call carries LastName and assigns Age, the second carries
+        // neither, so either value surviving the first call sends the second to the ELSE branch or drops its dialog.
+        // The third call repeats the first call's inputs and must answer exactly as the first did.
+        const string Program = """
+            Field Sex
+                After
+                    IF Age = (.) AND Sex = "1" THEN
+                        ENABLE Pregnant
+                    ELSE
+                        DISABLE Pregnant
+                        CLEAR Pregnant
+                        ASSIGN Age = 30
+                    END-IF
+                    IF LastName = (.) THEN
+                        DIALOG "no name"
+                    END-IF
+                End-After
+            End-Field
+            """;
         ICheckCodeEngine engine = new CheckCodeEngine();
-        var values = new Dictionary<string, FieldValue> { ["Sex"] = Text("2") };
+        KeyValuePair<string, FieldValue>[] firstInput = [new("Sex", Text("2")), new("LastName", Text("Smith"))];
+        KeyValuePair<string, FieldValue>[] secondInput = [new("Sex", Text("1"))];
+        var firstValues = new Dictionary<string, FieldValue>(firstInput);
+        var secondValues = new Dictionary<string, FieldValue>(secondInput);
+        var thirdValues = new Dictionary<string, FieldValue>(firstInput);
 
-        FieldEventResponse first = engine.Run(
-            AssignSexThenTestItProgram,
-            CaseReportForm,
-            FieldEventKind.FieldAfter,
-            "Sex",
-            values);
-        FieldEventResponse second = engine.Run(
-            AssignSexThenTestItProgram,
-            CaseReportForm,
-            FieldEventKind.FieldAfter,
-            "Sex",
-            values);
+        FieldEventResponse first = RunSexAfter(firstValues);
+        FieldEventResponse second = RunSexAfter(secondValues);
+        FieldEventResponse third = RunSexAfter(thirdValues);
 
-        Assert.Equal(new[] { "Pregnant" }, first.Enabled);
-        Assert.Equal(first.Enabled, second.Enabled);
-        Assert.Equal(first.Disabled, second.Disabled);
-        Assert.Equal(first.Cleared, second.Cleared);
-        Assert.Equal(first.Dialogs, second.Dialogs);
-        Assert.Equal(first.Diagnostics, second.Diagnostics);
-        Assert.Equal(
-            first.Assigned.Select(entry => (entry.Key, entry.Value)),
-            second.Assigned.Select(entry => (entry.Key, entry.Value)));
+        AssertFirstCallResponse(first);
+        Assert.Equal(new[] { "Pregnant" }, second.Enabled);
+        Assert.Empty(second.Disabled);
+        Assert.Empty(second.Cleared);
+        Assert.Empty(second.Assigned);
+        Assert.Equal(new DialogMessage("no name", null), Assert.Single(second.Dialogs));
+        Assert.Empty(second.Diagnostics);
+        AssertFirstCallResponse(third);
+        Assert.Equal(firstInput, firstValues);
+        Assert.Equal(secondInput, secondValues);
+        Assert.Equal(firstInput, thirdValues);
+
+        FieldEventResponse RunSexAfter(Dictionary<string, FieldValue> values) =>
+            engine.Run(Program, CaseReportForm, FieldEventKind.FieldAfter, "Sex", values);
+
+        static void AssertFirstCallResponse(FieldEventResponse response)
+        {
+            Assert.Empty(response.Enabled);
+            Assert.Equal(new[] { "Pregnant" }, response.Disabled);
+            Assert.Equal(new[] { "Pregnant" }, response.Cleared);
+            Assert.Equal(new[] { ("Age", N(30)) }, response.Assigned.Select(entry => (entry.Key, entry.Value)));
+            Assert.Empty(response.Dialogs);
+            Assert.Empty(response.Diagnostics);
+        }
     }
 
     // Column metadata comes only from FieldTypeMapper.DescribeColumn, the one owner of the column-family rules.
@@ -1581,6 +2045,32 @@ public sealed class EvaluatorTests
 
     // Line numbers are 1-based, as diagnostics report them; indentation is not part of the statement.
     private static string ProgramLine(string program, int line) => program.Split('\n')[line - 1].Trim();
+
+    // A FoodHistory Sex After block whose IF at ConditionLine enables Age for THEN and disables it for ELSE, between
+    // an ENABLE before it and one after it.
+    private static string ConditionProgram(string condition) => $"""
+        Field Sex
+            After
+                ENABLE DOB
+                IF {condition} THEN
+                    ENABLE Age
+                ELSE
+                    DISABLE Age
+                END-IF
+                ENABLE OnsetDate
+            End-After
+        End-Field
+        """;
+
+    private static void AssertMissingConditionValueError(FieldEventResponse response, int line)
+    {
+        Diagnostic diagnostic = Assert.Single(response.Diagnostics);
+        Assert.Equal(DiagnosticSeverity.Error, diagnostic.Severity);
+        Assert.Equal("IF", diagnostic.Command);
+        Assert.Equal(line, diagnostic.Line);
+        Assert.Equal("FoodHistory", diagnostic.Form);
+        Assert.Equal(MissingConditionValueReason, diagnostic.Message);
+    }
 
     private static void AssertNoFieldEffects(FieldEventResponse response)
     {

@@ -81,13 +81,18 @@ public static class FieldValueCoercion
 {
     private const string MetadataDateFormat = "MM-dd-yyyy";
 
+    // Exponent digits past this magnitude saturate it: no text is long enough for its digit counts to offset a scale
+    // of this many powers of ten, so the number is then far beyond every finite double and the signed 64-bit range,
+    // or nearer to zero than any text short enough to hold its digits could bring it back from.
+    private const long ExponentSaturation = 1_000_000_000_000L;
+
     // Every finite double is below 2^1024, which is below 10^309, so a number text whose value is at least 10^309
     // never parses as finite.
     private const int MaxFiniteDecimalExponent = 308;
 
-    // Exponent digits past this magnitude saturate it: the value is then far beyond every finite double, or nearer
-    // to zero than any text short enough to hold its digits could bring it back from.
-    private const long ExponentSaturation = 1_000_000_000_000L;
+    // The integer digits of long.MaxValue, 9223372036854775807: a number with more is at least 10^19, beyond the
+    // signed 64-bit range.
+    private const int MaxInt64IntegerDigits = 19;
 
     /// <summary>
     /// Coerces a raw scalar into a <see cref="FieldValue"/> of the <paramref name="target"/> kind.
@@ -112,7 +117,8 @@ public static class FieldValueCoercion
     /// <item><description>
     /// a number needs a finite numeric primitive, kept exact: an integer primitive, or a whole decimal, within the
     /// signed 64-bit range keeps its exact integer, and any other value keeps its nearest double without being
-    /// rounded into a whole number;
+    /// rounded into a whole number, and its exact floor (<see cref="FieldValue.TryGetFloor"/>) when that lies
+    /// within the range;
     /// </description></item>
     /// <item><description>a boolean needs a <see cref="bool"/>;</description></item>
     /// <item><description>a date needs a <c>yyyy-MM-dd</c> string or a <see cref="DateOnly"/>;</description></item>
@@ -278,7 +284,11 @@ public static class FieldValueCoercion
     /// leading sign, a decimal point and an exponent, and no thousands separators. A whole number within the
     /// signed 64-bit range, such as <c>9007199254740993</c>, <c>2.0</c> or <c>2e3</c>, keeps its exact integer;
     /// any other number keeps its nearest double without being rounded into a whole number, so
-    /// <c>2.0000000000000001</c> is not the integer 2. Negative zero becomes zero.
+    /// <c>2.0000000000000001</c> is not the integer 2, and also its exact floor
+    /// (<see cref="FieldValue.TryGetFloor"/>) when that lies within the signed 64-bit range: <c>9007199254740992.5</c>,
+    /// whose nearest double is the whole 9007199254740992, keeps the floor 9007199254740992 and <c>-1e-400</c> the
+    /// floor -1. The floor is read from the text itself in one pass bounded by its length, whatever its digit count
+    /// or exponent. Negative zero becomes zero.
     /// </summary>
     /// <param name="text">Search or metadata text, such as <c>120</c> or <c>37.5</c>.</param>
     /// <param name="value">The number, or <see cref="FieldValue.Null"/> when parsing fails.</param>
@@ -297,7 +307,7 @@ public static class FieldValueCoercion
 
         if (double.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out var nearest))
         {
-            return TryFromNonInt64Number(nearest, out value);
+            return TryFromNonInt64Number(text.AsSpan(), nearest, out value);
         }
 
         value = FieldValue.Null;
@@ -307,8 +317,8 @@ public static class FieldValueCoercion
     /// <summary>
     /// Parses a finite number from UTF-8 text exactly, with the rules of
     /// <see cref="TryParseNumber(string, out FieldValue)"/>. It serves JSON number literals, which the JSON reader
-    /// has already checked against the JSON number grammar, so <c>9007199254740993</c> keeps its exact integer
-    /// and <c>1e400</c> is refused rather than read as infinity.
+    /// has already checked against the JSON number grammar, so <c>9007199254740993</c> keeps its exact integer,
+    /// <c>9007199254740992.5</c> its exact floor, and <c>1e400</c> is refused rather than read as infinity.
     /// </summary>
     /// <param name="utf8Text">The UTF-8 text, such as a JSON number literal.</param>
     /// <param name="value">The number, or <see cref="FieldValue.Null"/> when parsing fails.</param>
@@ -326,7 +336,7 @@ public static class FieldValueCoercion
 
         if (double.TryParse(utf8Text, NumberStyles.Float, CultureInfo.InvariantCulture, out var nearest))
         {
-            return TryFromNonInt64Number(nearest, out value);
+            return TryFromNonInt64Number(utf8Text, nearest, out value);
         }
 
         value = FieldValue.Null;
@@ -473,9 +483,10 @@ public static class FieldValueCoercion
         byte value => FieldValueCoercionResult.Success(FieldValue.FromInteger(value)),
         ushort value => FieldValueCoercionResult.Success(FieldValue.FromInteger(value)),
         uint value => FieldValueCoercionResult.Success(FieldValue.FromInteger(value)),
+        // A ulong above long.MaxValue is a whole number beyond the signed 64-bit range, so it has no floor within it.
         ulong value => FieldValueCoercionResult.Success(value <= long.MaxValue
             ? FieldValue.FromInteger((long)value)
-            : FieldValue.FromNonInt64Number(value)),
+            : FieldValue.FromNonInt64Number(value, floor: null)),
         decimal value => NumberFromDecimal(value),
         _ => FieldValueCoercionResult.Failure(FieldValueCoercionError.WrongType),
     };
@@ -486,27 +497,231 @@ public static class FieldValueCoercion
         : FieldValueCoercionResult.Failure(FieldValueCoercionError.NotFinite);
 
     // A decimal can hold a fraction a double rounds away, such as 2.0000000000000001, so it is tested for a whole
-    // value in decimal arithmetic. Every decimal lies within the range of double, so the conversion cannot overflow.
-    private static FieldValueCoercionResult NumberFromDecimal(decimal value) =>
-        FieldValueCoercionResult.Success(
-            decimal.Truncate(value) == value && value >= long.MinValue && value <= long.MaxValue
-                ? FieldValue.FromInteger((long)value)
-                : FieldValue.FromNonInt64Number((double)value));
+    // value, and floored, in decimal arithmetic. The explicit conversion to double divides by a power of ten and is
+    // not always the nearest double, so a non-integral result could lie on the other side of an integer from the
+    // decimal; the nearest double is therefore parsed from the decimal's exact invariant text, which the parser
+    // rounds correctly. Every decimal lies within the range of double, so the parse cannot overflow.
+    private static FieldValueCoercionResult NumberFromDecimal(decimal value)
+    {
+        if (decimal.Truncate(value) == value && value >= long.MinValue && value <= long.MaxValue)
+        {
+            return FieldValueCoercionResult.Success(FieldValue.FromInteger((long)value));
+        }
+
+        var floor = decimal.Floor(value);
+        long? exactFloor = floor >= long.MinValue && floor <= long.MaxValue ? (long)floor : null;
+        var nearest = double.Parse(
+            value.ToString(CultureInfo.InvariantCulture), NumberStyles.Float, CultureInfo.InvariantCulture);
+        return FieldValueCoercionResult.Success(FieldValue.FromNonInt64Number(nearest, exactFloor));
+    }
 
     // long.TryParse refuses every number that is not exactly a whole number within the signed 64-bit range, so a
-    // number reaching here keeps only its nearest double. The invariant culture accepts "NaN", "Infinity" and "∞",
-    // and overflow yields an infinity, so a successful double parse alone does not make a field value.
-    private static bool TryFromNonInt64Number(double nearest, out FieldValue value)
+    // number reaching here keeps its nearest double and the exact floor the scanner reads from the same text. The
+    // invariant culture accepts "NaN", "Infinity" and "∞", and overflow yields an infinity, so a successful double
+    // parse alone does not make a field value. Text the scanner does not read as the parser does is refused rather
+    // than given a floor it cannot vouch for.
+    private static bool TryFromNonInt64Number<TChar>(ReadOnlySpan<TChar> text, double nearest, out FieldValue value)
+        where TChar : struct, IBinaryInteger<TChar>
     {
-        if (!double.IsFinite(nearest))
+        if (!double.IsFinite(nearest) || !TryScanExactInterval(text, out var interval))
         {
             value = FieldValue.Null;
             return false;
         }
 
-        value = FieldValue.FromNonInt64Number(nearest);
+        // The scan finding a whole number within range is defensive: long.TryParse normally accepts every such text.
+        value = interval.Integer is { } integer
+            ? FieldValue.FromInteger(integer)
+            : FieldValue.FromNonInt64Number(nearest, interval.Floor);
         return true;
     }
+
+    // Reads the exact integer interval of a number in the invariant NumberStyles.Float grammar, as the .NET parser
+    // reads it: white space (U+0009 to U+000D and U+0020) around the number; an optional '+' or '-'; digits with at
+    // most one '.', at least one of them a digit, so ".5" and "5." are numbers; an optional 'e' or 'E' exponent with
+    // an optional sign and at least one digit, where an 'e' without exponent digits is left unread and refuses the
+    // text; and any number of trailing U+0000 characters, which the parser ignores. It runs in time linear in the
+    // text and allocates nothing: leading zeros are skipped, the exponent saturates, and at most 19 integer digits are
+    // accumulated, because a number with more integer digits than that is at least 10^19, beyond the signed 64-bit
+    // range. UTF-8 and UTF-16 text share it: the grammar is ASCII, and a code unit outside it ends the number.
+    private static bool TryScanExactInterval<TChar>(ReadOnlySpan<TChar> text, out ExactInterval interval)
+        where TChar : struct, IBinaryInteger<TChar>
+    {
+        interval = default;
+        var position = 0;
+        while (position < text.Length && IsNumberWhite(CodeUnit(text, position)))
+        {
+            position++;
+        }
+
+        var negative = false;
+        if (position < text.Length && CodeUnit(text, position) is '+' or '-')
+        {
+            negative = CodeUnit(text, position) == '-';
+            position++;
+        }
+
+        // The mantissa: digits and at most one decimal point.
+        var mantissaStart = position;
+        long digitCount = 0;
+        long fractionDigitCount = 0;
+        var pointSeen = false;
+        for (; position < text.Length; position++)
+        {
+            var unit = CodeUnit(text, position);
+            if (IsAsciiDigit(unit))
+            {
+                digitCount++;
+                if (pointSeen)
+                {
+                    fractionDigitCount++;
+                }
+            }
+            else if (unit == '.' && !pointSeen)
+            {
+                pointSeen = true;
+            }
+            else
+            {
+                break;
+            }
+        }
+
+        var mantissaEnd = position;
+        if (digitCount == 0)
+        {
+            return false;
+        }
+
+        long exponent = 0;
+        if (position < text.Length && CodeUnit(text, position) is 'e' or 'E')
+        {
+            var exponentPosition = position + 1;
+            var negativeExponent = false;
+            if (exponentPosition < text.Length && CodeUnit(text, exponentPosition) is '+' or '-')
+            {
+                negativeExponent = CodeUnit(text, exponentPosition) == '-';
+                exponentPosition++;
+            }
+
+            if (exponentPosition < text.Length && IsAsciiDigit(CodeUnit(text, exponentPosition)))
+            {
+                while (exponentPosition < text.Length && IsAsciiDigit(CodeUnit(text, exponentPosition)))
+                {
+                    if (exponent < ExponentSaturation)
+                    {
+                        exponent = (exponent * 10) + (CodeUnit(text, exponentPosition) - '0');
+                    }
+
+                    exponentPosition++;
+                }
+
+                exponent = negativeExponent ? -exponent : exponent;
+                position = exponentPosition;
+            }
+        }
+
+        while (position < text.Length && IsNumberWhite(CodeUnit(text, position)))
+        {
+            position++;
+        }
+
+        while (position < text.Length && CodeUnit(text, position) == '\0')
+        {
+            position++;
+        }
+
+        if (position != text.Length)
+        {
+            return false;
+        }
+
+        // The mantissa's digits, read as one integer, are scaled by 10^(exponent - fractionDigitCount). Without its
+        // leading zeros that integer has significantCount digits, so the number has integerDigitCount integer digits;
+        // zero or fewer means the number lies below 1 in magnitude.
+        var significantStart = mantissaStart;
+        long leadingZeroCount = 0;
+        for (; significantStart < mantissaEnd; significantStart++)
+        {
+            var unit = CodeUnit(text, significantStart);
+            if (unit == '0')
+            {
+                leadingZeroCount++;
+            }
+            else if (unit != '.')
+            {
+                break;
+            }
+        }
+
+        var significantCount = digitCount - leadingZeroCount;
+        if (significantCount == 0)
+        {
+            // Every digit is zero, whatever the sign or exponent: the whole number 0.
+            interval = new ExactInterval(0L, null);
+            return true;
+        }
+
+        // Each term is bounded by the text length, and the exponent by its saturation, so the sum cannot overflow.
+        var integerDigitCount = significantCount + exponent - fractionDigitCount;
+        if (integerDigitCount > MaxInt64IntegerDigits)
+        {
+            // At least 10^19 in magnitude: beyond the signed 64-bit range, with no floor within it.
+            return true;
+        }
+
+        // At most 19 integer digits, so the integer part stays below 10^19, within ulong.
+        ulong integerPart = 0;
+        long integerDigitsRead = 0;
+        var hasFraction = false;
+        for (var index = significantStart; index < mantissaEnd && !hasFraction; index++)
+        {
+            var unit = CodeUnit(text, index);
+            if (unit == '.')
+            {
+                continue;
+            }
+
+            if (integerDigitsRead < integerDigitCount)
+            {
+                integerPart = (integerPart * 10) + (ulong)(unit - '0');
+                integerDigitsRead++;
+            }
+            else
+            {
+                hasFraction = unit != '0';
+            }
+        }
+
+        // Fewer significant digits than integer digits: the exponent supplies trailing zeros.
+        for (; integerDigitsRead < integerDigitCount; integerDigitsRead++)
+        {
+            integerPart *= 10;
+        }
+
+        // The floor of a negative number with a fraction is one below its negated integer part.
+        var exact = negative ? -(Int128)integerPart : integerPart;
+        if (negative && hasFraction)
+        {
+            exact--;
+        }
+
+        if (exact < long.MinValue || exact > long.MaxValue)
+        {
+            return true;
+        }
+
+        interval = hasFraction ? new ExactInterval(null, (long)exact) : new ExactInterval((long)exact, null);
+        return true;
+    }
+
+    private static int CodeUnit<TChar>(ReadOnlySpan<TChar> text, int index)
+        where TChar : struct, IBinaryInteger<TChar> => int.CreateTruncating(text[index]);
+
+    // The white space the .NET number parser skips: U+0009 to U+000D and U+0020.
+    private static bool IsNumberWhite(int unit) => unit == ' ' || (uint)(unit - '\t') <= '\r' - '\t';
+
+    private static bool IsAsciiDigit(int unit) => (uint)(unit - '0') <= 9;
 
     // Reads the grammar the invariant NumberStyles.Float parse accepts, [ws][+|-]digits[.digits][(e|E)[+|-]digits]
     // [ws], with ASCII digits on at least one side of the point and the trailing NUL characters .NET number parsing
@@ -707,4 +922,9 @@ public static class FieldValueCoercion
         return FieldValueCoercionResult.Failure(
             nearest < 0d ? FieldValueCoercionError.Negative : FieldValueCoercionError.OutOfRange);
     }
+
+    // The exact integer interval of a scanned number. Integer has a value when the number is a whole number within the
+    // signed 64-bit range; otherwise Floor has one when the greatest integer not above the number lies within that
+    // range. Both are null for a number beyond the range.
+    private readonly record struct ExactInterval(long? Integer, long? Floor);
 }

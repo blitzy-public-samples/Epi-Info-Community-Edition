@@ -37,13 +37,16 @@ public sealed class CheckCodeEngineContractTests
         End-Field
         """;
 
-    /// <summary>Every field-event kind, none of which has a block for <c>LastName</c>.</summary>
-    public static TheoryData<FieldEventKind> AllEventKinds { get; } = new(Enum.GetValues<FieldEventKind>());
+    /// <summary>
+    /// Every field-event kind, none of which has a block for <c>LastName</c>; a fresh set on each access.
+    /// </summary>
+    public static TheoryData<FieldEventKind> AllEventKinds => new(Enum.GetValues<FieldEventKind>());
 
     /// <summary>
-    /// Programs that hold nothing to run or report: absent, empty, whitespace only, and comments only.
+    /// Programs that hold nothing to run or report: absent, empty, whitespace only, and comments only; a fresh set on
+    /// each access, so the theories that share it never share an instance.
     /// </summary>
-    public static TheoryData<string?> EmptyPrograms { get; } = new()
+    public static TheoryData<string?> EmptyPrograms => new()
     {
         null,
         "",

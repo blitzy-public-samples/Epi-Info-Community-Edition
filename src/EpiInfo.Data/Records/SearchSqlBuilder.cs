@@ -149,7 +149,11 @@ internal static class SearchSqlBuilder
     /// <c>SUBSTRING(column, 1, 255) = SUBSTRING(@p, 1, 255)</c>. That last parameter is <c>nvarchar(max)</c>, where
     /// legacy bound <c>DbType.AnsiString</c> (<c>:2212-2222</c>), which would have replaced characters outside the
     /// code page; the difference is recorded in the parity notes. Values are bound by
-    /// <see cref="ColumnValueConverter.ToSearchParameter"/>.
+    /// <see cref="ColumnValueConverter.ToSearchParameter"/>, each typed by the resolved column. On an integer column a
+    /// number criterion is compared exactly, never through <c>float</c>, which rounds a <c>bigint</c> beyond 2^53: an
+    /// exact 64-bit integer is bound as that <c>bigint</c>, and any other number as the exact <c>decimal</c> half-way
+    /// inside the integer interval that holds it, or just beyond the <c>bigint</c> range on its side. On a
+    /// <c>float</c> column the number is bound as <c>float</c>.
     /// </para>
     /// <para>
     /// <b>ntext.</b> An <c>ntext</c> column admits <c>LIKE</c>, <c>IS NULL</c> and <c>SUBSTRING</c> but no comparison
@@ -420,17 +424,20 @@ internal static class SearchSqlBuilder
                         column.Column.Metadata.SqlTypeName, NTextTypeName, StringComparison.OrdinalIgnoreCase)
                         ? string.Concat("CONVERT(nvarchar(max), ", reference, ")")
                         : reference;
-                    resolved.Add(new ResolvedCondition(condition, reference, comparable));
+                    resolved.Add(new ResolvedCondition(condition, reference, comparable, column.Column.Metadata));
                     break;
 
                 case SearchTarget.BaseGlobalRecordId:
-                    var idReference = BaseReference(RecordSqlBuilder.Require(schema.GlobalRecordId));
-                    resolved.Add(new ResolvedCondition(condition, idReference, idReference));
+                    var idColumn = RecordSqlBuilder.Require(schema.GlobalRecordId);
+                    var idReference = BaseReference(idColumn);
+                    resolved.Add(new ResolvedCondition(condition, idReference, idReference, idColumn.Metadata));
                     break;
 
                 case SearchTarget.BaseRecStatus:
-                    var statusReference = BaseReference(RecordSqlBuilder.Require(schema.RecStatus));
-                    resolved.Add(new ResolvedCondition(condition, statusReference, statusReference));
+                    var statusColumn = RecordSqlBuilder.Require(schema.RecStatus);
+                    var statusReference = BaseReference(statusColumn);
+                    resolved.Add(
+                        new ResolvedCondition(condition, statusReference, statusReference, statusColumn.Metadata));
                     break;
 
                 default:
@@ -487,8 +494,9 @@ internal static class SearchSqlBuilder
         var value = alternative.Value ?? throw new ArgumentException(MissingValueMessage, nameof(alternative));
         var target = condition.Condition.Target;
         var fieldType = condition.Condition.FieldType;
+        var column = condition.Column;
 
-        return parameters.Add(n => ColumnValueConverter.ToSearchParameter(n, target, fieldType, value));
+        return parameters.Add(n => ColumnValueConverter.ToSearchParameter(n, target, fieldType, column, value));
     }
 
     // Resolves the grid columns to reader-built columns with consecutive ordinals from firstOrdinal.
@@ -607,6 +615,11 @@ internal static class SearchSqlBuilder
         string.Concat(RecordSqlBuilder.BaseAlias, ".", SqlIdentifier.Quote(column));
 
     // A condition with the column text it is rendered on: Reference for IS NULL, LIKE and SUBSTRING, and Comparable
-    // for the comparison operators, which differs from Reference only for an ntext column.
-    private sealed record ResolvedCondition(SearchCondition Condition, string Reference, string Comparable);
+    // for the comparison operators, which differs from Reference only for an ntext column. Column is the reader-built
+    // column it reads, whose type the converter binds each value for, so a number on an integer column stays exact.
+    private sealed record ResolvedCondition(
+        SearchCondition Condition,
+        string Reference,
+        string Comparable,
+        ColumnMetadata Column);
 }

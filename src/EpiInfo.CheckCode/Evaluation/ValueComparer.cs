@@ -97,10 +97,12 @@ public static class ValueComparer
     /// </description></item>
     /// <item><description>Both dates: equal when they are the same calendar date.</description></item>
     /// <item><description>
-    /// Any other pair, such as a date against text or text that is not a number against a number: the invariant
-    /// string forms of both sides (<see cref="FieldValue.ToInvariantString"/>: dates as <c>yyyy-MM-dd</c>, numbers
-    /// in round-trip form, text as stored), untrimmed, as legacy compares the string forms of two different types,
-    /// and otherwise compared as in rule 8. So text <c>"2011-01-15"</c> equals the date 2011-01-15, while
+    /// Any other pair, such as a date against text or text that is not a number against a number: the string forms
+    /// of both sides, untrimmed, as legacy compares the string forms of two different types, and otherwise compared
+    /// as in rule 8. A date's form is legacy's <c>DateTime.ToString()</c>, the general date-and-time text, in the
+    /// invariant culture, such as <c>01/15/2011 00:00:00</c>; every other kind's form is
+    /// <see cref="FieldValue.ToInvariantString"/>: numbers in round-trip form, text as stored. The date's form always
+    /// carries a time, so, as in legacy, a date never equals date-only text such as <c>"2011-01-15"</c>, and
     /// <c>"25"</c> followed by a non-breaking space, which rule 7 does not read as a number, does not equal 25.
     /// </description></item>
     /// </list>
@@ -205,8 +207,7 @@ public static class ValueComparer
 
         // Rule_CompareExp.cs:191-217: any other pair is compared by the string forms of both sides, untrimmed, so text
         // that failed the number parse, such as "25" followed by a non-breaking space, is not trimmed into a number.
-        // Neither side is empty, so neither is Null and both invariant forms are non-null.
-        equal = TextEquals(left.ToInvariantString() ?? string.Empty, right.ToInvariantString() ?? string.Empty);
+        equal = TextEquals(LegacyString(left), LegacyString(right));
         return true;
     }
 
@@ -320,6 +321,14 @@ public static class ValueComparer
         number = 0d;
         return false;
     }
+
+    // Rule 10's string form of a non-empty value. Legacy wrote a date with DateTime.ToString(), the general
+    // date-and-time text, which the invariant culture writes as 01/15/2011 00:00:00. Every other kind is its
+    // invariant string, which is non-null because a non-empty value is never Null.
+    private static string LegacyString(FieldValue value) =>
+        value.TryGetDate(out var date)
+            ? date.ToDateTime(TimeOnly.MinValue).ToString(CultureInfo.InvariantCulture)
+            : value.ToInvariantString() ?? string.Empty;
 
     // Rule_CompareExp.cs:226: legacy trims two texts before it compares them.
     private static bool TrimmedTextEquals(string left, string right) =>

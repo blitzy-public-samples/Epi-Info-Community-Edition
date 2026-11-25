@@ -572,6 +572,37 @@ public sealed class SearchCriteriaParserTests
         AssertFieldError(Parse(Value("Age", FieldValue.FromBoolean(true))), "Age");
     }
 
+    // A number alternative that holds no exact 64-bit integer keeps the integer interval of its exact value, which
+    // its nearest double can lose: the floor when that lies within the signed 64-bit range, and otherwise no floor and
+    // the sign of the nearest double. Integer columns compare by that interval.
+    [Theory]
+    [InlineData("9007199254740992.5", 9007199254740992L, 1)]
+    [InlineData("2.0000000000000001", 2L, 1)]
+    [InlineData("1.9999999999999999", 1L, 1)]
+    [InlineData("-2.5", -3L, -1)]
+    [InlineData("1e-400", 0L, 0)]
+    [InlineData("-1e-400", -1L, 0)]
+    [InlineData("-9223372036854775809", null, -1)]
+    [InlineData("9223372036854775808", null, 1)]
+    [InlineData("9223372036854775806.9", 9223372036854775806L, 1)]
+    [InlineData("-9223372036854775807.5", long.MinValue, -1)]
+    public void Number_NonIntegerAlternative_KeepsItsExactIntegerInterval(
+        string value,
+        long? expectedFloor,
+        int expectedSign)
+    {
+        SearchAlternative alternative = Assert.Single(SingleCondition(Parse(Text("Age", value))).Alternatives);
+        FieldValue number = Assert.NotNull(alternative.Value);
+
+        Assert.Equal(SearchOperator.Equal, alternative.Operator);
+        Assert.Equal(FieldValueKind.Number, number.Kind);
+        Assert.False(number.TryGetInteger(out _));
+        Assert.Equal(expectedFloor.HasValue, number.TryGetFloor(out var floor));
+        Assert.Equal(expectedFloor ?? 0L, floor);
+        Assert.True(number.TryGetNumber(out var nearest));
+        Assert.Equal(expectedSign, Math.Sign(nearest));
+    }
+
     #endregion
 
     #region Option

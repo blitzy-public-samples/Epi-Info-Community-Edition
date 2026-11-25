@@ -16,7 +16,7 @@ public enum FieldValueKind
 
     /// <summary>
     /// A finite number, held by number fields: an exact signed 64-bit integer when the number is a whole number
-    /// within that range, and always its nearest double.
+    /// within that range, otherwise its floor when that lies within the range, and always its nearest double.
     /// </summary>
     Number = 2,
 
@@ -36,11 +36,14 @@ public enum FieldValueKind
 /// </summary>
 /// <remarks>
 /// Each factory fills only the slots of its own kind and leaves every other slot at its default, so the
-/// synthesized record equality is exact and values of different kinds are never equal. A number fills two
-/// slots: its nearest double always, and its exact signed 64-bit integer when the number is exactly a whole
-/// number within that range. Two numbers are therefore equal only when both slots agree, so
+/// synthesized record equality is exact and values of different kinds are never equal. A number fills three
+/// slots: its nearest double always; its exact signed 64-bit integer when the number is exactly a whole number
+/// within that range; and otherwise its floor, the greatest integer not above its exact value, when that floor
+/// lies within the range. Two numbers are therefore equal only when all three slots agree, so
 /// <c>FromNumber(2)</c> equals <c>FromInteger(2)</c>, a number never equals the option index of the same
-/// value, and a non-integral number whose nearest double is whole never equals that whole number.
+/// value, a non-integral number whose nearest double is whole never equals that whole number, and two numbers
+/// that hold no exact integer are equal only when their nearest doubles and their floors agree, so
+/// <c>2.0000000000000001</c> and <c>1.9999999999999999</c>, which share the nearest double 2, differ.
 /// The value text is field data, which the redaction policy keeps out of logs and error bodies:
 /// never pass a <see cref="FieldValue"/>, its <see cref="ToString"/> or its
 /// <see cref="ToInvariantString"/> to a logger or an error message.
@@ -57,6 +60,11 @@ public readonly record struct FieldValue
     // range; _number then holds its nearest double.
     private readonly long? _integer;
 
+    // Has a value exactly when Kind is Number, the number holds no exact 64-bit integer, and the greatest integer
+    // not above its exact value lies within the signed 64-bit range. It keeps the integer interval the exact number
+    // lies in, which its nearest double can lose: 9007199254740992.5 has the nearest double 9007199254740992.
+    private readonly long? _floor;
+
     private FieldValue(
         FieldValueKind kind,
         string? text = null,
@@ -64,7 +72,8 @@ public readonly record struct FieldValue
         bool boolean = false,
         DateOnly date = default,
         int index = 0,
-        long? integer = null)
+        long? integer = null,
+        long? floor = null)
     {
         Kind = kind;
         _text = text;
@@ -73,6 +82,7 @@ public readonly record struct FieldValue
         _date = date;
         _index = index;
         _integer = integer;
+        _floor = floor;
     }
 
     /// <summary>The null value, equal to <c>default(FieldValue)</c>.</summary>
@@ -96,7 +106,8 @@ public readonly record struct FieldValue
     /// <summary>
     /// Creates a number value from a double, taken as exact. Negative zero is stored as zero. A whole number
     /// within the signed 64-bit range also keeps that exact integer, so <c>FromNumber(2)</c> equals
-    /// <c>FromInteger(2)</c> and <see cref="TryGetInteger"/> returns it.
+    /// <c>FromInteger(2)</c> and <see cref="TryGetInteger"/> returns it; a non-integral number keeps its floor,
+    /// which <see cref="TryGetFloor"/> returns.
     /// </summary>
     /// <param name="value">A finite number.</param>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="value"/> is NaN or infinite.</exception>
@@ -113,13 +124,18 @@ public readonly record struct FieldValue
             value = 0d;
         }
 
+        if (Math.Truncate(value) != value)
+        {
+            // Every double of magnitude 2^52 or more is whole, so a non-integral one has an exact floor well
+            // within the signed 64-bit range.
+            return new FieldValue(FieldValueKind.Number, number: value, floor: (long)Math.Floor(value));
+        }
+
         // -2^63 and 2^63 are exact doubles, so this range holds exactly the whole doubles a long can represent,
-        // and the cast cannot overflow.
-        long? integer = Math.Truncate(value) == value
-            && value >= -9223372036854775808d
-            && value < 9223372036854775808d
-                ? (long)value
-                : null;
+        // and the cast cannot overflow. A whole double beyond it has no floor within the range.
+        long? integer = value >= -9223372036854775808d && value < 9223372036854775808d
+            ? (long)value
+            : null;
         return new FieldValue(FieldValueKind.Number, number: value, integer: integer);
     }
 
@@ -134,26 +150,49 @@ public readonly record struct FieldValue
     /// <summary>
     /// Creates a number value for a finite number whose exact value is not a whole number within the signed
     /// 64-bit range: a non-integral number such as <c>2.0000000000000001</c>, or an integer beyond that range
-    /// such as <c>9223372036854775808</c>. Only its nearest double is kept, and <see cref="TryGetInteger"/>
-    /// returns <see langword="false"/> even when that double is whole, so rounding cannot turn the number into
-    /// an integer or an option index. Negative zero is stored as zero.
+    /// such as <c>9223372036854775808</c>. Its nearest double and its exact floor are kept, and
+    /// <see cref="TryGetInteger"/> returns <see langword="false"/> even when that double is whole, so rounding
+    /// cannot turn the number into an integer or an option index. Negative zero is stored as zero.
     /// </summary>
+    /// <remarks>
+    /// When <paramref name="nearest"/> is not whole, the floor is fully determined by it: no integer lies between
+    /// a number and its non-integral nearest double, because every integer of that magnitude is itself a double.
+    /// A different floor is therefore a caller error and is rejected. When <paramref name="nearest"/> is whole,
+    /// as for <c>2.0000000000000001</c>, <c>1.9999999999999999</c> or <c>1e-400</c>, only the caller knows the
+    /// exact number, and its floor is kept as given.
+    /// </remarks>
     /// <param name="nearest">The double nearest to the number.</param>
+    /// <param name="floor">
+    /// The greatest integer not above the number's exact value, or <see langword="null"/> when that integer lies
+    /// beyond the signed 64-bit range.
+    /// </param>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="nearest"/> is NaN or infinite.</exception>
-    internal static FieldValue FromNonInt64Number(double nearest)
+    /// <exception cref="ArgumentException">
+    /// <paramref name="nearest"/> is not whole and <paramref name="floor"/> is not its floor.
+    /// </exception>
+    internal static FieldValue FromNonInt64Number(double nearest, long? floor)
     {
         if (!double.IsFinite(nearest))
         {
             throw new ArgumentOutOfRangeException(nameof(nearest), "A number field value must be finite.");
         }
 
-        // A number nearer to zero than the smallest double, such as -1e-400, rounds to -0; it is stored as +0.
+        // A non-integral double has magnitude below 2^52, so its floor converts to long exactly.
+        if (Math.Truncate(nearest) != nearest && floor != (long)Math.Floor(nearest))
+        {
+            throw new ArgumentException(
+                "The floor of a number whose nearest double is not whole must be the floor of that double.",
+                nameof(floor));
+        }
+
+        // A number nearer to zero than the smallest double, such as -1e-400, rounds to -0; it is stored as +0,
+        // and its floor, -1, keeps its sign.
         if (nearest == 0d)
         {
             nearest = 0d;
         }
 
-        return new FieldValue(FieldValueKind.Number, number: nearest);
+        return new FieldValue(FieldValueKind.Number, number: nearest, floor: floor);
     }
 
     /// <summary>Creates a boolean value.</summary>
@@ -206,8 +245,9 @@ public readonly record struct FieldValue
 
     /// <summary>
     /// Gets the nearest double to the number when this is a number value. It is exact for a <c>float</c>
-    /// column, but may be rounded for an integer beyond 2^53 or a decimal a double cannot hold, so an integer
-    /// column or an option index decides with <see cref="TryGetInteger"/> instead.
+    /// column, but may be rounded for an integer beyond 2^53 or a decimal a double cannot hold, so an option
+    /// index decides with <see cref="TryGetInteger"/> instead, and an integer column with
+    /// <see cref="TryGetInteger"/> and <see cref="TryGetFloor"/>.
     /// </summary>
     /// <param name="value">The nearest double, or 0 when this is not a number value.</param>
     /// <returns>Whether this is a number value.</returns>
@@ -232,6 +272,34 @@ public readonly record struct FieldValue
         if (Kind == FieldValueKind.Number && _integer is { } integer)
         {
             value = integer;
+            return true;
+        }
+
+        value = 0L;
+        return false;
+    }
+
+    /// <summary>
+    /// Gets the floor, the greatest integer not above the number's exact value, when this is a number value that
+    /// holds no exact 64-bit integer and whose floor lies within the signed 64-bit range. It places the exact
+    /// number strictly inside the integer interval from the floor to the floor plus 1, which its nearest double
+    /// may not: <c>9007199254740992.5</c> has the floor <c>9007199254740992</c> and the same nearest double, and
+    /// <c>1.9999999999999999</c> has the floor 1 and the nearest double 2. An integer column compares with
+    /// <see cref="TryGetInteger"/>, then with this, and for a number beyond the signed 64-bit range, where both
+    /// return <see langword="false"/>, with the sign of <see cref="TryGetNumber"/>.
+    /// </summary>
+    /// <param name="value">The floor, or 0 when this is not such a number.</param>
+    /// <returns>
+    /// Whether this is a number value holding no exact 64-bit integer whose floor lies within the signed 64-bit
+    /// range; <see langword="false"/> for an exact integer such as <c>FromInteger(2)</c> or <c>FromNumber(2)</c>,
+    /// a number whose floor lies beyond the range such as <c>9223372036854775808</c> or
+    /// <c>-9223372036854775808.5</c>, and every other kind.
+    /// </returns>
+    public bool TryGetFloor(out long value)
+    {
+        if (Kind == FieldValueKind.Number && _floor is { } floor)
+        {
+            value = floor;
             return true;
         }
 

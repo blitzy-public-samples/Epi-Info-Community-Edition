@@ -185,7 +185,8 @@ public sealed class DiagnosticsTests
             "PatientAddress",
             Values(("PatientAddress", FieldValue.FromText(ValueSentinel))));
 
-        // Diagnostics are logged, so a message may name fields and constructs but never carry a field value.
+        // The field-event response returns each diagnostic to the client, so its message and command may name fields
+        // and constructs but never carry a field value.
         Diagnostic error = Assert.Single(response.Diagnostics);
         AssertDiagnostic(error, DiagnosticSeverity.Error, FoodHistoryForm, 3, "ASSIGN");
         Assert.DoesNotContain(ValueSentinel, error.Message, StringComparison.Ordinal);
@@ -522,8 +523,11 @@ public sealed class DiagnosticsTests
     private static FormMetadata Form(string name, params FieldSpec[] fields)
     {
         var page = new PageMetadata(1, "Page 1", 0, name + "1");
-        FieldMetadata[] metadata = fields
-            .Select((field, index) => new FieldMetadata
+
+        // The static fixtures share this list, so it is built read-only: unlike an array, no cast makes it writable.
+        IReadOnlyList<FieldMetadata> metadata =
+        [
+            .. fields.Select((field, index) => new FieldMetadata
             {
                 FieldId = index + 1,
                 Name = field.Field,
@@ -535,8 +539,8 @@ public sealed class DiagnosticsTests
                 Column = field.SqlType is null
                     ? null
                     : FieldTypeMapper.DescribeColumn(field.Field, field.SqlType, field.Bytes),
-            })
-            .ToArray();
+            }),
+        ];
 
         return new FormMetadata(1, name, name, [page], metadata);
     }
