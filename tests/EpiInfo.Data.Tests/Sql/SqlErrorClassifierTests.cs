@@ -3,6 +3,7 @@ using System.Net.Sockets;
 using System.Reflection;
 using System.Security.Authentication;
 using EpiInfo.Data.Sql;
+using EpiInfo.Domain.Storage;
 using Microsoft.Data.SqlClient;
 
 namespace EpiInfo.Data.Tests.Sql;
@@ -461,6 +462,75 @@ public sealed class SqlErrorClassifierTests
         // SqlClient reports Number 0 for an empty Errors collection; the classifier reports no number instead.
         Assert.Equal(0, exception.Number);
         Assert.Equal(new SqlFailure(SqlFailureKind.Unexpected, null), failure);
+    }
+
+    // Write outcome: after DML, before or during the commit call, only a completed rollback or the server's
+    // deadlock-victim abort (1205) proves nothing was kept; a failed or unacknowledged commit without it is unknown.
+
+    /// <summary>
+    /// The write-outcome table, stage by stage, with and without evidence that the transaction was not kept: stage,
+    /// whether the rollback completed, the original failure's classification and the expected outcome.
+    /// </summary>
+    public static TheoryData<WriteStage, bool, SqlFailure, WriteOutcome> WriteOutcomeCases => new()
+    {
+        // No DML was sent, whatever the failure and the rollback.
+        { WriteStage.BeforeDml, false, new SqlFailure(SqlFailureKind.Unexpected, 547), WriteOutcome.NotWritten },
+        { WriteStage.BeforeDml, true, new SqlFailure(SqlFailureKind.Unexpected, 547), WriteOutcome.NotWritten },
+        { WriteStage.BeforeDml, false, new SqlFailure(SqlFailureKind.Unavailable, 53), WriteOutcome.NotWritten },
+        { WriteStage.BeforeDml, true, new SqlFailure(SqlFailureKind.Unavailable, -2), WriteOutcome.NotWritten },
+
+        // DML was sent and Commit was not called.
+        { WriteStage.DmlSent, true, new SqlFailure(SqlFailureKind.Unavailable, -2), WriteOutcome.NotWritten },
+        { WriteStage.DmlSent, true, new SqlFailure(SqlFailureKind.Unexpected, 547), WriteOutcome.NotWritten },
+        { WriteStage.DmlSent, false, new SqlFailure(SqlFailureKind.Unavailable, 1205), WriteOutcome.NotWritten },
+        { WriteStage.DmlSent, true, new SqlFailure(SqlFailureKind.Unavailable, 1205), WriteOutcome.NotWritten },
+        { WriteStage.DmlSent, false, new SqlFailure(SqlFailureKind.Unavailable, -2), WriteOutcome.Unknown },
+        { WriteStage.DmlSent, false, new SqlFailure(SqlFailureKind.Unexpected, 547), WriteOutcome.Unknown },
+
+        // Commit was called and threw or did not return: a commit-time deadlock and a completed rollback prove nothing
+        // was kept; a lost acknowledgement (broken connection, timeout, managed transport failure) or any other
+        // failure without that evidence does not.
+        { WriteStage.Committing, false, new SqlFailure(SqlFailureKind.Unavailable, 1205), WriteOutcome.NotWritten },
+        { WriteStage.Committing, true, new SqlFailure(SqlFailureKind.Unavailable, 1205), WriteOutcome.NotWritten },
+        { WriteStage.Committing, true, new SqlFailure(SqlFailureKind.Unavailable, -2), WriteOutcome.NotWritten },
+        { WriteStage.Committing, true, new SqlFailure(SqlFailureKind.Unexpected, 547), WriteOutcome.NotWritten },
+        { WriteStage.Committing, false, new SqlFailure(SqlFailureKind.Unavailable, 10054), WriteOutcome.Unknown },
+        { WriteStage.Committing, false, new SqlFailure(SqlFailureKind.Unavailable, -2), WriteOutcome.Unknown },
+        { WriteStage.Committing, false, new SqlFailure(SqlFailureKind.Unavailable, 0), WriteOutcome.Unknown },
+        { WriteStage.Committing, false, new SqlFailure(SqlFailureKind.Unexpected, 547), WriteOutcome.Unknown },
+        { WriteStage.Committing, false, new SqlFailure(SqlFailureKind.Unexpected, null), WriteOutcome.Unknown },
+
+        // An undefined stage proves nothing, whatever the evidence.
+        { (WriteStage)99, true, new SqlFailure(SqlFailureKind.Unavailable, -2), WriteOutcome.Unknown },
+        { (WriteStage)99, false, new SqlFailure(SqlFailureKind.Unavailable, 1205), WriteOutcome.Unknown },
+    };
+
+    [Theory]
+    [MemberData(nameof(WriteOutcomeCases))]
+    public void ResolveWriteOutcome_StageAndEvidence_GiveTheTableOutcome(
+        WriteStage stage, bool rollbackCompleted, SqlFailure failure, WriteOutcome expectedOutcome)
+    {
+        WriteOutcome outcome = SqlErrorClassifier.ResolveWriteOutcome(stage, rollbackCompleted, failure);
+
+        Assert.Equal(expectedOutcome, outcome);
+    }
+
+    [Fact]
+    public void ResolveWriteOutcome_CommitTimeDeadlock_IsNotWrittenAndKeepsUnavailableClassification()
+    {
+        SqlException deadlock = SqlExceptionFactory.Create(1205);
+
+        SqlFailure failure = SqlErrorClassifier.Classify(deadlock, CancellationToken.None);
+        WriteOutcome outcome =
+            SqlErrorClassifier.ResolveWriteOutcome(WriteStage.Committing, rollbackCompleted: false, failure);
+        Exception raised = SqlErrorClassifier.ToDataStoreException(failure, "InsertRecord", outcome, deadlock);
+
+        Assert.Equal(new SqlFailure(SqlFailureKind.Unavailable, 1205), failure);
+        Assert.Equal(WriteOutcome.NotWritten, outcome);
+        DataStoreUnavailableException unavailable = Assert.IsType<DataStoreUnavailableException>(raised);
+        Assert.Equal(WriteOutcome.NotWritten, unavailable.Outcome);
+        Assert.Equal(1205, unavailable.SqlErrorNumber);
+        Assert.Same(deadlock, unavailable.InnerException);
     }
 
     /// <summary>Sets <see cref="CultureInfo.CurrentUICulture"/> for one test and restores it on disposal.</summary>

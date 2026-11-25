@@ -54,7 +54,11 @@ public enum WriteStage
     /// <summary>At least one <c>INSERT</c> or <c>UPDATE</c> was sent, and <c>Commit</c> has not been called.</summary>
     DmlSent,
 
-    /// <summary><c>Commit</c> was called and threw or did not return, so the server may or may not have committed.</summary>
+    /// <summary>
+    /// <c>Commit</c> was called and threw or did not return. The server may or may not have committed, unless the
+    /// failure itself proves the transaction was not kept: a rollback that completed without error, or the server's
+    /// deadlock-victim abort (1205). See <see cref="SqlErrorClassifier.ResolveWriteOutcome"/>.
+    /// </summary>
     Committing,
 }
 
@@ -325,7 +329,8 @@ public static class SqlErrorClassifier
         new(UnavailableErrorNumbers.Contains(number) ? SqlFailureKind.Unavailable : SqlFailureKind.Unexpected, number);
 
     /// <summary>
-    /// Decides the <see cref="WriteOutcome"/> a failed write reports, from how far the transaction had progressed.
+    /// Decides the <see cref="WriteOutcome"/> a failed write reports, from how far the transaction had progressed and
+    /// whether the failure proves the transaction was not kept.
     /// </summary>
     /// <param name="stage">How far the write had progressed when it failed.</param>
     /// <param name="rollbackCompleted">
@@ -333,8 +338,12 @@ public static class SqlErrorClassifier
     /// </param>
     /// <param name="failure">The classification of the original failure.</param>
     /// <returns>
-    /// <see cref="WriteOutcome.NotWritten"/> before any DML, or after DML when the rollback completed or the server
-    /// aborted the transaction as a deadlock victim (1205); otherwise <see cref="WriteOutcome.Unknown"/>.
+    /// <see cref="WriteOutcome.NotWritten"/> before any DML (<see cref="WriteStage.BeforeDml"/>). After DML, whether
+    /// <c>Commit</c> was not yet called (<see cref="WriteStage.DmlSent"/>) or was called and threw or did not return
+    /// (<see cref="WriteStage.Committing"/>): <see cref="WriteOutcome.NotWritten"/> when the rollback completed or the
+    /// server aborted the transaction as a deadlock victim (1205); otherwise <see cref="WriteOutcome.Unknown"/>, as for
+    /// a failed, timed-out or unacknowledged commit, or a failed rollback, without that evidence. An undefined
+    /// <paramref name="stage"/> is <see cref="WriteOutcome.Unknown"/> whatever the evidence.
     /// <see cref="WriteOutcome.Written"/> is never returned: <c>RecordService</c> records it once the store reports
     /// a commit.
     /// </returns>
@@ -342,10 +351,14 @@ public static class SqlErrorClassifier
         stage switch
         {
             WriteStage.BeforeDml => WriteOutcome.NotWritten,
-            WriteStage.DmlSent when rollbackCompleted || failure.SqlErrorNumber == DeadlockVictimErrorNumber =>
+            // After DML, before or during the commit call, only conclusive evidence that the transaction was not kept
+            // proves nothing was written: a rollback that completed without error, or the server's deadlock-victim
+            // abort, because the engine rolls the victim back before it returns 1205. A failed, timed-out or
+            // unacknowledged commit without that evidence may have been applied, so it is never reported as resendable.
+            WriteStage.DmlSent or WriteStage.Committing
+                when rollbackCompleted || failure.SqlErrorNumber == DeadlockVictimErrorNumber =>
                 WriteOutcome.NotWritten,
-            WriteStage.DmlSent => WriteOutcome.Unknown,
-            WriteStage.Committing => WriteOutcome.Unknown,
+            WriteStage.DmlSent or WriteStage.Committing => WriteOutcome.Unknown,
             // An undefined stage proves nothing about the data, so it reports the one outcome that is never resent.
             _ => WriteOutcome.Unknown,
         };
