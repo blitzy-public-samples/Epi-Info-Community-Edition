@@ -9,6 +9,7 @@ using EpiInfo.Domain.Metadata;
 using EpiInfo.Domain.Records;
 using EpiInfo.Domain.Search;
 using EpiInfo.Domain.Storage;
+using EpiInfo.Domain.Validation;
 using EpiInfo.Domain.Values;
 using EpiInfo.Tests.Shared;
 using Microsoft.Data.SqlClient;
@@ -17,13 +18,14 @@ namespace EpiInfo.Data.Tests.Records;
 
 /// <summary>
 /// Integration tests on session temporary tables, for the identifiers and column types the seeded forms do not have,
-/// and for stored values the seeded rows lack, such as text with trailing blanks. Each test creates its <c>#</c>
-/// tables on one dedicated connection, reads their schema through
-/// <see cref="SqlMetadataReader.ReadTempTableSchemaAsync"/>, builds an in-memory form over them (no <c>meta*</c> row
-/// is written), writes and reads through <see cref="RecordSqlBuilder"/>, <see cref="SearchSqlBuilder"/> and
-/// <see cref="SqlExecution"/>, and verifies with plain parameterised <see cref="SqlCommand"/> reads on the same
-/// connection. The temporary tables live in <c>tempdb</c> for that session only and are dropped in <c>finally</c>, so
-/// no seeded row, metadata row or schema object of the database is touched.
+/// such as the T-SQL reserved words <c>Order</c>, <c>Select</c> and <c>Group</c> as column names, and for stored
+/// values the seeded rows lack, such as text with trailing blanks. Each test creates its <c>#</c> tables on one
+/// dedicated connection, reads their schema through <see cref="SqlMetadataReader.ReadTempTableSchemaAsync"/>, builds an
+/// in-memory form over them (no <c>meta*</c> row is written), writes and reads through the open-connection overloads
+/// of <see cref="SqlRecordRepository"/>, or through <see cref="RecordSqlBuilder"/>, <see cref="SearchSqlBuilder"/>
+/// and <see cref="SqlExecution"/> directly, and verifies with plain parameterised <see cref="SqlCommand"/> reads on the
+/// same connection. The temporary tables live in <c>tempdb</c> for that session only and are dropped in
+/// <c>finally</c>, so no seeded row, metadata row or schema object of the database is touched.
 /// </summary>
 /// <remarks>
 /// Assertion messages never quote a parameter or field value; values are compared with
@@ -49,6 +51,8 @@ public sealed class ReservedWordIdentifierTests
     private const string NumberTypeName = "Number";
     private const int PhoneNumberTypeId = 6;
     private const string PhoneNumberTypeName = "Phone Number";
+    private const int CheckboxTypeId = 10;
+    private const string CheckboxTypeName = "Checkbox";
     private const int OptionTypeId = 12;
     private const string OptionTypeName = "Option";
 
@@ -67,6 +71,11 @@ public sealed class ReservedWordIdentifierTests
     private const string Remarks = "Remarks";
     private const string Phone = "Phone";
 
+    // T-SQL reserved words as column names, one per admitted column family: an unquoted one is a syntax error.
+    private const string ReservedOrder = "Order";
+    private const string ReservedSelect = "Select";
+    private const string ReservedGroup = "Group";
+
     // Dapper's literal token for parameter p1. Dapper's own DynamicParameters would replace it in the command text with
     // the value of @p1, even inside a bracketed identifier.
     private const string BinderMarkerColumn = "{=p1}";
@@ -83,8 +92,132 @@ public sealed class ReservedWordIdentifierTests
     private const string MarkerPage = "#MarkerPage";
     private const string PaddingBase = "#PaddingBase";
     private const string PaddingPage = "#PaddingPage";
+    private const string ReservedBase = "#RwBase";
+    private const string ReservedPage = "#RwPage";
 
     private static readonly TimeSpan TestTimeout = TimeSpan.FromSeconds(120);
+
+    /// <summary>
+    /// Page columns named by the T-SQL reserved words <c>Order</c> (<c>nvarchar(4000)</c>), <c>Select</c>
+    /// (<c>float</c>) and <c>Group</c> (<c>bit</c>) round-trip through the repository's production insert, update and
+    /// by-id read, over a schema the reader built from the catalogue. Every statement naming them succeeds and quotes
+    /// each one in brackets, and a direct read finds the values stored; an unquoted reserved word would be a syntax
+    /// error, so the two together prove the quoting.
+    /// </summary>
+    [Fact]
+    public async Task ReservedWordColumns_RoundTripThroughTheRepository()
+    {
+        await TestDatabase.EnsureReachableAsync();
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        var cancellationToken = timeout.Token;
+        await using var writeLock = await DatabaseWriteLock.AcquireExclusiveAsync(cancellationToken);
+        await using var connection = await TestDatabase.OpenConnectionAsync(cancellationToken);
+        try
+        {
+            var fixture = await CreateFixtureAsync(
+                connection,
+                ReservedBase,
+                ReservedPage,
+                $"[{ReservedOrder}] nvarchar(4000), [{ReservedSelect}] float, [{ReservedGroup}] bit",
+                [
+                    new FixtureField(ReservedOrder, TextTypeId, TextTypeName),
+                    new FixtureField(ReservedSelect, NumberTypeId, NumberTypeName),
+                    new FixtureField(ReservedGroup, CheckboxTypeId, CheckboxTypeName),
+                ],
+                cancellationToken);
+
+            // The columns, with their spelling and family, are the reader's catalogue answer, not the DDL text.
+            var pageTable = Assert.IsType<TableSchema>(fixture.Page.Table);
+            AssertCatalogueColumn(pageTable, ReservedOrder, ColumnFamily.Character);
+            AssertCatalogueColumn(pageTable, ReservedSelect, ColumnFamily.Float);
+            AssertCatalogueColumn(pageTable, ReservedGroup, ColumnFamily.Bit);
+
+            var options = new DatabaseOptions(TestDatabase.ConnectionString);
+            var connections = new SqlConnectionFactory(options);
+            var repository = new SqlRecordRepository(
+                connections,
+                new SqlMetadataReader(connections, options, fixture.Recorder),
+                options,
+                fixture.Recorder);
+            var stamp = new SaveStamp(Environment.UserName, SaveStamp.TruncateToSeconds(DateTime.Now));
+
+            var insertedValues = Values(
+                (ReservedOrder, FieldValue.FromText("o-" + Guid.NewGuid().ToString("N"))),
+                (ReservedSelect, FieldValue.FromNumber(42.5d)),
+                (ReservedGroup, FieldValue.FromBoolean(true)));
+            var inserted = await repository.InsertAsync(
+                connection,
+                fixture.Form,
+                fixture.Schema,
+                insertedValues,
+                stamp,
+                cancellationToken);
+            Assert.True(Guid.TryParse(inserted.GlobalRecordId, out _), "The new GlobalRecordId is not a GUID.");
+            AssertSoleRecord(inserted, inserted, insertedValues, "insert");
+
+            var updatedValues = Values(
+                (ReservedOrder, FieldValue.FromText("updated")),
+                (ReservedSelect, FieldValue.FromNumber(-7d)),
+                (ReservedGroup, FieldValue.FromBoolean(false)));
+            var gated = new List<StoredRecord>();
+            var updated = await repository.UpdateAsync(
+                connection,
+                fixture.Form,
+                fixture.Schema,
+                inserted.GlobalRecordId,
+                updatedValues,
+                stamp,
+                stored =>
+                {
+                    gated.Add(stored);
+                    return RecordValidationResult.Success(stored.Values);
+                },
+                permissions: null,
+                cancellationToken);
+            Assert.Equal(RecordWriteStatus.Success, updated.Status);
+            AssertSoleRecord(inserted, Assert.IsType<RecordDto>(updated.Record), updatedValues, "update");
+
+            // The gate saw the stored record, read inside the update's transaction through the same quoted columns.
+            var gatedRecord = Assert.Single(gated);
+            AssertValues(gatedRecord.Values, insertedValues, "update's locked read");
+
+            var read = await repository.GetByIdAsync(
+                connection,
+                fixture.Form,
+                fixture.Schema,
+                inserted.GlobalRecordId,
+                cancellationToken);
+            AssertSoleRecord(inserted, Assert.IsType<RecordDto>(read), updatedValues, "read");
+
+            await AssertReservedWordRowAsync(
+                connection,
+                inserted.GlobalRecordId,
+                updatedValues[ReservedOrder].AsText(),
+                updatedValues[ReservedSelect].AsNumber(),
+                updatedValues[ReservedGroup].AsBoolean(),
+                cancellationToken);
+
+            const string pageInsertPrefix = "INSERT INTO [" + ReservedPage + "]";
+            const string pageUpdatePrefix = "UPDATE [" + ReservedPage + "]";
+            var pageInsert = Assert.Single(
+                fixture.Recorder.ForOperation(RecordOperations.Insert),
+                command => command.CommandText.StartsWith(pageInsertPrefix, StringComparison.Ordinal));
+            var pageUpdate = Assert.Single(
+                fixture.Recorder.ForOperation(RecordOperations.Update),
+                command => command.CommandText.StartsWith(pageUpdatePrefix, StringComparison.Ordinal));
+            var recordRead = Assert.Single(fixture.Recorder.ForOperation(RecordOperations.Get));
+            AssertQuotesReservedWords(pageInsert, inTransaction: true);
+            AssertQuotesReservedWords(pageUpdate, inTransaction: true);
+            AssertQuotesReservedWords(recordRead, inTransaction: false);
+
+            // RecordedCommand.ToString describes a command without its parameter values.
+            Assert.Empty(fixture.Recorder.Failed());
+        }
+        finally
+        {
+            await DropTablesAsync(connection, ReservedPage, ReservedBase);
+        }
+    }
 
     /// <summary>
     /// A <c>bigint</c> number field and Option fields on <c>tinyint</c>, <c>smallint</c> and <c>int</c> columns
@@ -653,7 +786,14 @@ public sealed class ReservedWordIdentifierTests
             .ToArray();
 
         recorder.Clear();
-        return new Fixture(schema, pageSchema, dataFields, pageColumns, recorder, options.CommandTimeoutSeconds);
+        return new Fixture(
+            form,
+            schema,
+            pageSchema,
+            dataFields,
+            pageColumns,
+            recorder,
+            options.CommandTimeoutSeconds);
     }
 
     // Inserts an active base row with a new id through the builder and returns the id.
@@ -778,6 +918,104 @@ public sealed class ReservedWordIdentifierTests
         Assert.Contains(identifier, SqlCommandRecorder.BracketedIdentifiers(observed.CommandText));
     }
 
+    // The reader returned the column under its catalogue spelling and in the expected column family.
+    private static void AssertCatalogueColumn(TableSchema table, string name, ColumnFamily family)
+    {
+        var column = table.FindColumn(name);
+        Assert.NotNull(column);
+        Assert.Equal(name, column.Name);
+        Assert.Equal(family, column.Metadata.Family);
+    }
+
+    // The session base table holds only the fixture's record, so every read of it is active at position 1 of 1, under
+    // the id and key its insert returned.
+    private static void AssertSoleRecord(
+        RecordDto created,
+        RecordDto actual,
+        IReadOnlyDictionary<string, FieldValue> expected,
+        string step)
+    {
+        Assert.True(
+            string.Equals(created.GlobalRecordId, actual.GlobalRecordId, StringComparison.Ordinal),
+            "The record returned by the " + step + " has another GlobalRecordId.");
+        Assert.Equal(created.UniqueKey, actual.UniqueKey);
+        Assert.Equal(RecordQueryRules.ActiveRecStatus, actual.RecStatus);
+        Assert.Equal(1, actual.Position);
+        Assert.Equal(1, actual.Count);
+        AssertValues(actual.Values, expected, step);
+    }
+
+    // Compares every value without quoting either, so no field value reaches the test output.
+    private static void AssertValues(
+        IReadOnlyDictionary<string, FieldValue> actual,
+        IReadOnlyDictionary<string, FieldValue> expected,
+        string step)
+    {
+        Assert.Equal(expected.Count, actual.Count);
+        foreach (var (name, value) in expected)
+        {
+            Assert.True(
+                actual.TryGetValue(name, out var stored) && stored.Equals(value),
+                name + " after the " + step + " does not hold the value written.");
+        }
+    }
+
+    // Reads the fixture's rows by plain parameterised commands that name the bracketed identifiers themselves: the
+    // page row holds the expected values with the columns' exact CLR types, and the base table holds only the record,
+    // active.
+    private static async Task AssertReservedWordRowAsync(
+        SqlConnection connection,
+        string globalRecordId,
+        string expectedOrder,
+        double expectedSelect,
+        bool expectedGroup,
+        CancellationToken cancellationToken)
+    {
+        await using (var command = new SqlCommand(
+            $"SELECT [{ReservedOrder}], [{ReservedSelect}], [{ReservedGroup}] FROM [{ReservedPage}] " +
+            "WHERE [GlobalRecordId] = @id",
+            connection))
+        {
+            command.Parameters.Add(new SqlParameter("@id", SqlDbType.NVarChar, 255) { Value = globalRecordId });
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+            Assert.True(await reader.ReadAsync(cancellationToken), "The page row was not found.");
+            Assert.True(
+                reader.GetValue(0) is string order && string.Equals(expectedOrder, order, StringComparison.Ordinal),
+                ReservedOrder + " does not hold the exact text written.");
+            AssertExact(expectedSelect, reader.GetValue(1), ReservedSelect);
+            AssertExact(expectedGroup, reader.GetValue(2), ReservedGroup);
+            Assert.False(await reader.ReadAsync(cancellationToken), "The page holds more than one row for the id.");
+        }
+
+        await using (var command = new SqlCommand(
+            $"SELECT [GlobalRecordId], [RecStatus] FROM [{ReservedBase}]",
+            connection))
+        {
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+            Assert.True(await reader.ReadAsync(cancellationToken), "The base row was not found.");
+            Assert.True(
+                reader.GetValue(0) is string id && string.Equals(globalRecordId, id, StringComparison.Ordinal),
+                "The base row holds another GlobalRecordId.");
+            AssertExact((short)RecordQueryRules.ActiveRecStatus, reader.GetValue(1), "RecStatus");
+            Assert.False(await reader.ReadAsync(cancellationToken), "The base table holds more than one row.");
+        }
+    }
+
+    // A statement naming the reserved-word columns ran as recorded, quoted each of them in brackets, and succeeded.
+    private static void AssertQuotesReservedWords(RecordedCommand command, bool inTransaction)
+    {
+        Assert.True(
+            command.Completed && command.Succeeded,
+            "The command did not succeed: " + command.Describe(includeParameterValues: false));
+        Assert.Equal(inTransaction, command.InTransaction);
+        var identifiers = SqlCommandRecorder.BracketedIdentifiers(command.CommandText);
+        foreach (var name in new[] { ReservedOrder, ReservedSelect, ReservedGroup })
+        {
+            Assert.Contains(name, identifiers);
+            Assert.Contains("[" + name + "]", command.CommandText, StringComparison.Ordinal);
+        }
+    }
+
     // A JSON number criterion as the API reads it: FieldValueJsonConverter parses the literal's UTF-8 bytes.
     private static FieldValue JsonNumber(string literal)
     {
@@ -852,6 +1090,7 @@ public sealed class ReservedWordIdentifierTests
 
     // The in-memory form over reader-built temporary tables, with the recorder every fixture command reports to.
     private sealed record Fixture(
+        FormMetadata Form,
         FormSchema Schema,
         PageTableSchema Page,
         DataFieldSet DataFields,
