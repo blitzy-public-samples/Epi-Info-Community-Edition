@@ -664,8 +664,10 @@ public sealed partial class StoredDataContractTests : IAsyncLifetime
         await using SqlConnection connection = await TestDatabase.OpenConnectionAsync(ct);
         await using var command = new SqlCommand(
             $"SELECT TOP (1) {quotedColumn} FROM [dbo].{Quote(table)} " +
-            $"WHERE {quotedColumn} IS NOT NULL AND {quotedColumn} <> N'' ORDER BY {quotedColumn};",
+            $"WHERE {quotedColumn} IS NOT NULL AND {quotedColumn} <> @empty ORDER BY {quotedColumn};",
             connection);
+        // The seeded code-table text columns are nvarchar(255) (testdata/sql/04_code_tables.sql).
+        command.Parameters.Add(new SqlParameter("@empty", SqlDbType.NVarChar, 255) { Value = string.Empty });
         return await command.ExecuteScalarAsync(ct) as string
             ?? throw new InvalidOperationException($"Code table {table} holds no {column} value.");
     }
@@ -735,4 +737,3 @@ public sealed partial class StoredDataContractTests : IAsyncLifetime
         IReadOnlyList<FieldWrite> Create,
         IReadOnlyList<FieldWrite> Update);
 }
-

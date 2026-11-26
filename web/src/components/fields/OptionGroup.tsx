@@ -1,9 +1,10 @@
 // Option field: a native radio group whose fieldset is named by its legend, the
-// prompt. The value is the 0-based index of the chosen item, as legacy stores it;
-// an empty or out-of-range value checks no radio, and there is no "clear" radio.
+// prompt, and carries the field's required and invalid state. The value is the
+// 0-based index of the chosen item, as legacy stores it; an empty or out-of-range
+// value checks no radio, and there is no "clear" radio.
 import { Fragment } from 'react';
 import type { FieldComponentProps } from './fieldComponents';
-import { fieldControlId, fieldErrorId, fieldLabelText, fieldWrapperClass } from './fieldComponents';
+import { fieldAriaProps, fieldControlId, fieldErrorId, fieldLabelText, fieldWrapperClass } from './fieldComponents';
 
 /**
  * One radio per option, each followed by its own label, inside a fieldset whose
@@ -23,8 +24,12 @@ export function OptionGroup(props: FieldComponentProps) {
     <div className={fieldWrapperClass(props)} data-field-name={field.name}>
       <fieldset
         id={groupId}
+        // The fieldset's implicit role, group, supports neither aria-required nor
+        // aria-invalid, and nor do its radios; radiogroup supports both, and the
+        // legend still names it.
+        role="radiogroup"
         disabled={disabled}
-        aria-describedby={hasErrors ? fieldErrorId(field.name) : undefined}
+        {...fieldAriaProps(props)}
         onFocus={(e) => {
           const from = e.relatedTarget;
           if (from instanceof Node && e.currentTarget.contains(from)) {

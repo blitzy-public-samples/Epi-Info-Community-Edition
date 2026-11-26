@@ -15,6 +15,7 @@ import { afterEach, describe, expect, it, vi, type Mock } from 'vitest';
 import { createApiClient, type ApiClient } from '../api/client';
 import { errorMessages } from '../api/errors';
 import type {
+  Diagnostic,
   DialogMessage,
   FieldEventKind,
   FieldEventResponse,
@@ -22,6 +23,8 @@ import type {
   ProblemDetails,
   RecordDto,
   Values,
+  WriteOutcome,
+  WriteProblemDetails,
 } from '../api/types';
 import type { EditorSnapshot } from '../checkcode/applyFieldEvent';
 import {
@@ -62,6 +65,14 @@ const FEVER_DIALOG: DialogMessage = {
 };
 const ONSET_DIALOG: DialogMessage = { message: 'Check the onset date.', title: 'Onset' };
 const RACE_DIALOG: DialogMessage = { message: 'Only one race may be selected.', title: 'Race' };
+/** The diagnostic of a skipped GEOCODE (EC-GEO-01), as the server reports it. */
+const GEOCODE_DIAGNOSTIC: Diagnostic = {
+  severity: 'info',
+  form: 'FoodHistory',
+  line: 12,
+  command: 'GEOCODE',
+  message: 'GEOCODE is not executed; statement skipped',
+};
 
 // Wire bodies
 
@@ -69,20 +80,43 @@ function json(status: number, body: FieldEventResponse | RecordDto): Response {
   return new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
 }
 
-function problem(status: number): Response {
-  const body: ProblemDetails = {
+/** A 200 whose JSON text is given as is, for answers no typed body can express. */
+function rawJson(text: string): Response {
+  return new Response(text, { status: 200, headers: { 'content-type': 'application/json' } });
+}
+
+/** A ProblemDetails body; given `writeOutcome`, the WriteProblemDetails of a failed record write. */
+function problem(status: number, writeOutcome?: WriteOutcome): Response {
+  const details: ProblemDetails = {
     type: 'about:blank',
     title: 'An error occurred while processing your request.',
     status,
     detail: 'An unexpected error occurred.',
     traceId: TRACE_ID,
   };
+  const body: ProblemDetails | WriteProblemDetails =
+    writeOutcome === undefined ? details : { ...details, writeOutcome };
   return new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/problem+json' } });
 }
 
 /** A field-event response: the empty envelope with `effects` laid over it. */
 function envelope(effects: Partial<FieldEventResponse> = {}): FieldEventResponse {
   return { enabled: [], disabled: [], cleared: [], assigned: {}, dialogs: [], diagnostics: [], ...effects };
+}
+
+/** The six members the OpenAPI document requires of every field-event response. */
+const ENVELOPE_MEMBERS = [
+  'enabled',
+  'disabled',
+  'cleared',
+  'assigned',
+  'dialogs',
+  'diagnostics',
+] as const satisfies readonly (keyof FieldEventResponse)[];
+
+/** The JSON text of `response` without its `member`. */
+function omitting(response: FieldEventResponse, member: keyof FieldEventResponse): string {
+  return JSON.stringify(Object.fromEntries(Object.entries(response).filter(([name]) => name !== member)));
 }
 
 /** A full `values` object of the fixture form; recordFixture rejects a name that is not a data field. */
@@ -160,6 +194,11 @@ interface RecordedCall {
 /** A field-event request held at the fake until the test answers it. */
 interface HeldEvent extends SentEvent {
   readonly respond: (response: Response) => void;
+  /**
+   * The signal the request arrived with. The fake stops counting an aborted request as
+   * open but still delivers a later answer, as a transport that ignores the abort would.
+   */
+  readonly signal: AbortSignal;
 }
 
 interface FakeApi {
@@ -170,10 +209,23 @@ interface FakeApi {
   readonly events: readonly HeldEvent[];
   /** The `values` of every PUT, in arrival order. */
   readonly puts: () => Values[];
-  /** The most field-event requests that were ever unanswered at once. */
+  /** The most field-event requests that were ever unanswered and not aborted at once. */
   readonly maxOpenEvents: () => number;
+  /** From now on each PUT is held until the test answers it; until then a PUT is answered at once. */
+  readonly holdPuts: () => void;
+  /** PUTs held since holdPuts(), in arrival order. */
+  readonly heldPuts: readonly HeldPut[];
   /** Requests the fake could not route or parse. */
   readonly faults: readonly string[];
+}
+
+/** A PUT held at the fake until the test answers it. */
+interface HeldPut {
+  /** The `values` the PUT carried. */
+  readonly values: Values;
+  /** Answers as an unheld PUT is answered, with the saved DTO. */
+  readonly save: () => void;
+  readonly respond: (response: Response) => void;
 }
 
 /** Every fake API of the running test, checked after it. */
@@ -181,7 +233,8 @@ const apisOfTest: FakeApi[] = [];
 
 /**
  * Field events are held until answered. A PUT of a `stored` record answers at once with
- * the record and the submitted values laid over it, as the server's saved DTO.
+ * the record and the submitted values laid over it, as the server's saved DTO; after
+ * holdPuts() each PUT is held until the test saves it or answers it otherwise.
  */
 function createFakeApi(stored: readonly RecordDto[]): FakeApi {
   const calls: RecordedCall[] = [];
@@ -190,12 +243,24 @@ function createFakeApi(stored: readonly RecordDto[]): FakeApi {
   let open = 0;
   let maxOpen = 0;
 
-  const holdFieldEvent = (sent: SentEvent): Promise<Response> =>
+  const holdFieldEvent = (sent: SentEvent, signal: AbortSignal): Promise<Response> =>
     new Promise<Response>((resolve) => {
       const index = events.length;
       let answered = false;
+      let closed = false;
+      const close = (): void => {
+        if (!closed) {
+          closed = true;
+          open -= 1;
+        }
+      };
       open += 1;
       maxOpen = Math.max(maxOpen, open);
+      if (signal.aborted) {
+        close();
+      } else {
+        signal.addEventListener('abort', close, { once: true });
+      }
       events.push({
         ...sent,
         respond: (response) => {
@@ -203,9 +268,10 @@ function createFakeApi(stored: readonly RecordDto[]): FakeApi {
             throw new Error(`field event ${index} was already answered`);
           }
           answered = true;
-          open -= 1;
+          close();
           resolve(response);
         },
+        signal,
       });
     });
 
@@ -218,6 +284,29 @@ function createFakeApi(stored: readonly RecordDto[]): FakeApi {
     return json(200, { ...record, values: { ...record.values, ...values } });
   };
 
+  const heldPuts: HeldPut[] = [];
+  let holdingPuts = false;
+
+  const holdPut = (id: string, values: Values): Promise<Response> =>
+    new Promise<Response>((resolve) => {
+      const index = heldPuts.length;
+      let answered = false;
+      const respond = (response: Response): void => {
+        if (answered) {
+          throw new Error(`PUT ${index} was already answered`);
+        }
+        answered = true;
+        resolve(response);
+      };
+      heldPuts.push({
+        values,
+        save: () => {
+          respond(saveRecord(id, values));
+        },
+        respond,
+      });
+    });
+
   const fetchFromFake = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     // openapi-fetch hands over the Request it built; anything else is normalised to one.
     const request = input instanceof Request ? input : new Request(input, init);
@@ -228,11 +317,12 @@ function createFakeApi(stored: readonly RecordDto[]): FakeApi {
       const body: unknown = text === '' ? null : JSON.parse(text);
       calls.push({ method: request.method, path, body });
       if (request.method === 'POST' && path === FIELD_EVENT_PATH) {
-        return await holdFieldEvent(readFieldEvent(body));
+        return await holdFieldEvent(readFieldEvent(body), request.signal);
       }
       const record = RECORD_ROUTE.exec(path);
       if (request.method === 'PUT' && record !== null && Number(record[1]) === VIEW_ID) {
-        return saveRecord(record[2], readWriteValues(body));
+        const values = readWriteValues(body);
+        return holdingPuts ? await holdPut(record[2], values) : saveRecord(record[2], values);
       }
       faults.push(`unrouted ${request.method} ${path}`);
     } catch (e) {
@@ -247,6 +337,10 @@ function createFakeApi(stored: readonly RecordDto[]): FakeApi {
     events,
     puts: () => calls.filter((call) => call.method === 'PUT').map((call) => readWriteValues(call.body)),
     maxOpenEvents: () => maxOpen,
+    holdPuts: () => {
+      holdingPuts = true;
+    },
+    heldPuts,
     faults,
   };
   apisOfTest.push(api);
@@ -305,6 +399,14 @@ async function eventAt(api: FakeApi, index: number): Promise<HeldEvent> {
     expect(api.events.length).toBeGreaterThan(index);
   });
   return api.events[index];
+}
+
+/** Waits until the `index`-th PUT has reached the fake after holdPuts(). */
+async function putAt(api: FakeApi, index: number): Promise<HeldPut> {
+  await waitFor(() => {
+    expect(api.heldPuts.length).toBeGreaterThan(index);
+  });
+  return api.heldPuts[index];
 }
 
 /** Answers the `index`-th field event and waits until the queue has processed the answer. */
@@ -366,10 +468,13 @@ interface QueueUnderTest {
   readonly edit: (name: string, value: FieldValue) => void;
 }
 
-function createQueue(values: Values = valuesWith({ DateofInterview: INTERVIEW_DATE })): QueueUnderTest {
+function createQueue(
+  values: Values = valuesWith({ DateofInterview: INTERVIEW_DATE }),
+  deadlineMs?: number,
+): QueueUnderTest {
   const harness = createHarness();
   const host = createHost(values);
-  const queue = createFieldEventQueue({ client: harness.client, viewId: VIEW_ID, definition, host });
+  const queue = createFieldEventQueue({ client: harness.client, viewId: VIEW_ID, definition, host, deadlineMs });
   return {
     harness,
     host,
@@ -508,15 +613,43 @@ describe('createFieldEventQueue', () => {
   });
 
   it.each([
+    { when: 'after the event was raised', winner: 'the edit', editAfterRaise: true, sent: 'Ann', expected: 'Anna' },
+    { when: 'before the event was raised', winner: 'check code', editAfterRaise: false, sent: 'Anna', expected: null },
+  ])('resolves a cleared FirstName against a user edit made $when: $winner wins', async (row) => {
+    const { editAfterRaise, sent, expected } = row;
+    const { harness, host, queue, edit } = createQueue(valuesWith({ FirstName: 'Ann', LastName: 'Smith' }));
+
+    if (!editAfterRaise) {
+      edit('FirstName', 'Anna');
+    }
+    queue.raise('FieldAfter', 'LastName');
+    const blur = await eventAt(harness.api, 0);
+    if (editAfterRaise) {
+      edit('FirstName', 'Anna');
+    }
+    await answer(harness, 0, json(200, envelope({ cleared: ['FirstName', 'LastName'] })));
+
+    // The event carries the value the user had when it was raised.
+    expect(blur.values.FirstName).toBe(sent);
+    expect(host.snapshot.values.FirstName).toBe(expected);
+    // A field the user did not touch is cleared and saved with the record.
+    expect(host.snapshot.values.LastName).toBeNull();
+    expect([...host.snapshot.dirty].sort()).toEqual(['FirstName', 'LastName']);
+  });
+
+  it.each([
     { outcome: 'effects', response: staleEffects },
     { outcome: 'a 500', response: (): Response => problem(500) },
-  ])('ignores $outcome arriving for a record generation that reset() ended', async ({ response }) => {
+    { outcome: 'an unreadable answer', response: (): Response => rawJson('{"enabled":5}') },
+  ])('cancels the request of a record generation that reset() ended, and ignores $outcome arriving for it', async ({
+    response,
+  }) => {
     const { harness, host, queue } = createQueue(valuesWith({ LastName: 'Smith' }));
     const { api } = harness;
     let drained = false;
 
     queue.raise('FieldAfter', 'DOB');
-    await eventAt(api, 0);
+    const stale = await eventAt(api, 0);
     void queue.drain().then(() => {
       drained = true;
     });
@@ -524,6 +657,7 @@ describe('createFieldEventQueue', () => {
     expect(drained).toBe(false);
 
     queue.reset();
+    expect(stale.signal.aborted).toBe(true);
     await flush();
     // The waiter is released by the reset itself, not by the stale answer.
     expect(drained).toBe(true);
@@ -534,6 +668,7 @@ describe('createFieldEventQueue', () => {
     queue.raise('FieldBefore', 'LastName');
     const fresh = await eventAt(api, 1);
     expect(fresh).toMatchObject({ event: 'FieldBefore', fieldName: 'LastName' });
+    expect(fresh.signal.aborted).toBe(false);
     expect(queue.size).toBe(1);
 
     const before = host.snapshot;
@@ -582,6 +717,191 @@ describe('createFieldEventQueue', () => {
     expect(next).toMatchObject({ event: 'FieldBefore', fieldName: 'FirstName' });
     await answer(harness, 1, json(200, envelope()));
     expect(drained).toBe(true);
+  });
+
+  // A request that never answers, an answer of the wrong shape and a host callback that
+  // throws each end as a notice; none of them stops the queue or holds drain().
+
+  /**
+   * The deadline of the cases that let a request stall. The event queued behind the stalled
+   * one is answered as soon as it arrives, so the deadline only has to outlast that, with
+   * room for a loaded machine.
+   */
+  const STALL_DEADLINE_MS = 300;
+
+  /** Waits `ms` on the real clock. */
+  const elapse = (ms: number): Promise<void> =>
+    new Promise((resolve) => {
+      setTimeout(resolve, ms);
+    });
+
+  it('cancels a request unanswered past the deadline, shows one notice and sends the next event', async () => {
+    const { harness, host, queue, edit } = createQueue(undefined, STALL_DEADLINE_MS);
+    const { api } = harness;
+    let drained = false;
+
+    queue.raise('FieldAfter', 'LastName');
+    const stalled = await eventAt(api, 0);
+    edit('DOB', DOB_ENTERED);
+    queue.raise('FieldAfter', 'DOB');
+    // Made after the blur was raised, so the blur must not carry it.
+    edit('DOB', DOB_LATER);
+    void queue.drain().then(() => {
+      drained = true;
+    });
+
+    const next = await eventAt(api, 1);
+    expect(stalled.signal.aborted).toBe(true);
+    expect(host.onNotice.mock.calls).toEqual([
+      ['Check code could not run for Last Name. The server did not answer in time.'],
+    ]);
+    expect(next).toMatchObject({ event: 'FieldAfter', fieldName: 'DOB' });
+    expect(next.values).toMatchObject({ DOB: DOB_ENTERED, DateofInterview: INTERVIEW_DATE });
+    expect(next.signal.aborted).toBe(false);
+    expect(drained).toBe(false);
+
+    await answer(harness, 1, json(200, envelope({ assigned: { Age: ASSIGNED_AGE } })));
+    expect(drained).toBe(true);
+    expect(queue.size).toBe(0);
+    expect(host.snapshot.values.Age).toBe(ASSIGNED_AGE);
+
+    // An answer that still arrives for the cancelled request changes nothing.
+    await answer(harness, 0, json(200, envelope({ assigned: { Age: 30 }, dialogs: [FEVER_DIALOG] })));
+    expect(host.snapshot.values.Age).toBe(ASSIGNED_AGE);
+    expect(host.onDialogs).not.toHaveBeenCalled();
+    expect(host.onNotice).toHaveBeenCalledTimes(1);
+    // The stalled request stopped counting as open when it was cancelled.
+    expect(api.maxOpenEvents()).toBe(1);
+  });
+
+  it('reports nothing when the deadline of a request that reset() cancelled passes', async () => {
+    const { harness, host, queue } = createQueue(undefined, STALL_DEADLINE_MS);
+
+    queue.raise('FieldAfter', 'LastName');
+    const stale = await eventAt(harness.api, 0);
+    queue.reset();
+    expect(stale.signal.aborted).toBe(true);
+    await elapse(STALL_DEADLINE_MS * 2);
+
+    expect(host.onNotice).not.toHaveBeenCalled();
+    expect(host.setSnapshot).not.toHaveBeenCalled();
+    expect(queue.size).toBe(0);
+    await expect(queue.drain()).resolves.toBeUndefined();
+  });
+
+  /**
+   * A complete answer that assigns a value and opens a dialog, so applying any part of it
+   * would call setSnapshot or onDialogs. Each malformed answer below breaks it in one place.
+   */
+  const effectful = envelope({ assigned: { Age: ASSIGNED_AGE }, dialogs: [FEVER_DIALOG] });
+
+  it.each([
+    { shape: 'a null body', text: 'null' },
+    { shape: 'an array body', text: '[]' },
+    { shape: 'none of the members', text: '{"message":"Not available"}' },
+    ...ENVELOPE_MEMBERS.flatMap((member) => [
+      { shape: `no \`${member}\``, text: omitting(effectful, member) },
+      { shape: `a null \`${member}\``, text: JSON.stringify({ ...effectful, [member]: null }) },
+    ]),
+    { shape: 'a list that is not an array', text: JSON.stringify({ ...effectful, enabled: 5 }) },
+    {
+      shape: 'a dialog whose message is not text',
+      text: JSON.stringify({ ...effectful, dialogs: [{ message: 5, title: null }] }),
+    },
+    {
+      shape: 'a dialog without its title',
+      text: JSON.stringify({ ...effectful, dialogs: [{ message: FEVER_DIALOG.message }] }),
+    },
+    { shape: '`assigned` as an array', text: JSON.stringify({ ...effectful, assigned: [ASSIGNED_AGE] }) },
+    { shape: '`assigned` as text', text: JSON.stringify({ ...effectful, assigned: 'Age' }) },
+    {
+      shape: 'a diagnostic without its line',
+      text: JSON.stringify({
+        ...effectful,
+        diagnostics: [{ severity: 'warning', form: 'FoodHistory', command: 'ASSIGN Age', message: 'Skipped.' }],
+      }),
+    },
+    // Lines are 1-based in the form's program text.
+    ...[0, -1, 1.5].map((line) => ({
+      shape: `a diagnostic on line ${line}`,
+      text: JSON.stringify({ ...effectful, diagnostics: [{ ...GEOCODE_DIAGNOSTIC, line }] }),
+    })),
+  ])('applies none of an answer with $shape, shows a notice and sends the next event', async ({ text }) => {
+    const { harness, host, queue } = createQueue();
+    let drained = false;
+
+    queue.raise('FieldAfter', 'LastName');
+    queue.raise('FieldBefore', 'FirstName');
+    void queue.drain().then(() => {
+      drained = true;
+    });
+    await answer(harness, 0, rawJson(text));
+
+    expect(host.onNotice.mock.calls).toEqual([["Check code could not run for Last Name. The server's answer could not be read."]]);
+    expect(host.setSnapshot).not.toHaveBeenCalled();
+    expect(host.onDialogs).not.toHaveBeenCalled();
+
+    const next = await eventAt(harness.api, 1);
+    expect(next).toMatchObject({ event: 'FieldBefore', fieldName: 'FirstName' });
+    await answer(harness, 1, json(200, envelope()));
+    expect(drained).toBe(true);
+  });
+
+  it('applies an answer whose diagnostics are on line 1 or later and passes them on in source order', async () => {
+    const { harness, host, queue } = createQueue();
+    const onDiagnostics = vi.fn<(diagnostics: readonly Diagnostic[]) => void>();
+    host.onDiagnostics = onDiagnostics;
+    const firstLine: Diagnostic = { ...GEOCODE_DIAGNOSTIC, line: 1 };
+
+    queue.raise('FieldAfter', 'DOB');
+    await answer(
+      harness,
+      0,
+      json(200, envelope({ assigned: { Age: ASSIGNED_AGE }, diagnostics: [firstLine, GEOCODE_DIAGNOSTIC] })),
+    );
+
+    expect(host.onNotice).not.toHaveBeenCalled();
+    expect(host.snapshot.values.Age).toBe(ASSIGNED_AGE);
+    expect(onDiagnostics.mock.calls).toEqual([[[firstLine, GEOCODE_DIAGNOSTIC]]]);
+  });
+
+  it.each([
+    {
+      callback: 'setSnapshot',
+      response: (): Response => json(200, envelope({ assigned: { Age: ASSIGNED_AGE } })),
+      notice: 'Check code could not run for Last Name. Its effects could not be applied.',
+    },
+    {
+      callback: 'onDialogs',
+      response: (): Response => json(200, envelope({ dialogs: [FEVER_DIALOG] })),
+      notice: 'Check code could not run for Last Name. Its effects could not be applied.',
+    },
+    {
+      callback: 'onNotice',
+      response: (): Response => rawJson('null'),
+      notice: "Check code could not run for Last Name. The server's answer could not be read.",
+    },
+  ] as const)('keeps sending events and drains when host.$callback throws', async ({ callback, response, notice }) => {
+    const { harness, host, queue } = createQueue();
+    let drained = false;
+    host[callback].mockImplementationOnce(() => {
+      throw new Error(`${callback} failed`);
+    });
+
+    queue.raise('FieldAfter', 'LastName');
+    queue.raise('FieldBefore', 'FirstName');
+    void queue.drain().then(() => {
+      drained = true;
+    });
+    await answer(harness, 0, response());
+
+    expect(host.onNotice.mock.calls).toEqual([[notice]]);
+    const next = await eventAt(harness.api, 1);
+    expect(next).toMatchObject({ event: 'FieldBefore', fieldName: 'FirstName' });
+    await answer(harness, 1, json(200, envelope({ assigned: { Age: ASSIGNED_AGE } })));
+    expect(drained).toBe(true);
+    expect(queue.size).toBe(0);
+    expect(host.snapshot.values.Age).toBe(ASSIGNED_AGE);
   });
 });
 
@@ -668,31 +988,241 @@ describe('useRecordEditor field events', () => {
     expect(result.current.dirty.size).toBe(0);
   });
 
-  it('saves after a field event that failed with 500, showing a non-blocking notice', async () => {
+  it.each<{ effect: string; response: FieldEventResponse; put: Values | null }>([
+    { effect: 'an assigned Age', response: envelope({ assigned: { Age: ASSIGNED_AGE } }), put: { Age: ASSIGNED_AGE } },
+    { effect: 'a cleared FirstName', response: envelope({ cleared: ['FirstName'] }), put: { FirstName: null } },
+    { effect: 'no effect', response: envelope(), put: null },
+  ])('decides that an unedited record is clean only after its pending event answers with $effect', async (row) => {
+    const { response, put } = row;
     const harness = createHarness([RECORD_A]);
     const { api } = harness;
-    const { result } = await mountEditor(harness);
+    api.holdPuts();
+    const { result, onSaved } = await mountEditor(harness);
+
+    // A blur without an edit: the draft is clean while the event is pending.
+    act(() => {
+      result.current.onFieldBlur('DOB');
+    });
+    await eventAt(api, 0);
+    expect(result.current.isDirty).toBe(false);
+    let left: boolean | undefined;
+    const leaving = result.current.leave().then((value) => {
+      left = value;
+      return value;
+    });
+    await act(flush);
+    expect(left).toBeUndefined();
+    expect(api.calls.map((call) => call.method)).toEqual(['POST']);
+    expect(onSaved).not.toHaveBeenCalled();
+
+    await answer(harness, 0, json(200, response));
+    if (put !== null) {
+      // The effect made the draft dirty, so leaving saves it first and waits for the PUT.
+      const held = await putAt(api, 0);
+      await act(flush);
+      expect(left).toBeUndefined();
+      expect(onSaved).not.toHaveBeenCalled();
+      held.save();
+    }
+
+    expect(await perform(() => leaving)).toBe(true);
+    expect(api.puts()).toStrictEqual(put === null ? [] : [put]);
+    expect(onSaved).toHaveBeenCalledTimes(put === null ? 0 : 1);
+    expect(result.current.isDirty).toBe(false);
+  });
+
+  it.each<{ edit: string; before: string | null; after: string | null; saved: string | null }>([
+    { edit: 'no edit', before: null, after: null, saved: null },
+    { edit: 'an edit before the event', before: 'Anna', after: null, saved: null },
+    { edit: 'an edit after the event', before: null, after: 'Anna', saved: 'Anna' },
+  ])('saves FirstName as $saved after check code cleared it, with $edit', async (row) => {
+    const { before, after, saved } = row;
+    const harness = createHarness([RECORD_A]);
+    const { api } = harness;
+    const { result, onSaved } = await mountEditor(harness);
+    expect(result.current.values.FirstName).toBe('Ann');
+
+    act(() => {
+      if (before !== null) {
+        result.current.setValue('FirstName', before);
+      }
+      result.current.onFieldBlur('FirstName');
+    });
+    await eventAt(api, 0);
+    if (after !== null) {
+      act(() => {
+        result.current.setValue('FirstName', after);
+      });
+    }
+    await answer(harness, 0, json(200, envelope({ cleared: ['FirstName'] })));
+    expect(result.current.values.FirstName).toBe(saved);
+    expect([...result.current.dirty]).toEqual(['FirstName']);
+
+    expect(await perform(() => result.current.save())).toBe(true);
+
+    // A cleared value goes out as an explicit null, never as a missing key.
+    const writes = api.calls.filter((call) => call.method === 'PUT');
+    expect(writes.map((call) => call.body)).toStrictEqual([{ values: { FirstName: saved } }]);
+    expect(Object.hasOwn(api.puts()[0], 'FirstName')).toBe(true);
+    expect(onSaved).toHaveBeenCalledTimes(1);
+    expect(result.current.values.FirstName).toBe(saved);
+    expect(result.current.dirty.size).toBe(0);
+  });
+
+  it('saves after a field event that failed with 500, showing its non-blocking notice until the save succeeds', async () => {
+    const harness = createHarness([RECORD_A]);
+    const { api } = harness;
+    api.holdPuts();
+    const { result, onSaved } = await mountEditor(harness);
 
     act(() => {
       result.current.setValue('LastName', 'Jones');
       result.current.onFieldBlur('LastName');
     });
-    const blur = await eventAt(api, 0);
+    await eventAt(api, 0);
     const saving = result.current.save();
     await act(flush);
     expect(api.puts()).toEqual([]);
 
+    // The failed event counts as drained, so the save goes ahead while the notice is shown.
+    await answer(harness, 0, problem(500));
+    const put = await putAt(api, 0);
+    expect(put.values).toEqual({ LastName: 'Jones' });
+    expect(result.current.saving).toBe(true);
+    expect(result.current.eventNotice).toBe(
+      `Check code could not run for Last Name. An unexpected error occurred. Trace id: ${TRACE_ID}.`,
+    );
+    expect(result.current.banner).toBeNull();
+
     const saved = await perform(() => {
-      blur.respond(problem(500));
+      put.save();
       return saving;
     });
 
     expect(saved).toBe(true);
     expect(api.puts()).toEqual([{ LastName: 'Jones' }]);
-    expect(result.current.eventNotice).toBe(
-      `Check code could not run for Last Name. ${errorMessages.server}${errorMessages.traceIdSuffix(TRACE_ID)}`,
-    );
+    expect(onSaved).toHaveBeenCalledTimes(1);
+    // The server answered the save, so the notice of the earlier failure is gone.
+    expect(result.current.eventNotice).toBeNull();
     expect(result.current.banner).toBeNull();
+  });
+
+  it('keeps the notice of an event that failed with 503 until Retry saves the record', async () => {
+    const harness = createHarness([RECORD_A]);
+    const { api } = harness;
+    api.holdPuts();
+    const { result, onSaved } = await mountEditor(harness);
+    const notice =
+      'Check code could not run for First Name. The database cannot be reached. Your changes are still on screen.';
+
+    act(() => {
+      result.current.setValue('FirstName', 'Anna');
+      result.current.onFieldBlur('FirstName');
+    });
+    await answer(harness, 0, problem(503));
+    expect(result.current.eventNotice).toBe(notice);
+
+    // The database is still unreachable: the PUT writes nothing, so Retry is offered.
+    const saving = result.current.save();
+    const failed = await putAt(api, 0);
+    const saved = await perform(() => {
+      failed.respond(problem(503, 'notWritten'));
+      return saving;
+    });
+    expect(saved).toBe(false);
+    expect(result.current.banner).toMatchObject({
+      kind: 'unavailable',
+      message: 'The database cannot be reached. Your changes are still on screen.',
+      actions: ['retry'],
+    });
+    expect(result.current.eventNotice).toBe(notice);
+    expect(onSaved).not.toHaveBeenCalled();
+
+    // The database is back: Retry resends the same PUT, which succeeds.
+    const retrying = result.current.retry();
+    const resent = await putAt(api, 1);
+    await perform(() => {
+      resent.save();
+      return retrying;
+    });
+
+    expect(api.puts()).toEqual([{ FirstName: 'Anna' }, { FirstName: 'Anna' }]);
+    expect(onSaved).toHaveBeenCalledTimes(1);
+    expect(result.current.banner).toBeNull();
+    expect(result.current.eventNotice).toBeNull();
+    expect(result.current.values.FirstName).toBe('Anna');
+    expect(result.current.dirty.size).toBe(0);
+  });
+
+  it('clears a failure notice once a later event succeeds, although it was raised before the failure', async () => {
+    const harness = createHarness();
+    const { result } = await mountEditor(harness);
+
+    // Both events are raised before the first fails, so raising is not what clears the notice.
+    act(() => {
+      result.current.onFieldBlur('LastName');
+      result.current.onFieldFocus('FirstName');
+    });
+    await answer(harness, 0, problem(500));
+    expect(result.current.eventNotice).toBe(
+      `Check code could not run for Last Name. An unexpected error occurred. Trace id: ${TRACE_ID}.`,
+    );
+
+    await answer(harness, 1, json(200, envelope()));
+    expect(result.current.eventNotice).toBeNull();
+  });
+
+  it('keeps a failure notice on screen when the next event is answered 200 without the response envelope', async () => {
+    const harness = createHarness();
+    const { result } = await mountEditor(harness);
+
+    act(() => {
+      result.current.onFieldBlur('LastName');
+      result.current.onFieldFocus('FirstName');
+    });
+    await answer(harness, 0, problem(503));
+    expect(result.current.eventNotice).toBe(
+      'Check code could not run for Last Name. The database cannot be reached. Your changes are still on screen.',
+    );
+
+    // An OK status alone is no success: the answer is unreadable, so it reports its own failure.
+    await answer(harness, 1, rawJson('{"message":"Not available"}'));
+    expect(result.current.eventNotice).toBe(
+      "Check code could not run for First Name. The server's answer could not be read.",
+    );
+    expect(result.current.values).toEqual(RECORD_A.values);
+    expect(result.current.dirty.size).toBe(0);
+  });
+
+  it('keeps the notice of an event that failed while a save was in flight after that save succeeds', async () => {
+    const harness = createHarness([RECORD_A]);
+    const { api } = harness;
+    api.holdPuts();
+    const { result, onSaved } = await mountEditor(harness);
+    const notice = `Check code could not run for First Name. An unexpected error occurred. Trace id: ${TRACE_ID}.`;
+
+    act(() => {
+      result.current.setValue('LastName', 'Jones');
+    });
+    const saving = result.current.save();
+    const put = await putAt(api, 0);
+
+    act(() => {
+      result.current.onFieldFocus('FirstName');
+    });
+    await answer(harness, 0, problem(500));
+    expect(result.current.eventNotice).toBe(notice);
+
+    const saved = await perform(() => {
+      put.save();
+      return saving;
+    });
+
+    expect(saved).toBe(true);
+    expect(api.puts()).toEqual([{ LastName: 'Jones' }]);
+    expect(onSaved).toHaveBeenCalledTimes(1);
+    // The event failed after the PUT was sent, so the save's success says nothing about it.
+    expect(result.current.eventNotice).toBe(notice);
   });
 
   it('raises no event for the blur and focus that replacing the rendered record causes', async () => {

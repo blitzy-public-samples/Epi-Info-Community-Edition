@@ -3,7 +3,7 @@
 // included, where legacy's required check showed a message box for the first missing field only.
 // Render-only: no state, no effects and no rule about what counts as an error.
 import type { FieldDefinition, FormDefinition, PageDefinition } from '../api/types';
-import type { FieldErrors } from '../validation/clientValidation';
+import { isDataField, type FieldErrors } from '../validation/clientValidation';
 
 export interface ValidationSummaryProps {
   /** The open form: maps a field name to its prompt and orders the messages by the field's place. */
@@ -56,7 +56,12 @@ function fieldLabel(field: FieldDefinition): string {
   return typeof prompt === 'string' && prompt.trim() !== '' ? prompt : field.name;
 }
 
-/** Field keys in form order, then the keys that name no field in the map's own order. */
+/**
+ * Field keys in form order, then the keys that name no field in the map's own order. A key is
+ * placed and labelled at the data field of exactly its name, which owns that key in `values` and
+ * renders the control a jump focuses; a label, group or placeholder sharing the name is passed
+ * over. A name no data field holds is placed at its first field in form order.
+ */
 function summaryItems(definition: FormDefinition, fieldErrors: ValidationSummaryProps['fieldErrors']): SummaryItem[] {
   const items: SummaryItem[] = [];
   const listed = new Set<string>();
@@ -68,7 +73,13 @@ function summaryItems(definition: FormDefinition, fieldErrors: ValidationSummary
     });
   };
 
-  for (const field of fieldsInFormOrder(definition)) {
+  const fields = fieldsInFormOrder(definition);
+  const dataFieldNames = new Set(fields.filter(isDataField).map((field) => field.name));
+
+  for (const field of fields) {
+    if (!isDataField(field) && dataFieldNames.has(field.name)) {
+      continue;
+    }
     if (!listed.has(field.name) && Object.hasOwn(fieldErrors, field.name)) {
       add(field.name, fieldLabel(field), true, fieldErrors[field.name]);
     }

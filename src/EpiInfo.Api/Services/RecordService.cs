@@ -382,7 +382,10 @@ public sealed partial class RecordService(
     /// <para>
     /// The required gate runs inside the store's transaction, after the locked read of the base row and every page
     /// row, on the stored values overlaid with the submitted ones, so two concurrent saves can never both pass it on
-    /// stale state. A failed gate rolls back with nothing written.
+    /// stale state. A failed gate rolls back with nothing written. After it, the store reads the permissions again
+    /// inside that transaction and refuses, with nothing written, an update the login may no longer apply: UPDATE
+    /// denied on the base table or a page table, or INSERT denied on the table of a page whose row is missing. The
+    /// service's earlier read only turns that check on.
     /// </para>
     /// </remarks>
     /// <param name="httpContext">The current request, which carries the <see cref="WriteOutcomeFeature"/>.</param>
@@ -394,8 +397,8 @@ public sealed partial class RecordService(
     /// <param name="cancellationToken">The request's abort token.</param>
     /// <returns>
     /// 200 with the updated <see cref="RecordDto"/>; 400 for invalid input or a failed required gate; 403 for a denied
-    /// permission, including a missing page row the login may not insert; 404 for an unknown form or record; or 409
-    /// for a deleted record.
+    /// permission, before the store or by its in-transaction re-check, including a missing page row the login may not
+    /// insert; 404 for an unknown form or record; or 409 for a deleted record.
     /// </returns>
     /// <exception cref="ArgumentNullException">
     /// <paramref name="httpContext"/> or <paramref name="globalRecordId"/> is <see langword="null"/>.
@@ -615,8 +618,9 @@ public sealed partial class RecordService(
         }
         catch (Exception)
         {
-            // Deliberately swallowed: the write has already committed, and a failing log provider must never turn its
-            // response into an error, which the client would read as a save that may not have happened.
+            // Deliberately swallowed: the response is already decided, for a committed write or a record left
+            // unchanged, and a failing log provider must never turn it into an error, which the client would read as
+            // a save that may not have happened.
         }
     }
 

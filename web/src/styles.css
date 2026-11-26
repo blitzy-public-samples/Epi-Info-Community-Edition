@@ -40,11 +40,14 @@
  * text 15.8:1, muted text 6.0:1 or more, accent 5.2:1, danger 6.1:1 or more,
  * banner texts 9.1:1 or more, control borders 4.3:1 or more (3:1 needed),
  * hover borders 8.4:1 or more, text on the pressed surface 11.6:1, text
- * 11.6:1 and muted text 4.6:1 on the pressed row tint. Selected tab text
- * (accent strong) 6.7:1 on hover (accent subtle) and 5.6:1 pressed (accent
- * muted), its accent top bar 4.6:1 and 3.8:1 there (3:1 needed). White text
- * on the danger button: 6.5:1 at rest (danger), 10.5:1 on hover (danger
- * text) and 13.3:1 pressed (danger active). */
+ * 11.6:1 and muted text 4.6:1 on the pressed row tint, text 14.8:1 in a
+ * pressed text-like control, and the invalid choice ring (danger border)
+ * 5.4:1 on the page, 4.6:1 on the hover halo and 3.9:1 on the pressed halo
+ * (3:1 needed). Selected tab text (accent strong) 6.7:1 on hover (accent
+ * subtle) and 5.6:1 pressed (accent muted), its accent top bar 4.6:1 and
+ * 3.8:1 there (3:1 needed). White text on the danger button: 6.5:1 at rest
+ * (danger), 10.5:1 on hover (danger text) and 13.3:1 pressed (danger
+ * active). */
 :root {
   color-scheme: light;
 
@@ -214,6 +217,11 @@
     resize: vertical;
   }
 
+  /* Checkboxes and radios draw their states outside the box, from custom
+   * properties as text-like controls do: an error ring (--choice-ring-color)
+   * over a hover or pressed halo (--choice-halo-color), each transparent
+   * until a state rule sets it. The focus ring is an outline, drawn over
+   * both. */
   input[type="checkbox"],
   input[type="radio"] {
     flex: none;
@@ -222,10 +230,20 @@
     margin: 0;
     accent-color: var(--color-accent);
     cursor: pointer;
+    box-shadow:
+      0 0 0 var(--focus-ring-width) var(--choice-ring-color, transparent),
+      0 0 0 var(--space-1) var(--choice-halo-color, transparent);
   }
 
+  /* Rounds the ring and the halo with the radio. */
+  input[type="radio"] {
+    border-radius: 50%;
+  }
+
+  /* An invalid radiogroup fieldset passes the ring colour on to its radios. */
   [aria-invalid="true"] {
     --control-border-color: var(--color-danger-border);
+    --choice-ring-color: var(--color-danger-border);
   }
 
   /* Disabled outranks invalid. A disabled fieldset passes the colours on to
@@ -237,6 +255,7 @@
     --control-border-color: var(--color-border);
     --control-background: var(--color-surface-disabled);
     --control-text: var(--color-text-muted);
+    --choice-ring-color: transparent;
   }
 
   input:disabled,
@@ -317,6 +336,13 @@
     :where(textarea:hover:not(:disabled):not([aria-disabled="true"])) {
       --control-border-color: var(--color-border-hover);
     }
+
+    /* Enabled checkboxes and radios show a halo under the pointer, also while
+     * it is on the label that follows them, their larger target. Zero
+     * specificity, so the pressed rule below wins at equal weight. */
+    :where(input:is([type="checkbox"], [type="radio"]):is(:hover, :has(+ label:hover)):not(:disabled):not([aria-disabled="true"])) {
+      --choice-halo-color: var(--color-surface-hover);
+    }
   }
 
   /* Pressed: a darker surface than hover. It answers pointer, touch and the
@@ -324,6 +350,22 @@
    * hover rule at equal weight, so it wins while both apply. */
   button:active:not(:disabled):not([aria-disabled="true"]) {
     background-color: var(--color-surface-active);
+  }
+
+  /* Pressed checkboxes and radios, the label that follows them included,
+   * darken their halo the same way. */
+  :where(input:is([type="checkbox"], [type="radio"]):is(:active, :has(+ label:active)):not(:disabled):not([aria-disabled="true"])) {
+    --choice-halo-color: var(--color-surface-active);
+  }
+
+  /* Pressed text-like controls keep the hover border on a muted surface.
+   * Zero specificity, as for hover, so the invalid and disabled colours
+   * still win. */
+  :where(input:not([type="checkbox"]):not([type="radio"]):active:not(:disabled):not([aria-disabled="true"])),
+  :where(select:active:not(:disabled):not([aria-disabled="true"])),
+  :where(textarea:active:not(:disabled):not([aria-disabled="true"])) {
+    --control-border-color: var(--color-border-hover);
+    --control-background: var(--color-surface-muted);
   }
 
   @media (prefers-reduced-motion: no-preference) {

@@ -15,6 +15,7 @@ import { describeError, isAbortError, networkError, type ApiError } from '../api
 import type { FieldDefinition, FormDefinition, PageDefinition } from '../api/types';
 import { useRecordEditor, type BannerAction, type EditorBanner, type RecordEditor } from '../state/useRecordEditor';
 import { useRecordNavigation } from '../state/useRecordNavigation';
+import { isDataField } from '../validation/clientValidation';
 import { ConfirmDialog } from './ConfirmDialog';
 import { ConnectionError } from './ConnectionError';
 import { FieldRenderer } from './FieldRenderer';
@@ -248,9 +249,19 @@ function firstPageId(pages: readonly PageDefinition[]): number | null {
   return [...pages].sort(byPosition)[0]?.pageId ?? null;
 }
 
-/** The page that lists `fieldName`, the first by position when several do. */
+/**
+ * The page to show for `fieldName`: the page of the data field of exactly that name, the only
+ * field that renders the control `focusFieldControl` looks for, even when a label, group or
+ * placeholder of the same name sits on an earlier page. A name no data field holds falls back
+ * to the first page by position that lists it.
+ */
 function pageOfField(pages: readonly PageDefinition[], fieldName: string): PageDefinition | null {
-  return [...pages].sort(byPosition).find((page) => page.fields.some((field) => field.name === fieldName)) ?? null;
+  const ordered = [...pages].sort(byPosition);
+  return (
+    ordered.find((page) => page.fields.some((field) => field.name === fieldName && isDataField(field))) ??
+    ordered.find((page) => page.fields.some((field) => field.name === fieldName)) ??
+    null
+  );
 }
 
 /**

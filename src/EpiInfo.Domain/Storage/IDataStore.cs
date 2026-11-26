@@ -455,14 +455,18 @@ public interface IDataStore
     /// </description></item>
     /// <item><description>Read every page row into a <see cref="StoredRecord"/>.</description></item>
     /// <item><description>
-    /// When <paramref name="permissions"/> is not <see langword="null"/>, every page whose row the locked read found
-    /// missing must pass <see cref="FormPermissions.CanInsertInto"/> for its <see cref="PageMetadata.TableName"/>;
-    /// otherwise roll back with <see cref="RecordWriteStatus.Forbidden"/> before any data statement.
-    /// </description></item>
-    /// <item><description>
     /// Call <paramref name="requiredGate"/> with the stored record. A result that is not valid rolls back before any
     /// write, with <see cref="RecordWriteStatus.ValidationFailed"/> carrying that result. Running the gate after the
     /// locked read means two concurrent saves can never both pass it on stale state.
+    /// </description></item>
+    /// <item><description>
+    /// When <paramref name="permissions"/> is not <see langword="null"/>, the record must pass
+    /// <see cref="FormPermissions.CanUpdate"/>, UPDATE on the base table and every page table, and every page whose
+    /// row the locked read found missing must pass <see cref="FormPermissions.CanInsertInto"/> for its
+    /// <see cref="PageMetadata.TableName"/>; otherwise roll back with <see cref="RecordWriteStatus.Forbidden"/> before
+    /// any data statement. The store decides both from its own permission read inside the transaction, for the base
+    /// and page tables the transaction resolved, so the decision follows the grants in force inside the transaction,
+    /// not those the caller read earlier.
     /// </description></item>
     /// <item><description>
     /// Set the base <c>LastSaveLogonName</c> and <c>LastSaveTime</c> from <paramref name="stamp"/>.
@@ -495,8 +499,10 @@ public interface IDataStore
     /// stored ones itself.
     /// </param>
     /// <param name="permissions">
-    /// The login's per-table permissions for the missing-page insert check, or <see langword="null"/> for no check,
-    /// which is what callers pass while permission awareness is not delivered.
+    /// Non-null turns on the update and missing-page insert check: the caller's own earlier
+    /// <see cref="GetPermissionsAsync"/> result, which never decides it, because the store reads the permissions again
+    /// inside the transaction. <see langword="null"/> means no check, which is what callers pass while permission
+    /// awareness is not delivered.
     /// </param>
     /// <param name="cancellationToken">The request's abort token.</param>
     /// <returns>
@@ -582,8 +588,9 @@ public enum RecordWriteStatus
     ValidationFailed,
 
     /// <summary>
-    /// A page row of the record is missing and the login may not insert into that page table; the API answers 403.
-    /// Only a store given permissions, under permission awareness, returns it.
+    /// The store's permission read inside the transaction found that the login may not update the base table or a
+    /// page table, or may not insert into the table of a page whose row is missing; the API answers 403. Only a store
+    /// given permissions, under permission awareness, returns it.
     /// </summary>
     Forbidden,
 }
@@ -667,7 +674,9 @@ public sealed class RecordWriteResult
         return new RecordWriteResult(RecordWriteStatus.ValidationFailed, null, validation);
     }
 
-    /// <summary>The login may not insert a missing page row of the record, so nothing was written.</summary>
+    /// <summary>
+    /// The login may not update the record's tables or insert a missing page row of it, so nothing was written.
+    /// </summary>
     /// <returns>A <see cref="RecordWriteStatus.Forbidden"/> result.</returns>
     public static RecordWriteResult Forbidden() => ForbiddenResult;
 }

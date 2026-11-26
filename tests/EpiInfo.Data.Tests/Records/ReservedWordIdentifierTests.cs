@@ -18,8 +18,9 @@ namespace EpiInfo.Data.Tests.Records;
 
 /// <summary>
 /// Integration tests on session temporary tables, for the identifiers and column types the seeded forms do not have,
-/// such as the T-SQL reserved words <c>Order</c>, <c>Select</c> and <c>Group</c> as column names, and for stored
-/// values the seeded rows lack, such as text with trailing blanks. Each test creates its <c>#</c> tables on one
+/// such as the T-SQL reserved words <c>Order</c>, <c>Select</c> and <c>Group</c> as column names, for stored
+/// values the seeded rows lack, such as text with trailing blanks, and for catalogue shapes the seeded forms never
+/// present, such as a page without its table. Each test creates its <c>#</c> tables on one
 /// dedicated connection, reads their schema through <see cref="SqlMetadataReader.ReadTempTableSchemaAsync"/>, builds an
 /// in-memory form over them (no <c>meta*</c> row is written), writes and reads through the open-connection overloads
 /// of <see cref="SqlRecordRepository"/>, or through <see cref="RecordSqlBuilder"/>, <see cref="SearchSqlBuilder"/>
@@ -41,6 +42,9 @@ public sealed class ReservedWordIdentifierTests
     // The in-memory form's ids. No seeded view has id 0; the form exists only in the test.
     private const int FixtureViewId = 0;
     private const int FixturePageId = 1;
+
+    // The second page only the incomplete-schema fixture adds, after the fixture page.
+    private const int SecondPageId = 2;
 
     // metaFieldTypes ids and names, as testdata/sql/02_reference_data.sql seeds them.
     private const int TextTypeId = 1;
@@ -94,6 +98,11 @@ public sealed class ReservedWordIdentifierTests
     private const string PaddingPage = "#PaddingPage";
     private const string ReservedBase = "#RwBase";
     private const string ReservedPage = "#RwPage";
+    private const string IncompleteBase = "#IncompleteBase";
+    private const string IncompletePage = "#IncompletePage";
+
+    // A second page's table that lacks the GlobalRecordId record key column.
+    private const string KeylessPage = "#KeylessPage";
 
     private static readonly TimeSpan TestTimeout = TimeSpan.FromSeconds(120);
 
@@ -216,6 +225,91 @@ public sealed class ReservedWordIdentifierTests
         finally
         {
             await DropTablesAsync(connection, ReservedPage, ReservedBase);
+        }
+    }
+
+    /// <summary>
+    /// An insert through the repository's production insert, on a form whose second page has no catalogue table, or
+    /// has one without its <c>GlobalRecordId</c> record key column, is refused before any statement is sent: it fails
+    /// with the store's <see cref="DataStoreWriteException"/> for <c>records.insert</c> and
+    /// <see cref="WriteOutcome.NotWritten"/>, and neither the base table nor the first page's table holds a row, so no
+    /// record is committed without one of its page rows.
+    /// </summary>
+    /// <param name="pageTableExists">
+    /// Whether the second page has a table, which then lacks its record key column; otherwise it has none.
+    /// </param>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task InsertOnPageWithoutCatalogueTableOrKey_IsRefusedWithNothingWritten(bool pageTableExists)
+    {
+        await TestDatabase.EnsureReachableAsync();
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        var cancellationToken = timeout.Token;
+        await using var writeLock = await DatabaseWriteLock.AcquireExclusiveAsync(cancellationToken);
+        await using var connection = await TestDatabase.OpenConnectionAsync(cancellationToken);
+        try
+        {
+            var fixture = await CreateFixtureAsync(
+                connection,
+                IncompleteBase,
+                IncompletePage,
+                $"[{Surname}] nvarchar(4000)",
+                [new FixtureField(Surname, TextTypeId, TextTypeName)],
+                cancellationToken);
+
+            var options = new DatabaseOptions(TestDatabase.ConnectionString);
+            var connections = new SqlConnectionFactory(options);
+            var reader = new SqlMetadataReader(connections, options, fixture.Recorder);
+            TableSchema? secondTable = null;
+            if (pageTableExists)
+            {
+                await ExecuteDdlAsync(
+                    connection,
+                    $"CREATE TABLE [{KeylessPage}] ([{Remarks}] nvarchar(4000));",
+                    cancellationToken);
+                secondTable = await reader.ReadTempTableSchemaAsync(connection, KeylessPage, cancellationToken);
+                Assert.Null(secondTable.FindColumn("GlobalRecordId"));
+            }
+
+            // The second page holds no data field, as the reader leaves a page whose table is missing: the form's
+            // values all belong to the first page, so the empty submission passes the values contract.
+            var secondPage = new PageMetadata(
+                SecondPageId,
+                "Page 2",
+                Position: 1,
+                secondTable?.Name ?? IncompleteBase + SecondPageId.ToString(CultureInfo.InvariantCulture));
+            var form = fixture.Form with { Pages = [.. fixture.Form.Pages, secondPage] };
+            var schema = new FormSchema(
+                FixtureViewId,
+                fixture.Schema.BaseTable,
+                [fixture.Page, new PageTableSchema(secondPage, secondTable)]);
+            var repository = new SqlRecordRepository(connections, reader, options, fixture.Recorder);
+            var stamp = new SaveStamp(StampLogonName, SaveStamp.TruncateToSeconds(DateTime.Now));
+
+            fixture.Recorder.Clear();
+            var failure = await Assert.ThrowsAsync<DataStoreWriteException>(() => repository.InsertAsync(
+                connection,
+                form,
+                schema,
+                Values(),
+                stamp,
+                cancellationToken));
+            Assert.Equal(WriteOutcome.NotWritten, failure.Outcome);
+            Assert.Equal(RecordOperations.Insert, failure.Operation);
+            Assert.Empty(fixture.Recorder.Writes());
+            Assert.Empty(fixture.Recorder.ForOperation(RecordOperations.Insert));
+
+            foreach (var table in new[] { IncompleteBase, IncompletePage })
+            {
+                await using var command = new SqlCommand($"SELECT COUNT(*) FROM [{table}]", connection);
+                var rows = Assert.IsType<int>(await command.ExecuteScalarAsync(cancellationToken));
+                Assert.True(rows == 0, table + " holds a row of the refused insert.");
+            }
+        }
+        finally
+        {
+            await DropTablesAsync(connection, KeylessPage, IncompletePage, IncompleteBase);
         }
     }
 

@@ -39,6 +39,12 @@ public sealed partial class SqlParameterizationTests : IAsyncLifetime
     // The page table of LastName, nvarchar(4000) (testdata/sql/05_data_tables.sql).
     private const string PageTable = "CaseReport1";
 
+    // OBJECT_ID's object-type code of a user table; sys.objects.type is char(2).
+    private const string UserTableType = "U";
+
+    // nvarchar(776), the size SQL Server's own procedures, such as sp_help, give a multi-part object name.
+    private const int ObjectNameLength = 776;
+
     // Quote, statement separator, DDL and a line comment. Neither it nor the marker holds %, _, [, \, *, ?, a leading
     // comparison prefix or " or ", so the grid's "contains" filter and Find's equality both match it literally
     // (AAP 0.3.4.4).
@@ -192,12 +198,19 @@ public sealed partial class SqlParameterizationTests : IAsyncLifetime
         }
     }
 
-    // The hostile DROP TABLE was never executed against the form's tables.
+    // After the requests, both form tables, dbo.CaseReport and dbo.CaseReport1, still exist as user tables. The
+    // recorder checks of AssertTravelsOnlyAsParameter, not this catalogue read, establish that the payload stayed out
+    // of every command's text.
     private static async Task AssertTablesExistAsync(CancellationToken ct)
     {
         await using var connection = await TestDatabase.OpenConnectionAsync(ct);
         await using var command = connection.CreateCommand();
-        command.CommandText = "SELECT OBJECT_ID(N'dbo.CaseReport', N'U'), OBJECT_ID(N'dbo.CaseReport1', N'U');";
+        command.CommandText = "SELECT OBJECT_ID(@baseTable, @userTable), OBJECT_ID(@pageTable, @userTable);";
+        command.Parameters.Add(
+            new SqlParameter("@baseTable", SqlDbType.NVarChar, ObjectNameLength) { Value = "dbo." + BaseTable });
+        command.Parameters.Add(
+            new SqlParameter("@pageTable", SqlDbType.NVarChar, ObjectNameLength) { Value = "dbo." + PageTable });
+        command.Parameters.Add(new SqlParameter("@userTable", SqlDbType.NVarChar, 2) { Value = UserTableType });
         await using var reader = await command.ExecuteReaderAsync(ct);
         Assert.True(await reader.ReadAsync(ct));
         Assert.False(await reader.IsDBNullAsync(0, ct), $"Table dbo.{BaseTable} no longer exists.");

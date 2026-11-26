@@ -2,6 +2,7 @@ using System.Collections.ObjectModel;
 using System.Data;
 using System.Data.Common;
 using EpiInfo.Data.Metadata;
+using EpiInfo.Data.Permissions;
 using EpiInfo.Data.Sql;
 using EpiInfo.Domain.Metadata;
 using EpiInfo.Domain.Records;
@@ -479,7 +480,10 @@ internal sealed class SqlRecordRepository(
     /// before any base- or page-table statement is sent.
     /// </exception>
     /// <exception cref="DataStoreUnavailableException">The database was unavailable; the outcome says what is known.</exception>
-    /// <exception cref="DataStoreWriteException">Any other failure; the outcome says what is known.</exception>
+    /// <exception cref="DataStoreWriteException">
+    /// Any other failure; the outcome says what is known. A page whose table, or its record key column, the catalogue
+    /// does not hold is refused this way, with <see cref="WriteOutcome.NotWritten"/> and nothing written.
+    /// </exception>
     public async Task<RecordDto> InsertAsync(
         FormMetadata form,
         IReadOnlyDictionary<string, FieldValue> values,
@@ -519,17 +523,24 @@ internal sealed class SqlRecordRepository(
     /// </summary>
     /// <remarks>
     /// In order: the locked base read (<c>NotFound</c>, or <c>Deleted</c> for <c>RecStatus</c> 0); the page-row read;
-    /// the permission check of every missing page row; the required gate; the base last-save stamp; for each page
+    /// the required gate; when <paramref name="permissions"/> is not <see langword="null"/>, one permission read inside
+    /// this transaction for the base table and every page table, which must grant UPDATE on each of them and INSERT on
+    /// the table of every page whose row is missing (<c>Forbidden</c>); the base last-save stamp; for each page
     /// holding a submitted field, in page order, the submitted columns, inserting the page row first when the update
-    /// finds none, as legacy repairs it; then the snapshot and the commit. Concurrent saves of one record serialise
-    /// on the base-row lock and the later commit wins for a field both submitted, with no row-version check.
+    /// finds none, as legacy repairs it; then the snapshot and the commit.
+    /// Concurrent saves of one record serialise on the base-row lock and the later commit wins for a field both
+    /// submitted, with no row-version check.
     /// </remarks>
     /// <param name="form">The form's metadata, as the store's metadata read returned it.</param>
     /// <param name="globalRecordId">The record's base-table <c>GlobalRecordId</c>, matched exactly.</param>
     /// <param name="submitted">The validated values of the writable data fields the request submitted.</param>
     /// <param name="stamp">The save stamp of this write.</param>
     /// <param name="requiredGate">The required-field check of the stored record overlaid with the submitted values.</param>
-    /// <param name="permissions">The login's per-table permissions, or <see langword="null"/> for no check.</param>
+    /// <param name="permissions">
+    /// Non-null turns on the UPDATE and missing-page INSERT check, which this transaction decides from its own
+    /// permission read; the caller's earlier read passed here never decides it. <see langword="null"/> means no check
+    /// and no permission statement.
+    /// </param>
     /// <param name="cancellationToken">The request's abort token.</param>
     /// <returns>
     /// <see cref="RecordWriteStatus.Success"/> with the updated record when the transaction committed; any other
@@ -692,7 +703,10 @@ internal sealed class SqlRecordRepository(
     /// <param name="submitted">The values of the writable data fields to write.</param>
     /// <param name="stamp">The save stamp of this write.</param>
     /// <param name="requiredGate">The required-field check of the stored record.</param>
-    /// <param name="permissions">Per-table permissions, or <see langword="null"/> for no check.</param>
+    /// <param name="permissions">
+    /// Non-null turns on the UPDATE and missing-page INSERT check, decided from this transaction's own permission
+    /// read; <see langword="null"/> means no check.
+    /// </param>
     /// <param name="cancellationToken">The caller's abort token.</param>
     /// <returns>The update's result, as the public overload returns it.</returns>
     internal async Task<RecordWriteResult> UpdateAsync(
@@ -798,15 +812,15 @@ internal sealed class SqlRecordRepository(
         var pageInserts = new List<SqlStatement>(schema.Pages.Count);
         foreach (PageTableSchema page in schema.Pages)
         {
-            // Legacy inserts a row on every page whatever it holds, so a page with no submitted value still gets one.
-            if (page.Table is not null)
-            {
-                pageInserts.Add(RecordSqlBuilder.InsertPage(
-                    page,
-                    globalRecordId,
-                    PageColumns(schema, dataFields, page),
-                    resolved.ByName));
-            }
+            // Every page of the form gets its row, as legacy inserts one whatever the page holds, so a page with no
+            // submitted value still gets one. A page whose table or record key the catalogue lacks makes the builder
+            // refuse the whole insert here, before any statement is sent, so a record is never committed without one
+            // of its page rows.
+            pageInserts.Add(RecordSqlBuilder.InsertPage(
+                page,
+                globalRecordId,
+                PageColumns(schema, dataFields, page),
+                resolved.ByName));
         }
 
         scope.MarkDmlSent();
@@ -880,20 +894,24 @@ internal sealed class SqlRecordRepository(
             .ConfigureAwait(false)
             ?? throw new InvalidOperationException(MissingRecordMessage);
 
-        // The port's order puts the permission check before the required gate, and it covers every page whose row
-        // the locked read found missing, not only the pages a submitted field sits on, as the permission rule states
-        // it for PUT; the narrower per-submitted-page reading of the build plan is not followed.
-        if (permissions is not null
-            && stored.MissingPages.Any(page => !permissions.CanInsertInto(page.Page.TableName)))
-        {
-            return WriteDecision<RecordWriteResult>.RolledBack(RecordWriteResult.Forbidden());
-        }
-
         RecordValidationResult gate = requiredGate(stored.Record)
             ?? throw new InvalidOperationException(GateResultMessage);
         if (!gate.IsValid)
         {
             return WriteDecision<RecordWriteResult>.RolledBack(RecordWriteResult.ValidationFailed(gate));
+        }
+
+        // The update needs UPDATE on the base table and on every page table, and INSERT on the table of every page
+        // whose row the locked read found missing, whether or not a submitted field sits on it. Both are checked after
+        // the required gate and before any statement that changes data, from the permissions read on this
+        // transaction's connection for the tables this transaction resolved, never from the caller's earlier read,
+        // which only turns the check on. A grant revoked while the update waited on the lock is therefore a refusal
+        // with nothing written, not a failed statement.
+        if (permissions is not null
+            && !await MayApplyUpdateAsync(scope, form, schema, stored.MissingPages, cancellationToken)
+                .ConfigureAwait(false))
+        {
+            return WriteDecision<RecordWriteResult>.RolledBack(RecordWriteResult.Forbidden());
         }
 
         SqlStatement? baseStamp = RecordSqlBuilder.UpdateBaseStamp(
@@ -925,6 +943,41 @@ internal sealed class SqlRecordRepository(
                 cancellationToken)
             .ConfigureAwait(false);
         return WriteDecision<RecordWriteResult>.Committed(RecordWriteResult.Success(snapshot));
+    }
+
+    // Whether the login may apply this update, as FormPermissions decides from the grants read here, inside the
+    // update's transaction: UPDATE on the base table and every page table of form, and INSERT on the table of every
+    // page in missingPages. One read covers the base table, then each page of schema in order, on the tables this
+    // transaction's schema read confirmed; a table it did not confirm gets no entry and so denies.
+    private async Task<bool> MayApplyUpdateAsync(
+        WriteScope scope,
+        FormMetadata form,
+        FormSchema schema,
+        IReadOnlyList<PageTableSchema> missingPages,
+        CancellationToken cancellationToken)
+    {
+        var requestedNames = new string[schema.Pages.Count + 1];
+        var resolved = new TableSchema?[schema.Pages.Count + 1];
+        requestedNames[0] = form.BaseTableName;
+        resolved[0] = schema.BaseTable;
+        for (int index = 0; index < schema.Pages.Count; index++)
+        {
+            requestedNames[index + 1] = schema.Pages[index].Page.TableName;
+            resolved[index + 1] = schema.Pages[index].Table;
+        }
+
+        FormPermissions current = await SqlPermissionReader.ReadResolvedAsync(
+                scope.Connection,
+                scope.Transaction,
+                RecordOperations.Update,
+                requestedNames,
+                resolved,
+                options.CommandTimeoutSeconds,
+                observer,
+                cancellationToken)
+            .ConfigureAwait(false);
+
+        return current.CanUpdate(form) && missingPages.All(page => current.CanInsertInto(page.Page.TableName));
     }
 
     // The base-only soft delete, inside the transaction RunWriteAsync opened. A record already deleted is left exactly

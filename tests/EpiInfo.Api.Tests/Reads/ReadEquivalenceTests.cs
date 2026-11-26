@@ -114,7 +114,8 @@ public static partial class ReadEquivalenceProcedure
     /// <summary>
     /// Loads both seeded forms through <paramref name="factory"/> with <c>GET</c> requests only and compares every
     /// response with SQL Server: the form definition's data fields, the counts of both sets, every list page of both
-    /// sets, <c>at/{position}</c> across every row and <c>GET</c> by id for every record.
+    /// sets against its own <c>UniqueKey</c> slice of the set, the first page past the end of each set,
+    /// <c>at/{position}</c> across every row and <c>GET</c> by id for every record.
     /// </summary>
     /// <remarks>
     /// The exclusive <see cref="DatabaseWriteLock"/> is taken first and held until the final snapshot comparison, so
@@ -496,7 +497,10 @@ public static partial class ReadEquivalenceProcedure
         Assert.Equal(expected, RequireInt32(body, "count", "GET " + path));
     }
 
-    // Every page of the list over one set, then one page past the end, which must be empty.
+    // Every page of the list over one set, each compared with its own slice of the snapshot set, then the first page
+    // past the end. The page count comes from the set, never from the responses, so page p must hold exactly the
+    // records at set indexes (p - 1) * ListPageSize onward, up to ListPageSize of them, in UniqueKey order: a page
+    // that returns more, fewer or other records than its slice fails, even when the pages together list the set.
     private static async Task CompareListAsync(
         HttpClient client,
         string recordsPath,
@@ -507,48 +511,38 @@ public static partial class ReadEquivalenceProcedure
     {
         string flag = includeDeleted ? "true" : "false";
         string[] gridColumns = GridColumns[context.Form.Name];
-        var listedIds = new List<string>(set.Count);
-        int page = 0;
+        int pageCount = (set.Count / ListPageSize) + (set.Count % ListPageSize == 0 ? 0 : 1);
 
-        // Bounded, so a list that never reaches its total cannot loop for ever.
-        int maxPages = (set.Count / ListPageSize) + 1;
-        while (page < maxPages)
+        for (int page = 1; page <= pageCount; page++)
         {
-            page++;
             string path = ListPath(recordsPath, flag, page);
-            JsonElement body = await ReadListPageAsync(client, path, set.Count, page, ct);
+            JsonElement items = await ReadListPageAsync(client, path, set.Count, page, ct);
             context.Summary.ListPagesRead++;
 
-            JsonElement items = body.GetProperty("items");
+            int offset = (page - 1) * ListPageSize;
+            BaseRecord[] slice = set.Skip(offset).Take(ListPageSize).ToArray();
+            string where = string.Create(CultureInfo.InvariantCulture, $"list includeDeleted={flag} page {page}");
+            AssertPageIsSlice(context.Form.Name + " " + where, slice, offset, items);
+
+            int index = 0;
             foreach (JsonElement item in items.EnumerateArray())
             {
-                string where = string.Create(CultureInfo.InvariantCulture, $"list includeDeleted={flag} page {page}");
-                string id = RequireString(item, "globalRecordId", where);
-                int index = listedIds.Count;
-                listedIds.Add(id);
-                if (index >= set.Count || !string.Equals(set[index].GlobalRecordId, id, StringComparison.Ordinal))
-                {
-                    // The order check after the loop names the first position that differs.
-                    continue;
-                }
-
-                CompareSummary(context, set[index], item, gridColumns, where);
-            }
-
-            if (items.GetArrayLength() == 0 || listedIds.Count >= set.Count)
-            {
-                break;
+                CompareSummary(context, slice[index], item, gridColumns, where);
+                index++;
             }
         }
 
-        AssertSameIds(set, listedIds, $"{context.Form.Name} list includeDeleted={flag}");
-
-        string pastEnd = ListPath(recordsPath, flag, page + 1);
-        JsonElement empty = await ReadListPageAsync(client, pastEnd, set.Count, page + 1, ct);
+        // The first page past the end, which is page 1 when the set is empty, keeps the set's total.
+        int pastEndPage = pageCount + 1;
+        string pastEnd = ListPath(recordsPath, flag, pastEndPage);
+        JsonElement pastEndItems = await ReadListPageAsync(client, pastEnd, set.Count, pastEndPage, ct);
         context.Summary.ListPagesRead++;
         Assert.True(
-            empty.GetProperty("items").GetArrayLength() == 0,
-            $"GET {pastEnd}, one page past the end, returned items; it must return an empty items array.");
+            pastEndItems.GetArrayLength() == 0,
+            string.Create(
+                CultureInfo.InvariantCulture,
+                $"GET {pastEnd}, the first page past the end of the {set.Count} record(s), returned " +
+                $"{pastEndItems.GetArrayLength()} item(s); it must return an empty items array."));
     }
 
     private static string ListPath(string recordsPath, string flag, int page) =>
@@ -556,7 +550,8 @@ public static partial class ReadEquivalenceProcedure
             CultureInfo.InvariantCulture,
             $"{recordsPath}?includeDeleted={flag}&page={page}&pageSize={ListPageSize}");
 
-    // One list page with its envelope checked: total is the set size and page and pageSize echo the request.
+    // One list page with its envelope checked: total is the set size and page and pageSize echo the request. Returns
+    // the page's items array.
     private static async Task<JsonElement> ReadListPageAsync(
         HttpClient client,
         string path,
@@ -570,33 +565,42 @@ public static partial class ReadEquivalenceProcedure
         Assert.Equal(expectedTotal, RequireInt32(body, "total", context));
         Assert.Equal(page, RequireInt32(body, "page", context));
         Assert.Equal(ListPageSize, RequireInt32(body, "pageSize", context));
-        _ = RequireArray(body, "items", context);
-        return body;
+        return RequireArray(body, "items", context);
     }
 
-    // The listed ids are the set's ids in UniqueKey order; the message names the first position that differs.
-    private static void AssertSameIds(IReadOnlyList<BaseRecord> set, List<string> listedIds, string what)
+    // A page's items are exactly its slice of the set, which starts at the 0-based set index offset: as many items as
+    // the slice holds, then the slice's ids in the same UniqueKey order. The message names the form, the set flag,
+    // the page and the item, and the ids, never a field value.
+    private static void AssertPageIsSlice(string what, BaseRecord[] slice, int offset, JsonElement items)
     {
-        int common = Math.Min(set.Count, listedIds.Count);
-        for (int index = 0; index < common; index++)
+        int length = items.GetArrayLength();
+        if (length != slice.Length)
         {
-            if (!string.Equals(set[index].GlobalRecordId, listedIds[index], StringComparison.Ordinal))
+            throw new XunitException(
+                string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"{what}: returned {length} item(s), expected {slice.Length}, the records at set positions " +
+                    $"{offset + 1} to {offset + slice.Length} in UniqueKey order."));
+        }
+
+        int index = 0;
+        foreach (JsonElement item in items.EnumerateArray())
+        {
+            string where = string.Create(CultureInfo.InvariantCulture, $"{what} item {index + 1}");
+            string id = RequireString(item, "globalRecordId", where);
+            string expected = slice[index].GlobalRecordId;
+            if (!string.Equals(id, expected, StringComparison.Ordinal))
             {
                 throw new XunitException(
                     string.Create(
                         CultureInfo.InvariantCulture,
-                        $"{what}: item {index + 1} is {listedIds[index]}, expected {set[index].GlobalRecordId} " +
-                        $"in UniqueKey order."));
+                        $"{where} (set position {offset + index + 1}) is {id}, expected {expected} in UniqueKey " +
+                        $"order."));
             }
+
+            index++;
         }
-
-        Assert.True(
-            set.Count == listedIds.Count,
-            string.Create(
-                CultureInfo.InvariantCulture,
-                $"{what}: listed {listedIds.Count} record(s); the set holds {set.Count}."));
     }
-
 
     // A list item: its identity and status, then its grid columns in order, each equal to the stored value.
     private static void CompareSummary(
@@ -1221,4 +1225,3 @@ public static partial class ReadEquivalenceProcedure
         }
     }
 }
-

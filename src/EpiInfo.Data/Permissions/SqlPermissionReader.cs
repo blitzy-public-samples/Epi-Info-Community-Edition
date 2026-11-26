@@ -20,12 +20,20 @@ namespace EpiInfo.Data.Permissions;
 /// from them, and it denies any table without an entry, such as a page whose table is missing from the catalogue.
 /// </para>
 /// <para>
-/// Each call uses one connection, outside any transaction. It sends at most one catalogue read, through
-/// <see cref="SqlMetadataReader.ResolveTablesAsync"/>: it confirms the form's own base and page tables and supplies
-/// each one's catalogue spelling, without reading the form's metadata again. That read is not sent when the base and
-/// page table names are all blank. Then one parameterised statement checks INSERT and UPDATE on up to 1,000 confirmed
-/// tables, and one more is sent for each further 1,000 or part of 1,000. A table the catalogue does not hold gets no
-/// entry, so it is denied; when no table is confirmed, no permission statement is sent and the result has no entry.
+/// Each <see cref="GetPermissionsAsync"/> call uses one connection, outside any transaction. It sends at most one
+/// catalogue read, through <see cref="SqlMetadataReader.ResolveTablesAsync"/>: it confirms the form's own base and page
+/// tables and supplies each one's catalogue spelling, without reading the form's metadata again. That read is not sent
+/// when the base and page table names are all blank. Then one parameterised statement checks INSERT and UPDATE on up
+/// to 1,000 confirmed tables, and one more is sent for each further 1,000 or part of 1,000. A table the catalogue does
+/// not hold gets no entry, so it is denied; when no table is confirmed, no permission statement is sent and the result
+/// has no entry.
+/// </para>
+/// <para>
+/// <see cref="ReadResolvedAsync"/> sends the same permission statements, and builds the same entries, for tables a
+/// caller already resolved, on that caller's connection and inside its transaction, and sends no catalogue read. The
+/// record repository uses it within an update, for the base table and every page table, so the UPDATE and
+/// missing-page INSERT it requires are decided inside the update's own transaction, on the tables that transaction's
+/// schema read confirmed.
 /// </para>
 /// <para>
 /// Each entry carries the catalogue spelling of its table, and <see cref="FormPermissions.ResolvedTableNames"/> maps
@@ -57,8 +65,9 @@ namespace EpiInfo.Data.Permissions;
 /// <para>
 /// Every statement is a <c>SELECT</c> and changes nothing. Nothing is cached: no call reuses an earlier call's
 /// catalogue or permission result, so a grant or revoke applies to the next request. Failures are not caught here:
-/// the connection factory classifies a failure to open, and the store that owns this reader classifies the rest. The
-/// instance holds only immutable collaborators and is safe to share across threads.
+/// the connection factory classifies a failure to open, and the store that owns this reader, or the write whose
+/// transaction <see cref="ReadResolvedAsync"/> joins, classifies the rest. The instance holds only immutable
+/// collaborators and is safe to share across threads.
 /// </para>
 /// </remarks>
 /// <param name="connectionFactory">Opens the one connection each call uses.</param>
@@ -74,6 +83,9 @@ internal sealed class SqlPermissionReader(
     // The fixed operation name reported to the connection factory, the command observer and failure classification.
     // It names no table, so no identifier reaches an exception or a log line.
     private const string Operation = "GetPermissions";
+
+    // Fixed text: the redaction policy keeps table names out of exception messages.
+    private const string MismatchedResolutionMessage = "Each requested table name needs exactly one resolution.";
 
     // The permission statement is these two fixed fragments around one "(@pN)" row per table, joined by ", ". Each row
     // value is a bracket-quoted table name, returned as Securable so a result row maps back to its table. A one-part
@@ -149,70 +161,135 @@ internal sealed class SqlPermissionReader(
                 .ResolveTablesAsync(connection, transaction: null, requestedNames, cancellationToken)
                 .ConfigureAwait(false);
 
-            // Only tables the catalogue holds are checked, in request order and once each. A missing table gets no
-            // entry, which FormPermissions denies, so the result can only fail closed.
-            var tables = new List<TableSchema>(resolved.Count);
-            var seen = new HashSet<string>(StringComparer.Ordinal);
-            foreach (TableSchema? table in resolved)
-            {
-                if (table is not null && seen.Add(table.Name))
-                {
-                    tables.Add(table);
-                }
-            }
-
-            if (tables.Count == 0)
-            {
-                return new FormPermissions([]);
-            }
-
-            var rowsBySecurable = new Dictionary<string, PermissionRow>(tables.Count, StringComparer.Ordinal);
-            for (int start = 0; start < tables.Count; start += MaxTablesPerStatement)
-            {
-                int count = Math.Min(MaxTablesPerStatement, tables.Count - start);
-                IReadOnlyList<PermissionRow> rows = await SqlExecution.QueryAsync<PermissionRow>(
-                        connection,
-                        transaction: null,
-                        Operation,
-                        PermissionStatement(tables, start, count),
-                        options.CommandTimeoutSeconds,
-                        observer,
-                        cancellationToken)
-                    .ConfigureAwait(false);
-
-                foreach (PermissionRow row in rows)
-                {
-                    if (row.Securable is { } securable)
-                    {
-                        rowsBySecurable.TryAdd(securable, row);
-                    }
-                }
-            }
-
-            var permissions = new TablePermission[tables.Count];
-            for (int index = 0; index < permissions.Length; index++)
-            {
-                TableSchema table = tables[index];
-
-                // A table with no result row is denied, and only the value 1 grants: 0 and NULL deny.
-                rowsBySecurable.TryGetValue(SqlIdentifier.Quote(table), out PermissionRow? row);
-                permissions[index] = new TablePermission(table.Name, row?.CanInsert == 1, row?.CanUpdate == 1);
-            }
-
-            // Each requested metadata name the catalogue confirmed maps to the entry of the table it reached, so a name
-            // spelled in another letter case finds that entry exactly. A name the catalogue left unresolved, missing or
-            // ambiguous, gets no key and so reaches no entry.
-            var resolvedTableNames = new Dictionary<string, string>(requestedNames.Count, StringComparer.Ordinal);
-            for (int index = 0; index < requestedNames.Count; index++)
-            {
-                if (resolved[index] is { } table)
-                {
-                    resolvedTableNames.TryAdd(requestedNames[index], table.Name);
-                }
-            }
-
-            return new FormPermissions(permissions) { ResolvedTableNames = resolvedTableNames };
+            return await ReadResolvedAsync(
+                    connection,
+                    transaction: null,
+                    Operation,
+                    requestedNames,
+                    resolved,
+                    options.CommandTimeoutSeconds,
+                    observer,
+                    cancellationToken)
+                .ConfigureAwait(false);
         }
+    }
+
+    /// <summary>
+    /// Reads the login's INSERT and UPDATE permissions on tables the caller already resolved, on the caller's
+    /// connection and, when one is given, inside the caller's transaction. No catalogue read is sent.
+    /// </summary>
+    /// <remarks>
+    /// The record repository calls it inside an update, after the locked read and the required gate, for the base
+    /// table and every page table, so the UPDATE on each of them and the INSERT on each page whose row is missing are
+    /// decided by the grants in force at that point of the transaction, on tables that transaction's own schema read
+    /// confirmed.
+    /// </remarks>
+    /// <param name="connection">An open connection; this method neither opens nor closes it.</param>
+    /// <param name="transaction">The transaction the statements join, or <see langword="null"/> for none.</param>
+    /// <param name="operation">The fixed operation name reported to the command observer.</param>
+    /// <param name="requestedNames">The table names, exactly as the metadata spells them.</param>
+    /// <param name="resolved">
+    /// For each entry of <paramref name="requestedNames"/>, at the same index, the reader-built table the catalogue
+    /// confirmed for it, or <see langword="null"/> when it confirmed none.
+    /// </param>
+    /// <param name="commandTimeoutSeconds">The command timeout in whole seconds.</param>
+    /// <param name="observer">Receives every command this method sends.</param>
+    /// <param name="cancellationToken">The request's abort token.</param>
+    /// <returns>
+    /// One entry per distinct resolved table, in request order, named with its catalogue spelling and with a flag set
+    /// only where <c>HAS_PERMS_BY_NAME</c> returned 1, and <see cref="FormPermissions.ResolvedTableNames"/> mapping
+    /// each requested name that was resolved to its entry's name. When no table is resolved, no statement is sent and
+    /// the result has no entry.
+    /// </returns>
+    /// <exception cref="ArgumentNullException">An argument is null.</exception>
+    /// <exception cref="ArgumentException">
+    /// <paramref name="resolved"/> and <paramref name="requestedNames"/> differ in length.
+    /// </exception>
+    /// <exception cref="SqlException">A permission command failed; the caller classifies it.</exception>
+    /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> was cancelled.</exception>
+    internal static async Task<FormPermissions> ReadResolvedAsync(
+        SqlConnection connection,
+        SqlTransaction? transaction,
+        string operation,
+        IReadOnlyList<string> requestedNames,
+        IReadOnlyList<TableSchema?> resolved,
+        int commandTimeoutSeconds,
+        ISqlCommandObserver observer,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(connection);
+        ArgumentNullException.ThrowIfNull(operation);
+        ArgumentNullException.ThrowIfNull(requestedNames);
+        ArgumentNullException.ThrowIfNull(resolved);
+        ArgumentNullException.ThrowIfNull(observer);
+        if (resolved.Count != requestedNames.Count)
+        {
+            throw new ArgumentException(MismatchedResolutionMessage, nameof(resolved));
+        }
+
+        // Only tables the catalogue holds are checked, in request order and once each. A missing table gets no
+        // entry, which FormPermissions denies, so the result can only fail closed.
+        var tables = new List<TableSchema>(resolved.Count);
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (TableSchema? table in resolved)
+        {
+            if (table is not null && seen.Add(table.Name))
+            {
+                tables.Add(table);
+            }
+        }
+
+        if (tables.Count == 0)
+        {
+            return new FormPermissions([]);
+        }
+
+        var rowsBySecurable = new Dictionary<string, PermissionRow>(tables.Count, StringComparer.Ordinal);
+        for (int start = 0; start < tables.Count; start += MaxTablesPerStatement)
+        {
+            int count = Math.Min(MaxTablesPerStatement, tables.Count - start);
+            IReadOnlyList<PermissionRow> rows = await SqlExecution.QueryAsync<PermissionRow>(
+                    connection,
+                    transaction,
+                    operation,
+                    PermissionStatement(tables, start, count),
+                    commandTimeoutSeconds,
+                    observer,
+                    cancellationToken)
+                .ConfigureAwait(false);
+
+            foreach (PermissionRow row in rows)
+            {
+                if (row.Securable is { } securable)
+                {
+                    rowsBySecurable.TryAdd(securable, row);
+                }
+            }
+        }
+
+        var permissions = new TablePermission[tables.Count];
+        for (int index = 0; index < permissions.Length; index++)
+        {
+            TableSchema table = tables[index];
+
+            // A table with no result row is denied, and only the value 1 grants: 0 and NULL deny.
+            rowsBySecurable.TryGetValue(SqlIdentifier.Quote(table), out PermissionRow? row);
+            permissions[index] = new TablePermission(table.Name, row?.CanInsert == 1, row?.CanUpdate == 1);
+        }
+
+        // Each requested metadata name the catalogue confirmed maps to the entry of the table it reached, so a name
+        // spelled in another letter case finds that entry exactly. A name the catalogue left unresolved, missing or
+        // ambiguous, gets no key and so reaches no entry.
+        var resolvedTableNames = new Dictionary<string, string>(requestedNames.Count, StringComparer.Ordinal);
+        for (int index = 0; index < requestedNames.Count; index++)
+        {
+            if (resolved[index] is { } table)
+            {
+                resolvedTableNames.TryAdd(requestedNames[index], table.Name);
+            }
+        }
+
+        return new FormPermissions(permissions) { ResolvedTableNames = resolvedTableNames };
     }
 
     // The base table, then each page table in metaPages.Position order. The sort is stable, so pages that share a

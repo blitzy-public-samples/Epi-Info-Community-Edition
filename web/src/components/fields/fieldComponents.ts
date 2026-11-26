@@ -44,7 +44,7 @@ export interface FieldComponentProps {
   children?: ReactNode;
 }
 
-/** ARIA attributes spread onto a native `input`, `textarea` or `select`; absent keys are omitted, never `undefined`. */
+/** ARIA attributes spread onto a native `input`, `textarea` or `select`, or an option group's radiogroup fieldset; absent keys are omitted, never `undefined`. */
 export type FieldAriaProps = {
   'aria-invalid'?: true;
   'aria-describedby'?: string;
@@ -52,14 +52,24 @@ export type FieldAriaProps = {
 };
 
 /**
- * DOM id of a field's control: deterministic, so labels, tests and FieldRenderer can
- * address it, and DOM-safe, because metadata names may hold any character.
+ * DOM id of a field's control: `field-` followed by the encoded name. Deterministic, so
+ * labels, validation jumps, radio group names and tests can address it.
+ *
+ * The encoding keeps ASCII letters and digits and writes every other UTF-16 code unit,
+ * `_` and `-` included, as `_` plus its four lowercase hex digits. It is injective, so
+ * distinct names never share an id, and its output holds only letters, digits and `_`,
+ * so the id is safe in the DOM and in a CSS selector whatever the metadata name holds.
+ *
+ * Because the encoded name never contains `-`, an id derived from a control's id as
+ * `${fieldControlId(name)}-<role>` (the error list, a hint, a radio) can never equal
+ * another field's control id or a different role's id. Every id derived for a field
+ * follows that form.
  */
 export function fieldControlId(name: string): string {
-  return 'field-' + name.replace(/[^A-Za-z0-9_-]/g, '_');
+  return 'field-' + name.replace(/[^A-Za-z0-9]/g, (unit) => '_' + unit.charCodeAt(0).toString(16).padStart(4, '0'));
 }
 
-/** DOM id of the element listing a field's error messages. */
+/** DOM id of the element listing a field's error messages: the control's id with the role `-error`. */
 export function fieldErrorId(name: string): string {
   return `${fieldControlId(name)}-error`;
 }

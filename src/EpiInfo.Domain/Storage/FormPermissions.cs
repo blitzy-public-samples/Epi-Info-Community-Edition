@@ -54,8 +54,9 @@ public sealed record TablePermission(string TableName, bool CanInsert, bool CanU
 /// <list type="bullet">
 /// <item><description><c>POST</c> needs <see cref="CanInsert"/>.</description></item>
 /// <item><description>
-/// <c>PUT</c> needs <see cref="CanUpdate"/>; then, after the locked read, the store requires
-/// <see cref="CanInsertInto"/> for each page whose row is missing, before any statement that changes data.
+/// <c>PUT</c> needs <see cref="CanUpdate"/>; then, after the locked read and the required gate and before any
+/// statement that changes data, the store re-checks <see cref="CanUpdate"/> and requires <see cref="CanInsertInto"/>
+/// for each page whose row is missing, from its own permission read inside the transaction.
 /// </description></item>
 /// <item><description><c>DELETE</c> needs <see cref="CanDelete"/>.</description></item>
 /// <item><description>A denied write is a 403 and nothing is written.</description></item>
@@ -169,8 +170,9 @@ public sealed record FormPermissions(IReadOnlyList<TablePermission> Tables)
     }
 
     /// <summary>
-    /// Whether the login may insert a row into <paramref name="tableName"/>. The store checks it inside an update
-    /// for each page whose row the locked read found missing, before any statement that changes data.
+    /// Whether the login may insert a row into <paramref name="tableName"/>. The store checks it inside an update,
+    /// from its own permission read in the transaction, for each page whose row the locked read found missing, before
+    /// any statement that changes data.
     /// </summary>
     /// <param name="tableName">
     /// A page table name, exactly as <see cref="PageMetadata.TableName"/> gives it; <see cref="Find"/> resolves it.

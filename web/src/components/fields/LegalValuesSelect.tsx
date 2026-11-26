@@ -16,9 +16,12 @@ import {
 } from './fieldComponents';
 
 /**
- * A native `select` labelled by the field's prompt. Its first option is empty and
- * stands for `null`. A stored value missing from the list is shown as one extra
- * option after the empty one, so a read shows the stored value unchanged.
+ * A native `select` labelled by the field's prompt. Its first option, "No selection",
+ * has the value `''` and stands for `null`: choosing it clears the field, and an empty
+ * field shows it. Its visible text is also its accessible name, so the collapsed
+ * select and its list never announce a blank item. A stored value missing from the
+ * list is shown as one extra option after "No selection", so a read shows the stored
+ * value unchanged.
  */
 export function LegalValuesSelect(props: FieldComponentProps) {
   const { field, value, disabled, errors, onChange, onFocus, onBlur } = props;
@@ -45,7 +48,7 @@ export function LegalValuesSelect(props: FieldComponentProps) {
           onBlur?.();
         }}
       >
-        <option value=""></option>
+        <option value="">No selection</option>
         {current !== '' && !currentIsListed && <option value={current}>{current}</option>}
         {options.map((option, index) => {
           const optionValue = fieldTextValue(option.value);

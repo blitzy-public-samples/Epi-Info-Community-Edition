@@ -1,4 +1,6 @@
+using System.Data;
 using System.Globalization;
+using System.Net;
 using System.Net.Http.Headers;
 using System.Text.Json;
 using EpiInfo.Api.Errors;
@@ -6,8 +8,11 @@ using EpiInfo.Api.Tests.Infrastructure;
 using EpiInfo.Domain.Metadata;
 using EpiInfo.Domain.Records;
 using EpiInfo.Domain.Storage;
+using EpiInfo.Domain.Validation;
 using EpiInfo.Domain.Values;
+using EpiInfo.Tests.Shared;
 using Microsoft.AspNetCore.Http;
+using Microsoft.Data.SqlClient;
 
 namespace EpiInfo.Api.Tests.Records;
 
@@ -19,10 +24,13 @@ namespace EpiInfo.Api.Tests.Records;
 /// <remarks>
 /// The class needs no database, so it carries no <c>Integration</c> trait. Each case hosts the API's own composition
 /// root, <c>Program.cs</c>, through an <see cref="ApiFactory"/> on TestServer whose store is a
-/// <see cref="FakeDataStore"/> holding <see cref="FakeForms.TwoPage"/> with synthetic per-table permissions. Every
-/// request therefore travels the production pipeline, its error handling, guards, routing, JSON binding, the endpoint
-/// handler, the service and result execution, and every assertion reads the status, headers and body the client
-/// receives. A real denied database principal is not created, because the database's logins and users stay unchanged.
+/// <see cref="FakeDataStore"/> holding <see cref="FakeForms.TwoPage"/>, or <see cref="FakeForms.WithRequiredField"/>
+/// for the case that orders the required gate before the missing-page check, with synthetic per-table permissions.
+/// Every request therefore travels the production pipeline, its error handling, guards, routing, JSON binding, the
+/// endpoint handler, the service and result execution, and every assertion reads the status, headers and body the
+/// client receives. A real denied database principal is not created, because the database's logins and users stay
+/// unchanged; <see cref="MissingPagePermissionSqlTests"/> proves on the database where the SQL Server store reads the
+/// permissions it re-checks inside an update.
 /// </remarks>
 public sealed class PermissionTests
 {
@@ -32,6 +40,9 @@ public sealed class PermissionTests
     private const string SecondPageField = "Notes";
 
     private const string SeededText = "Seeded";
+
+    // The optional text field beside the required one on FakeForms.WithRequiredField's only page.
+    private const string OptionalField = "Comment";
 
     /// <summary>
     /// The entry a data table gets in a <see cref="FormPermissions"/>; <see cref="Missing"/> leaves the table without
@@ -225,6 +236,107 @@ public sealed class PermissionTests
         AssertUpdated(harness, granted, lacking, field, "Granted");
     }
 
+    // On a one-page form whose only page row a record lacks, with UPDATE everywhere and INSERT denied on that page, the
+    // store's required gate runs before its missing-page INSERT check: a PUT that leaves the required field empty is
+    // the gate's 400, and one that fills it passes the gate and is the 403, each after the store's locked read with
+    // nothing written. Once INSERT on the page is granted, the same PUT saves and inserts the page row.
+    [Fact]
+    public async Task UpdateRunsTheRequiredGateBeforeTheMissingPageInsertCheck()
+    {
+        var form = FakeForms.WithRequiredField;
+        var store = new FakeDataStore(form);
+        await using var factory = new ApiFactory(ApiFactoryOptions.ForFake(store));
+        using var client = factory.CreateClient();
+
+        var metadata = form.Metadata;
+        var page = Assert.Single(metadata.Pages);
+        Assert.Equal(page.PageId, metadata.FindField(FakeForms.RequiredFieldName)?.PageId);
+        Assert.Equal(page.PageId, metadata.FindField(OptionalField)?.PageId);
+
+        var lacking = store.SeedRecord(FakeForms.RequiredViewId, missingPageIds: [page.PageId]);
+        var path = string.Create(
+            CultureInfo.InvariantCulture,
+            $"/api/forms/{FakeForms.RequiredViewId}/records/{Uri.EscapeDataString(lacking)}");
+        store.SetPermissions(FakeForms.RequiredViewId, OnePagePermissions(metadata, pageInsert: false));
+        var before = OnePageSnapshot(store, lacking);
+        Assert.DoesNotContain(page.PageId, before.PresentPageIds);
+
+        var incomplete = await ExchangeAsync(
+            store,
+            () => ApiTestClient.PutJsonAsync(client, path, OnePageBody(surname: null, "Incomplete")));
+        AssertRequiredFieldMissing(incomplete);
+        Assert.Contains(new FakeStoreCall(nameof(IDataStore.UpdateAsync), IsWrite: false), incomplete.Calls);
+        AssertUnchanged(before, OnePageSnapshot(store, lacking));
+
+        var denied = await ExchangeAsync(
+            store,
+            () => ApiTestClient.PutJsonAsync(client, path, OnePageBody("Filled", "Denied")));
+        AssertForbidden(denied, ApiProblems.ForbiddenUpdateDetail);
+        Assert.Contains(new FakeStoreCall(nameof(IDataStore.UpdateAsync), IsWrite: false), denied.Calls);
+        AssertUnchanged(before, OnePageSnapshot(store, lacking));
+
+        store.SetPermissions(FakeForms.RequiredViewId, OnePagePermissions(metadata, pageInsert: true));
+        var granted = await ExchangeAsync(
+            store,
+            () => ApiTestClient.PutJsonAsync(client, path, OnePageBody("Filled", "Granted")));
+        Assert.Equal(StatusCodes.Status200OK, granted.Status);
+        Assert.Equal([new FakeStoreCall(nameof(IDataStore.UpdateAsync), IsWrite: true)], granted.Writes);
+        var after = OnePageSnapshot(store, lacking);
+        Assert.Contains(page.PageId, after.PresentPageIds);
+        Assert.Equal("Filled", after.Values[FakeForms.RequiredFieldName].AsText());
+        Assert.Equal("Granted", after.Values[OptionalField].AsText());
+        Assert.NotNull(after.LastSave);
+    }
+
+    // UPDATE and INSERT on the base table, UPDATE on the one page table, and INSERT on it only when pageInsert is set.
+    private static FormPermissions OnePagePermissions(FormMetadata form, bool pageInsert) => new(
+    [
+        new TablePermission(form.BaseTableName, CanInsert: true, CanUpdate: true),
+        new TablePermission(form.Pages[0].TableName, CanInsert: pageInsert, CanUpdate: true),
+    ]);
+
+    // The PUT body of FakeForms.WithRequiredField: the optional field, and the required field unless surname is null.
+    private static object OnePageBody(string? surname, string comment)
+    {
+        var values = new Dictionary<string, string> { [OptionalField] = comment };
+        if (surname is not null)
+        {
+            values[FakeForms.RequiredFieldName] = surname;
+        }
+
+        return new { values };
+    }
+
+    private static FakeRecordState OnePageSnapshot(FakeDataStore store, string globalRecordId)
+    {
+        var state = store.GetRecord(FakeForms.RequiredViewId, globalRecordId);
+        Assert.NotNull(state);
+        return state;
+    }
+
+    // The required gate's field-level 400: a validation ProblemDetails whose errors hold only the required field, with
+    // its FIELD_IS_REQUIRED_LONG message, and no data-changing store call.
+    private static void AssertRequiredFieldMissing(Response response)
+    {
+        Assert.Equal(StatusCodes.Status400BadRequest, response.Status);
+        Assert.NotNull(response.ContentType);
+        Assert.Equal(ApiProblems.ProblemContentType, MediaTypeHeaderValue.Parse(response.ContentType).MediaType);
+
+        var body = ApiTestClient.AssertProblemDetails(Body(response), StatusCodes.Status400BadRequest);
+        Assert.Equal(ApiProblems.ValidationFailedDetail, body.GetProperty("detail").GetString());
+        var entry = Assert.Single(body.GetProperty("errors").EnumerateObject());
+        Assert.Equal(FakeForms.RequiredFieldName, entry.Name);
+        var message = Assert.Single(entry.Value.EnumerateArray());
+        Assert.Equal(
+            ValidationMessages.FormatFieldIsRequired(
+                FakeForms.RequiredFieldPrompt,
+                FakeForms.RequiredFieldName,
+                FakeForms.RequiredFieldPageName),
+            message.GetString());
+
+        Assert.Empty(response.Writes);
+    }
+
     // Permissions are read on every write and never cached: on one store behind one host, a write that was allowed is
     // refused once the permission it needs is revoked, with nothing written, and allowed again once the permission is
     // restored. Each write reads the permissions exactly once.
@@ -304,6 +416,78 @@ public sealed class PermissionTests
         foreach (var response in new[] { created, updated, deleted })
         {
             Assert.Single(response.Calls, call => call.Method == nameof(IDataStore.GetPermissionsAsync));
+        }
+    }
+
+    /// <summary>The permissions the store holds for the form when an update given permissions runs.</summary>
+    public enum StoreGrants
+    {
+        /// <summary>INSERT and UPDATE on every table.</summary>
+        Every,
+
+        /// <summary>No permissions at all.</summary>
+        None,
+
+        /// <summary>Every grant but UPDATE on the first page's table, whose row the record holds.</summary>
+        PresentPageUpdateRevoked,
+
+        /// <summary>Every grant but INSERT on the second page's table, whose row the record lacks.</summary>
+        MissingPageInsertRevoked,
+    }
+
+    // The store decides an update given permissions from the permissions it holds when the update runs, never from the
+    // caller's argument, which only turns the check on, as the SQL Server store reads them again inside its
+    // transaction: on a record lacking its second-page row, an argument granting nothing still saves when the store
+    // grants everything, and an argument granting everything is refused, with nothing written, when the store holds no
+    // permissions or revokes a page's UPDATE or the missing page's INSERT.
+    [Theory]
+    [InlineData(StoreGrants.Every, false, true)]
+    [InlineData(StoreGrants.None, true, false)]
+    [InlineData(StoreGrants.PresentPageUpdateRevoked, true, false)]
+    [InlineData(StoreGrants.MissingPageInsertRevoked, true, false)]
+    public async Task TheStoreDecidesAnUpdateFromThePermissionsItHoldsWhenItRuns(
+        StoreGrants held,
+        bool argumentGrantsEverything,
+        bool saves)
+    {
+        await using var harness = await Harness.StartAsync();
+        var lacking = harness.SeedRecord(harness.SecondPage);
+        harness.SetPermissions(held switch
+        {
+            StoreGrants.Every => harness.AllGranted,
+            StoreGrants.None => null,
+            StoreGrants.PresentPageUpdateRevoked => harness.Permissions(Grant.Both, Grant.InsertOnly, Grant.Both),
+            StoreGrants.MissingPageInsertRevoked => harness.Permissions(Grant.Both, Grant.Both, Grant.UpdateOnly),
+            _ => throw new ArgumentOutOfRangeException(nameof(held)),
+        });
+        var argument = argumentGrantsEverything ? harness.AllGranted : new FormPermissions([]);
+        var stamp = new SaveStamp("tester", new DateTime(2024, 1, 2, 3, 4, 5, DateTimeKind.Local));
+        var before = harness.Snapshot(lacking);
+        var callsBefore = harness.Store.Calls.Count;
+
+        var result = await harness.Store.UpdateAsync(
+            harness.Form,
+            lacking,
+            new Dictionary<string, FieldValue> { [FirstPageField] = FieldValue.FromText("Applied") },
+            stamp,
+            _ => RecordValidationResult.Success(new Dictionary<string, FieldValue>()),
+            argument,
+            CancellationToken.None);
+
+        var writes = harness.Store.Calls.Skip(callsBefore).Where(call => call.IsWrite).ToList();
+        if (saves)
+        {
+            Assert.Equal(RecordWriteStatus.Success, result.Status);
+            Assert.Equal([new FakeStoreCall(nameof(IDataStore.UpdateAsync), IsWrite: true)], writes);
+            var after = harness.Snapshot(lacking);
+            Assert.Equal("Applied", after.Values[FirstPageField].AsText());
+            Assert.Equal(stamp, after.LastSave);
+        }
+        else
+        {
+            Assert.Equal(RecordWriteStatus.Forbidden, result.Status);
+            Assert.Empty(writes);
+            AssertUnchanged(before, harness.Snapshot(lacking));
         }
     }
 
@@ -662,6 +846,30 @@ public sealed class PermissionTests
         return response.Body.Value;
     }
 
+    // Sends one request and reads its whole response before collecting the store calls made while it ran. Location is
+    // read as sent: on Unix a path beginning with '/' parses as an absolute file URI, whose original string is still
+    // the header's text.
+    private static async Task<Response> ExchangeAsync(FakeDataStore store, Func<Task<HttpResponseMessage>> send)
+    {
+        var callsBefore = store.Calls.Count;
+        using var response = await send().ConfigureAwait(false);
+        var body = await response.Content.ReadAsByteArrayAsync().ConfigureAwait(false);
+
+        JsonElement? json = null;
+        if (body.Length > 0)
+        {
+            using var document = JsonDocument.Parse(body);
+            json = document.RootElement.Clone();
+        }
+
+        return new Response(
+            (int)response.StatusCode,
+            response.Content.Headers.ContentType?.ToString(),
+            response.Headers.Location?.OriginalString,
+            json,
+            [.. store.Calls.Skip(callsBefore)]);
+    }
+
     /// <summary>A response as the client received it, with the store calls the request made.</summary>
     /// <param name="Status">The response status.</param>
     /// <param name="ContentType">The response's <c>Content-Type</c>, or <see langword="null"/> for none.</param>
@@ -842,28 +1050,242 @@ public sealed class PermissionTests
         private string RecordPath(string globalRecordId) =>
             $"{FormPath()}/records/{Uri.EscapeDataString(globalRecordId)}";
 
-        // Sends one request and reads its whole response before collecting the store calls made while it ran. Location
-        // is read as sent: on Unix a path beginning with '/' parses as an absolute file URI, whose original string is
-        // still the header's text.
-        private async Task<Response> ExecuteAsync(Func<Task<HttpResponseMessage>> send)
-        {
-            var callsBefore = Store.Calls.Count;
-            using var response = await send().ConfigureAwait(false);
-            var body = await response.Content.ReadAsByteArrayAsync().ConfigureAwait(false);
+        private Task<Response> ExecuteAsync(Func<Task<HttpResponseMessage>> send) => ExchangeAsync(Store, send);
+    }
+}
 
-            JsonElement? json = null;
-            if (body.Length > 0)
-            {
-                using var document = JsonDocument.Parse(body);
-                json = document.RootElement.Clone();
-            }
+/// <summary>
+/// The in-transaction permission check of <c>PUT</c> on the SQL Server store, against the rehearsal database (AAP
+/// 0.2.4), on a record whose page row is missing and once that row is repaired: every update reads the permissions
+/// inside its transaction, after the locked read, the record read and the required gate and before the first write,
+/// for the base table and every page table, so the UPDATE on each of them and the INSERT on the table of each page
+/// whose row is missing are never decided from the service's earlier read.
+/// </summary>
+/// <remarks>
+/// <para>
+/// The seeded login holds every permission and no denied principal is created, because the database's logins and
+/// users stay unchanged. The case therefore proves where and on what the check runs through
+/// <see cref="SqlCommandRecorder"/>, and <see cref="PermissionTests"/> proves the denial on
+/// <see cref="FakeDataStore"/>.
+/// </para>
+/// <para>
+/// The record is created only through <c>POST /api/forms/{viewId}/records</c>, carrying a fresh
+/// <see cref="TestDatabase.NewMarker"/> in <see cref="TestDatabase.MarkerField"/>, and stays in the database. The one
+/// direct write deletes the <c>FoodHistory3</c> row of that record (AAP 0.3.7, "Data reach of tests"), under the
+/// exclusive <see cref="DatabaseWriteLock"/>. Failure messages describe commands without their bound values and never
+/// print a response body.
+/// </para>
+/// </remarks>
+[Trait("Category", "Integration")]
+[Collection(DatabaseCollections.Database)]
+public sealed class MissingPagePermissionSqlTests
+{
+    private const string FoodHistory = "FoodHistory";
 
-            return new Response(
-                (int)response.StatusCode,
-                response.Content.Headers.ContentType?.ToString(),
-                response.Headers.Location?.OriginalString,
-                json,
-                [.. Store.Calls.Skip(callsBefore)]);
-        }
+    // FoodHistory's text fields FirstName, on its first page (FoodHistory2), and Lab, on its second (FoodHistory3),
+    // both nvarchar(4000) with no pattern, length limit or legal values (testdata/sql/03_forms.sql and
+    // 05_data_tables.sql).
+    private const string PageOneField = "FirstName";
+
+    private const string PageTwoField = "Lab";
+
+    // The fixed operation names EpiInfo.Data reports to the command observer: the record repository's update, and the
+    // permission reader's form-level read that RecordService makes before it calls the store.
+    private const string UpdateOperation = "records.update";
+
+    private const string ServicePermissionOperation = "GetPermissions";
+
+    private const string PermissionFunction = "HAS_PERMS_BY_NAME";
+
+    private const string LockHint = "UPDLOCK";
+
+    // The parameters the in-transaction permission statement binds, in order: the bracket-quoted catalogue names of
+    // FoodHistory's base table, then of its page tables in metaPages.Position order (testdata/sql/03_forms.sql and
+    // 05_data_tables.sql).
+    private static readonly string[] TableSecurables = ["[FoodHistory]", "[FoodHistory2]", "[FoodHistory3]"];
+
+    // Longer than DatabaseWriteLock's 300-second wait, so a lock held by another process fails the lock call rather
+    // than this token; xUnit v2 gives a test no cancellation token of its own.
+    private static readonly TimeSpan TestTimeout = TimeSpan.FromMinutes(10);
+
+    // A PUT of a page-one field on a record lacking its FoodHistory3 row, a PUT of the page-two field that repairs the
+    // row, and a PUT once every page row is present each read the permissions of the base table and every page table
+    // in their transaction, which is where the UPDATE on each table, and the INSERT on FoodHistory3 while its row is
+    // missing, are decided. The service's own read runs before each transaction, outside it, and decides nothing there.
+    [Fact]
+    public async Task UpdatePermissions_AreReadInsideTheUpdateTransactionBeforeItsFirstWrite()
+    {
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        var ct = timeout.Token;
+        await using var factory = await ApiFactory.ForDatabaseAsync();
+        using var client = factory.CreateClient();
+        await using var dbLock = await DatabaseWriteLock.AcquireExclusiveAsync(ct);
+
+        var viewId = await ApiTestClient.GetViewIdAsync(client, FoodHistory, ct);
+        var created = await ApiTestClient.CreateRecordAsync(
+            client,
+            viewId,
+            new Dictionary<string, object?> { [TestDatabase.MarkerField] = TestDatabase.NewMarker() },
+            ct);
+        var id = created.GlobalRecordId;
+
+        // The create wrote a FoodHistory3 row; removing it is the one direct write the test makes on its own record.
+        Assert.Equal(1, await CountPageTwoRowsAsync(id, ct));
+        Assert.Equal(1, await DeletePageTwoRowAsync(id, ct));
+        Assert.Equal(0, await CountPageTwoRowsAsync(id, ct));
+
+        factory.Recorder.Clear();
+        await PutAsync(client, viewId, id, PageOneField, "Avery", ct);
+        var pageOneUpdate = factory.Recorder.Commands;
+        AssertServiceReadPrecedesTheTransaction(pageOneUpdate);
+        AssertPermissionsCheckedInTheTransaction(pageOneUpdate);
+        Assert.Equal(0, await CountPageTwoRowsAsync(id, ct));
+
+        factory.Recorder.Clear();
+        await PutAsync(client, viewId, id, PageTwoField, "Pending", ct);
+        var pageTwoUpdate = factory.Recorder.Commands;
+        AssertServiceReadPrecedesTheTransaction(pageTwoUpdate);
+        AssertPermissionsCheckedInTheTransaction(pageTwoUpdate);
+        Assert.Equal(1, await CountPageTwoRowsAsync(id, ct));
+
+        factory.Recorder.Clear();
+        await PutAsync(client, viewId, id, PageOneField, "Blake", ct);
+        var completeUpdate = factory.Recorder.Commands;
+        AssertServiceReadPrecedesTheTransaction(completeUpdate);
+        AssertPermissionsCheckedInTheTransaction(completeUpdate);
+        Assert.Equal(1, await CountPageTwoRowsAsync(id, ct));
+    }
+
+    // PUT {"values": {field: text}} answers 200 with the record holding the submitted text.
+    private static async Task PutAsync(
+        HttpClient client,
+        int viewId,
+        string globalRecordId,
+        string field,
+        string text,
+        CancellationToken ct)
+    {
+        var path = string.Create(
+            CultureInfo.InvariantCulture,
+            $"/api/forms/{viewId}/records/{Uri.EscapeDataString(globalRecordId)}");
+        using var response = await ApiTestClient.PutJsonAsync(
+            client,
+            path,
+            new { values = new Dictionary<string, object?> { [field] = text } },
+            ct);
+        Assert.True(
+            response.StatusCode == HttpStatusCode.OK,
+            string.Create(
+                CultureInfo.InvariantCulture,
+                $"The PUT of {field} returned {(int)response.StatusCode}, expected 200."));
+
+        var record = await ApiTestClient.ReadJsonElementAsync(response, ct);
+        Assert.True(
+            record.ValueKind == JsonValueKind.Object &&
+            record.TryGetProperty("values", out var values) &&
+            values.ValueKind == JsonValueKind.Object &&
+            values.TryGetProperty(field, out var stored) &&
+            stored.ValueKind == JsonValueKind.String &&
+            stored.ValueEquals(text),
+            $"The record the PUT of {field} returned does not hold the submitted text.");
+    }
+
+    // RecordService's own permission read: one statement, outside any transaction, completed before the update's
+    // transaction sent its first statement.
+    private static void AssertServiceReadPrecedesTheTransaction(IReadOnlyList<RecordedCommand> commands)
+    {
+        var serviceReads = commands
+            .Where(command => IsPermissionCheck(command) &&
+                string.Equals(command.Operation, ServicePermissionOperation, StringComparison.Ordinal))
+            .ToList();
+        Assert.True(
+            serviceReads.Count == 1 && !serviceReads[0].InTransaction && serviceReads[0].Succeeded,
+            "The PUT must send exactly one service permission statement, outside any transaction, and it must " +
+            "succeed:" + Describe(commands));
+
+        var firstInTransaction = commands.FirstOrDefault(command => command.InTransaction);
+        Assert.True(
+            firstInTransaction is not null && serviceReads[0].Sequence < firstInTransaction.Sequence,
+            "The service permission statement must precede every statement of the update's transaction:" +
+            Describe(commands));
+    }
+
+    // On the update's connection, from its locked base read on, the statements before the first write are exactly the
+    // locked read, the record read and one permission statement bound to the base table and then each page table, all
+    // inside the transaction; no other permission statement joins any transaction.
+    private static void AssertPermissionsCheckedInTheTransaction(IReadOnlyList<RecordedCommand> commands)
+    {
+        var lockedReads = commands
+            .Where(command => IsUpdate(command) && command.CommandText.Contains(LockHint, StringComparison.Ordinal))
+            .ToList();
+        Assert.True(
+            lockedReads.Count == 1 && lockedReads[0].InTransaction,
+            "The PUT must send exactly one locked base read, inside its transaction:" + Describe(commands));
+        var lockedRead = lockedReads[0];
+
+        var fromLock = commands
+            .Where(command => command.ClientConnectionId == lockedRead.ClientConnectionId &&
+                command.Sequence >= lockedRead.Sequence)
+            .ToList();
+        var beforeWrite = fromLock.TakeWhile(command => !command.IsWrite).ToList();
+        var firstWrite = fromLock.FirstOrDefault(command => command.IsWrite);
+        var recordRead = beforeWrite.Count == 3 ? beforeWrite[1] : null;
+        var check = beforeWrite.Count == 3 ? beforeWrite[2] : null;
+        Assert.True(
+            recordRead is not null &&
+            IsUpdate(recordRead) &&
+            recordRead.InTransaction &&
+            !IsPermissionCheck(recordRead) &&
+            !recordRead.CommandText.Contains(LockHint, StringComparison.Ordinal) &&
+            check is not null &&
+            IsUpdate(check) &&
+            check.InTransaction &&
+            IsPermissionCheck(check) &&
+            check.Succeeded &&
+            firstWrite is not null &&
+            firstWrite.InTransaction,
+            "From the locked base read on, the update's connection must send the record read, then one permission " +
+            "statement, both inside the transaction, and then its first write:" + Describe(fromLock));
+
+        Assert.True(
+            check.Parameters.Select(parameter => parameter.Value as string).SequenceEqual(TableSecurables),
+            "The in-transaction permission statement must bind exactly the base table and then each page table, " +
+            $"{string.Join(", ", TableSecurables)}: {check}");
+
+        Assert.True(
+            commands.Count(command => IsPermissionCheck(command) && command.InTransaction) == 1,
+            "Exactly one permission statement may run inside a transaction:" + Describe(commands));
+    }
+
+    private static bool IsPermissionCheck(RecordedCommand command) =>
+        command.CommandText.Contains(PermissionFunction, StringComparison.Ordinal);
+
+    private static bool IsUpdate(RecordedCommand command) =>
+        string.Equals(command.Operation, UpdateOperation, StringComparison.Ordinal);
+
+    // Each command on its own line, without parameter values.
+    private static string Describe(IEnumerable<RecordedCommand> commands) =>
+        string.Concat(commands.Select(command => Environment.NewLine + command));
+
+    private static SqlParameter IdParameter(string globalRecordId) =>
+        new("@id", SqlDbType.NVarChar, 255) { Value = globalRecordId };
+
+    private static async Task<int> CountPageTwoRowsAsync(string globalRecordId, CancellationToken ct)
+    {
+        await using var connection = await TestDatabase.OpenConnectionAsync(ct);
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT COUNT(*) FROM [dbo].[FoodHistory3] WHERE [GlobalRecordId] = @id;";
+        command.Parameters.Add(IdParameter(globalRecordId));
+        return Assert.IsType<int>(await command.ExecuteScalarAsync(ct));
+    }
+
+    // The missing-page fixture: the only direct write of this test, on the FoodHistory record it created.
+    private static async Task<int> DeletePageTwoRowAsync(string globalRecordId, CancellationToken ct)
+    {
+        await using var connection = await TestDatabase.OpenConnectionAsync(ct);
+        await using var command = connection.CreateCommand();
+        command.CommandText = "DELETE FROM [dbo].[FoodHistory3] WHERE [GlobalRecordId] = @id;";
+        command.Parameters.Add(IdParameter(globalRecordId));
+        return await command.ExecuteNonQueryAsync(ct);
     }
 }

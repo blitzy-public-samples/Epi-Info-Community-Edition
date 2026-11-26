@@ -660,8 +660,9 @@ public sealed class FakeDataStore : IDataStore
     }
 
     /// <summary>
-    /// Sets the per-table permissions <see cref="GetPermissionsAsync"/> reports for a form; <see langword="null"/>
-    /// reports none, so no permission check runs.
+    /// Sets the per-table permissions <see cref="GetPermissionsAsync"/> reports for a form, and that
+    /// <see cref="UpdateAsync"/> re-checks under its lock when it is given permissions; <see langword="null"/> reports
+    /// none, so the service runs no permission check, while an update given permissions then grants nothing.
     /// </summary>
     /// <param name="viewId">The form's view id.</param>
     /// <param name="permissions">The base-table and page-table entries, or <see langword="null"/>.</param>
@@ -1214,15 +1215,6 @@ public sealed class FakeDataStore : IDataStore
                     return RecordWriteResult.Deleted();
                 }
 
-                // Every page whose row the locked read found missing needs INSERT, whether or not a submitted field
-                // sits on it: the interface's contract, which this follows over a narrower per-submitted-page reading.
-                if (permissions is not null
-                    && state.Form.Metadata.Pages.Any(page =>
-                        !row.PresentPageIds.Contains(page.PageId) && !permissions.CanInsertInto(page.TableName)))
-                {
-                    return RecordWriteResult.Forbidden();
-                }
-
                 RecordValidationResult gate;
                 try
                 {
@@ -1237,6 +1229,22 @@ public sealed class FakeDataStore : IDataStore
                 if (!gate.IsValid)
                 {
                     return RecordWriteResult.ValidationFailed(gate);
+                }
+
+                // After the gate, the update needs UPDATE on the base table and every page table, and INSERT on every
+                // page whose row the locked read found missing, whether or not a submitted field sits on it. As the
+                // SQL store reads the grants again inside its transaction, the decision comes from the permissions
+                // this store holds now, under the lock, never from the caller's earlier read, which only turns the
+                // check on. Holding none then grants nothing, so the check fails closed.
+                if (permissions is not null)
+                {
+                    var current = state.Permissions ?? new FormPermissions([]);
+                    if (!current.CanUpdate(state.Form.Metadata)
+                        || state.Form.Metadata.Pages.Any(page =>
+                            !row.PresentPageIds.Contains(page.PageId) && !current.CanInsertInto(page.TableName)))
+                    {
+                        return RecordWriteResult.Forbidden();
+                    }
                 }
 
                 // The first data statement: the base-row stamp update.

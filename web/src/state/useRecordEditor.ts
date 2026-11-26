@@ -509,6 +509,11 @@ function createController(host: ControllerHost): Controller {
    * and a FieldBefore block holding a DIALOG would otherwise raise itself again.
    */
   let blurredForDialog: string | null = null;
+  /**
+   * Counts the field-event failure notices shown. A successful write clears the notice
+   * only when none arrived while it was in flight, so a newer event's failure stays.
+   */
+  let noticeSerial = 0;
 
   const indexOf = (definition: FormDefinition): FieldIndex => {
     if (indexCache === null || indexCache.definition !== definition) {
@@ -529,9 +534,10 @@ function createController(host: ControllerHost): Controller {
         return;
       }
       const current = host.state();
+      // A later event succeeded, so an earlier event's failure notice no longer holds.
       if (recordProtected(current)) {
         // A deleted record keeps its values: only the check-code flags change.
-        host.update({ checkCodeDisabled: next.checkCodeDisabled });
+        host.update({ checkCodeDisabled: next.checkCodeDisabled, eventNotice: null });
         return;
       }
       for (const field of index().dataFields) {
@@ -542,7 +548,12 @@ function createController(host: ControllerHost): Controller {
           readOnlyAssigned.add(field.name);
         }
       }
-      host.update({ values: next.values, dirty: next.dirty, checkCodeDisabled: next.checkCodeDisabled });
+      host.update({
+        values: next.values,
+        dirty: next.dirty,
+        checkCodeDisabled: next.checkCodeDisabled,
+        eventNotice: null,
+      });
     },
     onDialogs: (dialogs) => {
       if (active) {
@@ -551,6 +562,7 @@ function createController(host: ControllerHost): Controller {
     },
     onNotice: (message) => {
       if (active) {
+        noticeSerial += 1;
         host.update({ eventNotice: message });
       }
     },
@@ -675,6 +687,7 @@ function createController(host: ControllerHost): Controller {
   async function sendWrite(write: RecordWrite): Promise<boolean> {
     const { client, viewId } = host.options();
     failedWrite = null;
+    const noticesBefore = noticeSerial;
     host.update({ saving: true, banner: null });
     const result = await settle(() =>
       write.method === 'POST'
@@ -688,6 +701,11 @@ function createController(host: ControllerHost): Controller {
     }
     if (result.ok) {
       adoptRecord(result.data, write);
+      // The record was saved, so a field-event failure shown before the write, such as an
+      // unreachable database, no longer holds; one that arrived during the write stays.
+      if (noticeSerial === noticesBefore && host.state().eventNotice !== null) {
+        host.update({ eventNotice: null });
+      }
       host.options().onSaved(result.data);
       return true;
     }

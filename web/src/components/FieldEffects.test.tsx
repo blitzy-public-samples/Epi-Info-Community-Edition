@@ -258,6 +258,15 @@ function fieldControl(name: string): HTMLInputElement {
   return control(prompt ?? name);
 }
 
+/** The label a user clicks for a fixture field: the one label of its control, found by its prompt. */
+function fieldLabel(name: string): HTMLLabelElement {
+  const labels = fieldControl(name).labels;
+  if (labels === null || labels.length !== 1) {
+    throw new Error(`the control of ${name} does not have exactly one label`);
+  }
+  return labels[0];
+}
+
 // Real focus moves, which jsdom reports with focusin and focusout, the events React's
 // onFocus and onBlur listen to.
 function focus(element: HTMLElement): void {
@@ -339,6 +348,56 @@ describe('FieldEffects: check-code effects reach the screen (SC-10)', () => {
     await waitFor(() => {
       expect(fieldControl('LastName').disabled).toBe(false);
     });
+    expect(eventKeys(api)).toEqual(['FieldBefore:DOB', 'FieldAfter:DOB', 'FieldBefore:FirstName']);
+  });
+
+  // A disabled date shows its date as read-only text through the field's date mask, while
+  // the editor, and so every event payload, keeps the wire's ISO string.
+  it('shows a date disabled by check code as read-only text in its date mask, and ENABLE restores its date input', async () => {
+    const api = await openForm({
+      'FieldAfter:DOB': { disabled: ['DateofInterview'] },
+      'FieldBefore:FirstName': { enabled: ['DateofInterview'] },
+    });
+    // RECORD's DateofInterview, and the field's metadata bounds and date mask.
+    const stored = '2011-02-28';
+    const { lower, upper, pattern } = fieldByName('DateofInterview', definition).validation;
+    expect(pattern).toBe('MM-DD-YYYY');
+    const before = fieldControl('DateofInterview');
+    expect([before.type, before.value, before.disabled, before.min, before.max]).toEqual([
+      'date',
+      stored,
+      false,
+      lower,
+      upper,
+    ]);
+
+    const dob = fieldControl('DOB');
+    focus(dob);
+    blur(dob);
+    await waitFor(() => {
+      expect(fieldControl('DateofInterview').disabled).toBe(true);
+    });
+    const disabled = screen.getByRole('textbox', { name: 'Date of Interview' });
+    expect(disabled).toBe(fieldControl('DateofInterview'));
+    expect(disabled.getAttribute('type')).toBe('text');
+    expect(disabled.hasAttribute('readonly')).toBe(true);
+    expect(disabled.hasAttribute('min') || disabled.hasAttribute('max')).toBe(false);
+    expect(fieldControl('DateofInterview').value).toBe('02-28-2011');
+
+    focus(fieldControl('FirstName'));
+    await waitFor(() => {
+      expect(fieldControl('DateofInterview').disabled).toBe(false);
+    });
+    const enabled = fieldControl('DateofInterview');
+    expect([enabled.type, enabled.value, enabled.readOnly, enabled.min, enabled.max]).toEqual([
+      'date',
+      stored,
+      false,
+      lower,
+      upper,
+    ]);
+    // FieldBefore:FirstName was captured while the date was disabled, and carries its ISO value.
+    expect(sentEvent(api, 'FieldBefore:FirstName').values).toMatchObject({ DateofInterview: stored });
     expect(eventKeys(api)).toEqual(['FieldBefore:DOB', 'FieldAfter:DOB', 'FieldBefore:FirstName']);
   });
 
@@ -437,5 +496,49 @@ describe('FieldEffects: check-code effects reach the screen (SC-10)', () => {
     expect(control(label).checked).toBe(true);
     expect(eventKeys(api)).toEqual([key]);
     expect(sentEvent(api, key).values).toMatchObject({ [fieldName]: posted, Black: true });
+  });
+
+  // In a browser a mousedown on a label moves focus to the body before the label's click
+  // focuses its checkbox again, which would raise FieldAfter and FieldBefore around the
+  // click. jsdom moves no focus on mousedown, so the guard is pinned by its prevented
+  // default: the focused box keeps focus, and the click still toggles it through the label.
+  it('raises FieldClick alone, with the toggled value, on each click on the focused checkbox label', async () => {
+    const api = await openForm();
+    const asian = fieldControl('Asian');
+    const label = fieldLabel('Asian');
+
+    focus(asian);
+    for (const checked of [true, false]) {
+      expect(fireEvent.mouseDown(label)).toBe(false);
+      fireEvent.mouseUp(label);
+      fireEvent.click(label);
+      await flush();
+      expect(asian.checked).toBe(checked);
+      expect(document.activeElement).toBe(asian);
+    }
+
+    await waitFor(() => {
+      expect(eventKeys(api)).toEqual(['FieldBefore:Asian', 'FieldClick:Asian', 'FieldClick:Asian']);
+    });
+    expect(api.events.map((sent) => sent.values.Asian)).toEqual([false, true, false]);
+  });
+
+  // A mousedown while focus is elsewhere keeps its default, so the browser moves focus to
+  // the box as usual: the focused field's FieldAfter, then the box's FieldBefore.
+  it.each([
+    { focused: 'no field', focusName: null },
+    { focused: 'the text field LastName', focusName: 'LastName' },
+    { focused: 'another checkbox, Black', focusName: 'Black' },
+  ])('leaves the default of a mousedown on a checkbox label while $focused has focus', async ({ focusName }) => {
+    await openForm();
+    if (focusName === null) {
+      if (document.activeElement instanceof HTMLElement) {
+        blur(document.activeElement);
+      }
+    } else {
+      focus(fieldControl(focusName));
+    }
+
+    expect(fireEvent.mouseDown(fieldLabel('Asian'))).toBe(true);
   });
 });

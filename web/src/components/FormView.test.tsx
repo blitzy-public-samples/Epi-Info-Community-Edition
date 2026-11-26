@@ -24,6 +24,7 @@ import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vite
 import { createApiClient } from '../api/client';
 import type {
   FieldDefinition,
+  FieldEventResponse,
   FieldType,
   FormDefinition,
   HttpValidationProblemDetails,
@@ -41,14 +42,16 @@ import {
   createFormDefinitionFixture,
   dataFieldNames,
   fieldByName,
+  isDataField,
   readOnlyFieldNames,
   recordFixture,
   recordSummaryFixture,
   withField,
   writableCheckboxNames,
 } from '../test/formDefinitionFixture';
+import { formatRequiredMessage } from '../validation/clientValidation';
 import { FormView } from './FormView';
-import { fieldComponents, fieldControlId, type FieldComponentProps } from './fields/fieldComponents';
+import { fieldComponents, fieldControlId, fieldErrorId, type FieldComponentProps } from './fields/fieldComponents';
 
 // The in-memory API
 
@@ -302,11 +305,22 @@ function storeSaved(records: RecordDto[], target: 'create' | RecordDto, saved: R
   }
 }
 
+/** The answer to a field event in a case that moves focus into a field: no effects. */
+const NO_EFFECTS: FieldEventResponse = {
+  enabled: [],
+  disabled: [],
+  cleared: [],
+  assigned: {},
+  dialogs: [],
+  diagnostics: [],
+};
+
 /**
  * A fetch that serves `definition`'s form and `records`, answers each write with the next
- * queued reply, and records every request it receives.
+ * queued reply, answers field events with no effects when `answersFieldEvents` is set, and
+ * records every request it receives.
  */
-function fakeApi(definition: FormDefinition, records: RecordDto[]): typeof fetch {
+function fakeApi(definition: FormDefinition, records: RecordDto[], answersFieldEvents = false): typeof fetch {
   return async (input, init) => {
     const request = input instanceof Request ? input : new Request(input, init);
     const url = new URL(request.url);
@@ -317,6 +331,9 @@ function fakeApi(definition: FormDefinition, records: RecordDto[]): typeof fetch
     const body = readRouteBody(call.method, url.pathname, definition, records);
     if (body !== null) {
       return jsonResponse(200, body);
+    }
+    if (answersFieldEvents && call.method === 'POST' && url.pathname === `/api/forms/${definition.viewId}/checkcode/field-event`) {
+      return jsonResponse(200, NO_EFFECTS);
     }
     const target = writeTargetOf(call.method, url.pathname, definition, records);
     const answer = target === null ? undefined : writeAnswers.shift();
@@ -345,6 +362,8 @@ interface RenderedForm {
 interface RenderOptions {
   /** The form's stored active records in position order; by default the one RECORD. */
   readonly records?: readonly RecordDto[];
+  /** Answer field events with no effects, for a case that moves focus into a field. */
+  readonly answersFieldEvents?: boolean;
 }
 
 /**
@@ -360,7 +379,10 @@ async function renderForm(
   const onExit = vi.fn<() => void>();
   const onFormNotFound = vi.fn<() => void>();
   // Absolute: openapi-fetch builds a Request, and Node's Request rejects a relative URL.
-  const client = createApiClient({ baseUrl: 'http://localhost', fetch: fakeApi(definition, records) });
+  const client = createApiClient({
+    baseUrl: 'http://localhost',
+    fetch: fakeApi(definition, records, options.answersFieldEvents ?? false),
+  });
   const { container } = render(
     <FormView viewId={definition.viewId} client={client} onExit={onExit} onFormNotFound={onFormNotFound} />,
   );
@@ -453,6 +475,18 @@ function controlValue(element: HTMLElement): string {
     return element.value;
   }
   throw new Error(`${element.tagName} is not a native control`);
+}
+
+/** A wire `YYYY-MM-DD` date as the user's locale writes it: the text a disabled date control with no date mask shows. */
+function localeDate(iso: string): string {
+  const [year, month, day] = iso.split('-').map(Number);
+  return new Intl.DateTimeFormat(undefined, {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    timeZone: 'UTC',
+    calendar: 'gregory',
+  }).format(Date.UTC(year, month - 1, day));
 }
 
 // Write-flow helpers
@@ -629,7 +663,11 @@ describe('FormView accessible structure (SC-8)', () => {
         const fieldset = present(wrapper.querySelector('fieldset'), `fieldset of ${name}`);
         expect(fieldset.id).toBe(fieldControlId(name));
         expect(fieldset.querySelector('legend')?.textContent).toBe(promptOf(field));
-        expect(screen.getByRole('group', { name: promptOf(field) })).toBe(fieldset);
+        expect(screen.getByRole('radiogroup', { name: promptOf(field) })).toBe(fieldset);
+        // Neither required nor in error: the group carries no state and describes nothing.
+        expect(fieldset.hasAttribute('aria-required')).toBe(false);
+        expect(fieldset.hasAttribute('aria-invalid')).toBe(false);
+        expect(fieldset.hasAttribute('aria-describedby')).toBe(false);
 
         // The group's only controls are its radios, one per option, each labelled by the option.
         const options = present(field.options, `options of ${name}`);
@@ -690,9 +728,9 @@ describe('FormView accessible structure (SC-8)', () => {
       `description of ${phone.name}`,
     ).toEqual([`Format: ${present(phone.validation.pattern, `pattern of ${phone.name}`)}`]);
 
-    // Legal values follow one empty choice in the order the server sends them. The fixture's
-    // order is not alphabetical, so a renderer that sorted them fails here; the stored F-Female
-    // is listed, so no extra option for an unlisted stored value appears.
+    // Legal values follow the empty "No selection" choice in the order the server sends them. The
+    // fixture's order is not alphabetical, so a renderer that sorted them fails here; the stored
+    // F-Female is listed, so no extra option for an unlisted stored value appears.
     const sex = fieldByName('Sex', definition);
     const sexOptions = present(sex.options, `options of ${sex.name}`);
     const sexLabels = sexOptions.map((option) => option.label);
@@ -700,7 +738,7 @@ describe('FormView accessible structure (SC-8)', () => {
     expect(
       Array.from(controlLabelledBy(sex, HTMLSelectElement).options, (option) => [option.value, option.text]),
       `options of ${sex.name}`,
-    ).toEqual([['', ''], ...sexOptions.map((option) => [String(option.value), option.label])]);
+    ).toEqual([['', 'No selection'], ...sexOptions.map((option) => [String(option.value), option.label])]);
   });
 
   it('labels a control by the field name when the prompt is null', async () => {
@@ -710,6 +748,85 @@ describe('FormView accessible structure (SC-8)', () => {
     const control = screen.getByLabelText('PatientAddress');
     expect(control.tagName).toBe('TEXTAREA');
     expect(wrapperOf(container, 'PatientAddress').contains(control)).toBe(true);
+  });
+
+  it('exposes a required option field as a required radiogroup, invalid and described by its errors once Save reports them', async () => {
+    const definition = withField('IllnessSeverity', (field) => ({
+      ...field,
+      validation: { ...field.validation, required: true },
+    }));
+    const severity = fieldByName('IllnessSeverity', definition);
+    const prompt = promptOf(severity);
+    const message = formatRequiredMessage(severity.prompt, severity.name, pageOf(definition, severity.pageId).name);
+    const recordsPath = `/api/forms/${definition.viewId}/records`;
+    // The one write this case makes: a POST the server's required gate rejects. The client
+    // leaves option fields to that gate, as legacy data entry never required them.
+    replyToWrite({ kind: 'problem', problem: fieldLevelProblem({ [severity.name]: [message] }) });
+    await renderForm(definition);
+    const group = screen.getByRole('radiogroup', { name: prompt });
+
+    // The stored record holds an option, so the group is required but not invalid.
+    expect(group.getAttribute('aria-required')).toBe('true');
+    expect(group.hasAttribute('aria-invalid')).toBe(false);
+    expect(group.hasAttribute('aria-describedby')).toBe(false);
+
+    // A new record with another field entered and no option chosen: the server rejects the
+    // save, and its message shows beside the group.
+    const navigator = screen.getByRole('toolbar', { name: 'Record navigation' });
+    fireEvent.click(within(navigator).getByRole('button', { name: 'New' }));
+    await within(navigator).findByText('New record');
+    fireEvent.change(screen.getByLabelText('Last Name'), { target: { value: 'Byron' } });
+    fireEvent.click(within(screen.getByRole('toolbar', { name: 'Form actions' })).getByRole('button', { name: 'Save' }));
+
+    await waitFor(() => {
+      expect(screen.getByRole('radiogroup', { name: prompt }).getAttribute('aria-invalid')).toBe('true');
+    });
+    expect(calls.filter((call) => call.method !== 'GET').map(requestLine)).toEqual([`POST ${recordsPath}`]);
+    const invalid = screen.getByRole('radiogroup', { name: prompt });
+    const errorId = fieldErrorId(severity.name);
+    expect(invalid.getAttribute('aria-required')).toBe('true');
+    expect(invalid.getAttribute('aria-describedby')).toBe(errorId);
+    const errorList = present(document.getElementById(errorId), `error list of ${severity.name}`);
+    expect(errorList.textContent).toBe(message);
+    // The radios support neither state, so only the group carries it.
+    for (const radio of within(invalid).getAllByRole('radio')) {
+      expect(radio.hasAttribute('aria-required'), radio.id).toBe(false);
+      expect(radio.hasAttribute('aria-invalid'), radio.id).toBe(false);
+    }
+  });
+
+  it('names the empty legal-values option "No selection", lists the server\'s options after it, and saves it as null', async () => {
+    const definition = createFormDefinitionFixture();
+    // The one write this case makes: the PUT of the open record.
+    replyToWrite({ kind: 'saved', record: savedWith(RECORD, { Sex: null }) });
+    await renderForm(definition);
+    const sex = fieldByName('Sex', definition);
+    const select = screen.getByRole('combobox', { name: promptOf(sex) });
+    const noSelection = within(select).getByRole('option', { name: 'No selection' });
+    const options = within(select).getAllByRole('option');
+
+    // "No selection" comes first and carries '' for null; the server's options follow in its order.
+    expect(options[0]).toBe(noSelection);
+    expect(noSelection.getAttribute('value')).toBe('');
+    expect(
+      options.slice(1).map((option) => ({ value: option.getAttribute('value'), label: option.textContent })),
+    ).toEqual(present(sex.options, 'options of Sex'));
+    expect(controlValue(select)).toBe('F-Female');
+
+    fireEvent.change(select, { target: { value: '' } });
+
+    expect(controlValue(select)).toBe('');
+    expect(within(select).getByRole('option', { selected: true })).toBe(noSelection);
+
+    fireEvent.click(within(screen.getByRole('toolbar', { name: 'Form actions' })).getByRole('button', { name: 'Save' }));
+
+    await waitFor(() => {
+      expect(calls.filter((call) => call.method === 'PUT').map((call) => call.body)).toEqual([
+        JSON.stringify({ values: { Sex: null } }),
+      ]);
+    });
+    await within(screen.getByRole('toolbar', { name: 'Record navigation' })).findByText('1 of 1');
+    expect(within(select).getByRole('option', { selected: true })).toBe(noSelection);
   });
 
   it('renders label fields as headings without a control', async () => {
@@ -781,6 +898,153 @@ describe('FormView accessible structure (SC-8)', () => {
     }
   });
 
+  it('keeps every id unique when field names differ only in characters an id cannot hold, and when two groups share a name', async () => {
+    // Each fixture field is renamed so that an id kept DOM-safe by folding characters, or by
+    // keeping `-`, would merge it with another field's control id or with a derived id: the
+    // `-hint` of `Q-1` (it keeps PhoneNumber's pattern), the first radio of IllnessSeverity,
+    // or the `-error` list of `Q-1`. Every field renamed holds no value in RECORD.
+    const renames: readonly { readonly from: string; readonly to: string }[] = [
+      { from: 'PhoneNumber', to: 'Q-1' },
+      { from: 'Zip', to: 'Q-1-hint' },
+      { from: 'DateofInterview', to: 'Q.1' },
+      { from: 'PatientAddress', to: 'Q 1' },
+      { from: 'FeverTemp', to: 'Q_1' },
+      { from: 'OnsetDate', to: 'IllnessSeverity-option-0' },
+      { from: 'BuyLastTenDays', to: 'Q-1-error' },
+    ];
+    const definition = createFormDefinitionFixture();
+    for (const page of definition.pages) {
+      page.fields = page.fields.map((field) => {
+        const rename = renames.find(({ from }) => from === field.name);
+        return rename === undefined ? field : { ...field, name: rename.to };
+      });
+    }
+    // A second group with the first group's name, on the other page, holding Lab.
+    const [firstPage, secondPage] = [...definition.pages].sort((a, b) => a.position - b.position);
+    const group = fieldByName('DemographicInformation', definition);
+    const secondGroup: FieldDefinition = {
+      ...group,
+      prompt: 'Demographic Information, continued',
+      tabIndex: 3.5,
+      pageId: secondPage.pageId,
+      members: ['Lab'],
+    };
+    secondPage.fields.push(secondGroup);
+
+    const { container } = await renderForm(definition);
+
+    const ids = Array.from(document.querySelectorAll('[id]'), (element) => element.id);
+    expect(ids.filter((id, index) => ids.indexOf(id) !== index)).toEqual([]);
+
+    // Each renamed field's prompt labels its own control, which carries that field's id.
+    for (const { to } of renames) {
+      const control = screen.getByLabelText(promptOf(fieldByName(to, definition)));
+      expect(wrapperOf(container, to).contains(control), to).toBe(true);
+      expect(control.id, to).toBe(fieldControlId(to));
+    }
+    // Every label of every data field names a control inside that field.
+    for (const field of allFields(definition).filter(isDataField)) {
+      const wrapper = wrapperOf(container, field.name);
+      const labels = Array.from(wrapper.querySelectorAll('label'));
+      expect(labels, `labels of ${field.name}`).not.toHaveLength(0);
+      for (const label of labels) {
+        const target = document.getElementById(label.htmlFor);
+        expect(target !== null && wrapper.contains(target), `${field.name}: ${label.textContent ?? ''}`).toBe(true);
+      }
+    }
+
+    // Each group's section is named by its own heading.
+    const sections = wrappersOf(container, group.name);
+    expect(sections).toHaveLength(2);
+    expect(screen.getByRole('region', { name: promptOf(group) })).toBe(sections[0]);
+    expect(panelOf(firstPage).contains(sections[0])).toBe(true);
+    showPage(secondPage);
+    expect(screen.getByRole('region', { name: promptOf(secondGroup) })).toBe(sections[1]);
+    expect(within(sections[1]).getByLabelText(promptOf(fieldByName('Lab', definition)))).toBeTruthy();
+
+    // Distinct names give distinct control ids, none equals a derived id, and every id is
+    // usable unescaped in a CSS selector. The name `Q_002d1` spells the encoding of `Q-1`, so
+    // it keeps its own id only because `_` is encoded as well.
+    const names = [...allFields(definition).map((field) => field.name), 'Q_002d1'];
+    const controlIds = names.map(fieldControlId);
+    expect(new Set(controlIds).size).toBe(new Set(names).size);
+    const derivedIds = names.flatMap((name) => [fieldErrorId(name), `${fieldControlId(name)}-hint`]);
+    expect(derivedIds.filter((id) => controlIds.includes(id))).toEqual([]);
+    for (const id of controlIds) {
+      expect(id).toMatch(/^field-[A-Za-z0-9_]+$/);
+    }
+  });
+
+  it("lists a save error at the data field that owns its name, and its jump shows that field's page, when a group on an earlier page shares the name", async () => {
+    // Metadata may give a label, group or placeholder a data field's exact name, but the
+    // `values` and `errors` key belongs to the data field: here a group `Lab` on page 1,
+    // ahead of CaseID, and the text field `Lab` on page 2.
+    const definition = createFormDefinitionFixture();
+    const [firstPage, secondPage] = [...definition.pages].sort((a, b) => a.position - b.position);
+    const lab = fieldByName('Lab', definition);
+    const caseId = fieldByName('CaseID', definition);
+    const labGroup: FieldDefinition = {
+      ...fieldByName('DemographicInformation', definition),
+      name: lab.name,
+      prompt: 'Laboratory testing',
+      tabIndex: 1.5,
+      members: [],
+    };
+    firstPage.fields.push(labGroup);
+    expect(lab.pageId).toBe(secondPage.pageId);
+    expect(caseId.pageId).toBe(firstPage.pageId);
+    expect(labGroup.tabIndex).toBeLessThan(caseId.tabIndex);
+
+    const labMessage = 'Name the laboratory that tested the specimen.';
+    const caseIdMessage = 'Case ID must be a whole number.';
+    const recordPath = `/api/forms/${definition.viewId}/records/${RECORD.globalRecordId}`;
+    const fieldEventPath = `/api/forms/${definition.viewId}/checkcode/field-event`;
+    // This case's writes: the PUT of the open record, which the server rejects with a message
+    // for each name, and the field event that focusing a control raises.
+    replyToWrite({ kind: 'problem', problem: fieldLevelProblem({ [lab.name]: [labMessage], [caseId.name]: [caseIdMessage] }) });
+    await renderForm(definition, { answersFieldEvents: true });
+    expect(screen.getByRole('region', { name: promptOf(labGroup) })).toBeTruthy();
+
+    fireEvent.change(screen.getByLabelText('Last Name'), { target: { value: 'Byron' } });
+    fireEvent.click(within(screen.getByRole('toolbar', { name: 'Form actions' })).getByRole('button', { name: 'Save' }));
+
+    await screen.findByRole('heading', { name: 'Please correct the following' });
+    expect(calls.filter((call) => call.method !== 'GET').map(requestLine)).toEqual([`PUT ${recordPath}`]);
+    const summary = present(
+      screen
+        .getAllByRole('alert')
+        .find((alert) => within(alert).queryByRole('heading', { name: 'Please correct the following' }) !== null),
+      'validation summary',
+    );
+    // Lab's message follows CaseID's, at the data field's place on page 2, under its prompt
+    // ("Lab:" already ends with a colon); the group's prompt labels nothing.
+    expect(within(summary).getAllByRole('listitem').map((item) => item.textContent)).toEqual([
+      `${promptOf(caseId)}: ${caseIdMessage}`,
+      `${promptOf(lab)} ${labMessage}`,
+    ]);
+    expect(within(summary).queryByRole('button', { name: promptOf(labGroup) })).toBeNull();
+
+    fireEvent.click(within(summary).getByRole('button', { name: promptOf(lab) }));
+
+    await waitFor(() => {
+      expect(document.activeElement?.id).toBe(fieldControlId(lab.name));
+    });
+    expect(screen.getByRole('tab', { name: secondPage.name }).getAttribute('aria-selected')).toBe('true');
+    expect(screen.getByRole('tab', { name: firstPage.name }).getAttribute('aria-selected')).toBe('false');
+    const panel = panelOf(secondPage);
+    expect(panel.hidden).toBe(false);
+    expect(panel.contains(document.activeElement)).toBe(true);
+    // A role query skips hidden content, so this also shows the focused control is on screen.
+    expect(screen.getByRole('textbox', { name: promptOf(lab) })).toBe(document.activeElement);
+    // Focusing the control raises its FieldBefore, answered with no effects.
+    await waitFor(() => {
+      expect(calls.filter((call) => call.method !== 'GET').map(requestLine)).toEqual([
+        `PUT ${recordPath}`,
+        `POST ${fieldEventPath}`,
+      ]);
+    });
+  });
+
   it('disables the controls of read-only fields and leaves writable ones enabled', async () => {
     const { container } = await renderForm();
     expect(readOnlyFieldNames).not.toHaveLength(0);
@@ -794,6 +1058,52 @@ describe('FormView accessible structure (SC-8)', () => {
       ).toEqual(controls.map(() => readOnly));
     }
   });
+
+  // Chromium's accessibility snapshots drop a disabled date input and announce its
+  // spinbuttons without the field's label, so a protected date is a read-only text box.
+  // Its text follows the field's date mask, which holds each of YYYY, MM and DD once in
+  // any case; any other pattern, or none, shows the date in the user's locale.
+  it.each([
+    { name: 'DOB', stored: '1980-05-01', pattern: 'MM-DD-YYYY', shown: '05-01-1980' },
+    { name: 'DOB', stored: '1980-05-01', pattern: 'DD-MM-YYYY', shown: '01-05-1980' },
+    { name: 'DOB', stored: '1980-05-01', pattern: 'yyyy/mm/dd', shown: '1980/05/01' },
+    { name: 'DOB', stored: '1980-05-01', pattern: null, shown: localeDate('1980-05-01') },
+    { name: 'DOB', stored: '1980-05-01', pattern: 'MM-DD', shown: localeDate('1980-05-01') },
+    { name: 'DOB', stored: '1980-05-01', pattern: 'MM-DD-YYYY HH:MM:SS AMPM', shown: localeDate('1980-05-01') },
+    { name: 'OnsetDate', stored: null, pattern: 'MM-DD-YYYY', shown: '' },
+  ])(
+    'renders the read-only date $name, stored $stored with pattern $pattern, as a disabled read-only text box showing $shown, and writable dates as date inputs',
+    async ({ name, stored, pattern, shown }) => {
+      const definition = withField(name, (field) => ({
+        ...field,
+        validation: { ...field.validation, readOnly: true, pattern },
+      }));
+      const { container } = await renderForm(definition);
+      expect(RECORD.values[name] ?? null).toBe(stored);
+
+      const control = screen.getByRole('textbox', { name: promptOf(fieldByName(name, definition)) });
+      expect(control.id).toBe(fieldControlId(name));
+      expect(wrapperOf(container, name).contains(control)).toBe(true);
+      expect(control.getAttribute('type')).toBe('text');
+      expect(isDisabled(control)).toBe(true);
+      expect(control.hasAttribute('readonly')).toBe(true);
+      expect(control.hasAttribute('min') || control.hasAttribute('max')).toBe(false);
+      expect(controlValue(control)).toBe(shown);
+
+      const writableDates = allFields(definition).filter(
+        (field) => field.fieldType === 'date' && field.name !== name,
+      );
+      expect(writableDates).not.toHaveLength(0);
+      for (const field of writableDates) {
+        const input = present(wrapperOf(container, field.name).querySelector('input'), `control of ${field.name}`);
+        const value = RECORD.values[field.name] ?? null;
+        expect(input.getAttribute('type'), field.name).toBe('date');
+        expect(isDisabled(input), field.name).toBe(false);
+        expect(input.hasAttribute('readonly'), field.name).toBe(false);
+        expect(controlValue(input), field.name).toBe(typeof value === 'string' ? value : '');
+      }
+    },
+  );
 
   it('renders an unsupported field as a disabled placeholder naming its type, with no control', async () => {
     const { container } = await renderForm();

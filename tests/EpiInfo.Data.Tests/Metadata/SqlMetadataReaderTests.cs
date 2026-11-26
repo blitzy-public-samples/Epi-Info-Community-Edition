@@ -132,6 +132,38 @@ public sealed class SqlMetadataReaderTests : IAsyncLifetime
     private static readonly string[] SeededColumnTypes =
         ["bit", "datetime", "float", "int", "ntext", "nvarchar", "smallint", "tinyint"];
 
+    // The family each catalogue sys.types name belongs to, written from the AAP's admitted-types table (0.3.4.3)
+    // rather than from FieldTypeMapper, so a misclassification in the product cannot appear on both sides: text,
+    // multiline and legalValues admit nvarchar(n), nchar(n), nvarchar(max) and ntext; number admits the four integer
+    // types and float; option admits tinyint, smallint and int; date admits datetime; checkbox admits bit. The types
+    // the table names as mismatches, and uniqueidentifier, are Other. A catalogue type missing here fails the test
+    // rather than passing unchecked.
+    private static readonly IReadOnlyDictionary<string, ColumnFamily> ExpectedColumnFamilies =
+        new Dictionary<string, ColumnFamily>(StringComparer.Ordinal)
+        {
+            ["nvarchar"] = ColumnFamily.Character,
+            ["nchar"] = ColumnFamily.Character,
+            ["ntext"] = ColumnFamily.Character,
+            ["tinyint"] = ColumnFamily.Integer,
+            ["smallint"] = ColumnFamily.Integer,
+            ["int"] = ColumnFamily.Integer,
+            ["bigint"] = ColumnFamily.Integer,
+            ["float"] = ColumnFamily.Float,
+            ["datetime"] = ColumnFamily.DateTime,
+            ["bit"] = ColumnFamily.Bit,
+            ["varchar"] = ColumnFamily.Other,
+            ["char"] = ColumnFamily.Other,
+            ["text"] = ColumnFamily.Other,
+            ["decimal"] = ColumnFamily.Other,
+            ["numeric"] = ColumnFamily.Other,
+            ["money"] = ColumnFamily.Other,
+            ["real"] = ColumnFamily.Other,
+            ["date"] = ColumnFamily.Other,
+            ["datetime2"] = ColumnFamily.Other,
+            ["smalldatetime"] = ColumnFamily.Other,
+            ["uniqueidentifier"] = ColumnFamily.Other,
+        };
+
     // Seeded character columns with their catalogue type, length in UTF-16 code units and raw max_length.
     private static readonly CharacterColumn[] SeededCharacterColumns =
     [
@@ -971,7 +1003,8 @@ public sealed class SqlMetadataReaderTests : IAsyncLifetime
     /// <summary>
     /// The seeded base and page tables use only the types the admitted families cover, and every column the reader
     /// returns, as a schema column or as a field's column, carries the catalogue's name, type and length with the
-    /// family <see cref="FieldTypeMapper.ClassifyColumn"/> gives that type (A17).
+    /// family the AAP's admitted-types table gives the catalogue type, held independently of the product in
+    /// <see cref="ExpectedColumnFamilies"/> (A17).
     /// </summary>
     [Fact]
     public async Task ColumnFamilies_MatchCatalogue()
@@ -1398,6 +1431,9 @@ public sealed class SqlMetadataReaderTests : IAsyncLifetime
 
     private static SqlParameter ViewIdParameter(int viewId) => new("@viewId", SqlDbType.Int) { Value = viewId };
 
+    // The schema of every seeded table, bound as SCHEMA_ID's sysname argument.
+    private static SqlParameter SchemaParameter() => new("@schema", SqlDbType.NVarChar, 128) { Value = "dbo" };
+
     // Integer columns are read whatever their integer type (metaPages.Position is smallint, COUNT(*) is int).
     private static int Int(SqlDataReader row, int ordinal) =>
         Convert.ToInt32(row.GetValue(ordinal), CultureInfo.InvariantCulture);
@@ -1410,11 +1446,12 @@ public sealed class SqlMetadataReaderTests : IAsyncLifetime
             """
             SELECT t.[object_id]
             FROM sys.tables AS t
-            WHERE t.[name] COLLATE Latin1_General_100_BIN2 = @name AND t.[schema_id] = SCHEMA_ID(N'dbo');
+            WHERE t.[name] COLLATE Latin1_General_100_BIN2 = @name AND t.[schema_id] = SCHEMA_ID(@schema);
             """,
             row => row.GetInt32(0),
             token,
-            new SqlParameter("@name", SqlDbType.NVarChar, 128) { Value = table });
+            new SqlParameter("@name", SqlDbType.NVarChar, 128) { Value = table },
+            SchemaParameter());
         return matches.Count == 1;
     }
 
@@ -1431,18 +1468,20 @@ public sealed class SqlMetadataReaderTests : IAsyncLifetime
             FROM sys.tables AS t
             INNER JOIN sys.columns AS c ON c.[object_id] = t.[object_id]
             INNER JOIN sys.types AS ty ON ty.[user_type_id] = c.[user_type_id]
-            WHERE t.[name] COLLATE Latin1_General_100_BIN2 = @name AND t.[schema_id] = SCHEMA_ID(N'dbo')
+            WHERE t.[name] COLLATE Latin1_General_100_BIN2 = @name AND t.[schema_id] = SCHEMA_ID(@schema)
             ORDER BY c.[column_id];
             """,
             row => new CatalogueColumn(row.GetString(0), row.GetString(1), Int(row, 2)),
             token,
-            new SqlParameter("@name", SqlDbType.NVarChar, 128) { Value = table });
+            new SqlParameter("@name", SqlDbType.NVarChar, 128) { Value = table },
+            SchemaParameter());
 
     private static bool IsGlobalRecordId(string column) =>
         string.Equals(column, "GlobalRecordId", StringComparison.OrdinalIgnoreCase);
 
     // A column the reader returned agrees with its catalogue row: the exact name, the type, the length in UTF-16 code
-    // units for nvarchar(n) and nchar(n) (max_length / 2, none for max and ntext), and the family of that type.
+    // units for nvarchar(n) and nchar(n) (max_length / 2, none for max and ntext), and the family
+    // ExpectedColumnFamilies gives the catalogue's type name.
     private static void AssertColumnMatches(CatalogueColumn expected, ColumnMetadata column)
     {
         Assert.Equal(expected.Name, column.Name);
@@ -1451,7 +1490,11 @@ public sealed class SqlMetadataReaderTests : IAsyncLifetime
             ? expected.MaxLengthBytes / 2
             : null;
         Assert.Equal(maxCharacters, column.MaxCharacters);
-        Assert.Equal(FieldTypeMapper.ClassifyColumn(column.SqlTypeName), column.Family);
+        Assert.True(
+            ExpectedColumnFamilies.TryGetValue(expected.TypeName, out ColumnFamily family),
+            $"Column {expected.Name} has catalogue type {expected.TypeName}, " +
+            "which ExpectedColumnFamilies does not list.");
+        Assert.Equal(family, column.Family);
     }
 
     private static string[] DescribeCounts(IEnumerable<KeyValuePair<string, int>> counts) =>

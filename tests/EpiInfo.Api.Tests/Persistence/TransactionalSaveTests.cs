@@ -65,18 +65,32 @@ public sealed partial class TransactionalSaveTests : IAsyncLifetime
     private const string TakeTableLockSql =
         "SELECT COUNT(*) FROM [dbo].[" + PageTwoTable + "] WITH (TABLOCKX, HOLDLOCK);";
 
-    // Object ids are unique only within a database, so the lock is matched in the current database.
+    // Object ids are unique only within a database, so the lock is matched in the current database. The object name
+    // and the lock's resource type, mode and status are bound as parameters.
     private const string TableLockHeldSql =
         """
         SELECT COUNT(*)
         FROM sys.dm_tran_locks
         WHERE request_session_id = @@SPID
           AND resource_database_id = DB_ID()
-          AND resource_type = 'OBJECT'
-          AND resource_associated_entity_id = OBJECT_ID(N'dbo.FoodHistory3')
-          AND request_mode = 'X'
-          AND request_status = 'GRANT';
+          AND resource_type = @resourceType
+          AND resource_associated_entity_id = OBJECT_ID(@objectName)
+          AND request_mode = @requestMode
+          AND request_status = @requestStatus;
         """;
+
+    // The sys.dm_tran_locks values of a granted exclusive lock on a whole object.
+    private const string ObjectResourceType = "OBJECT";
+
+    private const string ExclusiveMode = "X";
+
+    private const string GrantedStatus = "GRANT";
+
+    // sys.dm_tran_locks declares resource_type, request_mode and request_status as nvarchar(60).
+    private const int LockColumnLength = 60;
+
+    // nvarchar(776), the size SQL Server's own procedures, such as sp_help, give a multi-part object name.
+    private const int ObjectNameLength = 776;
 
     private static readonly string[] Tables = [BaseTable, PageOneTable, PageTwoTable];
 
@@ -188,6 +202,14 @@ public sealed partial class TransactionalSaveTests : IAsyncLifetime
         await using SqlCommand check = connection.CreateCommand();
         check.Transaction = transaction;
         check.CommandText = TableLockHeldSql;
+        check.Parameters.Add(
+            new SqlParameter("@resourceType", SqlDbType.NVarChar, LockColumnLength) { Value = ObjectResourceType });
+        check.Parameters.Add(
+            new SqlParameter("@objectName", SqlDbType.NVarChar, ObjectNameLength) { Value = "dbo." + PageTwoTable });
+        check.Parameters.Add(
+            new SqlParameter("@requestMode", SqlDbType.NVarChar, LockColumnLength) { Value = ExclusiveMode });
+        check.Parameters.Add(
+            new SqlParameter("@requestStatus", SqlDbType.NVarChar, LockColumnLength) { Value = GrantedStatus });
         int granted = Assert.IsType<int>(await check.ExecuteScalarAsync(ct));
         Assert.True(
             granted >= 1,
