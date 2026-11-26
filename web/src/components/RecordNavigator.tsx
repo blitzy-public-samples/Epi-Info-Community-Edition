@@ -66,7 +66,12 @@ export function RecordNavigator({ navigation, busy = false, canInsert = null }: 
   const [entry, setEntry] = useState('');
   const [entryError, setEntryError] = useState<EntryError | null>(null);
 
-  const moveBlocked = busy || navigation.loading;
+  // A pending load disables nothing: useRecordNavigation drops the responses of a load a
+  // newer action overtakes, so a move, Go or New pressed mid-load supersedes it, and the
+  // load is announced instead. A control is disabled only while its operation is
+  // unavailable: an edge or an empty set (canX false), a save in progress (busy), or, for
+  // New, a denied insert permission.
+  const pending = navigation.loading;
   const goToDisabled = !navigation.canGoTo || busy;
   // Legacy GotoNewRecord runs only with canInsertRecords; New stays enabled on an empty form.
   const newDisabled = busy || canInsert === false;
@@ -107,82 +112,101 @@ export function RecordNavigator({ navigation, busy = false, canInsert = null }: 
   }
 
   return (
-    <div className="record-navigator" role="toolbar" aria-label="Record navigation">
-      <button
-        type="button"
-        disabled={!navigation.canFirst || moveBlocked}
-        onClick={() => {
-          void navigation.first();
-        }}
+    <>
+      <div
+        className="record-navigator"
+        role="toolbar"
+        aria-label="Record navigation"
+        aria-busy={pending || busy ? true : undefined}
       >
-        First
-      </button>
-      <button
-        type="button"
-        disabled={!navigation.canPrevious || moveBlocked}
-        onClick={() => {
-          void navigation.previous();
-        }}
-      >
-        Previous
-      </button>
-      <span role="status" aria-live="polite">
-        {navigation.statusText}
+        <button
+          type="button"
+          disabled={!navigation.canFirst || busy}
+          onClick={() => {
+            void navigation.first();
+          }}
+        >
+          First
+        </button>
+        <button
+          type="button"
+          disabled={!navigation.canPrevious || busy}
+          onClick={() => {
+            void navigation.previous();
+          }}
+        >
+          Previous
+        </button>
+        {/* Busy while a load is pending, so the coordinates it still shows are not announced
+            as current; the text itself stays the hook's statusText. */}
+        <span role="status" aria-live="polite" aria-busy={pending ? true : undefined}>
+          {navigation.statusText}
+        </span>
+        <button
+          type="button"
+          disabled={!navigation.canNext || busy}
+          onClick={() => {
+            void navigation.next();
+          }}
+        >
+          Next
+        </button>
+        <button
+          type="button"
+          disabled={!navigation.canLast || busy}
+          onClick={() => {
+            void navigation.last();
+          }}
+        >
+          Last
+        </button>
+        <label htmlFor={inputId}>Go to record</label>
+        <input
+          id={inputId}
+          type="text"
+          inputMode="numeric"
+          enterKeyHint="go"
+          autoComplete="off"
+          spellCheck={false}
+          value={entry}
+          disabled={goToDisabled}
+          aria-invalid={error !== null ? true : undefined}
+          aria-describedby={error !== null ? errorId : undefined}
+          onChange={(event) => {
+            setEntry(event.target.value);
+          }}
+          onKeyDown={handleEntryKeyDown}
+        />
+        <button type="button" disabled={goToDisabled} onClick={submitGoTo}>
+          Go
+        </button>
+        <button
+          type="button"
+          disabled={newDisabled}
+          onClick={() => {
+            void navigation.newRecord();
+          }}
+        >
+          New
+        </button>
+        {/* Last child: .record-navigator .field-error spans the full width on its own row,
+            which placed earlier would push New onto a row of its own. */}
+        {error !== null && (
+          <div className="field-error" id={errorId} role="alert">
+            <p>{error}</p>
+          </div>
+        )}
+      </div>
+      {/* The pending announcement sits beside the toolbar, not in it: assistive technology may
+          hold back updates inside an aria-busy subtree until it clears, and the render that
+          clears the toolbar's aria-busy also empties this text, so inside it the load would
+          never be announced. It is a status message of its own, so it carries role="status";
+          the toolbar's one status stays the "[n] of N" text. Always mounted, so the region
+          exists before its text changes, and unnamed, since a name on a live region can be
+          read in place of its content. */}
+      <span className="visually-hidden" role="status" aria-live="polite">
+        {pending ? 'Loading…' : ''}
       </span>
-      <button
-        type="button"
-        disabled={!navigation.canNext || moveBlocked}
-        onClick={() => {
-          void navigation.next();
-        }}
-      >
-        Next
-      </button>
-      <button
-        type="button"
-        disabled={!navigation.canLast || moveBlocked}
-        onClick={() => {
-          void navigation.last();
-        }}
-      >
-        Last
-      </button>
-      <label htmlFor={inputId}>Go to record</label>
-      <input
-        id={inputId}
-        type="text"
-        inputMode="numeric"
-        enterKeyHint="go"
-        autoComplete="off"
-        spellCheck={false}
-        value={entry}
-        disabled={goToDisabled}
-        aria-invalid={error !== null ? true : undefined}
-        aria-describedby={error !== null ? errorId : undefined}
-        onChange={(event) => {
-          setEntry(event.target.value);
-        }}
-        onKeyDown={handleEntryKeyDown}
-      />
-      <button type="button" disabled={goToDisabled} onClick={submitGoTo}>
-        Go
-      </button>
-      <button
-        type="button"
-        disabled={newDisabled}
-        onClick={() => {
-          void navigation.newRecord();
-        }}
-      >
-        New
-      </button>
-      {/* Last child: .record-navigator .field-error spans the full width on its own row,
-          which placed earlier would push New onto a row of its own. */}
-      {error !== null && (
-        <div className="field-error" id={errorId} role="alert">
-          <p>{error}</p>
-        </div>
-      )}
-    </div>
+    </>
   );
 }

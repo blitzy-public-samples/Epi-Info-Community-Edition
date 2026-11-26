@@ -52,6 +52,13 @@ export interface RecordNavigation {
   /** +1 whenever the record list may have changed; the grid's reload key. */
   readonly listVersion: number;
   readonly loading: boolean;
+  /**
+   * A record-changing operation is running: set before its beforeLeave is called, and
+   * cleared once it has installed a record or New, was cancelled, failed or settled idle.
+   * FormView passes it to useRecordEditor, which freezes the draft meanwhile, so no edit
+   * made during a move is lost to the record that replaces it.
+   */
+  readonly transitioning: boolean;
   /** Informational banner text, such as "This record no longer exists." after a 404. */
   readonly notice: string | null;
   /** Why the last goTo was rejected; cleared by the next transition. */
@@ -83,7 +90,13 @@ export interface RecordNavigation {
   readonly afterDelete: () => void;
   /** Re-reads N and opens the record nearest to n, or New on an empty set. */
   readonly openNearest: (notice?: string) => void;
-  /** Repeats the last load; every load is GETs only, so it is always safe to repeat. */
+  /**
+   * Repeats the last load; every load is GETs only, so it is always safe to repeat. A load
+   * that replaces the record repeats its whole operation, beforeLeave first, so an edit
+   * made since the failure is saved before anything is read; it sends nothing when
+   * beforeLeave resolves `false`. `loadError` clears as Retry is pressed and is set again
+   * when the repeated operation stops at its leave.
+   */
   readonly retryLoad: () => Promise<void>;
   readonly dismissNotice: () => void;
 }
@@ -114,6 +127,7 @@ interface NavigationState {
   readonly recordGeneration: number;
   readonly listVersion: number;
   readonly loading: boolean;
+  readonly transitioning: boolean;
   readonly notice: string | null;
   readonly goToError: string | null;
   readonly loadError: ApiError | null;
@@ -128,6 +142,7 @@ const INITIAL_STATE: NavigationState = {
   recordGeneration: 0,
   listVersion: 0,
   loading: true,
+  transitioning: false,
   notice: null,
   goToError: null,
   loadError: null,
@@ -172,15 +187,28 @@ function resolveMove(move: Move, state: NavigationState): MoveTarget | null {
 /** A settled call, or `null` for an aborted one, which is never an error to show. */
 type Settled<T> = ApiResult<T> | null;
 
-async function settle<T>(call: () => Promise<ApiResult<T>>): Promise<Settled<T>> {
+/** A call's result. An aborted call rejects with its AbortError, which its caller settles. */
+async function attempt<T>(call: () => Promise<ApiResult<T>>): Promise<ApiResult<T>> {
   try {
     return await call();
   } catch (e) {
     if (isAbortError(e)) {
-      return null;
+      throw e;
     }
     // The client settles every response itself; any other rejection got no response.
     return { ok: false, error: networkError() };
+  }
+}
+
+/** A single read's result, or `null` once it was aborted. */
+async function settle<T>(read: Promise<ApiResult<T>>): Promise<Settled<T>> {
+  try {
+    return await read;
+  } catch (e) {
+    if (isAbortError(e)) {
+      return null;
+    }
+    throw e;
   }
 }
 
@@ -213,13 +241,43 @@ function nearest(anchor: number, count: number): number {
   return Math.min(Math.max(anchor, 1), count);
 }
 
-// Superseded responses are dropped by generation rather than aborted: every load takes
-// the next generation and applies its results only while it is still the latest. That
-// covers StrictMode's repeated effects, fast clicks, and the after-save refresh that the
-// transition whose leave() saved the record overtakes.
+/** One load: its generation, and the signal that cancels its requests once it is superseded. */
+interface Load {
+  readonly gen: number;
+  readonly signal: AbortSignal;
+  /** Aborts this load's own requests: one of its parallel reads was aborted, so the rest are not awaited. */
+  readonly cancel: () => void;
+}
+
+/**
+ * The results of `load`'s parallel reads, in order, once every one has answered; `null` as
+ * soon as one of them is aborted. That abort cancels the whole load, so its other requests
+ * are aborted as well, and nothing waits for them, whether or not they honour the signal.
+ */
+async function settleAll<T extends readonly Promise<ApiResult<unknown>>[] | []>(
+  load: Load,
+  reads: T,
+): Promise<{ -readonly [K in keyof T]: Awaited<T[K]> } | null> {
+  try {
+    return await Promise.all(reads);
+  } catch (e) {
+    if (isAbortError(e)) {
+      load.cancel();
+      return null;
+    }
+    throw e;
+  }
+}
+
+// Every load takes the next generation and applies its results only while it is still
+// the latest, and its requests are aborted once a newer load, New or an unmount
+// supersedes it. That covers StrictMode's repeated effects and fast clicks. A read the
+// current load itself finds aborted settles that load idle, with nothing to show.
 function createController(host: ControllerHost): Controller {
   /** Generation of the latest load. */
   let loadGen = 0;
+  /** Cancels the requests of the latest load. */
+  let loadAbort: AbortController | null = null;
   /** The latest user transition; an older one stops once its beforeLeave resolves. */
   let intent = 0;
   let active = false;
@@ -228,31 +286,140 @@ function createController(host: ControllerHost): Controller {
   let countStale = false;
   /** What retryLoad repeats. */
   let lastLoad: (() => Promise<unknown>) | null = null;
+  /**
+   * The failure a pending Retry took off screen. It is still the latest failure until a
+   * load begins or New is installed, either of which drops it, and it is shown again when
+   * the repeated operation stops at its leave.
+   */
+  let retrying: ApiError | null = null;
+  /** The intent whose beforeLeave is pending: a save its leave makes defers the after-save refresh to it. */
+  let leavingToken: number | null = null;
+  /**
+   * The record generation of an after-save refresh deferred to the transition that is
+   * leaving the saved record; `null` when none is deferred.
+   */
+  let deferredRefresh: number | null = null;
 
   const api = (): ApiClient => host.options().client;
   const viewId = (): number => host.options().viewId;
 
-  const readCount = (includeDeleted: boolean): Promise<Settled<RecordCountResponse>> =>
-    settle(() => api().countRecords(viewId(), { includeDeleted }));
-  const readAt = (position: number, includeDeleted: boolean): Promise<Settled<RecordDto>> =>
-    settle(() => api().getRecordAt(viewId(), position, { includeDeleted }));
-  const readRecord = (id: string): Promise<Settled<RecordDto>> => settle(() => api().getRecord(viewId(), id));
-  const readPosition = (id: string, includeDeleted: boolean): Promise<Settled<NavigationPosition>> =>
-    settle(() => api().getRecordPosition(viewId(), id, { includeDeleted }));
+  // Each read rejects once aborted: settle() resolves a single read, settleAll() parallel ones.
+  const readCount = (load: Load, includeDeleted: boolean): Promise<ApiResult<RecordCountResponse>> =>
+    attempt(() => api().countRecords(viewId(), { includeDeleted }, load.signal));
+  const readAt = (load: Load, position: number, includeDeleted: boolean): Promise<ApiResult<RecordDto>> =>
+    attempt(() => api().getRecordAt(viewId(), position, { includeDeleted }, load.signal));
+  const readRecord = (load: Load, id: string): Promise<ApiResult<RecordDto>> =>
+    attempt(() => api().getRecord(viewId(), id, load.signal));
+  const readPosition = (load: Load, id: string, includeDeleted: boolean): Promise<ApiResult<NavigationPosition>> =>
+    attempt(() => api().getRecordPosition(viewId(), id, { includeDeleted }, load.signal));
 
-  const isCurrent = (gen: number): boolean => active && gen === loadGen;
+  const isCurrent = (load: Load): boolean => active && load.gen === loadGen;
 
-  /** Starts a load that supersedes every load in flight; Retry runs `repeat`. */
-  function begin(repeat: () => Promise<unknown>): number {
+  /** Cancels the latest load's requests; its results are ignored by generation as well. */
+  function abortLoad(): void {
+    loadAbort?.abort();
+    loadAbort = null;
+  }
+
+  /** Takes the next generation: every load in flight is superseded and its requests aborted. */
+  function nextLoad(): Load {
     loadGen += 1;
+    abortLoad();
+    const abort = new AbortController();
+    loadAbort = abort;
+    return {
+      gen: loadGen,
+      signal: abort.signal,
+      cancel: () => {
+        abort.abort();
+      },
+    };
+  }
+
+  /** Starts a load that supersedes every load in flight and aborts its requests; Retry runs `repeat`. */
+  function begin(repeat: () => Promise<unknown>): Load {
+    const load = nextLoad();
     lastLoad = repeat;
+    retrying = null;
     host.update({ loading: true, loadError: null });
-    return loadGen;
+    return load;
   }
 
   /** Ends the current load with `error`, keeping the previous display. */
   function fail(error: ApiError): void {
     host.update({ loading: false, loadError: error });
+  }
+
+  /** Ends the current load whose read was aborted: idle, with no error to show or retry. */
+  function settleIdle(): void {
+    host.update({ loading: false });
+  }
+
+  /** The operation `token` is about to replace the record: while it is the latest intent, it owns `transitioning`. */
+  function claimTransition(token: number): void {
+    if (token === intent && !host.state().transitioning) {
+      host.update({ transitioning: true });
+    }
+  }
+
+  /**
+   * Starts a record-changing operation as the latest intent. `transitioning` is set before
+   * anything is awaited, beforeLeave included, so the editor freezes the draft at once.
+   */
+  function startTransition(): number {
+    intent += 1;
+    claimTransition(intent);
+    return intent;
+  }
+
+  /**
+   * Ends the operation `token`. Only the latest intent clears `transitioning`, since a
+   * newer one owns it, and only it settles a deferred after-save refresh, which runs when
+   * the operation installed nothing and left N stale. When the operation failed, or is a
+   * Retry that stopped at its leave, only the saved record's coordinates are re-read, so
+   * the failure and its Retry stay shown.
+   */
+  function endTransition(token: number): void {
+    if (token !== intent) {
+      return;
+    }
+    if (host.state().transitioning) {
+      host.update({ transitioning: false });
+    }
+    const deferredIn = deferredRefresh;
+    deferredRefresh = null;
+    const { record, recordGeneration, includeDeleted, loadError } = host.state();
+    if (deferredIn === null || deferredIn !== recordGeneration || !active || !countStale || record === null) {
+      return;
+    }
+    if (loadError === null && retrying === null) {
+      void refreshAfterSave(record, includeDeleted);
+    } else {
+      void refreshCoordinates(record, includeDeleted);
+    }
+  }
+
+  /**
+   * A record-changing operation that leaves the open record first: `body` runs only once
+   * beforeLeave has resolved `true` while this is still the latest intent.
+   */
+  async function guarded(body: () => Promise<boolean>): Promise<boolean> {
+    const token = startTransition();
+    try {
+      return (await leave(token)) && (await body());
+    } finally {
+      endTransition(token);
+    }
+  }
+
+  /** A record-changing operation that does not call beforeLeave: the draft was deleted or discarded. */
+  async function replaceWithoutLeave(body: () => Promise<boolean>): Promise<void> {
+    const token = startTransition();
+    try {
+      await body();
+    } finally {
+      endTransition(token);
+    }
   }
 
   function installRecord(record: RecordDto, n: number, set: SetView): void {
@@ -290,14 +457,28 @@ function createController(host: ControllerHost): Controller {
 
   /** Awaits the editor's leave(); `false` also when a newer transition or an unmount overtook it. */
   async function leave(token: number): Promise<boolean> {
-    const left = await host.options().beforeLeave();
-    return left && active && token === intent;
+    leavingToken = token;
+    try {
+      const left = await host.options().beforeLeave();
+      return left && active && token === intent;
+    } finally {
+      if (leavingToken === token) {
+        leavingToken = null;
+      }
+    }
   }
 
-  /** Reads N for the load `gen`; `null` when the load was overtaken or failed, the failure shown. */
-  async function readSet(gen: number, includeDeleted: boolean): Promise<SetView | null> {
-    const counted = await readCount(includeDeleted);
-    if (counted === null || !isCurrent(gen)) {
+  /**
+   * Reads N for `load`; `null` when the load was overtaken, aborted (settled idle) or
+   * failed, the failure shown.
+   */
+  async function readSet(load: Load, includeDeleted: boolean): Promise<SetView | null> {
+    const counted = await settle(readCount(load, includeDeleted));
+    if (!isCurrent(load)) {
+      return null;
+    }
+    if (counted === null) {
+      settleIdle();
       return null;
     }
     if (!counted.ok) {
@@ -313,9 +494,13 @@ function createController(host: ControllerHost): Controller {
    * `recovering` is set this already is that attempt, and a second 404 installs New
    * instead of looping.
    */
-  async function openAt(gen: number, position: number, set: SetView, recovering: boolean): Promise<boolean> {
-    const result = await readAt(position, set.includeDeleted);
-    if (result === null || !isCurrent(gen)) {
+  async function openAt(load: Load, position: number, set: SetView, recovering: boolean): Promise<boolean> {
+    const result = await settle(readAt(load, position, set.includeDeleted));
+    if (!isCurrent(load)) {
+      return false;
+    }
+    if (result === null) {
+      settleIdle();
       return false;
     }
     if (result.ok) {
@@ -335,12 +520,12 @@ function createController(host: ControllerHost): Controller {
   }
 
   /** Opens `position`, or installs New when the set is empty. */
-  function openOrNew(gen: number, position: number, set: SetView, recovering: boolean): Promise<boolean> {
+  function openOrNew(load: Load, position: number, set: SetView, recovering: boolean): Promise<boolean> {
     if (set.count === 0) {
       installNew(set);
       return Promise.resolve(false);
     }
-    return openAt(gen, position, set, recovering);
+    return openAt(load, position, set, recovering);
   }
 
   /** Handles a failed read of a record by id or of its position: a 404 recovers once. */
@@ -366,9 +551,10 @@ function createController(host: ControllerHost): Controller {
     const listVersion = host.state().listVersion + 1;
     host.update(notice === null ? { listVersion } : { listVersion, notice });
     const run = async (): Promise<boolean> => {
-      const gen = begin(run);
-      const set = await readSet(gen, includeDeleted);
-      return set === null ? false : openOrNew(gen, nearest(anchor, set.count), set, recovering);
+      // The record still shown may have been edited since a failure, so Retry leaves it first.
+      const load = begin(() => guarded(run));
+      const set = await readSet(load, includeDeleted);
+      return set === null ? false : openOrNew(load, nearest(anchor, set.count), set, recovering);
     };
     return run();
   }
@@ -378,9 +564,9 @@ function createController(host: ControllerHost): Controller {
     const requested = host.options().initialPosition;
     const position = requested !== undefined && Number.isInteger(requested) && requested >= 1 ? requested : 1;
     const run = async (): Promise<boolean> => {
-      const gen = begin(run);
-      const set = await readSet(gen, includeDeleted);
-      return set === null ? false : openOrNew(gen, position, set, false);
+      const load = begin(run);
+      const set = await readSet(load, includeDeleted);
+      return set === null ? false : openOrNew(load, position, set, false);
     };
     return run();
   }
@@ -388,8 +574,8 @@ function createController(host: ControllerHost): Controller {
   /** Re-reads N only; the open record, or New, stays. */
   function recount(includeDeleted: boolean): Promise<boolean> {
     const run = async (): Promise<boolean> => {
-      const gen = begin(run);
-      const set = await readSet(gen, includeDeleted);
+      const load = begin(run);
+      const set = await readSet(load, includeDeleted);
       if (set === null) {
         return false;
       }
@@ -400,25 +586,24 @@ function createController(host: ControllerHost): Controller {
     return run();
   }
 
-  /** A user move: leave the open record, then open the target; N is reused unless a save made it stale. */
-  async function transition(target: MoveTarget): Promise<boolean> {
-    const token = ++intent;
-    if (!(await leave(token))) {
-      return false;
-    }
-    host.update({ goToError: null, notice: null });
-    const { includeDeleted } = host.state();
-    const positionIn = (count: number): number => (target.kind === 'last' ? count : target.position);
-    const run = async (): Promise<boolean> => {
-      const gen = begin(run);
+  /**
+   * A user move: leave the open record, then open the target; N is reused unless a save
+   * made it stale. Retry repeats the whole move, so an edit made since a failure is saved
+   * before the target is read.
+   */
+  function transition(target: MoveTarget): Promise<boolean> {
+    return guarded(async () => {
+      host.update({ goToError: null, notice: null });
+      const { includeDeleted } = host.state();
+      const positionIn = (count: number): number => (target.kind === 'last' ? count : target.position);
+      const load = begin(() => transition(target));
       const { count } = host.state();
       if (!countStale && count > 0) {
-        return openAt(gen, positionIn(count), { includeDeleted, count, fresh: false }, false);
+        return openAt(load, positionIn(count), { includeDeleted, count, fresh: false }, false);
       }
-      const set = await readSet(gen, includeDeleted);
-      return set === null ? false : openOrNew(gen, positionIn(set.count), set, false);
-    };
-    return run();
+      const set = await readSet(load, includeDeleted);
+      return set === null ? false : openOrNew(load, positionIn(set.count), set, false);
+    });
   }
 
   function move(kind: Move): Promise<boolean> {
@@ -440,40 +625,50 @@ function createController(host: ControllerHost): Controller {
   }
 
   async function newRecord(): Promise<void> {
-    const token = ++intent;
-    if (!(await leave(token))) {
-      return;
-    }
-    // New overtakes every load in flight, an after-save refresh among them.
-    loadGen += 1;
-    lastLoad = null;
-    const stale = countStale;
-    const { count, includeDeleted } = host.state();
-    host.update({ goToError: null, notice: null });
-    installNew({ includeDeleted, count, fresh: false });
-    if (stale) {
-      await recount(includeDeleted);
+    const token = startTransition();
+    try {
+      if (!(await leave(token))) {
+        return;
+      }
+      // New overtakes every load in flight, an after-save refresh among them.
+      loadGen += 1;
+      abortLoad();
+      lastLoad = null;
+      retrying = null;
+      const stale = countStale;
+      const { count, includeDeleted } = host.state();
+      host.update({ goToError: null, notice: null });
+      installNew({ includeDeleted, count, fresh: false });
+      // New is open, so the draft is the user's again while N is re-read.
+      endTransition(token);
+      if (stale) {
+        await recount(includeDeleted);
+      }
+    } finally {
+      endTransition(token);
     }
   }
 
+  /** Opens a record by id; Retry repeats the whole open, beforeLeave first. */
   async function openById(id: string): Promise<void> {
-    const token = ++intent;
-    if (!(await leave(token))) {
-      return;
-    }
-    host.update({ goToError: null, notice: null });
-    const { n, includeDeleted } = host.state();
-    const anchor = n ?? 1;
-    const run = async (): Promise<boolean> => {
-      const gen = begin(run);
-      const [found, placed, counted] = await Promise.all([
-        readRecord(id),
-        readPosition(id, includeDeleted),
-        readCount(includeDeleted),
+    await guarded(async () => {
+      host.update({ goToError: null, notice: null });
+      const { n, includeDeleted } = host.state();
+      const anchor = n ?? 1;
+      const load = begin(() => openById(id));
+      const results = await settleAll(load, [
+        readRecord(load, id),
+        readPosition(load, id, includeDeleted),
+        readCount(load, includeDeleted),
       ]);
-      if (found === null || placed === null || counted === null || !isCurrent(gen)) {
+      if (!isCurrent(load)) {
         return false;
       }
+      if (results === null) {
+        settleIdle();
+        return false;
+      }
+      const [found, placed, counted] = results;
       if (!counted.ok) {
         fail(counted.error);
         return false;
@@ -493,9 +688,8 @@ function createController(host: ControllerHost): Controller {
         return true;
       }
       // Outside the selected set: open the set's record nearest to the one that was open.
-      return openOrNew(gen, nearest(anchor, set.count), set, false);
-    };
-    await run();
+      return openOrNew(load, nearest(anchor, set.count), set, false);
+    });
   }
 
   async function setIncludeDeleted(value: boolean): Promise<void> {
@@ -504,59 +698,89 @@ function createController(host: ControllerHost): Controller {
       return;
     }
     const token = ++intent;
-    const { record } = before;
-    if (record === null) {
-      host.update({ goToError: null, notice: null });
-      // New stays New and only N changes; with nothing open yet the form loads afresh.
-      await (before.isNew ? recount(value) : loadInitial(value));
-      return;
-    }
+    // Ends the toggle whichever path it took: it is the latest intent until a newer one starts.
+    try {
+      const { record } = before;
+      if (record === null) {
+        host.update({ goToError: null, notice: null });
+        // New stays New and only N changes; with nothing open yet the form loads afresh.
+        await (before.isNew ? recount(value) : loadInitial(value));
+        return;
+      }
 
-    // Switching to the active set while a deleted record is open leaves that record.
-    let left = !value && record.recStatus !== ACTIVE_STATUS;
-    if (left && !(await leave(token))) {
-      return;
-    }
-    host.update({ goToError: null, notice: null });
-    const anchor = before.n ?? 1;
-    const run = async (): Promise<boolean> => {
-      const gen = begin(run);
-      const [counted, placed] = await Promise.all([
-        readCount(value),
-        readPosition(record.globalRecordId, value),
-      ]);
-      if (counted === null || placed === null || !isCurrent(gen)) {
-        return false;
-      }
-      if (!counted.ok) {
-        fail(counted.error);
-        return false;
-      }
-      if (!placed.ok) {
-        await failOpen(placed.error, anchor, value);
-        return false;
-      }
-      const set: SetView = { includeDeleted: value, count: counted.data.count, fresh: true };
-      const { position } = placed.data;
-      if (position !== null) {
-        // The open record stays: only n and N change, so the generation does not.
-        countStale = false;
-        host.update({ n: position, count: set.count, includeDeleted: value, loading: false });
-        return true;
-      }
-      if (!left) {
-        // Deleted elsewhere since it was opened: leave it like any other transition, then
-        // read the set again, since the save may have run its own refresh.
-        host.update({ loading: false });
+      // Switching to the active set while a deleted record is open leaves that record.
+      let left = !value && record.recStatus !== ACTIVE_STATUS;
+      if (left) {
+        claimTransition(token);
         if (!(await leave(token))) {
+          return;
+        }
+      }
+      host.update({ goToError: null, notice: null });
+      const anchor = before.n ?? 1;
+      const run = async (): Promise<boolean> => {
+        // Results apply only on success, so includeDeleted is still the old value when
+        // Retry repeats the whole toggle, with its leave where the record must be left.
+        const load = begin(() => setIncludeDeleted(value));
+        const results = await settleAll(load, [
+          readCount(load, value),
+          readPosition(load, record.globalRecordId, value),
+        ]);
+        if (!isCurrent(load)) {
           return false;
         }
-        left = true;
-        return run();
-      }
-      return openOrNew(gen, nearest(anchor, set.count), set, false);
-    };
-    await run();
+        if (results === null) {
+          settleIdle();
+          return false;
+        }
+        const [counted, placed] = results;
+        if (!counted.ok) {
+          fail(counted.error);
+          return false;
+        }
+        if (!placed.ok) {
+          if (placed.error.kind !== 'notFound') {
+            fail(placed.error);
+            return false;
+          }
+          if (!left) {
+            // The open record no longer exists. Opening the nearest one replaces it, and the
+            // user may have edited it, so it is left first like any other transition.
+            host.update({ loading: false });
+            claimTransition(token);
+            if (!(await leave(token))) {
+              return false;
+            }
+            left = true;
+          }
+          await openNearestTo(anchor, value, errorMessages.notFound, true);
+          return false;
+        }
+        const set: SetView = { includeDeleted: value, count: counted.data.count, fresh: true };
+        const { position } = placed.data;
+        if (position !== null) {
+          // The open record stays: only n and N change, so the generation does not.
+          countStale = false;
+          host.update({ n: position, count: set.count, includeDeleted: value, loading: false });
+          return true;
+        }
+        if (!left) {
+          // Deleted elsewhere since it was opened: leave it like any other transition, then
+          // read the set again, since the save may have run its own refresh.
+          host.update({ loading: false });
+          claimTransition(token);
+          if (!(await leave(token))) {
+            return false;
+          }
+          left = true;
+          return run();
+        }
+        return openOrNew(load, nearest(anchor, set.count), set, false);
+      };
+      await run();
+    } finally {
+      endTransition(token);
+    }
   }
 
   function afterSave(record: RecordDto): void {
@@ -569,48 +793,116 @@ function createController(host: ControllerHost): Controller {
       n: before.isNew ? null : before.n,
       listVersion: before.listVersion + 1,
     });
-    const { includeDeleted } = before;
+    if (leavingToken !== null && leavingToken === intent) {
+      // The save is the one the pending transition's leave made. That transition re-reads
+      // N, since countStale is set, so a refresh now would only be superseded; it runs
+      // when the transition ends without replacing the record (endTransition).
+      deferredRefresh = host.state().recordGeneration;
+      return;
+    }
+    void refreshAfterSave(record, before.includeDeleted);
+  }
+
+  /** Re-reads N and the saved record's n; the record stays, so the generation does too. */
+  function refreshAfterSave(record: RecordDto, includeDeleted: boolean): Promise<boolean> {
     const run = async (): Promise<boolean> => {
-      const gen = begin(run);
-      const [counted, placed] = await Promise.all([
-        readCount(includeDeleted),
-        readPosition(record.globalRecordId, includeDeleted),
+      const load = begin(run);
+      const results = await settleAll(load, [
+        readCount(load, includeDeleted),
+        readPosition(load, record.globalRecordId, includeDeleted),
       ]);
-      if (counted === null || placed === null || !isCurrent(gen)) {
+      if (!isCurrent(load)) {
         return false;
       }
+      if (results === null) {
+        settleIdle();
+        return false;
+      }
+      const [counted, placed] = results;
       if (!counted.ok) {
         fail(counted.error);
         return false;
       }
       if (!placed.ok) {
-        await failOpen(placed.error, host.state().n ?? 1, includeDeleted);
+        if (placed.error.kind !== 'notFound') {
+          fail(placed.error);
+          return false;
+        }
+        // The saved record is gone. Opening the nearest one replaces it, and the user may
+        // have edited it since the save, so it is left first like any other transition.
+        const anchor = host.state().n ?? 1;
+        host.update({ loading: false });
+        await guarded(() => openNearestTo(anchor, includeDeleted, errorMessages.notFound, true));
         return false;
       }
       countStale = false;
       host.update({ n: placed.data.position, count: counted.data.count, loading: false });
       return true;
     };
-    void run();
+    return run();
   }
 
+  /**
+   * Re-reads N and the saved record's n while a failed load is shown: the transition whose
+   * leave saved the record failed afterwards, so the record stays open with stale
+   * coordinates. The failure, its Retry and `loading` stay as they are. An abort, a failure
+   * or a 404 changes nothing, so Retry still re-reads N; any later load supersedes this one
+   * and aborts its requests.
+   */
+  async function refreshCoordinates(record: RecordDto, includeDeleted: boolean): Promise<void> {
+    const load = nextLoad();
+    const results = await settleAll(load, [
+      readCount(load, includeDeleted),
+      readPosition(load, record.globalRecordId, includeDeleted),
+    ]);
+    if (!isCurrent(load) || results === null) {
+      return;
+    }
+    const [counted, placed] = results;
+    if (!counted.ok || !placed.ok) {
+      return;
+    }
+    countStale = false;
+    host.update({ n: placed.data.position, count: counted.data.count });
+  }
+
+  /** Does not call beforeLeave: the delete already discarded the draft. */
   function afterDelete(): void {
-    intent += 1;
     const { n, includeDeleted } = host.state();
     host.update({ goToError: null, notice: null });
-    void openNearestTo(n ?? 1, includeDeleted, null, false);
+    void replaceWithoutLeave(() => openNearestTo(n ?? 1, includeDeleted, null, false));
   }
 
+  /** Does not call beforeLeave: the draft is gone (404) or its edits were discarded. */
   function openNearest(notice?: string): void {
-    intent += 1;
     const { n, includeDeleted } = host.state();
-    void openNearestTo(n ?? 1, includeDeleted, notice ?? null, true);
+    void replaceWithoutLeave(() => openNearestTo(n ?? 1, includeDeleted, notice ?? null, true));
   }
 
   async function retryLoad(): Promise<void> {
     const repeat = lastLoad;
-    if (repeat !== null) {
+    if (repeat === null) {
+      return;
+    }
+    const failure = host.state().loadError;
+    if (failure !== null) {
+      // The failure leaves the screen in the commit of the press, before the repeated
+      // operation's leave resolves; an operation that replaces the record freezes the draft
+      // in that same commit.
+      retrying = failure;
+      host.update({ loadError: null });
+    }
+    try {
       await repeat();
+    } finally {
+      // Still `retrying`: no load began and no New replaced the operation, which stopped
+      // at its leave, so its failure and the Retry that repeats it are shown again.
+      if (failure !== null && retrying === failure) {
+        retrying = null;
+        if (active) {
+          host.update({ loadError: failure });
+        }
+      }
     }
   }
 
@@ -647,6 +939,9 @@ function createController(host: ControllerHost): Controller {
         const { recordGeneration, listVersion } = host.state();
         countStale = false;
         host.update({ ...INITIAL_STATE, recordGeneration: recordGeneration + 1, listVersion: listVersion + 1 });
+      } else if (host.state().transitioning) {
+        // deactivate dropped every operation in flight, the one that owned the flag among them.
+        host.update({ transitioning: false });
       }
       activeViewId = id;
       void loadInitial(host.state().includeDeleted);
@@ -655,7 +950,10 @@ function createController(host: ControllerHost): Controller {
     deactivate: () => {
       active = false;
       loadGen += 1;
+      abortLoad();
       intent += 1;
+      leavingToken = null;
+      deferredRefresh = null;
     },
   };
 }
@@ -696,6 +994,7 @@ function present(state: NavigationState, actions: NavigationActions): RecordNavi
  *   client, viewId, definition,
  *   record: navigation.record, isNew: navigation.isNew, recordGeneration: navigation.recordGeneration,
  *   onSaved: navigation.afterSave, onDeleted: navigation.afterDelete, onDiscardToNearest: navigation.openNearest,
+ *   transitioning: navigation.transitioning,
  * });
  * leaveRef.current = editor.leave;
  * ```

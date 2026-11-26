@@ -23,7 +23,7 @@ export interface FieldComponentProps {
   field: FieldDefinition;
   /** The field's current value; `null` is empty. */
   value: FieldValue;
-  /** `isProtected` or disabled by check code; set as the native `disabled` attribute. */
+  /** `isProtected`, disabled by check code, or a frozen draft; set as the native `disabled` attribute. */
   disabled: boolean;
   /** Read-only metadata, a deleted record, or an unsupported field; `ENABLE` never clears it. */
   isProtected: boolean;
@@ -83,7 +83,7 @@ export function fieldLabelText(field: FieldDefinition): string {
 
 /**
  * Class list of a field's wrapper: `field--protected` for a protected field, and
- * `field--disabled` for a field disabled by check code only.
+ * `field--disabled` for a field disabled by check code only or by a frozen draft.
  */
 export function fieldWrapperClass(props: Pick<FieldComponentProps, 'disabled' | 'isProtected'>): string {
   if (props.isProtected) {

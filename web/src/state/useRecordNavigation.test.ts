@@ -9,6 +9,7 @@
 // count are intrinsic, over the active set for an active record and over every row for a
 // deleted one.
 import { act, renderHook, waitFor } from '@testing-library/react';
+import { useLayoutEffect, useRef } from 'react';
 import { afterEach, describe, expect, it, vi, type Mock } from 'vitest';
 
 import { createApiClient } from '../api/client';
@@ -21,6 +22,7 @@ import type {
   Values,
 } from '../api/types';
 import { formDefinitionFixture, isDataField, recordFixture } from '../test/formDefinitionFixture';
+import { useRecordEditor, type RecordEditor } from './useRecordEditor';
 import { useRecordNavigation, type RecordNavigation } from './useRecordNavigation';
 
 const VIEW_ID = formDefinitionFixture.viewId;
@@ -160,6 +162,11 @@ interface FakeApi {
   readonly hold: (pathname: string) => Gate;
   /** From now on every at/{position} answers 404, although count still counts the rows. */
   readonly failEveryAt: () => void;
+  /**
+   * From now on the position route answers 404 for `id`, while the read by id still
+   * answers 200 with its DTO and count still counts the row.
+   */
+  readonly failPosition: (id: string) => void;
 }
 
 /** Every fake API of the running test, checked for DATA-01 after it. */
@@ -191,6 +198,7 @@ const BY_ID_ROUTE = /^\/api\/forms\/(\d+)\/records\/([^/]+)$/;
 function createFakeApi(initialRows: readonly Row[]): FakeApi {
   let rows: Row[] = [...initialRows].sort((a, b) => a.uniqueKey - b.uniqueKey);
   let everyAtMissing = false;
+  const positionMissing = new Set<string>();
   const calls: Call[] = [];
   const unrouted: string[] = [];
   const log: { readonly request: boolean; readonly text: string }[] = [];
@@ -254,6 +262,9 @@ function createFakeApi(initialRows: readonly Row[]): FakeApi {
       return notFound();
     }
     if (POSITION_ROUTE.test(path)) {
+      if (positionMissing.has(target.globalRecordId)) {
+        return notFound();
+      }
       const inSet = includeDeleted || target.recStatus === ACTIVE;
       return jsonResponse({ position: inSet ? placeIn(set, target) : null, count: set.length });
     }
@@ -328,6 +339,9 @@ function createFakeApi(initialRows: readonly Row[]): FakeApi {
     },
     failEveryAt: () => {
       everyAtMissing = true;
+    },
+    failPosition: (id) => {
+      positionMissing.add(requireRow(id).globalRecordId);
     },
   };
   apisOfTest.push(api);
@@ -530,36 +544,46 @@ describe('useRecordNavigation', () => {
       },
     );
 
-    it('New shows "New record" with no request, and previous from it opens at/{N}', async () => {
-      const { api, result, beforeLeave } = await mount(activeRows(5), { initialPosition: 2 });
-      const generation = result.current.recordGeneration;
-      const mark = api.mark();
+    it.each([
+      { name: 'start', from: 1 },
+      { name: 'middle', from: 3 },
+      { name: 'end', from: 5 },
+    ])(
+      'New from the $name (position $from) shows "New record" with no request, and previous from it opens at/{N}',
+      async ({ from }) => {
+        const { api, result, beforeLeave } = await mount(activeRows(5), { initialPosition: from });
+        // The record New leaves is the one at this position.
+        expect(result.current.n).toBe(from);
+        expect(result.current.record?.globalRecordId).toBe(idOf(from));
+        const generation = result.current.recordGeneration;
+        const mark = api.mark();
 
-      await perform(() => result.current.newRecord());
+        await perform(() => result.current.newRecord());
 
-      expect(beforeLeave).toHaveBeenCalledTimes(1);
-      expect(api.requestsSince(mark)).toEqual([]);
-      expect(result.current.isNew).toBe(true);
-      expect(result.current.n).toBeNull();
-      expect(result.current.record).toBeNull();
-      expect(result.current.count).toBe(5);
-      expect(result.current.statusText).toBe('New record');
-      expect(result.current.recordGeneration).toBe(generation + 1);
-      expect(result.current.canPrevious).toBe(true);
-      expect(result.current.canNext).toBe(false);
+        expect(beforeLeave).toHaveBeenCalledTimes(1);
+        expect(api.requestsSince(mark)).toEqual([]);
+        expect(result.current.isNew).toBe(true);
+        expect(result.current.n).toBeNull();
+        expect(result.current.record).toBeNull();
+        expect(result.current.count).toBe(5);
+        expect(result.current.statusText).toBe('New record');
+        expect(result.current.recordGeneration).toBe(generation + 1);
+        expect(result.current.canPrevious).toBe(true);
+        expect(result.current.canNext).toBe(false);
 
-      // Next from New does nothing; previous opens the last record of the N shown with New.
-      await perform(() => result.current.next());
-      expect(api.requestsSince(mark)).toEqual([]);
-      await perform(() => result.current.previous());
+        // Next from New does nothing; previous opens the last record of the N shown with New.
+        await perform(() => result.current.next());
+        expect(api.requestsSince(mark)).toEqual([]);
+        await perform(() => result.current.previous());
 
-      expect(api.requestsSince(mark)).toEqual([atRequest(5)]);
-      expect(result.current.isNew).toBe(false);
-      expect(result.current.n).toBe(5);
-      expect(result.current.record?.globalRecordId).toBe(idOf(5));
-      expect(result.current.statusText).toBe('5 of 5');
-      expect(result.current.recordGeneration).toBe(generation + 2);
-    });
+        expect(api.requestsSince(mark)).toEqual([atRequest(5)]);
+        expect(result.current.isNew).toBe(false);
+        expect(result.current.n).toBe(5);
+        expect(result.current.record?.globalRecordId).toBe(idOf(5));
+        expect(result.current.statusText).toBe('5 of 5');
+        expect(result.current.recordGeneration).toBe(generation + 2);
+      },
+    );
 
     it('a move waits for beforeLeave and sends nothing until it resolves', async () => {
       const leaving = deferred<boolean>();
@@ -691,12 +715,17 @@ describe('useRecordNavigation', () => {
       expect(result.current.record?.count).toBe(3);
       expect(result.current.recordGeneration).toBe(generation);
 
-      // Moves use the toggle's set: record 3 of every row is B.
+      // Moves use the toggle's set: record 3 of every row is B. n is the requested
+      // position, while the DTO at/3 returns keeps its active-set 2 of 3.
       mark = api.mark();
       await perform(() => result.current.goTo(3));
       expect(api.requestsSince(mark)).toEqual([atRequest(3, true)]);
       expect(result.current.record?.globalRecordId).toBe(B.globalRecordId);
+      expect(result.current.n).toBe(3);
+      expect(result.current.count).toBe(4);
+      expect(result.current.statusText).toBe('3 of 4');
       expect(result.current.record?.position).toBe(2);
+      expect(result.current.record?.count).toBe(3);
 
       mark = api.mark();
       await perform(() => result.current.setIncludeDeleted(false));
@@ -815,6 +844,74 @@ describe('useRecordNavigation', () => {
       expect(result.current.record).toBe(saved);
       expect(result.current.recordGeneration).toBe(recordGeneration);
     });
+
+    // B's saved DTO is 2 of 3 over the active set in both cases, while the refresh places
+    // it elsewhere, so only the count and position reads can supply n and N.
+    const savedElsewhere: readonly {
+      readonly name: string;
+      readonly includeDeleted: boolean;
+      readonly opened: { readonly n: number; readonly count: number };
+      /** Rows another session deletes after the save answered and before the refresh. */
+      readonly deletedAfterSave: readonly string[];
+      readonly refreshed: { readonly n: number; readonly count: number };
+      readonly statusText: string;
+    }[] = [
+      {
+        name: 'with deleted records shown, the deleted record before it counts',
+        includeDeleted: true,
+        opened: { n: 3, count: 4 },
+        deletedAfterSave: [],
+        refreshed: { n: 3, count: 4 },
+        statusText: '3 of 4',
+      },
+      {
+        name: 'with the active set shown, the record before it was deleted after the save',
+        includeDeleted: false,
+        opened: { n: 2, count: 3 },
+        deletedAfterSave: [A.globalRecordId],
+        refreshed: { n: 1, count: 2 },
+        statusText: '1 of 2',
+      },
+    ];
+
+    it.each(savedElsewhere)(
+      'afterSave takes n and N from the refresh, not the saved DTO, $name',
+      async ({ includeDeleted, opened, deletedAfterSave, refreshed, statusText }) => {
+        const { api, result } = await mount(mixedRows());
+        await perform(() => result.current.setIncludeDeleted(includeDeleted));
+        await perform(() => result.current.openById(B.globalRecordId));
+        expect(result.current.n).toBe(opened.n);
+        expect(result.current.count).toBe(opened.count);
+        const { recordGeneration } = result.current;
+        const saved = api.dto(B.globalRecordId);
+        expect(saved.recStatus).toBe(ACTIVE);
+        expect(saved.position).toBe(2);
+        expect(saved.count).toBe(3);
+        expect({ n: saved.position, count: saved.count }).not.toEqual(refreshed);
+        for (const id of deletedAfterSave) {
+          api.setStatus(id, DELETED);
+        }
+        const mark = api.mark();
+
+        act(() => {
+          result.current.afterSave(saved);
+        });
+        await settled(result);
+
+        expect(sorted(api.requestsSince(mark))).toEqual(
+          sorted([countRequest(includeDeleted), positionRequest(B.globalRecordId, includeDeleted)]),
+        );
+        expect(result.current.includeDeleted).toBe(includeDeleted);
+        expect(result.current.n).toBe(refreshed.n);
+        expect(result.current.count).toBe(refreshed.count);
+        expect(result.current.statusText).toBe(statusText);
+        // The saved DTO is installed as the server returned it, its own coordinates untouched.
+        expect(result.current.record).toBe(saved);
+        expect(result.current.record?.position).toBe(2);
+        expect(result.current.record?.count).toBe(3);
+        expect(result.current.recordGeneration).toBe(recordGeneration);
+      },
+    );
   });
 
   describe('the deleted toggle with a deleted record open', () => {
@@ -897,6 +994,144 @@ describe('useRecordNavigation', () => {
       expect(result.current.isNew).toBe(false);
       expect(result.current.loadError).toBeNull();
     });
+
+    // The read by id answers 200 while the position endpoint answers 404, so only the
+    // position 404 can start the recovery; it is not read as a `null` position either.
+    const positionOnlyMisses: readonly {
+      readonly name: string;
+      readonly rows: readonly Row[];
+      readonly initialPosition: number;
+      /** Rows soft-deleted after the load, so they leave the active set. */
+      readonly deleted: readonly string[];
+      /** The requests after the open's three parallel reads. */
+      readonly recovery: readonly string[];
+      readonly n: number | null;
+      readonly count: number;
+      readonly opened: string | null;
+      readonly isNew: boolean;
+      readonly statusText: string;
+    }[] = [
+      {
+        name: 'opens at/{min(n, count)} of a set that still counts the record',
+        rows: activeRows(5),
+        initialPosition: 3,
+        deleted: [],
+        recovery: [countRequest(), atRequest(3)],
+        n: 3,
+        count: 5,
+        opened: idOf(3),
+        isNew: false,
+        statusText: '3 of 5',
+      },
+      {
+        name: 'shows the empty state when the count is 0',
+        rows: activeRows(2),
+        initialPosition: 1,
+        deleted: [idOf(1), idOf(2)],
+        recovery: [countRequest()],
+        n: null,
+        count: 0,
+        opened: null,
+        isNew: true,
+        statusText: 'New record',
+      },
+    ];
+
+    it.each(positionOnlyMisses)(
+      'openById with a 404 from the position endpoint alone shows the notice, reloads the list and N, and $name',
+      async ({ rows, initialPosition, deleted, recovery, n, count, opened, isNew, statusText }) => {
+        const { api, result } = await mount(rows, { initialPosition });
+        const { listVersion, recordGeneration } = result.current;
+        const target = idOf(2);
+        for (const id of deleted) {
+          api.setStatus(id, DELETED);
+        }
+        api.failPosition(target);
+        const mark = api.mark();
+
+        await perform(() => result.current.openById(target));
+
+        const requests = api.requestsSince(mark);
+        expect(sorted(requests.slice(0, 3))).toEqual(
+          sorted([byIdRequest(target), positionRequest(target), countRequest()]),
+        );
+        expect(requests.slice(3)).toEqual(recovery);
+        expect(result.current.notice).toMatch(RECORD_GONE);
+        expect(result.current.listVersion).toBe(listVersion + 1);
+        expect(result.current.recordGeneration).toBe(recordGeneration + 1);
+        expect(result.current.n).toBe(n);
+        expect(result.current.count).toBe(count);
+        expect(result.current.record?.globalRecordId ?? null).toBe(opened);
+        expect(result.current.isNew).toBe(isNew);
+        expect(result.current.statusText).toBe(statusText);
+        expect(result.current.loadError).toBeNull();
+      },
+    );
+
+    // Record 3 of 5 is open and active, so switching the toggle on keeps it open unless it
+    // is gone: its position read answers 404, and the nearest record would replace it.
+    it.each([
+      {
+        name: 'refused',
+        left: false,
+        recovery: [] as string[],
+        opened: idOf(3),
+        count: 5,
+        includeDeleted: false,
+        installed: 0,
+        notice: null as RegExp | null,
+        listChanged: 0,
+        statusText: '3 of 5',
+      },
+      {
+        name: 'succeeds',
+        left: true,
+        recovery: [countRequest(true), atRequest(3, true)],
+        // Position 3 of the remaining 1, 2, 4, 5.
+        opened: idOf(4),
+        count: 4,
+        includeDeleted: true,
+        installed: 1,
+        notice: RECORD_GONE,
+        listChanged: 1,
+        statusText: '3 of 4',
+      },
+    ])(
+      'a toggle change that finds the open record gone leaves it before opening the nearest record (leave $name)',
+      async ({ left, recovery, opened, count, includeDeleted, installed, notice, listChanged, statusText }) => {
+        const { api, result, beforeLeave } = await mount(activeRows(5), { initialPosition: 3 });
+        const { recordGeneration, listVersion } = result.current;
+        api.remove(idOf(3));
+        beforeLeave.mockImplementation(() => {
+          api.note('beforeLeave');
+          return Promise.resolve(left);
+        });
+        const mark = api.mark();
+
+        await perform(() => result.current.setIncludeDeleted(true));
+
+        // The toggle's own reads, then the leave, and only after a successful leave the recovery.
+        const log = api.logSince(mark);
+        expect(sorted(log.slice(0, 2))).toEqual(sorted([countRequest(true), positionRequest(idOf(3), true)]));
+        expect(log.slice(2)).toEqual(['beforeLeave', ...recovery]);
+        expect(beforeLeave).toHaveBeenCalledTimes(1);
+        expect(result.current.record?.globalRecordId).toBe(opened);
+        expect(result.current.n).toBe(3);
+        expect(result.current.count).toBe(count);
+        expect(result.current.includeDeleted).toBe(includeDeleted);
+        expect(result.current.recordGeneration).toBe(recordGeneration + installed);
+        expect(result.current.listVersion).toBe(listVersion + listChanged);
+        if (notice === null) {
+          expect(result.current.notice).toBeNull();
+        } else {
+          expect(result.current.notice).toMatch(notice);
+        }
+        expect(result.current.statusText).toBe(statusText);
+        expect(result.current.loadError).toBeNull();
+        expect(result.current.loading).toBe(false);
+        expect(result.current.transitioning).toBe(false);
+      },
+    );
 
     it('goTo of a position that vanished since N was read opens the nearest record', async () => {
       const { api, result } = await mount(activeRows(5));
@@ -1107,6 +1342,1067 @@ describe('useRecordNavigation', () => {
         expect(READ_ROUTES.some((readRoute) => readRoute.test(call.url.pathname))).toBe(true);
         expect(call.url.pathname).not.toContain('/checkcode/field-event');
       }
+    });
+  });
+});
+
+// Record transitions: the `transitioning` flag that freezes the editor's draft from the
+// start of every record-changing operation until it ends, Retry through the leave guard,
+// and reads that are cancelled when superseded or unmounted.
+describe('record transitions (0.3.6, 0.3.4.2)', () => {
+  /** What fetch rejects with once its request was aborted. */
+  function abortError(): DOMException {
+    return new DOMException('The operation was aborted.', 'AbortError');
+  }
+
+  interface Sent {
+    readonly line: string;
+    readonly signal: AbortSignal;
+  }
+
+  /** The in-memory API behind a fetch that keeps each request's signal and can fail or cancel one request. */
+  interface Wire {
+    readonly api: FakeApi;
+    readonly client: ReturnType<typeof createApiClient>;
+    /** Every request with its signal, in arrival order. */
+    readonly sent: readonly Sent[];
+    /** The next request to `pathname` reaches the fake, then answers 503. */
+    readonly failNext: (pathname: string) => void;
+    /** The next request to `pathname` reaches the fake, then rejects with an AbortError, as a cancelled fetch does. */
+    readonly abortNext: (pathname: string) => void;
+    /** Lines of the requests that rejected with an AbortError of their own while their signal was still live. */
+    readonly selfAborted: readonly string[];
+    /**
+     * The next request to `pathname` keeps waiting for its answer after its signal aborts,
+     * as a fetch that does not honour its signal, so only a load that stops waiting for it
+     * settles before it answers.
+     */
+    readonly ignoreAbort: (pathname: string) => void;
+  }
+
+  function wire(rows: readonly Row[]): Wire {
+    const api = createFakeApi(rows);
+    const sent: Sent[] = [];
+    const selfAborted: string[] = [];
+    const outcomes = new Map<string, 'fail' | 'abort'>();
+    const deaf = new Set<string>();
+    const fetchThrough = (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      const request = input instanceof Request ? input : new Request(input, init);
+      const url = new URL(request.url);
+      const line = `${request.method} ${url.pathname}${url.search}`;
+      sent.push({ line, signal: request.signal });
+      const outcome = outcomes.get(url.pathname);
+      outcomes.delete(url.pathname);
+      const honoursAbort = !deaf.delete(url.pathname);
+      return new Promise<Response>((resolve, reject) => {
+        // A real fetch rejects as soon as its request is aborted, answered or still held.
+        if (honoursAbort) {
+          request.signal.addEventListener(
+            'abort',
+            () => {
+              reject(abortError());
+            },
+            { once: true },
+          );
+        }
+        api.fetch(request).then((response) => {
+          if (outcome === 'abort') {
+            if (!request.signal.aborted) {
+              selfAborted.push(line);
+            }
+            reject(abortError());
+          } else {
+            resolve(outcome === 'fail' ? problemResponse(503, 'Service Unavailable') : response);
+          }
+        }, reject);
+      });
+    };
+    return {
+      api,
+      client: createApiClient({ baseUrl: 'http://localhost', fetch: fetchThrough }),
+      sent,
+      failNext: (pathname) => {
+        outcomes.set(pathname, 'fail');
+      },
+      abortNext: (pathname) => {
+        outcomes.set(pathname, 'abort');
+      },
+      selfAborted,
+      ignoreAbort: (pathname) => {
+        deaf.add(pathname);
+      },
+    };
+  }
+
+  interface MountedWire extends Wire {
+    readonly result: Current;
+    readonly beforeLeave: Mock<() => Promise<boolean>>;
+    readonly unmount: () => void;
+  }
+
+  /** Notes `beforeLeave` in the log and resolves `left`. */
+  function leaving(api: FakeApi, left: boolean): () => Promise<boolean> {
+    return () => {
+      api.note('beforeLeave');
+      return Promise.resolve(left);
+    };
+  }
+
+  async function mountWire(rows: readonly Row[], initialPosition?: number): Promise<MountedWire> {
+    const connection = wire(rows);
+    const beforeLeave = vi.fn(leaving(connection.api, true));
+    const { result, unmount } = renderHook(() =>
+      useRecordNavigation({ client: connection.client, viewId: VIEW_ID, initialPosition, beforeLeave }),
+    );
+    await settled(result);
+    return { ...connection, result, beforeLeave, unmount };
+  }
+
+  /**
+   * The latest request sent as `line`. A load's signal is aborted whenever a newer load
+   * supersedes it, its finished requests included, so only the latest one tells.
+   */
+  function sentTo(connection: Wire, line: string): Sent {
+    const found = [...connection.sent].reverse().find((entry) => entry.line === line);
+    if (found === undefined) {
+      throw new Error(`no request ${line} was sent`);
+    }
+    return found;
+  }
+
+  const RECORD_CHANGES: readonly NamedAction[] = [
+    FIRST,
+    PREVIOUS,
+    NEXT,
+    LAST,
+    goTo(5),
+    { name: 'newRecord', run: (navigation) => navigation.newRecord() },
+    { name: 'openById', run: (navigation) => navigation.openById(idOf(4)) },
+  ];
+
+  describe('transitioning', () => {
+    it.each(RECORD_CHANGES)(
+      '$name sets it before beforeLeave resolves, and clears it with no request when beforeLeave cancels',
+      async ({ run }) => {
+        const leave = deferred<boolean>();
+        const { api, result, beforeLeave } = await mount(activeRows(5), {
+          initialPosition: 3,
+          beforeLeave: () => leave.promise,
+        });
+        const { record, recordGeneration } = result.current;
+        expect(result.current.transitioning).toBe(false);
+        const mark = api.mark();
+        let changing: Promise<unknown> = Promise.resolve();
+
+        act(() => {
+          changing = run(result.current);
+        });
+
+        expect(beforeLeave).toHaveBeenCalledTimes(1);
+        expect(result.current.transitioning).toBe(true);
+        expect(result.current.loading).toBe(false);
+
+        await act(async () => {
+          leave.resolve(false);
+          await changing;
+        });
+
+        expect(result.current.transitioning).toBe(false);
+        expect(result.current.loading).toBe(false);
+        expect(api.requestsSince(mark)).toEqual([]);
+        expect(result.current.record).toBe(record);
+        expect(result.current.recordGeneration).toBe(recordGeneration);
+      },
+    );
+
+    it.each([
+      { name: 'next', run: NEXT.run, held: `${RECORDS_PATH}/at/4`, n: 4 },
+      {
+        name: 'openById',
+        run: (navigation: RecordNavigation) => navigation.openById(idOf(5)),
+        held: `${RECORDS_PATH}/${idOf(5)}/position`,
+        n: 5,
+      },
+    ])('$name stays transitioning through beforeLeave and a held GET until the record is installed', async ({ run, held, n }) => {
+      const leave = deferred<boolean>();
+      const { api, result } = await mount(activeRows(5), { initialPosition: 3, beforeLeave: () => leave.promise });
+      const gate = api.hold(held);
+      let changing: Promise<unknown> = Promise.resolve();
+
+      act(() => {
+        changing = run(result.current);
+      });
+      expect(result.current.transitioning).toBe(true);
+
+      await act(async () => {
+        leave.resolve(true);
+        await gate.reached;
+      });
+      expect(result.current.transitioning).toBe(true);
+      expect(result.current.loading).toBe(true);
+      expect(result.current.n).toBe(3);
+
+      await act(async () => {
+        gate.release();
+        await changing;
+      });
+      expect(result.current.transitioning).toBe(false);
+      expect(result.current.loading).toBe(false);
+      expect(result.current.n).toBe(n);
+      expect(result.current.record?.globalRecordId).toBe(idOf(n));
+    });
+
+    it('afterDelete sets it without calling beforeLeave, and clears it once the nearest record is open', async () => {
+      const { api, result, beforeLeave } = await mount(activeRows(3), { initialPosition: 2 });
+      api.setStatus(idOf(2), DELETED);
+      const gate = api.hold(`${RECORDS_PATH}/at/2`);
+
+      await act(async () => {
+        result.current.afterDelete();
+        await gate.reached;
+      });
+      expect(result.current.transitioning).toBe(true);
+      expect(beforeLeave).not.toHaveBeenCalled();
+
+      await act(async () => {
+        gate.release();
+        await flush();
+      });
+      await settled(result);
+      expect(result.current.transitioning).toBe(false);
+      expect(result.current.record?.globalRecordId).toBe(idOf(3));
+    });
+  });
+
+  describe('Retry of a load that replaces the record', () => {
+    const failedLoads: readonly {
+      readonly name: string;
+      /** The request that answers 503 once. */
+      readonly failed: string;
+      readonly prepare: (api: FakeApi) => void;
+      readonly start: (navigation: RecordNavigation) => Promise<unknown>;
+      /** The reads the successful Retry sends after beforeLeave; parallel ones are compared sorted. */
+      readonly reads: readonly string[];
+      readonly parallel: boolean;
+      readonly opened: number;
+    }[] = [
+      {
+        name: 'a move',
+        failed: `${RECORDS_PATH}/at/2`,
+        prepare: () => undefined,
+        start: NEXT.run,
+        reads: [atRequest(2)],
+        parallel: false,
+        opened: 2,
+      },
+      {
+        name: 'an open by id',
+        failed: `${RECORDS_PATH}/${idOf(4)}`,
+        prepare: () => undefined,
+        start: (navigation) => navigation.openById(idOf(4)),
+        reads: sorted([byIdRequest(idOf(4)), positionRequest(idOf(4)), countRequest()]),
+        parallel: true,
+        opened: 4,
+      },
+      {
+        name: 'the landing after a delete',
+        failed: `${RECORDS_PATH}/count`,
+        // The editor's DELETE soft-deleted the open record.
+        prepare: (api) => {
+          api.setStatus(idOf(1), DELETED);
+        },
+        start: (navigation) => {
+          navigation.afterDelete();
+          return Promise.resolve();
+        },
+        reads: [countRequest(), atRequest(1)],
+        parallel: false,
+        opened: 2,
+      },
+    ];
+
+    /** The next leave notes `beforeLeave` in the log and stays pending until the test resolves it. */
+    function holdLeave(api: FakeApi, beforeLeave: Mock<() => Promise<boolean>>): Deferred<boolean> {
+      const leave = deferred<boolean>();
+      beforeLeave.mockImplementationOnce(() => {
+        api.note('beforeLeave');
+        return leave.promise;
+      });
+      return leave;
+    }
+
+    /** Presses Retry and returns its promise, still pending, once the press has rendered. */
+    function pressRetry(result: Current): Promise<void> {
+      let retrying: Promise<void> = Promise.resolve();
+      act(() => {
+        retrying = result.current.retryLoad();
+      });
+      return retrying;
+    }
+
+    /** Mounts 5 rows and fails Next, the read of record 2: the failure and its Retry are shown. */
+    async function mountFailedNext(): Promise<MountedWire> {
+      const connection = await mountWire(activeRows(5));
+      connection.failNext(`${RECORDS_PATH}/at/2`);
+      await perform(() => NEXT.run(connection.result.current));
+      await settled(connection.result);
+      expect(connection.result.current.loadError?.kind).toBe('unavailable');
+      return connection;
+    }
+
+    it.each(failedLoads)(
+      'after $name failed, Retry takes the failure off screen at once and calls beforeLeave before any read; a refused leave sends nothing and shows the failure again',
+      async ({ failed, prepare, start, reads, parallel, opened }) => {
+        const connection = await mountWire(activeRows(5));
+        const { api, result, beforeLeave } = connection;
+        prepare(api);
+        connection.failNext(failed);
+
+        await perform(() => start(result.current));
+        await settled(result);
+
+        expect(result.current.loadError?.kind).toBe('unavailable');
+        expect(result.current.loading).toBe(false);
+        expect(result.current.transitioning).toBe(false);
+        const { record, recordGeneration } = result.current;
+
+        // The user may have edited the record still shown since the failure, so Retry leaves
+        // it first, and a leave that cannot save the edit sends nothing. The banner goes as
+        // Retry is pressed, in the commit that freezes the draft, before the leave resolves.
+        let leave = holdLeave(api, beforeLeave);
+        let mark = api.mark();
+        let retrying = pressRetry(result);
+
+        expect(result.current.loadError).toBeNull();
+        expect(result.current.transitioning).toBe(true);
+        await act(async () => {
+          leave.resolve(false);
+          await retrying;
+        });
+
+        expect(api.logSince(mark)).toEqual(['beforeLeave']);
+        expect(result.current.loadError?.kind).toBe('unavailable');
+        expect(result.current.loading).toBe(false);
+        expect(result.current.transitioning).toBe(false);
+        expect(result.current.record).toBe(record);
+        expect(result.current.recordGeneration).toBe(recordGeneration);
+
+        leave = holdLeave(api, beforeLeave);
+        mark = api.mark();
+        retrying = pressRetry(result);
+
+        expect(result.current.loadError).toBeNull();
+        expect(result.current.transitioning).toBe(true);
+        await act(async () => {
+          leave.resolve(true);
+          await retrying;
+        });
+        await settled(result);
+
+        const log = api.logSince(mark);
+        expect(log[0]).toBe('beforeLeave');
+        expect(parallel ? sorted(log.slice(1)) : log.slice(1)).toEqual(reads);
+        expect(result.current.loadError).toBeNull();
+        expect(result.current.transitioning).toBe(false);
+        expect(result.current.record?.globalRecordId).toBe(idOf(opened));
+      },
+    );
+
+    it.each([{ left: false }, { left: true }])(
+      'a New pressed while the leave of a Retry is pending is installed, and the failure does not come back (Retry leave resolves $left)',
+      async ({ left }) => {
+        const { api, result, beforeLeave } = await mountFailedNext();
+        const { recordGeneration } = result.current;
+        const leave = holdLeave(api, beforeLeave);
+        const mark = api.mark();
+        const retrying = pressRetry(result);
+        expect(result.current.loadError).toBeNull();
+
+        // New's own leave resolves true at once, so New overtakes the Retry.
+        await perform(() => result.current.newRecord());
+        expect(result.current.isNew).toBe(true);
+
+        await act(async () => {
+          leave.resolve(left);
+          await retrying;
+        });
+        await act(flush);
+
+        expect(api.logSince(mark)).toEqual(['beforeLeave', 'beforeLeave']);
+        expect(result.current.loadError).toBeNull();
+        expect(result.current.isNew).toBe(true);
+        expect(result.current.record).toBeNull();
+        expect(result.current.statusText).toBe('New record');
+        expect(result.current.recordGeneration).toBe(recordGeneration + 1);
+        expect(result.current.transitioning).toBe(false);
+        expect(result.current.loading).toBe(false);
+      },
+    );
+
+    it("a Retry whose leave saves the record and then resolves false keeps the failure, re-reading only the saved record's n and N", async () => {
+      const { api, result, beforeLeave } = await mountFailedNext();
+      const { recordGeneration } = result.current;
+      // Another session adds a record while record 1 is edited, so N grows.
+      api.add(row(6));
+      // The editor's leave() saves the edit and reports it, then cannot save a later edit.
+      beforeLeave.mockImplementationOnce(() => {
+        api.note('beforeLeave');
+        result.current.afterSave(api.dto(idOf(1)));
+        return Promise.resolve(false);
+      });
+      const mark = api.mark();
+
+      await perform(() => result.current.retryLoad());
+      await act(flush);
+
+      const log = api.logSince(mark);
+      expect(log[0]).toBe('beforeLeave');
+      expect(sorted(log.slice(1))).toEqual(sorted([countRequest(), positionRequest(idOf(1))]));
+      expect(result.current.loadError?.kind).toBe('unavailable');
+      expect(result.current.loading).toBe(false);
+      expect(result.current.transitioning).toBe(false);
+      expect(result.current.record?.globalRecordId).toBe(idOf(1));
+      expect(result.current.recordGeneration).toBe(recordGeneration);
+      expect(result.current.statusText).toBe('1 of 6');
+
+      // Retry still repeats the move; N is fresh from the refresh, so only its target is read.
+      const retryMark = api.mark();
+      await perform(() => result.current.retryLoad());
+      await settled(result);
+
+      expect(api.logSince(retryMark)).toEqual(['beforeLeave', atRequest(2)]);
+      expect(result.current.loadError).toBeNull();
+      expect(result.current.record?.globalRecordId).toBe(idOf(2));
+      expect(result.current.statusText).toBe('2 of 6');
+    });
+
+    it.each([
+      { left: false, expected: [] as string[] },
+      { left: true, expected: [countRequest(), atRequest(2)] },
+    ])(
+      'the after-save refresh that finds the record gone opens the nearest one only after beforeLeave (left: $left)',
+      async ({ left, expected }) => {
+        const { api, result, beforeLeave } = await mount(activeRows(3), { initialPosition: 2 });
+        const saved = api.dto(idOf(2));
+        api.remove(idOf(2));
+        beforeLeave.mockImplementation(leaving(api, left));
+        const mark = api.mark();
+
+        act(() => {
+          result.current.afterSave(saved);
+        });
+        await settled(result);
+        await act(flush);
+
+        const log = api.logSince(mark);
+        expect(sorted(log.slice(0, 2))).toEqual(sorted([countRequest(), positionRequest(idOf(2))]));
+        expect(log.slice(2)).toEqual(['beforeLeave', ...expected]);
+        expect(result.current.transitioning).toBe(false);
+        expect(result.current.loading).toBe(false);
+        if (left) {
+          expect(result.current.notice).toMatch(RECORD_GONE);
+        } else {
+          expect(result.current.notice).toBeNull();
+        }
+        expect(result.current.record?.globalRecordId).toBe(left ? idOf(3) : idOf(2));
+      },
+    );
+  });
+
+  describe('cancelled reads', () => {
+    const abortedReads: readonly {
+      readonly name: string;
+      /** The request whose fetch rejects with an AbortError of its own. */
+      readonly aborted: string;
+      readonly line: string;
+      readonly prepare: (api: FakeApi) => void;
+      readonly start: (navigation: RecordNavigation, api: FakeApi) => Promise<unknown>;
+      /** Every read the load sends; parallel ones are compared sorted. */
+      readonly reads: readonly string[];
+      /** The load reads in parallel, so the abort of one read cancels the load's other requests. */
+      readonly parallel: boolean;
+    }[] = [
+      {
+        name: 'the at/{n} read of a move',
+        aborted: `${RECORDS_PATH}/at/2`,
+        line: atRequest(2),
+        prepare: () => undefined,
+        start: NEXT.run,
+        reads: [atRequest(2)],
+        parallel: false,
+      },
+      {
+        name: 'the record read of an open by id',
+        aborted: `${RECORDS_PATH}/${idOf(4)}`,
+        line: byIdRequest(idOf(4)),
+        prepare: () => undefined,
+        start: (navigation) => navigation.openById(idOf(4)),
+        reads: sorted([byIdRequest(idOf(4)), positionRequest(idOf(4)), countRequest()]),
+        parallel: true,
+      },
+      {
+        name: 'the count read of a toggle change',
+        aborted: `${RECORDS_PATH}/count`,
+        line: countRequest(true),
+        prepare: () => undefined,
+        start: (navigation) => navigation.setIncludeDeleted(true),
+        reads: sorted([countRequest(true), positionRequest(idOf(1), true)]),
+        parallel: true,
+      },
+      {
+        name: 'the count read of the landing after a delete',
+        aborted: `${RECORDS_PATH}/count`,
+        line: countRequest(),
+        prepare: (api) => {
+          api.setStatus(idOf(1), DELETED);
+        },
+        start: (navigation) => {
+          navigation.afterDelete();
+          return Promise.resolve();
+        },
+        reads: [countRequest()],
+        parallel: false,
+      },
+      {
+        name: 'the position read of the after-save refresh',
+        aborted: `${RECORDS_PATH}/${idOf(1)}/position`,
+        line: positionRequest(idOf(1)),
+        prepare: () => undefined,
+        start: (navigation, api) => {
+          navigation.afterSave(api.dto(idOf(1)));
+          return Promise.resolve();
+        },
+        reads: sorted([countRequest(), positionRequest(idOf(1))]),
+        parallel: true,
+      },
+    ];
+
+    it.each(abortedReads)(
+      'an abort of $name settles the current load idle: no error, no banner, not loading',
+      async ({ aborted, line, prepare, start, reads, parallel }) => {
+        const connection = await mountWire(activeRows(5));
+        const { api, result } = connection;
+        prepare(api);
+        connection.abortNext(aborted);
+        const { recordGeneration, n, count } = result.current;
+        const sentBefore = connection.sent.length;
+
+        await perform(() => start(result.current, api));
+        await act(flush);
+
+        // The fetch rejected by itself while its signal was live, and nothing but this load's
+        // own reads was sent: no newer load superseded it, so this load was current.
+        expect(connection.selfAborted).toEqual([line]);
+        const lines = connection.sent.slice(sentBefore).map((entry) => entry.line);
+        expect(parallel ? sorted(lines) : lines).toEqual(reads);
+        // A parallel load cancels its other reads once one is aborted; a single read is left as it was.
+        expect(sentTo(connection, line).signal.aborted).toBe(parallel);
+        expect(result.current.loading).toBe(false);
+        expect(result.current.loadError).toBeNull();
+        expect(result.current.notice).toBeNull();
+        expect(result.current.transitioning).toBe(false);
+        expect(result.current.record?.globalRecordId).toBe(idOf(1));
+        expect(result.current.recordGeneration).toBe(recordGeneration);
+        expect(result.current.n).toBe(n);
+        expect(result.current.count).toBe(count);
+        expect(result.current.includeDeleted).toBe(false);
+      },
+    );
+
+    // The loads that read in parallel: one read of each aborts by itself, or is the one
+    // held at the fake while the load is superseded, and a sibling read stays held.
+    const parallelLoads: readonly {
+      readonly name: string;
+      readonly start: (navigation: RecordNavigation, api: FakeApi) => Promise<unknown>;
+      readonly aborted: { readonly pathname: string; readonly line: string };
+      readonly held: { readonly pathname: string; readonly line: string };
+    }[] = [
+      {
+        name: 'an open by id',
+        start: (navigation) => navigation.openById(idOf(4)),
+        aborted: { pathname: `${RECORDS_PATH}/${idOf(4)}`, line: byIdRequest(idOf(4)) },
+        held: { pathname: `${RECORDS_PATH}/${idOf(4)}/position`, line: positionRequest(idOf(4)) },
+      },
+      {
+        name: 'a toggle change',
+        start: (navigation) => navigation.setIncludeDeleted(true),
+        aborted: { pathname: `${RECORDS_PATH}/count`, line: countRequest(true) },
+        held: { pathname: `${RECORDS_PATH}/${idOf(1)}/position`, line: positionRequest(idOf(1), true) },
+      },
+      {
+        name: 'the after-save refresh',
+        start: (navigation, api) => {
+          navigation.afterSave(api.dto(idOf(1)));
+          return Promise.resolve();
+        },
+        aborted: { pathname: `${RECORDS_PATH}/${idOf(1)}/position`, line: positionRequest(idOf(1)) },
+        held: { pathname: `${RECORDS_PATH}/count`, line: countRequest() },
+      },
+    ];
+
+    it.each(parallelLoads)(
+      'an abort of one read of $name settles it idle at once and cancels the held read it no longer awaits',
+      async ({ start, aborted, held }) => {
+        const connection = await mountWire(activeRows(5));
+        const { api, result } = connection;
+        const { recordGeneration, n, count } = result.current;
+        const gate = api.hold(held.pathname);
+        connection.ignoreAbort(held.pathname);
+        connection.abortNext(aborted.pathname);
+        let running: Promise<unknown> = Promise.resolve();
+        const unchanged = (): void => {
+          expect(result.current.loading).toBe(false);
+          expect(result.current.transitioning).toBe(false);
+          expect(result.current.loadError).toBeNull();
+          expect(result.current.notice).toBeNull();
+          expect(result.current.record?.globalRecordId).toBe(idOf(1));
+          expect(result.current.recordGeneration).toBe(recordGeneration);
+          expect(result.current.n).toBe(n);
+          expect(result.current.count).toBe(count);
+          expect(result.current.includeDeleted).toBe(false);
+        };
+
+        await act(async () => {
+          running = start(result.current, api);
+          await gate.reached;
+          await flush();
+        });
+
+        // The held read has not answered and ignores its signal, so the load settled without
+        // waiting for it, and cancelled it rather than leaving it to run on.
+        expect(connection.selfAborted).toEqual([aborted.line]);
+        expect(sentTo(connection, held.line).signal.aborted).toBe(true);
+        unchanged();
+
+        // Its late answer changes nothing either.
+        await act(async () => {
+          gate.release();
+          await running;
+          await flush();
+        });
+        unchanged();
+      },
+    );
+
+    it.each(parallelLoads)(
+      'a superseded $name whose reads are aborted changes nothing while the move that superseded it runs',
+      async ({ start, held }) => {
+        const connection = await mountWire(activeRows(5));
+        const { api, result } = connection;
+        const obsoleteGate = api.hold(held.pathname);
+        let superseded: Promise<unknown> = Promise.resolve();
+        await act(async () => {
+          superseded = start(result.current, api);
+          await obsoleteGate.reached;
+        });
+        const obsolete = sentTo(connection, held.line);
+        expect(obsolete.signal.aborted).toBe(false);
+        const moveGate = api.hold(`${RECORDS_PATH}/at/2`);
+        let moving: Promise<boolean> = Promise.resolve(false);
+
+        await act(async () => {
+          moving = result.current.goTo(2);
+          await moveGate.reached;
+          await flush();
+        });
+
+        // The move aborted the older load's reads. That load is no longer current, so its
+        // aborted reads neither settle the move idle nor show anything.
+        expect(obsolete.signal.aborted).toBe(true);
+        expect(connection.selfAborted).toEqual([]);
+        expect(result.current.loading).toBe(true);
+        expect(result.current.transitioning).toBe(true);
+        expect(result.current.loadError).toBeNull();
+        expect(result.current.notice).toBeNull();
+        expect(result.current.n).toBe(1);
+        expect(result.current.record?.globalRecordId).toBe(idOf(1));
+        expect(result.current.includeDeleted).toBe(false);
+
+        await act(async () => {
+          moveGate.release();
+          expect(await moving).toBe(true);
+        });
+        const opened = result.current;
+        expect(opened.n).toBe(2);
+        expect(opened.record?.globalRecordId).toBe(idOf(2));
+        expect(opened.loading).toBe(false);
+        expect(opened.transitioning).toBe(false);
+
+        // The superseded load's late answer changes nothing.
+        await act(async () => {
+          obsoleteGate.release();
+          await superseded;
+          await flush();
+        });
+        expect(result.current).toBe(opened);
+      },
+    );
+
+    it.each([
+      {
+        name: 'a later move',
+        overtake: async ({ result }: MountedWire) => {
+          await perform(() => result.current.goTo(4));
+        },
+        n: 4,
+      },
+      {
+        name: 'New',
+        overtake: async ({ result }: MountedWire) => {
+          await perform(() => result.current.newRecord());
+        },
+        n: null,
+      },
+    ])('a load that $name supersedes has its request aborted', async ({ overtake, n }) => {
+      const connection = await mountWire(activeRows(5));
+      const { api, result } = connection;
+      const gate = api.hold(`${RECORDS_PATH}/at/2`);
+      let moving: Promise<void> = Promise.resolve();
+      await act(async () => {
+        moving = result.current.next();
+        await gate.reached;
+      });
+      const held = sentTo(connection, atRequest(2));
+      expect(held.signal.aborted).toBe(false);
+      const sentBefore = connection.sent.length;
+
+      await overtake(connection);
+
+      expect(held.signal.aborted).toBe(true);
+      // The load that overtook it is the latest, so its own reads run on.
+      for (const entry of connection.sent.slice(sentBefore)) {
+        expect(entry.signal.aborted).toBe(false);
+      }
+      await act(async () => {
+        gate.release();
+        await moving;
+      });
+      // The aborted read changed nothing; whatever overtook it decided what is open.
+      expect(result.current.n).toBe(n);
+      expect(result.current.loading).toBe(false);
+      expect(result.current.loadError).toBeNull();
+      expect(result.current.transitioning).toBe(false);
+    });
+
+    it('an unmount aborts the read in flight, and its late answer changes nothing', async () => {
+      const connection = await mountWire(activeRows(5));
+      const { api, result, unmount } = connection;
+      const gate = api.hold(`${RECORDS_PATH}/at/2`);
+      let moving: Promise<void> = Promise.resolve();
+      await act(async () => {
+        moving = result.current.next();
+        await gate.reached;
+      });
+      const held = sentTo(connection, atRequest(2));
+      expect(held.signal.aborted).toBe(false);
+      const shown = result.current;
+
+      unmount();
+
+      expect(held.signal.aborted).toBe(true);
+      gate.release();
+      await moving;
+      await flush();
+      expect(result.current).toBe(shown);
+      expect(api.requests().slice(-1)).toEqual([atRequest(2)]);
+    });
+  });
+
+  describe('the save a transition leave makes', () => {
+    it.each([
+      {
+        name: 'next, once the leave has saved the record,',
+        run: NEXT.run,
+        left: true,
+        reads: [countRequest(), atRequest(2)],
+        parallel: false,
+        n: 2,
+      },
+      {
+        name: 'New, once the leave has saved the record,',
+        run: (navigation: RecordNavigation) => navigation.newRecord(),
+        left: true,
+        reads: [countRequest()],
+        parallel: false,
+        n: null,
+      },
+      {
+        name: 'next, cancelled after the leave saved the record,',
+        run: NEXT.run,
+        left: false,
+        reads: sorted([countRequest(), positionRequest(idOf(1))]),
+        parallel: true,
+        n: 1,
+      },
+    ])('$name sends no after-save refresh of its own before its reads', async ({ run, left, reads, parallel, n }) => {
+      const { api, result, beforeLeave, sent } = await mountWire(activeRows(3));
+      const saved = api.dto(idOf(1));
+      // The editor's leave() saves the dirty record and reports the save before it resolves.
+      beforeLeave.mockImplementation(() => {
+        api.note('beforeLeave');
+        result.current.afterSave(saved);
+        return Promise.resolve(left);
+      });
+      const mark = api.mark();
+      const sentBefore = sent.length;
+
+      await perform(() => run(result.current));
+      await settled(result);
+
+      const log = api.logSince(mark);
+      expect(log[0]).toBe('beforeLeave');
+      expect(parallel ? sorted(log.slice(1)) : log.slice(1)).toEqual(reads);
+      // Nothing was sent only to be superseded.
+      expect(sent.slice(sentBefore).filter((entry) => entry.signal.aborted)).toEqual([]);
+      expect(result.current.n).toBe(n);
+      expect(result.current.count).toBe(3);
+      expect(result.current.transitioning).toBe(false);
+      expect(result.current.loadError).toBeNull();
+    });
+
+    // Record 4 joins the 3-row set before the leave: the record the leave creates, or one
+    // another session created while record 2 was edited, so N grows in both cases.
+    it.each([
+      {
+        name: 'a create on leave (New, then First)',
+        initialPosition: 1,
+        prepare: (navigation: RecordNavigation) => navigation.newRecord(),
+        saved: idOf(4),
+        run: FIRST.run,
+        failed: `${RECORDS_PATH}/at/1`,
+        move: [countRequest(), atRequest(1)],
+        coordinates: { n: 4, count: 4, statusText: '4 of 4' },
+        landed: { id: idOf(1), statusText: '1 of 4' },
+      },
+      {
+        name: 'an update on leave (record 2 edited, then Next)',
+        initialPosition: 2,
+        prepare: () => Promise.resolve(),
+        saved: idOf(2),
+        run: NEXT.run,
+        failed: `${RECORDS_PATH}/at/3`,
+        move: [countRequest(), atRequest(3)],
+        coordinates: { n: 2, count: 4, statusText: '2 of 4' },
+        landed: { id: idOf(3), statusText: '3 of 4' },
+      },
+    ])(
+      "after $name fails, the saved record's n and N are refreshed while the failure and its Retry stay",
+      async ({ initialPosition, prepare, saved, run, failed, move, coordinates, landed }) => {
+        const connection = await mountWire(activeRows(3), initialPosition);
+        const { api, result, beforeLeave } = connection;
+        await perform(() => prepare(result.current));
+        api.add(row(4));
+        // The editor's leave() saves the dirty draft and reports the save before it resolves;
+        // later leaves find the draft clean.
+        beforeLeave.mockImplementationOnce(() => {
+          api.note('beforeLeave');
+          result.current.afterSave(api.dto(saved));
+          return Promise.resolve(true);
+        });
+        connection.failNext(failed);
+        const mark = api.mark();
+
+        await perform(() => run(result.current));
+        await act(flush);
+
+        // The move's reads, the failing one last, then the coordinates of the saved record.
+        const log = api.logSince(mark);
+        expect(log.slice(0, 3)).toEqual(['beforeLeave', ...move]);
+        expect(sorted(log.slice(3))).toEqual(sorted([countRequest(), positionRequest(saved)]));
+        expect(result.current.loadError?.kind).toBe('unavailable');
+        expect(result.current.record?.globalRecordId).toBe(saved);
+        expect(result.current.isNew).toBe(false);
+        expect(result.current.n).toBe(coordinates.n);
+        expect(result.current.count).toBe(coordinates.count);
+        expect(result.current.statusText).toBe(coordinates.statusText);
+        expect(result.current.loading).toBe(false);
+        expect(result.current.transitioning).toBe(false);
+        const { recordGeneration } = result.current;
+
+        // Retry repeats the move; N is fresh from the refresh, so only its target is read.
+        const retryMark = api.mark();
+        await perform(() => result.current.retryLoad());
+        await settled(result);
+
+        expect(api.logSince(retryMark)).toEqual(['beforeLeave', move[1]]);
+        expect(result.current.loadError).toBeNull();
+        expect(result.current.record?.globalRecordId).toBe(landed.id);
+        expect(result.current.statusText).toBe(landed.statusText);
+        expect(result.current.recordGeneration).toBe(recordGeneration + 1);
+        expect(result.current.transitioning).toBe(false);
+      },
+    );
+
+    /**
+     * From New, First whose leave saves the created record 4, which the test has added to
+     * the fake's rows, and whose at/1 then answers 503. Resolves the log mark taken just
+     * before First.
+     */
+    async function failFirstAfterCreate(connection: MountedWire): Promise<number> {
+      const { api, result, beforeLeave } = connection;
+      await perform(() => result.current.newRecord());
+      beforeLeave.mockImplementationOnce(() => {
+        api.note('beforeLeave');
+        result.current.afterSave(api.dto(idOf(4)));
+        return Promise.resolve(true);
+      });
+      connection.failNext(`${RECORDS_PATH}/at/1`);
+      const mark = api.mark();
+      await perform(() => result.current.first());
+      return mark;
+    }
+
+    it('a coordinates refresh answering 404 changes nothing: the failure stays and Retry re-reads N', async () => {
+      const connection = await mountWire(activeRows(3));
+      const { api, result } = connection;
+      api.add(row(4));
+      api.failPosition(idOf(4));
+
+      const mark = await failFirstAfterCreate(connection);
+      await act(flush);
+
+      // The refresh's 404 starts no recovery and shows nothing of its own.
+      const log = api.logSince(mark);
+      expect(log.slice(0, 3)).toEqual(['beforeLeave', countRequest(), atRequest(1)]);
+      expect(sorted(log.slice(3))).toEqual(sorted([countRequest(), positionRequest(idOf(4))]));
+      expect(result.current.loadError?.kind).toBe('unavailable');
+      expect(result.current.notice).toBeNull();
+      expect(result.current.record?.globalRecordId).toBe(idOf(4));
+      expect(result.current.n).toBeNull();
+      expect(result.current.count).toBe(3);
+      expect(result.current.statusText).toBe('');
+
+      // N is still stale, so the repeated move reads it before its target.
+      const retryMark = api.mark();
+      await perform(() => result.current.retryLoad());
+      await settled(result);
+
+      expect(api.logSince(retryMark)).toEqual(['beforeLeave', countRequest(), atRequest(1)]);
+      expect(result.current.loadError).toBeNull();
+      expect(result.current.record?.globalRecordId).toBe(idOf(1));
+      expect(result.current.statusText).toBe('1 of 4');
+    });
+
+    it('Retry supersedes a coordinates refresh in flight and aborts it; its late answer changes nothing', async () => {
+      const connection = await mountWire(activeRows(3));
+      const { api, result } = connection;
+      api.add(row(4));
+      const gate = api.hold(`${RECORDS_PATH}/${idOf(4)}/position`);
+
+      await failFirstAfterCreate(connection);
+      await act(async () => {
+        await gate.reached;
+      });
+
+      const refresh = sentTo(connection, positionRequest(idOf(4)));
+      expect(refresh.signal.aborted).toBe(false);
+      expect(result.current.loadError?.kind).toBe('unavailable');
+      expect(result.current.loading).toBe(false);
+      expect(result.current.n).toBeNull();
+      const retryMark = api.mark();
+
+      await perform(() => result.current.retryLoad());
+      await settled(result);
+
+      // The refresh never answered, so N is still stale and the move re-reads it.
+      expect(refresh.signal.aborted).toBe(true);
+      expect(api.logSince(retryMark)).toEqual(['beforeLeave', countRequest(), atRequest(1)]);
+      const opened = result.current;
+      expect(opened.loadError).toBeNull();
+      expect(opened.record?.globalRecordId).toBe(idOf(1));
+      expect(opened.statusText).toBe('1 of 4');
+
+      await act(async () => {
+        gate.release();
+        await flush();
+      });
+      expect(result.current).toBe(opened);
+    });
+  });
+
+  describe('the editor wired to navigation as FormView wires them', () => {
+    /** A writable text field the fake's records leave empty. */
+    const EDITED = 'FirstName';
+
+    interface Workspace {
+      readonly navigation: RecordNavigation;
+      readonly editor: RecordEditor;
+    }
+
+    function useWorkspace(client: ReturnType<typeof createApiClient>): Workspace {
+      const leaveRef = useRef<() => Promise<boolean>>(() => Promise.resolve(true));
+      const navigation = useRecordNavigation({ client, viewId: VIEW_ID, beforeLeave: () => leaveRef.current() });
+      const editor = useRecordEditor({
+        client,
+        viewId: VIEW_ID,
+        definition: formDefinitionFixture,
+        record: navigation.record,
+        isNew: navigation.isNew,
+        recordGeneration: navigation.recordGeneration,
+        onSaved: navigation.afterSave,
+        onDeleted: navigation.afterDelete,
+        onDiscardToNearest: navigation.openNearest,
+        transitioning: navigation.transitioning,
+      });
+      const { leave } = editor;
+      useLayoutEffect(() => {
+        leaveRef.current = leave;
+      }, [leave]);
+      return { navigation, editor };
+    }
+
+    it('refuses an edit while an open by id waits for its position and count, then edits the opened record', async () => {
+      const api = createFakeApi(activeRows(5));
+      const client = createApiClient({ baseUrl: 'http://localhost', fetch: api.fetch });
+      const { result } = renderHook(() => useWorkspace(client));
+      await waitFor(() => {
+        expect(result.current.navigation.loading).toBe(false);
+      });
+      expect(result.current.editor.values.LastName).toBe('Last 1');
+      expect(result.current.editor.frozen).toBe(false);
+      expect(result.current.editor.isDisabled(EDITED)).toBe(false);
+      expect(result.current.editor.isProtected(EDITED)).toBe(false);
+      const positionGate = api.hold(`${RECORDS_PATH}/${idOf(4)}/position`);
+      const countGate = api.hold(`${RECORDS_PATH}/count`);
+      let opening: Promise<void> = Promise.resolve();
+
+      await act(async () => {
+        opening = result.current.navigation.openById(idOf(4));
+        await Promise.all([positionGate.reached, countGate.reached]);
+      });
+
+      // The record read has answered and the old record is still shown, frozen: the edit
+      // that the record about to be installed would silently replace is refused instead.
+      // Frozen is not protected: the field is disabled, and its protection is unchanged.
+      expect(result.current.navigation.transitioning).toBe(true);
+      expect(result.current.navigation.record?.globalRecordId).toBe(idOf(1));
+      expect(result.current.editor.frozen).toBe(true);
+      expect(result.current.editor.isDisabled(EDITED)).toBe(true);
+      expect(result.current.editor.isProtected(EDITED)).toBe(false);
+      act(() => {
+        result.current.editor.setValue(EDITED, 'Typed while opening');
+      });
+      expect(result.current.editor.values[EDITED]).toBeNull();
+      expect(result.current.editor.isDirty).toBe(false);
+
+      await act(async () => {
+        positionGate.release();
+        countGate.release();
+        await opening;
+      });
+
+      expect(result.current.navigation.transitioning).toBe(false);
+      expect(result.current.navigation.record?.globalRecordId).toBe(idOf(4));
+      expect(result.current.navigation.n).toBe(4);
+      expect(result.current.editor.values.LastName).toBe('Last 4');
+      expect(result.current.editor.frozen).toBe(false);
+      expect(result.current.editor.isDisabled(EDITED)).toBe(false);
+      expect(result.current.editor.isProtected(EDITED)).toBe(false);
+      act(() => {
+        result.current.editor.setValue(EDITED, 'Typed after opening');
+      });
+      expect(result.current.editor.values[EDITED]).toBe('Typed after opening');
+      expect(result.current.editor.isDirty).toBe(true);
     });
   });
 });

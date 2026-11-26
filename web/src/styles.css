@@ -451,6 +451,11 @@
     text-align: center;
   }
 
+  /* A pending load's status shows the previous coordinates muted until the new ones arrive. */
+  .record-navigator [role="status"][aria-busy="true"] {
+    color: var(--color-text-muted);
+  }
+
   /* "Saving…" while a save is under way; empty and visually hidden, though still rendered, when idle. */
   .form-toolbar [role="status"] {
     padding-inline: var(--space-2);
@@ -459,6 +464,23 @@
 
   .record-navigator input:not([type="checkbox"]):not([type="radio"]) {
     inline-size: 5.5rem;
+  }
+
+  /* Pressed entry: the button pressed surface, through the control's custom
+   * property like the other text-control states. */
+  .record-navigator input:not([type="checkbox"]):not([type="radio"]):active:not(:disabled) {
+    --control-background: var(--color-surface-active);
+  }
+
+  /* A pending load disables no control, since a press supersedes it, so the
+   * toolbar and its enabled controls show the progress pointer instead;
+   * disabled controls keep theirs. The label is listed because the user-agent
+   * stylesheet gives labels their own cursor, which blocks inheritance. */
+  .record-navigator[aria-busy="true"],
+  .record-navigator[aria-busy="true"] label,
+  .record-navigator[aria-busy="true"] button:not(:disabled),
+  .record-navigator[aria-busy="true"] input:not(:disabled) {
+    cursor: progress;
   }
 
   .record-navigator .field-error {
@@ -620,7 +642,9 @@
     background-color: var(--color-surface-muted);
   }
 
-  /* Disabled by check code only: the native disabled controls fade, radios
+  /* Disabled by check code only, or a draft frozen while its record is being
+   * left or replaced. Only opacity changes, so the layout never shifts: the
+   * native disabled controls fade, radios
    * in a disabled fieldset included, as inactive controls are exempt from
    * the WCAG contrast minimum (1.4.3). The label, legend, hint and error
    * messages are separate text the exemption does not cover, so the wrapper

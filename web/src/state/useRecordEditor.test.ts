@@ -12,6 +12,8 @@
 // - A write is acknowledged only by its contracted status (201 for POST, 200 for PUT)
 //   with its complete Record DTO; any other 2xx offers Save again only, as no response does.
 // - C-6: Delete asks first; Cancel sends nothing, Confirm sends exactly one DELETE.
+// - P2 permissions (0.2.4): a save the definition's flags deny sends no request; a known
+//   denial or a 403 keeps the draft and offers Discard edits, which reverts it in place.
 // - Exact numbers: the client reads a field value that is an integer beyond
 //   ±Number.MAX_SAFE_INTEGER, which a `bigint` column admits, as its bigint and saves it
 //   digit for digit, and reads every other number, such as a `tabIndex`, `uniqueKey` or
@@ -25,6 +27,7 @@ import { act, renderHook } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi, type Mock } from 'vitest';
 
 import { createApiClient, numberFromText, type ApiClient, type ApiResult } from '../api/client';
+import { errorMessages } from '../api/errors';
 import type {
   FieldDefinition,
   FieldEventResponse,
@@ -292,10 +295,11 @@ function jsonResponse(status: number, body: RecordDto): Response {
   });
 }
 
-type ProblemStatus = 400 | 404 | 409 | 413 | 500 | 503;
+type ProblemStatus = 400 | 403 | 404 | 409 | 413 | 500 | 503;
 
 const PROBLEM_TITLES: Readonly<Record<ProblemStatus, string>> = {
   400: 'Bad Request',
+  403: 'Forbidden',
   404: 'Not Found',
   409: 'Conflict',
   413: 'Payload Too Large',
@@ -1687,6 +1691,139 @@ describe('delete (C-6)', () => {
   });
 });
 
+describe('permission flags (P2)', () => {
+  // Flags are null until the server reports them, and only `false` denies. The write's own
+  // flag decides: canInsert for the POST of a new record, canUpdate for a PUT. A denied save
+  // sends nothing, whether Save or leaving started it, and a 403 from the server keeps the
+  // draft as well. Either banner offers Discard edits, which reverts the record in place:
+  // it still exists, so no other record is opened. Permissions protect no field (0.3.6).
+  type Flags = Pick<FormDefinition, 'canInsert' | 'canUpdate'>;
+
+  /** The write of each case, and the values Discard edits restores. */
+  const UPDATE = {
+    write: 'an update',
+    isNew: false,
+    line: `PUT ${recordPath(storedRecord())}`,
+    stored: storedRecord().values,
+    action: 'update',
+  } as const;
+  const CREATE = {
+    write: 'a create',
+    isNew: true,
+    line: `POST ${RECORDS_PATH}`,
+    stored: emptyValues(),
+    action: 'create',
+  } as const;
+
+  /** Mounts the editor on a definition carrying `flags`, kept as one object across rerenders. */
+  function mountWithFlags(isNew: boolean, flags: Flags): Mounted {
+    const definition: FormDefinition = { ...createFormDefinitionFixture(), ...flags };
+    return isNew ? mount(null, true, definition) : mount(storedRecord(), false, definition);
+  }
+
+  it.each([
+    { ...UPDATE, flags: { canInsert: true, canUpdate: false } },
+    { ...CREATE, flags: { canInsert: false, canUpdate: true } },
+  ])('refuses $write the flags deny without a request, and discards it in place', async (row) => {
+    const { api, result, onSaved, onDiscardToNearest } = mountWithFlags(row.isNew, row.flags);
+    edit(result, TEXT, 'Jones');
+
+    expect(await perform(() => result.current.leave())).toBe(false);
+
+    const banner = bannerOf(result.current);
+    expect(banner.kind).toBe('forbidden');
+    expect(banner.message).toBe(errorMessages.forbidden[row.action]);
+    expect(banner.actions).toEqual(['discardEdits']);
+    expect(banner.traceId).toBeNull();
+    expect(banner.isCreate).toBe(row.isNew);
+    expect(result.current.values[TEXT]).toBe('Jones');
+    expect(result.current.isDirty).toBe(true);
+    expect(result.current.isProtected(TEXT)).toBe(false);
+    expect(result.current.saving).toBe(false);
+
+    // An explicit save is refused the same way.
+    run(() => {
+      result.current.dismissBanner();
+    });
+    expect(await perform(() => result.current.save())).toBe(false);
+    expect(result.current.banner).toEqual(banner);
+    expect(api.calls).toEqual([]);
+
+    run(() => {
+      result.current.discardEdits();
+    });
+
+    expect(result.current.values).toEqual(row.stored);
+    expect(result.current.isDirty).toBe(false);
+    expect(result.current.banner).toBeNull();
+    expect(onDiscardToNearest).not.toHaveBeenCalled();
+    expect(await perform(() => result.current.leave())).toBe(true);
+    expect(api.calls).toEqual([]);
+    expect(onSaved).not.toHaveBeenCalled();
+  });
+
+  // Null flags restrict nothing either: the fixture reports none, so 'posts an entered value
+  // with false for every unchecked writable checkbox and no protected field' and 'puts only %s'
+  // above save with null flags.
+  it.each([
+    {
+      ...UPDATE,
+      flags: { canInsert: false, canUpdate: true },
+      status: 200,
+      saved: savedCopy(storedRecord(), { [TEXT]: 'Jones' }),
+    },
+    {
+      ...CREATE,
+      flags: { canInsert: true, canUpdate: false },
+      status: 201,
+      saved: createdRecord({ [TEXT]: 'Jones', ...uncheckedCheckboxes() }),
+    },
+  ])('sends $write its own flag allows, whatever the other flag says', async (row) => {
+    const { api, result, onSaved } = mountWithFlags(row.isNew, row.flags);
+    edit(result, TEXT, 'Jones');
+    api.reply(jsonResponse(row.status, row.saved));
+
+    expect(await perform(() => result.current.leave())).toBe(true);
+
+    expect(api.lines()).toEqual([row.line]);
+    expect(onSaved).toHaveBeenCalledWith(row.saved);
+    expect(result.current.banner).toBeNull();
+    expect(result.current.isDirty).toBe(false);
+  });
+
+  it.each([
+    { ...UPDATE, flags: { canInsert: null, canUpdate: null } },
+    { ...CREATE, flags: { canInsert: true, canUpdate: true } },
+  ])('keeps the draft on a 403 to $write, and discards it in place', async (row) => {
+    const { api, result, onSaved, onDiscardToNearest } = mountWithFlags(row.isNew, row.flags);
+    edit(result, TEXT, 'Jones');
+    api.reply(problem(403));
+
+    expect(await perform(() => result.current.leave())).toBe(false);
+
+    expect(api.lines()).toEqual([row.line]);
+    const banner = bannerOf(result.current);
+    expect(banner.kind).toBe('forbidden');
+    expect(banner.message).toBe(errorMessages.forbidden[row.action]);
+    expect(banner.actions).toEqual(['discardEdits']);
+    expect(banner.traceId).toBe(TRACE_ID);
+    expect(result.current.values[TEXT]).toBe('Jones');
+    expect(result.current.isDirty).toBe(true);
+
+    run(() => {
+      result.current.discardEdits();
+    });
+
+    expect(result.current.values).toEqual(row.stored);
+    expect(result.current.isDirty).toBe(false);
+    expect(result.current.banner).toBeNull();
+    expect(onDiscardToNearest).not.toHaveBeenCalled();
+    expect(await perform(() => result.current.leave())).toBe(true);
+    expect(api.lines()).toEqual([row.line]);
+    expect(onSaved).not.toHaveBeenCalled();
+  });
+});
+
 describe('protected state', () => {
   it('protects read-only and unsupported fields of an active record, and no writable one', () => {
     const { result } = mountExisting();
@@ -1750,6 +1887,151 @@ describe('protected state', () => {
     expect(result.current.fieldErrors).toEqual({});
     expect(result.current.banner).toBeNull();
     expect(api.lines()).toHaveLength(2);
+  });
+});
+
+describe('leaving a record: the frozen draft (0.3.6)', () => {
+  /**
+   * Lets the tick pass after which the record installed at mount may raise field events,
+   * so a focus, blur or click that raises none does so because the draft is frozen.
+   */
+  async function pastMountTick(): Promise<void> {
+    await act(async () => {
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, 0);
+      });
+    });
+  }
+
+  /** Edits and field events a frozen draft must refuse; an event sent would be an unanswered request. */
+  function tryToChange(result: Current): void {
+    edit(result, TEXT, 'Brown');
+    edit(result, OTHER_TEXT, 'Brown');
+    edit(result, CHECKBOX, true);
+    run(() => {
+      result.current.onFieldFocus(TEXT);
+      result.current.onFieldBlur(TEXT);
+      result.current.onFieldClick(CHECKBOX);
+    });
+  }
+
+  /**
+   * A frozen draft disables every field and protects none that is not protected anyway:
+   * a record being left or replaced is not read-only, so protection keeps its own state.
+   */
+  function expectEveryFieldFrozen(editor: RecordEditor, frozen: boolean): void {
+    expect(editor.frozen).toBe(frozen);
+    for (const field of allFields().filter(isWritableDataField)) {
+      expect(editor.isProtected(field.name), field.name).toBe(false);
+      expect(editor.isDisabled(field.name), field.name).toBe(frozen);
+    }
+    for (const name of PROTECTED_FIELD_NAMES) {
+      expect(editor.isProtected(name), name).toBe(true);
+      expect(editor.isDisabled(name), name).toBe(true);
+    }
+    if (frozen) {
+      for (const field of allFields()) {
+        expect(editor.isDisabled(field.name), field.name).toBe(true);
+      }
+    }
+  }
+
+  it('freezes the draft during the save leave() starts, then resolves true after exactly one PUT', async () => {
+    const { api, result, record, onSaved } = mountExisting();
+    await pastMountTick();
+    edit(result, TEXT, 'Jones');
+    const gate = api.hold();
+
+    // Back to forms calls leave() directly, with no transition around it.
+    const leaving = await startHeld(() => result.current.leave(), gate);
+
+    expect(api.lines()).toEqual([`PUT ${recordPath(record)}`]);
+    expectEveryFieldFrozen(result.current, true);
+    tryToChange(result);
+    expect(result.current.values).toEqual({ ...record.values, [TEXT]: 'Jones' });
+    expect(result.current.dirty).toEqual(new Set([TEXT]));
+    expect(leaving.outcome()).toBeUndefined();
+
+    const saved = savedCopy(record, { [TEXT]: 'Jones' });
+    await act(async () => {
+      gate.release(jsonResponse(200, saved));
+      await leaving.promise;
+    });
+
+    expect(leaving.outcome()).toBe(true);
+    // One PUT, carrying the edit made before the leave, and no field event.
+    expect(api.lines()).toEqual([`PUT ${recordPath(record)}`]);
+    expect(sentValues(api.calls[0])).toEqual({ [TEXT]: 'Jones' });
+    expect(onSaved).toHaveBeenCalledTimes(1);
+    expect(result.current.isDirty).toBe(false);
+    expect(result.current.dirty.size).toBe(0);
+    expect(result.current.values).toEqual(saved.values);
+
+    // Once leave() has resolved, the draft takes edits again.
+    expectEveryFieldFrozen(result.current, false);
+    edit(result, OTHER_TEXT, 'Green');
+    expect(result.current.values[OTHER_TEXT]).toBe('Green');
+  });
+
+  it('saves an edit made while an explicit save was in flight before leave() resolves true', async () => {
+    const { api, result, record, onSaved } = mountExisting();
+    edit(result, TEXT, 'Jones');
+    const gate = api.hold();
+    const saving = await startHeld(() => result.current.save(), gate);
+
+    // An explicit save does not freeze the draft, so the user keeps typing.
+    expectEveryFieldFrozen(result.current, false);
+    edit(result, OTHER_TEXT, 'Brown');
+    expect(result.current.values[OTHER_TEXT]).toBe('Brown');
+
+    const second = savedCopy(record, { [TEXT]: 'Jones', [OTHER_TEXT]: 'Brown' });
+    api.reply(jsonResponse(200, second));
+    const left = await perform(() => {
+      const leaving = result.current.leave();
+      gate.release(jsonResponse(200, savedCopy(record, { [TEXT]: 'Jones' })));
+      return leaving;
+    });
+
+    expect(await saving.promise).toBe(true);
+    expect(left).toBe(true);
+    expect(api.lines()).toEqual([`PUT ${recordPath(record)}`, `PUT ${recordPath(record)}`]);
+    expect(sentValues(api.calls[0])).toEqual({ [TEXT]: 'Jones' });
+    expect(sentValues(api.calls[1])).toEqual({ [OTHER_TEXT]: 'Brown' });
+    expect(onSaved).toHaveBeenCalledTimes(2);
+    expect(onSaved).toHaveBeenLastCalledWith(second);
+    expect(result.current.isDirty).toBe(false);
+    expect(result.current.values).toEqual(second.values);
+  });
+
+  it('freezes the draft while navigation is transitioning, still saves it on leave, and unfreezes it after', async () => {
+    const { api, result, record, props, rerender } = mountExisting();
+    await pastMountTick();
+    edit(result, TEXT, 'Jones');
+
+    rerender({ ...props, transitioning: true });
+
+    expectEveryFieldFrozen(result.current, true);
+    tryToChange(result);
+    expect(result.current.values).toEqual({ ...record.values, [TEXT]: 'Jones' });
+    expect(result.current.dirty).toEqual(new Set([TEXT]));
+    expect(api.calls).toEqual([]);
+    // Frozen is not protected: the edit made before the freeze still holds the user, and
+    // the leave that navigation awaits saves it.
+    expect(result.current.isDirty).toBe(true);
+    const saved = savedCopy(record, { [TEXT]: 'Jones' });
+    api.reply(jsonResponse(200, saved));
+    expect(await perform(() => result.current.leave())).toBe(true);
+    expect(api.lines()).toEqual([`PUT ${recordPath(record)}`]);
+    expect(sentValues(api.calls[0])).toEqual({ [TEXT]: 'Jones' });
+    expectEveryFieldFrozen(result.current, true);
+
+    rerender({ ...props, transitioning: false });
+
+    expectEveryFieldFrozen(result.current, false);
+    edit(result, OTHER_TEXT, 'Brown');
+    expect(result.current.values[OTHER_TEXT]).toBe('Brown');
+    expect(result.current.dirty).toEqual(new Set([OTHER_TEXT]));
+    expect(api.lines()).toHaveLength(1);
   });
 });
 

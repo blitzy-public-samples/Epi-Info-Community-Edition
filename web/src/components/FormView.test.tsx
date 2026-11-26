@@ -26,6 +26,10 @@
 // as a fraction whose nearest double is whole is sent as typed, in its field event and its
 // save. A tabIndex beyond the safe range, read from the form route's own body text, still
 // orders the page and Find.
+//
+// The navigator cases hold a navigation read: a pending load disables no control, marks the
+// toolbar and its status busy and announces itself outside them, a press supersedes it, and
+// the draft it replaces is frozen, every field disabled and none marked protected.
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { Profiler } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vitest';
@@ -65,6 +69,7 @@ import {
 } from '../test/formDefinitionFixture';
 import { formatRequiredMessage } from '../validation/clientValidation';
 import { FormView } from './FormView';
+import { RecordNavigator, type RecordNavigatorProps } from './RecordNavigator';
 import type { RecordGridProps } from './RecordGrid';
 import { fieldComponents, fieldControlId, fieldErrorId, type FieldComponentProps } from './fields/fieldComponents';
 import { NumberInput } from './fields/NumberInput';
@@ -3102,6 +3107,353 @@ describe('a tabIndex beyond the safe range', () => {
       'GlobalRecordId',
       'RecStatus',
     ]);
+  });
+});
+
+describe('RecordNavigator pending and busy states', () => {
+  // A pending navigation load disables no control: useRecordNavigation drops the responses
+  // of a load a newer action overtakes, so a press mid-load supersedes it. The toolbar and
+  // its status are marked busy and the load is announced instead. A control is disabled
+  // only while its operation is unavailable: an edge, an empty set, or a save in progress.
+  type NavigatorState = RecordNavigatorProps['navigation'];
+
+  const LOADING = 'Loading…';
+  const BUTTONS = ['First', 'Previous', 'Next', 'Last', 'Go', 'New'] as const;
+
+  // Three records, so record 1 has a Next, and Last can overtake a pending Next.
+  const LAST_NAMES = ['Lovelace', 'Hopper', 'Noether'];
+  const RECORDS: readonly RecordDto[] = LAST_NAMES.map((lastName, index) =>
+    recordFixture({
+      globalRecordId: `3f2b8c1e-5d4a-4c1b-9e7f-${String(101 + index).padStart(12, '0')}`,
+      uniqueKey: index + 1,
+      position: index + 1,
+      count: LAST_NAMES.length,
+      values: { LastName: lastName },
+    }),
+  );
+
+  interface HoldingApi {
+    readonly fetch: typeof fetch;
+    /** Holds the next GET of `at/{position}` until `release`. */
+    readonly holdAt: (position: number) => void;
+    /** Requests held so far and not yet released. */
+    readonly heldCount: () => number;
+    /** Answers every held request. */
+    readonly release: () => void;
+  }
+
+  /**
+   * The in-memory API over the three records. The definition and every other request go
+   * to fakeApi, which records an unrouted one. A held request still rejects with an
+   * AbortError when its signal aborts, as fetch does.
+   */
+  function holdingApi(definition: FormDefinition): HoldingApi {
+    const base = fakeApi(definition, [...RECORDS]);
+    const records = `/api/forms/${definition.viewId}/records`;
+    const heldPaths = new Set<string>();
+    const waiting: (() => void)[] = [];
+
+    function bodyOf(path: string): unknown {
+      if (path === records) {
+        const page: RecordPage = {
+          items: RECORDS.map((record) => recordSummaryFixture(record, definition)),
+          total: RECORDS.length,
+          page: 1,
+          pageSize: 50,
+        };
+        return page;
+      }
+      if (path === `${records}/count`) {
+        const count: RecordCountResponse = { count: RECORDS.length };
+        return count;
+      }
+      for (const [index, record] of RECORDS.entries()) {
+        const byId = `${records}/${record.globalRecordId}`;
+        if (path === `${records}/at/${index + 1}` || path === byId) {
+          return record;
+        }
+        if (path === `${byId}/position`) {
+          const position: NavigationPosition = { position: index + 1, count: RECORDS.length };
+          return position;
+        }
+      }
+      return null;
+    }
+
+    function hold(signal: AbortSignal): Promise<void> {
+      return new Promise((resolve, reject) => {
+        const abort = (): void => {
+          reject(new DOMException('The operation was aborted.', 'AbortError'));
+        };
+        if (signal.aborted) {
+          abort();
+          return;
+        }
+        signal.addEventListener('abort', abort, { once: true });
+        waiting.push(resolve);
+      });
+    }
+
+    return {
+      fetch: async (input, init) => {
+        const request = input instanceof Request ? input : new Request(input, init);
+        const url = new URL(request.url);
+        const body = request.method === 'GET' ? bodyOf(url.pathname) : null;
+        if (body === null) {
+          return base(request);
+        }
+        calls.push({ method: request.method, url, body: null });
+        if (heldPaths.delete(url.pathname)) {
+          await hold(request.signal);
+        }
+        return jsonResponse(200, body);
+      },
+      holdAt: (position) => {
+        heldPaths.add(`${records}/at/${position}`);
+      },
+      heldCount: () => waiting.length,
+      release: () => {
+        for (const resolve of waiting.splice(0)) {
+          resolve();
+        }
+      },
+    };
+  }
+
+  /** Renders the form over the three records; resolves once record 1 of 3 and the grid have loaded. */
+  async function renderThreeRecords(api: HoldingApi, definition: FormDefinition): Promise<HTMLElement> {
+    const client = createApiClient({ baseUrl: 'http://localhost', fetch: api.fetch });
+    render(
+      <FormView
+        viewId={definition.viewId}
+        client={client}
+        onExit={vi.fn<() => void>()}
+        onFormNotFound={vi.fn<() => void>()}
+      />,
+    );
+    const navigator = await screen.findByRole('toolbar', { name: 'Record navigation' });
+    await within(navigator).findByText('1 of 3');
+    await within(screen.getByRole('region', { name: 'Records' })).findByText('3 records');
+    return navigator;
+  }
+
+  /** Answers the held requests and lets their responses run through to the render. */
+  async function releaseAndSettle(api: HoldingApi): Promise<void> {
+    await act(async () => {
+      api.release();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+  }
+
+  /** Whether each navigator control is enabled, by accessible name. */
+  function enabledControls(navigator: HTMLElement): Record<string, boolean> {
+    const states: Record<string, boolean> = {};
+    for (const name of BUTTONS) {
+      states[name] = !isDisabled(within(navigator).getByRole('button', { name }));
+    }
+    states['Go to record'] = !isDisabled(within(navigator).getByRole('textbox', { name: 'Go to record' }));
+    return states;
+  }
+
+  function allControls(enabled: boolean): Record<string, boolean> {
+    return Object.fromEntries([...BUTTONS, 'Go to record'].map((name) => [name, enabled]));
+  }
+
+  function lastNameValue(): string {
+    return controlValue(screen.getByLabelText('Last Name'));
+  }
+
+  /**
+   * The pending-load announcer, found by role: the one status that directly follows the
+   * navigator toolbar. Other statuses, such as the navigator's "[n] of N", the form actions'
+   * Saving… and the record grid's, sit elsewhere.
+   */
+  function loadingAnnouncer(navigator: HTMLElement): HTMLElement {
+    const following = screen.getAllByRole('status').filter((element) => element.previousElementSibling === navigator);
+    expect(following, 'statuses following the navigator toolbar').toHaveLength(1);
+    expect(navigator.contains(following[0])).toBe(false);
+    return following[0];
+  }
+
+  /**
+   * Asserts the announcer reads `text` as a polite status of its own, beside the toolbar and
+   * outside every aria-busy subtree, while the toolbar's one status stays `status`, the
+   * "[n] of N" text. Returns the announcer.
+   */
+  function expectAnnouncer(navigator: HTMLElement, status: HTMLElement, text: string): HTMLElement {
+    const announcer = loadingAnnouncer(navigator);
+    expect(announcer.textContent).toBe(text);
+    expect(announcer.getAttribute('role')).toBe('status');
+    expect(announcer.getAttribute('aria-live')).toBe('polite');
+    expect(announcer.closest('[aria-busy="true"]')).toBeNull();
+    expect(navigator.nextElementSibling).toBe(announcer);
+    expect(within(navigator).getAllByRole('status')).toEqual([status]);
+    return announcer;
+  }
+
+  it('keeps every available control enabled during a pending load, and marks and announces the load', async () => {
+    const definition = createFormDefinitionFixture();
+    const api = holdingApi(definition);
+    const navigator = await renderThreeRecords(api, definition);
+    const status = within(navigator).getByRole('status');
+    expect(navigator.getAttribute('aria-busy')).toBeNull();
+    expect(status.getAttribute('aria-busy')).toBeNull();
+
+    api.holdAt(2);
+    fireEvent.click(within(navigator).getByRole('button', { name: 'Next' }));
+    await waitFor(() => {
+      expect(api.heldCount()).toBe(1);
+    });
+
+    expect(navigator.getAttribute('aria-busy')).toBe('true');
+    // The status still shows the open record's coordinates, so it is busy rather than current.
+    expect(status.getAttribute('aria-busy')).toBe('true');
+    expect(status.textContent).toBe('1 of 3');
+    // The selector styles.css mutes the pending status with (jsdom loads no stylesheet).
+    expect(status.matches('.record-navigator [role="status"][aria-busy="true"]')).toBe(true);
+    // The announcement follows the toolbar, outside every aria-busy subtree, since assistive
+    // technology may hold back a busy subtree's updates until the load has ended.
+    const announcement = expectAnnouncer(navigator, status, LOADING);
+    // Previous is the one disabled control: record 1 has no previous record.
+    expect(enabledControls(navigator)).toEqual({ ...allControls(true), Previous: false });
+
+    await releaseAndSettle(api);
+
+    expect(status.textContent).toBe('2 of 3');
+    expect(lastNameValue()).toBe('Hopper');
+    expect(navigator.getAttribute('aria-busy')).toBeNull();
+    expect(status.getAttribute('aria-busy')).toBeNull();
+    // The same live region stays mounted beside the toolbar, emptied, for the next load to
+    // announce into.
+    expect(expectAnnouncer(navigator, status, '')).toBe(announcement);
+    expect(enabledControls(navigator)).toEqual(allControls(true));
+  });
+
+  it('lets a press during a pending load supersede it, and ignores the overtaken response', async () => {
+    const definition = createFormDefinitionFixture();
+    const api = holdingApi(definition);
+    const navigator = await renderThreeRecords(api, definition);
+    const status = within(navigator).getByRole('status');
+
+    api.holdAt(2);
+    fireEvent.click(within(navigator).getByRole('button', { name: 'Next' }));
+    await waitFor(() => {
+      expect(api.heldCount()).toBe(1);
+    });
+    fireEvent.click(within(navigator).getByRole('button', { name: 'Last' }));
+
+    await waitFor(() => {
+      expect(status.textContent).toBe('3 of 3');
+    });
+    expect(lastNameValue()).toBe('Noether');
+    expect(navigator.getAttribute('aria-busy')).toBeNull();
+
+    // The read of record 2 answers last and installs nothing.
+    await releaseAndSettle(api);
+
+    expect(status.textContent).toBe('3 of 3');
+    expect(lastNameValue()).toBe('Noether');
+    expect(navigator.getAttribute('aria-busy')).toBeNull();
+    expectAnnouncer(navigator, status, '');
+  });
+
+  it('disables every data field while a pending load replaces the record, without marking any protected (0.3.6)', async () => {
+    const definition = createFormDefinitionFixture();
+    const api = holdingApi(definition);
+    const navigator = await renderThreeRecords(api, definition);
+    const body = document.body;
+    const writable = dataFieldNames.filter((name) => !readOnlyFieldNames.includes(name));
+    expect(writable).not.toHaveLength(0);
+
+    /** The field's control, found by its prompt within the field's own wrapper. */
+    function labelledControl(name: string): HTMLElement {
+      const field = fieldByName(name, definition);
+      const wrapper = within(wrapperOf(body, name));
+      // A radio group is named by its legend; a panel other than the selected one is hidden.
+      return field.fieldType === 'option'
+        ? wrapper.getByRole('radiogroup', { name: promptOf(field), hidden: true })
+        : wrapper.getByLabelText(promptOf(field));
+    }
+
+    /** Whether the labelled control and each native control the field renders is disabled. */
+    function disabledStates(name: string): boolean[] {
+      const controls = Array.from(wrapperOf(body, name).querySelectorAll(NATIVE_CONTROLS));
+      return [labelledControl(name), ...controls].map((control) => isDisabled(control));
+    }
+
+    function protectedWrappers(): (string | undefined)[] {
+      return Array.from(body.querySelectorAll<HTMLElement>('[data-field-name].field--protected')).map(
+        (wrapper) => wrapper.dataset.fieldName,
+      );
+    }
+
+    // Before the load only read-only metadata and the unsupported field are protected.
+    const protectedBefore = protectedWrappers();
+    expect(new Set(protectedBefore)).toEqual(
+      new Set(
+        allFields(definition)
+          .filter((field) => field.fieldType === 'unsupported' || readOnlyFieldNames.includes(field.name))
+          .map((field) => field.name),
+      ),
+    );
+    expect(body.querySelectorAll('.field--disabled')).toHaveLength(0);
+
+    api.holdAt(2);
+    fireEvent.click(within(navigator).getByRole('button', { name: 'Next' }));
+    await waitFor(() => {
+      expect(api.heldCount()).toBe(1);
+    });
+
+    // The record being left is frozen: every control refuses input, yet nothing becomes
+    // protected, so no wrapper takes the protected padding and background meanwhile.
+    expect(lastNameValue()).toBe('Lovelace');
+    for (const name of dataFieldNames) {
+      expect(disabledStates(name), name).not.toContain(false);
+    }
+    expect(protectedWrappers()).toEqual(protectedBefore);
+    for (const name of writable) {
+      expect(wrapperOf(body, name).className, name).toBe('field field--disabled');
+    }
+
+    await releaseAndSettle(api);
+
+    expect(lastNameValue()).toBe('Hopper');
+    for (const name of writable) {
+      expect(disabledStates(name), name).not.toContain(true);
+      expect(wrapperOf(body, name).className, name).toBe('field');
+    }
+    expect(protectedWrappers()).toEqual(protectedBefore);
+    expect(body.querySelectorAll('.field--disabled')).toHaveLength(0);
+  });
+
+  it('disables every control while the editor saves, and marks the toolbar busy without announcing a load', () => {
+    const navigation: NavigatorState = {
+      count: 3,
+      statusText: '2 of 3',
+      goToError: null,
+      loading: false,
+      recordGeneration: 1,
+      canFirst: true,
+      canPrevious: true,
+      canNext: true,
+      canLast: true,
+      canGoTo: true,
+      first: vi.fn<NavigatorState['first']>(),
+      previous: vi.fn<NavigatorState['previous']>(),
+      next: vi.fn<NavigatorState['next']>(),
+      last: vi.fn<NavigatorState['last']>(),
+      goTo: vi.fn<NavigatorState['goTo']>(),
+      newRecord: vi.fn<NavigatorState['newRecord']>(),
+    };
+    render(<RecordNavigator navigation={navigation} busy />);
+    const navigator = screen.getByRole('toolbar', { name: 'Record navigation' });
+    const status = within(navigator).getByRole('status');
+
+    expect(enabledControls(navigator)).toEqual(allControls(false));
+    expect(navigator.getAttribute('aria-busy')).toBe('true');
+    expect(status.getAttribute('aria-busy')).toBeNull();
+    expect(status.textContent).toBe('2 of 3');
+    expectAnnouncer(navigator, status, '');
   });
 });
 

@@ -109,6 +109,11 @@ export interface UseRecordEditorOptions {
   readonly onDeleted: () => void;
   /** The record is gone (404) or its edits were discarded: open the nearest record. */
   readonly onDiscardToNearest: (notice?: string) => void;
+  /**
+   * useRecordNavigation's `transitioning`: the record is being left or replaced; the draft
+   * is frozen until the next record is installed.
+   */
+  readonly transitioning?: boolean;
 }
 
 /**
@@ -136,9 +141,18 @@ export interface RecordEditor {
   readonly deletedReadOnly: boolean;
   /** Fields check code disabled; protection is kept apart, so ENABLE never unlocks a protected field. */
   readonly checkCodeDisabled: ReadonlySet<string>;
-  /** Read-only metadata, an unsupported field, a deleted record, or no record open. */
+  /**
+   * The record is being left or replaced: leave() is running, or navigation's
+   * `transitioning` holds until the next record is installed. No edit or field event
+   * reaches the draft meanwhile, and every field is disabled; protection is unchanged.
+   */
+  readonly frozen: boolean;
+  /**
+   * Read-only metadata, an unsupported field, a deleted record, or no record open. A
+   * frozen draft is not protected.
+   */
   readonly isProtected: (name: string) => boolean;
-  /** Protected, or disabled by check code. */
+  /** Protected, disabled by check code, or frozen. */
   readonly isDisabled: (name: string) => boolean;
   readonly setValue: (name: string, value: FieldValue) => void;
   /** Resolves `true` when nothing needed saving or the save succeeded. */
@@ -210,6 +224,8 @@ interface EditorState {
   readonly deleteDialogOpen: boolean;
   readonly dialogs: readonly DialogMessage[];
   readonly eventNotice: string | null;
+  /** leave() is running: the draft is frozen until it resolves. */
+  readonly leaving: boolean;
 }
 
 interface FieldIndex {
@@ -408,7 +424,30 @@ function freshDraft(index: FieldIndex, record: RecordDto | null, isNew: boolean,
     deleteDialogOpen: false,
     dialogs: [],
     eventNotice: null,
+    leaving: false,
   };
+}
+
+/**
+ * Whether two states of one draft hold the same dirty set and values: a save that
+ * succeeded and left this unchanged made no progress, and sending it again would too.
+ */
+function sameDraft(a: EditorState, b: EditorState): boolean {
+  if (a.generation !== b.generation || a.isNew !== b.isNew || a.dirty.size !== b.dirty.size) {
+    return false;
+  }
+  for (const name of a.dirty) {
+    if (!b.dirty.has(name)) {
+      return false;
+    }
+  }
+  const names = new Set([...Object.keys(a.values), ...Object.keys(b.values)]);
+  for (const name of names) {
+    if (!Object.is(ownValue(a.values, name), ownValue(b.values, name))) {
+      return false;
+    }
+  }
+  return true;
 }
 
 function makeBanner(
@@ -434,7 +473,8 @@ function saveFailureBanner(error: ApiError, method: 'POST' | 'PUT'): EditorBanne
     case 'unsupportedMediaType':
       return makeBanner('badRequest', describeError(error), error, method, []);
     case 'forbidden':
-      return makeBanner('forbidden', describeError(error, action), error, method, []);
+      // The draft stays, and Discard edits is the deliberate way out of a draft that cannot be saved.
+      return makeBanner('forbidden', describeError(error, action), error, method, ['discardEdits']);
     case 'notFound':
       return makeBanner('notFound', errorMessages.notFound, error, method, ['discardEdits']);
     case 'conflict':
@@ -457,6 +497,15 @@ function saveFailureBanner(error: ApiError, method: 'POST' | 'PUT'): EditorBanne
         ['saveAgain'],
       );
   }
+}
+
+/**
+ * The error of a write the form definition's permission flags already deny. It is refused
+ * before any request, so, like a request that got no response, it has no status, trace id
+ * or write outcome.
+ */
+function knownDenial(): ApiError {
+  return { ...networkError(), kind: 'forbidden' };
 }
 
 /** The banner of a failed DELETE; repeating a DELETE is always safe, so a 500, 503 or lost response offers Retry. */
@@ -577,6 +626,18 @@ function createController(host: ControllerHost): Controller {
    * and a FieldBefore block holding a DIALOG would otherwise raise itself again.
    */
   let blurredForDialog: string | null = null;
+  /** leave() calls running; any one freezes the draft. */
+  let leaveLocks = 0;
+  /**
+   * The last leave() has ended, and the freeze holds until the next commit. Navigation sets
+   * `transitioning` before it calls leave(), but the editor reads the new value only once
+   * that commit has run, so without this an edit made in between would reach the draft
+   * that the next record is about to replace.
+   */
+  let awaitingCommit = false;
+
+  /** The draft is being left or replaced: no edit or field event may change it. */
+  const frozen = (): boolean => leaveLocks > 0 || awaitingCommit || host.options().transitioning === true;
   /**
    * Counts the field-event failure notices shown. A successful write clears the notice
    * only when none arrived while it was in flight, so a newer event's failure stays.
@@ -675,7 +736,7 @@ function createController(host: ControllerHost): Controller {
     blurredForDialog = null;
     queue().reset();
     const { saving, savePending } = host.state();
-    host.update({ ...freshDraft(index(), record, isNew, generation), saving, savePending });
+    host.update({ ...freshDraft(index(), record, isNew, generation), saving, savePending, leaving: leaveLocks > 0 });
   }
 
   /** Drops the draft's edits, banner and check-code state; the record stays open. */
@@ -872,6 +933,12 @@ function createController(host: ControllerHost): Controller {
     }
 
     const { definition } = host.options();
+    // Permission flags are null until reported; only `false` denies. The same rule disables
+    // the Save and New buttons, so a save started by leaving is refused like an explicit one.
+    if (write.method === 'POST' ? definition.canInsert === false : definition.canUpdate === false) {
+      host.update({ banner: saveFailureBanner(knownDenial(), write.method) });
+      return false;
+    }
     // Both checks see only what the write submits: the draft may be stale, and the server's gate
     // decides a PUT's untouched fields on the stored row, its field-level 400 shown by failWrite.
     const errors = mergeFieldErrors(validateValues(definition, write.values), requiredErrors(definition, write));
@@ -886,19 +953,51 @@ function createController(host: ControllerHost): Controller {
     return exclusiveSave(() => runSave(false));
   }
 
+  /**
+   * Resolves `true` only once the draft is clean: every save it awaits or starts is
+   * followed by a fresh drain and check. The draft is frozen from the first moment, so
+   * nothing the user does meanwhile can be dropped by the transition that follows.
+   */
   async function leave(): Promise<boolean> {
-    // Edits made while an earlier save was in flight are still to be saved.
-    if (activeSave !== null && !(await activeSave)) {
-      return false;
+    leaveLocks += 1;
+    if (leaveLocks === 1) {
+      host.update({ leaving: true });
     }
-    await queue().drain();
-    const s = host.state();
-    const idx = index();
-    if (s.isNew && isEmptyNewDraft(idx, s.values)) {
-      discardDraft();
-      return true;
+    try {
+      /** The state before the last save this leave started. */
+      let beforeSave: EditorState | null = null;
+      for (;;) {
+        // A save in flight settles first: edits made while it ran are still to be saved.
+        if (activeSave !== null && !(await activeSave)) {
+          return false;
+        }
+        await queue().drain();
+        const s = host.state();
+        const idx = index();
+        if (s.isNew && isEmptyNewDraft(idx, s.values)) {
+          discardDraft();
+          return true;
+        }
+        if (!isDraftDirty(s, idx)) {
+          return true;
+        }
+        // A save that reported success yet left the draft as it was would only be sent
+        // again: the draft stays, and the record is not left.
+        if (beforeSave !== null && sameDraft(beforeSave, s)) {
+          return false;
+        }
+        beforeSave = s;
+        if (!(await save())) {
+          return false;
+        }
+      }
+    } finally {
+      leaveLocks -= 1;
+      if (leaveLocks === 0) {
+        awaitingCommit = true;
+        host.update({ leaving: false });
+      }
     }
-    return isDraftDirty(s, idx) ? save() : true;
   }
 
   /** The drain leave() and save() wait on, for a caller that must judge the draft without saving it. */
@@ -1019,15 +1118,21 @@ function createController(host: ControllerHost): Controller {
   }
 
   function discardEdits(): void {
+    // Read before discardDraft clears the banner.
+    const deniedInPlace = host.state().banner?.kind === 'forbidden';
     discardDraft();
-    host.options().onDiscardToNearest();
+    // A record the user may not save still exists, so it stays open with its stored values;
+    // a record that no longer exists gives way to the nearest one.
+    if (!deniedInPlace) {
+      host.options().onDiscardToNearest();
+    }
   }
 
   function setValue(name: string, raw: FieldValue): void {
     const s = host.state();
     const idx = index();
     const field = idx.byName.get(name);
-    if (field === undefined || !isDataField(field) || isProtectedIn(s, idx, name)) {
+    if (field === undefined || !isDataField(field) || isProtectedIn(s, idx, name) || frozen()) {
       return;
     }
     const dirty = new Set(s.dirty);
@@ -1052,8 +1157,9 @@ function createController(host: ControllerHost): Controller {
     queue().raise(kind, name);
   }
 
+  // A frozen draft raises no event, and its focus and blur leave no trace for later ones.
   function onFieldFocus(name: string): void {
-    if (replacing) {
+    if (replacing || frozen()) {
       return;
     }
     if (blurredForDialog === name) {
@@ -1069,7 +1175,7 @@ function createController(host: ControllerHost): Controller {
   }
 
   function onFieldBlur(name: string): void {
-    if (replacing) {
+    if (replacing || frozen()) {
       return;
     }
     const focusedIn = focusGenerations.get(name);
@@ -1090,7 +1196,7 @@ function createController(host: ControllerHost): Controller {
   // Raised by the control after its toggled value went through setValue, so the event
   // carries the post-click value.
   function onFieldClick(name: string): void {
-    if (canRaise(name)) {
+    if (!frozen() && canRaise(name)) {
       raise('FieldClick', name);
     }
   }
@@ -1111,6 +1217,8 @@ function createController(host: ControllerHost): Controller {
   }
 
   function sync(): void {
+    // The options now hold the committed `transitioning`, which takes over from leave().
+    awaitingCommit = false;
     const { record, isNew, recordGeneration } = host.options();
     // Started here as well as on first use, so a changed form drops the old form's events at once.
     queue();
@@ -1177,7 +1285,10 @@ function createController(host: ControllerHost): Controller {
   };
 }
 
-function present(state: EditorState, index: FieldIndex, actions: EditorActions): RecordEditor {
+function present(state: EditorState, index: FieldIndex, actions: EditorActions, frozen: boolean): RecordEditor {
+  // A frozen draft disables every field, so no control accepts input meanwhile, but
+  // protects none: protection stays read-only metadata, an unsupported field, a deleted
+  // record or none open, and only it takes the protected styling.
   const isProtected = (name: string): boolean => isProtectedIn(state, index, name);
   return {
     values: state.values,
@@ -1189,8 +1300,9 @@ function present(state: EditorState, index: FieldIndex, actions: EditorActions):
     savePending: state.savePending,
     deletedReadOnly: state.deletedReadOnly,
     checkCodeDisabled: state.checkCodeDisabled,
+    frozen,
     isProtected,
-    isDisabled: (name) => isProtected(name) || state.checkCodeDisabled.has(name),
+    isDisabled: (name) => frozen || isProtected(name) || state.checkCodeDisabled.has(name),
     deleteDialogOpen: state.deleteDialogOpen,
     dialogs: state.dialogs,
     eventNotice: state.eventNotice,
@@ -1257,7 +1369,8 @@ export function useRecordEditor(options: UseRecordEditorOptions): RecordEditor {
   }, [controller, recordGeneration]);
 
   const index = controller.indexOf(options.definition);
-  const editor = useMemo(() => present(state, index, controller.actions), [state, index, controller]);
+  const frozen = state.leaving || options.transitioning === true;
+  const editor = useMemo(() => present(state, index, controller.actions, frozen), [state, index, controller, frozen]);
 
   const { isDirty } = editor;
   useEffect(() => {

@@ -28,6 +28,11 @@ export interface FieldRendererProps {
   isProtected: (field: FieldDefinition) => boolean;
   /** Disabled by check code (`DISABLE`); never unlocks a protected field. */
   isCheckCodeDisabled: (field: FieldDefinition) => boolean;
+  /**
+   * The record is being left or replaced, so every control is disabled until it settles.
+   * Protection and its styling are unchanged. Defaults to `false`.
+   */
+  frozen?: boolean;
   onChange: (fieldName: string, value: FieldValue) => void;
   /** Raised when a field's control gains focus (`FieldBefore`). */
   onFocus?: (fieldName: string) => void;
@@ -330,6 +335,7 @@ export function FieldRenderer({
   fieldErrors,
   isProtected,
   isCheckCodeDisabled,
+  frozen = false,
   onChange,
   onFocus,
   onBlur,
@@ -353,7 +359,7 @@ export function FieldRenderer({
       // name renders no value and no message of it.
       value: dataField ? (ownEntry(values, name) ?? null) : null,
       isProtected: fieldProtected,
-      disabled: fieldProtected || isCheckCodeDisabled(field),
+      disabled: fieldProtected || isCheckCodeDisabled(field) || frozen,
       errors: dataField ? (ownEntry(fieldErrors, name) ?? NO_ERRORS) : NO_ERRORS,
       headingLevel,
     };

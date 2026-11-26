@@ -504,6 +504,7 @@ function FormWorkspace({
     onSaved: navigation.afterSave,
     onDeleted: navigation.afterDelete,
     onDiscardToNearest: navigation.openNearest,
+    transitioning: navigation.transitioning,
   });
   const { leave } = editor;
   useLayoutEffect(() => {
@@ -636,6 +637,7 @@ function FormWorkspace({
       fieldErrors={editor.fieldErrors}
       isProtected={isProtected}
       isCheckCodeDisabled={isCheckCodeDisabled}
+      frozen={editor.frozen}
       onChange={editor.setValue}
       onFocus={editor.onFieldFocus}
       onBlur={editor.onFieldBlur}
