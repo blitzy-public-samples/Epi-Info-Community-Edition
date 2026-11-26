@@ -9,6 +9,7 @@ using System.Text.Json.Serialization;
 using EpiInfo.Api.Contracts;
 using EpiInfo.Api.Endpoints;
 using EpiInfo.Api.Errors;
+using EpiInfo.Api.Health;
 using EpiInfo.Api.Hosting;
 using EpiInfo.Api.Json;
 using EpiInfo.Api.Services;
@@ -36,10 +37,11 @@ using Microsoft.Extensions.Logging.Abstractions;
 namespace EpiInfo.Api.Tests.Errors;
 
 /// <summary>
-/// The error contract of AAP 0.3.4.2: every error response under <c>/api</c> is a ProblemDetails with exactly
-/// <c>type</c>, <c>title</c>, <c>status</c>, <c>detail</c> and <c>traceId</c>, and a 500's <c>detail</c> is the fixed
-/// generic sentence plus that <c>traceId</c>; and the redaction policy of AAP 0.9.3, proved through the API's error
-/// pipeline with the committed <c>appsettings*.json</c> logging configuration.
+/// The error contract of AAP 0.3.4.2: every error response under <c>/api</c> is a ProblemDetails with <c>type</c>,
+/// <c>title</c>, <c>status</c>, <c>detail</c> and <c>traceId</c>, a 500's <c>detail</c> is the fixed generic sentence
+/// plus that <c>traceId</c>, and the 500 and 503 of a record write carry its <c>writeOutcome</c>; the CORS row of AAP
+/// 0.7.6; and the redaction policy of AAP 0.9.3, proved through the API's error pipeline with the committed
+/// <c>appsettings*.json</c> logging configuration.
 /// </summary>
 /// <remarks>
 /// <para>
@@ -48,9 +50,13 @@ namespace EpiInfo.Api.Tests.Errors;
 /// ProblemDetails writer declines. Every HTTP case runs in the Production and the Development environment.
 /// </para>
 /// <para>
-/// No case needs a database. The contract cases start their own <see cref="ApiFactory"/> with no connection string,
-/// and the 500 and 503 cases execute the <see cref="ApiProblems"/> writers on a <see cref="DefaultHttpContext"/>; their
-/// assertion messages are fixed texts that never quote a response body. The body-classification, response
+/// No case needs a database. Each HTTP case starts its own <see cref="ApiFactory"/>, so captured logs never mix: with
+/// no connection string; over a <see cref="FakeDataStore"/>, which injects the store failures; or with the real SQL
+/// Server store pointed at a loopback port that refuses connections. The redaction cases place a fresh sentinel per
+/// placement and search the body and every line <see cref="ApiFactoryBase.Logs"/> captured under the committed
+/// filters, after asserting that the line they search exists. The writer cases execute the <see cref="ApiProblems"/>
+/// writers on a <see cref="DefaultHttpContext"/>. Assertion messages are fixed texts that never quote a response
+/// body. The body-classification, response
 /// serialization and exception-boundary cases start an <see cref="ErrorPipelineHost"/>, which composes the real
 /// exception handler, guards, endpoints and services in the pipeline order <c>Program.cs</c> uses, over a
 /// <see cref="FakeDataStore"/>. The class carries no <c>Integration</c> trait, joins no database collection and takes
@@ -973,6 +979,671 @@ public sealed class ErrorContractTests
         AssertOneClientAbortLine(host.Logs);
     }
 
+    // The routing and lookup errors a request alone produces.
+    private const string UnknownFormCase = "GET of a form that does not exist";
+
+    private const string NonIntegerViewIdCase = "GET with a viewId that is not an integer";
+
+    private const string RecordPatchCase = "PATCH on a record";
+
+    // The field-level 400s: a query parameter outside its range, and a record value outside its field's range.
+    private const string PageZeroCase = "records list with page=0";
+
+    private const string AgeOutOfRangeCase = "create with Age above its upper bound";
+
+    // The read endpoints, each of which writes nothing and so documents no writeOutcome.
+    private const string FormsListEndpoint = "GET /api/forms";
+
+    private const string RecordsListEndpoint = "GET records";
+
+    private const string CountEndpoint = "GET records/count";
+
+    private const string SearchEndpoint = "POST records/search";
+
+    // The store failures injected through FakeDataStore, named after its factories.
+    private const string UnavailableFailure = nameof(FakeDataStore.Unavailable);
+
+    private const string WriteFailureKind = nameof(FakeDataStore.WriteFailure);
+
+    private const string SqlTextFailure = nameof(FakeDataStore.SqlTextException);
+
+    // The third record write, beside CreateRoute and UpdateRoute.
+    private const string DeleteRoute = "delete";
+
+    // Where a redaction case places its sentinel.
+    private const string QueryFilterPlacement = "q of a failing records list";
+
+    private const string QueryPagePlacement = "page that is not an integer";
+
+    private const string UnparsableCriterionPlacement = "criterion its number field cannot parse";
+
+    private const string FailingSearchPlacement = "criterion of a failing search";
+
+    private const string NumberTypeErrorPlacement = "text value for a number field";
+
+    private const string OverLongTextPlacement = "text value longer than its nvarchar(4000) column";
+
+    private const string FailingInsertPlacement = "valid value of a failing create";
+
+    // The cross-origin request of the CORS cases.
+    private const string ForeignOrigin = "http://example.test";
+
+    // The keyword that introduces a password in a SQL Server connection string.
+    private const string PasswordKeyword = "Password=";
+
+    // The members a framework error body could use to carry an exception; no error body may hold one.
+    private static readonly string[] ExceptionMembers = ["exception", "stackTrace", "exceptionDetails"];
+
+    private static readonly string TwoPageRecordsPath =
+        string.Create(CultureInfo.InvariantCulture, $"/api/forms/{FakeForms.TwoPageViewId}/records");
+
+    /// <summary>Each environment with each routing or lookup error a request alone produces.</summary>
+    public static TheoryData<string, string> EnvironmentsAndRequestErrors =>
+        EnvironmentsWith(UnknownFormCase, NonIntegerViewIdCase, RecordPatchCase);
+
+    /// <summary>Each environment with each field-level 400.</summary>
+    public static TheoryData<string, string> EnvironmentsAndFieldLevelErrors =>
+        EnvironmentsWith(PageZeroCase, AgeOutOfRangeCase);
+
+    /// <summary>Each environment with each create body whose <c>values</c> is not an object.</summary>
+    public static TheoryData<string, string> EnvironmentsAndBodiesWithoutAValuesObject =>
+        EnvironmentsWith("""{"values":5}""", "{}");
+
+    /// <summary>Each environment with each read endpoint and each store failure that ends it.</summary>
+    public static TheoryData<string, string, string> ReadFailures
+    {
+        get
+        {
+            var data = new TheoryData<string, string, string>();
+            string[] endpoints = [FormsListEndpoint, RecordsListEndpoint, CountEndpoint, SearchEndpoint];
+            foreach (string environment in EnvironmentNames)
+            {
+                foreach (string endpoint in endpoints)
+                {
+                    data.Add(environment, endpoint, UnavailableFailure);
+                    data.Add(environment, endpoint, SqlTextFailure);
+                }
+            }
+
+            return data;
+        }
+    }
+
+    /// <summary>
+    /// Each environment with each record write, each outcome a store failure can report, and each kind of store
+    /// failure: unavailability (503) and an unexpected write failure (500).
+    /// </summary>
+    public static TheoryData<string, string, WriteOutcome, string> WriteFailures
+    {
+        get
+        {
+            var data = new TheoryData<string, string, WriteOutcome, string>();
+            foreach (string environment in EnvironmentNames)
+            {
+                foreach (string route in new[] { CreateRoute, UpdateRoute, DeleteRoute })
+                {
+                    foreach (WriteOutcome outcome in Enum.GetValues<WriteOutcome>())
+                    {
+                        data.Add(environment, route, outcome, UnavailableFailure);
+                        data.Add(environment, route, outcome, WriteFailureKind);
+                    }
+                }
+            }
+
+            return data;
+        }
+    }
+
+    /// <summary>Each environment with each failure of the metadata read a create starts with.</summary>
+    public static TheoryData<string, string> EnvironmentsAndMetadataFailures =>
+        EnvironmentsWith(UnavailableFailure, SqlTextFailure);
+
+    /// <summary>Every outcome a store exception can report.</summary>
+    public static TheoryData<WriteOutcome> StoreOutcomes =>
+        new() { WriteOutcome.Unknown, WriteOutcome.NotWritten, WriteOutcome.Written };
+
+    /// <summary>Each environment with a cross-origin request and a CORS preflight.</summary>
+    public static TheoryData<string, bool> EnvironmentsAndCorsRequests
+    {
+        get
+        {
+            var data = new TheoryData<string, bool>();
+            foreach (string environment in EnvironmentNames)
+            {
+                data.Add(environment, false);
+                data.Add(environment, true);
+            }
+
+            return data;
+        }
+    }
+
+    /// <summary>Each environment with each query-string placement of a sentinel.</summary>
+    public static TheoryData<string, string> EnvironmentsAndQueryPlacements =>
+        EnvironmentsWith(QueryFilterPlacement, QueryPagePlacement);
+
+    /// <summary>Each environment with each search-criterion placement of a sentinel.</summary>
+    public static TheoryData<string, string> EnvironmentsAndCriterionPlacements =>
+        EnvironmentsWith(UnparsableCriterionPlacement, FailingSearchPlacement);
+
+    /// <summary>Each environment with each placement of a sentinel in the values of a create that fails.</summary>
+    public static TheoryData<string, string> EnvironmentsAndValuePlacements =>
+        EnvironmentsWith(NumberTypeErrorPlacement, OverLongTextPlacement, FailingInsertPlacement);
+
+    // AAP 0.3.4.2: a form that does not exist, a viewId its int route constraint cannot match, and a method the record
+    // route does not map are each the fixed ProblemDetails of their status in every environment. The PATCH carries an
+    // application/json body, so the media-type guard, which acts only on the body endpoints, never turns its 405 into
+    // a 415.
+    [Theory]
+    [MemberData(nameof(EnvironmentsAndRequestErrors))]
+    public async Task RequestErrorsAreProblemDetailsInEveryEnvironment(string environment, string errorCase)
+    {
+        FakeDataStore store = FakeDataStore.WithStandardForms();
+        string recordId = store.SeedRecord(FakeForms.TwoPageViewId);
+        (HttpMethod method, string path, HttpStatusCode status, string detail) = errorCase switch
+        {
+            UnknownFormCase => (
+                HttpMethod.Get,
+                "/api/forms/999999",
+                HttpStatusCode.NotFound,
+                ApiProblems.FormNotFoundDetail),
+            NonIntegerViewIdCase => (
+                HttpMethod.Get,
+                "/api/forms/abc",
+                HttpStatusCode.NotFound,
+                ApiProblems.ResourceNotFoundDetail),
+            RecordPatchCase => (
+                HttpMethod.Patch,
+                $"{TwoPageRecordsPath}/{recordId}",
+                HttpStatusCode.MethodNotAllowed,
+                ApiProblems.MethodNotAllowedDetail),
+            _ => throw new ArgumentOutOfRangeException(nameof(errorCase), errorCase, "Unknown request error."),
+        };
+        await using ApiFactory factory = CreateFactory(environment, store);
+        using HttpClient client = factory.CreateClient();
+        using var request = new HttpRequestMessage(method, path);
+        if (method == HttpMethod.Patch)
+        {
+            request.Content = JsonBody("{}");
+        }
+
+        using HttpResponseMessage response = await client.SendAsync(request);
+        string body = await response.Content.ReadAsStringAsync();
+
+        JsonElement problem = AssertProblemDetails(response, body, status);
+        Assert.Equal(detail, StringMember(problem, "detail"));
+        Assert.Empty(store.WriteCalls);
+    }
+
+    // AAP 0.3.4.2: a field-level 400 holds an errors map keyed by the parameter or the canonical field name, each with
+    // fixed messages; on a record write it carries no writeOutcome, which only a write's 500 and 503 hold.
+    [Theory]
+    [MemberData(nameof(EnvironmentsAndFieldLevelErrors))]
+    public async Task FieldLevelErrorsAreKeyedByParameterOrFieldName(string environment, string errorCase)
+    {
+        FakeDataStore store = FakeDataStore.WithStandardForms();
+        await using ApiFactory factory = CreateFactory(environment, store);
+        using HttpClient client = factory.CreateClient();
+
+        string key = errorCase == PageZeroCase ? RequestParameters.Page : "Age";
+        using HttpResponseMessage response = errorCase switch
+        {
+            PageZeroCase => await client.GetAsync($"{TwoPageRecordsPath}?{RequestParameters.Page}=0"),
+            AgeOutOfRangeCase => await ApiTestClient.PostJsonAsync(
+                client,
+                TwoPageRecordsPath,
+                new { values = new Dictionary<string, object?> { ["Age"] = 121 } }),
+            _ => throw new ArgumentOutOfRangeException(nameof(errorCase), errorCase, "Unknown field-level error."),
+        };
+        string body = await response.Content.ReadAsStringAsync();
+
+        JsonElement problem = AssertProblemDetails(response, body, HttpStatusCode.BadRequest);
+        Assert.Equal(ApiProblems.ValidationFailedDetail, StringMember(problem, "detail"));
+        AssertErrorMessages(problem, key);
+        Assert.False(problem.TryGetProperty("writeOutcome", out _), "A 400 carries writeOutcome.");
+        Assert.Empty(store.WriteCalls);
+    }
+
+    // AAP 0.3.4.2: a create body whose values is not an object is the request-level 400, a plain ProblemDetails whose
+    // detail names the problem, with no errors map, no writeOutcome and nothing written.
+    [Theory]
+    [MemberData(nameof(EnvironmentsAndBodiesWithoutAValuesObject))]
+    public async Task BodyWithoutAValuesObjectIsARequestLevel400(string environment, string json)
+    {
+        FakeDataStore store = FakeDataStore.WithStandardForms();
+        await using ApiFactory factory = CreateFactory(environment, store);
+        using HttpClient client = factory.CreateClient();
+        using var request = new HttpRequestMessage(HttpMethod.Post, TwoPageRecordsPath) { Content = JsonBody(json) };
+
+        using HttpResponseMessage response = await client.SendAsync(request);
+        string body = await response.Content.ReadAsStringAsync();
+
+        JsonElement problem = AssertProblemDetails(response, body, HttpStatusCode.BadRequest);
+        Assert.Equal(ApiProblems.ValuesMustBeObjectDetail, StringMember(problem, "detail"));
+        Assert.False(problem.TryGetProperty("errors", out _), "A request-level 400 carries an errors map.");
+        Assert.False(problem.TryGetProperty("writeOutcome", out _), "A 400 carries writeOutcome.");
+        Assert.Empty(store.WriteCalls);
+    }
+
+    // AAP 0.3.4.2: a store failure on an endpoint that writes nothing, search included although it takes a body, is the
+    // plain ProblemDetails of its classification: a 503 with the fixed unavailable text, or a 500 whose detail is the
+    // generic sentence plus the body's own traceId, an expectation that does not depend on the environment, so the
+    // detail is the same in Production and Development apart from the trace id. Neither carries writeOutcome. The
+    // handler logs the failure once, and the SQL text of the unexpected failure reaches neither the body nor a log.
+    [Theory]
+    [MemberData(nameof(ReadFailures))]
+    public async Task ReadFailureIsPlainProblemDetailsWithoutWriteOutcome(
+        string environment,
+        string endpoint,
+        string kind)
+    {
+        string sentinel = NewSentinel();
+        FakeDataStore store = FakeDataStore.WithStandardForms();
+        bool unavailable = kind == UnavailableFailure;
+        Exception failure = unavailable
+            ? FakeDataStore.Unavailable(WriteOutcome.NotWritten)
+            : FakeDataStore.SqlTextException(sentinel);
+        store.ThrowOn(ReadStoreMethod(endpoint), failure);
+        await using ApiFactory factory = CreateFactory(environment, store);
+        using HttpClient client = factory.CreateClient();
+
+        using HttpResponseMessage response = await SendReadAsync(client, endpoint);
+        string body = await response.Content.ReadAsStringAsync();
+
+        HttpStatusCode status = unavailable ? HttpStatusCode.ServiceUnavailable : HttpStatusCode.InternalServerError;
+        JsonElement problem = AssertProblemDetails(response, body, status);
+        string? detail = StringMember(problem, "detail");
+        if (unavailable)
+        {
+            Assert.Equal(ApiProblems.UnavailableDetail, detail);
+        }
+        else
+        {
+            AssertUnexpectedDetail(detail, StringMember(problem, ApiProblems.TraceIdKey));
+        }
+
+        Assert.False(
+            problem.TryGetProperty("writeOutcome", out _),
+            "A failure of an endpoint that writes nothing carries writeOutcome.");
+        CapturedLogEntry line = AssertOneHandlerLine(factory, status);
+        Assert.Null(StateValue(line, "WriteOutcome"));
+        AssertRedacted(factory, body, sentinel, failure.Message);
+    }
+
+    // AAP 0.3.4.2: a store failure inside a record write is answered with its classification's status, 503 for
+    // unavailability and 500 otherwise, and carries the writeOutcome the store reported, in every environment; the
+    // outcome never changes the status. Each outcome is injected at the stage whose state agrees with it, so the write
+    // log holds the change exactly when the store reported it written.
+    [Theory]
+    [MemberData(nameof(WriteFailures))]
+    public async Task WriteFailureCarriesTheOutcomeTheStoreReported(
+        string environment,
+        string route,
+        WriteOutcome outcome,
+        string kind)
+    {
+        FakeDataStore store = FakeDataStore.WithStandardForms();
+        string recordId = store.SeedRecord(
+            FakeForms.TwoPageViewId,
+            new Dictionary<string, FieldValue> { ["LastName"] = FieldValue.FromText("Original") });
+        bool unavailable = kind == UnavailableFailure;
+        Exception failure = unavailable ? FakeDataStore.Unavailable(outcome) : FakeDataStore.WriteFailure(outcome);
+        FakeFailureStage stage = outcome == WriteOutcome.Written
+            ? FakeFailureStage.AfterWrite
+            : FakeFailureStage.BeforeWrite;
+        string storeMethod = WriteStoreMethod(route);
+        store.ThrowOn(storeMethod, failure, stage);
+        await using ApiFactory factory = CreateFactory(environment, store);
+        using HttpClient client = factory.CreateClient();
+
+        using HttpResponseMessage response = await SendWriteAsync(client, route, recordId, "Changed");
+        string body = await response.Content.ReadAsStringAsync();
+
+        HttpStatusCode status = unavailable ? HttpStatusCode.ServiceUnavailable : HttpStatusCode.InternalServerError;
+        JsonElement problem = AssertProblemDetails(response, body, status);
+        Assert.Equal(outcome.ToWireValue(), StringMember(problem, "writeOutcome"));
+        string? detail = StringMember(problem, "detail");
+        if (unavailable)
+        {
+            Assert.Equal(ApiProblems.UnavailableDetail, detail);
+        }
+        else
+        {
+            AssertUnexpectedDetail(detail, StringMember(problem, ApiProblems.TraceIdKey));
+        }
+
+        CapturedLogEntry line = AssertOneHandlerLine(factory, status);
+        Assert.Equal(outcome.ToWireValue(), StateValue(line, "WriteOutcome"));
+        if (stage == FakeFailureStage.AfterWrite)
+        {
+            Assert.Equal(storeMethod, Assert.Single(store.WriteCalls).Method);
+        }
+        else
+        {
+            Assert.Empty(store.WriteCalls);
+        }
+    }
+
+    // AAP 0.3.4.2: a failure before any store write, here the metadata read a create starts with, is notWritten,
+    // whether the exception reports that outcome itself or carries none; the store saw no write call.
+    [Theory]
+    [MemberData(nameof(EnvironmentsAndMetadataFailures))]
+    public async Task MetadataReadFailureOnACreateIsNotWritten(string environment, string kind)
+    {
+        string storeSentinel = NewSentinel();
+        string valueSentinel = NewSentinel();
+        FakeDataStore store = FakeDataStore.WithStandardForms();
+        bool unavailable = kind == UnavailableFailure;
+        Exception failure = unavailable
+            ? FakeDataStore.Unavailable(WriteOutcome.NotWritten)
+            : FakeDataStore.SqlTextException(storeSentinel);
+        store.ThrowOn(nameof(IDataStore.GetFormMetadataAsync), failure);
+        await using ApiFactory factory = CreateFactory(environment, store);
+        using HttpClient client = factory.CreateClient();
+
+        using HttpResponseMessage response = await SendWriteAsync(client, CreateRoute, recordId: null, valueSentinel);
+        string body = await response.Content.ReadAsStringAsync();
+
+        HttpStatusCode status = unavailable ? HttpStatusCode.ServiceUnavailable : HttpStatusCode.InternalServerError;
+        JsonElement problem = AssertProblemDetails(response, body, status);
+        Assert.Equal(WriteOutcomeExtensions.WireNotWritten, StringMember(problem, "writeOutcome"));
+        CapturedLogEntry line = AssertOneHandlerLine(factory, status);
+        Assert.Equal(WriteOutcomeExtensions.WireNotWritten, StateValue(line, "WriteOutcome"));
+        Assert.Empty(store.WriteCalls);
+        Assert.DoesNotContain(store.Calls, call => call.Method == nameof(IDataStore.InsertAsync));
+        AssertRedacted(factory, body, storeSentinel, valueSentinel, failure.Message);
+    }
+
+    // AAP 0.3.4.2: once the store reported a commit, the request is written, whatever outcome a later store exception
+    // reports.
+    [Theory]
+    [MemberData(nameof(StoreOutcomes))]
+    public void CommittedWriteIsWrittenWhateverTheStoreExceptionReports(WriteOutcome reported)
+    {
+        var feature = new WriteOutcomeFeature();
+        feature.MarkWriteStarted();
+        feature.MarkWritten();
+
+        foreach (Exception failure in StoreExceptions(reported))
+        {
+            Assert.Equal(WriteOutcome.Written, ApiExceptionHandler.ResolveWriteOutcome(feature, failure));
+        }
+    }
+
+    // A started write that has not committed reports the store exception's own outcome.
+    [Theory]
+    [MemberData(nameof(StoreOutcomes))]
+    public void StartedWriteReportsTheStoreExceptionsOwnOutcome(WriteOutcome reported)
+    {
+        var feature = new WriteOutcomeFeature();
+        feature.MarkWriteStarted();
+
+        foreach (Exception failure in StoreExceptions(reported))
+        {
+            Assert.Equal(reported, ApiExceptionHandler.ResolveWriteOutcome(feature, failure));
+        }
+    }
+
+    // With no write call issued, a failure that carries no outcome is notWritten: nothing can have been written.
+    [Fact]
+    public void FailureWithoutAnOutcomeBeforeAnyWriteIsNotWritten()
+    {
+        var failure = new InvalidOperationException(NewSentinel());
+
+        Assert.Equal(WriteOutcome.NotWritten, ApiExceptionHandler.ResolveWriteOutcome(null, failure));
+        Assert.Equal(
+            WriteOutcome.NotWritten,
+            ApiExceptionHandler.ResolveWriteOutcome(new WriteOutcomeFeature(), failure));
+    }
+
+    // AAP 0.7.6: CORS is not registered, because the client is same-origin, so neither a cross-origin request nor a
+    // preflight gets any Access-Control-* header. A preflight's status is not asserted: any non-CORS answer is correct.
+    [Theory]
+    [MemberData(nameof(EnvironmentsAndCorsRequests))]
+    public async Task CrossOriginRequestsGetNoCorsHeaders(string environment, bool preflight)
+    {
+        await using ApiFactory factory = CreateFactory(environment, FakeDataStore.WithStandardForms());
+        using HttpClient client = factory.CreateClient();
+        using var request = new HttpRequestMessage(preflight ? HttpMethod.Options : HttpMethod.Get, "/api/forms");
+        request.Headers.Add("Origin", ForeignOrigin);
+        if (preflight)
+        {
+            request.Headers.Add("Access-Control-Request-Method", HttpMethods.Get);
+        }
+
+        using HttpResponseMessage response = await client.SendAsync(request);
+
+        if (!preflight)
+        {
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        }
+
+        string[] corsHeaders = response.Headers
+            .Concat(response.Content.Headers)
+            .Select(header => header.Key)
+            .Where(name => name.StartsWith("Access-Control-", StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+        Assert.True(corsHeaders.Length == 0, "The response carries CORS headers: " + string.Join(", ", corsHeaders));
+    }
+
+    // AAP 0.9.3: a value sent in the query string reaches neither the error body nor any log line: not the 500 of a
+    // records list whose store fails, nor the 400 of a page that is not an integer, whose errors entry is the fixed
+    // coercion message. The hosting request lines, which carry the URL, are dropped by the committed Warning floor on
+    // Microsoft.AspNetCore, so lowering it fails this case.
+    [Theory]
+    [MemberData(nameof(EnvironmentsAndQueryPlacements))]
+    public async Task QueryStringValuesAreRedacted(string environment, string placement)
+    {
+        string querySentinel = NewSentinel();
+        string storeSentinel = NewSentinel();
+        FakeDataStore store = FakeDataStore.WithStandardForms();
+        Exception failure = FakeDataStore.SqlTextException(storeSentinel);
+        store.ThrowOn(nameof(IDataStore.ListAsync), failure);
+        await using ApiFactory factory = CreateFactory(environment, store);
+        using HttpClient client = factory.CreateClient();
+
+        bool filter = placement == QueryFilterPlacement;
+        string parameter = filter ? RequestParameters.Query : RequestParameters.Page;
+        using HttpResponseMessage response = await client.GetAsync(
+            $"{TwoPageRecordsPath}?{parameter}={Uri.EscapeDataString(querySentinel)}");
+        string body = await response.Content.ReadAsStringAsync();
+
+        if (filter)
+        {
+            AssertProblemDetails(response, body, HttpStatusCode.InternalServerError);
+            AssertOneHandlerLine(factory, HttpStatusCode.InternalServerError);
+        }
+        else
+        {
+            JsonElement problem = AssertProblemDetails(response, body, HttpStatusCode.BadRequest);
+            string message = Assert.Single(AssertErrorMessages(problem, RequestParameters.Page));
+            Assert.Equal(RequestParameters.IntegerExpectedMessage, message);
+        }
+
+        AssertRedacted(factory, body, querySentinel, storeSentinel, failure.Message);
+    }
+
+    // AAP 0.9.3: a search criterion's value reaches neither the field-level 400 of a value its number field cannot
+    // parse nor the 500 of a search whose store fails, nor any log line.
+    [Theory]
+    [MemberData(nameof(EnvironmentsAndCriterionPlacements))]
+    public async Task SearchCriterionValuesAreRedacted(string environment, string placement)
+    {
+        string criterionSentinel = NewSentinel();
+        string storeSentinel = NewSentinel();
+        FakeDataStore store = FakeDataStore.WithStandardForms();
+        Exception failure = FakeDataStore.SqlTextException(storeSentinel);
+        store.ThrowOn(nameof(IDataStore.SearchAsync), failure);
+        await using ApiFactory factory = CreateFactory(environment, store);
+        using HttpClient client = factory.CreateClient();
+
+        bool unparsable = placement == UnparsableCriterionPlacement;
+        string field = unparsable ? "Age" : "LastName";
+        using HttpResponseMessage response = await ApiTestClient.PostJsonAsync(
+            client,
+            $"{TwoPageRecordsPath}/search",
+            new { criteria = new[] { new { field, value = criterionSentinel } } });
+        string body = await response.Content.ReadAsStringAsync();
+
+        if (unparsable)
+        {
+            JsonElement problem = AssertProblemDetails(response, body, HttpStatusCode.BadRequest);
+            AssertErrorMessages(problem, field);
+        }
+        else
+        {
+            AssertProblemDetails(response, body, HttpStatusCode.InternalServerError);
+            AssertOneHandlerLine(factory, HttpStatusCode.InternalServerError);
+        }
+
+        AssertRedacted(factory, body, criterionSentinel, storeSentinel, failure.Message);
+    }
+
+    // AAP 0.9.3: a field value of a create that fails reaches neither its body nor any log line: not the field-level
+    // 400 of a text value sent for a number field or of a text longer than its nvarchar(4000) column (no fake field
+    // has a metaFields MaxLength, so the column bound is the length check), nor the 500 of an insert that fails once
+    // the write started, which is therefore unknown.
+    [Theory]
+    [MemberData(nameof(EnvironmentsAndValuePlacements))]
+    public async Task FieldValuesOfAFailingCreateAreRedacted(string environment, string placement)
+    {
+        string valueSentinel = NewSentinel();
+        string storeSentinel = NewSentinel();
+        FakeDataStore store = FakeDataStore.WithStandardForms();
+        Exception failure = FakeDataStore.SqlTextException(storeSentinel);
+        store.ThrowOn(nameof(IDataStore.InsertAsync), failure);
+        await using ApiFactory factory = CreateFactory(environment, store);
+        using HttpClient client = factory.CreateClient();
+
+        (string field, string value) = placement switch
+        {
+            NumberTypeErrorPlacement => ("Age", valueSentinel),
+            OverLongTextPlacement => ("LastName", valueSentinel.PadRight(4001, 'x')),
+            FailingInsertPlacement => ("LastName", valueSentinel),
+            _ => throw new ArgumentOutOfRangeException(nameof(placement), placement, "Unknown value placement."),
+        };
+        using HttpResponseMessage response = await ApiTestClient.PostJsonAsync(
+            client,
+            TwoPageRecordsPath,
+            new { values = new Dictionary<string, object?> { [field] = value } });
+        string body = await response.Content.ReadAsStringAsync();
+
+        if (placement == FailingInsertPlacement)
+        {
+            JsonElement problem = AssertProblemDetails(response, body, HttpStatusCode.InternalServerError);
+            Assert.Equal(WriteOutcomeExtensions.WireUnknown, StringMember(problem, "writeOutcome"));
+            AssertOneHandlerLine(factory, HttpStatusCode.InternalServerError);
+        }
+        else
+        {
+            JsonElement problem = AssertProblemDetails(response, body, HttpStatusCode.BadRequest);
+            AssertErrorMessages(problem, field);
+            Assert.DoesNotContain(store.Calls, call => call.Method == nameof(IDataStore.InsertAsync));
+        }
+
+        AssertRedacted(factory, body, valueSentinel, storeSentinel, failure.Message);
+    }
+
+    // AAP 0.9.3 and 0.3.4.6: with the configured server refusing connections, a read is the 503 ProblemDetails and a
+    // create the 503 whose metadata read failed before any write, so notWritten. Neither the connection string, nor
+    // its password, nor the Password= keyword, nor the submitted value reaches a body or a log line.
+    [Theory]
+    [MemberData(nameof(Environments))]
+    public async Task UnreachableDatabaseIsUnavailableWithoutTheConnectionString(string environment)
+    {
+        string password = NewSentinel();
+        string valueSentinel = NewSentinel();
+        string connectionString = UnreachableConnectionString(password);
+        await using ApiFactory factory = CreateUnreachableFactory(environment, connectionString);
+        using HttpClient client = factory.CreateClient();
+
+        using HttpResponseMessage list = await client.GetAsync("/api/forms");
+        string listBody = await list.Content.ReadAsStringAsync();
+        AssertRefusedConnectionIsUnavailable(factory, list);
+        JsonElement listProblem = AssertProblemDetails(list, listBody, HttpStatusCode.ServiceUnavailable);
+        Assert.Equal(ApiProblems.UnavailableDetail, StringMember(listProblem, "detail"));
+        Assert.False(listProblem.TryGetProperty("writeOutcome", out _), "The forms list 503 carries writeOutcome.");
+
+        using HttpResponseMessage create = await ApiTestClient.PostJsonAsync(
+            client,
+            "/api/forms/1/records",
+            new { values = new Dictionary<string, object?> { ["LastName"] = valueSentinel } });
+        string createBody = await create.Content.ReadAsStringAsync();
+        AssertRefusedConnectionIsUnavailable(factory, create);
+        JsonElement createProblem = AssertProblemDetails(create, createBody, HttpStatusCode.ServiceUnavailable);
+        Assert.Equal(ApiProblems.UnavailableDetail, StringMember(createProblem, "detail"));
+        Assert.Equal(WriteOutcomeExtensions.WireNotWritten, StringMember(createProblem, "writeOutcome"));
+
+        Assert.Equal(2, factory.Logs.Find(entry => entry.Category == HandlerCategory).Count);
+        AssertRedacted(
+            factory,
+            listBody + createBody,
+            password,
+            valueSentinel,
+            connectionString,
+            PasswordKeyword);
+    }
+
+    // AAP 0.9.3: the message of a failure that holds SQL text and a value reaches neither the 500 body nor any log
+    // line. The handler passes no exception object to the logger, so no entry carries exception text, and its one line
+    // names the exception's type only; no framework line reports the exception either.
+    [Theory]
+    [MemberData(nameof(Environments))]
+    public async Task ExceptionMessageHoldingSqlTextIsRedacted(string environment)
+    {
+        string sentinel = NewSentinel();
+        FakeDataStore store = FakeDataStore.WithStandardForms();
+        store.ThrowOn(
+            nameof(IDataStore.GetFormMetadataAsync),
+            new InvalidOperationException($"{SecretSqlText} WHERE x = '{sentinel}'"));
+        await using ApiFactory factory = CreateFactory(environment, store);
+        using HttpClient client = factory.CreateClient();
+
+        using HttpResponseMessage response = await client.GetAsync(
+            string.Create(CultureInfo.InvariantCulture, $"/api/forms/{FakeForms.TwoPageViewId}"));
+        string body = await response.Content.ReadAsStringAsync();
+
+        JsonElement problem = AssertProblemDetails(response, body, HttpStatusCode.InternalServerError);
+        AssertUnexpectedDetail(StringMember(problem, "detail"), StringMember(problem, ApiProblems.TraceIdKey));
+        CapturedLogEntry line = AssertOneHandlerLine(factory, HttpStatusCode.InternalServerError);
+        Assert.Null(line.ExceptionType);
+        Assert.Null(line.ExceptionMessage);
+        Assert.Equal(typeof(InvalidOperationException).FullName, StateValue(line, "ExceptionType"));
+        Assert.Empty(factory.Logs.Find(IsFrameworkExceptionLine));
+        AssertRedacted(factory, body, sentinel, SecretSqlText);
+    }
+
+    // AAP 0.3.4.7 and 0.9.3: /health answers a server that refuses connections with exactly {"status":"unhealthy"},
+    // the one error body outside ProblemDetails. The health check logs its failure, and neither that line nor any other
+    // carries the connection string, its password or the Password= keyword.
+    [Theory]
+    [MemberData(nameof(Environments))]
+    public async Task UnhealthyDatabaseAnswersTheFixedBodyWithoutTheConnectionString(string environment)
+    {
+        string password = NewSentinel();
+        string connectionString = UnreachableConnectionString(password);
+        await using ApiFactory factory = CreateUnreachableFactory(environment, connectionString);
+        using HttpClient client = factory.CreateClient();
+
+        using HttpResponseMessage response = await client.GetAsync("/health");
+        string body = await response.Content.ReadAsStringAsync();
+
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, response.StatusCode);
+        Assert.Equal(ApiTestClient.JsonMediaType, response.Content.Headers.ContentType?.MediaType);
+        using (JsonDocument document = JsonDocument.Parse(body))
+        {
+            JsonProperty member = Assert.Single(document.RootElement.EnumerateObject());
+            Assert.Equal("status", member.Name);
+            Assert.Equal(HealthResponse.UnhealthyStatus, member.Value.GetString());
+        }
+
+        Assert.True(
+            factory.Logs.Find(entry => entry.Category == typeof(SqlServerHealthCheck).FullName).Count > 0,
+            "The health check logged no failure, so the redaction check would search no line of it.");
+        AssertRedacted(factory, body, password, connectionString, PasswordKeyword);
+    }
+
+
     // Every case names its client folder, so none falls back to the committed default (the repository's web/dist),
     // whose presence depends on whether the client was built.
     private static ApiFactory CreateFactory(string environment, string clientFolder) =>
@@ -980,11 +1651,58 @@ public sealed class ErrorContractTests
         {
             EnvironmentName = environment,
             ConnectionMode = ApiConnectionMode.None,
-            ExtraSettings = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
-            {
-                [ApiOptions.ClientPathKey] = clientFolder,
-            },
+            ExtraSettings = ClientPathSetting(clientFolder),
         });
+
+    // A host over store, which replaces the SQL Server store, so no connection string is set and no SQL Server is
+    // needed; the client is absent, as for the /api miss cases.
+    private static ApiFactory CreateFactory(string environment, FakeDataStore store) =>
+        new(new ApiFactoryOptions
+        {
+            EnvironmentName = environment,
+            DataStore = store,
+            ConnectionMode = ApiConnectionMode.None,
+            ExtraSettings = ClientPathSetting(AbsentClientFolder()),
+        });
+
+    // A host whose real SQL Server store is configured with connectionString, so its failures pass through the store's
+    // own classification.
+    private static ApiFactory CreateUnreachableFactory(string environment, string connectionString) =>
+        new(new ApiFactoryOptions
+        {
+            EnvironmentName = environment,
+            ConnectionMode = ApiConnectionMode.Supplied,
+            ConnectionString = connectionString,
+            ExtraSettings = ClientPathSetting(AbsentClientFolder()),
+        });
+
+    // Port 1 on IPv4 loopback refuses the TCP connection at once, so no SQL Server is needed and none is reached. The
+    // string names no database, because the server is never reached and the tests never name a database. The password
+    // is the sentinel the redaction cases search for.
+    private static string UnreachableConnectionString(string password) =>
+        "Server=127.0.0.1,1;User Id=sa;" + PasswordKeyword + password +
+        ";TrustServerCertificate=True;Connect Timeout=2;Pooling=false";
+
+    private static Dictionary<string, string?> ClientPathSetting(string clientFolder) =>
+        new(StringComparer.OrdinalIgnoreCase) { [ApiOptions.ClientPathKey] = clientFolder };
+
+    // Each environment with each case.
+    private static TheoryData<string, string> EnvironmentsWith(params string[] cases)
+    {
+        var data = new TheoryData<string, string>();
+        foreach (string environment in EnvironmentNames)
+        {
+            foreach (string item in cases)
+            {
+                data.Add(environment, item);
+            }
+        }
+
+        return data;
+    }
+
+    private static StringContent JsonBody(string json) =>
+        new(json, Encoding.UTF8, ApiTestClient.JsonMediaType);
 
     // A client folder that does not exist and is never created, so the host serves no client and maps no client
     // fallback. The /api miss cases select it so they do not depend on a built web/dist: with the client served, an
@@ -1371,6 +2089,201 @@ public sealed class ErrorContractTests
         || entry.EventId.Name == "ApplicationError"
         || entry.ExceptionType is not null;
 
+    // The shape every error under /api has in every environment: the expected status, application/problem+json, a
+    // non-empty type, title, detail and traceId, a status member equal to the HTTP status, and no member that could
+    // carry an exception. Messages are fixed texts that never quote the body.
+    private static JsonElement AssertProblemDetails(HttpResponseMessage response, string body, HttpStatusCode expected)
+    {
+        Assert.Equal(expected, response.StatusCode);
+        Assert.True(
+            string.Equals(
+                ApiProblems.ProblemContentType,
+                response.Content.Headers.ContentType?.MediaType,
+                StringComparison.Ordinal),
+            "The error response is not application/problem+json.");
+
+        JsonElement problem;
+        try
+        {
+            using JsonDocument document = JsonDocument.Parse(body);
+            problem = document.RootElement.Clone();
+        }
+        catch (JsonException)
+        {
+            throw new Xunit.Sdk.XunitException("The error body is not JSON.");
+        }
+
+        ApiTestClient.AssertProblemDetails(problem, (int)expected);
+        foreach (string member in new[] { "type", "title", "detail", ApiProblems.TraceIdKey })
+        {
+            Assert.False(
+                string.IsNullOrWhiteSpace(StringMember(problem, member)),
+                $"ProblemDetails member '{member}' is empty.");
+        }
+
+        foreach (string member in ExceptionMembers)
+        {
+            Assert.False(problem.TryGetProperty(member, out _), $"The error body carries an '{member}' member.");
+        }
+
+        return problem;
+    }
+
+    // The messages of a field-level 400 under key: a non-empty array of non-blank strings.
+    private static string[] AssertErrorMessages(JsonElement problem, string key)
+    {
+        Assert.True(
+            problem.TryGetProperty("errors", out JsonElement errors) && errors.ValueKind == JsonValueKind.Object,
+            "The field-level 400 has no errors object.");
+        Assert.True(
+            errors.TryGetProperty(key, out JsonElement messages) && messages.ValueKind == JsonValueKind.Array,
+            $"The errors object has no '{key}' array.");
+
+        string[] texts = messages.EnumerateArray()
+            .Select(message => message.ValueKind == JsonValueKind.String ? message.GetString() : null)
+            .Select(text => text ?? string.Empty)
+            .ToArray();
+        Assert.True(
+            texts.Length > 0 && !texts.Any(string.IsNullOrWhiteSpace),
+            $"The '{key}' errors entry is not a non-empty list of messages.");
+        return texts;
+    }
+
+    // AAP 0.3.4.2: one handler line per failure, carrying the status it answered. A redaction case asserts it first,
+    // so its search runs over a line that exists.
+    private static CapturedLogEntry AssertOneHandlerLine(ApiFactoryBase factory, HttpStatusCode status)
+    {
+        CapturedLogEntry line = Assert.Single(factory.Logs.Find(entry => entry.Category == HandlerCategory));
+        Assert.Equal((int)status, StateValue(line, "StatusCode"));
+        return line;
+    }
+
+    // AAP 0.9.3: no secret in the error body or in any captured log line. A failure names the secret by its position
+    // and the offending entries by category and level, never the secret or an entry's text.
+    private static void AssertRedacted(ApiFactoryBase factory, string body, params string[] secrets)
+    {
+        for (int index = 0; index < secrets.Length; index++)
+        {
+            string secret = secrets[index];
+            Assert.False(
+                body.Contains(secret, StringComparison.Ordinal),
+                string.Create(CultureInfo.InvariantCulture, $"Secret #{index} appears in the response body."));
+
+            if (factory.Logs.ContainsText(secret))
+            {
+                string entries = string.Join(
+                    ", ",
+                    factory.Logs
+                        .Find(entry => Mentions(entry, secret))
+                        .Select(entry => $"{entry.Category} at {entry.Level}"));
+                string where = entries.Length == 0 ? "an entry" : entries;
+                Assert.Fail(
+                    string.Create(
+                        CultureInfo.InvariantCulture,
+                        $"Secret #{index} appears in a captured log line: {where}."));
+            }
+        }
+    }
+
+    // A coarse search of one entry's texts, used only to name the entries in which ContainsText found a secret.
+    private static bool Mentions(CapturedLogEntry entry, string text) =>
+        entry.Category.Contains(text, StringComparison.Ordinal)
+        || entry.Message.Contains(text, StringComparison.Ordinal)
+        || entry.StateMessage?.Contains(text, StringComparison.Ordinal) == true
+        || entry.State.Any(pair =>
+            pair.Key.Contains(text, StringComparison.Ordinal)
+            || Convert.ToString(pair.Value, CultureInfo.InvariantCulture)
+                ?.Contains(text, StringComparison.Ordinal) == true)
+        || entry.Scopes.Any(scope => scope.Contains(text, StringComparison.Ordinal))
+        || entry.ExceptionType?.Contains(text, StringComparison.Ordinal) == true
+        || entry.ExceptionMessage?.Contains(text, StringComparison.Ordinal) == true;
+
+    // AAP 0.3.4.6: a refused TCP connection is an evidenced connectivity failure, so 503. Any other status is reported
+    // as a classifier defect with the SQL error number the handler logged and the numbers the classifier admits, since
+    // the managed network layer used on Linux may report a refused connection under a number the set lacks.
+    private static void AssertRefusedConnectionIsUnavailable(ApiFactoryBase factory, HttpResponseMessage response)
+    {
+        if (response.StatusCode == HttpStatusCode.ServiceUnavailable)
+        {
+            return;
+        }
+
+        CapturedLogEntry? line = factory.Logs.Find(entry => entry.Category == HandlerCategory).LastOrDefault();
+        object? number = line?.State.FirstOrDefault(pair => pair.Key == "SqlErrorNumber").Value;
+        string admitted = string.Join(", ", EpiInfo.Data.Sql.SqlErrorClassifier.UnavailableErrorNumbers.Order());
+        Assert.Fail(
+            string.Create(
+                CultureInfo.InvariantCulture,
+                $"A refused connection was answered {(int)response.StatusCode}, not 503: a SqlErrorClassifier "
+                + $"defect. The handler logged SQL error {number ?? "none"}; the unavailable numbers are "
+                + $"[{admitted}]."));
+    }
+
+    // The store member each read endpoint ends in.
+    private static string ReadStoreMethod(string endpoint) => endpoint switch
+    {
+        FormsListEndpoint => nameof(IDataStore.ListFormsAsync),
+        RecordsListEndpoint => nameof(IDataStore.ListAsync),
+        CountEndpoint => nameof(IDataStore.CountAsync),
+        SearchEndpoint => nameof(IDataStore.SearchAsync),
+        _ => throw new ArgumentOutOfRangeException(nameof(endpoint), endpoint, "Unknown read endpoint."),
+    };
+
+    // A valid request to each read endpoint on the two-page form.
+    private static Task<HttpResponseMessage> SendReadAsync(HttpClient client, string endpoint) => endpoint switch
+    {
+        FormsListEndpoint => client.GetAsync("/api/forms"),
+        RecordsListEndpoint => client.GetAsync(TwoPageRecordsPath),
+        CountEndpoint => client.GetAsync($"{TwoPageRecordsPath}/count"),
+        SearchEndpoint => ApiTestClient.PostJsonAsync(
+            client,
+            $"{TwoPageRecordsPath}/search",
+            new { criteria = new[] { new { field = "LastName", value = "Smith" } } }),
+        _ => throw new ArgumentOutOfRangeException(nameof(endpoint), endpoint, "Unknown read endpoint."),
+    };
+
+    // The store member each record write ends in.
+    private static string WriteStoreMethod(string route) => route switch
+    {
+        CreateRoute => nameof(IDataStore.InsertAsync),
+        UpdateRoute => nameof(IDataStore.UpdateAsync),
+        DeleteRoute => nameof(IDataStore.SoftDeleteAsync),
+        _ => throw new ArgumentOutOfRangeException(nameof(route), route, "Unknown record write."),
+    };
+
+    // A valid record write on the two-page form: a create or an update setting LastName, or a delete, of recordId.
+    private static Task<HttpResponseMessage> SendWriteAsync(
+        HttpClient client,
+        string route,
+        string? recordId,
+        string lastName)
+    {
+        var body = new { values = new Dictionary<string, object?> { ["LastName"] = lastName } };
+        return route switch
+        {
+            CreateRoute => ApiTestClient.PostJsonAsync(client, TwoPageRecordsPath, body),
+            UpdateRoute => ApiTestClient.PutJsonAsync(client, $"{TwoPageRecordsPath}/{recordId}", body),
+            DeleteRoute => client.DeleteAsync($"{TwoPageRecordsPath}/{recordId}"),
+            _ => throw new ArgumentOutOfRangeException(nameof(route), route, "Unknown record write."),
+        };
+    }
+
+    // Both store exceptions reporting outcome, each built with its full constructor.
+    private static Exception[] StoreExceptions(WriteOutcome outcome) =>
+    [
+        new DataStoreUnavailableException(
+            nameof(IDataStore.InsertAsync),
+            outcome,
+            sqlErrorNumber: -2,
+            innerException: new TimeoutException(NewSentinel())),
+        new DataStoreWriteException(
+            nameof(IDataStore.UpdateAsync),
+            outcome,
+            sqlErrorNumber: 547,
+            innerException: null),
+    ];
+
+
     /// <summary>
     /// Fails every serialisation of <typeparamref name="T"/> with the serializer's own exception type, carrying a
     /// sentinel where a real failure would carry the path and value it failed on.
@@ -1412,8 +2325,8 @@ public sealed class ErrorContractTests
 /// <para>
 /// The class needs no database: it carries no <c>Integration</c> trait, joins no database collection and takes no
 /// <c>DatabaseWriteLock</c>, so <c>--filter "Category!=Integration"</c> selects it. Every case starts its own
-/// <see cref="FakeDataStore"/>, clock and host. The planned <c>ErrorContractTests</c> class, with the error-contract,
-/// CORS and redaction cases hosted on <c>ApiFactory</c>, belongs beside it in this file.
+/// <see cref="FakeDataStore"/>, clock and host. <see cref="ErrorContractTests"/>, beside it in this file, holds the
+/// error-contract, CORS and redaction cases hosted on <c>ApiFactory</c>.
 /// </para>
 /// <para>
 /// A failure after the endpoint has chosen its result is injected by a one-shot seam that makes the response body
