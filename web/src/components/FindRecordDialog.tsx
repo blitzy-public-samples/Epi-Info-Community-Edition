@@ -54,6 +54,11 @@ export interface FindRecordDialogProps {
   /** Called with the chosen result; the form view closes the dialog and opens the record. */
   onOpen: (globalRecordId: string) => void;
   onClose: () => void;
+  /**
+   * Called when a search answers 404, which means the form itself no longer exists; the
+   * form view's form-not-found handling closes the dialog and decides what follows.
+   */
+  onFormNotFound: () => void;
 }
 
 /** Legacy SEARCH_LIMIT_EXCEEDED: a search names at most six fields. */
@@ -61,7 +66,24 @@ const MAX_SEARCH_FIELDS = 6;
 const LIMIT_NOTE = 'At most six fields can be searched.';
 const NO_FIELD_NOTE = 'Choose up to six fields, then enter a value for each.';
 
-const TEXT_HINT = 'Use a or b for alternatives, >=, <=, <>, >, < to compare, * as a wildcard (e.g. Sm*).';
+// Text, multiline and legal values other than a Phone Number: the server strips a leading
+// >=, <=, <>, > or < and ignores it, so these hints offer no comparison. What is left
+// matches the whole value, a value holding a wildcard is a pattern match, and a prefix
+// with nothing after it finds the records where the field is empty.
+const PATTERN_SYNTAX = 'Use a or b for alternatives and * as a wildcard (e.g. Sm*); > alone finds empty values.';
+const MULTILINE_HINT = `Matches the whole text; a longer text matches on its first 255 characters. ${PATTERN_SYNTAX}`;
+// A legal-values field is never a Phone Number, so its wildcard needs no exception.
+const LEGAL_VALUES_HINT = `Matches the whole value. ${PATTERN_SYNTAX}`;
+// A Phone Number field arrives as text, with or without a mask, and the form definition
+// carries no metadata type name to tell it from other text. For a Phone Number the server
+// reads the prefix as the comparison and has no wildcard path, so * is matched as typed;
+// alternatives and a prefix with nothing after it work as for other text. The text hints
+// therefore claim only what holds for both: a masked field, most likely a Phone Number,
+// gets no wildcard claim, and an unmasked one gets the wildcard with the Phone Number
+// exception.
+const MASKED_TEXT_HINT = 'Matches the whole value. Use a or b for alternatives; > alone finds empty values.';
+const TEXT_HINT =
+  `${MASKED_TEXT_HINT} * is a wildcard (e.g. Sm*), except in a phone number, where it is matched as typed.`;
 const NUMBER_HINT = 'A number, e.g. >=5 or 1 or 2. Leave empty to find missing values.';
 const DATE_HINT = 'A date as YYYY-MM-DD, e.g. >=2011-01-15. Leave empty to find missing values.';
 const CHECKBOX_HINT = 'Yes, No, (+) or (-).';
@@ -73,8 +95,11 @@ const SYSTEM_HINT = 'GlobalRecordId text, or RecStatus 1 (active) / 0 (deleted).
 const LISTED_LEGAL_VALUES = 5;
 
 // A search 404 means the form itself is gone, which describeError's record text misstates.
-const FORM_NOT_FOUND = 'This form no longer exists. Close this dialog and choose a form from the forms list.';
+// The form view's form-not-found handling takes over, so the text names no next step.
+const FORM_NOT_FOUND = 'This form no longer exists.';
 const SEARCHING = 'Searching…';
+const SEARCHING_OVER_RESULTS = 'Searching… The results below are from the previous search.';
+const STALE_RESULTS = 'These results are for the previous criteria; Search updates them.';
 const NO_MATCHES = 'No records match.';
 
 // The data-field types SearchCriteriaParser accepts. Labels, groups and unsupported
@@ -120,11 +145,17 @@ function optionHint(options: readonly FieldOption[]): string {
 
 function legalValuesHint(options: readonly FieldOption[]): string {
   if (options.length === 0) {
-    return TEXT_HINT;
+    return LEGAL_VALUES_HINT;
   }
   const listed = options.slice(0, LISTED_LEGAL_VALUES).map((option) => option.label);
   const more = options.length > LISTED_LEGAL_VALUES ? ', …' : '';
-  return `${TEXT_HINT} ${ALLOWED_VALUES} ${listed.join(', ')}${more}.`;
+  return `${LEGAL_VALUES_HINT} ${ALLOWED_VALUES} ${listed.join(', ')}${more}.`;
+}
+
+/** Whether the field carries an input mask, as a Phone Number field usually does. */
+function isMasked(field: FieldDefinition): boolean {
+  const pattern = field.validation.pattern;
+  return typeof pattern === 'string' && pattern.trim() !== '';
 }
 
 function hintFor(field: FieldDefinition): string {
@@ -139,6 +170,10 @@ function hintFor(field: FieldDefinition): string {
       return optionHint(field.options ?? []);
     case 'legalValues':
       return legalValuesHint(field.options ?? []);
+    case 'multiline':
+      return MULTILINE_HINT;
+    case 'text':
+      return isMasked(field) ? MASKED_TEXT_HINT : TEXT_HINT;
     default:
       return TEXT_HINT;
   }
@@ -208,15 +243,57 @@ function resultSummary(response: SearchResponse): string {
   return response.total === 1 ? '1 record matches.' : `${response.total} records match.`;
 }
 
+/** One criterion as the dialog sends it: the picked field and its text as entered. */
+interface CriterionEntry {
+  readonly field: string;
+  readonly value: string;
+}
+
+/** The criteria a search was sent with, kept beside what that search returned. */
+interface SubmittedCriteria {
+  /** The search's identity, from {@link criteriaKey}. */
+  readonly key: string;
+  /** Each criterion's text as sent, by field name. */
+  readonly texts: ReadonlyMap<string, string>;
+}
+
 /**
- * Splits a 400's `errors` map. Messages keyed by a searchable field, matched
- * case-insensitively, go beside that field's criterion while it is picked, and are
- * dropped once its row is removed; every other key (`criteria`,
- * `excludeGlobalRecordId`, …) goes to the banner.
+ * Identity of a search: the picked fields in picker order with their texts, the set
+ * searched and the excluded record. Results and errors describe the criteria on screen
+ * only while this equals the key they were sent with.
+ */
+function criteriaKey(entries: readonly CriterionEntry[], includeDeleted: boolean, openRecordId: string | null): string {
+  return JSON.stringify([entries.map((entry) => [entry.field, entry.value]), includeDeleted, openRecordId]);
+}
+
+/**
+ * The searchable field an `errors` key names. The server keys each message by the
+ * field's canonical name, so the field of exactly that name wins; a key that differs
+ * only in letter case names a field only when exactly one field name matches it that
+ * way, as the server itself resolves names. `undefined` for any other key.
+ */
+function fieldNamed(key: string, fields: readonly SearchableField[]): string | undefined {
+  if (fields.some((field) => field.name === key)) {
+    return key;
+  }
+  const folded = key.toLowerCase();
+  const names = new Set(fields.filter((field) => field.name.toLowerCase() === folded).map((field) => field.name));
+  return names.size === 1 ? [...names][0] : undefined;
+}
+
+/**
+ * Splits a 400's `errors` map. A message keyed by a searchable field ({@link fieldNamed})
+ * that the search was sent with stays beside that field's criterion while the field is
+ * picked and its text is still the text sent; once the criterion is edited or removed
+ * the message no longer describes it and is dropped. Every other key (`criteria`,
+ * `excludeGlobalRecordId`, a name two fields share ignoring case, a field the search did
+ * not send, …) goes to the banner.
  */
 function splitFieldErrors(
   error: ApiError | null,
   fields: readonly SearchableField[],
+  submitted: SubmittedCriteria | null,
+  texts: ReadonlyMap<string, string>,
   picked: ReadonlySet<string>,
 ): { byField: ReadonlyMap<string, readonly string[]>; other: readonly string[] } {
   const byField = new Map<string, string[]>();
@@ -224,12 +301,12 @@ function splitFieldErrors(
   if (error === null) {
     return { byField, other };
   }
-  const canonical = new Map(fields.map((field) => [field.name.toLowerCase(), field.name]));
   for (const [key, messages] of Object.entries(error.fieldErrors)) {
-    const name = canonical.get(key.toLowerCase());
-    if (name === undefined) {
+    const name = fieldNamed(key, fields);
+    const sentText = name === undefined ? undefined : submitted?.texts.get(name);
+    if (name === undefined || sentText === undefined) {
       other.push(...messages);
-    } else if (picked.has(name)) {
+    } else if (picked.has(name) && (texts.get(name) ?? '') === sentText) {
       byField.set(name, [...(byField.get(name) ?? []), ...messages]);
     }
   }
@@ -320,11 +397,13 @@ export function FindRecordDialog({
   openRecordId,
   onOpen,
   onClose,
+  onFormNotFound,
 }: FindRecordDialogProps) {
   const baseId = useId();
   const headingId = `${baseId}-heading`;
   const formId = `${baseId}-form`;
   const limitNoteId = `${baseId}-limit`;
+  const statusId = `${baseId}-status`;
   const backdropRef = useRef<HTMLDivElement>(null);
   const dialogRef = useRef<HTMLDivElement>(null);
   const checkboxRefs = useRef(new Map<string, HTMLInputElement>());
@@ -341,6 +420,8 @@ export function FindRecordDialog({
   const [loading, setLoading] = useState(false);
   const [response, setResponse] = useState<SearchResponse | null>(null);
   const [error, setError] = useState<ApiError | null>(null);
+  // The criteria `response` and `error` were returned for; set together with them.
+  const [submitted, setSubmitted] = useState<SubmittedCriteria | null>(null);
 
   // Criteria belong to one form: another form starts with an empty picker. Adjusted
   // during render, so the other form's criteria are never shown, not even for a frame.
@@ -352,6 +433,7 @@ export function FindRecordDialog({
     setLoading(false);
     setResponse(null);
     setError(null);
+    setSubmitted(null);
   }
 
   // A search still in flight for the previous form, or at unmount, is abandoned.
@@ -367,6 +449,11 @@ export function FindRecordDialog({
   const onCloseRef = useRef(onClose);
   useEffect(() => {
     onCloseRef.current = onClose;
+  });
+  // A search's outcome arrives later and reports a missing form through the latest callback.
+  const onFormNotFoundRef = useRef(onFormNotFound);
+  useEffect(() => {
+    onFormNotFoundRef.current = onFormNotFound;
   });
 
   // Modal isolation for one open session, as in ConfirmDialog and MessageDialog. The
@@ -470,6 +557,7 @@ export function FindRecordDialog({
       setLoading(false);
       setResponse(null);
       setError(null);
+      setSubmitted(null);
 
       // Focus returns only when it has nowhere else to be: it was inside the dialog,
       // or on <body> once the dialog left the page.
@@ -507,7 +595,24 @@ export function FindRecordDialog({
 
   const criteria = fields.filter((field) => selected.has(field.name));
   const atLimit = criteria.length >= MAX_SEARCH_FIELDS;
-  const { byField, other } = splitFieldErrors(error, fields, selected);
+  const entries: CriterionEntry[] = criteria.map((field) => ({
+    field: field.name,
+    value: texts.get(field.name) ?? '',
+  }));
+  const searchKey = criteriaKey(entries, includeDeleted, openRecordId);
+
+  // Pending policy. While a search runs, the picker, the value boxes and Remove stay
+  // usable: an edit makes the running search's outcome out of date, shown as below
+  // once it arrives. Search is disabled and the status line says "Searching…"; Close
+  // is never disabled and abandons the search. Results and errors belong to the
+  // criteria they were sent with (`submitted`). The results can be opened only when
+  // no search is pending and the criteria on screen are the ones sent; otherwise they
+  // stay on screen, marked out of date, and every row and Open button is
+  // aria-disabled (focusable, inactive). A field's message shows while its criterion
+  // holds the text sent, and the banner only while the whole criteria are unchanged.
+  const current = submitted !== null && submitted.key === searchKey;
+  const actionable = current && !loading;
+  const { byField, other } = splitFieldErrors(error, fields, submitted, texts, selected);
 
   const setPicked = (name: string, picked: boolean) => {
     if (picked && atLimit) {
@@ -556,9 +661,13 @@ export function FindRecordDialog({
     controllerRef.current = controller;
 
     const request: SearchRequest = {
-      criteria: criteria.map((field) => ({ field: field.name, value: texts.get(field.name) ?? '' })),
+      criteria: entries.map((entry) => ({ field: entry.field, value: entry.value })),
       includeDeleted,
       excludeGlobalRecordId: openRecordId ?? undefined,
+    };
+    const sent: SubmittedCriteria = {
+      key: searchKey,
+      texts: new Map(entries.map((entry) => [entry.field, entry.value])),
     };
 
     const settle = (nextResponse: SearchResponse | null, nextError: ApiError | null) => {
@@ -569,6 +678,7 @@ export function FindRecordDialog({
       setLoading(false);
       setResponse(nextResponse);
       setError(nextError);
+      setSubmitted(sent);
     };
 
     refocusSearchRef.current = true;
@@ -579,15 +689,24 @@ export function FindRecordDialog({
         if (result.ok) {
           settle(result.data, null);
         } else {
+          // A 404 of the latest search means the form itself is gone: the form view's
+          // form-not-found handling takes over. A superseded search reports nothing.
+          const formGone = result.error.kind === 'notFound' && controllerRef.current === controller;
           settle(null, result.error);
+          if (formGone) {
+            onFormNotFoundRef.current();
+          }
         }
       },
       (reason: unknown) => {
-        // The client rejects only for an abort, which is this dialog's own decision.
-        if (controller.signal.aborted || isAbortError(reason)) {
+        // The dialog's own abort: a newer search, closing, another form or unmounting.
+        if (controller.signal.aborted) {
           return;
         }
-        settle(null, networkError());
+        // The client rejects only for an abort. One the dialog did not cause, such as the
+        // browser stopping the page's requests, failed nothing: the search settles idle with
+        // no result and no error, so Search is enabled again.
+        settle(null, isAbortError(reason) ? null : networkError());
       },
     );
   };
@@ -617,12 +736,19 @@ export function FindRecordDialog({
     }
   };
 
-  const statusText = loading ? SEARCHING : response !== null ? resultSummary(response) : '';
   const items = response?.items ?? [];
   const columns = items.length > 0 ? Object.keys(items[0].values) : [];
+  let statusText = '';
+  if (loading) {
+    statusText = items.length > 0 ? SEARCHING_OVER_RESULTS : SEARCHING;
+  } else if (response !== null) {
+    statusText = current ? resultSummary(response) : `${resultSummary(response)} ${STALE_RESULTS}`;
+  }
 
+  // The banner speaks of the search that failed, so it shows only while the criteria
+  // on screen are the ones that search sent.
   let banner: ReactNode = null;
-  if (error !== null) {
+  if (error !== null && current) {
     if (isConnectionFailure(error)) {
       banner = <ConnectionError error={error} method="GET" onRetry={runSearch} />;
     } else {
@@ -768,12 +894,12 @@ export function FindRecordDialog({
         </button>
 
         {/* Always rendered, so "Searching…" and the result count are announced. */}
-        <p role="status" className={statusText === '' ? 'visually-hidden' : undefined}>
+        <p id={statusId} role="status" className={statusText === '' ? 'visually-hidden' : undefined}>
           {statusText}
         </p>
         {items.length > 0 && (
-          <div className="find-dialog__results">
-            <table>
+          <div className={actionable ? 'find-dialog__results' : 'find-dialog__results find-dialog__results--stale'}>
+            <table aria-busy={loading}>
               <caption className="visually-hidden">Matching records</caption>
               <thead>
                 <tr>
@@ -792,18 +918,25 @@ export function FindRecordDialog({
                     <tr
                       key={item.globalRecordId}
                       className={deleted ? 'record-grid__row--deleted' : undefined}
+                      aria-disabled={actionable ? undefined : 'true'}
                       onClick={() => {
-                        onOpen(item.globalRecordId);
+                        if (actionable) {
+                          onOpen(item.globalRecordId);
+                        }
                       }}
                     >
                       <td>
                         <button
                           type="button"
                           aria-label={`Open record at position ${item.position}`}
+                          aria-disabled={actionable ? undefined : 'true'}
+                          aria-describedby={actionable ? undefined : statusId}
                           onClick={(event) => {
                             // The row's own click would report the same record a second time.
                             event.stopPropagation();
-                            onOpen(item.globalRecordId);
+                            if (actionable) {
+                              onOpen(item.globalRecordId);
+                            }
                           }}
                         >
                           {item.position}

@@ -2,6 +2,8 @@
 // generated from it (web/src/api/schema.ts).
 //
 // Usage, from web/ after any change to the API contract:  npm run api:generate
+// `node scripts/api-generate.mjs --help` (or -h) prints the usage and changes nothing; the script takes no other
+// argument, and any other argument is refused with exit status 2 before anything runs (see handleArguments).
 //
 // Requires the .NET SDK 10.0.1xx (see the root README.md) and `npm ci` already run in web/. No database is needed:
 // the build-time generator hosts Program without starting Kestrel. Nothing is added to the environment the build
@@ -10,13 +12,24 @@
 // check-api-fresh.mjs, the second half of `npm run lint`, reuses generateFresh() and compares its output with
 // COMMITTED, so both scripts produce the documents in exactly the same way.
 
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { readFileSync, unlinkSync } from 'node:fs';
+import {
+  closeSync,
+  mkdtempSync,
+  openSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
+import { clearInterval, setInterval, setTimeout } from 'node:timers';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { URL, fileURLToPath } from 'node:url';
 
@@ -43,7 +56,10 @@ export const COMMITTED = Object.freeze({
   ts: path.join(webDir, 'src', 'api', clientFileName),
 });
 
-/** A generation failure; exitCode carries the status of the failing dotnet or openapi-typescript run. */
+/**
+ * A generation failure; exitCode carries the status of the failing dotnet or openapi-typescript run, or 128 + n for a
+ * run interrupted by signal n (see currentInterruption).
+ */
 export class GenerationError extends Error {
   constructor(message, exitCode = 1) {
     super(message);
@@ -59,9 +75,12 @@ export class GenerationError extends Error {
  * leftover in the checkout's own src/EpiInfo.Api/obj/. Returns { json, ts, dir }: the fresh document, the fresh client
  * types and the directory that holds them, which the caller removes with removeFresh(dir), marker included. Until then
  * the run holds the checkout's generation lock, which every other run of this checkout waits for. A failed run removes
- * the directory and releases the lock itself.
+ * the directory and releases the lock itself. From the directory's creation until its removal, an interruption by
+ * SIGINT, SIGTERM or SIGHUP stops every process the run started, with their descendants, fails the run through that
+ * same cleanup, and then ends the process by the signal (see onInterruptionSignal).
  */
 export async function generateFresh() {
+  throwIfInterrupted();
   // Every checkout and temporary path a later step hands to a shell or reads as a URL is checked first (see
   // assertPathCharacters), so a refused path creates nothing and starts no build. Each is checked as the text that
   // step uses: MSBuild resolves no symlinks, so the build is given the canonical checkout and document directory. The
@@ -98,7 +117,19 @@ export async function generateFresh() {
   assertPathCharacters(tempRoot, 'temporary directory', shellInDoubleQuotes, tempRemedy);
   assertPathCharacters(tempRoot, 'temporary directory', urlText, tempRemedy);
 
-  const dir = await fs.mkdtemp(path.join(tempRoot, 'epiinfo-openapi-'));
+  // The run opens, and its directory is created and recorded in it, in one synchronous step. A signal is handled only
+  // between synchronous steps, so an interruption finds this run either not yet open, with nothing created, or open
+  // with its directory recorded, which it then removes. An asynchronous mkdtemp would leave the directory existing but
+  // unrecorded until it completed, and a forced stop in that window would leave it behind.
+  const run = openRun();
+  let dir;
+  try {
+    dir = mkdtempSync(path.join(tempRoot, 'epiinfo-openapi-'));
+  } catch (error) {
+    closeRun(run);
+    throw error;
+  }
+  run.dir = dir;
   try {
     // Runs of one checkout share the API's obj/ and bin/ outputs, so concurrent builds would write the same files and
     // the generator could read an assembly another build is still writing. Each run holds the checkout's generation
@@ -192,11 +223,21 @@ export async function generateFresh() {
   }
 }
 
-/** Removes a directory returned by generateFresh(), and releases the generation lock its run holds. */
+/**
+ * Removes a directory returned by generateFresh(), and releases the generation lock its run holds. The run stays open
+ * until its directory is removed, so a directory that could not be removed is tried again if an interruption follows.
+ * While an interruption is stopping the processes the run started, which may still write into the directory, nothing
+ * is removed until all of them have ended with their descendants; the interruption bounds that wait, as it ends the
+ * process once its own bounded waits are over (see finishInterruption).
+ */
 export async function removeFresh(dir) {
+  if (interruption !== null) {
+    await waitUntil(startedProcessesEnded, Infinity);
+  }
   const lock = heldLocks.get(dir);
   if (lock === undefined) {
     await fs.rm(dir, { recursive: true, force: true });
+    closeRunOf(dir);
     return;
   }
   heldLocks.delete(dir);
@@ -205,6 +246,9 @@ export async function removeFresh(dir) {
     fs.rm(dir, { recursive: true, force: true }),
     releaseGenerationLock(lock),
   ]);
+  if (removal.status === 'fulfilled') {
+    closeRunOf(dir);
+  }
   if (removal.status === 'rejected' && release.status === 'rejected') {
     throw new GenerationError(
       `could not remove ${dir} (${errorMessage(removal.reason)}), and ${errorMessage(release.reason)}`,
@@ -216,6 +260,319 @@ export async function removeFresh(dir) {
   if (release.status === 'rejected') {
     throw release.reason;
   }
+}
+
+// Interruption. Left to their default disposition, Ctrl-C (SIGINT), a termination request (SIGTERM) and the loss of
+// the terminal (SIGHUP) end this process at once: the run's temporary directory stays behind, the generation lock
+// stays until the next run removes it as stale, and a dotnet child goes on building and writes the document into the
+// orphaned directory. So while at least one run is open, these signals are caught, and the first one:
+//   - is remembered (see currentInterruption), and from then on nothing new starts: runChecked() spawns no process,
+//     a run waiting for the lock stops waiting, and writeCommitted() starts no publication. A publication already
+//     under way is never cut short: it completes, or rolls back as a whole, by its own logic;
+//   - stops every process the run started, with its descendants. On POSIX, runChecked() starts each command detached,
+//     as the leader of a new session and process group, which every descendant joins unless it changes group itself.
+//     Having no controlling terminal, the tree never receives a terminal's Ctrl-C or hangup, which reach only this
+//     process, and no background read or write of the terminal can stop it with SIGTTIN or SIGTTOU. Each group is
+//     sent SIGINT, whichever signal arrived: SIGINT is MSBuild's graceful cancellation, while a dotnet sent SIGTERM
+//     ends at once with status 0. A group still holding a live member after childStopGraceMilliseconds, such as a
+//     dotnet build cancelled during its implicit restore, which can hang, or a descendant that ignores SIGINT, is
+//     sent SIGKILL. A group counts as stopped only once none of its members is alive, however long ago its leader
+//     ended (see groupHasLiveMember), and it stays tracked after its leader has ended for as long as members remain.
+//     On Windows, which has neither signals nor process groups and where a detached child would open a console
+//     window, each command still running has its process tree ended outright (see endProcessTree);
+//   - lets the run fail through its own cleanup, generateFresh()'s failure path or the caller's removeFresh(dir),
+//     which waits until every started process has ended with its descendants, then removes the directory and
+//     releases the lock, and lets the caller report the interruption;
+//   - then, synchronously (see finishInterruption), kills every process group still tracked, waits briefly for each
+//     to empty, removes what is left, restores the default disposition and raises the signal again, so the process
+//     still ends by it and its parent sees 128 + n.
+// A second signal while stopping skips the waiting and goes straight to that last step. Either way, the run's
+// directory is removed only once every process the run started, with its descendants, has ended or, in that last
+// step, been killed. The directory and the lock are created and recorded synchronously, so no interruption finds one
+// of them existing but unrecorded. What escapes: a descendant that leaves its process group (by setsid or setpgid) is
+// not stopped, nor on Windows, where taskkill finds a tree by parent process, a descendant whose parent had already
+// ended; and SIGKILL of this process, which cannot be caught, leaves the directory behind and the processes it started
+// running to their end. Its lock, which records the running dotnet child, is removed as stale by the first run after
+// that child has ended.
+const interruptionSignals = Object.freeze(['SIGINT', 'SIGTERM', 'SIGHUP']);
+const childStopGraceMilliseconds = 30 * 1000;
+const childKillGraceMilliseconds = 5 * 1000;
+const runSettleMilliseconds = 10 * 1000;
+const interruptionPollMilliseconds = 50;
+// How long the final, synchronous cleanup waits for the process groups it has just killed to empty.
+const killedChildEndMilliseconds = 500;
+// How long the process may outlive the signal it raises again before it exits with 128 + n instead.
+const reRaiseGraceMilliseconds = 1000;
+// How often a process group whose leader has ended is checked for having emptied (see onStartedProcessClosed).
+const lingeringGroupPollMilliseconds = 1000;
+
+// The runs still open, each as { dir }: from just before generateFresh() creates its temporary directory (dir is set
+// once it exists) until that directory has been removed. The signals are caught exactly while one is open.
+const openRuns = new Set();
+// Each process runChecked() started, as { child, closed }, until it has ended with its descendants: on POSIX until its
+// process group has no live member, which may be long after the child itself closed, and on Windows until it closes.
+const startedProcesses = new Set();
+// The timer that checks the groups whose leader has ended, while there are any.
+let lingeringGroupWatch = null;
+// How many publications of the committed pair are under way.
+let publicationsUnderWay = 0;
+// The first interruption, as { signal, exitCode }, or null while none has arrived.
+let interruption = null;
+let interruptionFinished = false;
+// The standard streams whose terminal or pipe went away during an interruption.
+const lostStreams = new Set();
+
+/**
+ * The interruption this process received while a run was open, as { signal, exitCode } with exitCode 128 + the
+ * signal's number, or null. Once it is set, every run of this process fails, and the process ends by that signal as
+ * soon as its runs have cleaned up, so callers report it in place of their usual outcome.
+ */
+export function currentInterruption() {
+  return interruption;
+}
+
+function openRun() {
+  if (openRuns.size === 0) {
+    for (const signal of interruptionSignals) {
+      process.on(signal, onInterruptionSignal);
+    }
+  }
+  const run = { dir: undefined };
+  openRuns.add(run);
+  return run;
+}
+
+// Once no run is open, the default disposition is back, unless an interruption is ending the process, which then
+// removes the listeners itself just before it raises the signal again.
+function closeRun(run) {
+  openRuns.delete(run);
+  if (openRuns.size === 0 && interruption === null) {
+    removeInterruptionListeners();
+  }
+}
+
+function closeRunOf(dir) {
+  for (const run of openRuns) {
+    if (run.dir === dir) {
+      closeRun(run);
+    }
+  }
+}
+
+function removeInterruptionListeners() {
+  for (const signal of interruptionSignals) {
+    process.removeListener(signal, onInterruptionSignal);
+  }
+}
+
+function throwIfInterrupted() {
+  if (interruption !== null) {
+    throw new GenerationError(`the run was interrupted by ${interruption.signal}`, interruption.exitCode);
+  }
+}
+
+function onInterruptionSignal(signal) {
+  if (interruption !== null) {
+    reportWhileStopping(`${signal} received again: stopping at once\n`);
+    finishInterruption();
+    return;
+  }
+  interruption = Object.freeze({ signal, exitCode: 128 + os.constants.signals[signal] });
+  // A terminal or pipe that went away, the usual cause of SIGHUP, fails later writes with an asynchronous stream
+  // error, which unhandled would end the process before its cleanup. A failed stream is recorded instead, and the
+  // interruption writes nothing more to it.
+  for (const stream of [process.stdout, process.stderr]) {
+    stream.on('error', () => lostStreams.add(stream));
+  }
+  reportWhileStopping(`${signal} received: stopping the OpenAPI build and removing its temporary directory\n`);
+  stopInterruptedRuns().then(finishInterruption, finishInterruption);
+}
+
+function reportWhileStopping(text) {
+  if (!lostStreams.has(process.stderr)) {
+    process.stderr.write(text);
+  }
+}
+
+// The first interruption's orderly stop: the started processes first, with their descendants, then a publication
+// under way, however long it takes, then the runs' own cleanup, each wait bounded except the publication's, which a
+// second signal cuts short.
+async function stopInterruptedRuns() {
+  signalStartedProcesses('SIGINT');
+  if (!(await waitUntil(startedProcessesEnded, childStopGraceMilliseconds))) {
+    signalStartedProcesses('SIGKILL');
+    await waitUntil(startedProcessesEnded, childKillGraceMilliseconds);
+  }
+  await waitUntil(() => publicationsUnderWay === 0, Infinity);
+  await waitUntil(() => openRuns.size === 0, runSettleMilliseconds);
+}
+
+// Polls with a timer, which also keeps the event loop alive, until the condition holds or the time is up. Returns
+// whether the condition holds.
+async function waitUntil(condition, milliseconds) {
+  const deadline = Date.now() + milliseconds;
+  while (!condition()) {
+    if (Date.now() >= deadline) {
+      return false;
+    }
+    await sleep(interruptionPollMilliseconds);
+  }
+  return true;
+}
+
+// Sends the signal to every process runChecked() started that has not ended with its descendants.
+function signalStartedProcesses(signal) {
+  for (const started of startedProcesses) {
+    signalStartedProcess(started, signal);
+  }
+}
+
+// On POSIX the signal goes to the process's whole group. A group that emptied since it was last checked answers
+// ESRCH; nothing more is needed for it. On Windows every signal ends the process tree outright.
+function signalStartedProcess(started, signal) {
+  if (process.platform === 'win32') {
+    if (!started.closed) {
+      endProcessTree(started.child);
+    }
+    return;
+  }
+  try {
+    process.kill(-started.child.pid, signal);
+  } catch {
+    // The group has no member left to signal.
+  }
+}
+
+// taskkill /T /F ends the process together with every process it started that still runs, which child.kill(), the
+// fallback for a taskkill that cannot run, would leave running. Failures are ignored: a process that has ended already
+// needs nothing more.
+function endProcessTree(child) {
+  spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true });
+  child.kill();
+}
+
+// Whether the started process has ended with its descendants: on POSIX, whether its group has no live member left.
+function hasEnded(started) {
+  if (process.platform === 'win32') {
+    return started.closed || !isProcessRunning(started.child.pid);
+  }
+  return !groupHasLiveMember(started.child.pid);
+}
+
+// Stops tracking every started process that has ended with its descendants, and returns whether none is left.
+function startedProcessesEnded() {
+  for (const started of startedProcesses) {
+    if (hasEnded(started)) {
+      startedProcesses.delete(started);
+    }
+  }
+  return startedProcesses.size === 0;
+}
+
+// Runs when a started process closes. A group whose members outlive their leader stays tracked, and while any such
+// group remains, a timer that does not keep the process alive checks it every lingeringGroupPollMilliseconds. Once a
+// group has emptied, its id may be given to a new group, so it is dropped at the next check, long before the system's
+// cycle of process ids could reuse that id, and is never signalled again.
+function onStartedProcessClosed(started) {
+  started.closed = true;
+  if (hasEnded(started)) {
+    startedProcesses.delete(started);
+    return;
+  }
+  if (lingeringGroupWatch !== null) {
+    return;
+  }
+  lingeringGroupWatch = setInterval(() => {
+    startedProcessesEnded();
+    if (![...startedProcesses].some((entry) => entry.closed)) {
+      clearInterval(lingeringGroupWatch);
+      lingeringGroupWatch = null;
+    }
+  }, lingeringGroupPollMilliseconds);
+  lingeringGroupWatch.unref();
+}
+
+// Whether the process group still holds a live member. Signal 0 to the group fails with ESRCH once no member exists,
+// and with EPERM when a member runs under another account, which counts as live. A member that has ended but was not
+// yet reaped still answers it, and an orphaned descendant may never be reaped (see isProcessRunning), so on Linux the
+// group's members are looked up in /proc, whose stat for each process names its group, and only members not in state
+// Z (zombie) or X (dead) count. Elsewhere, and where /proc cannot be listed, the signal's answer stands.
+function groupHasLiveMember(group) {
+  try {
+    process.kill(-group, 0);
+  } catch (error) {
+    return error.code !== 'ESRCH';
+  }
+  if (process.platform !== 'linux') {
+    return true;
+  }
+  let pids;
+  try {
+    pids = readdirSync('/proc');
+  } catch {
+    return true;
+  }
+  for (const pid of pids) {
+    if (!/^\d+$/.test(pid)) {
+      continue;
+    }
+    let stat;
+    try {
+      stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+    } catch {
+      // Ended since the listing.
+      continue;
+    }
+    const [state, , processGroup] = procStatFields(stat);
+    if (Number(processGroup) === group && state !== 'Z' && state !== 'X') {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Ends an interrupted process: kills every process group still tracked (on Windows, every process tree still running),
+// removes every directory a run left open and releases every lock and claim file still held, all synchronously, then
+// raises the signal again with the default disposition restored. A killed group takes a moment to empty, so that is
+// awaited briefly first; a lock whose recorded child has still not ended is kept by releaseLockFileSync, and the next
+// run removes it as stale.
+function finishInterruption() {
+  if (interruptionFinished) {
+    return;
+  }
+  interruptionFinished = true;
+  signalStartedProcesses('SIGKILL');
+  const deadline = Date.now() + killedChildEndMilliseconds;
+  const pause = new Int32Array(new SharedArrayBuffer(4));
+  while (!startedProcessesEnded() && Date.now() < deadline) {
+    Atomics.wait(pause, 0, 0, interruptionPollMilliseconds / 5);
+  }
+  for (const run of openRuns) {
+    if (run.dir !== undefined) {
+      try {
+        rmSync(run.dir, { recursive: true, force: true });
+      } catch (error) {
+        reportWhileStopping(`could not remove ${run.dir}: ${errorMessage(error)}\n`);
+      }
+    }
+  }
+  for (const lock of heldLocks.values()) {
+    releaseLockFileSync(lock.token);
+  }
+  for (const [claim, token] of heldClaims) {
+    releaseLockFileSync(token, claim);
+  }
+  removeInterruptionListeners();
+  const { signal, exitCode } = interruption;
+  process.exitCode = exitCode;
+  // Where raising the signal does not end the process (Windows has no POSIX signals, and another listener for it
+  // keeps the process alive), it exits with the status a shell reports for that signal.
+  try {
+    process.kill(process.pid, signal);
+  } catch {
+    process.exit(exitCode);
+  }
+  setTimeout(() => process.exit(exitCode), reRaiseGraceMilliseconds).unref();
 }
 
 // Generation lock. One file per checkout, under the API's git-ignored obj/, created exclusively by the run that holds
@@ -237,6 +594,9 @@ const claimDepthLimit = 3;
 let generationQueue = Promise.resolve();
 // The lock of each run still open, by its temporary directory, until removeFresh(dir) releases it.
 const heldLocks = new Map();
+// The token of each claim file this process created while removing a stale lock, by the claim's path, until the claim
+// has been removed again, so that an interruption that ends the process meanwhile removes it too.
+const heldClaims = new Map();
 
 async function acquireGenerationLock(dir) {
   const previous = generationQueue;
@@ -245,19 +605,24 @@ async function acquireGenerationLock(dir) {
     leaveQueue = resolve;
   });
   await previous;
+  let lock;
   try {
+    // acquireLockFile() creates the lock synchronously as its last step, and only promise continuations, never a
+    // signal handler, run between that and the lines below, so the lock is recorded as held before an interruption
+    // can look for it (see finishInterruption).
     const record = await acquireLockFile();
     // Safety net for a process that exits without removeFresh(dir); a release in removeFresh deregisters it.
     const releaseOnExit = () => releaseLockFileSync(record.token);
     process.on('exit', releaseOnExit);
     // record is the content of the lock file, which recordLockChild rewrites while a child runs.
-    const lock = { token: record.token, record, releaseOnExit, leaveQueue };
+    lock = { token: record.token, record, releaseOnExit, leaveQueue };
     heldLocks.set(dir, lock);
-    return lock;
   } catch (error) {
     leaveQueue();
     throw error;
   }
+  await removeLockLeftovers();
+  return lock;
 }
 
 async function acquireLockFile() {
@@ -266,8 +631,9 @@ async function acquireLockFile() {
   const deadline = Date.now() + lockWaitLimitMilliseconds;
   let announced = false;
   for (;;) {
-    if (await createExclusive(generationLock, record)) {
-      await removeLockLeftovers();
+    // An interrupted run stops waiting at the next poll.
+    throwIfInterrupted();
+    if (createExclusive(generationLock, record)) {
       return record;
     }
     const holder = await readLockRecord(generationLock);
@@ -307,7 +673,7 @@ async function acquireLockFile() {
 async function removeStaleInstance(file, stale, depth) {
   const claim = `${file}.claim-${stale.record?.token ?? stale.identity}`;
   const claimant = newLockRecord();
-  if (!(await createExclusive(claim, claimant))) {
+  if (!createExclusive(claim, claimant)) {
     const other = await readLockRecord(claim);
     if (other === null) {
       return true;
@@ -317,6 +683,8 @@ async function removeStaleInstance(file, stale, depth) {
     }
     return false;
   }
+  // Recorded in the same synchronous step as its creation (see heldClaims).
+  heldClaims.set(claim, claimant.token);
   let failed = true;
   try {
     if (await removeIfUnchanged(file, stale)) {
@@ -327,6 +695,7 @@ async function removeStaleInstance(file, stale, depth) {
     return true;
   } finally {
     await cleanUpAfter(failed, toRepoRelative(claim), () => removeIfUnchanged(claim, { record: claimant }));
+    heldClaims.delete(claim);
   }
 }
 
@@ -372,12 +741,13 @@ async function releaseGenerationLock(lock) {
 
 // Runs from the process 'exit' event, so it is synchronous and never throws: a lock it cannot remove names a
 // process that no longer runs, and the next run removes it as stale. A lock whose recorded child still runs is kept,
-// because that child goes on writing the checkout's outputs; it turns stale when the child ends.
-function releaseLockFileSync(token) {
+// because that child goes on writing the checkout's outputs; it turns stale when the child ends. A claim file, which
+// records no child, is released the same way.
+function releaseLockFileSync(token, file = generationLock) {
   try {
-    const record = parseLockRecord(readFileSync(generationLock, 'utf8'));
+    const record = parseLockRecord(readFileSync(file, 'utf8'));
     if (record?.token === token && !isChildRunning(record)) {
-      unlinkSync(generationLock);
+      unlinkSync(file);
     }
   } catch {
     // Nothing more can be done while the process exits.
@@ -386,24 +756,37 @@ function releaseLockFileSync(token) {
 
 // Rewrites the held lock's record with childPid set to the given pid, or without childPid when it is undefined. The
 // new record is written whole to `<lock>.<token>.next` and renamed over the lock, so a reader sees the old record or
-// the new one and never a partial one; the lock must still carry this run's token, or the update fails.
-async function recordLockChild(lock, childPid) {
+// the new one and never a partial one; the lock must still carry this run's token, or the update fails. Every step is
+// synchronous, so an interruption never finds an update under way that could put the lock, or its update file, back
+// after finishInterruption has released it.
+function recordLockChild(lock, childPid) {
   const { childPid: previous, ...record } = lock.record;
   if (childPid !== undefined) {
     record.childPid = childPid;
   }
   const update = `${generationLock}.${lock.token}.next`;
   try {
-    await fs.writeFile(update, `${JSON.stringify(record)}\n`);
-    const current = await readLockRecord(generationLock);
+    writeFileSync(update, `${JSON.stringify(record)}\n`);
+    let current = null;
+    try {
+      current = { record: parseLockRecord(readFileSync(generationLock, 'utf8')) };
+    } catch (error) {
+      if (error.code !== 'ENOENT') {
+        throw error;
+      }
+    }
     if (current?.record?.token !== lock.token) {
       throw new Error(
         current === null ? 'the lock file no longer exists' : `the lock is now held by ${describeHolder(current)}`,
       );
     }
-    await renameReplacing(update, generationLock);
+    renameReplacing(update, generationLock);
   } catch (error) {
-    await cleanUpAfter(true, toRepoRelative(update), () => fs.rm(update, { force: true }));
+    try {
+      rmSync(update, { force: true });
+    } catch (cleanupError) {
+      process.stderr.write(`could not clean up ${toRepoRelative(update)}: ${errorMessage(cleanupError)}\n`);
+    }
     const change =
       childPid === undefined ? `clear child process ${previous} from` : `record child process ${childPid} in`;
     throw new GenerationError(
@@ -413,19 +796,21 @@ async function recordLockChild(lock, childPid) {
   lock.record = record;
 }
 
-// Renames a file over an existing one. Windows refuses the replacement while another process has the target open,
-// which waiting runs do for an instant on each poll, so those refusals are retried a few times.
-async function renameReplacing(source, target) {
+// Renames a file over an existing one, synchronously. Windows refuses the replacement while another process has the
+// target open, which waiting runs do for an instant on each poll, so those refusals are retried a few times after a
+// pause that blocks this thread rather than yielding to a signal handler.
+function renameReplacing(source, target) {
+  const pause = new Int32Array(new SharedArrayBuffer(4));
   for (let attempt = 1; ; attempt += 1) {
     try {
-      await fs.rename(source, target);
+      renameSync(source, target);
       return;
     } catch (error) {
       if (attempt >= 5 || !['EPERM', 'EACCES', 'EBUSY'].includes(error.code)) {
         throw error;
       }
     }
-    await sleep(50);
+    Atomics.wait(pause, 0, 0, 50);
   }
 }
 
@@ -434,26 +819,37 @@ function newLockRecord() {
 }
 
 // Creates the file only if it does not exist and writes the record into it. Returns false when the file exists. A
-// record that cannot be written completely is removed again, so it never stays behind as a lock.
-async function createExclusive(file, record) {
-  let handle;
+// record that cannot be written completely is removed again, so it never stays behind as a lock. All of it is
+// synchronous, so an interruption finds the file either absent or complete and in its creator's hands, never being
+// created by an operation that could complete after the interruption has released everything this process holds.
+function createExclusive(file, record) {
+  let descriptor;
   try {
-    handle = await fs.open(file, 'wx');
+    descriptor = openSync(file, 'wx');
   } catch (error) {
     if (error.code === 'EEXIST') {
       return false;
     }
     throw error;
   }
+  let failure;
   try {
-    await handle.writeFile(`${JSON.stringify(record)}\n`);
-    await handle.close();
+    writeFileSync(descriptor, `${JSON.stringify(record)}\n`);
   } catch (error) {
-    await cleanUpAfter(true, toRepoRelative(file), async () => {
-      await handle.close();
-      await fs.rm(file, { force: true });
-    });
-    throw error;
+    failure = error;
+  }
+  try {
+    closeSync(descriptor);
+  } catch (error) {
+    failure ??= error;
+  }
+  if (failure !== undefined) {
+    try {
+      rmSync(file, { force: true });
+    } catch (error) {
+      process.stderr.write(`could not clean up ${toRepoRelative(file)}: ${errorMessage(error)}\n`);
+    }
+    throw failure;
   }
   return true;
 }
@@ -539,9 +935,14 @@ function isProcessRunning(pid) {
     // Gone since the signal; any other failure leaves the signal's answer standing.
     return error.code !== 'ENOENT';
   }
-  // The state follows the command name, which is in parentheses and may itself contain ') '.
-  const state = stat.slice(stat.lastIndexOf(')') + 2, stat.lastIndexOf(')') + 3);
+  const [state] = procStatFields(stat);
   return state !== 'Z' && state !== 'X';
+}
+
+// The fields of a /proc/<pid>/stat text from the state on: state, ppid, pgrp and the rest, space-separated. They follow
+// the command name, which is in parentheses and may itself contain ') ', so they start after the last ')'.
+function procStatFields(stat) {
+  return stat.slice(stat.lastIndexOf(')') + 2).split(' ');
 }
 
 // Removes the file while it still holds the expected holder: the same token, or, for a record that was never
@@ -762,15 +1163,25 @@ function errorMessage(error) {
   return error instanceof Error ? error.message : String(error);
 }
 
-// Runs a command without a shell, with inherited stdin, stderr and environment, and stdout inherited too or, with
-// captureStdout, collected and returned as text. A failed start or a failed exit becomes a GenerationError that keeps
-// the command's exit status, after any captured output has been passed on to stderr. Given the held lock, the child's
-// pid is recorded in the lock for as long as the child runs, so the lock outlives this process while a child goes on
-// writing the checkout's outputs; a child whose pid cannot be recorded is stopped before the error is raised.
+// Runs a command without a shell, with inherited stderr and environment, stdout inherited too or, with captureStdout,
+// collected and returned as text, and no stdin, which none of the commands reads. On POSIX the command starts detached,
+// as the leader of a new session and process group that its descendants share, so that an interruption can stop the
+// whole tree (see the Interruption section). A failed start or a failed exit becomes a GenerationError that keeps the
+// command's exit status, after any captured output has been passed on to stderr. Given the held lock, the child's pid
+// is recorded in the lock for as long as the child runs, so the lock outlives this process while a child goes on
+// writing the checkout's outputs; a child whose pid cannot be recorded is stopped, with its descendants, before the
+// error is raised. Each started process is tracked from the moment it starts until it has ended with its descendants,
+// so that an interruption can stop them; once the process is interrupted, no command starts, and a command that ends
+// afterwards fails the run whatever its status, since dotnet sent SIGTERM exits with 0.
 async function runChecked(command, args, cwd, description, startFailureMessage, { lock, captureStdout = false } = {}) {
+  throwIfInterrupted();
   let child;
   try {
-    child = spawn(command, args, { cwd, stdio: ['inherit', captureStdout ? 'pipe' : 'inherit', 'inherit'] });
+    child = spawn(command, args, {
+      cwd,
+      stdio: ['ignore', captureStdout ? 'pipe' : 'inherit', 'inherit'],
+      detached: process.platform !== 'win32',
+    });
   } catch (error) {
     throw new GenerationError(startFailureMessage(error));
   }
@@ -782,12 +1193,18 @@ async function runChecked(command, args, cwd, description, startFailureMessage, 
   if (child.pid === undefined) {
     throw new GenerationError(startFailureMessage(await startError));
   }
+  // Tracked, and its pid recorded in the lock, in the same synchronous step as the start, so an interruption always
+  // knows of the process and its lock always names it.
+  const started = { child, closed: false };
+  startedProcesses.add(started);
+  exit.then(() => onStartedProcessClosed(started));
   if (lock !== undefined) {
     try {
-      await recordLockChild(lock, child.pid);
+      recordLockChild(lock, child.pid);
     } catch (error) {
-      child.kill();
+      signalStartedProcess(started, 'SIGKILL');
       await exit;
+      await waitUntil(() => hasEnded(started), childKillGraceMilliseconds);
       throw error;
     }
   }
@@ -795,6 +1212,7 @@ async function runChecked(command, args, cwd, description, startFailureMessage, 
   if (lock !== undefined) {
     await cleanUpAfter(status !== 0, toRepoRelative(generationLock), () => recordLockChild(lock, undefined));
   }
+  throwIfInterrupted();
   const output = Buffer.concat(chunks).toString('utf8');
   if (status !== 0) {
     process.stderr.write(output);
@@ -1083,16 +1501,173 @@ function toRepoRelative(file) {
   return path.relative(repoRoot, file).split(path.sep).join('/');
 }
 
-async function writeCommitted() {
+// progress records whether publication began and whether it completed, which is what an interrupted run reports.
+async function writeCommitted(progress) {
   const fresh = await generateFresh();
   let published = false;
   try {
-    await publishFresh(fresh);
+    // An interrupted run publishes nothing. A publication that has begun is never cut short by an interruption, which
+    // waits for it to complete or roll back by its own logic.
+    throwIfInterrupted();
+    progress.publishing = true;
+    publicationsUnderWay += 1;
+    try {
+      await publishFresh(fresh);
+    } finally {
+      publicationsUnderWay -= 1;
+    }
     published = true;
+    progress.published = true;
   } finally {
     await cleanUpAfter(!published, fresh.dir, () => removeFresh(fresh.dir));
   }
 }
+
+// After an interruption, api:generate ends with one line saying so and what became of the committed pair, in place of
+// a failure message: the interruption is neither a toolchain failure nor a generation result. Returns whether the run
+// was interrupted.
+function reportInterruptedGeneration(progress, failure) {
+  const interrupted = currentInterruption();
+  if (interrupted === null) {
+    return false;
+  }
+  let outcome;
+  if (!progress.publishing) {
+    outcome = 'no committed file was changed';
+  } else if (progress.published) {
+    const cleanup = failure === undefined ? '' : `, and ${errorMessage(failure)}`;
+    outcome = `its publication had begun and completed, so both committed files were written${cleanup}`;
+  } else {
+    outcome = `its publication had begun and failed: ${errorMessage(failure)}`;
+  }
+  process.stderr.write(`api:generate was interrupted by ${interrupted.signal}; ${outcome}\n`);
+  process.exitCode = interrupted.exitCode;
+  return true;
+}
+
+// Command line. Neither script takes an argument apart from a request for help, so a mistyped or unknown option is
+// refused before anything runs, rather than ignored by a run that rewrites or rebuilds something.
+const helpFlags = Object.freeze(['--help', '-h']);
+
+/**
+ * Reads a script's arguments, as process.argv.slice(2) holds them, before anything else runs. Returns undefined when
+ * there are none, and the script runs. Otherwise the script runs nothing and ends with the returned exit status: 0
+ * after writing usage to stdout for exactly one --help or -h, and 2 after writing one line that names the first
+ * refused argument, then usage, to stderr. Every argument that is not a help flag is refused, and so is a help flag
+ * given beside another argument.
+ */
+export function handleArguments(args, usage) {
+  if (args.length === 0) {
+    return undefined;
+  }
+  if (args.length === 1 && helpFlags.includes(args[0])) {
+    process.stdout.write(usage);
+    return 0;
+  }
+  const refused = args.find((argument) => !helpFlags.includes(argument)) ?? args[1];
+  process.stderr.write(
+    `unexpected argument ${JSON.stringify(refused)}: this script takes no arguments, only --help or -h on its own\n` +
+      usage,
+  );
+  return 2;
+}
+
+/**
+ * The --help text of either script: its synopsis lines, its description paragraph and its own exit statuses, around
+ * the sections both share, which are the prerequisites, the rules generateFresh() enforces on the temporary
+ * directory, the options, and the statuses for a refused argument and for an interruption, whose meaning
+ * `interrupted` completes. Paragraphs are wrapped to usageWidth columns.
+ */
+export function formatUsage({ synopsis, description, exitStatuses, interrupted }) {
+  const signalStatuses = interruptionSignals
+    .map((signal) => `${128 + os.constants.signals[signal]} for ${signal}`)
+    .join(', ');
+  const statuses = [
+    ...exitStatuses,
+    ['2', 'an argument other than one --help or -h was given; nothing ran'],
+    ['128+n', `interrupted by signal n (${signalStatuses}); ${interrupted}`],
+  ];
+  const width = Math.max(...statuses.map(([status]) => status.length));
+  return [
+    ...synopsis,
+    '',
+    ...wrapUsage(description, ''),
+    '',
+    'Prerequisites:',
+    ...wrapUsage('`npm ci` run in web/, and the .NET SDK 10.0.1xx (see the root README.md).', '  '),
+    ...wrapUsage('No database and no connection string are needed.', '  '),
+    '',
+    'Temporary directory:',
+    ...temporaryDirectoryRules(),
+    '',
+    'Options:',
+    ...wrapUsage('print this help and exit, running nothing', '  -h, --help  '),
+    '',
+    'Exit status:',
+    ...statuses.flatMap(([status, meaning]) => wrapUsage(meaning, `  ${status.padEnd(width)}  `)),
+    '',
+  ].join('\n');
+}
+
+const usageWidth = 80;
+
+// Breaks a paragraph at spaces into lines of at most usageWidth columns where its words allow. The first line starts
+// with the given prefix, and every later line is indented to the prefix's width.
+function wrapUsage(text, prefix) {
+  const indent = ' '.repeat(prefix.length);
+  const lines = [];
+  let line = prefix;
+  for (const word of text.split(' ')) {
+    if (line.length > indent.length && line.length + 1 + word.length > usageWidth) {
+      lines.push(line);
+      line = indent;
+    }
+    line += line.length > indent.length ? ` ${word}` : word;
+  }
+  lines.push(line);
+  return lines;
+}
+
+// The temporary-directory rules of generateFresh(), as the help states them. They are built from the character sets
+// that generateFresh() checks, so the help cannot drift from the checks: the variable as written is held to
+// shellUnquoted, and the directory os.tmpdir() resolves to is held to shellInDoubleQuotes, which shellUnquoted
+// contains, and to urlText. A path free of both sets therefore always passes. Returns the section's lines, with the
+// characters on a line of their own.
+function temporaryDirectoryRules() {
+  const characters = [...new Set(`${shellUnquoted.characters}${urlText.characters}`)]
+    .map((character) => (character === ' ' ? 'space' : character))
+    .join(' ');
+  const windows = process.platform === 'win32';
+  const variables = windows ? 'TMP and TEMP, when set, must be absolute paths' : 'TMPDIR, when set, must be absolute';
+  return [
+    ...wrapUsage('Each run writes its files to a new directory under os.tmpdir() and removes it when it ends.', '  '),
+    ...wrapUsage(
+      `${variables}. Neither ${windows ? 'they' : 'it'} nor the directory os.tmpdir() resolves to with symbolic ` +
+        `links followed${windows ? '' : ' (/tmp when TMPDIR is unset)'} may hold a control character or any of ` +
+        'these characters:',
+      '  ',
+    ),
+    `    ${characters}`,
+  ];
+}
+
+const generateUsage = () =>
+  formatUsage({
+    synopsis: ['Usage: node scripts/api-generate.mjs [--help | -h]', '   or: npm run api:generate   (from web/)'],
+    description:
+      `Regenerates the committed OpenAPI document ${toRepoRelative(COMMITTED.json)} and the client types ` +
+      `generated from it, ${toRepoRelative(COMMITTED.ts)}. It builds src/EpiInfo.Api with document generation ` +
+      'forced on and runs openapi-typescript on the result, both in a new temporary directory, then replaces the ' +
+      'two committed files together. Run it from any directory after a change to the API contract, then commit ' +
+      'both files.',
+    exitStatuses: [
+      ['0', 'both committed files were written'],
+      ['1', 'generation or publication failed; a failing dotnet or openapi-typescript run gives its own status'],
+    ],
+    interrupted:
+      'the temporary directory is removed, and no committed file is changed unless their publication was ' +
+      'already under way, which then completes or rolls back as a whole',
+  });
 
 // Importing this module, as check-api-fresh.mjs does, must not rewrite the committed files. Node names the main
 // module by its real path, while process.argv[1] keeps the path as typed, so a run through a symlinked file or
@@ -1109,11 +1684,21 @@ const isMain =
   ));
 
 if (isMain) {
-  try {
-    await writeCommitted();
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    process.stderr.write(`api:generate failed: ${message}\n`);
-    process.exitCode = error instanceof GenerationError ? error.exitCode : 1;
+  // The arguments are read before anything else, so --help and a refused argument run nothing.
+  const status = handleArguments(process.argv.slice(2), generateUsage());
+  if (status !== undefined) {
+    process.exitCode = status;
+  } else {
+    const progress = { publishing: false, published: false };
+    try {
+      await writeCommitted(progress);
+      reportInterruptedGeneration(progress);
+    } catch (error) {
+      if (!reportInterruptedGeneration(progress, error)) {
+        const message = error instanceof Error ? error.message : String(error);
+        process.stderr.write(`api:generate failed: ${message}\n`);
+        process.exitCode = error instanceof GenerationError ? error.exitCode : 1;
+      }
+    }
   }
 }

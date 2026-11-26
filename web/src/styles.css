@@ -10,11 +10,13 @@
  *   Pages        .page-tabs with [role="tablist"], [role="tab"], [role="tabpanel"]
  *   Fields       .page-fields  .field  .field--protected  .field--disabled
  *                .field-error  .group-section  .label-heading  .unsupported-placeholder
- *   Grid         .record-grid  .record-grid__row--deleted  .record-grid__paging
+ *   Grid         .record-grid  .record-grid__toggle  .record-grid__toggle--pending
+ *                .record-grid__scroll  .record-grid__open  .record-grid__row--deleted
+ *                .record-grid__table--pending  .record-grid__paging
  *   Messages     .banner  .banner--error  .banner--warning  .banner--info
  *                .banner__actions  .validation-summary
  *   Dialogs      .dialog-backdrop  .dialog  .button--danger  .find-dialog  .find-dialog__fields
- *                .find-dialog__criterion  .find-dialog__results
+ *                .find-dialog__criterion  .find-dialog__results  .find-dialog__results--stale
  *   Utilities    .visually-hidden
  *
  * State comes from native attributes (disabled, aria-selected, aria-current,
@@ -674,15 +676,23 @@
     font-weight: 600;
   }
 
-  /* Record grid: search and "Show deleted" share the first row; the table
-   * and the paging row each take a full row. A table wider than the screen
-   * scrolls sideways inside the section; the padding keeps focus rings of
-   * edge controls inside the scroll box. */
+  /* Record grid: search and "Show deleted" share the first row; messages,
+   * the table and the footer each take a full row. The padding keeps the
+   * focus rings of the section's own controls inside it. */
   .record-grid {
     display: flex;
     flex-wrap: wrap;
     align-items: center;
     gap: var(--space-3) var(--space-4);
+    padding: var(--focus-ring-room);
+  }
+
+  /* Only the table scrolls sideways when it is wider than the screen, so the
+   * search box, the toggle and the paging stay in view. min-inline-size: 0
+   * lets the box shrink below the table's width instead of widening the
+   * page, and its padding keeps the focus rings of edge cells inside it. */
+  .record-grid__scroll {
+    min-inline-size: 0;
     padding: var(--focus-ring-room);
     overflow-x: auto;
     scroll-padding-inline: var(--focus-ring-room);
@@ -696,7 +706,7 @@
     white-space: nowrap;
   }
 
-  .record-grid > table,
+  .record-grid > .record-grid__scroll,
   .record-grid > div,
   .record-grid > p,
   .record-grid > footer,
@@ -707,6 +717,17 @@
   .record-grid input[type="search"] {
     flex: 1 1 16rem;
     max-inline-size: 24rem;
+  }
+
+  /* Pressed: while the pointer is down the search box takes the hover
+   * surface and keeps the hover border; an invalid box keeps its danger
+   * border. */
+  .record-grid input[type="search"]:active:not(:disabled) {
+    --control-background: var(--color-surface-hover);
+  }
+
+  .record-grid input[type="search"]:active:not(:disabled):not([aria-invalid="true"]) {
+    --control-border-color: var(--color-border-hover);
   }
 
   .record-grid label {
@@ -720,6 +741,31 @@
   /* A label around a disabled control is not a click target. */
   .record-grid label:has(:disabled) {
     cursor: not-allowed;
+  }
+
+  /* "Show deleted": the whole label is the toggle's click target, so it
+   * shows hover and pressed surfaces as a button does. */
+  .record-grid__toggle {
+    padding-inline: var(--space-2);
+    border-radius: var(--radius-small);
+  }
+
+  @media (hover: hover) {
+    .record-grid__toggle:hover:not(:has(:disabled)):not(.record-grid__toggle--pending) {
+      background-color: var(--color-surface-hover);
+    }
+  }
+
+  .record-grid__toggle:active:not(:has(:disabled)):not(.record-grid__toggle--pending) {
+    background-color: var(--color-surface-active);
+  }
+
+  /* A change waiting for the record set to be re-read: the requested state
+   * is shown muted and further presses are ignored. The selector outweighs
+   * the label's pointer cursor above. */
+  .record-grid .record-grid__toggle--pending {
+    color: var(--color-text-muted);
+    cursor: progress;
   }
 
   /* Rows of the record grid and of the find results open a record on click
@@ -738,8 +784,62 @@
     background-color: var(--color-surface-muted);
   }
 
-  .record-grid tbody tr:focus-visible {
+  /* Each row's open action: its first cell's text styled as a link. It fills
+   * the cell and is one line tall, so a blank value, whose button holds only
+   * visually hidden text, still has a hover target across the cell's line;
+   * the cell's padding sets the rest of the row height. A pointer click
+   * anywhere on the row opens the record as well. */
+  .record-grid__open {
+    /* Block-level, so no inline baseline gap adds to the row's height. */
+    display: flex;
+    justify-content: flex-start;
+    inline-size: 100%;
+    min-block-size: 1lh;
+    min-inline-size: 0;
+    padding: 0;
+    border: 0;
+    background-color: transparent;
+    color: inherit;
+    font-weight: inherit;
+    line-height: inherit;
+    text-align: start;
+    text-decoration: underline;
+    text-underline-offset: 2px;
+    white-space: nowrap;
+  }
+
+  /* A button is an atomic inline box, which does not take its cell's
+   * line-through, so a deleted row's button draws both lines itself. */
+  .record-grid__row--deleted .record-grid__open {
+    text-decoration-line: underline line-through;
+  }
+
+  @media (hover: hover) {
+    .record-grid__open:hover:not(:disabled):not([aria-disabled="true"]) {
+      background-color: transparent;
+      text-decoration-thickness: 2px;
+    }
+  }
+
+  /* Pressed: the link keeps its transparent background over the base pressed
+   * surface and thickens its underline beyond the hover state, as the
+   * validation summary's links do; the row shows its own pressed tint. */
+  .record-grid__open:active:not(:disabled):not([aria-disabled="true"]) {
+    background-color: transparent;
+    text-decoration-thickness: 3px;
+  }
+
+  /* Keyboard focus on a row's open action rings the whole row, inset as the
+   * row's own focus ring was, so a blank first cell, whose button shows no
+   * text, still shows which record has focus. The row's ring replaces the
+   * button's, so one ring marks the focused record. */
+  .record-grid tbody tr:has(.record-grid__open:focus-visible) {
+    outline: var(--focus-ring-width) solid var(--color-focus);
     outline-offset: calc(-1 * var(--focus-ring-width));
+  }
+
+  .record-grid tbody tr .record-grid__open:focus-visible {
+    outline: none;
   }
 
   /* The open record: tinted, bold and marked by a bar on its first cell. */
@@ -762,6 +862,14 @@
     text-decoration: line-through;
   }
 
+  /* Rows of an earlier page, filter or set, kept on screen while the next
+   * one loads: muted, and inert through their aria-disabled, until the
+   * matching page replaces them. */
+  .record-grid__table--pending tbody {
+    color: var(--color-text-muted);
+    cursor: progress;
+  }
+
   .record-grid__paging,
   .record-grid > footer {
     display: flex;
@@ -773,6 +881,14 @@
   .record-grid__paging > :first-child,
   .record-grid > footer > :first-child {
     margin-inline-end: auto;
+  }
+
+  /* Paging held while the requested page loads: aria-disabled keeps a
+   * pressed button focused, so the disabled look is given here. */
+  .record-grid__paging button[aria-disabled="true"] {
+    border-color: var(--color-border);
+    background-color: var(--color-surface-disabled);
+    color: var(--color-text-muted);
   }
 
   @media (hover: hover) {
@@ -1032,6 +1148,30 @@
     margin-block-start: calc((1lh - var(--choice-size)) / 2);
   }
 
+  /* The whole label toggles its checkbox, so it is the click target: a tint
+   * under the pointer and a darker one while pressed, as on buttons. A field
+   * the six-field limit has disabled takes neither. */
+  .find-dialog__fields > label {
+    padding-inline: var(--space-1);
+    border-radius: var(--radius-small);
+    cursor: pointer;
+  }
+
+  .find-dialog__fields > label:has(:disabled) {
+    cursor: not-allowed;
+  }
+
+  @media (hover: hover) {
+    .find-dialog__fields > label:hover:not(:has(:disabled)) {
+      background-color: var(--color-surface-hover);
+    }
+  }
+
+  /* Pressed follows hover at equal weight, so it wins while both apply. */
+  .find-dialog__fields > label:active:not(:has(:disabled)) {
+    background-color: var(--color-surface-active);
+  }
+
   /* One row per checked field: label, value box, hint, Remove button. */
   .find-dialog__criterion {
     display: flex;
@@ -1050,6 +1190,17 @@
     flex: 1 1 16rem;
   }
 
+  /* Pressed value box: a tinted surface and the hover border. An invalid box
+   * keeps its danger border, and a disabled box keeps the disabled colours. */
+  .find-dialog__criterion > input:not([type="checkbox"]):not([type="radio"]):active:not(:disabled) {
+    --control-background: var(--color-surface-muted);
+  }
+
+  .find-dialog__criterion
+    > input:not([type="checkbox"]):not([type="radio"]):active:not(:disabled):not([aria-invalid="true"]) {
+    --control-border-color: var(--color-border-hover);
+  }
+
   .find-dialog__criterion > small,
   .find-dialog__criterion > .field-error {
     flex: 1 1 100%;
@@ -1060,6 +1211,23 @@
     padding: var(--focus-ring-room);
     overflow-x: auto;
     scroll-padding-inline: var(--focus-ring-room);
+  }
+
+  /* Results of earlier criteria, or kept while a newer search runs: muted,
+   * their rows and Open buttons inert through aria-disabled and drawn as
+   * disabled, until a search with the criteria on screen replaces them. */
+  .find-dialog__results--stale tbody {
+    color: var(--color-text-muted);
+  }
+
+  .find-dialog__results--stale tbody button {
+    border-color: var(--color-border);
+    background-color: var(--color-surface-disabled);
+    color: var(--color-text-muted);
+  }
+
+  .find-dialog__results table[aria-busy="true"] {
+    cursor: progress;
   }
 
   @media (prefers-reduced-motion: no-preference) {

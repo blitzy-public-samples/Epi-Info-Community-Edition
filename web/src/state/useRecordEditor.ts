@@ -145,6 +145,11 @@ export interface RecordEditor {
   readonly save: () => Promise<boolean>;
   /** Navigation's `beforeLeave`: resolves `true` only when the record may be left. */
   readonly leave: () => Promise<boolean>;
+  /**
+   * Resolves once every pending field event has been applied or has failed (a failure counts
+   * as drained), or once the record changes; never rejects and never saves.
+   */
+  readonly drainFieldEvents: () => Promise<void>;
   readonly deleteDialogOpen: boolean;
   readonly requestDelete: () => void;
   readonly confirmDelete: () => Promise<void>;
@@ -170,6 +175,7 @@ type EditorActions = Pick<
   | 'setValue'
   | 'save'
   | 'leave'
+  | 'drainFieldEvents'
   | 'requestDelete'
   | 'confirmDelete'
   | 'cancelDelete'
@@ -895,6 +901,10 @@ function createController(host: ControllerHost): Controller {
     return isDraftDirty(s, idx) ? save() : true;
   }
 
+  /** The drain leave() and save() wait on, for a caller that must judge the draft without saving it. */
+  function drainFieldEvents(): Promise<void> {
+    return queue().drain();
+  }
 
   async function sendDelete(write: DeleteWrite): Promise<void> {
     const { client, viewId } = host.options();
@@ -1127,6 +1137,7 @@ function createController(host: ControllerHost): Controller {
       setValue,
       save,
       leave,
+      drainFieldEvents,
       requestDelete,
       confirmDelete,
       cancelDelete,

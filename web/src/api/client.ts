@@ -86,8 +86,9 @@ export interface ApiClient {
   readonly getForm: (viewId: number, signal?: AbortSignal) => Promise<ApiResult<FormDefinition>>;
 
   /**
-   * `GET /api/forms/{viewId}/records`: one page of the grid. A blank `q` is not sent,
-   * because the server treats it as no filter.
+   * `GET /api/forms/{viewId}/records`: one page of the grid. A blank `q`, as
+   * {@link isBlankQuery} decides, is not sent, because the server treats it as no filter;
+   * any other `q` is sent verbatim.
    */
   readonly listRecords: (
     viewId: number,
@@ -445,10 +446,27 @@ function abortable(signal: AbortSignal | undefined): { signal: AbortSignal | nul
 // The API rejects every other media type with 415, `+json` types included.
 const jsonHeaders: Record<string, string> = { 'Content-Type': 'application/json' };
 
+// Text made only of .NET whitespace (`char.IsWhiteSpace`), or empty.
+const DOTNET_BLANK = /^[\t\n\v\f\r \u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*$/;
+
+/**
+ * Whether a records-list `q` is blank, the text the server reads as no filter: empty, or
+ * every UTF-16 code unit whitespace by .NET `char.IsWhiteSpace`, the test behind the
+ * server's `string.IsNullOrWhiteSpace`. That set is U+0009–U+000D, U+0020, U+0085, U+00A0,
+ * U+1680, U+2000–U+200A, U+2028, U+2029, U+202F, U+205F and U+3000. Unlike JavaScript's
+ * `String.prototype.trim` and `\s`, it includes U+0085 and excludes U+FEFF, so a text the
+ * server filters on is never dropped here, and a text it ignores is never sent.
+ */
+export function isBlankQuery(text: string): boolean {
+  return DOTNET_BLANK.test(text);
+}
+
+// A blank `q` (isBlankQuery) is not sent; any other `q` is sent exactly as given, edge
+// whitespace included, because the server matches it untrimmed.
 function listQuery(query: RecordListQuery = {}): RecordListQuery {
   const { q, includeDeleted, page, pageSize } = query;
   return {
-    ...(q !== undefined && q.trim() !== '' ? { q } : {}),
+    ...(q !== undefined && !isBlankQuery(q) ? { q } : {}),
     ...(includeDeleted !== undefined ? { includeDeleted } : {}),
     ...(page !== undefined ? { page } : {}),
     ...(pageSize !== undefined ? { pageSize } : {}),

@@ -44,6 +44,9 @@ import type {
   RecordCountResponse,
   RecordDto,
   RecordPage,
+  RecordSummary,
+  SearchResponse,
+  SearchResult,
   Values,
   WriteOutcome,
   WriteProblemDetails,
@@ -62,8 +65,25 @@ import {
 } from '../test/formDefinitionFixture';
 import { formatRequiredMessage } from '../validation/clientValidation';
 import { FormView } from './FormView';
+import type { RecordGridProps } from './RecordGrid';
 import { fieldComponents, fieldControlId, fieldErrorId, type FieldComponentProps } from './fields/fieldComponents';
 import { NumberInput } from './fields/NumberInput';
+
+// The record grid FormView renders is the real one inside a memo probe that counts the
+// renders getting past React.memo's comparison of its props, the comparison the real grid
+// makes itself. Every case here renders the real grid through it.
+const gridRenders = vi.hoisted(() => ({ count: 0 }));
+vi.mock('./RecordGrid', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./RecordGrid')>();
+  const { createElement, memo } = await import('react');
+  return {
+    ...actual,
+    RecordGrid: memo(function CountingRecordGrid(props: RecordGridProps) {
+      gridRenders.count += 1;
+      return createElement(actual.RecordGrid, props);
+    }),
+  };
+});
 
 // The in-memory API
 
@@ -329,6 +349,12 @@ function storeSaved(records: RecordDto[], target: 'create' | RecordDto, saved: R
   }
 }
 
+/**
+ * A case's own answer to a request, tried before every other route: a response, a
+ * rejection (an aborted or failed fetch), or `null` to fall through to the other routes.
+ */
+type Route = (call: Call) => Response | Promise<Response> | null;
+
 /** The answer to a field event in a case that moves focus into a field: no effects. */
 const NO_EFFECTS: FieldEventResponse = {
   enabled: [],
@@ -339,24 +365,33 @@ const NO_EFFECTS: FieldEventResponse = {
   diagnostics: [],
 };
 
+interface FakeApiOptions {
+  /** Answer field events with no effects, for a case that moves focus into a field. */
+  readonly answersFieldEvents?: boolean;
+  /** The form route's body text as sent, in place of the definition as JSON. */
+  readonly definitionText?: string;
+  /** The case's own answers, tried first. */
+  readonly route?: Route;
+}
+
 /**
  * A fetch that serves `definition`'s form and `records`, answers each write with the next
  * queued reply, answers field events with no effects when `answersFieldEvents` is set, and
- * records every request it receives. `definitionText`, when given, is the form route's body
- * text as sent, in place of `definition` as JSON.
+ * records every request it receives. A case's `route` answers before all of these.
  */
-function fakeApi(
-  definition: FormDefinition,
-  records: RecordDto[],
-  answersFieldEvents = false,
-  definitionText?: string,
-): typeof fetch {
+function fakeApi(definition: FormDefinition, records: RecordDto[], options: FakeApiOptions = {}): typeof fetch {
+  const { answersFieldEvents = false, definitionText, route } = options;
   return async (input, init) => {
     const request = input instanceof Request ? input : new Request(input, init);
     const url = new URL(request.url);
     const text = await request.text();
     const call: Call = { method: request.method, url, body: text === '' ? null : text };
     calls.push(call);
+
+    const own = route === undefined ? null : await route(call);
+    if (own !== null) {
+      return own;
+    }
 
     const body = readRouteBody(call.method, url.pathname, definition, records);
     if (body === definition && definitionText !== undefined) {
@@ -383,6 +418,22 @@ function fakeApi(
   };
 }
 
+/** Whether `call` is a Find search of the form. */
+function isSearch(call: Call): boolean {
+  return call.method === 'POST' && call.url.pathname.endsWith('/records/search');
+}
+
+/** A response the test releases when it chooses, for a request held open. */
+function deferred(): { readonly response: Promise<Response>; readonly release: (response: Response) => void } {
+  let release: (response: Response) => void = () => {
+    throw new Error('released before the request was held');
+  };
+  const response = new Promise<Response>((resolve) => {
+    release = resolve;
+  });
+  return { response, release };
+}
+
 // Rendering
 
 interface RenderedForm {
@@ -392,32 +443,25 @@ interface RenderedForm {
   readonly onFormNotFound: Mock<() => void>;
 }
 
-interface RenderOptions {
+interface RenderOptions extends FakeApiOptions {
   /** The form's stored active records in position order; by default the one RECORD. */
   readonly records?: readonly RecordDto[];
-  /** Answer field events with no effects, for a case that moves focus into a field. */
-  readonly answersFieldEvents?: boolean;
   /** Answers a GET of `path` before the read routes do, for a case that fails a read; `undefined` leaves it to them. */
   readonly answerRead?: (path: string) => Response | undefined;
   /** Called at the end of each commit of the form view, in its layout phase, after the form view's layout effects. */
   readonly onCommit?: () => void;
-  /** The form route's body text, in place of the definition as JSON. */
-  readonly definitionText?: string;
 }
 
-/**
- * Renders the form view and waits until the definition, the first record (New on an
- * empty form) and the grid have loaded.
- */
-async function renderForm(
+/** Renders the form view without waiting for anything. */
+function mountForm(
   definition: FormDefinition = createFormDefinitionFixture(),
   options: RenderOptions = {},
-): Promise<RenderedForm> {
+): RenderedForm & { readonly records: readonly RecordDto[] } {
   // A copy, so the writes of one case never change the records another case stores.
   const records = [...(options.records ?? [RECORD])];
   const onExit = vi.fn<() => void>();
   const onFormNotFound = vi.fn<() => void>();
-  const serve = fakeApi(definition, records, options.answersFieldEvents ?? false, options.definitionText);
+  const serve = fakeApi(definition, records, options);
   const { answerRead, onCommit } = options;
   const fetch: typeof globalThis.fetch =
     answerRead === undefined
@@ -447,16 +491,28 @@ async function renderForm(
       </Profiler>
     ),
   );
+  return { container, definition, onExit, onFormNotFound, records };
+}
 
+/**
+ * Renders the form view and waits until the definition, the first record (New on an
+ * empty form) and the grid have loaded.
+ */
+async function renderForm(
+  definition: FormDefinition = createFormDefinitionFixture(),
+  options: RenderOptions = {},
+): Promise<RenderedForm> {
+  const { records, ...rendered } = mountForm(definition, options);
   const count = records.length;
   await screen.findByRole('heading', { name: definition.name });
   await within(screen.getByRole('toolbar', { name: 'Record navigation' })).findByText(
     count === 0 ? 'New record' : `1 of ${count}`,
   );
+  // An empty list's status is its empty text, not a count.
   await within(screen.getByRole('region', { name: 'Records' })).findByText(
-    count === 1 ? '1 record' : `${count} records`,
+    count === 0 ? 'No records found.' : count === 1 ? '1 record' : `${count} records`,
   );
-  return { container, definition, onExit, onFormNotFound };
+  return rendered;
 }
 
 // DOM helpers
@@ -491,6 +547,15 @@ function present<T>(value: T | null | undefined, what: string): T {
 }
 
 /** The prompt of a fixture field that has one; every fixture field does. */
+/** The number `record` holds for `name`, as the form and the grid show it. */
+function recordNumberText(record: RecordDto, name: string): string {
+  const value = record.values[name];
+  if (typeof value !== 'number') {
+    throw new Error(`${name} holds no number in the record`);
+  }
+  return String(value);
+}
+
 function promptOf(field: FieldDefinition): string {
   return present(field.prompt, `prompt of ${field.name}`);
 }
@@ -3037,5 +3102,961 @@ describe('a tabIndex beyond the safe range', () => {
       'GlobalRecordId',
       'RecStatus',
     ]);
+  });
+});
+
+describe('FormView Find record', () => {
+  // The dialog renders into <body>, so its controls are found through the screen.
+  function openFind(): HTMLElement {
+    const formActions = screen.getByRole('toolbar', { name: 'Form actions' });
+    fireEvent.click(within(formActions).getByRole('button', { name: 'Find' }));
+    return screen.getByRole('dialog', { name: 'Find record' });
+  }
+
+  /** Picks `name` in the field picker and returns its criterion's value box. */
+  function pick(dialog: HTMLElement, name: string): HTMLInputElement {
+    fireEvent.click(within(dialog).getByRole('checkbox', { name }));
+    const box = within(dialog).getByRole('textbox', { name: `Value for ${name}` });
+    if (!(box instanceof HTMLInputElement)) {
+      throw new Error(`the value box of ${name} is not an input`);
+    }
+    return box;
+  }
+
+  /** Text of each element the control's aria-describedby names, in order. */
+  function descriptionsOf(control: HTMLElement): string[] {
+    const ids = (control.getAttribute('aria-describedby') ?? '').split(' ').filter((id) => id !== '');
+    return ids.map((id) => present(document.getElementById(id), `element #${id}`).textContent ?? '');
+  }
+
+  // Text kinds other than a Phone Number ignore a comparison prefix on the server, so their
+  // hints offer none. A Phone Number arrives as text, with or without a mask, and has no
+  // wildcard path: a masked text hint offers no wildcard, and an unmasked one offers it only
+  // with the Phone Number exception. Legal values are never a Phone Number, so theirs is plain.
+  const COMPARISONS = ['>=', '<=', '<>', '<', 'compare'];
+  const PLAIN_WILDCARD = '* as a wildcard (e.g. Sm*)';
+  const PHONE_EXCEPTION = '* is a wildcard (e.g. Sm*), except in a phone number, where it is matched as typed.';
+  /** The fixture with `PhoneNumber` unmasked, as a Phone Number whose metadata mask is blank arrives. */
+  const unmaskedPhone = (): FormDefinition =>
+    withField('PhoneNumber', (field) => ({ ...field, validation: { ...field.validation, pattern: null } }));
+  const unlistedLegalValues = (): FormDefinition => withField('Sex', (field) => ({ ...field, options: [] }));
+  it.each<{
+    kind: string;
+    name: string;
+    definition?: () => FormDefinition;
+    includes: readonly string[];
+    /** Fragments the hint must not hold outside the Phone Number exception sentence. */
+    excludes: readonly string[];
+  }>([
+    {
+      kind: 'unmasked text',
+      name: 'LastName',
+      includes: ['whole value', 'a or b', '> alone finds empty values', PHONE_EXCEPTION],
+      excludes: [...COMPARISONS, '*', 'wildcard'],
+    },
+    {
+      kind: 'unmasked phone number',
+      name: 'PhoneNumber',
+      definition: unmaskedPhone,
+      includes: ['whole value', 'a or b', '> alone finds empty values', PHONE_EXCEPTION],
+      excludes: [...COMPARISONS, '*', 'wildcard'],
+    },
+    {
+      kind: 'masked text',
+      name: 'PhoneNumber',
+      includes: ['whole value', 'a or b', '> alone finds empty values'],
+      excludes: [...COMPARISONS, '*', 'wildcard', 'phone number'],
+    },
+    {
+      kind: 'multiline',
+      name: 'PatientAddress',
+      includes: ['whole text', 'first 255 characters', 'a or b', PLAIN_WILDCARD, '> alone finds empty values'],
+      excludes: [...COMPARISONS, 'phone number'],
+    },
+    {
+      kind: 'legal values',
+      name: 'Sex',
+      includes: [
+        'whole value',
+        'a or b',
+        PLAIN_WILDCARD,
+        '> alone finds empty values',
+        'Allowed values: M-Male, F-Female, U-Unknown.',
+      ],
+      excludes: [...COMPARISONS, 'phone number'],
+    },
+    {
+      kind: 'unlisted legal values',
+      name: 'Sex',
+      definition: unlistedLegalValues,
+      includes: ['whole value', 'a or b', PLAIN_WILDCARD, '> alone finds empty values'],
+      excludes: [...COMPARISONS, 'phone number', 'Allowed values'],
+    },
+    { kind: 'number', name: 'CaseID', includes: ['>=5', 'Leave empty to find missing values'], excludes: [] },
+    { kind: 'date', name: 'DOB', includes: ['YYYY-MM-DD', '>=2011-01-15'], excludes: [] },
+  ])(
+    'describes the $kind criterion $name by the syntax the server applies',
+    async ({ name, definition, includes, excludes }) => {
+      await renderForm(definition?.());
+      const box = pick(openFind(), name);
+
+      const [hint] = descriptionsOf(box);
+      for (const fragment of includes) {
+        expect(hint, name).toContain(fragment);
+      }
+      const outsideException = hint.replace(PHONE_EXCEPTION, '');
+      for (const fragment of excludes) {
+        expect(outsideException, name).not.toContain(fragment);
+      }
+    },
+  );
+
+  /** Answers the searches in order, one answer each; a search past the last is left unrouted. */
+  function searchRoute(...answers: readonly (() => Response | Promise<Response>)[]): Route {
+    let next = 0;
+    return (call) => {
+      if (!isSearch(call) || next >= answers.length) {
+        return null;
+      }
+      const answer = answers[next];
+      next += 1;
+      return answer();
+    };
+  }
+
+  // The open record as a match: opening it needs only the read routes.
+  const MATCH: SearchResult = {
+    globalRecordId: RECORD.globalRecordId,
+    uniqueKey: RECORD.uniqueKey,
+    recStatus: RECORD.recStatus,
+    position: 1,
+    values: { LastName: 'Lovelace' },
+  };
+
+  function matches(...items: SearchResult[]): Response {
+    const body: SearchResponse = { items, total: items.length, truncated: false };
+    return jsonResponse(200, body);
+  }
+
+  function sentCriteria(call: Call): unknown {
+    const body: unknown = JSON.parse(present(call.body, 'search body'));
+    return typeof body === 'object' && body !== null && 'criteria' in body ? body.criteria : undefined;
+  }
+
+  /** How the one result row offers itself: actionable rows carry no aria-disabled. */
+  function resultState(dialog: HTMLElement) {
+    const table = within(dialog).getByRole('table', { name: 'Matching records' });
+    const open = within(table).getByRole('button', { name: 'Open record at position 1' });
+    return {
+      open: open.getAttribute('aria-disabled'),
+      row: present(open.closest('tr'), 'result row').getAttribute('aria-disabled'),
+      busy: table.getAttribute('aria-busy'),
+      stale: present(table.parentElement, 'results wrapper').classList.contains('find-dialog__results--stale'),
+    };
+  }
+
+  const ACTIONABLE = { open: null, row: null, busy: 'false', stale: false };
+  const OUT_OF_DATE = { open: 'true', row: 'true', busy: 'false', stale: true };
+  const PENDING = { open: 'true', row: 'true', busy: 'true', stale: true };
+
+  /** Clicks the result's Open button and its row; the dialog stays open when they are inactive. */
+  function tryToOpen(dialog: HTMLElement): void {
+    const open = within(dialog).getByRole('button', { name: 'Open record at position 1' });
+    fireEvent.click(open);
+    fireEvent.click(present(open.closest('tr'), 'result row'));
+  }
+
+  it('opens results only while no search runs and the criteria are the ones sent', async () => {
+    const second = deferred();
+    const { definition } = await renderForm(undefined, {
+      route: searchRoute(
+        () => matches(MATCH),
+        () => second.response,
+      ),
+    });
+    const openByIdPath = `/api/forms/${definition.viewId}/records/${RECORD.globalRecordId}`;
+    const opened = () => calls.filter((call) => call.method === 'GET' && call.url.pathname === openByIdPath);
+    const dialog = openFind();
+    const box = pick(dialog, 'LastName');
+    const search = within(dialog).getByRole('button', { name: 'Search' });
+
+    fireEvent.change(box, { target: { value: 'Lovelace' } });
+    fireEvent.click(search);
+    await within(dialog).findByText('1 record matches.');
+    expect(resultState(dialog)).toEqual(ACTIONABLE);
+
+    // An edit keeps the rows on screen, marked out of date, and they no longer open.
+    fireEvent.change(box, { target: { value: 'Love' } });
+    const stale = '1 record matches. These results are for the previous criteria; Search updates them.';
+    expect(resultState(dialog)).toEqual(OUT_OF_DATE);
+    expect(within(dialog).getByText(stale)).toBeTruthy();
+    expect(descriptionsOf(within(dialog).getByRole('button', { name: 'Open record at position 1' }))).toEqual([stale]);
+    tryToOpen(dialog);
+    expect(screen.getByRole('dialog', { name: 'Find record' })).toBe(dialog);
+
+    // The criteria sent again describe the rows.
+    fireEvent.change(box, { target: { value: 'Lovelace' } });
+    expect(resultState(dialog)).toEqual(ACTIONABLE);
+
+    // A newer search, held open: the old rows stay inactive while the criteria stay editable.
+    fireEvent.change(box, { target: { value: 'Lovelace or Smith' } });
+    fireEvent.click(search);
+    expect(resultState(dialog)).toEqual(PENDING);
+    expect(within(dialog).getByText('Searching… The results below are from the previous search.')).toBeTruthy();
+    expect(isDisabled(search)).toBe(true);
+    expect(isDisabled(box)).toBe(false);
+    expect(isDisabled(within(dialog).getByRole('button', { name: 'Remove LastName' }))).toBe(false);
+    expect(isDisabled(within(dialog).getByRole('button', { name: 'Close' }))).toBe(false);
+    tryToOpen(dialog);
+    expect(screen.getByRole('dialog', { name: 'Find record' })).toBe(dialog);
+    expect(opened()).toEqual([]);
+
+    second.release(matches(MATCH));
+    await within(dialog).findByText('1 record matches.');
+    expect(resultState(dialog)).toEqual(ACTIONABLE);
+    // Each search sent its criterion exactly as typed.
+    expect(calls.filter(isSearch).map(sentCriteria)).toEqual([
+      [{ field: 'LastName', value: 'Lovelace' }],
+      [{ field: 'LastName', value: 'Lovelace or Smith' }],
+    ]);
+
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Open record at position 1' }));
+    expect(screen.queryByRole('dialog', { name: 'Find record' })).toBeNull();
+    await vi.waitFor(() => {
+      expect(opened()).toHaveLength(1);
+    });
+    await within(screen.getByRole('toolbar', { name: 'Record navigation' })).findByText('1 of 1');
+  });
+
+  it("keeps a field's message while its criterion holds the text sent, and drops it and the banner once edited", async () => {
+    const problem = {
+      type: 'https://tools.ietf.org/html/rfc9110#section-15.5.1',
+      title: 'One or more validation errors occurred.',
+      status: 400,
+      traceId: '00-test-search-00',
+      errors: {
+        LastName: ['LastName needs a value.'],
+        CaseID: ['CaseID must be a number.'],
+        criteria: ['A search names at most six fields.'],
+      },
+    };
+    await renderForm(undefined, { route: searchRoute(() => jsonResponse(400, problem)) });
+    const dialog = openFind();
+    const lastName = pick(dialog, 'LastName');
+    const caseId = pick(dialog, 'CaseID');
+    const [lastNameHint] = descriptionsOf(lastName);
+    const [caseIdHint] = descriptionsOf(caseId);
+
+    fireEvent.change(caseId, { target: { value: 'abc' } });
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Search' }));
+    await within(dialog).findByText('CaseID must be a number.');
+    const shown = () => ({
+      lastName: { invalid: lastName.getAttribute('aria-invalid'), described: descriptionsOf(lastName) },
+      caseId: { invalid: caseId.getAttribute('aria-invalid'), described: descriptionsOf(caseId) },
+      banner: within(dialog).queryByRole('alert')?.textContent ?? null,
+    });
+    const lastNameInvalid = { invalid: 'true', described: [lastNameHint, 'LastName needs a value.'] };
+    const sentState = {
+      lastName: lastNameInvalid,
+      caseId: { invalid: 'true', described: [caseIdHint, 'CaseID must be a number.'] },
+      banner: 'Some values need attention. See the messages beside each field.A search names at most six fields.',
+    };
+    expect(shown()).toEqual(sentState);
+
+    // Editing CaseID drops its message and the banner; the untouched LastName keeps its own.
+    fireEvent.change(caseId, { target: { value: 'abcd' } });
+    expect(shown()).toEqual({
+      lastName: lastNameInvalid,
+      caseId: { invalid: null, described: [caseIdHint] },
+      banner: null,
+    });
+
+    // The text sent once more: the messages describe the criteria on screen again.
+    fireEvent.change(caseId, { target: { value: 'abc' } });
+    expect(shown()).toEqual(sentState);
+  });
+
+  /** The fixture plus `LASTNAME`, just before `LastName`, whose name differs from it only in letter case. */
+  function caseDistinctDefinition(): FormDefinition {
+    const definition = createFormDefinitionFixture();
+    const lastName = fieldByName('LastName', definition);
+    const page = pageOf(definition, lastName.pageId);
+    const twin: FieldDefinition = {
+      ...lastName,
+      name: 'LASTNAME',
+      prompt: 'Surname as registered',
+      tabIndex: lastName.tabIndex - 0.5,
+    };
+    page.fields.splice(page.fields.indexOf(lastName), 0, twin);
+    return definition;
+  }
+
+  it('heads each grid column by the field of its exact name, and ignores case only for a unique match', async () => {
+    const definition = caseDistinctDefinition();
+    const listPath = `/api/forms/${definition.viewId}/records`;
+    // Keys as exact names, a unique and an ambiguous spelling in another letter case.
+    const summary: RecordSummary = {
+      globalRecordId: RECORD.globalRecordId,
+      uniqueKey: RECORD.uniqueKey,
+      recStatus: RECORD.recStatus,
+      values: { caseid: 1042, LASTNAME: null, LastName: 'Lovelace', lastname: null },
+    };
+    const list: RecordPage = { items: [summary], total: 1, page: 1, pageSize: 50 };
+    await renderForm(definition, {
+      route: (call) =>
+        call.method === 'GET' && call.url.pathname === listPath ? jsonResponse(200, list) : null,
+    });
+
+    const headers = within(screen.getByRole('region', { name: 'Records' })).getAllByRole('columnheader');
+    expect(headers.map((header) => header.textContent)).toEqual([
+      'Case ID',
+      'Surname as registered',
+      'Last Name',
+      'lastname',
+    ]);
+  });
+
+  it.each<{ key: string; target: string | null }>([
+    { key: 'LASTNAME', target: 'LASTNAME' },
+    { key: 'LastName', target: 'LastName' },
+    { key: 'firstname', target: 'FirstName' },
+    // Two field names equal it ignoring case, so it names neither criterion.
+    { key: 'lastname', target: null },
+  ])('shows a search error keyed $key beside the criterion of that exact or only name', async ({ key, target }) => {
+    const message = `Message for ${key}.`;
+    const problem = {
+      type: 'https://tools.ietf.org/html/rfc9110#section-15.5.1',
+      title: 'One or more validation errors occurred.',
+      status: 400,
+      traceId: '00-test-search-01',
+      errors: { [key]: [message] },
+    };
+    await renderForm(caseDistinctDefinition(), {
+      route: searchRoute(() => jsonResponse(400, problem)),
+    });
+    const dialog = openFind();
+    const boxes = new Map(['FirstName', 'LASTNAME', 'LastName'].map((name) => [name, pick(dialog, name)]));
+
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Search' }));
+    await within(dialog).findByText(message);
+
+    const invalid = [...boxes].filter(([, box]) => box.getAttribute('aria-invalid') === 'true').map(([name]) => name);
+    expect(invalid).toEqual(target === null ? [] : [target]);
+    if (target !== null) {
+      expect(descriptionsOf(present(boxes.get(target), `value box of ${target}`))).toContain(message);
+    }
+    expect(within(dialog).getByRole('alert').textContent).toBe(
+      target === null ? message : 'Some values need attention. See the messages beside each field.',
+    );
+  });
+});
+
+describe('FormView record grid', () => {
+  const LIST_PATH = `/api/forms/${createFormDefinitionFixture().viewId}/records`;
+  const COUNT_PATH = `${LIST_PATH}/count`;
+  const OPEN_PATH = `${LIST_PATH}/${RECORD.globalRecordId}`;
+  // A row's first cell is its first grid column, the fixture's CaseID.
+  const OPEN_NAME = `Open record ${recordNumberText(RECORD, 'CaseID')}`;
+  const FORM_GONE = 'This form no longer exists.';
+  const NOT_FOUND: ProblemDetails = {
+    type: 'https://tools.ietf.org/html/rfc9110#section-15.5.5',
+    title: 'Not Found',
+    status: 404,
+    detail: 'The form does not exist.',
+    traceId: '00-test-gone-00',
+  };
+
+  function isGet(call: Call, path: string): boolean {
+    return call.method === 'GET' && call.url.pathname === path;
+  }
+
+  function listCalls(): Call[] {
+    return calls.filter((call) => isGet(call, LIST_PATH));
+  }
+
+  function openCalls(): Call[] {
+    return calls.filter((call) => isGet(call, OPEN_PATH));
+  }
+
+  function records(): HTMLElement {
+    return screen.getByRole('region', { name: 'Records' });
+  }
+
+  function searchBox(): HTMLElement {
+    return within(records()).getByRole('searchbox', { name: 'Search records' });
+  }
+
+  /** The text of the grid's one live region. */
+  function gridStatus(): string | null {
+    return within(records()).getByRole('status').textContent;
+  }
+
+  // The workspace, and with it the navigator and the grid, renders once the form definition has loaded.
+  async function recordOpened(): Promise<void> {
+    const navigator = await screen.findByRole('toolbar', { name: 'Record navigation' });
+    await within(navigator).findByText('1 of 1');
+  }
+
+  async function findInGrid(text: string): Promise<HTMLElement> {
+    const region = await screen.findByRole('region', { name: 'Records' });
+    return within(region).findByText(text);
+  }
+
+  /** One page of the list holding the stored record, as `recStatus` and with `values` replaced, of `total` records. */
+  function listPage(
+    total: number,
+    page: number,
+    recStatus: number = RECORD.recStatus,
+    values: RecordSummary['values'] = {},
+  ): Response {
+    const summary = recordSummaryFixture(RECORD, createFormDefinitionFixture());
+    const body: RecordPage = {
+      items: [{ ...summary, recStatus, values: { ...summary.values, ...values } }],
+      total,
+      page,
+      pageSize: 50,
+    };
+    return jsonResponse(200, body);
+  }
+
+  function abortError(): DOMException {
+    return new DOMException('The operation was aborted.', 'AbortError');
+  }
+
+  // Blank is the server's .NET whitespace test, not JavaScript's trim(): the two disagree on
+  // U+FEFF, a filter to the server, and U+0085, blank to it.
+  it.each<{ label: string; typed: readonly string[]; sent: readonly (string | null)[] }>([
+    { label: 'sends a nonblank filter verbatim, edge spaces included', typed: [' Ada '], sent: [' Ada '] },
+    { label: 'sends a U+FEFF filter verbatim, not whitespace to .NET', typed: ['\uFEFF'], sent: ['\uFEFF'] },
+    { label: 'sends no q for a blank filter', typed: ['Ada', '   '], sent: ['Ada', null] },
+    { label: 'sends no q for a U+0085 filter, whitespace to .NET', typed: ['Ada', '\u0085'], sent: ['Ada', null] },
+    { label: 'sends no q for a U+3000, space and tab filter', typed: ['Ada', '\u3000 \t'], sent: ['Ada', null] },
+  ])('$label', async ({ typed, sent }) => {
+    // A filtered list matches nothing here, so the status tells which list answered.
+    const noMatch: RecordPage = { items: [], total: 0, page: 1, pageSize: 50 };
+    await renderForm(undefined, {
+      route: (call) =>
+        isGet(call, LIST_PATH) && call.url.searchParams.has('q') ? jsonResponse(200, noMatch) : null,
+    });
+
+    for (const [index, value] of typed.entries()) {
+      const before = listCalls().length;
+      fireEvent.change(searchBox(), { target: { value } });
+      // One request per filter, once the search box's pause has passed.
+      await vi.waitFor(() => {
+        expect(listCalls()).toHaveLength(before + 1);
+      });
+      const { searchParams } = present(listCalls().at(-1), 'list request').url;
+      expect(searchParams.has('q'), value).toBe(sent[index] !== null);
+      expect(searchParams.get('q'), value).toBe(sent[index]);
+      // No q shows the unfiltered list, the one stored record.
+      const status = sent[index] === null ? '1 record' : 'No records found.';
+      await vi.waitFor(() => {
+        expect(gridStatus(), value).toBe(status);
+      });
+    }
+  });
+
+  it('shows a 400 about q beside the search box and other parameters in the banner, and drops the stale message on an edit', async () => {
+    const tooLong = 'q must be at most 3998 characters long, counting each %, _, [ and \\ as two.';
+    const rejected = {
+      type: 'https://tools.ietf.org/html/rfc9110#section-15.5.1',
+      title: 'One or more validation errors occurred.',
+      status: 400,
+      traceId: '00-test-list-00',
+      errors: { q: [tooLong], pageSize: ['The value must be an integer.'] },
+    };
+    await renderForm(undefined, {
+      route: (call) =>
+        isGet(call, LIST_PATH) && call.url.searchParams.has('q') ? jsonResponse(400, rejected) : null,
+    });
+    const search = searchBox();
+
+    fireEvent.change(search, { target: { value: 'Ada' } });
+    await findInGrid(tooLong);
+    expect(search.getAttribute('aria-invalid')).toBe('true');
+    const describedBy = present(search.getAttribute('aria-describedby'), 'aria-describedby of the search box');
+    const message = present(document.getElementById(describedBy), 'the search box message');
+    expect(message.getAttribute('role')).toBe('alert');
+    expect(message.textContent).toBe(tooLong);
+    // The other parameter's message names it in the banner, which offers no Retry for a 400.
+    expect(within(records()).getAllByRole('alert').map((alert) => alert.textContent)).toEqual([
+      tooLong,
+      'The record list could not be loaded.pageSize: The value must be an integer.Trace id: 00-test-list-00',
+    ]);
+    expect(within(records()).queryByRole('button', { name: 'Retry' })).toBeNull();
+
+    // Another text: the message no longer describes the box, so it goes at once.
+    fireEvent.change(search, { target: { value: 'Adam' } });
+    expect(search.getAttribute('aria-invalid')).toBeNull();
+    expect(search.getAttribute('aria-describedby')).toBeNull();
+    expect(within(records()).queryByText(tooLong)).toBeNull();
+
+    // The new text gets its own answer, shown beside the box in turn.
+    await findInGrid(tooLong);
+    expect(listCalls().map((call) => call.url.searchParams.get('q'))).toEqual([null, 'Ada', 'Adam']);
+  });
+
+  it.each<{ source: string; path: string; grid: string }>([
+    { source: 'records list', path: LIST_PATH, grid: FORM_GONE },
+    { source: 'record count', path: COUNT_PATH, grid: '1 record' },
+  ])('hands a $source 404 over to the forms list once while the draft is clean', async ({ path, grid }) => {
+    const { onFormNotFound } = mountForm(undefined, {
+      route: (call) =>
+        isGet(call, path) ? jsonResponse(404, NOT_FOUND) : null,
+    });
+
+    await findInGrid(grid);
+    await vi.waitFor(() => {
+      expect(onFormNotFound).toHaveBeenCalledTimes(1);
+    });
+    // One alert, the workspace's; the grid states the loss without an alert or a Retry.
+    expect(screen.getAllByRole('alert').map((alert) => alert.textContent)).toEqual([FORM_GONE]);
+    expect(gridStatus()).toBe(grid);
+    expect(screen.queryByRole('button', { name: 'Retry' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Discard edits' })).toBeNull();
+  });
+
+  it('keeps a dirty draft on a list 404 until "Discard edits" is chosen', async () => {
+    const list = deferred();
+    let held = false;
+    const { definition, onFormNotFound } = mountForm(undefined, {
+      route: (call) => {
+        if (held || !isGet(call, LIST_PATH)) {
+          return null;
+        }
+        held = true;
+        return list.response;
+      },
+    });
+    await recordOpened();
+    const firstName = screen.getByLabelText(promptOf(fieldByName('FirstName', definition)));
+    fireEvent.change(firstName, { target: { value: 'Adah' } });
+
+    list.release(jsonResponse(404, NOT_FOUND));
+    const banner = await screen.findByRole('alert');
+    expect(banner.textContent).toBe(`${FORM_GONE}Discard edits`);
+    expect(gridStatus()).toBe(FORM_GONE);
+    expect(onFormNotFound).not.toHaveBeenCalled();
+    expect(controlValue(firstName)).toBe('Adah');
+
+    fireEvent.click(within(banner).getByRole('button', { name: 'Discard edits' }));
+    await vi.waitFor(() => {
+      expect(onFormNotFound).toHaveBeenCalledTimes(1);
+    });
+    expect(within(banner).queryByRole('button', { name: 'Discard edits' })).toBeNull();
+  });
+
+  const FIELD_EVENT_PATH = `/api/forms/${createFormDefinitionFixture().viewId}/checkcode/field-event`;
+  const EVENT_FAILED: ProblemDetails = {
+    type: 'https://tools.ietf.org/html/rfc9110#section-15.6.1',
+    title: 'An error occurred while processing your request.',
+    status: 500,
+    detail: 'An unexpected error occurred.',
+    traceId: '00-test-event-00',
+  };
+
+  /** The `event` of a field-event request; `null` for any other request. */
+  function fieldEventOf(call: Call): string | null {
+    if (call.method !== 'POST' || call.url.pathname !== FIELD_EVENT_PATH || call.body === null) {
+      return null;
+    }
+    const body: unknown = JSON.parse(call.body);
+    return typeof body === 'object' && body !== null && 'event' in body && typeof body.event === 'string'
+      ? body.event
+      : null;
+  }
+
+  function fieldEventResponse(assigned: FieldEventResponse['assigned']): Response {
+    const body: FieldEventResponse = { enabled: [], disabled: [], cleared: [], assigned, dialogs: [], diagnostics: [] };
+    return jsonResponse(200, body);
+  }
+
+  it.each<{
+    outcome: string;
+    answer: () => Promise<Response>;
+    age: string;
+    notice: string | null;
+    dirty: boolean;
+  }>([
+    {
+      outcome: 'assigns nothing',
+      answer: () => Promise.resolve(fieldEventResponse({})),
+      age: recordNumberText(RECORD, 'Age'),
+      notice: null,
+      dirty: false,
+    },
+    {
+      outcome: 'assigns Age',
+      answer: () => Promise.resolve(fieldEventResponse({ Age: 11 })),
+      age: '11',
+      notice: null,
+      dirty: true,
+    },
+    {
+      outcome: 'fails with a 500',
+      answer: () => Promise.resolve(jsonResponse(500, EVENT_FAILED)),
+      age: recordNumberText(RECORD, 'Age'),
+      notice: `Check code could not run for DOB. An unexpected error occurred. Trace id: ${EVENT_FAILED.traceId}.`,
+      dirty: false,
+    },
+    {
+      outcome: 'gets no response',
+      answer: () => Promise.reject(new TypeError('Failed to fetch')),
+      age: recordNumberText(RECORD, 'Age'),
+      notice: 'Check code could not run for DOB. The server could not be reached. Your changes are still on screen.',
+      dirty: false,
+    },
+  ])('decides on a list 404 only after a held FieldAfter that $outcome has settled', async (example) => {
+    // The gate's own response is not used: the example answers the event once it opens.
+    const gate = deferred();
+    const { definition, onFormNotFound } = await renderForm(undefined, {
+      route: (call) => {
+        if (isGet(call, LIST_PATH) && call.url.searchParams.get('q') === 'gone') {
+          return jsonResponse(404, NOT_FOUND);
+        }
+        switch (fieldEventOf(call)) {
+          case 'FieldBefore':
+            return fieldEventResponse({});
+          case 'FieldAfter':
+            return gate.response.then(example.answer);
+          default:
+            return null;
+        }
+      },
+    });
+    const dob = screen.getByLabelText(promptOf(fieldByName('DOB', definition)));
+    const age = screen.getByLabelText(promptOf(fieldByName('Age', definition)));
+
+    // Entering and leaving DOB, unedited: FieldBefore is answered, FieldAfter is held.
+    fireEvent.focus(dob);
+    fireEvent.blur(dob);
+    await vi.waitFor(() => {
+      expect(calls.map(fieldEventOf).filter((event) => event !== null)).toEqual(['FieldBefore', 'FieldAfter']);
+    });
+    fireEvent.change(searchBox(), { target: { value: 'gone' } });
+
+    // The form is gone, but the draft is not judged clean while its event is pending.
+    const banner = await screen.findByRole('alert');
+    expect(banner.textContent).toBe(FORM_GONE);
+    expect(gridStatus()).toBe(FORM_GONE);
+    expect(onFormNotFound).not.toHaveBeenCalled();
+
+    gate.release(new Response(null));
+    if (example.dirty) {
+      // The assignment is applied and dirties the draft, which stays until it is discarded.
+      await within(banner).findByRole('button', { name: 'Discard edits' });
+      expect(banner.textContent).toBe(`${FORM_GONE}Discard edits`);
+      expect(controlValue(age)).toBe(example.age);
+      expect(onFormNotFound).not.toHaveBeenCalled();
+      fireEvent.click(within(banner).getByRole('button', { name: 'Discard edits' }));
+    }
+    await vi.waitFor(() => {
+      expect(onFormNotFound).toHaveBeenCalledTimes(1);
+    });
+    expect(controlValue(age)).toBe(example.age);
+    // A failed event shows its non-blocking notice and still counts as drained.
+    const notices = screen
+      .getAllByRole('status')
+      .map((status) => status.textContent ?? '')
+      .filter((text) => text.startsWith('Check code could not run'));
+    expect(notices).toEqual(example.notice === null ? [] : [example.notice]);
+    // Leaving the gone form writes nothing.
+    expect(calls.filter((call) => call.url.pathname.startsWith(LIST_PATH) && call.method !== 'GET')).toEqual([]);
+  });
+
+  it('decides on a list 404 only after a fresh drain when a dirty draft turns clean with a FieldAfter held', async () => {
+    const gate = deferred();
+    const { definition, onFormNotFound } = await renderForm(undefined, {
+      route: (call) => {
+        if (isGet(call, LIST_PATH) && call.url.searchParams.get('q') === 'gone') {
+          return jsonResponse(404, NOT_FOUND);
+        }
+        switch (fieldEventOf(call)) {
+          case 'FieldBefore':
+            return fieldEventResponse({});
+          case 'FieldAfter':
+            return gate.response.then(() => fieldEventResponse({}));
+          default:
+            return null;
+        }
+      },
+    });
+    // A new draft is clean while it is empty, so clearing its one entry restores it; an
+    // edited field of a stored record stays dirty whatever value it is given back.
+    const navigator = screen.getByRole('toolbar', { name: 'Record navigation' });
+    fireEvent.click(within(navigator).getByRole('button', { name: 'New' }));
+    await within(navigator).findByText('New record');
+    const lastName = screen.getByLabelText(promptOf(fieldByName('LastName', definition)));
+    const dob = screen.getByLabelText(promptOf(fieldByName('DOB', definition)));
+    fireEvent.change(lastName, { target: { value: 'Byron' } });
+
+    // The form is gone while the draft is dirty, with no event pending: it stays until discarded.
+    fireEvent.change(searchBox(), { target: { value: 'gone' } });
+    const banner = await screen.findByRole('alert');
+    await within(banner).findByRole('button', { name: 'Discard edits' });
+    expect(onFormNotFound).not.toHaveBeenCalled();
+
+    // Entering and leaving DOB holds its FieldAfter; then the user restores the empty LastName.
+    fireEvent.focus(dob);
+    fireEvent.blur(dob);
+    await vi.waitFor(() => {
+      expect(calls.map(fieldEventOf).filter((event) => event !== null)).toEqual(['FieldBefore', 'FieldAfter']);
+    });
+    fireEvent.change(lastName, { target: { value: '' } });
+    expect(banner.textContent).toBe(FORM_GONE);
+    // The drain that ended while the draft was dirty does not judge the clean draft, and
+    // the fresh drain waits for the held event however long the rest takes to settle.
+    expect(onFormNotFound).not.toHaveBeenCalled();
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 0);
+    });
+    expect(onFormNotFound).not.toHaveBeenCalled();
+
+    gate.release(new Response(null));
+    await vi.waitFor(() => {
+      expect(onFormNotFound).toHaveBeenCalledTimes(1);
+    });
+    expect(controlValue(lastName)).toBe('');
+    expect(controlValue(dob)).toBe('');
+    // Leaving the gone form writes nothing.
+    expect(calls.filter((call) => call.url.pathname.startsWith(LIST_PATH) && call.method !== 'GET')).toEqual([]);
+  });
+
+  /** Opens Find, picks LastName, enters a value and presses Search; returns the dialog and its Search button. */
+  function searchLastName(): { readonly dialog: HTMLElement; readonly search: HTMLElement } {
+    const formActions = screen.getByRole('toolbar', { name: 'Form actions' });
+    fireEvent.click(within(formActions).getByRole('button', { name: 'Find' }));
+    const dialog = screen.getByRole('dialog', { name: 'Find record' });
+    fireEvent.click(within(dialog).getByRole('checkbox', { name: 'LastName' }));
+    fireEvent.change(within(dialog).getByRole('textbox', { name: 'Value for LastName' }), {
+      target: { value: 'Lovelace' },
+    });
+    const search = within(dialog).getByRole('button', { name: 'Search' });
+    fireEvent.click(search);
+    return { dialog, search };
+  }
+
+  it('closes Find and hands a search 404 over to the forms list', async () => {
+    const { onFormNotFound } = await renderForm(undefined, {
+      route: (call) =>
+        isSearch(call) ? jsonResponse(404, NOT_FOUND) : null,
+    });
+
+    searchLastName();
+    await vi.waitFor(() => {
+      expect(onFormNotFound).toHaveBeenCalledTimes(1);
+    });
+    expect(screen.queryByRole('dialog', { name: 'Find record' })).toBeNull();
+    expect(screen.getByRole('alert').textContent).toBe(FORM_GONE);
+  });
+
+  it('settles a list request aborted by something else to a line offering Retry, which loads the list', async () => {
+    let aborted = false;
+    mountForm(undefined, {
+      route: (call) => {
+        if (aborted || !isGet(call, LIST_PATH)) {
+          return null;
+        }
+        aborted = true;
+        return Promise.reject(abortError());
+      },
+    });
+
+    await findInGrid('The record list was not loaded.');
+    expect(gridStatus()).toBe('The record list was not loaded.');
+    expect(within(records()).queryByText('Loading records…')).toBeNull();
+    expect(within(records()).queryByRole('alert')).toBeNull();
+
+    fireEvent.click(within(records()).getByRole('button', { name: 'Retry' }));
+    // The button leaves with the line, so focus moves to the live region, which stays.
+    expect(document.activeElement).toBe(within(records()).getByRole('status'));
+    await findInGrid('1 record');
+    expect(document.activeElement).toBe(within(records()).getByRole('status'));
+    expect(listCalls()).toHaveLength(2);
+  });
+
+  it('enables Search again after a search aborted by something else, with no error', async () => {
+    let aborted = false;
+    await renderForm(undefined, {
+      route: (call) => {
+        if (aborted || !isSearch(call)) {
+          return null;
+        }
+        aborted = true;
+        return Promise.reject(abortError());
+      },
+    });
+
+    const { dialog, search } = searchLastName();
+    expect(isDisabled(search)).toBe(true);
+    await vi.waitFor(() => {
+      expect(isDisabled(search)).toBe(false);
+    });
+    expect(within(dialog).queryByRole('alert')).toBeNull();
+    expect(calls.filter(isSearch)).toHaveLength(1);
+  });
+
+  it.each<{
+    change: string;
+    first: () => Response;
+    trigger: () => void;
+    isHeld: (call: Call) => boolean;
+    then: () => Response;
+    pages: readonly [before: string, pending: string, after: string];
+  }>([
+    {
+      change: 'a new filter',
+      first: () => listPage(1, 1),
+      trigger: () => fireEvent.change(searchBox(), { target: { value: 'Ada' } }),
+      isHeld: (call) => call.url.searchParams.get('q') === 'Ada',
+      then: () => listPage(1, 1),
+      pages: ['Page 1 of 1', 'Page 1', 'Page 1 of 1'],
+    },
+    {
+      change: 'another page',
+      first: () => listPage(51, 1),
+      trigger: () => fireEvent.click(within(records()).getByRole('button', { name: 'Later records' })),
+      isHeld: (call) => call.url.searchParams.get('page') === '2',
+      then: () => listPage(51, 2),
+      pages: ['Page 1 of 2', 'Page 2', 'Page 2 of 2'],
+    },
+  ])('keeps rows on screen but inert while $change loads, and opens a row once it arrives', async (example) => {
+    const held = deferred();
+    const { definition } = mountForm(undefined, {
+      route: (call) => {
+        if (!isGet(call, LIST_PATH)) {
+          return null;
+        }
+        return example.isHeld(call) ? held.response : example.first();
+      },
+    });
+    const state = () => {
+      const table = within(records()).getByRole('table', { name: `${definition.name} records` });
+      const open = within(table).getByRole('button', { name: OPEN_NAME });
+      const paging = within(records()).getByRole('navigation', { name: 'Record list pages' });
+      return {
+        busy: table.getAttribute('aria-busy'),
+        pendingStyle: table.classList.contains('record-grid__table--pending'),
+        row: present(open.closest('tr'), 'grid row').getAttribute('aria-disabled'),
+        open: open.getAttribute('aria-disabled'),
+        page: within(paging).getByText(/^Page /).textContent,
+        paging: within(paging)
+          .getAllByRole('button')
+          .map((button) => button.getAttribute('aria-disabled')),
+      };
+    };
+    const clickRow = () => {
+      const open = within(records()).getByRole('button', { name: OPEN_NAME });
+      fireEvent.click(open);
+      fireEvent.click(present(open.closest('tr'), 'grid row'));
+    };
+    const [before, pending, after] = example.pages;
+    await recordOpened();
+    await vi.waitFor(() => {
+      expect(state().busy).toBe('false');
+    });
+    const settled = { busy: 'false', pendingStyle: false, row: null, open: null, paging: [null, null] };
+    expect(state()).toEqual({ ...settled, page: before });
+
+    example.trigger();
+    await vi.waitFor(() => {
+      expect(listCalls().some(example.isHeld)).toBe(true);
+    });
+    expect(state()).toEqual({
+      busy: 'true',
+      pendingStyle: true,
+      row: 'true',
+      open: 'true',
+      page: pending,
+      paging: ['true', 'true'],
+    });
+    expect(gridStatus()).toBe('Loading records…');
+    clickRow();
+    expect(openCalls()).toEqual([]);
+
+    held.release(example.then());
+    await vi.waitFor(() => {
+      expect(state().busy).toBe('false');
+    });
+    expect(state()).toEqual({ ...settled, page: after });
+    fireEvent.click(within(records()).getByRole('button', { name: OPEN_NAME }));
+    await vi.waitFor(() => {
+      expect(openCalls()).toHaveLength(1);
+    });
+    await recordOpened();
+  });
+
+  it.each<{ row: string; recStatus: number; values: RecordSummary['values']; name: string }>([
+    { row: 'an active row', recStatus: 1, values: {}, name: OPEN_NAME },
+    { row: 'a deleted row', recStatus: 0, values: {}, name: `${OPEN_NAME} (deleted)` },
+    // The next grid column, FirstName, is the first nonblank cell.
+    { row: 'a row with a blank first cell', recStatus: 1, values: { CaseID: null }, name: 'Open record Ada' },
+  ])('names the open action of $row and opens that record by id', async ({ recStatus, values, name }) => {
+    mountForm(undefined, { route: (call) => (isGet(call, LIST_PATH) ? listPage(1, 1, recStatus, values) : null) });
+    await recordOpened();
+    const open = await within(records()).findByRole('button', { name });
+    const row = present(open.closest('tr'), 'grid row');
+    // The button is the row's only control and its one tab stop; the row takes no focus.
+    expect(row.hasAttribute('tabindex')).toBe(false);
+    expect(within(row).getAllByRole('button')).toEqual([open]);
+    expect(open.getAttribute('type')).toBe('button');
+
+    fireEvent.click(open);
+    await vi.waitFor(() => {
+      expect(openCalls()).toHaveLength(1);
+    });
+    await recordOpened();
+  });
+
+  it('shows a "Show deleted" change as pending, ignoring further changes, until navigation applies it', async () => {
+    const count = deferred();
+    const isDeletedCount = (call: Call) =>
+      isGet(call, COUNT_PATH) && call.url.searchParams.get('includeDeleted') === 'true';
+    await renderForm(undefined, { route: (call) => (isDeletedCount(call) ? count.response : null) });
+    const toggle = within(records()).getByRole('checkbox', { name: 'Show deleted' });
+    const state = () => ({
+      checked: toggle.matches(':checked'),
+      busy: toggle.getAttribute('aria-busy'),
+      pendingStyle: present(toggle.closest('label'), 'toggle label').classList.contains('record-grid__toggle--pending'),
+      rows: within(records()).getByRole('button', { name: OPEN_NAME }).getAttribute('aria-disabled'),
+    });
+    expect(state()).toEqual({ checked: false, busy: null, pendingStyle: false, rows: null });
+
+    fireEvent.click(toggle);
+    await vi.waitFor(() => {
+      expect(calls.some(isDeletedCount)).toBe(true);
+    });
+    const pending = { checked: true, busy: 'true', pendingStyle: true, rows: 'true' };
+    expect(state()).toEqual(pending);
+    // A second press while the first is pending changes nothing.
+    fireEvent.click(toggle);
+    expect(state()).toEqual(pending);
+
+    count.release(jsonResponse(200, { count: 1 }));
+    await vi.waitFor(() => {
+      expect(listCalls().at(-1)?.url.searchParams.get('includeDeleted')).toBe('true');
+    });
+    await findInGrid('1 record');
+    expect(state()).toEqual({ checked: true, busy: null, pendingStyle: false, rows: null });
+  });
+
+  it('re-renders no grid row and sends no list request while a field is edited', async () => {
+    const { definition } = await renderForm();
+    const renders = gridRenders.count;
+    const lists = listCalls().length;
+    expect(renders).toBeGreaterThan(0);
+
+    const firstName = screen.getByLabelText(promptOf(fieldByName('FirstName', definition)));
+    for (const value of ['A', 'Ad', 'Ada', 'Adah']) {
+      fireEvent.change(firstName, { target: { value } });
+    }
+    expect(controlValue(firstName)).toBe('Adah');
+    expect(gridRenders.count).toBe(renders);
+    expect(listCalls()).toHaveLength(lists);
+
+    // The probe stands for the real export, which is memoised itself.
+    const actual = await vi.importActual<typeof import('./RecordGrid')>('./RecordGrid');
+    expect(actual.RecordGrid.$$typeof).toBe(Symbol.for('react.memo'));
   });
 });

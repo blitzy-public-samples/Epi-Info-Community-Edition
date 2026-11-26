@@ -514,13 +514,72 @@ function FormWorkspace({
 
   usePositionReport(navigation.n, onPositionChange);
 
-  // A count that answers 404 means the form itself is gone.
-  const formGone = navigation.loadError?.kind === 'notFound' ? navigation.loadError : null;
-  useReportOnce(formGone, onFormNotFound);
-
   const { selectedPageId, selectPage, selectField } = usePageSelection(definition);
 
   const [findOpen, setFindOpen] = useState(false);
+
+  // One form-not-found path for every 404 that means the form itself is gone: the count's,
+  // the grid's list and Find's search. It closes Find. A clean draft hands over to the
+  // forms list only on a drain of the pending field events (applied or failed) that began
+  // while it was clean and ended with it still clean: an effect in flight (an assigned Age)
+  // may make it dirty, and each time a dirty draft turns clean again (a new record's one
+  // entry cleared) a fresh drain decides, so no event queued meanwhile is dropped. The
+  // drain saves nothing, as the form is gone. A dirty draft stays on screen until the user
+  // chooses "Discard edits", which hands over at once, so it is never dropped without that
+  // decision. A record that 404s on open is navigation's own recovery and does not come here.
+  const [formGone, setFormGone] = useState(false);
+  const [discardChosen, setDiscardChosen] = useState(false);
+  const [eventsDrained, setEventsDrained] = useState(false);
+  const draftClean = !editor.isDirty;
+  const handleFormNotFound = useCallback(() => {
+    setFindOpen(false);
+    setFormGone(true);
+  }, []);
+  // Adjusted during render, so the count's 404 stays recorded after a later navigation
+  // action clears navigation's load error.
+  if (navigation.loadError?.kind === 'notFound' && !formGone) {
+    setFindOpen(false);
+    setFormGone(true);
+  }
+  // Also adjusted during render: a drain that answered for a clean draft no longer speaks
+  // for it once it is dirty, even when the answer and the dirtying effect land together.
+  if (eventsDrained && !draftClean) {
+    setEventsDrained(false);
+  }
+  const { drainFieldEvents } = editor;
+  useEffect(() => {
+    if (!formGone || discardChosen || !draftClean) {
+      return undefined;
+    }
+    // Unmounting, choosing Discard edits or the draft turning dirty meanwhile makes the
+    // drain's answer moot.
+    let current = true;
+    void drainFieldEvents().then(() => {
+      if (current) {
+        setEventsDrained(true);
+      }
+    });
+    return () => {
+      current = false;
+    };
+  }, [formGone, discardChosen, draftClean, drainFieldEvents]);
+  // One object for the workspace's life: the loss of the form is reported once, however
+  // many 404s arrive and whenever the drained draft is found clean or is discarded.
+  const [formGoneReport] = useState(() => ({}));
+  useReportOnce(
+    formGone && (discardChosen || (eventsDrained && draftClean)) ? formGoneReport : null,
+    onFormNotFound,
+  );
+
+  // The grid is memoised and every edit of the draft re-renders this workspace, so it gets
+  // stable callbacks only: navigation's actions keep their identity, and so does this one.
+  const { openById } = navigation;
+  const openFromGrid = useCallback(
+    (id: string) => {
+      void openById(id);
+    },
+    [openById],
+  );
 
   // Back to forms is a leave like any move: a dirty draft is saved first, and a failed
   // save keeps the user on the record. A second press while the first is pending is ignored.
@@ -634,6 +693,9 @@ function FormWorkspace({
             void navigation.retryLoad();
           })
         }
+        formGone={formGone}
+        offerDiscard={editor.isDirty && !discardChosen}
+        onDiscardFormGone={() => runBannerAction(() => setDiscardChosen(true))}
         editorBanner={editorBanner}
         bannerHandlers={bannerHandlers}
         eventNotice={editor.eventNotice}
@@ -659,14 +721,11 @@ function FormWorkspace({
         viewId={viewId}
         definition={definition}
         includeDeleted={navigation.includeDeleted}
-        onIncludeDeletedChange={(value) => {
-          void navigation.setIncludeDeleted(value);
-        }}
+        onIncludeDeletedChange={navigation.setIncludeDeleted}
         listVersion={navigation.listVersion}
         openRecordId={openRecordId}
-        onOpen={(id) => {
-          void navigation.openById(id);
-        }}
+        onOpen={openFromGrid}
+        onFormNotFound={handleFormNotFound}
         disabled={editor.saving}
       />
 
@@ -689,6 +748,7 @@ function FormWorkspace({
           void navigation.openById(id);
         }}
         onFindClose={() => setFindOpen(false)}
+        onFindFormNotFound={handleFormNotFound}
       />
     </div>
   );
@@ -743,9 +803,15 @@ interface WorkspaceNoticesProps {
   /** Navigation's informational text, such as a record that no longer exists. */
   readonly navigationNotice: string | null;
   readonly onDismissNavigationNotice: () => void;
-  /** The failed navigation load, shown with Retry. */
+  /** The failed navigation load, shown with Retry; a count's 404 is the form-gone banner's instead. */
   readonly loadError: ApiError | null;
   readonly onRetryLoad: () => void;
+  /** A 404 said the form itself no longer exists. */
+  readonly formGone: boolean;
+  /** The draft has unsaved edits the user has not yet chosen to discard. */
+  readonly offerDiscard: boolean;
+  /** "Discard edits" on the form-gone banner: the draft may be dropped and the forms list shown. */
+  readonly onDiscardFormGone: () => void;
   /** The failed save or delete; `null` when there is none or the deleted warning says the same. */
   readonly editorBanner: EditorBanner | null;
   /** The editor banner's actions. */
@@ -754,13 +820,19 @@ interface WorkspaceNoticesProps {
   readonly eventNotice: string | null;
 }
 
-/** The workspace's banners, in order: deleted record, navigation notice, failed load, failed write, field event. */
+/**
+ * The workspace's banners, in order: deleted record, navigation notice, failed load, form
+ * gone, failed write, field event.
+ */
 function WorkspaceNotices({
   recordDeleted,
   navigationNotice,
   onDismissNavigationNotice,
   loadError,
   onRetryLoad,
+  formGone,
+  offerDiscard,
+  onDiscardFormGone,
   editorBanner,
   bannerHandlers,
   eventNotice,
@@ -782,7 +854,21 @@ function WorkspaceNotices({
         </div>
       )}
 
-      {loadError !== null && <NavigationLoadFailure error={loadError} onRetry={onRetryLoad} />}
+      {/* The form-gone banner, below, states a count's 404. */}
+      {loadError !== null && loadError.kind !== 'notFound' && (
+        <NavigationLoadFailure error={loadError} onRetry={onRetryLoad} />
+      )}
+
+      {formGone && (
+        <div className="banner banner--error" role="alert">
+          <p>{FORM_NOT_FOUND_TEXT}</p>
+          {offerDiscard && (
+            <button type="button" onClick={() => onDiscardFormGone()}>
+              {DISCARD_EDITS}
+            </button>
+          )}
+        </div>
+      )}
 
       {editorBanner !== null && <EditorBannerView banner={editorBanner} handlers={bannerHandlers} />}
 
@@ -815,6 +901,8 @@ interface WorkspaceDialogsProps {
   /** A Find result was chosen. */
   readonly onFindResult: (globalRecordId: string) => void;
   readonly onFindClose: () => void;
+  /** Find's search answered 404: the form itself no longer exists. */
+  readonly onFindFormNotFound: () => void;
 }
 
 /** The workspace's modals: delete confirmation, check-code messages and Find. */
@@ -834,6 +922,7 @@ function WorkspaceDialogs({
   openRecordId,
   onFindResult,
   onFindClose,
+  onFindFormNotFound,
 }: WorkspaceDialogsProps) {
   return (
     <>
@@ -856,6 +945,7 @@ function WorkspaceDialogs({
         openRecordId={isNew ? null : openRecordId}
         onOpen={onFindResult}
         onClose={onFindClose}
+        onFormNotFound={onFindFormNotFound}
       />
     </>
   );

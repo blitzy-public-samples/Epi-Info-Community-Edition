@@ -5,9 +5,17 @@
 // generateFresh() that `npm run api:generate` uses, then compared with the committed pair byte for byte, line endings
 // aside. Requires the .NET SDK 10.0.1xx (already a build prerequisite, see the root README.md) and `npm ci` in web/.
 // No database is needed and no connection string is read or printed. Nothing in the checkout is written apart from
-// git-ignored build output, and the temporary directory is removed on every path.
+// git-ignored build output, and the temporary directory is removed on every path, an interruption by SIGINT, SIGTERM
+// or SIGHUP included: an interrupted check stops every process it started, with their descendants, before it removes
+// the directory, then reports the interruption rather than staleness and ends by that signal (see the Interruption
+// section and currentInterruption in api-generate.mjs). Only a SIGKILL of the check's own node process, which no
+// process can catch, leaves the directory behind, and only a descendant that leaves its process group escapes the stop.
 //
 // Remedy for a stale pair: npm run api:generate, then commit both files.
+//
+// `node scripts/check-api-fresh.mjs --help` (or -h) prints the usage and checks nothing; the script takes no other
+// argument, and any other argument is refused with exit status 2 before anything runs (see handleArguments in
+// api-generate.mjs).
 
 import { Buffer } from 'node:buffer';
 import fs from 'node:fs/promises';
@@ -15,7 +23,14 @@ import path from 'node:path';
 import process from 'node:process';
 import { URL, fileURLToPath } from 'node:url';
 
-import { COMMITTED, generateFresh, removeFresh } from './api-generate.mjs';
+import {
+  COMMITTED,
+  currentInterruption,
+  formatUsage,
+  generateFresh,
+  handleArguments,
+  removeFresh,
+} from './api-generate.mjs';
 
 const STALE_MESSAGE = 'OpenAPI document or generated client is stale; run npm run api:generate';
 
@@ -38,6 +53,9 @@ async function checkFreshness() {
   try {
     fresh = await generateFresh();
   } catch (error) {
+    if (currentInterruption() !== null) {
+      return reportInterrupted();
+    }
     // Without a fresh pair the check cannot confirm that the committed one is current, so it fails with the one
     // failure line and exit status 1 that a stale pair gets, after a line that says why generation failed.
     process.stderr.write(`OpenAPI freshness check could not generate the document: ${errorMessage(error)}\n`);
@@ -61,6 +79,9 @@ async function checkFreshness() {
     }
   }
 
+  if (currentInterruption() !== null) {
+    return reportInterrupted();
+  }
   if (stale === null) {
     return 1;
   }
@@ -80,6 +101,16 @@ async function checkFreshness() {
   }
   process.stdout.write('OpenAPI document and generated client are current.\n');
   return 0;
+}
+
+/**
+ * An interrupted check has no outcome, so it is reported on one line, never as staleness or as a generation failure,
+ * and returns 128 + n, the status the process also ends with when the interruption raises signal n again.
+ */
+function reportInterrupted() {
+  const { signal, exitCode } = currentInterruption();
+  process.stderr.write(`OpenAPI freshness check was interrupted by ${signal} and did not complete\n`);
+  return exitCode;
 }
 
 /**
@@ -213,4 +244,24 @@ function errorMessage(error) {
   return error instanceof Error ? error.message : String(error);
 }
 
-process.exitCode = await checkFreshness();
+const usage = () =>
+  formatUsage({
+    synopsis: [
+      'Usage: node scripts/check-api-fresh.mjs [--help | -h]',
+      '   or: npm run lint   (from web/, after eslint .)',
+    ],
+    description:
+      `Checks that the committed OpenAPI document ${toRepoRelative(COMMITTED.json)} and the client types ` +
+      `generated from it, ${toRepoRelative(COMMITTED.ts)}, are current. It regenerates both into a new temporary ` +
+      'directory exactly as npm run api:generate does, and compares them with the committed pair byte for byte, ' +
+      'line endings aside. It writes nothing in the checkout apart from git-ignored build output, and works from ' +
+      'any directory. For a stale pair, run npm run api:generate, then commit both files.',
+    exitStatuses: [
+      ['0', 'both committed files are current'],
+      ['1', 'a committed file is stale, or the check could not generate or compare the pair'],
+    ],
+    interrupted: 'the temporary directory is removed and nothing is reported as stale',
+  });
+
+// The arguments are read before anything else, so --help and a refused argument check nothing.
+process.exitCode = handleArguments(process.argv.slice(2), usage()) ?? (await checkFreshness());

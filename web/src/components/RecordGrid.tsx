@@ -1,6 +1,18 @@
-import { useCallback, useEffect, useId, useMemo, useState, type KeyboardEvent, type ReactNode } from 'react';
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useId,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent,
+  type MouseEvent,
+  type ReactNode,
+} from 'react';
 
-import { isExactDecimal, type ApiClient } from '../api/client';
+import { isBlankQuery, isExactDecimal, type ApiClient } from '../api/client';
 import { describeError, isAbortError, networkError, type ApiError } from '../api/errors';
 import type { FieldDefinition, FieldValue, FormDefinition, RecordPage, RecordSummary } from '../api/types';
 import { ConnectionError } from './ConnectionError';
@@ -12,13 +24,22 @@ export interface RecordGridProps {
   definition: FormDefinition;
   /** The shared deleted toggle, owned by the navigation state. */
   includeDeleted: boolean;
-  onIncludeDeletedChange: (value: boolean) => void;
+  /**
+   * Asks for the other set. The toggle shows the requested state as pending, and rows
+   * cannot be opened, until the returned promise settles and `includeDeleted` follows.
+   */
+  onIncludeDeletedChange: (value: boolean) => Promise<void>;
   /** Bumped whenever the record list may have changed; each change reloads the current page. */
   listVersion: number;
   /** `globalRecordId` of the open record, marked `aria-current`. */
   openRecordId?: string | null;
   /** Opens a record by id; the caller runs the leave flow first. */
   onOpen: (globalRecordId: string) => void;
+  /**
+   * Called when the list answers 404, which means the form itself no longer exists; the
+   * caller's form-not-found handling decides what happens to the open record.
+   */
+  onFormNotFound: () => void;
   /** Makes every control inert, for example while a save is in flight. */
   disabled?: boolean;
 }
@@ -31,8 +52,20 @@ const EMPTY_TEXT = 'No records found.';
 // The 403, 404, 409, 413 and 415 texts of describeError speak of a record or a write;
 // none of them describes a records-list GET, so the grid states its own fixed text.
 const LIST_FAILED_TEXT = 'The record list could not be loaded.';
+// A request aborted by something other than the grid, such as the browser stopping the
+// page's requests, received no response and failed nothing: a plain line, not an alert.
+const NOT_LOADED_TEXT = 'The record list was not loaded.';
+// A list 404 means the form is gone. The workspace raises the alert and decides what
+// follows, so the grid only states it, with nothing to retry.
+const FORM_NOT_FOUND_TEXT = 'This form no longer exists.';
+const RETRY_TEXT = 'Retry';
+// Each row's open button is named by this prefix and its first cell's text, never by cell
+// data alone, and the prefix holds none of the toolbar's and navigator's names.
+const OPEN_RECORD_PREFIX = 'Open record ';
+// The search box's query parameter, which keys its messages in a 400's `errors` map.
+const SEARCH_PARAMETER = 'q';
 // Column of last resort, for a form whose server-chosen grid columns are empty: a row
-// with no cell would be a focusable row with no content and no accessible name.
+// with no cell would have no content and no cell to hold its open button.
 const RECORD_ID_COLUMN = 'Record ID';
 
 // Paging names avoid First, Previous, Next, Last, New, Save, Delete and Find, which the
@@ -40,9 +73,21 @@ const RECORD_ID_COLUMN = 'Record ID';
 const EARLIER_TEXT = 'Earlier records';
 const LATER_TEXT = 'Later records';
 
-/** Header text of a grid column: the field's non-blank prompt, else its name, else the key itself. */
-function headerText(key: string, fields: ReadonlyMap<string, FieldDefinition>): string {
-  const field = fields.get(key.toLowerCase());
+/** The form's fields by exact name, and by lower-cased name where only one field name folds to it. */
+interface FieldLookup {
+  readonly exact: ReadonlyMap<string, FieldDefinition>;
+  /** `null` for a lower-cased name that two or more distinct field names share. */
+  readonly folded: ReadonlyMap<string, FieldDefinition | null>;
+}
+
+/**
+ * Header text of a grid column: the field's non-blank prompt, else its name, else the key
+ * itself. A column key is the server's canonical field name, so the field of exactly that
+ * name labels it; a key that differs only in letter case names a field only when no other
+ * field name shares its lower-cased form, as the server itself resolves names.
+ */
+function headerText(key: string, fields: FieldLookup): string {
+  const field = fields.exact.get(key) ?? fields.folded.get(key.toLowerCase()) ?? undefined;
   if (field === undefined) {
     return key;
   }
@@ -74,6 +119,16 @@ function pageCountOf(result: RecordPage): number {
   return Math.max(1, Math.ceil(result.total / pageSize));
 }
 
+/**
+ * The filter a search box text stands for. Only an entirely blank text, by the server's
+ * own whitespace test (isBlankQuery), is no filter; any other text is the filter exactly
+ * as typed, edge whitespace included, because the server matches it untrimmed and
+ * trimming would broaden it.
+ */
+function filterText(text: string): string {
+  return isBlankQuery(text) ? '' : text;
+}
+
 function countText(total: number): string {
   return total === 1 ? '1 record' : `${total} records`;
 }
@@ -82,15 +137,38 @@ function isConnectionFailure(error: ApiError): boolean {
   return error.kind === 'unavailable' || error.kind === 'network';
 }
 
+// A field-level 400 is about the list's own query parameters, never a form field, so
+// describeError's "see the messages beside each field" does not apply: such a 400 states
+// the list's fixed text, with the messages split by splitListErrors.
 function listErrorText(error: ApiError): string {
   switch (error.kind) {
     case 'badRequest':
-    case 'validation':
     case 'server':
       return describeError(error);
     default:
       return LIST_FAILED_TEXT;
   }
+}
+
+/**
+ * Splits a 400's `errors` map, keyed by query parameter. Messages about `q` belong beside
+ * the search box. Those about another parameter (`page`, `pageSize`, `includeDeleted`)
+ * go to the banner, prefixed with the parameter, because their text does not name it.
+ */
+function splitListErrors(error: ApiError | null): { search: readonly string[]; other: readonly string[] } {
+  const search: string[] = [];
+  const other: string[] = [];
+  if (error === null) {
+    return { search, other };
+  }
+  for (const [key, messages] of Object.entries(error.fieldErrors)) {
+    if (key === SEARCH_PARAMETER) {
+      search.push(...messages);
+    } else {
+      other.push(...messages.map((message) => `${key}: ${message}`));
+    }
+  }
+  return { search, other };
 }
 
 function sameRecordId(a: string, b: string | null | undefined): boolean {
@@ -99,11 +177,13 @@ function sameRecordId(a: string, b: string | null | undefined): boolean {
 
 interface ListErrorBannerProps {
   error: ApiError;
+  /** A 400's messages about parameters other than the search box. */
+  otherMessages: readonly string[];
   onRetry: () => void;
 }
 
 /** A failed list load other than an unreachable server; a bad request is not worth repeating. */
-function ListErrorBanner({ error, onRetry }: ListErrorBannerProps) {
+function ListErrorBanner({ error, otherMessages, onRetry }: ListErrorBannerProps) {
   const message = listErrorText(error);
   const traceId = error.traceId;
   // describeError already ends a 500's text with the trace id.
@@ -113,6 +193,9 @@ function ListErrorBanner({ error, onRetry }: ListErrorBannerProps) {
   return (
     <div className="banner banner--error" role="alert">
       <p>{message}</p>
+      {otherMessages.map((line, index) => (
+        <p key={`${index}-${line}`}>{line}</p>
+      ))}
       {traceLine !== null && (
         <p>
           <small>{traceLine}</small>
@@ -127,11 +210,26 @@ function ListErrorBanner({ error, onRetry }: ListErrorBannerProps) {
   );
 }
 
-/** The records page on screen, tagged with its form so another form's rows never show. */
+/**
+ * The records page on screen. Its form keeps another form's rows off screen; its request
+ * key says which request it answers, so rows of an earlier page, filter or set stay
+ * visible while the next one loads but cannot be opened.
+ */
 interface ShownPage {
+  key: string;
   viewId: number;
   page: RecordPage;
 }
+
+/**
+ * A load that ended without a page, tagged with the request key it answers: an error
+ * response or no response, `notLoaded` for an abort the grid did not cause, or
+ * `formGone` for a 404, which reports that the form itself no longer exists.
+ */
+type ListFailure =
+  | { key: string; kind: 'error'; error: ApiError }
+  | { key: string; kind: 'notLoaded' }
+  | { key: string; kind: 'formGone' };
 
 /**
  * The searchable, pageable record list of the open form. It displays what
@@ -139,8 +237,12 @@ interface ShownPage {
  * the server's case-insensitive "contains" over the grid columns, debounced, and the
  * server also chooses the columns. Activating a row asks the caller to open that
  * record, which runs the editor's leave flow before anything changes.
+ *
+ * Memoised: the workspace re-renders on every edit of the draft, and with stable
+ * callbacks those renders pass the grid the same props, so up to a page of rows is not
+ * rebuilt for each keystroke in a field.
  */
-export function RecordGrid({
+export const RecordGrid = memo(function RecordGrid({
   client,
   viewId,
   definition,
@@ -149,18 +251,26 @@ export function RecordGrid({
   listVersion,
   openRecordId = null,
   onOpen,
+  onFormNotFound,
   disabled = false,
 }: RecordGridProps) {
   const searchId = useId();
+  // Read when a load answers, so a new callback never restarts the load effect.
+  const onFormNotFoundRef = useRef(onFormNotFound);
+  useLayoutEffect(() => {
+    onFormNotFoundRef.current = onFormNotFound;
+  });
   const [q, setQ] = useState('');
   const [debouncedQ, setDebouncedQ] = useState('');
   const [page, setPage] = useState(1);
   const [shown, setShown] = useState<ShownPage | null>(null);
-  const [error, setError] = useState<ApiError | null>(null);
+  const [failure, setFailure] = useState<ListFailure | null>(null);
   const [loading, setLoading] = useState(true);
   const [reloadToken, setReloadToken] = useState(0);
+  // The "Show deleted" state asked for and not yet applied; `null` when none is pending.
+  const [requestedIncludeDeleted, setRequestedIncludeDeleted] = useState<boolean | null>(null);
 
-  const searchText = debouncedQ.trim();
+  const searchText = filterText(debouncedQ);
 
   // A new filter or form starts again at page 1. Adjusted during render rather than in
   // an effect, so the load effect never requests the old page under the new filter.
@@ -170,6 +280,9 @@ export function RecordGrid({
     setPageFilterKey(filterKey);
     setPage(1);
   }
+  // Every input of the list request: the page or failure on screen answers the request
+  // with this key, or an earlier one.
+  const requestKey = JSON.stringify([viewId, includeDeleted, searchText, page, listVersion, reloadToken]);
 
   useEffect(() => {
     const timer = setTimeout(() => setDebouncedQ(q), SEARCH_DEBOUNCE_MS);
@@ -192,8 +305,18 @@ export function RecordGrid({
             return;
           }
           if (!outcome.ok) {
-            setError(outcome.error);
+            const formGone = outcome.error.kind === 'notFound';
+            setFailure(
+              formGone
+                ? { key: requestKey, kind: 'formGone' }
+                : { key: requestKey, kind: 'error', error: outcome.error },
+            );
             setLoading(false);
+            if (formGone) {
+              // Not a list failure to retry: the form is gone, and the workspace's
+              // form-not-found handling takes over.
+              onFormNotFoundRef.current();
+            }
             return;
           }
           // The list shrank under a later page (a delete, a narrower filter): show its
@@ -203,40 +326,68 @@ export function RecordGrid({
             setPage(lastPage);
             return;
           }
-          setShown({ viewId, page: outcome.data });
-          setError(null);
+          setShown({ key: requestKey, viewId, page: outcome.data });
+          setFailure(null);
           setLoading(false);
         },
         (e: unknown) => {
-          if (controller.signal.aborted || isAbortError(e)) {
+          // The grid's own abort: a newer request superseded this one, or it unmounted.
+          if (controller.signal.aborted) {
             return;
           }
-          // The client settles every failure into a result, so a rejection means no
-          // response was confirmed; GET repeats safely through Retry.
-          setError(networkError());
+          // The client settles every failure but an abort into a result. An abort the grid
+          // did not cause failed nothing, so the grid settles idle and offers the GET again;
+          // any other rejection means no response was confirmed, and Retry repeats it safely.
+          setFailure(
+            isAbortError(e)
+              ? { key: requestKey, kind: 'notLoaded' }
+              : { key: requestKey, kind: 'error', error: networkError() },
+          );
           setLoading(false);
         },
       );
 
     return () => controller.abort();
-  }, [client, viewId, searchText, includeDeleted, page, listVersion, reloadToken]);
+    // requestKey also carries listVersion and reloadToken, whose changes reload the page.
+  }, [client, requestKey, viewId, searchText, includeDeleted, page]);
 
   const reload = useCallback(() => setReloadToken((token) => token + 1), []);
+  // A Retry button leaves with the failure it answers, so focus moves to the list's live
+  // region, which stays and announces the new load, instead of dropping to the page.
+  const statusRef = useRef<HTMLParagraphElement>(null);
+  const retry = useCallback(() => {
+    reload();
+    statusRef.current?.focus();
+  }, [reload]);
 
-  const fieldsByName = useMemo(() => {
-    const map = new Map<string, FieldDefinition>();
+  const fieldsByName = useMemo((): FieldLookup => {
+    const exact = new Map<string, FieldDefinition>();
+    const folded = new Map<string, FieldDefinition | null>();
     for (const pageDefinition of definition.pages) {
       for (const field of pageDefinition.fields) {
-        const key = field.name.toLowerCase();
-        if (!map.has(key)) {
-          map.set(key, field);
+        if (exact.has(field.name)) {
+          continue;
         }
+        exact.set(field.name, field);
+        // A second spelling of the same lower-cased name makes it ambiguous.
+        const key = field.name.toLowerCase();
+        folded.set(key, folded.has(key) ? null : field);
       }
     }
-    return map;
+    return { exact, folded };
   }, [definition]);
 
-  const result = shown !== null && shown.viewId === viewId ? shown.page : null;
+  // Only the current request's failure is shown; Retry or a new search replaces it at once.
+  const failed = failure !== null && failure.key === requestKey ? failure : null;
+  const error = failed?.kind === 'error' ? failed.error : null;
+  // The last page stays on screen while a newer request loads, so the list does not
+  // flicker, but only the page that answers the current request opens a record: rows of
+  // another page or filter, or a deleted row after "Show deleted" is switched off, never do.
+  const result = failed === null && shown !== null && shown.viewId === viewId ? shown.page : null;
+  // A pending "Show deleted" change is about to replace the set, so it also holds the rows.
+  const togglePending = requestedIncludeDeleted !== null;
+  const settled = shown !== null && shown.key === requestKey && !loading && !togglePending;
+  const rowsInert = disabled || !settled;
   const items: readonly RecordSummary[] = result?.items ?? [];
   const columns = useMemo(() => {
     const first = items[0];
@@ -245,20 +396,27 @@ export function RecordGrid({
   const lastPage = result === null ? 1 : pageCountOf(result);
 
   const open = (globalRecordId: string) => {
-    if (!disabled) {
+    if (!rowsInert) {
       onOpen(globalRecordId);
     }
   };
 
-  const handleRowKeyDown = (event: KeyboardEvent<HTMLTableRowElement>, globalRecordId: string) => {
-    if (event.altKey || event.ctrlKey || event.metaKey) {
+  // The row's own click would open the same record a second time.
+  const handleOpenClick = (event: MouseEvent<HTMLButtonElement>, globalRecordId: string) => {
+    event.stopPropagation();
+    open(globalRecordId);
+  };
+
+  // The navigator re-reads the set before the toggle follows, and may first save a dirty
+  // record; the requested state shows as pending meanwhile, and a further change is
+  // ignored until the first one settles, whether it applied or not.
+  const changeIncludeDeleted = (value: boolean) => {
+    if (togglePending) {
       return;
     }
-    if (event.key === 'Enter' || event.key === ' ') {
-      // Space would otherwise scroll the page.
-      event.preventDefault();
-      open(globalRecordId);
-    }
+    setRequestedIncludeDeleted(value);
+    const settle = () => setRequestedIncludeDeleted(null);
+    void onIncludeDeletedChange(value).then(settle, settle);
   };
 
   const handleSearchKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
@@ -268,24 +426,44 @@ export function RecordGrid({
     }
   };
 
+  const { search: searchErrors, other: otherErrors } = splitListErrors(error);
+  // Messages about the search text belong to the text that was searched for: once the
+  // box holds other text they are stale, and the next search answers for the new text.
+  const searchMessages = filterText(q) === searchText ? searchErrors : [];
+  const searchInvalid = searchMessages.length > 0;
+  const searchErrorId = `${searchId}-error`;
+
   // A load that follows a failure replaces the banner with the loading text, so Retry
   // and a new search visibly run, and a repeated failure announces its alert again.
   // Retry stays available while the grid is disabled: it only repeats the list GET.
-  let body: ReactNode;
+  // A 400 whose messages all concern the search box shows them there and no banner.
+  let banner: ReactNode = null;
   if (error !== null && !loading) {
-    body = isConnectionFailure(error) ? (
-      <ConnectionError error={error} method="GET" onRetry={reload} />
-    ) : (
-      <ListErrorBanner error={error} onRetry={reload} />
-    );
-  } else if (result === null || error !== null) {
-    body = <p>{LOADING_TEXT}</p>;
-  } else if (items.length === 0) {
-    body = <p>{EMPTY_TEXT}</p>;
-  } else {
+    if (isConnectionFailure(error)) {
+      banner = <ConnectionError error={error} method="GET" onRetry={retry} />;
+    } else if (error.kind !== 'validation' || otherErrors.length > 0) {
+      banner = <ListErrorBanner error={error} otherMessages={otherErrors} onRetry={retry} />;
+    }
+  }
+
+  // The one live region's text: loading, the outcome of the current request and the
+  // count. An error response announces itself through its own alert instead.
+  let statusText = '';
+  if (failed === null || loading) {
+    statusText =
+      settled && result !== null ? (items.length === 0 ? EMPTY_TEXT : countText(result.total)) : LOADING_TEXT;
+  } else if (failed.kind === 'formGone') {
+    statusText = FORM_NOT_FOUND_TEXT;
+  } else if (failed.kind === 'notLoaded') {
+    statusText = NOT_LOADED_TEXT;
+  }
+  const notLoaded = failed?.kind === 'notLoaded' && !loading;
+
+  let table: ReactNode = null;
+  if (result !== null && items.length > 0) {
     const hasColumns = columns.length > 0;
-    body = (
-      <table aria-busy={loading}>
+    table = (
+      <table aria-busy={!settled} className={settled ? undefined : 'record-grid__table--pending'}>
         <caption className="visually-hidden">{`${definition.name} records`}</caption>
         <thead>
           <tr>
@@ -303,30 +481,40 @@ export function RecordGrid({
         <tbody>
           {items.map((row) => {
             const deleted = row.recStatus === 0;
-            const deletedMark = deleted ? <span className="visually-hidden"> (deleted)</span> : null;
+            const [firstColumn, ...otherColumns] = hasColumns ? columns : [];
+            const firstText = firstColumn === undefined ? row.globalRecordId : cellText(row.values[firstColumn]);
+            // A blank first cell names its record by the row's first nonblank cell, else by id.
+            const nameText =
+              firstText !== ''
+                ? firstText
+                : (otherColumns.map((key) => cellText(row.values[key])).find((text) => text !== '') ??
+                  row.globalRecordId);
+            // A pointer click anywhere on the row opens the record; the first cell's button
+            // is the row's one tab stop and its named Open action. aria-disabled, unlike
+            // disabled, keeps the button focused while the rows wait for the current page.
             return (
               <tr
                 key={row.globalRecordId}
-                tabIndex={0}
                 className={deleted ? 'record-grid__row--deleted' : undefined}
                 aria-current={sameRecordId(row.globalRecordId, openRecordId) ? 'true' : undefined}
-                aria-disabled={disabled ? 'true' : undefined}
+                aria-disabled={rowsInert ? 'true' : undefined}
                 onClick={() => open(row.globalRecordId)}
-                onKeyDown={(event) => handleRowKeyDown(event, row.globalRecordId)}
               >
-                {hasColumns ? (
-                  columns.map((key, index) => (
-                    <td key={key}>
-                      {cellText(row.values[key])}
-                      {index === 0 && deletedMark}
-                    </td>
-                  ))
-                ) : (
-                  <td>
-                    {row.globalRecordId}
-                    {deletedMark}
-                  </td>
-                )}
+                <td>
+                  <button
+                    type="button"
+                    className="record-grid__open"
+                    aria-disabled={rowsInert ? 'true' : undefined}
+                    onClick={(event) => handleOpenClick(event, row.globalRecordId)}
+                  >
+                    <span className="visually-hidden">{OPEN_RECORD_PREFIX}</span>
+                    {firstText === '' ? <span className="visually-hidden">{nameText}</span> : firstText}
+                    {deleted && <span className="visually-hidden"> (deleted)</span>}
+                  </button>
+                </td>
+                {otherColumns.map((key) => (
+                  <td key={key}>{cellText(row.values[key])}</td>
+                ))}
               </tr>
             );
           })}
@@ -344,43 +532,80 @@ export function RecordGrid({
         autoComplete="off"
         value={q}
         disabled={disabled}
+        aria-invalid={searchInvalid ? true : undefined}
+        aria-describedby={searchInvalid ? searchErrorId : undefined}
         onChange={(event) => setQ(event.target.value)}
         onKeyDown={handleSearchKeyDown}
       />
-      <label>
+      <label className={togglePending ? 'record-grid__toggle record-grid__toggle--pending' : 'record-grid__toggle'}>
         <input
           type="checkbox"
-          checked={includeDeleted}
+          checked={requestedIncludeDeleted ?? includeDeleted}
           disabled={disabled}
-          onChange={(event) => onIncludeDeletedChange(event.target.checked)}
+          aria-busy={togglePending ? true : undefined}
+          onChange={(event) => changeIncludeDeleted(event.target.checked)}
         />
         Show deleted
       </label>
-      {body}
-      {error === null && result !== null && (
-        <footer>
-          <p aria-live="polite">{countText(result.total)}</p>
-          {items.length > 0 && (
-            <nav className="record-grid__paging" aria-label="Record list pages">
-              <p>{`Page ${result.page} of ${lastPage}`}</p>
-              <button
-                type="button"
-                disabled={disabled || page <= 1}
-                onClick={() => setPage((current) => Math.max(1, current - 1))}
-              >
-                {EARLIER_TEXT}
-              </button>
-              <button
-                type="button"
-                disabled={disabled || page >= lastPage}
-                onClick={() => setPage((current) => Math.min(lastPage, current + 1))}
-              >
-                {LATER_TEXT}
-              </button>
-            </nav>
-          )}
-        </footer>
+      {/* After the toggle, so the message takes its own full row below both controls. */}
+      {searchInvalid && (
+        <div className="field-error" id={searchErrorId} role="alert">
+          {searchMessages.map((message, index) => (
+            <p key={`${index}-${message}`}>{message}</p>
+          ))}
+        </div>
       )}
+      {banner}
+      {/* Only the table scrolls sideways, so the search box, toggle and paging stay in view. */}
+      {table !== null && <div className="record-grid__scroll">{table}</div>}
+      <footer>
+        {/* Always rendered, so loading, the outcome and the count are announced; it takes
+            focus from a Retry button that the new load removes. */}
+        <p
+          ref={statusRef}
+          role="status"
+          tabIndex={-1}
+          className={statusText === '' ? 'visually-hidden' : undefined}
+        >
+          {statusText}
+        </p>
+        {notLoaded && (
+          <button type="button" onClick={retry}>
+            {RETRY_TEXT}
+          </button>
+        )}
+        {table !== null && result !== null && (
+          <nav className="record-grid__paging" aria-label="Record list pages">
+            {/* The requested page; its page count is known again once that page arrives. */}
+            <p>{settled ? `Page ${page} of ${lastPage}` : `Page ${page}`}</p>
+            {/* Pending: aria-disabled rather than disabled, so a pressed button keeps focus. */}
+            <button
+              type="button"
+              disabled={disabled || page <= 1}
+              aria-disabled={settled ? undefined : 'true'}
+              onClick={() => {
+                if (settled) {
+                  setPage((current) => Math.max(1, current - 1));
+                }
+              }}
+            >
+              {EARLIER_TEXT}
+            </button>
+            <button
+              type="button"
+              disabled={disabled || page >= lastPage}
+              aria-disabled={settled ? undefined : 'true'}
+              onClick={() => {
+                if (settled) {
+                  setPage((current) => Math.min(lastPage, current + 1));
+                }
+              }}
+            >
+              {LATER_TEXT}
+            </button>
+          </nav>
+        )}
+      </footer>
     </section>
   );
-}
+});
