@@ -19,7 +19,7 @@ namespace EpiInfo.Data.Tests.Records;
 /// <summary>
 /// Integration tests of the record statements the repository builds and runs, against the seeded forms of the
 /// rehearsal database. The metadata reader supplies every form, page, table and column schema, so each identifier a
-/// statement names is one the catalogue returned. The cases pin two contracts:
+/// statement names is one the catalogue returned. The cases pin three contracts:
 /// <list type="bullet">
 /// <item><description>
 /// The page-row statements the repository sends when it creates and updates a record,
@@ -31,13 +31,18 @@ namespace EpiInfo.Data.Tests.Records;
 /// id exactly, so a spelling that differs from it only by trailing spaces, within or beyond the column's width, finds
 /// no row; and the base-row reads return the id as stored, the spelling every later statement binds.
 /// </description></item>
+/// <item><description>
+/// Stored reads: every stored data value of the seeded forms, with the runtime type SqlClient returns for its column,
+/// converts through <see cref="ColumnValueConverter.FromDbValue"/> to the value stored.
+/// </description></item>
 /// </list>
 /// </summary>
 /// <remarks>
-/// The tests only read. The reader's commands are all <c>SELECT</c>, and the page-row statements are only built, never
-/// sent. The identity lookups run their locked read in a transaction that is rolled back, and the record they look up
-/// is the seeded row with the lowest <c>UniqueKey</c>, chosen by SQL rather than hard-coded. Their failure messages
-/// are fixed text, so no id reaches the output except through an equality assertion.
+/// The tests only read. The reader's commands are all <c>SELECT</c>, the page-row write statements are only built,
+/// never sent, and the stored-read case sends only <c>SELECT</c>. The identity lookups run their locked read in a
+/// transaction that is rolled back, and the record they look up is the seeded row with the lowest <c>UniqueKey</c>,
+/// chosen by SQL rather than hard-coded. Their failure messages are fixed text, so no id reaches the output except
+/// through an equality assertion.
 /// </remarks>
 [Collection(DatabaseCollections.Database)]
 [Trait("Category", "Integration")]
@@ -457,6 +462,144 @@ public sealed class SqlRecordRepositoryTests : IAsyncLifetime
 
         Assert.True(rows.Count == 0, "The read by key matched a padded id to the stored row.");
         AssertOnlySuccessfulReads(recorder, expectedCommands: 1);
+    }
+
+    // Every stored value of every data column of the form, read uncoerced with GetValue, converts through
+    // FromDbValue to the value stored, and a float column's number is the stored double bit for bit. Each page table
+    // is read whole, by a SELECT naming only reader-built identifiers, and the record projection the repository
+    // reads, RecordAt at the first position of the full set, is converted the same way.
+    [Theory]
+    [MemberData(nameof(Forms))]
+    public async Task FromDbValue_EveryStoredDataValueOfSeededForm_ConvertsToTheStoredValue(string formName)
+    {
+        await TestDatabase.EnsureReachableAsync();
+        await using DatabaseWriteLock dbLock = await DatabaseWriteLock.AcquireSharedAsync();
+
+        ReaderForm form = await ReaderForm.ReadAsync(formName);
+        var recorder = new SqlCommandRecorder();
+        await using SqlConnection connection = await TestDatabase.OpenConnectionAsync();
+
+        int pageReads = 0;
+        int floatsCompared = 0;
+        foreach (PageTableSchema page in form.Schema.Pages)
+        {
+            if (page.Table is not { } table)
+            {
+                continue;
+            }
+
+            IReadOnlyList<ProjectedColumn> columns = form.ColumnsOn(page);
+            Assert.NotEmpty(columns);
+
+            // The statement names only reader-built identifiers and holds no value, so it has no parameter.
+            var wholePage = new SqlStatement(
+                "SELECT " + string.Join(", ", columns.Select(column => SqlIdentifier.Quote(column.Column))) +
+                " FROM " + SqlIdentifier.Quote(table),
+                []);
+            (int rows, int floats) = await ReadAndConvertAsync(
+                connection,
+                recorder,
+                wholePage,
+                [.. columns.Select((column, ordinal) => (column, ordinal))]);
+            Assert.True(rows > 0, "A seeded page table returned no row.");
+            pageReads++;
+            floatsCompared += floats;
+        }
+
+        RecordSelect first = RecordSqlBuilder.RecordAt(
+            form.Schema,
+            [.. form.DataColumns.Select(column => column.Field)],
+            includeDeleted: true,
+            position: 1);
+        (int recordRows, int recordFloats) = await ReadAndConvertAsync(
+            connection,
+            recorder,
+            first.Statement,
+            [.. first.Columns.Select(column => (column, column.Ordinal))]);
+        Assert.True(recordRows == 1, "The record read at the first position did not return exactly one row.");
+
+        Assert.True(pageReads > 0, "The seeded form has no page table.");
+        Assert.True(floatsCompared + recordFloats > 0, "No stored float value was compared.");
+        AssertOnlySuccessfulReads(recorder, expectedCommands: pageReads + 1);
+    }
+
+    // Runs a SELECT and converts the value at each column's result ordinal of every row through FromDbValue, checking
+    // it against the raw value. Returns the rows read and the non-null float values compared.
+    private static Task<(int Rows, int Floats)> ReadAndConvertAsync(
+        SqlConnection connection,
+        SqlCommandRecorder recorder,
+        SqlStatement statement,
+        IReadOnlyList<(ProjectedColumn Column, int Ordinal)> columns) =>
+        SqlExecution.ReadAsync(
+            connection,
+            transaction: null,
+            Operation,
+            statement,
+            DatabaseOptions.DefaultCommandTimeoutSeconds,
+            recorder,
+            CancellationToken.None,
+            async (rows, token) =>
+            {
+                int read = 0;
+                int floats = 0;
+                while (await rows.ReadAsync(token))
+                {
+                    read++;
+                    foreach ((ProjectedColumn column, int ordinal) in columns)
+                    {
+                        object stored = rows.GetValue(ordinal);
+                        FieldValue value = ColumnValueConverter.FromDbValue(
+                            column.Column.Metadata,
+                            column.Field.FieldType,
+                            stored);
+                        if (AssertStoredValue(column.Field.FieldType, stored, value))
+                        {
+                            floats++;
+                        }
+                    }
+                }
+
+                return (read, floats);
+            });
+
+    // The converted value is the stored value as its field type reads it. Returns true for a non-null float, whose
+    // number must be the stored double bit for bit.
+    private static bool AssertStoredValue(FieldType fieldType, object stored, FieldValue value)
+    {
+        if (stored is DBNull)
+        {
+            Assert.True(value.IsNull, "A database NULL did not convert to the null value.");
+            return false;
+        }
+
+        switch (fieldType)
+        {
+            case FieldType.Number when stored is double number:
+                Assert.True(value.TryGetNumber(out double converted), "A stored float did not convert to a number.");
+                Assert.Equal(BitConverter.DoubleToInt64Bits(number), BitConverter.DoubleToInt64Bits(converted));
+                return true;
+
+            case FieldType.Number:
+                Assert.True(value.TryGetInteger(out long whole), "A stored integer did not convert exactly.");
+                Assert.Equal(Convert.ToInt64(stored, CultureInfo.InvariantCulture), whole);
+                return false;
+
+            case FieldType.Date:
+                Assert.Equal(DateOnly.FromDateTime(Assert.IsType<DateTime>(stored)), value.AsDate());
+                return false;
+
+            case FieldType.Checkbox:
+                Assert.Equal(Assert.IsType<bool>(stored), value.AsBoolean());
+                return false;
+
+            case FieldType.Option:
+                Assert.Equal(Convert.ToInt32(stored, CultureInfo.InvariantCulture), value.AsIndex());
+                return false;
+
+            default:
+                Assert.Equal(Assert.IsType<string>(stored), value.AsText());
+                return false;
+        }
     }
 
     private static void AssertSingleStoredRow(IReadOnlyList<IdRow> rows, SeededForm form, string message)
@@ -2177,4 +2320,171 @@ public sealed class SearchStatementBoundsTests : IAsyncLifetime
 
     // One Find result as the statement returns it: id, key, status, navigation position and the uncapped total.
     private readonly record struct SearchRow(string Id, long UniqueKey, long RecStatus, long Position, long Total);
+}
+
+/// <summary>
+/// Unit tests of <see cref="ColumnValueConverter.FromDbValue"/>, the read side of the SQL value conversion, on columns
+/// described by <see cref="FieldTypeMapper.DescribeColumn"/> as the metadata reader describes them. A stored number
+/// or option index is accepted only with the runtime type SqlClient returns for its column: <c>byte</c> for
+/// <c>tinyint</c>, <c>short</c> for <c>smallint</c>, <c>int</c> for <c>int</c>, <c>long</c> for <c>bigint</c> and a
+/// finite <c>double</c> for <c>float</c>. A widened, narrowed or integer/float-swapped projection is refused with
+/// fixed text that names no value. No database is used.
+/// </summary>
+public sealed class StoredValueConversionTests
+{
+    // The fixed text of every refused stored value, naming no value, column or field.
+    private const string UnexpectedStoredValueMessage =
+        "A stored value does not have a type its column and field admit.";
+
+    // Each stored value is given by its runtime type and invariant text, so every row keeps its exact CLR type and
+    // shows it in the test name. The last row is 2^53 + 1, the first integer a double cannot hold.
+    [Theory]
+    [InlineData("tinyint", TypeCode.Byte, "255", 255L)]
+    [InlineData("smallint", TypeCode.Int16, "-32768", -32768L)]
+    [InlineData("int", TypeCode.Int32, "2147483647", 2147483647L)]
+    [InlineData("bigint", TypeCode.Int64, "9007199254740993", 9007199254740993L)]
+    public void FromDbValue_NumberOnIntegerColumnWithItsNativeType_IsTheExactInteger(
+        string sqlType,
+        TypeCode storedType,
+        string storedText,
+        long expected)
+    {
+        FieldValue value = ColumnValueConverter.FromDbValue(
+            Column(sqlType),
+            FieldType.Number,
+            Stored(storedType, storedText));
+
+        Assert.True(value.TryGetInteger(out long whole), "The stored integer did not read as an exact integer.");
+        Assert.Equal(expected, whole);
+    }
+
+    // 37.5 is a float like a seeded Age; -0.1 has no exact binary form; the extremes bound the positive finite doubles.
+    [Theory]
+    [InlineData(37.5)]
+    [InlineData(-0.1)]
+    [InlineData(double.MaxValue)]
+    [InlineData(double.Epsilon)]
+    public void FromDbValue_NumberOnFloatColumnWithADouble_IsThatDoubleBitForBit(double stored)
+    {
+        FieldValue value = ColumnValueConverter.FromDbValue(Column("float"), FieldType.Number, stored);
+
+        Assert.True(value.TryGetNumber(out double number), "The stored float did not read as a number.");
+        Assert.Equal(BitConverter.DoubleToInt64Bits(stored), BitConverter.DoubleToInt64Bits(number));
+    }
+
+    // The admitted option column types, each with an index of its native type.
+    [Theory]
+    [InlineData("tinyint", TypeCode.Byte, "0", 0)]
+    [InlineData("smallint", TypeCode.Int16, "2", 2)]
+    [InlineData("int", TypeCode.Int32, "7", 7)]
+    public void FromDbValue_OptionOnIntegerColumnWithItsNativeType_IsTheIndex(
+        string sqlType,
+        TypeCode storedType,
+        string storedText,
+        int expected)
+    {
+        FieldValue value = ColumnValueConverter.FromDbValue(
+            Column(sqlType),
+            FieldType.Option,
+            Stored(storedType, storedText));
+
+        Assert.True(value.TryGetIndex(out int index), "The stored option did not read as an index.");
+        Assert.Equal(expected, index);
+    }
+
+    // Stored values whose runtime type is not the one SqlClient returns for the column, or that no field value of the
+    // field type can hold.
+    [Theory]
+    // A bigint projected as a double, where 2^53 + 1 has already become 2^53, and a narrower integer.
+    [InlineData("bigint", FieldType.Number, TypeCode.Double, "9007199254740992")]
+    [InlineData("bigint", FieldType.Number, TypeCode.Int32, "5")]
+    // Integer/float swaps on a float column such as the seeded Age and OnsetWeek, a single-precision float, and
+    // the non-finite doubles.
+    [InlineData("float", FieldType.Number, TypeCode.Int32, "37")]
+    [InlineData("float", FieldType.Number, TypeCode.Int64, "37")]
+    [InlineData("float", FieldType.Number, TypeCode.Single, "37.5")]
+    [InlineData("float", FieldType.Number, TypeCode.Double, "NaN")]
+    [InlineData("float", FieldType.Number, TypeCode.Double, "Infinity")]
+    // Another integer width, a double or a decimal on an integer column.
+    [InlineData("int", FieldType.Number, TypeCode.Int64, "5")]
+    [InlineData("int", FieldType.Number, TypeCode.Int16, "5")]
+    [InlineData("int", FieldType.Number, TypeCode.Double, "5")]
+    [InlineData("int", FieldType.Number, TypeCode.Decimal, "5")]
+    [InlineData("smallint", FieldType.Number, TypeCode.Int32, "5")]
+    [InlineData("tinyint", FieldType.Number, TypeCode.Int16, "5")]
+    [InlineData("tinyint", FieldType.Number, TypeCode.Int32, "5")]
+    // An option index of another width, or a negative one.
+    [InlineData("smallint", FieldType.Option, TypeCode.Int32, "1")]
+    [InlineData("tinyint", FieldType.Option, TypeCode.Int32, "1")]
+    [InlineData("int", FieldType.Option, TypeCode.Int64, "1")]
+    [InlineData("smallint", FieldType.Option, TypeCode.Int16, "-1")]
+    [InlineData("int", FieldType.Option, TypeCode.Int32, "-1")]
+    public void FromDbValue_ValueOutsideTheColumnsNativeTypeOrRange_IsRefusedWithFixedText(
+        string sqlType,
+        FieldType fieldType,
+        TypeCode storedType,
+        string storedText)
+    {
+        object stored = Stored(storedType, storedText);
+        Assert.Equal(storedType, Type.GetTypeCode(stored.GetType()));
+
+        InvalidOperationException failure = Assert.Throws<InvalidOperationException>(
+            () => ColumnValueConverter.FromDbValue(Column(sqlType), fieldType, stored));
+
+        Assert.Equal(UnexpectedStoredValueMessage, failure.Message);
+        Assert.DoesNotContain(storedText, failure.Message, StringComparison.Ordinal);
+    }
+
+    // A missing page row is read through a left join as DBNull; null is treated the same.
+    [Theory]
+    [InlineData("tinyint", FieldType.Number)]
+    [InlineData("smallint", FieldType.Number)]
+    [InlineData("int", FieldType.Number)]
+    [InlineData("bigint", FieldType.Number)]
+    [InlineData("float", FieldType.Number)]
+    [InlineData("tinyint", FieldType.Option)]
+    [InlineData("smallint", FieldType.Option)]
+    [InlineData("int", FieldType.Option)]
+    public void FromDbValue_DatabaseNullOnNumericColumn_IsTheNullValue(string sqlType, FieldType fieldType)
+    {
+        ColumnMetadata column = Column(sqlType);
+
+        Assert.True(ColumnValueConverter.FromDbValue(column, fieldType, DBNull.Value).IsNull);
+        Assert.True(ColumnValueConverter.FromDbValue(column, fieldType, null).IsNull);
+    }
+
+    // The pairing is checked before the value, so a pairing the mapper does not admit is refused for a null too.
+    [Theory]
+    [InlineData("bigint", FieldType.Option)]
+    [InlineData("float", FieldType.Option)]
+    [InlineData("nvarchar", FieldType.Number)]
+    public void FromDbValue_PairingTheMapperDoesNotAdmit_IsRefusedForTheNullValueToo(
+        string sqlType,
+        FieldType fieldType)
+    {
+        ColumnMetadata column = Column(sqlType);
+        Assert.False(FieldTypeMapper.IsAdmitted(fieldType, column));
+
+        Assert.Throws<ArgumentException>(
+            "column",
+            () => ColumnValueConverter.FromDbValue(column, fieldType, DBNull.Value));
+    }
+
+    // A stored value of the given runtime type, parsed from its invariant text and boxed as a data reader boxes it.
+    private static object Stored(TypeCode type, string text) =>
+        Convert.ChangeType(text, type, CultureInfo.InvariantCulture)
+        ?? throw new ArgumentException("The stored text did not convert to a value.", nameof(text));
+
+    // A page-table column as the reader describes it, with the sys.columns.max_length SQL Server reports for the type.
+    private static ColumnMetadata Column(string sqlType) => FieldTypeMapper.DescribeColumn(
+        "Stored",
+        sqlType,
+        sqlType switch
+        {
+            "tinyint" => 1,
+            "smallint" => 2,
+            "int" => 4,
+            "nvarchar" => 510,
+            _ => 8,
+        });
 }

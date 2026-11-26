@@ -285,24 +285,33 @@ internal static class ColumnValueConverter
     /// </summary>
     /// <param name="column">The field's page-table column, as the metadata reader discovered it.</param>
     /// <param name="fieldType">The field's type, as <see cref="FieldTypeMapper.Map"/> decided it.</param>
-    /// <param name="dbValue">The value the data reader returned for the column.</param>
+    /// <param name="dbValue">
+    /// The value the data reader returned for the column, uncoerced: a non-null value has the runtime type SqlClient
+    /// returns for the column's native type, <see cref="string"/> for <c>nvarchar</c>, <c>nchar</c> and <c>ntext</c>,
+    /// <see cref="byte"/> for <c>tinyint</c>, <see cref="short"/> for <c>smallint</c>, <see cref="int"/> for
+    /// <c>int</c>, <see cref="long"/> for <c>bigint</c>, <see cref="double"/> for <c>float</c>,
+    /// <see cref="DateTime"/> for <c>datetime</c> and <see cref="bool"/> for <c>bit</c>.
+    /// </param>
     /// <returns>
     /// <see cref="FieldValue.Null"/> for <see langword="null"/> and <see cref="DBNull"/>; otherwise text unchanged,
-    /// the empty string included, since reads never normalise; a number, exact for every integer column; a date with
-    /// any time of day discarded, because a date field is date-only; a boolean; or an option index.
+    /// the empty string included, since reads never normalise; a number, the stored double of a <c>float</c> column
+    /// or the exact integer of an integer column, a <c>bigint</c> beyond 2^53 included; a date with any time of day
+    /// discarded, because a date field is date-only; a boolean; or an option index.
     /// </returns>
     /// <exception cref="ArgumentNullException"><paramref name="column"/> is null.</exception>
     /// <exception cref="ArgumentException">
     /// The field type is a label, group or unsupported, which is never read into <c>values</c>, or the column type is
-    /// not one the field type admits.
+    /// not one the field type admits, whatever the value, the null value included.
     /// </exception>
     /// <exception cref="InvalidOperationException">
-    /// The stored value has a runtime type the column and field type do not produce, or a value no field value can
-    /// hold, such as a negative option index or a non-finite float.
+    /// The stored value's runtime type is not the one SqlClient returns for the column's native type, such as a
+    /// <see cref="double"/> from a <c>bigint</c> column, an integer from a <c>float</c> column or an integer of
+    /// another width; or it holds a value no field value can hold, such as a negative option index or a non-finite
+    /// float.
     /// </exception>
     internal static FieldValue FromDbValue(ColumnMetadata column, FieldType fieldType, object? dbValue)
     {
-        _ = FieldBinding(column, fieldType);
+        var binding = FieldBinding(column, fieldType);
         if (dbValue is null or DBNull)
         {
             return FieldValue.Null;
@@ -318,15 +327,20 @@ internal static class ColumnValueConverter
 
                 break;
 
+            // A number is read only as the type its column returns: a bigint projected as a double may already have
+            // been rounded, since beyond 2^53 not every integer is a double, and an integer for a float column comes
+            // from a projection that converted the stored double, so neither is the stored value.
             case FieldType.Number:
-                if (dbValue is double number && double.IsFinite(number))
+                if (binding.DbType == DbType.Double)
                 {
-                    return FieldValue.FromNumber(number);
+                    if (dbValue is double number && double.IsFinite(number))
+                    {
+                        return FieldValue.FromNumber(number);
+                    }
                 }
-
-                // FromInteger keeps a bigint beyond 2^53 exact, where a double would round it.
-                if (IsIntegral(dbValue) && TryWiden(dbValue, out var whole))
+                else if (TryReadNativeInteger(binding.DbType, dbValue, out var whole))
                 {
+                    // FromInteger keeps a bigint beyond 2^53 exact, where a double would round it.
                     return FieldValue.FromInteger(whole);
                 }
 
@@ -348,8 +362,9 @@ internal static class ColumnValueConverter
 
                 break;
 
+            // The admitted option columns are tinyint, smallint and int, each read only as its own integer type.
             case FieldType.Option:
-                if (IsIntegral(dbValue) && TryWiden(dbValue, out var index) && index is >= 0 and <= int.MaxValue)
+                if (TryReadNativeInteger(binding.DbType, dbValue, out var index) && index is >= 0 and <= int.MaxValue)
                 {
                     return FieldValue.FromIndex((int)index);
                 }
@@ -656,6 +671,24 @@ internal static class ColumnValueConverter
 
     private static bool IsIntegral(object value) =>
         value is byte or sbyte or short or ushort or int or uint or long or ulong;
+
+    // A stored integer widened to long exactly, accepted only as the type SqlClient returns for the column bound as
+    // dbType: byte for tinyint, short for smallint, int for int and long for bigint. Any other runtime type, another
+    // integer width or a double included, did not come from the column as stored.
+    private static bool TryReadNativeInteger(DbType dbType, object value, out long whole)
+    {
+        long? native = (dbType, value) switch
+        {
+            (DbType.Byte, byte tiny) => tiny,
+            (DbType.Int16, short small) => small,
+            (DbType.Int32, int regular) => regular,
+            (DbType.Int64, long big) => big,
+            _ => null,
+        };
+
+        whole = native.GetValueOrDefault();
+        return native.HasValue;
+    }
 
     // Widens an integral CLR number to long exactly; a ulong above long.MaxValue fits no admitted column.
     private static bool TryWiden(object value, out long whole)
