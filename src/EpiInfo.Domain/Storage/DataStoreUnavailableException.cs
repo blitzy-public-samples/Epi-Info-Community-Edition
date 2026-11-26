@@ -54,7 +54,9 @@ namespace EpiInfo.Domain.Storage;
 /// <para>
 /// On <c>POST</c>, <c>PUT</c> and <c>DELETE</c> of records the handler reports the <c>writeOutcome</c> member from the
 /// request's <c>WriteOutcomeFeature</c> first, which holds <see cref="WriteOutcome.Written"/> once the store has
-/// reported a commit, and otherwise from <see cref="Outcome"/>.
+/// reported a commit and <see cref="WriteOutcome.NotWritten"/> once it has returned a result that wrote nothing or
+/// while no store write call was issued. Only once a store write call was issued, and while it is outstanding, does
+/// the handler report <see cref="Outcome"/>.
 /// </para>
 /// <para>
 /// Redaction: <see cref="Exception.Message"/> is always <see cref="FixedMessage"/>, because no constructor takes a

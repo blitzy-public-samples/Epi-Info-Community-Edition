@@ -48,16 +48,20 @@ public readonly record struct SqlFailure(SqlFailureKind Kind, int? SqlErrorNumbe
 /// </summary>
 public enum WriteStage
 {
-    /// <summary>No <c>INSERT</c> or <c>UPDATE</c> has been sent, including a failure while opening or locking.</summary>
+    /// <summary>
+    /// No <c>INSERT</c> or <c>UPDATE</c> has been dispatched, including a failure while opening or locking, and a
+    /// failed or unconfirmed <c>Commit</c> of a transaction that dispatched none, which held nothing to keep.
+    /// </summary>
     BeforeDml,
 
     /// <summary>At least one <c>INSERT</c> or <c>UPDATE</c> was sent, and <c>Commit</c> has not been called.</summary>
     DmlSent,
 
     /// <summary>
-    /// <c>Commit</c> was called and threw or did not return. The server may or may not have committed, unless the
-    /// failure itself proves the transaction was not kept: a rollback that completed without error, or the server's
-    /// deadlock-victim abort (1205). See <see cref="SqlErrorClassifier.ResolveWriteOutcome"/>.
+    /// At least one <c>INSERT</c> or <c>UPDATE</c> was sent, and <c>Commit</c> was called and threw or did not
+    /// return. The server may or may not have committed, unless the failure itself proves the transaction was not
+    /// kept: a rollback that completed without error, or the server's deadlock-victim abort (1205). See
+    /// <see cref="SqlErrorClassifier.ResolveWriteOutcome"/>.
     /// </summary>
     Committing,
 }
@@ -76,7 +80,8 @@ public enum WriteStage
 /// code. It never copies, returns or logs message text otherwise. The exceptions it
 /// builds carry fixed messages, the caller's fixed operation name and the SQL error number, never SQL text, a
 /// parameter value, a connection string or a database message; the original failure is attached only as the inner
-/// exception.
+/// exception. The only other thing it writes is <see cref="Exception.Data"/> of the exception raised for a failure:
+/// a cancellation's SQL error number and a failed rollback's type name and SQL error number.
 /// </para>
 /// <para>
 /// A <see cref="DataStoreUnavailableException"/> or <see cref="DataStoreWriteException"/> that a store method has
@@ -107,6 +112,18 @@ public static class SqlErrorClassifier
     /// in place of it, and never with the rollback exception's message.
     /// </remarks>
     public const string RollbackSqlErrorNumberKey = "EpiInfo.Data.RollbackSqlErrorNumber";
+
+    /// <summary>
+    /// The <see cref="Exception.Data"/> key under which the store keeps the SQL error number (<see cref="int"/>) of a
+    /// failure it raises as an <see cref="OperationCanceledException"/>, such as 0 for SqlClient's acknowledgement of a
+    /// cancelled command; absent when the cancellation carried no SQL error.
+    /// </summary>
+    /// <remarks>
+    /// An <see cref="OperationCanceledException"/> has no SQL error number of its own, so this lets
+    /// <c>ApiExceptionHandler</c> log the classified number of a client abort, as it logs a store exception's. The
+    /// failure's message is never stored, because it may hold SQL text.
+    /// </remarks>
+    public const string SqlErrorNumberKey = "EpiInfo.Data.SqlErrorNumber";
 
     /// <summary>The fixed message of the cancellation exception <see cref="ToDataStoreException"/> builds.</summary>
     internal const string CancelledMessage = "The data store operation was cancelled.";
@@ -379,8 +396,10 @@ public static class SqlErrorClassifier
     /// <returns>
     /// A <see cref="DataStoreUnavailableException"/> for <see cref="SqlFailureKind.Unavailable"/>, a
     /// <see cref="DataStoreWriteException"/> for <see cref="SqlFailureKind.Unexpected"/>, and an
-    /// <see cref="OperationCanceledException"/> with a fixed message for <see cref="SqlFailureKind.Cancelled"/>. For a
-    /// cancellation the caller may instead rethrow the original exception.
+    /// <see cref="OperationCanceledException"/> with a fixed message for <see cref="SqlFailureKind.Cancelled"/>, which
+    /// keeps the failure's SQL error number, when it has one, under <see cref="SqlErrorNumberKey"/>. For a
+    /// cancellation the caller may instead use <see cref="ToCancellation"/>, which keeps an original
+    /// <see cref="OperationCanceledException"/> and the caller's token.
     /// </returns>
     /// <exception cref="ArgumentException"><paramref name="operation"/> is <see langword="null"/>, empty or whitespace.</exception>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="outcome"/> is not a defined value.</exception>
@@ -389,9 +408,66 @@ public static class SqlErrorClassifier
         {
             SqlFailureKind.Unavailable =>
                 new DataStoreUnavailableException(operation, outcome, failure.SqlErrorNumber, inner),
-            SqlFailureKind.Cancelled => new OperationCanceledException(CancelledMessage, inner),
+            SqlFailureKind.Cancelled =>
+                WithSqlErrorNumber(new OperationCanceledException(CancelledMessage, inner), failure),
             _ => new DataStoreWriteException(operation, outcome, failure.SqlErrorNumber, inner),
         };
+
+    /// <summary>
+    /// The exception a store raises for a failure classified as <see cref="SqlFailureKind.Cancelled"/>: the original
+    /// <see cref="OperationCanceledException"/> itself, or, for SqlClient's acknowledgement of a cancelled command, a
+    /// new one with the fixed message, the caller's token and the original failure as its inner exception. The
+    /// failure's SQL error number, when it has one, is kept under <see cref="SqlErrorNumberKey"/>.
+    /// </summary>
+    /// <param name="failure">
+    /// The classification of <paramref name="exception"/>, of kind <see cref="SqlFailureKind.Cancelled"/>.
+    /// </param>
+    /// <param name="exception">The original failure.</param>
+    /// <param name="cancellationToken">The caller's token, which a new exception carries.</param>
+    /// <returns>
+    /// <paramref name="exception"/> when it is an <see cref="OperationCanceledException"/>, which the caller rethrows
+    /// with <c>throw;</c>; otherwise the new exception.
+    /// </returns>
+    internal static Exception ToCancellation(SqlFailure failure, Exception exception, CancellationToken cancellationToken) =>
+        WithSqlErrorNumber(
+            exception as OperationCanceledException
+                ?? new OperationCanceledException(CancelledMessage, exception, cancellationToken),
+            failure);
+
+    /// <summary>
+    /// Records a rollback that failed on <paramref name="target"/>, the exception raised for the original failure: the
+    /// rollback exception's type name under <see cref="RollbackExceptionTypeKey"/> and, for a
+    /// <see cref="SqlException"/> carrying an error, its number under <see cref="RollbackSqlErrorNumberKey"/>. The
+    /// rollback exception's message is never stored, and <paramref name="target"/> keeps its own type, message and
+    /// classification.
+    /// </summary>
+    /// <param name="target">The exception raised for the original failure.</param>
+    /// <param name="rollbackError">What the rollback threw, or <see langword="null"/> when it did not fail.</param>
+    internal static void AttachRollbackFailure(Exception target, Exception? rollbackError)
+    {
+        if (rollbackError is null)
+        {
+            return;
+        }
+
+        target.Data[RollbackExceptionTypeKey] = rollbackError.GetType().Name;
+        if (rollbackError is SqlException sqlError && PrimaryNumber(sqlError) is int number)
+        {
+            target.Data[RollbackSqlErrorNumberKey] = number;
+        }
+    }
+
+    // Keeps the classified SQL error number of a cancellation on the exception raised for it, which has no number of
+    // its own.
+    private static Exception WithSqlErrorNumber(Exception cancellation, SqlFailure failure)
+    {
+        if (failure.SqlErrorNumber is int number)
+        {
+            cancellation.Data[SqlErrorNumberKey] = number;
+        }
+
+        return cancellation;
+    }
 
     private static SqlFailure ClassifySqlException(SqlException exception)
     {

@@ -98,6 +98,10 @@ public sealed class ReservedWordIdentifierTests
     private const string PaddingPage = "#PaddingPage";
     private const string ReservedBase = "#RwBase";
     private const string ReservedPage = "#RwPage";
+    private const string BeginBase = "#BeginBase";
+    private const string BeginPage = "#BeginPage";
+    private const string OutcomeBase = "#OutcomeBase";
+    private const string OutcomePage = "#OutcomePage";
     private const string IncompleteBase = "#IncompleteBase";
     private const string IncompletePage = "#IncompletePage";
 
@@ -225,6 +229,69 @@ public sealed class ReservedWordIdentifierTests
         finally
         {
             await DropTablesAsync(connection, ReservedPage, ReservedBase);
+        }
+    }
+
+    /// <summary>
+    /// A write whose token is already cancelled when its transaction would start fails with the cancellation before
+    /// any statement is sent: the transaction start observes the token, so the recorder sees no command of the insert,
+    /// the session holds no open transaction afterwards, and neither table holds a row.
+    /// </summary>
+    [Fact]
+    public async Task CancelledWrite_StartsNoTransactionAndSendsNoStatement()
+    {
+        await TestDatabase.EnsureReachableAsync();
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        var cancellationToken = timeout.Token;
+        await using var writeLock = await DatabaseWriteLock.AcquireExclusiveAsync(cancellationToken);
+        await using var connection = await TestDatabase.OpenConnectionAsync(cancellationToken);
+        try
+        {
+            var fixture = await CreateFixtureAsync(
+                connection,
+                BeginBase,
+                BeginPage,
+                $"[{Surname}] nvarchar(4000)",
+                [new FixtureField(Surname, TextTypeId, TextTypeName)],
+                cancellationToken);
+
+            var options = new DatabaseOptions(TestDatabase.ConnectionString);
+            var connections = new SqlConnectionFactory(options);
+            var repository = new SqlRecordRepository(
+                connections,
+                new SqlMetadataReader(connections, options, fixture.Recorder),
+                options,
+                fixture.Recorder);
+            var stamp = new SaveStamp(StampLogonName, SaveStamp.TruncateToSeconds(DateTime.Now));
+
+            // Only the insert runs under the aborted token; the fixture and the checks keep the test's own token.
+            using var aborted = new CancellationTokenSource();
+            await aborted.CancelAsync();
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => repository.InsertAsync(
+                connection,
+                fixture.Form,
+                fixture.Schema,
+                Values((Surname, FieldValue.FromText("b-" + Guid.NewGuid().ToString("N")))),
+                stamp,
+                aborted.Token));
+
+            Assert.Empty(fixture.Recorder.ForOperation(RecordOperations.Insert));
+            await using (var command = new SqlCommand("SELECT @@TRANCOUNT", connection))
+            {
+                var openTransactions = Assert.IsType<int>(await command.ExecuteScalarAsync(cancellationToken));
+                Assert.True(openTransactions == 0, "The cancelled write left a transaction open on the session.");
+            }
+
+            foreach (var tableName in new[] { BeginBase, BeginPage })
+            {
+                await using var command = new SqlCommand($"SELECT COUNT(*) FROM [{tableName}]", connection);
+                var rows = Assert.IsType<int>(await command.ExecuteScalarAsync(cancellationToken));
+                Assert.True(rows == 0, "The cancelled write left a row in a fixture table.");
+            }
+        }
+        finally
+        {
+            await DropTablesAsync(connection, BeginPage, BeginBase);
         }
     }
 
@@ -812,6 +879,190 @@ public sealed class ReservedWordIdentifierTests
         }
     }
 
+    /// <summary>
+    /// An update that submits no value and dispatches no <c>INSERT</c> or <c>UPDATE</c>. Its required gate closes the
+    /// connection, so whatever follows fails and the rollback cannot be confirmed either. When the gate passes, the
+    /// first statement after it fails: the snapshot read on a base table without the last-save columns, or, with
+    /// them, the base stamp <c>UPDATE</c>, which the data layer's open-connection check refuses before it is sent.
+    /// When the gate refuses the record, the rollback itself fails. Every way, the write reports
+    /// <see cref="WriteOutcome.NotWritten"/>, because no DML was sent, and carries the failed rollback's type beside
+    /// the original failure.
+    /// </summary>
+    [Theory]
+    [InlineData(true, false)]
+    [InlineData(false, false)]
+    [InlineData(true, true)]
+    [InlineData(false, true)]
+    public async Task UpdateDispatchingNoDml_FailingWithAnUnconfirmedRollback_IsNotWritten(
+        bool gatePasses,
+        bool lastSaveColumns)
+    {
+        await TestDatabase.EnsureReachableAsync();
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        var cancellationToken = timeout.Token;
+        await using var writeLock = await DatabaseWriteLock.AcquireExclusiveAsync(cancellationToken);
+        await using var connection = await TestDatabase.OpenConnectionAsync(cancellationToken);
+        try
+        {
+            var fixture = await CreateFixtureAsync(
+                connection,
+                OutcomeBase,
+                OutcomePage,
+                $"[{Surname}] nvarchar(4000)",
+                [new FixtureField(Surname, TextTypeId, TextTypeName)],
+                cancellationToken,
+                lastSaveColumns);
+            Assert.Equal(lastSaveColumns, fixture.Schema.LastSaveLogonName is not null);
+            Assert.Equal(lastSaveColumns, fixture.Schema.LastSaveTime is not null);
+
+            var options = new DatabaseOptions(TestDatabase.ConnectionString);
+            var connections = new SqlConnectionFactory(options);
+            var repository = new SqlRecordRepository(
+                connections,
+                new SqlMetadataReader(connections, options, fixture.Recorder),
+                options,
+                fixture.Recorder);
+            var stamp = new SaveStamp(StampLogonName, SaveStamp.TruncateToSeconds(DateTime.Now));
+            var inserted = await repository.InsertAsync(
+                connection,
+                fixture.Form,
+                fixture.Schema,
+                Values((Surname, FieldValue.FromText("u-" + Guid.NewGuid().ToString("N")))),
+                stamp,
+                cancellationToken);
+
+            var gateCalls = 0;
+            var failure = await Assert.ThrowsAsync<DataStoreWriteException>(() => repository.UpdateAsync(
+                connection,
+                fixture.Form,
+                fixture.Schema,
+                inserted.GlobalRecordId,
+                Values(),
+                stamp,
+                stored =>
+                {
+                    gateCalls++;
+                    connection.Close();
+                    return gatePasses
+                        ? RecordValidationResult.Success(stored.Values)
+                        : RecordValidationResult.RequestFailure("The fixture gate refuses the record.");
+                },
+                permissions: null,
+                cancellationToken));
+
+            Assert.Equal(1, gateCalls);
+            Assert.Equal(RecordOperations.Update, failure.Operation);
+            Assert.Equal(WriteOutcome.NotWritten, failure.Outcome);
+            Assert.Null(failure.SqlErrorNumber);
+            Assert.IsType<InvalidOperationException>(failure.InnerException);
+            Assert.Equal(nameof(InvalidOperationException), failure.Data[SqlErrorClassifier.RollbackExceptionTypeKey]);
+            Assert.False(failure.Data.Contains(SqlErrorClassifier.RollbackSqlErrorNumberKey));
+            Assert.DoesNotContain(fixture.Recorder.ForOperation(RecordOperations.Update), command => command.IsWrite);
+        }
+        finally
+        {
+            // The gate closed the connection, which ended the session and its temporary tables.
+            await DropTablesAsync(connection, OutcomePage, OutcomeBase);
+        }
+    }
+
+    /// <summary>
+    /// A write whose first <c>INSERT</c> or <c>UPDATE</c> the server ran before the connection closed: the base insert
+    /// of a create, or the base stamp <c>UPDATE</c> of an update that submits no value. The statement after it is
+    /// refused and the rollback cannot be confirmed, so the write reports <see cref="WriteOutcome.Unknown"/>: DML was
+    /// sent, and neither a commit nor a completed rollback is confirmed. The update differs from the not-written case
+    /// above only in that its stamp <c>UPDATE</c> went out, so the pair proves DML is marked when it is dispatched.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task WriteDispatchingDml_FailingWithAnUnconfirmedRollback_IsUnknown(bool create)
+    {
+        await TestDatabase.EnsureReachableAsync();
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        var cancellationToken = timeout.Token;
+        await using var writeLock = await DatabaseWriteLock.AcquireExclusiveAsync(cancellationToken);
+        await using var connection = await TestDatabase.OpenConnectionAsync(cancellationToken);
+        try
+        {
+            var fixture = await CreateFixtureAsync(
+                connection,
+                OutcomeBase,
+                OutcomePage,
+                $"[{Surname}] nvarchar(4000)",
+                [new FixtureField(Surname, TextTypeId, TextTypeName)],
+                cancellationToken);
+            Assert.NotNull(fixture.Schema.LastSaveLogonName);
+            Assert.NotNull(fixture.Schema.LastSaveTime);
+
+            var options = new DatabaseOptions(TestDatabase.ConnectionString);
+            var connections = new SqlConnectionFactory(options);
+            var closing = new CloseAfterFirstWriteObserver(fixture.Recorder, connection);
+            var repository = new SqlRecordRepository(
+                connections,
+                new SqlMetadataReader(connections, options, closing),
+                options,
+                closing);
+            var stamp = new SaveStamp(StampLogonName, SaveStamp.TruncateToSeconds(DateTime.Now));
+            var values = Values((Surname, FieldValue.FromText("u-" + Guid.NewGuid().ToString("N"))));
+
+            string operation;
+            DataStoreWriteException failure;
+            if (create)
+            {
+                operation = RecordOperations.Insert;
+                failure = await Assert.ThrowsAsync<DataStoreWriteException>(() => repository.InsertAsync(
+                    connection,
+                    fixture.Form,
+                    fixture.Schema,
+                    values,
+                    stamp,
+                    cancellationToken));
+            }
+            else
+            {
+                // The record is created through a repository whose observer only records, so the connection closes
+                // after the update's stamp UPDATE, not after this insert.
+                var setup = new SqlRecordRepository(
+                    connections,
+                    new SqlMetadataReader(connections, options, fixture.Recorder),
+                    options,
+                    fixture.Recorder);
+                var inserted = await setup.InsertAsync(
+                    connection,
+                    fixture.Form,
+                    fixture.Schema,
+                    values,
+                    stamp,
+                    cancellationToken);
+                operation = RecordOperations.Update;
+                failure = await Assert.ThrowsAsync<DataStoreWriteException>(() => repository.UpdateAsync(
+                    connection,
+                    fixture.Form,
+                    fixture.Schema,
+                    inserted.GlobalRecordId,
+                    Values(),
+                    stamp,
+                    stored => RecordValidationResult.Success(stored.Values),
+                    permissions: null,
+                    cancellationToken));
+            }
+
+            Assert.Equal(operation, failure.Operation);
+            Assert.Equal(WriteOutcome.Unknown, failure.Outcome);
+            Assert.Null(failure.SqlErrorNumber);
+            Assert.IsType<InvalidOperationException>(failure.InnerException);
+            Assert.Equal(nameof(InvalidOperationException), failure.Data[SqlErrorClassifier.RollbackExceptionTypeKey]);
+            var write = Assert.Single(fixture.Recorder.ForOperation(operation), command => command.IsWrite);
+            Assert.True(write.Succeeded, "The write the server ran must be recorded as succeeded.");
+        }
+        finally
+        {
+            // The observer closed the connection, which ended the session and its temporary tables.
+            await DropTablesAsync(connection, OutcomePage, OutcomeBase);
+        }
+    }
+
     // Creates the base and page tables on the test's connection, reads them back through the reader's temporary-table
     // overload, and builds the in-memory form over the reader-built tables. Constraints are unnamed, so the session's
     // tables never collide with another session's.
@@ -821,9 +1072,14 @@ public sealed class ReservedWordIdentifierTests
         string pageName,
         string pageColumnDefinitions,
         IReadOnlyList<FixtureField> fields,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool lastSaveColumns = true)
     {
-        // The base table has the seeded base tables' columns (testdata/sql/05_data_tables.sql).
+        // The base table has the seeded base tables' columns (testdata/sql/05_data_tables.sql), less the two last-save
+        // stamp columns when lastSaveColumns is false, which the write path then never names.
+        var lastSaveColumnDefinitions = lastSaveColumns
+            ? "[LastSaveLogonName] nvarchar(255), [LastSaveTime] datetime,"
+            : string.Empty;
         await ExecuteDdlAsync(
             connection,
             $"""
@@ -833,8 +1089,7 @@ public sealed class ReservedWordIdentifierTests
                 [GlobalRecordId] nvarchar(255) NOT NULL,
                 [FirstSaveLogonName] nvarchar(255),
                 [FirstSaveTime] datetime,
-                [LastSaveLogonName] nvarchar(255),
-                [LastSaveTime] datetime,
+                {lastSaveColumnDefinitions}
                 [FKEY] nvarchar(255));
             CREATE TABLE [{pageName}] (
                 [GlobalRecordId] nvarchar(255) PRIMARY KEY NOT NULL,
@@ -1181,6 +1436,27 @@ public sealed class ReservedWordIdentifierTests
     }
 
     private sealed record FixtureField(string Name, int FieldTypeId, string FieldTypeName, string? List = null);
+
+    // Records every command, and closes the write's connection once the first INSERT or UPDATE has succeeded, so the
+    // server has run DML that the write's next statement and its rollback then cannot follow. A fault injection for
+    // one test: unlike a production observer, it deliberately changes what happens next.
+    private sealed class CloseAfterFirstWriteObserver(SqlCommandRecorder recorder, SqlConnection connection)
+        : ISqlCommandObserver
+    {
+        private bool _closed;
+
+        public void OnExecuting(SqlCommandInfo command) => recorder.OnExecuting(command);
+
+        public void OnExecuted(SqlCommandInfo command, int? sqlErrorNumber, Exception? error)
+        {
+            recorder.OnExecuted(command, sqlErrorNumber, error);
+            if (!_closed && error is null && SqlCommandRecorder.ContainsWriteStatement(command.CommandText))
+            {
+                _closed = true;
+                connection.Close();
+            }
+        }
+    }
 
     // The in-memory form over reader-built temporary tables, with the recorder every fixture command reports to.
     private sealed record Fixture(

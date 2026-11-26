@@ -34,6 +34,11 @@ internal sealed class SqlConnectionFactory(DatabaseOptions options)
     internal int CommandTimeoutSeconds => options.CommandTimeoutSeconds;
 
     /// <summary>Opens a new connection to the configured database.</summary>
+    /// <remarks>
+    /// A connection that fails to open is released here, only after its failure is classified
+    /// (<see cref="OpenFailureAsync"/>). An error from that release is discarded, so the exception raised is always the
+    /// one for the open failure.
+    /// </remarks>
     /// <param name="operation">
     /// The fixed name of the store operation that needs the connection, such as <c>InsertAsync</c>; never request input.
     /// </param>
@@ -77,23 +82,73 @@ internal sealed class SqlConnectionFactory(DatabaseOptions options)
         }
         catch (Exception exception)
         {
-            await connection.DisposeAsync().ConfigureAwait(false);
-
-            // Opening is the one place where SqlClient's pool-timeout InvalidOperationException means unavailable.
-            SqlFailure failure = SqlErrorClassifier.Classify(exception, cancellationToken, duringOpen: true);
-
-            // A cancellation SqlClient raised as OperationCanceledException propagates unchanged. Any other failure
-            // classified as cancelled becomes the classifier's OperationCanceledException, so no SqlException leaves
-            // the data layer from here.
-            if (failure.Kind == SqlFailureKind.Cancelled && exception is OperationCanceledException)
+            Exception failure = await OpenFailureAsync(connection, operation, exception, cancellationToken)
+                .ConfigureAwait(false);
+            if (ReferenceEquals(failure, exception))
             {
                 throw;
             }
 
-            throw SqlErrorClassifier.ToDataStoreException(failure, operation, WriteOutcome.NotWritten, exception);
+            throw failure;
         }
 
         return connection;
+    }
+
+    /// <summary>
+    /// Classifies a failure to open <paramref name="connection"/>, then releases the connection, and returns the
+    /// exception <see cref="OpenAsync"/> raises for it.
+    /// </summary>
+    /// <remarks>
+    /// The order is the point: the failure is classified, and its exception built, before the release. A release that
+    /// throws therefore cannot replace the open failure or leave it unclassified, which would let a write's caller
+    /// report <see cref="WriteOutcome.Unknown"/> for a save that provably sent nothing. A release error is discarded:
+    /// nothing can have been sent on a connection that never opened, and the open failure is what is reported.
+    /// </remarks>
+    /// <param name="connection">The connection that failed to open; released here.</param>
+    /// <param name="operation">The fixed name of the store operation that needed the connection.</param>
+    /// <param name="exception">The failure the open raised.</param>
+    /// <param name="cancellationToken">The token the open ran under.</param>
+    /// <returns>
+    /// <paramref name="exception"/> itself, to be rethrown unchanged, when it is an
+    /// <see cref="OperationCanceledException"/> the classifier recognises as the client's cancellation. Otherwise the
+    /// <see cref="SqlErrorClassifier.ToDataStoreException"/> result for its classification, with
+    /// <paramref name="exception"/> as its inner exception: a <see cref="DataStoreUnavailableException"/> or
+    /// <see cref="DataStoreWriteException"/> with outcome <see cref="WriteOutcome.NotWritten"/>, or, for any other
+    /// failure classified as cancelled, an <see cref="OperationCanceledException"/>, so no SqlException leaves the data
+    /// layer from here.
+    /// </returns>
+    /// <exception cref="ArgumentNullException">
+    /// <paramref name="connection"/> or <paramref name="exception"/> is null.
+    /// </exception>
+    /// <exception cref="ArgumentException"><paramref name="operation"/> is null, empty or whitespace.</exception>
+    internal static async Task<Exception> OpenFailureAsync(
+        IAsyncDisposable connection,
+        string operation,
+        Exception exception,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(connection);
+        ArgumentException.ThrowIfNullOrWhiteSpace(operation);
+        ArgumentNullException.ThrowIfNull(exception);
+
+        // Opening is the one place where SqlClient's pool-timeout InvalidOperationException means unavailable.
+        SqlFailure failure = SqlErrorClassifier.Classify(exception, cancellationToken, duringOpen: true);
+        Exception result = failure.Kind == SqlFailureKind.Cancelled && exception is OperationCanceledException
+            ? exception
+            : SqlErrorClassifier.ToDataStoreException(failure, operation, WriteOutcome.NotWritten, exception);
+
+        try
+        {
+            await connection.DisposeAsync().ConfigureAwait(false);
+        }
+        catch (Exception)
+        {
+            // Discarded by design: the open failure, already classified, is what is reported, and a release error must
+            // not replace it. Nothing was sent on this connection, so NotWritten still holds.
+        }
+
+        return result;
     }
 }
 
@@ -106,7 +161,9 @@ internal sealed class SqlConnectionFactory(DatabaseOptions options)
 /// <para>
 /// Every method takes an open connection, the transaction the command joins (or <see langword="null"/>), the fixed
 /// operation name, the statement, the timeout from <see cref="SqlConnectionFactory.CommandTimeoutSeconds"/>, the
-/// observer and the caller's cancellation token.
+/// observer and the caller's cancellation token. <see cref="ExecuteAsync"/> and <see cref="ExecuteScalarAsync{T}"/>
+/// also take an optional dispatch callback, which tells a caller that the command passed every local check and is
+/// being sent, as distinct from one those checks refused.
 /// </para>
 /// <para>
 /// A command failure is reported to the observer and rethrown unchanged: classifying it, and deciding what a failed
@@ -132,6 +189,10 @@ internal static class SqlExecution
     /// <param name="commandTimeoutSeconds">The command timeout in whole seconds; at least 1.</param>
     /// <param name="observer">The command observer.</param>
     /// <param name="cancellationToken">Cancels the command.</param>
+    /// <param name="onDispatch">
+    /// Called once, after the guards, immediately before the command is sent; never when a guard rejects it.
+    /// <see langword="null"/> for no callback.
+    /// </param>
     /// <returns>The number of rows affected.</returns>
     /// <exception cref="InvalidOperationException">
     /// The connection is not open, or the transaction is not an active transaction of it.
@@ -143,7 +204,8 @@ internal static class SqlExecution
         SqlStatement statement,
         int commandTimeoutSeconds,
         ISqlCommandObserver observer,
-        CancellationToken cancellationToken) =>
+        CancellationToken cancellationToken,
+        Action? onDispatch = null) =>
         RunObservedAsync(
             connection,
             transaction,
@@ -152,6 +214,7 @@ internal static class SqlExecution
             commandTimeoutSeconds,
             observer,
             static (open, command, _) => open.ExecuteAsync(command),
+            onDispatch,
             cancellationToken);
 
     /// <summary>Runs a statement and returns the first column of its first row.</summary>
@@ -163,6 +226,10 @@ internal static class SqlExecution
     /// <param name="commandTimeoutSeconds">The command timeout in whole seconds; at least 1.</param>
     /// <param name="observer">The command observer.</param>
     /// <param name="cancellationToken">Cancels the command.</param>
+    /// <param name="onDispatch">
+    /// Called once, after the guards, immediately before the command is sent; never when a guard rejects it.
+    /// <see langword="null"/> for no callback.
+    /// </param>
     /// <returns>The value, or the default of <typeparamref name="T"/> when there is no row or the value is NULL.</returns>
     /// <exception cref="InvalidOperationException">
     /// The connection is not open, or the transaction is not an active transaction of it.
@@ -174,7 +241,8 @@ internal static class SqlExecution
         SqlStatement statement,
         int commandTimeoutSeconds,
         ISqlCommandObserver observer,
-        CancellationToken cancellationToken) =>
+        CancellationToken cancellationToken,
+        Action? onDispatch = null) =>
         RunObservedAsync(
             connection,
             transaction,
@@ -183,6 +251,7 @@ internal static class SqlExecution
             commandTimeoutSeconds,
             observer,
             static (open, command, _) => open.ExecuteScalarAsync<T>(command),
+            onDispatch,
             cancellationToken);
 
     /// <summary>Runs a query and maps every row of its first result set to <typeparamref name="T"/>.</summary>
@@ -218,6 +287,7 @@ internal static class SqlExecution
                 IEnumerable<T> rows = await open.QueryAsync<T>(command).ConfigureAwait(false);
                 return (IReadOnlyList<T>)rows.AsList().AsReadOnly();
             },
+            onDispatch: null,
             cancellationToken);
 
     /// <summary>
@@ -267,11 +337,14 @@ internal static class SqlExecution
                     return await read(reader, token).ConfigureAwait(false);
                 }
             },
+            onDispatch: null,
             cancellationToken);
     }
 
-    // The one place a command is sent: argument and state guards, then OnExecuting, the command (with any reading it
-    // does), and exactly one OnExecuted with the outcome. A guard failure sends nothing, so it is not observed.
+    // The one place a command is sent: argument and state guards, then onDispatch, OnExecuting, the command (with any
+    // reading it does), and exactly one OnExecuted with the outcome. A guard failure sends nothing, so it is neither
+    // dispatched nor observed. onDispatch runs when every local step that can refuse the command has passed, before
+    // the observer hears of it, so a callback that throws also sends nothing and leaves nothing half-observed.
     private static async Task<TResult> RunObservedAsync<TResult>(
         SqlConnection connection,
         SqlTransaction? transaction,
@@ -280,6 +353,7 @@ internal static class SqlExecution
         int commandTimeoutSeconds,
         ISqlCommandObserver observer,
         Func<SqlConnection, CommandDefinition, CancellationToken, Task<TResult>> run,
+        Action? onDispatch,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(connection);
@@ -310,6 +384,7 @@ internal static class SqlExecution
             cancellationToken: cancellationToken);
         SqlCommandInfo info = Describe(operation, statement, connection, transaction);
 
+        onDispatch?.Invoke();
         NotifyExecuting(observer, info);
         TResult result;
         try

@@ -15,8 +15,13 @@ using EpiInfo.Api.Json;
 using EpiInfo.Api.Services;
 using EpiInfo.Api.Tests.Infrastructure;
 using EpiInfo.CheckCode;
+using EpiInfo.Data.Sql;
+using EpiInfo.Domain.Forms;
+using EpiInfo.Domain.Metadata;
 using EpiInfo.Domain.Records;
+using EpiInfo.Domain.Search;
 using EpiInfo.Domain.Storage;
+using EpiInfo.Domain.Validation;
 using EpiInfo.Domain.Values;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Diagnostics;
@@ -26,10 +31,12 @@ using Microsoft.AspNetCore.Hosting.Server.Features;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Http.Features;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.AspNetCore.Routing;
 using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -188,6 +195,14 @@ public sealed class ErrorContractTests
     private const string PartialBody = "partial";
 
     private const string SecretSqlText = "SELECT * FROM [dbo].[Secret]";
+
+    // What StoreCancellation records: SqlClient's acknowledgement number, and a rollback that failed on a reset
+    // connection.
+    private const int StoreCancellationSqlErrorNumber = 0;
+
+    private const string StoreCancellationRollbackType = "SqlException";
+
+    private const int StoreCancellationRollbackNumber = 10054;
 
     // The event names of the handler category's lines.
     private const string RequestFailedEvent = "RequestFailed";
@@ -852,6 +867,46 @@ public sealed class ErrorContractTests
         Assert.False(logs.ContainsText(sentinel));
     }
 
+    // AAP 0.3.4.2, handler log line: a client abort's one line carries the SQL error number the store kept on its
+    // cancellation, 0 for SqlClient's acknowledgement of a cancelled command, and a failed rollback's type and number,
+    // whether the boundary or the handler answers it. A plain abort logs none of them, and no line holds the message.
+    [Theory]
+    [InlineData(true, true)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    [InlineData(false, false)]
+    public async Task ClientAbortLineCarriesTheStoreNumbersOfItsCancellation(bool throughBoundary, bool fromStore)
+    {
+        var sentinel = NewSentinel();
+        using var logs = new CapturingLoggerProvider();
+        using var loggerFactory = LoggerFactory.Create(logging => logging.AddProvider(logs));
+        var logger = loggerFactory.CreateLogger<ApiExceptionHandler>();
+        using var aborted = new CancellationTokenSource();
+        await aborted.CancelAsync();
+        using var body = new MemoryStream();
+        var context = new DefaultHttpContext { RequestAborted = aborted.Token };
+        context.Response.Body = body;
+        var failure = fromStore
+            ? StoreCancellation(sentinel)
+            : new OperationCanceledException(sentinel + " " + SecretSqlText);
+
+        if (throughBoundary)
+        {
+            await new ApiExceptionBoundaryMiddleware(_ => Task.FromException(failure), logger).InvokeAsync(context);
+        }
+        else
+        {
+            Assert.True(await new ApiExceptionHandler(logger).TryHandleAsync(context, failure, CancellationToken.None));
+        }
+
+        Assert.Equal(StatusCodes.Status499ClientClosedRequest, context.Response.StatusCode);
+        Assert.Equal(0, body.Length);
+        AssertOneClientAbortLine(logs);
+        AssertStoreNumbers(Assert.Single(logs.Find(captured => captured.Category == HandlerCategory)), fromStore);
+        Assert.False(logs.ContainsText(sentinel));
+        Assert.False(logs.ContainsText(SecretSqlText));
+    }
+
     // AAP 0.3.4.2: a cancellation the API raises itself while the caller is still connected is not an abort. It is the
     // fixed unexpected 500, logged once at Error with its type, and its message reaches neither the body nor a log.
     [Theory]
@@ -887,6 +942,37 @@ public sealed class ErrorContractTests
         Assert.Equal(typeof(OperationCanceledException).FullName, StateValue(entry, "ExceptionType"));
         Assert.Empty(host.Logs.Find(IsFrameworkExceptionLine));
         Assert.False(host.Logs.ContainsText(sentinel));
+    }
+
+    // The same internal cancellation as the store raises it, carrying its classified SQL error number and a failed
+    // rollback's type and number: the one Error line logs them, and its message stays out of every line.
+    [Theory]
+    [MemberData(nameof(Environments))]
+    public async Task InternalStoreCancellationLogsItsStoreNumbersOnTheFailureLine(string environment)
+    {
+        var sentinel = NewSentinel();
+        await using var host = await ErrorPipelineHost.StartAsync(new ErrorPipelineHostOptions
+        {
+            EnvironmentName = environment,
+            MapEndpoints = endpoints => endpoints.MapGet(
+                BoundaryTestPath,
+                _ => throw StoreCancellation(sentinel)),
+        });
+        using var client = host.CreateClient();
+
+        using var response = await client.GetAsync(BoundaryTestPath);
+        var text = await response.Content.ReadAsStringAsync();
+
+        Assert.Equal(HttpStatusCode.InternalServerError, response.StatusCode);
+        Assert.DoesNotContain(sentinel, text, StringComparison.Ordinal);
+        var entry = Assert.Single(host.Logs.Find(captured => captured.Category == HandlerCategory));
+        Assert.Equal(LogLevel.Error, entry.Level);
+        Assert.Equal(RequestFailedEvent, entry.EventId.Name);
+        Assert.Null(entry.ExceptionType);
+        AssertStoreNumbers(entry, expected: true);
+        Assert.Empty(host.Logs.Find(IsFrameworkExceptionLine));
+        Assert.False(host.Logs.ContainsText(sentinel));
+        Assert.False(host.Logs.ContainsText(SecretSqlText));
     }
 
     // Only a cancelled RequestAborted makes a cancellation an abort: otherwise the boundary lets the same exception
@@ -1401,9 +1487,29 @@ public sealed class ErrorContractTests
         }
     }
 
-    /// <summary>Each environment with each failure of the metadata read a create starts with.</summary>
-    public static TheoryData<string, string> EnvironmentsAndMetadataFailures =>
-        EnvironmentsWith(UnavailableFailure, SqlTextFailure);
+    /// <summary>
+    /// Each environment with each failure of the metadata read a create starts with: each kind of store exception
+    /// reporting each outcome, and an exception that carries no outcome (<see langword="null"/>).
+    /// </summary>
+    public static TheoryData<string, string, WriteOutcome?> EnvironmentsAndMetadataFailures
+    {
+        get
+        {
+            var data = new TheoryData<string, string, WriteOutcome?>();
+            foreach (string environment in EnvironmentNames)
+            {
+                foreach (WriteOutcome outcome in Enum.GetValues<WriteOutcome>())
+                {
+                    data.Add(environment, UnavailableFailure, outcome);
+                    data.Add(environment, WriteFailureKind, outcome);
+                }
+
+                data.Add(environment, SqlTextFailure, null);
+            }
+
+            return data;
+        }
+    }
 
     /// <summary>Every outcome a store exception can report.</summary>
     public static TheoryData<WriteOutcome> StoreOutcomes =>
@@ -1636,30 +1742,44 @@ public sealed class ErrorContractTests
     }
 
     // AAP 0.3.4.2: a failure before any store write, here the metadata read a create starts with, is notWritten,
-    // whether the exception reports that outcome itself or carries none; the store saw no write call.
+    // whatever outcome a store exception reports and when the exception carries none: no store write call was issued,
+    // so the exception's outcome describes no write. The status still follows the failure's classification, 503 for
+    // unavailability and 500 otherwise. MetadataReadFailureStore raises the failure, because FakeDataStore.ThrowOn
+    // rejects a read failure that reports written.
     [Theory]
     [MemberData(nameof(EnvironmentsAndMetadataFailures))]
-    public async Task MetadataReadFailureOnACreateIsNotWritten(string environment, string kind)
+    public async Task MetadataReadFailureOnACreateIsNotWritten(string environment, string kind, WriteOutcome? reported)
     {
         string storeSentinel = NewSentinel();
         string valueSentinel = NewSentinel();
         FakeDataStore store = FakeDataStore.WithStandardForms();
-        bool unavailable = kind == UnavailableFailure;
-        Exception failure = unavailable
-            ? FakeDataStore.Unavailable(WriteOutcome.NotWritten)
-            : FakeDataStore.SqlTextException(storeSentinel);
-        store.ThrowOn(nameof(IDataStore.GetFormMetadataAsync), failure);
+        Exception failure = (kind, reported) switch
+        {
+            (UnavailableFailure, { } outcome) => FakeDataStore.Unavailable(outcome),
+            (WriteFailureKind, { } outcome) => FakeDataStore.WriteFailure(outcome),
+            (SqlTextFailure, null) => FakeDataStore.SqlTextException(storeSentinel),
+            _ => throw new ArgumentOutOfRangeException(nameof(kind), kind, "Unknown metadata read failure."),
+        };
         await using ApiFactory factory = CreateFactory(environment, store);
-        using HttpClient client = factory.CreateClient();
+        await using WebApplicationFactory<Program> host = factory.WithWebHostBuilder(builder =>
+            builder.ConfigureTestServices(services =>
+            {
+                services.RemoveAll<IDataStore>();
+                services.AddSingleton<IDataStore>(new MetadataReadFailureStore(store, failure));
+            }));
+        using HttpClient client = host.CreateClient();
 
         using HttpResponseMessage response = await SendWriteAsync(client, CreateRoute, recordId: null, valueSentinel);
         string body = await response.Content.ReadAsStringAsync();
 
-        HttpStatusCode status = unavailable ? HttpStatusCode.ServiceUnavailable : HttpStatusCode.InternalServerError;
+        HttpStatusCode status = kind == UnavailableFailure
+            ? HttpStatusCode.ServiceUnavailable
+            : HttpStatusCode.InternalServerError;
         JsonElement problem = AssertProblemDetails(response, body, status);
         Assert.Equal(ExpectedNotWritten, StringMember(problem, "writeOutcome"));
         CapturedLogEntry line = AssertOneHandlerLine(factory, status);
         Assert.Equal(ExpectedNotWritten, StateValue(line, "WriteOutcome"));
+        Assert.Single(store.Calls, call => call.Method == nameof(IDataStore.GetFormMetadataAsync));
         Assert.Empty(store.WriteCalls);
         Assert.DoesNotContain(store.Calls, call => call.Method == nameof(IDataStore.InsertAsync));
         AssertRedacted(factory, body, storeSentinel, valueSentinel, failure.Message);
@@ -1695,6 +1815,39 @@ public sealed class ErrorContractTests
         }
     }
 
+    // AAP 0.3.4.2: the feature comes first, so once the store returned a result that wrote nothing, the request is
+    // notWritten, whatever outcome a later store exception reports.
+    [Theory]
+    [MemberData(nameof(StoreOutcomes))]
+    public void ReportedNoWriteIsNotWrittenWhateverALaterStoreExceptionReports(WriteOutcome reported)
+    {
+        var feature = new WriteOutcomeFeature();
+        feature.MarkWriteStarted();
+        feature.MarkNotWritten();
+
+        foreach (Exception failure in StoreExceptions(reported))
+        {
+            Assert.Equal(WriteOutcome.NotWritten, ApiExceptionHandler.ResolveWriteOutcome(feature, failure));
+        }
+    }
+
+    // A store write call started after a no-write result makes that result no longer the latest fact, so the store
+    // exception's own outcome applies again.
+    [Theory]
+    [MemberData(nameof(StoreOutcomes))]
+    public void WriteStartedAfterANoWriteResultReportsTheStoreExceptionsOwnOutcome(WriteOutcome reported)
+    {
+        var feature = new WriteOutcomeFeature();
+        feature.MarkWriteStarted();
+        feature.MarkNotWritten();
+        feature.MarkWriteStarted();
+
+        foreach (Exception failure in StoreExceptions(reported))
+        {
+            Assert.Equal(reported, ApiExceptionHandler.ResolveWriteOutcome(feature, failure));
+        }
+    }
+
     // With no write call issued, a failure that carries no outcome is notWritten: nothing can have been written.
     [Fact]
     public void FailureWithoutAnOutcomeBeforeAnyWriteIsNotWritten()
@@ -1705,6 +1858,21 @@ public sealed class ErrorContractTests
         Assert.Equal(
             WriteOutcome.NotWritten,
             ApiExceptionHandler.ResolveWriteOutcome(new WriteOutcomeFeature(), failure));
+    }
+
+    // AAP 0.3.4.2: with no write call issued, a store exception is notWritten, whatever outcome it reports: a failure
+    // before any store write, such as the metadata read, leaves nothing written, so its outcome describes no write.
+    [Theory]
+    [MemberData(nameof(StoreOutcomes))]
+    public void StoreExceptionBeforeAnyWriteIsNotWrittenWhateverItReports(WriteOutcome reported)
+    {
+        foreach (Exception failure in StoreExceptions(reported))
+        {
+            Assert.Equal(WriteOutcome.NotWritten, ApiExceptionHandler.ResolveWriteOutcome(null, failure));
+            Assert.Equal(
+                WriteOutcome.NotWritten,
+                ApiExceptionHandler.ResolveWriteOutcome(new WriteOutcomeFeature(), failure));
+        }
     }
 
     // AAP 0.7.6: CORS is not registered, because the client is same-origin, so neither a cross-origin request nor a
@@ -2656,6 +2824,31 @@ public sealed class ErrorContractTests
         Assert.Empty(logs.Find(IsFrameworkExceptionLine));
     }
 
+    // An OperationCanceledException as the store raises it for SqlClient's acknowledgement of a cancelled command after
+    // a rollback that failed: the classified SQL error number and the rollback's type name and number in Data, and a
+    // message holding the sentinel and SQL text, which no line may contain.
+    private static OperationCanceledException StoreCancellation(string sentinel)
+    {
+        var cancellation = new OperationCanceledException(sentinel + " " + SecretSqlText);
+        cancellation.Data[SqlErrorClassifier.SqlErrorNumberKey] = StoreCancellationSqlErrorNumber;
+        cancellation.Data[SqlErrorClassifier.RollbackExceptionTypeKey] = StoreCancellationRollbackType;
+        cancellation.Data[SqlErrorClassifier.RollbackSqlErrorNumberKey] = StoreCancellationRollbackNumber;
+        return cancellation;
+    }
+
+    // The line's SQL error number and rollback arguments are those StoreCancellation records when expected, and null
+    // for a cancellation that carries none.
+    private static void AssertStoreNumbers(CapturedLogEntry entry, bool expected)
+    {
+        Assert.Equal<object?>(expected ? StoreCancellationSqlErrorNumber : null, StateValue(entry, "SqlErrorNumber"));
+        Assert.Equal<object?>(
+            expected ? StoreCancellationRollbackType : null,
+            StateValue(entry, "RollbackExceptionType"));
+        Assert.Equal<object?>(
+            expected ? StoreCancellationRollbackNumber : null,
+            StateValue(entry, "RollbackSqlErrorNumber"));
+    }
+
     // Exactly one line for a failure after the response started: the handler category's Error ResponseAborted with
     // the status already sent and the exception's type only, no framework line about the exception, and neither the
     // sentinel nor the SQL text of the exception's message in any line.
@@ -2879,6 +3072,97 @@ public sealed class ErrorContractTests
             innerException: null),
     ];
 
+    /// <summary>
+    /// A store that answers every call from <paramref name="inner"/>, except the metadata read, which raises
+    /// <paramref name="failure"/> once <paramref name="inner"/> has logged the call. It fails that read with any
+    /// exception, a store exception reporting written included, which <see cref="FakeDataStore.ThrowOn"/> rejects for a
+    /// read because no real read can have written.
+    /// </summary>
+    private sealed class MetadataReadFailureStore(FakeDataStore inner, Exception failure) : IDataStore
+    {
+        public async Task<FormMetadata?> GetFormMetadataAsync(int viewId, CancellationToken cancellationToken)
+        {
+            _ = await inner.GetFormMetadataAsync(viewId, cancellationToken);
+            throw failure;
+        }
+
+        public Task<IReadOnlyList<FormSummary>> ListFormsAsync(CancellationToken cancellationToken) =>
+            inner.ListFormsAsync(cancellationToken);
+
+        public Task<IReadOnlyDictionary<string, IReadOnlyList<FieldOption>>> GetOptionsAsync(
+            FormMetadata form,
+            CancellationToken cancellationToken) =>
+            inner.GetOptionsAsync(form, cancellationToken);
+
+        public Task<string?> GetCheckCodeAsync(int viewId, CancellationToken cancellationToken) =>
+            inner.GetCheckCodeAsync(viewId, cancellationToken);
+
+        public Task<int> CountAsync(FormMetadata form, bool includeDeleted, CancellationToken cancellationToken) =>
+            inner.CountAsync(form, includeDeleted, cancellationToken);
+
+        public Task<RecordDto?> GetAtPositionAsync(
+            FormMetadata form,
+            int position,
+            bool includeDeleted,
+            CancellationToken cancellationToken) =>
+            inner.GetAtPositionAsync(form, position, includeDeleted, cancellationToken);
+
+        public Task<RecordDto?> GetByIdAsync(
+            FormMetadata form,
+            string globalRecordId,
+            CancellationToken cancellationToken) =>
+            inner.GetByIdAsync(form, globalRecordId, cancellationToken);
+
+        public Task<NavigationPosition?> GetSetPositionAsync(
+            FormMetadata form,
+            string globalRecordId,
+            bool includeDeleted,
+            CancellationToken cancellationToken) =>
+            inner.GetSetPositionAsync(form, globalRecordId, includeDeleted, cancellationToken);
+
+        public Task<RecordPage> ListAsync(
+            FormMetadata form,
+            RecordListQuery query,
+            CancellationToken cancellationToken) =>
+            inner.ListAsync(form, query, cancellationToken);
+
+        public Task<SearchResponse> SearchAsync(
+            FormMetadata form,
+            IReadOnlyList<SearchCondition> conditions,
+            bool includeDeleted,
+            string? excludeGlobalRecordId,
+            CancellationToken cancellationToken) =>
+            inner.SearchAsync(form, conditions, includeDeleted, excludeGlobalRecordId, cancellationToken);
+
+        public Task<bool> PingAsync(CancellationToken cancellationToken) => inner.PingAsync(cancellationToken);
+
+        public Task<RecordDto> InsertAsync(
+            FormMetadata form,
+            IReadOnlyDictionary<string, FieldValue> values,
+            SaveStamp stamp,
+            CancellationToken cancellationToken) =>
+            inner.InsertAsync(form, values, stamp, cancellationToken);
+
+        public Task<RecordWriteResult> UpdateAsync(
+            FormMetadata form,
+            string globalRecordId,
+            IReadOnlyDictionary<string, FieldValue> submitted,
+            SaveStamp stamp,
+            Func<StoredRecord, RecordValidationResult> requiredGate,
+            FormPermissions? permissions,
+            CancellationToken cancellationToken) =>
+            inner.UpdateAsync(form, globalRecordId, submitted, stamp, requiredGate, permissions, cancellationToken);
+
+        public Task<SoftDeleteResult> SoftDeleteAsync(
+            FormMetadata form,
+            string globalRecordId,
+            SaveStamp stamp,
+            CancellationToken cancellationToken) =>
+            inner.SoftDeleteAsync(form, globalRecordId, stamp, cancellationToken);
+
+        public Task<FormPermissions?> GetPermissionsAsync(FormMetadata form, CancellationToken cancellationToken) =>
+            inner.GetPermissionsAsync(form, cancellationToken);
+    }
 
     /// <summary>
     /// Fails every serialisation of <typeparamref name="T"/> with the serializer's own exception type, carrying a
@@ -3315,8 +3599,9 @@ public sealed class RecordWriteOutcomeTests
         AssertSameRecords(before, store.GetRecords(request.ViewId));
     }
 
-    // A definitive no-write result ends the started write, so an unclassified failure after it is notWritten;
-    // a started write without one stays unknown; and a commit never reverts.
+    // A definitive no-write result ends the started write and is recorded as NotWritten, so an unclassified failure
+    // after it is notWritten; a started write without one stays unknown; a new write call clears the no-write result;
+    // a commit clears it too; and a commit never reverts.
     [Fact]
     public void NotWrittenEndsAStartedWriteButNeverUndoesACommit()
     {
@@ -3324,18 +3609,32 @@ public sealed class RecordWriteOutcomeTests
 
         var started = new WriteOutcomeFeature();
         started.MarkWriteStarted();
+        Assert.False(started.NotWritten);
         Assert.Equal(WriteOutcome.Unknown, ApiExceptionHandler.ResolveWriteOutcome(started, failure));
 
         started.MarkNotWritten();
         Assert.False(started.WriteStarted);
         Assert.False(started.Written);
+        Assert.True(started.NotWritten);
         Assert.Equal(WriteOutcome.NotWritten, ApiExceptionHandler.ResolveWriteOutcome(started, failure));
+
+        started.MarkWriteStarted();
+        Assert.True(started.WriteStarted);
+        Assert.False(started.NotWritten);
+        Assert.Equal(WriteOutcome.Unknown, ApiExceptionHandler.ResolveWriteOutcome(started, failure));
+
+        started.MarkNotWritten();
+        started.MarkWritten();
+        Assert.True(started.Written);
+        Assert.False(started.NotWritten);
+        Assert.Equal(WriteOutcome.Written, ApiExceptionHandler.ResolveWriteOutcome(started, failure));
 
         var committed = new WriteOutcomeFeature();
         committed.MarkWritten();
         committed.MarkNotWritten();
         Assert.True(committed.Written);
         Assert.True(committed.WriteStarted);
+        Assert.False(committed.NotWritten);
         Assert.Equal(WriteOutcome.Written, ApiExceptionHandler.ResolveWriteOutcome(committed, failure));
     }
 

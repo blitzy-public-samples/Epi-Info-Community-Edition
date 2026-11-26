@@ -4,6 +4,12 @@
 // that no longer matches the OpenAPI document fails `tsc`. Every call settles into an
 // ApiResult here, and every failure is parsed by ./errors.
 //
+// A success body is checked against its contract shape before it is reported: callers
+// receive only well-formed data, and an OK response whose body is malformed settles as a
+// failure, as does a record create or update answered by any status but its contracted
+// 201 or 200. For a POST or PUT that failure states no outcome, so the save may have been
+// applied and is never resent without the user's explicit consent.
+//
 // The client is stateless: no retries, caching or timers. Retry decisions belong to
 // isSafeToResend and the hooks, and values are sent exactly as the caller gives them,
 // because the editor alone decides which fields a save carries.
@@ -12,17 +18,26 @@ import createClient from 'openapi-fetch';
 import { isAbortError, networkError, parseProblem, type ApiError } from './errors';
 import type { paths } from './schema';
 import type {
+  Diagnostic,
+  DiagnosticSeverity,
+  FieldDefinition,
   FieldEventRequest,
   FieldEventResponse,
+  FieldOption,
+  FieldValidation,
+  FieldValue,
   FormDefinition,
   FormSummary,
   HealthResponse,
   NavigationPosition,
+  PageDefinition,
   RecordCountResponse,
   RecordDto,
   RecordPage,
+  RecordSummary,
   SearchRequest,
   SearchResponse,
+  SearchResult,
   Values,
 } from './types';
 
@@ -102,10 +117,17 @@ export interface ApiClient {
     signal?: AbortSignal,
   ) => Promise<ApiResult<NavigationPosition>>;
 
-  /** `POST /api/forms/{viewId}/records`: creates a record; succeeds with status 201. */
+  /**
+   * `POST /api/forms/{viewId}/records`: creates a record; succeeds with status 201 only.
+   * Any other 2xx settles as a failure with no write outcome, so the create may have been applied.
+   */
   readonly createRecord: (viewId: number, values: Values, signal?: AbortSignal) => Promise<ApiResult<RecordDto>>;
 
-  /** `PUT /api/forms/{viewId}/records/{globalRecordId}`: saves the submitted fields only; 409 for a deleted record. */
+  /**
+   * `PUT /api/forms/{viewId}/records/{globalRecordId}`: saves the submitted fields only; 409 for a
+   * deleted record. Succeeds with status 200 only; any other 2xx settles as a failure with no
+   * write outcome, so the save may have been applied.
+   */
   readonly updateRecord: (
     viewId: number,
     globalRecordId: string,
@@ -145,11 +167,18 @@ interface Exchange<D> {
 }
 
 // Settles one call. `read` turns an OK response's body into the result's data, returning
-// `undefined` when the body the endpoint must return is missing.
+// `undefined` when the body is missing or is not the shape the endpoint's contract
+// returns. Such a response settles as a failure of its own status, which parseProblem
+// reads as `server` with no write outcome: a read offers Retry, and a POST or PUT counts
+// as possibly applied, since the server may have committed it before the body went wrong.
+// With `successStatus`, an OK response of any other status settles the same way: a write
+// is acknowledged only by the status its contract gives, so a 202 or another 2xx from
+// something other than the API proves neither that the write was applied nor that it was not.
 async function settle<D, T>(
   signal: AbortSignal | undefined,
   send: () => Promise<Exchange<D>>,
   read: (data: D | undefined) => T | undefined,
+  successStatus?: number,
 ): Promise<ApiResult<T>> {
   let exchange: Exchange<D>;
   try {
@@ -171,6 +200,10 @@ async function settle<D, T>(
     return { ok: false, error: parseProblem(response.status, error) };
   }
 
+  if (successStatus !== undefined && response.status !== successStatus) {
+    return { ok: false, error: parseProblem(response.status, undefined) };
+  }
+
   const value = read(data);
   if (value === undefined) {
     return { ok: false, error: parseProblem(response.status, undefined) };
@@ -179,14 +212,215 @@ async function settle<D, T>(
   return { ok: true, data: value, status: response.status };
 }
 
-/** Settles a call whose success carries a JSON body. */
-function withBody<D>(signal: AbortSignal | undefined, send: () => Promise<Exchange<D>>): Promise<ApiResult<D>> {
-  return settle(signal, send, (data) => data);
+/**
+ * Settles a call whose success carries a JSON body. The body is reported only when
+ * `isBody` holds for it; any other OK body settles as a failure.
+ * @param successStatus The one status that acknowledges the call, as a record create
+ *   (201) and update (200) have; without it any OK status does.
+ */
+function withBody<D>(
+  signal: AbortSignal | undefined,
+  send: () => Promise<Exchange<D>>,
+  isBody: (body: unknown) => body is D,
+  successStatus?: number,
+): Promise<ApiResult<D>> {
+  return settle(signal, send, (data) => (isBody(data) ? data : undefined), successStatus);
 }
 
 /** Settles a call whose success carries no body (204). */
 function withoutBody(signal: AbortSignal | undefined, send: () => Promise<Exchange<unknown>>): Promise<ApiResult<null>> {
   return settle(signal, send, () => null);
+}
+
+// Success bodies. Each guard reads a parsed body as `unknown` and holds only when every
+// member its schema in ./schema requires is present with the type the contract gives it,
+// so no caller reads a member that a malformed body lacks. Two parts are left to their
+// one reader: a field's `fieldType` is checked as a string, because FieldRenderer shows a
+// field of a type it does not know as a protected placeholder, and the field-event
+// response is passed on as parsed (raiseFieldEvent).
+
+function isObject(value: unknown): value is Readonly<Record<string, unknown>> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isString(value: unknown): value is string {
+  return typeof value === 'string';
+}
+
+function isStringOrNull(value: unknown): value is string | null {
+  return value === null || isString(value);
+}
+
+function isBoolean(value: unknown): value is boolean {
+  return typeof value === 'boolean';
+}
+
+function isBooleanOrNull(value: unknown): value is boolean | null {
+  return value === null || isBoolean(value);
+}
+
+/** An `int32` member: JSON carries it as a number with no fraction. */
+function isInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isInteger(value);
+}
+
+function isIntegerOrNull(value: unknown): value is number | null {
+  return value === null || isInteger(value);
+}
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value);
+}
+
+function isArrayOf<T>(value: unknown, isItem: (item: unknown) => item is T): value is T[] {
+  if (!Array.isArray(value)) {
+    return false;
+  }
+  const items: readonly unknown[] = value;
+  return items.every(isItem);
+}
+
+function isFieldValue(value: unknown): value is FieldValue {
+  return value === null || isString(value) || isBoolean(value) || isFiniteNumber(value);
+}
+
+/** A `values` map: an object whose own entries are all scalar field values. */
+function isValues(value: unknown): value is Values {
+  return isObject(value) && Object.values(value).every(isFieldValue);
+}
+
+function isRecordDto(body: unknown): body is RecordDto {
+  return (
+    isObject(body) &&
+    isString(body.globalRecordId) &&
+    isInteger(body.uniqueKey) &&
+    isInteger(body.recStatus) &&
+    isInteger(body.position) &&
+    isInteger(body.count) &&
+    isValues(body.values)
+  );
+}
+
+function isRecordSummary(body: unknown): body is RecordSummary {
+  return (
+    isObject(body) &&
+    isString(body.globalRecordId) &&
+    isInteger(body.uniqueKey) &&
+    isInteger(body.recStatus) &&
+    isValues(body.values)
+  );
+}
+
+function isRecordPage(body: unknown): body is RecordPage {
+  return (
+    isObject(body) &&
+    isArrayOf(body.items, isRecordSummary) &&
+    isInteger(body.total) &&
+    isInteger(body.page) &&
+    isInteger(body.pageSize)
+  );
+}
+
+function isRecordCountResponse(body: unknown): body is RecordCountResponse {
+  return isObject(body) && isInteger(body.count);
+}
+
+function isNavigationPosition(body: unknown): body is NavigationPosition {
+  return isObject(body) && isIntegerOrNull(body.position) && isInteger(body.count);
+}
+
+function isSearchResult(body: unknown): body is SearchResult {
+  return isObject(body) && isInteger(body.position) && isRecordSummary(body);
+}
+
+function isSearchResponse(body: unknown): body is SearchResponse {
+  return (
+    isObject(body) && isArrayOf(body.items, isSearchResult) && isInteger(body.total) && isBoolean(body.truncated)
+  );
+}
+
+function isFormSummary(body: unknown): body is FormSummary {
+  return isObject(body) && isInteger(body.viewId) && isString(body.name) && isInteger(body.pageCount);
+}
+
+function isFormSummaryList(body: unknown): body is FormSummary[] {
+  return isArrayOf(body, isFormSummary);
+}
+
+const DIAGNOSTIC_SEVERITIES: Readonly<Record<DiagnosticSeverity, true>> = { info: true, warning: true, error: true };
+
+function isDiagnosticSeverity(value: unknown): value is DiagnosticSeverity {
+  return isString(value) && Object.hasOwn(DIAGNOSTIC_SEVERITIES, value);
+}
+
+function isFieldOption(body: unknown): body is FieldOption {
+  return isObject(body) && isFieldValue(body.value) && isString(body.label);
+}
+
+function isFieldValidation(body: unknown): body is FieldValidation {
+  return (
+    isObject(body) &&
+    isBoolean(body.required) &&
+    isBoolean(body.readOnly) &&
+    isIntegerOrNull(body.maxLength) &&
+    isFieldValue(body.lower) &&
+    isFieldValue(body.upper) &&
+    isStringOrNull(body.pattern)
+  );
+}
+
+function isFieldDefinition(body: unknown): body is FieldDefinition {
+  return (
+    isObject(body) &&
+    isString(body.name) &&
+    isString(body.fieldType) &&
+    isStringOrNull(body.prompt) &&
+    isFiniteNumber(body.tabIndex) &&
+    isInteger(body.pageId) &&
+    isBoolean(body.unsupported) &&
+    isStringOrNull(body.unsupportedType) &&
+    isFieldValidation(body.validation) &&
+    (body.options === null || isArrayOf(body.options, isFieldOption)) &&
+    (body.members === null || isArrayOf(body.members, isString))
+  );
+}
+
+function isPageDefinition(body: unknown): body is PageDefinition {
+  return (
+    isObject(body) &&
+    isInteger(body.pageId) &&
+    isString(body.name) &&
+    isInteger(body.position) &&
+    isArrayOf(body.fields, isFieldDefinition)
+  );
+}
+
+function isDiagnostic(body: unknown): body is Diagnostic {
+  return (
+    isObject(body) &&
+    isDiagnosticSeverity(body.severity) &&
+    isString(body.form) &&
+    isInteger(body.line) &&
+    isString(body.command) &&
+    isString(body.message)
+  );
+}
+
+function isFormDefinition(body: unknown): body is FormDefinition {
+  return (
+    isObject(body) &&
+    isInteger(body.viewId) &&
+    isString(body.name) &&
+    isArrayOf(body.pages, isPageDefinition) &&
+    isArrayOf(body.unsupportedCheckCode, isDiagnostic) &&
+    isBooleanOrNull(body.canInsert) &&
+    isBooleanOrNull(body.canUpdate) &&
+    isBooleanOrNull(body.canDelete)
+  );
+}
+
+function isHealthResponse(body: unknown): body is HealthResponse {
+  return isObject(body) && isString(body.status);
 }
 
 // `null` rather than an absent member, so the init also compiles under
@@ -235,74 +469,100 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
   });
 
   return {
-    listForms: (signal) => withBody(signal, () => http.GET('/api/forms', abortable(signal))),
+    listForms: (signal) => withBody(signal, () => http.GET('/api/forms', abortable(signal)), isFormSummaryList),
 
     getForm: (viewId, signal) =>
-      withBody(signal, () =>
-        http.GET('/api/forms/{viewId}', {
-          params: { path: { viewId } },
-          ...abortable(signal),
-        }),
+      withBody(
+        signal,
+        () =>
+          http.GET('/api/forms/{viewId}', {
+            params: { path: { viewId } },
+            ...abortable(signal),
+          }),
+        isFormDefinition,
       ),
 
     listRecords: (viewId, query, signal) =>
-      withBody(signal, () =>
-        http.GET('/api/forms/{viewId}/records', {
-          params: { path: { viewId }, query: listQuery(query) },
-          ...abortable(signal),
-        }),
+      withBody(
+        signal,
+        () =>
+          http.GET('/api/forms/{viewId}/records', {
+            params: { path: { viewId }, query: listQuery(query) },
+            ...abortable(signal),
+          }),
+        isRecordPage,
       ),
 
     countRecords: (viewId, options, signal) =>
-      withBody(signal, () =>
-        http.GET('/api/forms/{viewId}/records/count', {
-          params: { path: { viewId }, query: setQuery(options) },
-          ...abortable(signal),
-        }),
+      withBody(
+        signal,
+        () =>
+          http.GET('/api/forms/{viewId}/records/count', {
+            params: { path: { viewId }, query: setQuery(options) },
+            ...abortable(signal),
+          }),
+        isRecordCountResponse,
       ),
 
     getRecordAt: (viewId, position, options, signal) =>
-      withBody(signal, () =>
-        http.GET('/api/forms/{viewId}/records/at/{position}', {
-          params: { path: { viewId, position }, query: setQuery(options) },
-          ...abortable(signal),
-        }),
+      withBody(
+        signal,
+        () =>
+          http.GET('/api/forms/{viewId}/records/at/{position}', {
+            params: { path: { viewId, position }, query: setQuery(options) },
+            ...abortable(signal),
+          }),
+        isRecordDto,
       ),
 
     getRecord: (viewId, globalRecordId, signal) =>
-      withBody(signal, () =>
-        http.GET('/api/forms/{viewId}/records/{globalRecordId}', {
-          params: { path: { viewId, globalRecordId } },
-          ...abortable(signal),
-        }),
+      withBody(
+        signal,
+        () =>
+          http.GET('/api/forms/{viewId}/records/{globalRecordId}', {
+            params: { path: { viewId, globalRecordId } },
+            ...abortable(signal),
+          }),
+        isRecordDto,
       ),
 
     getRecordPosition: (viewId, globalRecordId, options, signal) =>
-      withBody(signal, () =>
-        http.GET('/api/forms/{viewId}/records/{globalRecordId}/position', {
-          params: { path: { viewId, globalRecordId }, query: setQuery(options) },
-          ...abortable(signal),
-        }),
+      withBody(
+        signal,
+        () =>
+          http.GET('/api/forms/{viewId}/records/{globalRecordId}/position', {
+            params: { path: { viewId, globalRecordId }, query: setQuery(options) },
+            ...abortable(signal),
+          }),
+        isNavigationPosition,
       ),
 
     createRecord: (viewId, values, signal) =>
-      withBody(signal, () =>
-        http.POST('/api/forms/{viewId}/records', {
-          params: { path: { viewId } },
-          body: { values },
-          headers: jsonHeaders,
-          ...abortable(signal),
-        }),
+      withBody(
+        signal,
+        () =>
+          http.POST('/api/forms/{viewId}/records', {
+            params: { path: { viewId } },
+            body: { values },
+            headers: jsonHeaders,
+            ...abortable(signal),
+          }),
+        isRecordDto,
+        201,
       ),
 
     updateRecord: (viewId, globalRecordId, values, signal) =>
-      withBody(signal, () =>
-        http.PUT('/api/forms/{viewId}/records/{globalRecordId}', {
-          params: { path: { viewId, globalRecordId } },
-          body: { values },
-          headers: jsonHeaders,
-          ...abortable(signal),
-        }),
+      withBody(
+        signal,
+        () =>
+          http.PUT('/api/forms/{viewId}/records/{globalRecordId}', {
+            params: { path: { viewId, globalRecordId } },
+            body: { values },
+            headers: jsonHeaders,
+            ...abortable(signal),
+          }),
+        isRecordDto,
+        200,
       ),
 
     deleteRecord: (viewId, globalRecordId, signal) =>
@@ -314,26 +574,34 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
       ),
 
     searchRecords: (viewId, request, signal) =>
-      withBody(signal, () =>
-        http.POST('/api/forms/{viewId}/records/search', {
-          params: { path: { viewId } },
-          body: request,
-          headers: jsonHeaders,
-          ...abortable(signal),
-        }),
+      withBody(
+        signal,
+        () =>
+          http.POST('/api/forms/{viewId}/records/search', {
+            params: { path: { viewId } },
+            body: request,
+            headers: jsonHeaders,
+            ...abortable(signal),
+          }),
+        isSearchResponse,
       ),
 
+    // The body is passed on as parsed: the field-event queue reads it as `unknown` and
+    // reports an answer it cannot read, so no shape is decided here.
     raiseFieldEvent: (viewId, request, signal) =>
-      withBody(signal, () =>
-        http.POST('/api/forms/{viewId}/checkcode/field-event', {
-          params: { path: { viewId } },
-          body: request,
-          headers: jsonHeaders,
-          ...abortable(signal),
-        }),
+      settle(
+        signal,
+        () =>
+          http.POST('/api/forms/{viewId}/checkcode/field-event', {
+            params: { path: { viewId } },
+            body: request,
+            headers: jsonHeaders,
+            ...abortable(signal),
+          }),
+        (data) => data,
       ),
 
-    getHealth: (signal) => withBody(signal, () => http.GET('/health', abortable(signal))),
+    getHealth: (signal) => withBody(signal, () => http.GET('/health', abortable(signal)), isHealthResponse),
   };
 }
 

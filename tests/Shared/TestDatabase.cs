@@ -68,7 +68,9 @@ public static class TestDatabase
     /// <summary>The length of every marker <see cref="NewMarker"/> returns.</summary>
     public const int MarkerLength = 34;
 
-    private const string MarkerPrefix = "T-";
+    /// <summary>The text every marker starts with, which tells a test-created record from a seeded one.</summary>
+    public const string MarkerPrefix = "T-";
+
     private const string Login = "sa";
     private const int ProbeTimeoutSeconds = 5;
     private const string UnreachableSubject = "The rehearsal database is not reachable";

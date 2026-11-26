@@ -12,7 +12,6 @@ import { act, renderHook, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi, type Mock } from 'vitest';
 
 import { createApiClient } from '../api/client';
-import { errorMessages } from '../api/errors';
 import type {
   FieldDefinition,
   NavigationPosition,
@@ -28,6 +27,12 @@ const VIEW_ID = formDefinitionFixture.viewId;
 const RECORDS_PATH = `/api/forms/${VIEW_ID}/records`;
 const ACTIVE = 1;
 const DELETED = 0;
+
+/**
+ * The notice of an open that met a 404, in the words the 0.3.4.2 error table gives it,
+ * matched independently of the client's own text.
+ */
+const RECORD_GONE = /this record no longer exists/i;
 
 /** Page-2 data fields: a row without its page-2 row reads them as `null`. */
 const PAGE_2_FIELDS: readonly FieldDefinition[] = formDefinitionFixture.pages
@@ -883,7 +888,7 @@ describe('useRecordNavigation', () => {
         sorted([byIdRequest(vanished), positionRequest(vanished), countRequest()]),
       );
       expect(requests.slice(3)).toEqual([countRequest(), atRequest(3)]);
-      expect(result.current.notice).toBe(errorMessages.notFound);
+      expect(result.current.notice).toMatch(RECORD_GONE);
       expect(result.current.listVersion).toBe(listVersion + 1);
       expect(result.current.n).toBe(3);
       expect(result.current.count).toBe(4);
@@ -904,7 +909,7 @@ describe('useRecordNavigation', () => {
 
       expect(accepted).toBe(false);
       expect(api.requestsSince(mark)).toEqual([atRequest(5), countRequest(), atRequest(3)]);
-      expect(result.current.notice).toBe(errorMessages.notFound);
+      expect(result.current.notice).toMatch(RECORD_GONE);
       expect(result.current.listVersion).toBe(listVersion + 1);
       expect(result.current.n).toBe(3);
       expect(result.current.count).toBe(3);
@@ -921,7 +926,7 @@ describe('useRecordNavigation', () => {
       await perform(() => result.current.goTo(2));
 
       expect(api.requestsSince(mark)).toEqual([atRequest(2), countRequest()]);
-      expect(result.current.notice).toBe(errorMessages.notFound);
+      expect(result.current.notice).toMatch(RECORD_GONE);
       expect(result.current.isNew).toBe(true);
       expect(result.current.record).toBeNull();
       expect(result.current.n).toBeNull();
@@ -939,7 +944,7 @@ describe('useRecordNavigation', () => {
       await act(flush);
 
       expect(api.requestsSince(mark)).toEqual([atRequest(2), countRequest(), atRequest(2)]);
-      expect(result.current.notice).toBe(errorMessages.notFound);
+      expect(result.current.notice).toMatch(RECORD_GONE);
       expect(result.current.isNew).toBe(true);
       expect(result.current.count).toBe(3);
       expect(result.current.listVersion).toBe(listVersion + 1);
@@ -961,7 +966,7 @@ describe('useRecordNavigation', () => {
         sorted([byIdRequest(vanished), positionRequest(vanished), countRequest()]),
       );
       expect(requests.slice(3)).toEqual([countRequest(), atRequest(1)]);
-      expect(result.current.notice).toBe(errorMessages.notFound);
+      expect(result.current.notice).toMatch(RECORD_GONE);
       expect(result.current.isNew).toBe(true);
       expect(result.current.count).toBe(2);
       expect(result.current.listVersion).toBe(listVersion + 1);
@@ -1044,6 +1049,31 @@ describe('useRecordNavigation', () => {
     });
   });
 
+  describe('a success body outside the contract', () => {
+    it('shows a count answered 200 without its count as a server load error', async () => {
+      const requests: string[] = [];
+      // Every read answers 200 with an empty object, which no read's contract allows.
+      const answerEmptyObject = (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+        const request = input instanceof Request ? input : new Request(input, init);
+        const url = new URL(request.url);
+        requests.push(`${request.method} ${url.pathname}${url.search}`);
+        return Promise.resolve(new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
+      };
+      const client = createApiClient({ baseUrl: 'http://localhost', fetch: answerEmptyObject });
+      const beforeLeave = vi.fn((): Promise<boolean> => Promise.resolve(true));
+
+      const { result } = renderHook(() => useRecordNavigation({ client, viewId: VIEW_ID, beforeLeave }));
+      await settled(result);
+
+      // The load stops at the count, shown with Retry, and opens nothing from a count it lacks.
+      expect(requests).toEqual([countRequest()]);
+      expect(result.current.loadError?.kind).toBe('server');
+      expect(result.current.loadError?.status).toBe(200);
+      expect(result.current.record).toBeNull();
+      expect(beforeLeave).not.toHaveBeenCalled();
+    });
+  });
+
   describe('reads never write (DATA-01)', () => {
     it('a whole navigation session sends only GETs to the four record-read routes', async () => {
       const { api, result } = await mount(mixedRows());
@@ -1080,4 +1110,3 @@ describe('useRecordNavigation', () => {
     });
   });
 });
-

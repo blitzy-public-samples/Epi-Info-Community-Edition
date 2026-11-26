@@ -69,8 +69,9 @@ public static class SqlIdentifier
     /// <remarks>
     /// Internal so that <c>SqlIdentifierTests</c> can reach it through <c>InternalsVisibleTo</c>, and for no other
     /// caller. SQL builders never call it: every dynamic identifier enters SQL through <see cref="Quote(TableSchema)"/>
-    /// or <see cref="Quote(ColumnSchema)"/>, which <c>IdentifierProvenanceTests</c> proves by reflection and by the
-    /// recorded commands. A public overload taking a raw string would let a name the reader never returned reach SQL.
+    /// or <see cref="Quote(ColumnSchema)"/>, which <c>IdentifierProvenanceTests</c> proves by reflection and
+    /// <c>RecordCommandIdentifierProvenanceTests</c> by the recorded commands of saves made through the API. A public
+    /// overload taking a raw string would let a name the reader never returned reach SQL.
     /// </remarks>
     internal static string QuoteName(string name)
     {

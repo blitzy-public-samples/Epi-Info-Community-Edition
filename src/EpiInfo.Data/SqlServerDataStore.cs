@@ -325,12 +325,15 @@ public sealed class SqlServerDataStore : IDataStore
             SqlFailure failure = SqlErrorClassifier.Classify(exception, cancellationToken);
             if (failure.Kind == SqlFailureKind.Cancelled)
             {
-                if (exception is OperationCanceledException)
+                // The original OperationCanceledException propagates unchanged; SqlClient's acknowledgement becomes one
+                // that keeps its SQL error number for the abort log line.
+                Exception cancellation = SqlErrorClassifier.ToCancellation(failure, exception, cancellationToken);
+                if (ReferenceEquals(cancellation, exception))
                 {
                     throw;
                 }
 
-                throw new OperationCanceledException(SqlErrorClassifier.CancelledMessage, exception, cancellationToken);
+                throw cancellation;
             }
 
             throw SqlErrorClassifier.ToDataStoreException(failure, operation, OutcomeOf(kind), exception);

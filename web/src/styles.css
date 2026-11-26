@@ -449,6 +449,12 @@
     text-align: center;
   }
 
+  /* "Saving…" while a save is under way; empty and visually hidden, though still rendered, when idle. */
+  .form-toolbar [role="status"] {
+    padding-inline: var(--space-2);
+    font-weight: 600;
+  }
+
   .record-navigator input:not([type="checkbox"]):not([type="radio"]) {
     inline-size: 5.5rem;
   }
@@ -870,6 +876,13 @@
     font-weight: 700;
     text-decoration: underline;
     text-underline-offset: 2px;
+  }
+
+  /* The label of a field that cannot be edited now: plain bold text, still
+   * focusable and described by its note. */
+  .validation-summary li button[aria-disabled="true"] {
+    text-decoration: none;
+    cursor: default;
   }
 
   @media (hover: hover) {

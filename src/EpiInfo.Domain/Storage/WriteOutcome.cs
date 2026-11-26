@@ -15,11 +15,13 @@ namespace EpiInfo.Domain.Storage;
 /// </description></item>
 /// <item><description>
 /// <c>RecordService</c> records <see cref="Written"/> through the API's <c>WriteOutcomeFeature</c> once the store
-/// reports a commit.
+/// reports a commit, and <see cref="NotWritten"/> once the store returns a result that wrote nothing.
 /// </description></item>
 /// <item><description>
 /// <c>ApiExceptionHandler</c> reads it. For a write endpoint the handler takes the feature first, then the
-/// exception's <c>Outcome</c>, and writes the string from <see cref="WriteOutcomeExtensions.ToWireValue"/>.
+/// exception's <c>Outcome</c>, which applies only once a store write call was issued; before that, as when the
+/// metadata read fails, the request is <see cref="NotWritten"/>. It writes the string from
+/// <see cref="WriteOutcomeExtensions.ToWireValue"/>.
 /// </description></item>
 /// </list>
 /// <para>

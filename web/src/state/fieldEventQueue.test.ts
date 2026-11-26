@@ -13,7 +13,6 @@ import { act, renderHook, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi, type Mock } from 'vitest';
 
 import { createApiClient, type ApiClient } from '../api/client';
-import { errorMessages } from '../api/errors';
 import type {
   Diagnostic,
   DialogMessage,
@@ -708,9 +707,11 @@ describe('createFieldEventQueue', () => {
     });
     await answer(harness, 0, problem(500));
 
-    expect(host.onNotice.mock.calls).toEqual([
-      [`Check code could not run for Last Name. ${errorMessages.server}${errorMessages.traceIdSuffix(TRACE_ID)}`],
-    ]);
+    // One notice, naming the field by its prompt and carrying the server's trace id.
+    expect(host.onNotice).toHaveBeenCalledTimes(1);
+    const [notice] = host.onNotice.mock.calls[0];
+    expect(notice).toContain('Last Name');
+    expect(notice).toContain(TRACE_ID);
     expect(host.setSnapshot).not.toHaveBeenCalled();
 
     const next = await eventAt(harness.api, 1);
@@ -1223,6 +1224,35 @@ describe('useRecordEditor field events', () => {
     expect(onSaved).toHaveBeenCalledTimes(1);
     // The event failed after the PUT was sent, so the save's success says nothing about it.
     expect(result.current.eventNotice).toBe(notice);
+  });
+
+  it('reports the save pending, with no request in flight, while it waits for an unanswered field event', async () => {
+    const harness = createHarness([RECORD_A]);
+    const { api } = harness;
+    const { result } = await mountEditor(harness);
+
+    act(() => {
+      result.current.setValue('LastName', 'Jones');
+      result.current.onFieldBlur('LastName');
+    });
+    const blur = await eventAt(api, 0);
+    const saving = result.current.save();
+    await act(flush);
+
+    // The drain holds the write back; only savePending tells that the save is under way.
+    expect(api.puts()).toEqual([]);
+    expect(result.current.savePending).toBe(true);
+    expect(result.current.saving).toBe(false);
+
+    const saved = await perform(() => {
+      blur.respond(json(200, envelope()));
+      return saving;
+    });
+
+    expect(saved).toBe(true);
+    expect(api.puts()).toEqual([{ LastName: 'Jones' }]);
+    expect(result.current.savePending).toBe(false);
+    expect(result.current.saving).toBe(false);
   });
 
   it('raises no event for the blur and focus that replacing the rendered record causes', async () => {

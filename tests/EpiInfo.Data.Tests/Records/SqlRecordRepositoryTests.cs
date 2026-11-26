@@ -10,8 +10,6 @@ using EpiInfo.Domain.Forms;
 using EpiInfo.Domain.Metadata;
 using EpiInfo.Domain.Records;
 using EpiInfo.Domain.Search;
-using EpiInfo.Domain.Storage;
-using EpiInfo.Domain.Validation;
 using EpiInfo.Domain.Values;
 using EpiInfo.Tests.Shared;
 using Microsoft.Data.SqlClient;
@@ -21,7 +19,7 @@ namespace EpiInfo.Data.Tests.Records;
 /// <summary>
 /// Integration tests of the record statements the repository builds and runs, against the seeded forms of the
 /// rehearsal database. The metadata reader supplies every form, page, table and column schema, so each identifier a
-/// statement names is one the catalogue returned. The cases pin three contracts:
+/// statement names is one the catalogue returned. The cases pin four contracts:
 /// <list type="bullet">
 /// <item><description>
 /// The page-row statements the repository sends when it creates and updates a record,
@@ -39,34 +37,30 @@ namespace EpiInfo.Data.Tests.Records;
 /// converts through <see cref="ColumnValueConverter.FromDbValue"/> to the value stored.
 /// </description></item>
 /// <item><description>
-/// The repository's own operations (AAP 0.3.4.4 and 0.3.4.6), on records the tests create: the insert writes the base
-/// row, then one row on every page in page order, in one transaction; an update writes only the submitted columns and
-/// the last-save stamp, and repairs a missing page row as legacy does
-/// (<c>Epi.Core/Data/Services/CollectedDataProvider.cs:1360-1380</c>); a soft delete changes only the base row's
-/// status and stamp; an update of a deleted or unknown record writes nothing; and every read sends only
-/// <c>SELECT</c>.
+/// The repository's reads (AAP 0.3.4.4 and <c>DATA-01</c>): on a seeded record, every read of
+/// <see cref="SqlRecordRepository"/> sends only <c>SELECT</c> and changes nothing stored.
 /// </description></item>
 /// </list>
 /// </summary>
 /// <remarks>
 /// <para>
-/// The builder, identity and stored-read cases only read. The reader's commands are all <c>SELECT</c>, the page-row
-/// write statements are only built, never sent, and the stored-read case sends only <c>SELECT</c>. The identity
-/// lookups run their locked read in a transaction that is rolled back, and the record they look up is the seeded row
-/// with the lowest <c>UniqueKey</c>, chosen by SQL rather than hard-coded; the Find exclusion uses the lowest such
-/// active row with a row on every page. Their failure messages are fixed text, so no id reaches the output except
-/// through an equality assertion.
+/// The class only reads. The reader's commands are all <c>SELECT</c>, the page-row write statements are only built,
+/// never sent, and the stored-read and repository-read cases send only <c>SELECT</c>. The identity lookups run their
+/// locked read in a transaction that is rolled back, and the record they look up is the seeded row with the lowest
+/// <c>UniqueKey</c>, chosen by SQL rather than hard-coded; the Find exclusion uses the lowest such active row with a
+/// row on every page, and the repository reads the lowest such row whose <c>LastName</c> is plain seeded text. The
+/// identity cases' failure messages are fixed text, so no id reaches the output except through an equality assertion;
+/// the repository-read case describes commands with <see cref="RecordedCommand.Describe"/> without parameter values.
+/// Cases that compare snapshots hold the exclusive <see cref="DatabaseWriteLock"/>, the others the shared one.
 /// </para>
 /// <para>
-/// The repository cases write. This assembly reaches the data layer and not the API, so they create their records
-/// through <see cref="SqlRecordRepository"/>, the write path the API's store forwards to unchanged, each carrying a
-/// test marker in <see cref="TestDatabase.MarkerField"/>; the missing-page repair can be pinned only on such a record.
-/// Their one direct write is the removal of the page-two row of a record the test itself created, the missing-page
-/// fixture AAP 0.3.7 allows. They never touch a seeded, metadata or schema row, and the records they create stay in
-/// the database, so a rerun needs no reset. Each holds the exclusive <see cref="DatabaseWriteLock"/> for its whole
-/// body, so its snapshot comparisons hold exactly its own changes, and every expected count and position comes from
-/// SQL inside the test. Their failure messages describe commands with <see cref="RecordedCommand.Describe"/> without
-/// parameter values.
+/// The repository's writes are proved by <c>SqlRecordRepositoryWriteTests</c> in <c>EpiInfo.Api.Tests</c>: the insert
+/// of the base row and then one row on every page in page order in one transaction, the delta update, the legacy
+/// repair of a missing page row (<c>Epi.Core/Data/Services/CollectedDataProvider.cs:1360-1380</c>), the base-only soft
+/// delete, and the refused update of a deleted or unknown record. Tests may write only records created through the API
+/// and the few fixtures AAP 0.3.7 ("Data reach of tests") lists, and this assembly references the data layer alone,
+/// so it cannot create such a record; that class creates each one through the API and observes the repository's
+/// statements through the host's command observer.
 /// </para>
 /// </remarks>
 [Collection(DatabaseCollections.Database)]
@@ -86,30 +80,28 @@ public sealed class SqlRecordRepositoryTests : IAsyncLifetime
     // Trailing spaces that take the padded id beyond the seeded nvarchar(255) column.
     private const int OverWidthPadding = 300;
 
-    // FoodHistory's page-two Text field (FoodHistory3.Lab, nvarchar(4000), no pattern, MaxLength 0) and the page-one
-    // Text field both seeded forms share beside the marker field (testdata/sql/03_forms.sql, 05_data_tables.sql).
-    private const string PageTwoTextField = "Lab";
-    private const string FirstNameField = "FirstName";
+    // FoodHistory's page-one Text field (FoodHistory2.LastName, nvarchar(4000)), which the repository-read case filters
+    // and searches on with a seeded value (testdata/sql/03_forms.sql, 05_data_tables.sql).
+    private const string LastNameField = "LastName";
 
-    // The seeded form with two pages, on which every repository case but the insert theory runs.
+    // The seeded form with two pages, on which the repository-read case runs.
     private const string TwoPageForm = "FoodHistory";
 
-    // The base-table column the record path never names for a form without a foreign-key field.
-    private const string ForeignKeyColumn = "FKEY";
+    // The repository-read case's choice of its seeded record: the RecStatus of an active record, the test's own value,
+    // and the patterns of text starting with an ASCII letter and of any other character, each bound as a parameter
+    // and compared under a binary collation, in which [A-Za-z] is exactly the ASCII letters.
+    private const short ActiveStatus = 1;
+    private const string LetterFirstPattern = "[A-Za-z]%";
+    private const string NonLetterPattern = "%[^A-Za-z]%";
+    private const string BinaryCollation = "Latin1_General_BIN2";
 
-    private static readonly TimeSpan RepositoryTestTimeout = TimeSpan.FromMinutes(5);
+    // Covers a wait of up to 300 seconds for the test lock and the work behind it.
+    private static readonly TimeSpan RepositoryTestTimeout = TimeSpan.FromMinutes(10);
 
     private static readonly IReadOnlyDictionary<string, FieldValue> NoValues = new Dictionary<string, FieldValue>();
 
     /// <summary>The seeded forms.</summary>
     public static TheoryData<string> Forms => new() { "CaseReport", "FoodHistory" };
-
-    /// <summary>Each seeded form with its page tables in <c>metaPages.Position</c> order.</summary>
-    public static TheoryData<string, string[]> FormsWithPageTables => new()
-    {
-        { "CaseReport", new[] { "CaseReport1" } },
-        { "FoodHistory", new[] { "FoodHistory2", "FoodHistory3" } },
-    };
 
     /// <summary>Each seeded form with each padding: within and beyond the width of its id column.</summary>
     public static TheoryData<string, int> PaddedIds => new()
@@ -778,257 +770,38 @@ public sealed class SqlRecordRepositoryTests : IAsyncLifetime
         Assert.True(recorder.Writes().Count == 0, "A record lookup sent a write statement.");
     }
 
-    // AAP 0.3.4.6, insert: the base row first, returning its key through OUTPUT INSERTED.UniqueKey with one stamp for
-    // both pairs and FKEY never named, then one row on every page in metaPages.Position order, a page with no
-    // submitted value included, all in one transaction on one connection and nothing else in the five tables.
-    [Theory]
-    [MemberData(nameof(FormsWithPageTables))]
-    public async Task InsertWritesBaseThenEveryPageInPositionOrderInOneTransaction(string formName, string[] pageTables)
-    {
-        await TestDatabase.EnsureReachableAsync();
-        using var timeout = new CancellationTokenSource(RepositoryTestTimeout);
-        CancellationToken cancellationToken = timeout.Token;
-        await using var writeLock = await DatabaseWriteLock.AcquireExclusiveAsync(cancellationToken);
-
-        RepositoryHarness harness = RepositoryHarness.Create();
-        ReaderForm form = await ReaderForm.ReadAsync(formName);
-        IReadOnlyList<PageTableSchema> pages = PagesInPositionOrder(form);
-        Assert.Equal(pageTables, pages.Select(page => RequireTable(page).Name));
-        ColumnSchema foreignKey = Assert.IsType<ColumnSchema>(form.Schema.BaseTable.FindColumn(ForeignKeyColumn));
-        string marker = TestDatabase.NewMarker();
-        SaveStamp stamp = harness.Stamp(0);
-
-        SqlSnapshot before = await SqlSnapshot.CaptureAsync(cancellationToken);
-        harness.Recorder.Clear();
-        RecordDto record = await harness.Repository.InsertAsync(
-            form.Metadata,
-            Values(ignoreCase: false, (TestDatabase.MarkerField, FieldValue.FromText(marker))),
-            stamp,
-            cancellationToken);
-        IReadOnlyList<RecordedCommand> commands = harness.Recorder.Commands;
-        IReadOnlyList<RecordedCommand> writes = harness.Recorder.Writes();
-        SqlSnapshot after = await SqlSnapshot.CaptureAsync(cancellationToken);
-
-        AssertOneTransaction(commands);
-        Assert.True(
-            writes.Count == 1 + pages.Count,
-            Describe("The insert did not send exactly one base and one page write per page.", writes));
-        RecordedCommand baseInsert = writes[0];
-        Assert.True(
-            Verb(baseInsert) == "INSERT" && TargetTable(form, baseInsert) == form.Schema.BaseTable.Name,
-            Describe("The first write of the insert is not the base-table INSERT.", writes));
-        Assert.Contains("OUTPUT INSERTED.", baseInsert.CommandText, StringComparison.Ordinal);
-        IReadOnlyList<string> baseIdentifiers = SqlCommandRecorder.BracketedIdentifiers(baseInsert.CommandText);
-        Assert.Contains(RecordSqlBuilder.Require(form.Schema.UniqueKey).Name, baseIdentifiers);
-        Assert.DoesNotContain(foreignKey.Name, baseIdentifiers);
-
-        // One stamp fills both pairs, so no write after the base INSERT is an UPDATE.
-        Assert.Equal(
-            pages.Select(page => ("INSERT", (string?)RequireTable(page).Name)),
-            writes.Skip(1).Select(write => (Verb(write), TargetTable(form, write))));
-
-        string id = record.GlobalRecordId;
-        Assert.True(Guid.TryParse(id, out _), "The new GlobalRecordId is not a GUID.");
-        Assert.Equal(RecordQueryRules.ActiveRecStatus, record.RecStatus);
-        Assert.Equal(form.DataColumns.Select(column => column.Field.Name), record.Values.Keys);
-        Assert.Equal(marker, record.Values[TestDatabase.MarkerField].AsText());
-        Assert.All(
-            record.Values.Where(entry => entry.Key != TestDatabase.MarkerField),
-            entry => Assert.True(entry.Value.IsNull, "A field the insert did not submit was returned with a value."));
-
-        IReadOnlyDictionary<string, object> baseRow = Assert.Single(await ReadRowsAsync(
-            form.Schema.BaseTable,
-            RecordSqlBuilder.Require(form.Schema.GlobalRecordId),
-            id,
-            cancellationToken));
-        object Stored(ColumnSchema? column) => baseRow[RecordSqlBuilder.Require(column).Name];
-        Assert.Equal(id, Stored(form.Schema.GlobalRecordId));
-        Assert.Equal(record.UniqueKey, Assert.IsType<int>(Stored(form.Schema.UniqueKey)));
-        Assert.Equal(
-            RecordQueryRules.ActiveRecStatus,
-            Convert.ToInt32(Stored(form.Schema.RecStatus), CultureInfo.InvariantCulture));
-        Assert.Equal(Environment.UserName, Stored(form.Schema.FirstSaveLogonName));
-        Assert.Equal(Environment.UserName, Stored(form.Schema.LastSaveLogonName));
-        Assert.Equal(stamp.Time, Assert.IsType<DateTime>(Stored(form.Schema.FirstSaveTime)));
-        Assert.Equal(stamp.Time, Assert.IsType<DateTime>(Stored(form.Schema.LastSaveTime)));
-        Assert.Same(DBNull.Value, baseRow[foreignKey.Name]);
-
-        // Every column of each page row but its key is NULL, the marker column alone excepted: read-only and
-        // unsupported columns are never named, and the other writable columns are written NULL.
-        ProjectedColumn markerColumn = form.Column(TestDatabase.MarkerField);
-        foreach (PageTableSchema page in pages)
-        {
-            TableSchema table = RequireTable(page);
-            ColumnSchema key = RecordSqlBuilder.RequirePageKey(table);
-            bool holdsMarker = page.Page.PageId == markerColumn.Field.Page.PageId;
-            IReadOnlyDictionary<string, object> pageRow =
-                Assert.Single(await ReadRowsAsync(table, key, id, cancellationToken));
-            foreach ((string column, object value) in pageRow)
-            {
-                if (column == key.Name)
-                {
-                    Assert.Equal(id, value);
-                }
-                else if (holdsMarker && column == markerColumn.Column.Name)
-                {
-                    Assert.Equal(marker, value);
-                }
-                else
-                {
-                    Assert.True(value is DBNull, "A page column the insert did not submit holds a value.");
-                }
-            }
-        }
-
-        SnapshotDiff diff = SqlSnapshot.Compare(before, after);
-        Assert.True(
-            diff.RemovedRows.Count == 0 && diff.ChangedCells.Count == 0 && diff.SchemaChanges.Count == 0,
-            diff.ToString());
-        Assert.Equal(
-            pages.Select(page => RequireTable(page).Name)
-                .Prepend(form.Schema.BaseTable.Name)
-                .Order(StringComparer.Ordinal),
-            diff.AddedRows.Select(row => row.Table).Order(StringComparer.Ordinal));
-        Assert.True(diff.AddedRows.All(row => row.GlobalRecordId == id), diff.ToString());
-    }
-
-    // AAP 0.3.4.4 and 0.3.4.6, the missing page row: a record whose page-two row is gone still reads through the LEFT
-    // JOIN, with every page-two value null, and is still placed from the base table. An update of a page-two field then
-    // finds no row, inserts the page row holding only its key and repeats the update, as legacy repairs it
-    // (Epi.Core/Data/Services/CollectedDataProvider.cs:1360-1380), after the base stamp and without touching page one.
-    [Fact]
-    public async Task UpdateInsertsMissingPageRowAndRepeatsUpdate()
-    {
-        await TestDatabase.EnsureReachableAsync();
-        using var timeout = new CancellationTokenSource(RepositoryTestTimeout);
-        CancellationToken cancellationToken = timeout.Token;
-        await using var writeLock = await DatabaseWriteLock.AcquireExclusiveAsync(cancellationToken);
-
-        RepositoryHarness harness = RepositoryHarness.Create();
-        ReaderForm form = await ReaderForm.ReadAsync(TwoPageForm);
-        IReadOnlyList<PageTableSchema> pages = PagesInPositionOrder(form);
-        Assert.True(pages.Count == 2, "The two-page seeded form does not have two page tables.");
-        ProjectedColumn lab = form.Column(PageTwoTextField);
-        PageTableSchema missingPage = pages[1];
-        Assert.Equal(missingPage.Page.PageId, lab.Field.Page.PageId);
-        TableSchema missingTable = RequireTable(missingPage);
-        ColumnSchema missingKey = RecordSqlBuilder.RequirePageKey(missingTable);
-        string marker = TestDatabase.NewMarker();
-        RecordDto inserted = await harness.Repository.InsertAsync(
-            form.Metadata,
-            Values(ignoreCase: false, (TestDatabase.MarkerField, FieldValue.FromText(marker))),
-            harness.Stamp(0),
-            cancellationToken);
-        string id = inserted.GlobalRecordId;
-
-        // The one direct write the tests may make (AAP 0.3.7): the page-two row of the record this test created.
-        Assert.Equal(1, await DeleteRowAsync(missingTable, missingKey, id, cancellationToken));
-
-        RecordDto? read = await harness.Repository.GetByIdAsync(form.Metadata, id, cancellationToken);
-        Assert.NotNull(read);
-        Assert.Equal(marker, read.Values[TestDatabase.MarkerField].AsText());
-        Assert.All(
-            form.DataColumns.Where(column => column.Field.Page.PageId == missingPage.Page.PageId),
-            column => Assert.True(
-                read.Values[column.Field.Name].IsNull,
-                "A field of the missing page row was read with a value."));
-
-        foreach (bool includeDeleted in new[] { false, true })
-        {
-            NavigationPosition? placed =
-                await harness.Repository.GetSetPositionAsync(form.Metadata, id, includeDeleted, cancellationToken);
-            Assert.NotNull(placed);
-            Assert.Equal(
-                await CountBaseRowsAsync(form, inserted.UniqueKey, activeOnly: !includeDeleted, cancellationToken),
-                placed.Position);
-            Assert.Equal(
-                await CountBaseRowsAsync(form, atMostUniqueKey: null, activeOnly: !includeDeleted, cancellationToken),
-                placed.Count);
-        }
-
-        string labValue = "L-" + marker;
-        var gate = new CountingGate();
-        SqlSnapshot before = await SqlSnapshot.CaptureAsync(cancellationToken);
-        harness.Recorder.Clear();
-        RecordWriteResult result = await harness.Repository.UpdateAsync(
-            form.Metadata,
-            id,
-            Values(ignoreCase: false, (PageTwoTextField, FieldValue.FromText(labValue))),
-            harness.Stamp(1),
-            gate.Check,
-            permissions: null,
-            cancellationToken);
-        IReadOnlyList<RecordedCommand> commands = harness.Recorder.Commands;
-        IReadOnlyList<RecordedCommand> writes = harness.Recorder.Writes();
-        SqlSnapshot after = await SqlSnapshot.CaptureAsync(cancellationToken);
-
-        Assert.Equal(RecordWriteStatus.Success, result.Status);
-        Assert.Equal(1, gate.Calls);
-        AssertOneTransaction(commands);
-        string baseName = form.Schema.BaseTable.Name;
-        Assert.True(
-            writes.Count == 4 && Verb(writes[0]) == "UPDATE" && TargetTable(form, writes[0]) == baseName,
-            Describe("The update did not send the base stamp first and three page writes.", writes));
-        Assert.Equal(StampColumns(form), AssignedColumns(form, writes[0]));
-        Assert.Equal(
-            new[] { "UPDATE", "INSERT", "UPDATE" },
-            writes.Where(write => TargetTable(form, write) == missingTable.Name).Select(Verb));
-        Assert.Equal(new[] { missingKey.Name }, IdentifiersExcept(writes[2], missingTable.Name));
-        Assert.All(
-            new[] { writes[1], writes[3] },
-            update => Assert.Equal(new[] { lab.Column.Name }, AssignedColumns(form, update)));
-        Assert.True(
-            !writes.Any(write => TargetTable(form, write) == RequireTable(pages[0]).Name),
-            Describe("The update wrote the page it submitted no field for.", writes));
-
-        SnapshotDiff diff = SqlSnapshot.Compare(before, after);
-        Assert.True(diff.RemovedRows.Count == 0 && diff.SchemaChanges.Count == 0, diff.ToString());
-        SnapshotRowChange added = Assert.Single(diff.AddedRows);
-        Assert.Equal((missingTable.Name, id), (added.Table, added.GlobalRecordId));
-        foreach ((string column, object? value) in added.Row.Values)
-        {
-            object? expected = column == missingKey.Name ? id : column == lab.Column.Name ? labValue : null;
-            Assert.True(Equals(expected, value), "The repaired page row does not hold only its key and the update.");
-        }
-
-        Assert.Equal(
-            new[]
-            {
-                new SnapshotCellChange(baseName, id, LastSaveTime(form), harness.Stamp(0).Time, harness.Stamp(1).Time),
-            },
-            diff.ChangedCells);
-
-        Assert.True(result.IsSuccess);
-        Assert.Equal(labValue, result.Record.Values[PageTwoTextField].AsText());
-        Assert.Equal(marker, result.Record.Values[TestDatabase.MarkerField].AsText());
-    }
-
     // AAP 0.3.4.4 and DATA-01: every read of the repository sends only SELECT statements and changes nothing stored.
+    // The reads run on a seeded record chosen by SQL, so the case writes nothing; the repository's writes are proved on
+    // records created through the API, by SqlRecordRepositoryWriteTests in EpiInfo.Api.Tests.
     [Fact]
     public async Task ReadsIssueOnlySelect()
     {
         await TestDatabase.EnsureReachableAsync();
         using var timeout = new CancellationTokenSource(RepositoryTestTimeout);
         CancellationToken cancellationToken = timeout.Token;
+
+        // Exclusive, because the test compares snapshots taken before and after it.
         await using var writeLock = await DatabaseWriteLock.AcquireExclusiveAsync(cancellationToken);
 
-        RepositoryHarness harness = RepositoryHarness.Create();
+        // The repository as the store builds it, over one recorder that hears every command the repository and its
+        // metadata reader send.
+        var options = new DatabaseOptions(TestDatabase.ConnectionString);
+        var recorder = new SqlCommandRecorder();
+        var connections = new SqlConnectionFactory(options);
+        var repository = new SqlRecordRepository(
+            connections,
+            new SqlMetadataReader(connections, options, recorder),
+            options,
+            recorder);
         ReaderForm form = await ReaderForm.ReadAsync(TwoPageForm);
-        string marker = TestDatabase.NewMarker();
-        RecordDto inserted = await harness.Repository.InsertAsync(
-            form.Metadata,
-            Values(ignoreCase: false, (TestDatabase.MarkerField, FieldValue.FromText(marker))),
-            harness.Stamp(0),
-            cancellationToken);
-        string id = inserted.GlobalRecordId;
+        (string id, string lastName) = await ReadPlainSeededRecordAsync(form, cancellationToken);
         SearchParseResult criteria = SearchCriteriaParser.Parse(
             FormDefinitionFactory.GetDataFields(form.Metadata),
-            [new SearchCriterion(TestDatabase.MarkerField, FieldValue.FromText(marker))]);
-        Assert.True(criteria.IsSuccess, "The marker criterion did not parse.");
+            [new SearchCriterion(LastNameField, FieldValue.FromText(lastName))]);
+        Assert.True(criteria.IsSuccess, "The seeded LastName criterion did not parse.");
 
         SqlSnapshot before = await SqlSnapshot.CaptureAsync(cancellationToken);
-        harness.Recorder.Clear();
-        SqlRecordRepository repository = harness.Repository;
+        recorder.Clear();
         int activeCount = await repository.CountAsync(form.Metadata, includeDeleted: false, cancellationToken);
         int allCount = await repository.CountAsync(form.Metadata, includeDeleted: true, cancellationToken);
         RecordDto? first =
@@ -1040,17 +813,17 @@ public sealed class SqlRecordRepositoryTests : IAsyncLifetime
             await repository.GetSetPositionAsync(form.Metadata, id, includeDeleted: true, cancellationToken);
         RecordPage firstPage = await repository.ListAsync(form.Metadata, RecordListQuery.Default, cancellationToken);
         RecordPage filtered =
-            await repository.ListAsync(form.Metadata, RecordListQuery.Default with { Q = marker }, cancellationToken);
+            await repository.ListAsync(form.Metadata, RecordListQuery.Default with { Q = lastName }, cancellationToken);
         SearchResponse found = await repository.SearchAsync(
             form.Metadata,
             criteria.Conditions,
             includeDeleted: false,
             excludeGlobalRecordId: null,
             cancellationToken);
-        IReadOnlyList<RecordedCommand> commands = harness.Recorder.Commands;
+        IReadOnlyList<RecordedCommand> commands = recorder.Commands;
         SqlSnapshot after = await SqlSnapshot.CaptureAsync(cancellationToken);
 
-        Assert.True(harness.Recorder.Writes().Count == 0, Describe("A read sent a write statement.", commands));
+        Assert.True(recorder.Writes().Count == 0, Describe("A read sent a write statement.", commands));
         Assert.NotEmpty(commands);
         Assert.All(commands, command =>
         {
@@ -1068,279 +841,56 @@ public sealed class SqlRecordRepositoryTests : IAsyncLifetime
         Assert.NotNull(activePosition);
         Assert.NotNull(allPosition);
         Assert.NotNull(activePosition.Position);
-        Assert.Equal(id, Assert.Single(filtered.Items).GlobalRecordId);
-        Assert.Equal(1, filtered.Total);
-        SearchResult hit = Assert.Single(found.Items);
-        Assert.Equal(id, hit.GlobalRecordId);
-        Assert.Equal(activePosition.Position, hit.Position);
+        Assert.True(
+            filtered.Total >= 1 && filtered.Items.Any(item => item.GlobalRecordId == id),
+            "The records-list q of the record's LastName did not list the record.");
+        SearchResult[] hits = found.Items.Where(item => item.GlobalRecordId == id).ToArray();
+        Assert.True(hits.Length == 1, "The LastName criterion did not find the record exactly once.");
+        Assert.Equal(activePosition.Position, hits[0].Position);
     }
 
-    // AAP 0.3.4.6, update scope: a PUT is a delta, so the page holding the submitted field gets an UPDATE of that one
-    // column, the base row only its last-save stamp, and every other column and page stays as it was.
-    [Fact]
-    public async Task UpdateWritesOnlySubmittedColumns()
+    // Picks by SQL the active seeded base row with the lowest UniqueKey that has a row on every page and whose LastName
+    // is ASCII letters only: no test marker, which holds "-" and digits, and a plain Find criterion, with no wildcard,
+    // alternative or comparison prefix. Returns its stored id and LastName. The statement names only reader-built
+    // identifiers and binds every value as a typed parameter.
+    private static async Task<(string GlobalRecordId, string LastName)> ReadPlainSeededRecordAsync(
+        ReaderForm form,
+        CancellationToken cancellationToken)
     {
-        await TestDatabase.EnsureReachableAsync();
-        using var timeout = new CancellationTokenSource(RepositoryTestTimeout);
-        CancellationToken cancellationToken = timeout.Token;
-        await using var writeLock = await DatabaseWriteLock.AcquireExclusiveAsync(cancellationToken);
-
-        RepositoryHarness harness = RepositoryHarness.Create();
-        ReaderForm form = await ReaderForm.ReadAsync(TwoPageForm);
-        ProjectedColumn firstName = form.Column(FirstNameField);
-        PageTableSchema firstNamePage = form.PageOf(firstName.Field);
-        TableSchema firstNameTable = RequireTable(firstNamePage);
-        RecordDto inserted = await harness.Repository.InsertAsync(
-            form.Metadata,
-            Values(
-                ignoreCase: false,
-                (TestDatabase.MarkerField, FieldValue.FromText(TestDatabase.NewMarker())),
-                (FirstNameField, FieldValue.FromText("F"))),
-            harness.Stamp(0),
-            cancellationToken);
-        string id = inserted.GlobalRecordId;
-
-        var gate = new CountingGate();
-        SqlSnapshot before = await SqlSnapshot.CaptureAsync(cancellationToken);
-        harness.Recorder.Clear();
-        RecordWriteResult result = await harness.Repository.UpdateAsync(
-            form.Metadata,
-            id,
-            Values(ignoreCase: false, (FirstNameField, FieldValue.FromText("G"))),
-            harness.Stamp(1),
-            gate.Check,
-            permissions: null,
-            cancellationToken);
-        IReadOnlyList<RecordedCommand> commands = harness.Recorder.Commands;
-        IReadOnlyList<RecordedCommand> writes = harness.Recorder.Writes();
-        SqlSnapshot after = await SqlSnapshot.CaptureAsync(cancellationToken);
-
-        Assert.Equal(RecordWriteStatus.Success, result.Status);
-        Assert.Equal(1, gate.Calls);
-        AssertOneTransaction(commands);
-        Assert.True(
-            writes.Count == 2,
-            Describe("The update did not send exactly the base stamp and one page write.", writes));
-        Assert.Equal(("UPDATE", (string?)form.Schema.BaseTable.Name), (Verb(writes[0]), TargetTable(form, writes[0])));
-        Assert.Equal(StampColumns(form), AssignedColumns(form, writes[0]));
-        Assert.Equal(("UPDATE", (string?)firstNameTable.Name), (Verb(writes[1]), TargetTable(form, writes[1])));
-        Assert.Equal(new[] { firstName.Column.Name }, AssignedColumns(form, writes[1]));
-        Assert.All(
-            PagesInPositionOrder(form).Where(page => page.Page.PageId != firstNamePage.Page.PageId),
-            page => Assert.True(
-                !writes.Any(write => TargetTable(form, write) == RequireTable(page).Name),
-                Describe("The update wrote a page it submitted no field for.", writes)));
-
-        SnapshotDiff diff = SqlSnapshot.Compare(before, after);
-        Assert.True(
-            diff.AddedRows.Count == 0 && diff.RemovedRows.Count == 0 && diff.SchemaChanges.Count == 0,
-            diff.ToString());
-        Assert.Equal(
-            new[]
-            {
-                new SnapshotCellChange(
-                    form.Schema.BaseTable.Name,
-                    id,
-                    LastSaveTime(form),
-                    harness.Stamp(0).Time,
-                    harness.Stamp(1).Time),
-                new SnapshotCellChange(firstNameTable.Name, id, firstName.Column.Name, "F", "G"),
-            }.OrderBy(cell => cell.Table, StringComparer.Ordinal),
-            diff.ChangedCells.OrderBy(cell => cell.Table, StringComparer.Ordinal));
-
-        // The logon name is the same identity on both saves, so the diff cannot show it; it is read directly.
-        IReadOnlyDictionary<string, object> baseRow = Assert.Single(await ReadRowsAsync(
-            form.Schema.BaseTable,
-            RecordSqlBuilder.Require(form.Schema.GlobalRecordId),
-            id,
-            cancellationToken));
-        Assert.Equal(Environment.UserName, baseRow[RecordSqlBuilder.Require(form.Schema.LastSaveLogonName).Name]);
-    }
-
-    // AAP 0.3.4.6 and C-6, soft delete: the locked base read, then one base UPDATE of RecStatus and the last-save
-    // stamp; no page row is touched and nothing cascades. A repeated delete, or one of an unknown id, writes nothing.
-    [Fact]
-    public async Task SoftDeleteChangesOnlyBaseStatusAndStamps()
-    {
-        await TestDatabase.EnsureReachableAsync();
-        using var timeout = new CancellationTokenSource(RepositoryTestTimeout);
-        CancellationToken cancellationToken = timeout.Token;
-        await using var writeLock = await DatabaseWriteLock.AcquireExclusiveAsync(cancellationToken);
-
-        RepositoryHarness harness = RepositoryHarness.Create();
-        ReaderForm form = await ReaderForm.ReadAsync(TwoPageForm);
-        string marker = TestDatabase.NewMarker();
-        RecordDto inserted = await harness.Repository.InsertAsync(
-            form.Metadata,
-            Values(
-                ignoreCase: false,
-                (TestDatabase.MarkerField, FieldValue.FromText(marker)),
-                (PageTwoTextField, FieldValue.FromText("L-" + marker))),
-            harness.Stamp(0),
-            cancellationToken);
-        string id = inserted.GlobalRecordId;
-        string baseName = form.Schema.BaseTable.Name;
-        string recStatus = RecordSqlBuilder.Require(form.Schema.RecStatus).Name;
-
-        SqlSnapshot before = await SqlSnapshot.CaptureAsync(cancellationToken);
-        harness.Recorder.Clear();
-        SoftDeleteResult deleted =
-            await harness.Repository.SoftDeleteAsync(form.Metadata, id, harness.Stamp(1), cancellationToken);
-        IReadOnlyList<RecordedCommand> commands = harness.Recorder.Commands;
-        IReadOnlyList<RecordedCommand> writes = harness.Recorder.Writes();
-        SqlSnapshot afterDelete = await SqlSnapshot.CaptureAsync(cancellationToken);
-
-        Assert.Equal(SoftDeleteResult.Deleted, deleted);
-        AssertOneTransaction(commands);
-        RecordedCommand update = Assert.Single(writes);
-        Assert.Equal(("UPDATE", (string?)baseName), (Verb(update), TargetTable(form, update)));
-        Assert.Equal(
-            new[] { recStatus }.Concat(StampColumns(form)).Order(StringComparer.Ordinal),
-            AssignedColumns(form, update));
-        Assert.True(
-            commands.Any(command =>
-                command.Sequence < update.Sequence
-                && Verb(command) == "SELECT"
-                && TargetTable(form, command) == baseName
-                && command.CommandText.Contains("UPDLOCK", StringComparison.Ordinal)),
-            Describe("The soft delete did not lock the base row before its update.", commands));
-
-        // Two cells of the base row change; the page rows, both holding data, are left byte for byte as they were.
-        SnapshotDiff diff = SqlSnapshot.Compare(before, afterDelete);
-        Assert.True(
-            diff.AddedRows.Count == 0 && diff.RemovedRows.Count == 0 && diff.SchemaChanges.Count == 0,
-            diff.ToString());
-        Assert.True(
-            diff.ChangedCells.Count == 2
-            && diff.ChangedCells.All(cell => cell.Table == baseName && cell.GlobalRecordId == id),
-            diff.ToString());
-        SnapshotCellChange status = Assert.Single(diff.ChangedCells, cell => cell.Column == recStatus);
-        Assert.Equal(RecordQueryRules.ActiveRecStatus, Convert.ToInt32(status.OldValue, CultureInfo.InvariantCulture));
-        Assert.Equal(RecordQueryRules.DeletedRecStatus, Convert.ToInt32(status.NewValue, CultureInfo.InvariantCulture));
-        SnapshotCellChange stamped = Assert.Single(diff.ChangedCells, cell => cell.Column == LastSaveTime(form));
-        Assert.Equal(harness.Stamp(0).Time, stamped.OldValue);
-        Assert.Equal(harness.Stamp(1).Time, stamped.NewValue);
-
-        // A second delete finds RecStatus 0 and writes nothing, stamps included.
-        harness.Recorder.Clear();
-        SoftDeleteResult again =
-            await harness.Repository.SoftDeleteAsync(form.Metadata, id, harness.Stamp(2), cancellationToken);
-        Assert.Equal(SoftDeleteResult.AlreadyDeleted, again);
-        Assert.True(
-            harness.Recorder.Writes().Count == 0,
-            Describe("A repeated delete sent a write.", harness.Recorder.Commands));
-        SqlSnapshot afterRepeat = await SqlSnapshot.CaptureAsync(cancellationToken);
-        SnapshotDiff repeatDiff = SqlSnapshot.Compare(afterDelete, afterRepeat);
-        Assert.True(repeatDiff.IsEmpty, repeatDiff.ToString());
-        SnapshotRow? stored = afterRepeat.Row(baseName, id);
-        Assert.NotNull(stored);
-        Assert.Equal(harness.Stamp(1).Time, stored[LastSaveTime(form)]);
-
-        // An id the base table does not hold is not found, and nothing is written.
-        harness.Recorder.Clear();
-        SoftDeleteResult unknown = await harness.Repository.SoftDeleteAsync(
-            form.Metadata,
-            Guid.NewGuid().ToString(),
-            harness.Stamp(3),
-            cancellationToken);
-        Assert.Equal(SoftDeleteResult.NotFound, unknown);
-        Assert.True(
-            harness.Recorder.Writes().Count == 0,
-            Describe("A delete of an unknown id sent a write.", harness.Recorder.Commands));
-    }
-
-    // AAP 0.3.4.6: the locked read stops an update at RecStatus 0 (Deleted) or at a missing base row (NotFound), before
-    // the required gate runs and before any write.
-    [Fact]
-    public async Task UpdateOnDeletedRecordReturnsDeletedAndWritesNothing()
-    {
-        await TestDatabase.EnsureReachableAsync();
-        using var timeout = new CancellationTokenSource(RepositoryTestTimeout);
-        CancellationToken cancellationToken = timeout.Token;
-        await using var writeLock = await DatabaseWriteLock.AcquireExclusiveAsync(cancellationToken);
-
-        RepositoryHarness harness = RepositoryHarness.Create();
-        ReaderForm form = await ReaderForm.ReadAsync(TwoPageForm);
-        RecordDto inserted = await harness.Repository.InsertAsync(
-            form.Metadata,
-            Values(ignoreCase: false, (TestDatabase.MarkerField, FieldValue.FromText(TestDatabase.NewMarker()))),
-            harness.Stamp(0),
-            cancellationToken);
-        string id = inserted.GlobalRecordId;
-        Assert.Equal(
-            SoftDeleteResult.Deleted,
-            await harness.Repository.SoftDeleteAsync(form.Metadata, id, harness.Stamp(1), cancellationToken));
-        IReadOnlyDictionary<string, FieldValue> submitted =
-            Values(ignoreCase: false, (FirstNameField, FieldValue.FromText("X")));
-
-        var gate = new CountingGate();
-        SqlSnapshot before = await SqlSnapshot.CaptureAsync(cancellationToken);
-        harness.Recorder.Clear();
-        RecordWriteResult onDeleted = await harness.Repository.UpdateAsync(
-            form.Metadata,
-            id,
-            submitted,
-            harness.Stamp(2),
-            gate.Check,
-            permissions: null,
-            cancellationToken);
-        Assert.Equal(RecordWriteStatus.Deleted, onDeleted.Status);
-        Assert.Null(onDeleted.Record);
-        Assert.True(
-            harness.Recorder.Writes().Count == 0,
-            Describe("An update of a deleted record sent a write.", harness.Recorder.Commands));
-
-        harness.Recorder.Clear();
-        RecordWriteResult onUnknown = await harness.Repository.UpdateAsync(
-            form.Metadata,
-            Guid.NewGuid().ToString(),
-            submitted,
-            harness.Stamp(3),
-            gate.Check,
-            permissions: null,
-            cancellationToken);
-        Assert.Equal(RecordWriteStatus.NotFound, onUnknown.Status);
-        Assert.True(
-            harness.Recorder.Writes().Count == 0,
-            Describe("An update of an unknown id sent a write.", harness.Recorder.Commands));
-
-        Assert.Equal(0, gate.Calls);
-        SnapshotDiff diff = SqlSnapshot.Compare(before, await SqlSnapshot.CaptureAsync(cancellationToken));
-        Assert.True(diff.IsEmpty, diff.ToString());
-    }
-
-    // The form's pages in metaPages.Position order, then PageId, taken from the metadata rather than from the order the
-    // schema lists them in; every seeded page has its table.
-    private static IReadOnlyList<PageTableSchema> PagesInPositionOrder(ReaderForm form)
-    {
-        var pages = new List<PageTableSchema>();
-        foreach (PageMetadata page in form.Metadata.Pages.OrderBy(page => page.Position).ThenBy(page => page.PageId))
+        ProjectedColumn lastName = form.Column(LastNameField);
+        TableSchema lastNameTable = Assert.IsType<TableSchema>(form.PageOf(lastName.Field).Table);
+        string baseId = SqlIdentifier.Quote(RecordSqlBuilder.Require(form.Schema.GlobalRecordId));
+        string storedName = "n." + SqlIdentifier.Quote(lastName.Column);
+        string binaryName = storedName + " COLLATE " + BinaryCollation;
+        var sql = new StringBuilder("SELECT TOP (1) b.").Append(baseId).Append(", ").Append(storedName)
+            .Append(" FROM ").Append(SqlIdentifier.Quote(form.Schema.BaseTable)).Append(" b INNER JOIN ")
+            .Append(SqlIdentifier.Quote(lastNameTable)).Append(" n ON n.")
+            .Append(SqlIdentifier.Quote(RecordSqlBuilder.RequirePageKey(lastNameTable))).Append(" = b.").Append(baseId)
+            .Append(" WHERE b.").Append(SqlIdentifier.Quote(RecordSqlBuilder.Require(form.Schema.RecStatus)))
+            .Append(" = @recStatus AND ").Append(binaryName).Append(" LIKE @letterFirst AND ").Append(binaryName)
+            .Append(" NOT LIKE @nonLetter");
+        foreach (PageTableSchema page in form.Schema.Pages)
         {
-            PageTableSchema? schema = form.Schema.FindPage(page.PageId);
-            Assert.NotNull(schema);
-            _ = RequireTable(schema);
-            pages.Add(schema);
+            if (page.Table is { } table)
+            {
+                sql.Append(" AND EXISTS (SELECT 1 FROM ").Append(SqlIdentifier.Quote(table)).Append(" p WHERE p.")
+                    .Append(SqlIdentifier.Quote(RecordSqlBuilder.RequirePageKey(table))).Append(" = b.")
+                    .Append(baseId).Append(')');
+            }
         }
 
-        return pages.AsReadOnly();
-    }
-
-    private static TableSchema RequireTable(PageTableSchema page) => Assert.IsType<TableSchema>(page.Table);
-
-    // Every command of one write ran on its one connection, inside its transaction, and succeeded.
-    private static void AssertOneTransaction(IReadOnlyList<RecordedCommand> commands)
-    {
-        Assert.True(commands.Count > 0, "The write sent no command.");
-        Guid connection = commands[0].ClientConnectionId;
+        sql.Append(" ORDER BY b.").Append(SqlIdentifier.Quote(RecordSqlBuilder.Require(form.Schema.UniqueKey)));
+        await using SqlConnection connection = await TestDatabase.OpenConnectionAsync(cancellationToken);
+        await using var command = new SqlCommand(sql.ToString(), connection);
+        command.Parameters.Add("@recStatus", SqlDbType.SmallInt).Value = ActiveStatus;
+        command.Parameters.Add("@letterFirst", SqlDbType.NVarChar, LetterFirstPattern.Length).Value =
+            LetterFirstPattern;
+        command.Parameters.Add("@nonLetter", SqlDbType.NVarChar, NonLetterPattern.Length).Value = NonLetterPattern;
+        await using SqlDataReader reader = await command.ExecuteReaderAsync(cancellationToken);
         Assert.True(
-            commands.All(command =>
-                command.ClientConnectionId == connection
-                && command.InTransaction
-                && command.Completed
-                && command.Succeeded),
-            Describe(
-                "A command of the write ran on another connection or outside its transaction, or failed.",
-                commands));
+            await reader.ReadAsync(cancellationToken),
+            "The seeded form has no active record with a row on every page and a plain LastName.");
+        return (reader.GetString(0), reader.GetString(1));
     }
 
     // An assertion message that lists commands without their parameter values.
@@ -1373,184 +923,6 @@ public sealed class SqlRecordRepositoryTests : IAsyncLifetime
         return !command.IsWrite
             && (verb is "SELECT" or "WITH"
                 || (verb == "IF" && command.Operation.StartsWith("metadata.", StringComparison.Ordinal)));
-    }
-
-    // The first bracketed identifier of a command that names a table of the form, its base table or a page table;
-    // null for a command that names none, such as a metadata read.
-    private static string? TargetTable(ReaderForm form, RecordedCommand command)
-    {
-        var tables = new HashSet<string>(StringComparer.Ordinal) { form.Schema.BaseTable.Name };
-        foreach (PageTableSchema page in form.Schema.Pages)
-        {
-            if (page.Table is { } table)
-            {
-                tables.Add(table.Name);
-            }
-        }
-
-        return SqlCommandRecorder.BracketedIdentifiers(command.CommandText).FirstOrDefault(tables.Contains);
-    }
-
-    // The distinct bracketed identifiers of a command other than the excluded names, in ordinal order.
-    private static string[] IdentifiersExcept(RecordedCommand command, params string[] excluded) =>
-        SqlCommandRecorder.BracketedIdentifiers(command.CommandText)
-            .Where(name => !excluded.Contains(name, StringComparer.Ordinal))
-            .Distinct(StringComparer.Ordinal)
-            .Order(StringComparer.Ordinal)
-            .ToArray();
-
-    // The columns a base or page write assigns: its identifiers other than the form's tables and their key columns.
-    private static string[] AssignedColumns(ReaderForm form, RecordedCommand command)
-    {
-        var excluded = new List<string>
-        {
-            form.Schema.BaseTable.Name,
-            RecordSqlBuilder.Require(form.Schema.GlobalRecordId).Name,
-            RecordSqlBuilder.Require(form.Schema.UniqueKey).Name,
-        };
-        foreach (PageTableSchema page in form.Schema.Pages)
-        {
-            if (page.Table is { } table)
-            {
-                excluded.Add(table.Name);
-                excluded.Add(RecordSqlBuilder.RequirePageKey(table).Name);
-            }
-        }
-
-        return IdentifiersExcept(command, [.. excluded]);
-    }
-
-    // The base-table last-save stamp columns an update writes, in ordinal order.
-    private static string[] StampColumns(ReaderForm form) =>
-        new[]
-        {
-            RecordSqlBuilder.Require(form.Schema.LastSaveLogonName).Name,
-            LastSaveTime(form),
-        }.Order(StringComparer.Ordinal).ToArray();
-
-    private static string LastSaveTime(ReaderForm form) => RecordSqlBuilder.Require(form.Schema.LastSaveTime).Name;
-
-    // Every column of the rows of a table whose key column holds the id, raw as SqlClient returns them (DBNull for
-    // NULL), by a SELECT that names only reader-built identifiers and binds the id as a parameter.
-    private static async Task<IReadOnlyList<IReadOnlyDictionary<string, object>>> ReadRowsAsync(
-        TableSchema table,
-        ColumnSchema key,
-        string id,
-        CancellationToken cancellationToken)
-    {
-        string sql = "SELECT " + string.Join(", ", table.Columns.Select(column => SqlIdentifier.Quote(column))) +
-            " FROM " + SqlIdentifier.Quote(table) + " WHERE " + SqlIdentifier.Quote(key) + " = @id";
-        await using SqlConnection connection = await TestDatabase.OpenConnectionAsync(cancellationToken);
-        await using var command = new SqlCommand(sql, connection);
-        command.Parameters.Add(IdParameter(id));
-        await using SqlDataReader reader = await command.ExecuteReaderAsync(cancellationToken);
-        var rows = new List<IReadOnlyDictionary<string, object>>();
-        while (await reader.ReadAsync(cancellationToken))
-        {
-            var row = new Dictionary<string, object>(reader.FieldCount, StringComparer.Ordinal);
-            for (int ordinal = 0; ordinal < reader.FieldCount; ordinal++)
-            {
-                row.Add(reader.GetName(ordinal), reader.GetValue(ordinal));
-            }
-
-            rows.Add(row);
-        }
-
-        return rows.AsReadOnly();
-    }
-
-    // Deletes the rows of a table whose key column holds the id, by reader-built identifiers and a parameter, and
-    // returns how many it removed. Used only for the page-two row of a record the test created.
-    private static async Task<int> DeleteRowAsync(
-        TableSchema table,
-        ColumnSchema key,
-        string id,
-        CancellationToken cancellationToken)
-    {
-        await using SqlConnection connection = await TestDatabase.OpenConnectionAsync(cancellationToken);
-        await using var command = new SqlCommand(
-            "DELETE FROM " + SqlIdentifier.Quote(table) + " WHERE " + SqlIdentifier.Quote(key) + " = @id",
-            connection);
-        command.Parameters.Add(IdParameter(id));
-        return await command.ExecuteNonQueryAsync(cancellationToken);
-    }
-
-    // The number of base rows of the active set, or of every row, whose UniqueKey is at most the given key, or all of
-    // them when no key is given: the expected navigation coordinates, computed by SQL in the test.
-    private static async Task<int> CountBaseRowsAsync(
-        ReaderForm form,
-        int? atMostUniqueKey,
-        bool activeOnly,
-        CancellationToken cancellationToken)
-    {
-        await using SqlConnection connection = await TestDatabase.OpenConnectionAsync(cancellationToken);
-        await using var command = new SqlCommand { Connection = connection };
-        var conditions = new List<string>();
-        if (activeOnly)
-        {
-            conditions.Add(SqlIdentifier.Quote(RecordSqlBuilder.Require(form.Schema.RecStatus)) + " = @recStatus");
-            command.Parameters.Add("@recStatus", SqlDbType.Int).Value = RecordQueryRules.ActiveRecStatus;
-        }
-
-        if (atMostUniqueKey is int uniqueKey)
-        {
-            conditions.Add(SqlIdentifier.Quote(RecordSqlBuilder.Require(form.Schema.UniqueKey)) + " <= @uniqueKey");
-            command.Parameters.Add("@uniqueKey", SqlDbType.Int).Value = uniqueKey;
-        }
-
-        var sql = new StringBuilder("SELECT COUNT_BIG(*) FROM ").Append(SqlIdentifier.Quote(form.Schema.BaseTable));
-        if (conditions.Count > 0)
-        {
-            sql.Append(" WHERE ").AppendJoin(" AND ", conditions);
-        }
-
-        command.CommandText = sql.ToString();
-        object? count = await command.ExecuteScalarAsync(cancellationToken);
-        return checked((int)Assert.IsType<long>(count));
-    }
-
-    private static SqlParameter IdParameter(string id) => new("@id", SqlDbType.NVarChar, -1) { Value = id };
-
-    // An update's required gate that always passes and counts its calls, so a test can tell whether the locked read
-    // stopped the update before the gate ran.
-    private sealed class CountingGate
-    {
-        public int Calls { get; private set; }
-
-        public RecordValidationResult Check(StoredRecord stored)
-        {
-            Calls++;
-            return RecordValidationResult.Success(stored.Values);
-        }
-    }
-
-    // The repository as the store builds it, over one recorder that hears every command the repository and its
-    // metadata reader send, with the save stamps of one test: whole seconds, the precision legacy stores, one minute
-    // apart, so each write's LastSaveTime differs from every earlier stamp of the test and a change is asserted as one.
-    private sealed class RepositoryHarness
-    {
-        private readonly DateTime _start = SaveStamp.TruncateToSeconds(DateTime.Now);
-
-        private RepositoryHarness(SqlCommandRecorder recorder, SqlRecordRepository repository)
-        {
-            Recorder = recorder;
-            Repository = repository;
-        }
-
-        public SqlCommandRecorder Recorder { get; }
-
-        public SqlRecordRepository Repository { get; }
-
-        public static RepositoryHarness Create()
-        {
-            var options = new DatabaseOptions(TestDatabase.ConnectionString);
-            var recorder = new SqlCommandRecorder();
-            var factory = new SqlConnectionFactory(options);
-            var reader = new SqlMetadataReader(factory, options, recorder);
-            return new RepositoryHarness(recorder, new SqlRecordRepository(factory, reader, options, recorder));
-        }
-
-        public SaveStamp Stamp(int minute) => new(Environment.UserName, _start.AddMinutes(minute));
     }
 
     // A base row's stored id and key, as a by-id statement returned them.
@@ -1755,14 +1127,15 @@ public sealed class SqlRecordRepositoryTests : IAsyncLifetime
                 RecordSqlBuilder.RecordUniqueKeyOrdinal);
 
         // Picks by SQL the active base row with the lowest UniqueKey that has a row on every page table, a record Find
-        // can return. The statement names only reader-built identifiers and holds no value, so it has no parameter.
+        // can return. The statement names only reader-built identifiers and binds the test's active status as
+        // @activeStatus, typed as the smallint RecStatus column of both seeded base tables.
         public async Task<IdRow> ReadCompleteActiveRowAsync()
         {
             string baseId = SqlIdentifier.Quote(GlobalRecordIdColumn);
             string uniqueKey = SqlIdentifier.Quote(RecordSqlBuilder.Require(Schema.UniqueKey));
             var sql = new StringBuilder("SELECT TOP (1) b.").Append(baseId).Append(", b.").Append(uniqueKey)
                 .Append(" FROM ").Append(SqlIdentifier.Quote(Schema.BaseTable)).Append(" b WHERE b.")
-                .Append(SqlIdentifier.Quote(RecordSqlBuilder.Require(Schema.RecStatus))).Append(" = 1");
+                .Append(SqlIdentifier.Quote(RecordSqlBuilder.Require(Schema.RecStatus))).Append(" = @activeStatus");
             foreach (PageTableSchema page in Schema.Pages)
             {
                 if (page.Table is { } table)
@@ -1779,7 +1152,9 @@ public sealed class SqlRecordRepositoryTests : IAsyncLifetime
                 transaction: null,
                 _commandTimeoutSeconds,
                 _observer,
-                new SqlStatement(sql.ToString(), Array.Empty<SqlParameterValue>()),
+                new SqlStatement(
+                    sql.ToString(),
+                    [new SqlParameterValue("@activeStatus", DbType.Int16, ActiveStatus, Size: null)]),
                 globalRecordIdOrdinal: 0,
                 uniqueKeyOrdinal: 1);
             Assert.True(rows.Count == 1, "The seeded form has no active record with a row on every page.");
@@ -1906,12 +1281,12 @@ internal static class PageInsert
 /// <para>
 /// The class is read-only and seed-backed: it creates no record and sends only <c>SELECT</c> statements, the
 /// builder's through <see cref="SqlExecution"/> and the command recorder, and the direct queries. Tests may write only
-/// records created through the API, or through the repository the API's store forwards to as the write cases of
-/// <see cref="SqlRecordRepositoryTests"/> do to pin that path, and the few fixtures AAP 0.3.7 ("Data reach of tests")
-/// lists. This class pins the list and Find SQL against the seeded rows alone, so cases that need a stored literal
-/// pattern character belong to <c>ListAndSearchTests</c>. Each test holds the shared <see cref="DatabaseWriteLock"/>
-/// for its whole body, so the seeded rows its expected values come from cannot move, and ends by asserting that the
-/// recorder saw no write.
+/// records created through the API and the few fixtures AAP 0.3.7 ("Data reach of tests") lists, and this assembly
+/// cannot reach the API, so it writes nothing; the repository's write proofs are <c>SqlRecordRepositoryWriteTests</c>
+/// in <c>EpiInfo.Api.Tests</c>. This class pins the list and Find SQL against the seeded rows alone, so cases that
+/// need a stored literal pattern character belong to <c>ListAndSearchTests</c>. Each test holds the shared
+/// <see cref="DatabaseWriteLock"/> for its whole body, so the seeded rows its expected values come from cannot move,
+/// and ends by asserting that the recorder saw no write.
 /// </para>
 /// </remarks>
 [Trait("Category", "Integration")]
@@ -1954,6 +1329,10 @@ public sealed class ListAndFindSqlTests
     // many in all, which keeps every match under the cap.
     private const int RecordsBeforeFirstDeleted = 25;
     private const int SearchedRecords = 150;
+
+    // The RecStatus of an active record (AAP 0.3.4.6), a smallint in both seeded base tables: the test's own value
+    // rather than the production rules' constant.
+    private const short ActiveStatus = 1;
 
     // Covers a wait of up to 300 seconds for the test lock and the work behind it.
     private static readonly TimeSpan TestTimeout = TimeSpan.FromMinutes(10);
@@ -2291,7 +1670,7 @@ public sealed class ListAndFindSqlTests
 
         var form = await FormUnderTest.LoadAsync(formName, cancellationToken);
         var complete = await form.PlacedCompleteRecordsAsync(cancellationToken);
-        var firstDeleted = complete.FindIndex(record => record.RecStatus != RecordQueryRules.ActiveRecStatus);
+        var firstDeleted = complete.FindIndex(record => record.RecStatus != ActiveStatus);
         Assert.True(firstDeleted >= 0, $"No deleted {formName} record has a row on every page.");
         var window = complete
             .Skip(Math.Max(0, firstDeleted - RecordsBeforeFirstDeleted))
@@ -2299,11 +1678,11 @@ public sealed class ListAndFindSqlTests
             .ToArray();
         Assert.True(
             window.Any(record =>
-                record.RecStatus == RecordQueryRules.ActiveRecStatus && record.ActivePosition != record.EveryPosition),
+                record.RecStatus == ActiveStatus && record.ActivePosition != record.EveryPosition),
             $"The {formName} window holds no active record that the two sets place differently.");
 
         var selected = window
-            .Where(record => includeDeleted || record.RecStatus == RecordQueryRules.ActiveRecStatus)
+            .Where(record => includeDeleted || record.RecStatus == ActiveStatus)
             .ToArray();
         var expected = selected
             .Select(record => new PlacedRow(
@@ -2552,11 +1931,12 @@ public sealed class ListAndFindSqlTests
             var uniqueKey = SqlIdentifier.Quote(RecordSqlBuilder.Require(Schema.UniqueKey));
             var recStatus = SqlIdentifier.Quote(RecordSqlBuilder.Require(Schema.RecStatus));
             var placed = $"(SELECT COUNT_BIG(*) FROM {baseTable} s WHERE s.{uniqueKey} <= b.{uniqueKey}";
-            var sql = $"SELECT b.{baseId}, b.{uniqueKey}, b.{recStatus}, {placed} AND s.{recStatus} = 1), {placed})" +
-                $"{from} ORDER BY b.{uniqueKey};";
+            var sql = $"SELECT b.{baseId}, b.{uniqueKey}, b.{recStatus}, {placed} AND s.{recStatus} = @activeStatus)," +
+                $" {placed}){from} ORDER BY b.{uniqueKey};";
 
             await using var connection = await TestDatabase.OpenConnectionAsync(cancellationToken);
             await using var command = new SqlCommand(sql, connection) { CommandTimeout = Options.CommandTimeoutSeconds };
+            command.Parameters.Add(ActiveStatusParameter());
             await using var reader = await command.ExecuteReaderAsync(cancellationToken);
             var records = new List<PlacedRecord>();
             while (await reader.ReadAsync(cancellationToken))
@@ -2585,8 +1965,7 @@ public sealed class ListAndFindSqlTests
         {
             var (from, criterionColumn) = FindSource(fieldName);
 
-            // A bit is compared with the literal 1 or 0, any other operand with a parameter typed as its column.
-            var operandText = operand is bool flag ? (flag ? "1" : "0") : "@operand";
+            // The operand is a parameter typed as its column: datetime, float, or bit for a checkbox state.
             var parameters = new List<SqlParameter>();
             switch (operand)
             {
@@ -2596,13 +1975,14 @@ public sealed class ListAndFindSqlTests
                 case double number:
                     parameters.Add(new SqlParameter("@operand", SqlDbType.Float) { Value = number });
                     break;
-                case bool:
+                case bool flag:
+                    parameters.Add(new SqlParameter("@operand", SqlDbType.Bit) { Value = flag });
                     break;
                 default:
                     throw new ArgumentException("The operand is not a date, a number or a checkbox state.", nameof(operand));
             }
 
-            return await DirectFindAsync(from, $"{criterionColumn} {comparison} {operandText}", parameters, cancellationToken);
+            return await DirectFindAsync(from, $"{criterionColumn} {comparison} @operand", parameters, cancellationToken);
         }
 
         /// <summary>
@@ -2631,8 +2011,9 @@ public sealed class ListAndFindSqlTests
                 {
                     var name = "@segment" + terms.Count.ToString(CultureInfo.InvariantCulture);
                     parameters.Add(TextParameter(name, text));
-                    terms.Add(string.Create(
-                        CultureInfo.InvariantCulture, $"SUBSTRING({criterionColumn}, {start}, {text.Length}) = {name}"));
+                    parameters.Add(new SqlParameter(name + "Start", SqlDbType.Int) { Value = start });
+                    parameters.Add(new SqlParameter(name + "Length", SqlDbType.Int) { Value = text.Length });
+                    terms.Add($"SUBSTRING({criterionColumn}, {name}Start, {name}Length) = {name}");
                 }
 
                 predicate = string.Join(" AND ", terms);
@@ -2651,7 +2032,7 @@ public sealed class ListAndFindSqlTests
             CancellationToken cancellationToken) =>
             MostFrequentAsync(
                 fieldName,
-                value => fractionalOnly ? $" AND {value} <> FLOOR({value})" : string.Empty,
+                value => (fractionalOnly ? $" AND {value} <> FLOOR({value})" : string.Empty, []),
                 cancellationToken);
 
         /// <summary>
@@ -2665,8 +2046,16 @@ public sealed class ListAndFindSqlTests
             CancellationToken cancellationToken) =>
             Assert.IsType<string>(await MostFrequentAsync(
                 fieldName,
-                value => string.Create(CultureInfo.InvariantCulture, $" AND LEN({value}) >= {minimumLength}") +
-                    $" AND PATINDEX(N'%[^A-Za-z]%', {value} COLLATE {BinaryCollation}) = 0",
+                value => (
+                    $" AND LEN({value}) >= @minimumLength" +
+                        $" AND PATINDEX(@nonLetterPattern, {value} COLLATE {BinaryCollation}) = 0",
+                    [
+                        new SqlParameter("@minimumLength", SqlDbType.Int) { Value = minimumLength },
+                        new SqlParameter("@nonLetterPattern", SqlDbType.NVarChar, NonLetterPattern.Length)
+                        {
+                            Value = NonLetterPattern,
+                        },
+                    ]),
                 cancellationToken));
 
         /// <summary>The number of stored values of a <c>datetime</c> field, in any record, that carry a time of day.</summary>
@@ -2674,10 +2063,11 @@ public sealed class ListAndFindSqlTests
         {
             var (table, column) = PageColumn(fieldName);
             var sql = $"SELECT COUNT_BIG(*) FROM {table} WHERE {column} IS NOT NULL" +
-                $" AND CAST({column} AS time) <> CAST('00:00:00' AS time);";
+                $" AND CAST({column} AS time) <> @midnight;";
 
             await using var connection = await TestDatabase.OpenConnectionAsync(cancellationToken);
             await using var command = new SqlCommand(sql, connection) { CommandTimeout = Options.CommandTimeoutSeconds };
+            command.Parameters.Add(new SqlParameter("@midnight", SqlDbType.Time) { Value = TimeSpan.Zero });
             return Assert.IsType<long>(await command.ExecuteScalarAsync(cancellationToken));
         }
 
@@ -2720,24 +2110,28 @@ public sealed class ListAndFindSqlTests
         }
 
         // The most frequent non-null stored value of a field among active base rows that also meet the condition
-        // written on the value's column reference, ties broken by the smaller value.
+        // written on the value's column reference, ties broken by the smaller value. The condition returns its SQL
+        // text and the parameters that text names.
         private async Task<object> MostFrequentAsync(
             string fieldName,
-            Func<string, string> condition,
+            Func<string, (string Text, SqlParameter[] Parameters)> condition,
             CancellationToken cancellationToken)
         {
             var (table, column) = PageColumn(fieldName);
             var value = $"t.{column}";
             var baseId = SqlIdentifier.Quote(RecordSqlBuilder.Require(Schema.GlobalRecordId));
             var recStatus = SqlIdentifier.Quote(RecordSqlBuilder.Require(Schema.RecStatus));
+            var (conditionText, conditionParameters) = condition(value);
             var sql = $"SELECT TOP (1) {value} FROM {SqlIdentifier.Quote(Schema.BaseTable)} b" +
                 $" INNER JOIN {table} t ON t.{PageKey(fieldName)} = b.{baseId}" +
-                $" WHERE b.{recStatus} = 1 AND {value} IS NOT NULL" +
-                condition(value) +
+                $" WHERE b.{recStatus} = @activeStatus AND {value} IS NOT NULL" +
+                conditionText +
                 $" GROUP BY {value} ORDER BY COUNT_BIG(*) DESC, {value};";
 
             await using var connection = await TestDatabase.OpenConnectionAsync(cancellationToken);
             await using var command = new SqlCommand(sql, connection) { CommandTimeout = Options.CommandTimeoutSeconds };
+            command.Parameters.Add(ActiveStatusParameter());
+            command.Parameters.AddRange(conditionParameters);
             var result = await command.ExecuteScalarAsync(cancellationToken);
             Assert.NotNull(result);
             Assert.IsNotType<DBNull>(result);
@@ -2784,14 +2178,19 @@ public sealed class ListAndFindSqlTests
             CancellationToken cancellationToken)
         {
             var baseId = SqlIdentifier.Quote(RecordSqlBuilder.Require(Schema.GlobalRecordId));
-            var where = $" WHERE b.{SqlIdentifier.Quote(RecordSqlBuilder.Require(Schema.RecStatus))} = 1 AND {predicate}";
+            var where = $" WHERE b.{SqlIdentifier.Quote(RecordSqlBuilder.Require(Schema.RecStatus))} = @activeStatus" +
+                $" AND {predicate}";
             var sql = $"SELECT TOP (@cap) b.{baseId}{from}{where}" +
                 $" ORDER BY b.{SqlIdentifier.Quote(RecordSqlBuilder.Require(Schema.UniqueKey))};" +
                 $" SELECT COUNT_BIG(*){from}{where};";
 
             var (ids, total) = await ReadIdsAndTotalAsync(
                 sql,
-                [new SqlParameter("@cap", SqlDbType.Int) { Value = RecordQueryRules.SearchCap }, .. parameters],
+                [
+                    new SqlParameter("@cap", SqlDbType.Int) { Value = RecordQueryRules.SearchCap },
+                    ActiveStatusParameter(),
+                    .. parameters,
+                ],
                 cancellationToken);
             return new FindRows(ids, total);
         }
@@ -2822,7 +2221,7 @@ public sealed class ListAndFindSqlTests
             }
 
             Assert.NotEmpty(terms);
-            var where = $" WHERE b.{SqlIdentifier.Quote(RecordSqlBuilder.Require(Schema.RecStatus))} = 1" +
+            var where = $" WHERE b.{SqlIdentifier.Quote(RecordSqlBuilder.Require(Schema.RecStatus))} = @activeStatus" +
                 $" AND ({string.Join(" OR ", terms)})";
             var sql = $"SELECT TOP (@pageSize) b.{baseId}{from}{where}" +
                 $" ORDER BY b.{SqlIdentifier.Quote(RecordSqlBuilder.Require(Schema.UniqueKey))};" +
@@ -2833,6 +2232,7 @@ public sealed class ListAndFindSqlTests
                 [
                     TextParameter("@q", q),
                     new SqlParameter("@pageSize", SqlDbType.Int) { Value = RecordQueryRules.MaxPageSize },
+                    ActiveStatusParameter(),
                 ],
                 cancellationToken);
             return new ListRows(ids, total);
@@ -2866,6 +2266,14 @@ public sealed class ListAndFindSqlTests
         // A text parameter of a direct query, nvarchar(max), so it takes the collation of the column it is compared with.
         private static SqlParameter TextParameter(string name, string value) =>
             new(name, SqlDbType.NVarChar, -1) { Value = value };
+
+        // The pattern of any character that is not an ASCII letter, read exactly under BinaryCollation.
+        private const string NonLetterPattern = "%[^A-Za-z]%";
+
+        // The test's active status as @activeStatus of a direct query, typed as the smallint RecStatus column of both
+        // seeded base tables.
+        private static SqlParameter ActiveStatusParameter() =>
+            new("@activeStatus", SqlDbType.SmallInt) { Value = ActiveStatus };
 
         private static async Task<FindRows> ReadFindRowsAsync(DbDataReader reader, CancellationToken cancellationToken)
         {
@@ -2922,10 +2330,13 @@ public sealed class ListAndFindSqlTests
 /// <remarks>
 /// <para>
 /// Criteria are written as a client writes them and parsed by <see cref="SearchCriteriaParser"/> over the form's data
-/// fields; their values are read from the database by direct SQL, from active records with a row on every page, so
-/// each search matches something whatever rows the database holds. No count is hard-coded: every expected result is
-/// another statement's result, the per-alternative statement or the union of per-alternative statements over chunks
-/// of the alternatives.
+/// fields; their values are read from the database by direct SQL, from seeded active records with a row on every page,
+/// so each search matches something whatever rows the database holds. Every record a test creates carries a test
+/// marker at the start of <c>LastName</c>, so the samples leave out each record whose <c>LastName</c> starts with
+/// <see cref="TestDatabase.MarkerPrefix"/>: records other tests leave behind, such as a <c>LastName</c> at the
+/// column's full length, never become a criterion, and a rerun draws the same values. No count is hard-coded: every
+/// expected result is another statement's result, the per-alternative statement or the union of per-alternative
+/// statements over chunks of the alternatives.
 /// </para>
 /// <para>
 /// The tests only read. Each holds the shared <see cref="DatabaseWriteLock"/>, because it compares the results of
@@ -2984,6 +2395,18 @@ public sealed class SearchStatementBoundsTests : IAsyncLifetime
     // The most rows the threshold searches' seeded values may match, so that each chunk's result and the union stay
     // under the 200-row cap and are therefore complete.
     private const int MaxSeededMatches = 120;
+
+    // The RecStatus of an active record (C-16), a value the test owns, and the most rows a sample reads.
+    private const short ActiveStatus = 1;
+    private const int SampleRows = 40;
+
+    // The seeded active rows of CompleteRecords, as a WHERE clause whose values AddSeededActiveParameters binds: an
+    // active record whose LastName, p1 on both forms, is NULL or does not start with the test marker prefix. Every
+    // record a test creates starts its LastName with a marker; the one exception, the C-10 record of unchecked
+    // checkboxes only, is NULL in every sampled column but GlobalRecordId.
+    private const string SeededActiveRecords =
+        " WHERE b.[RecStatus] = @activeStatus"
+        + " AND (p1.[LastName] IS NULL OR LEFT(p1.[LastName], @markerPrefixLength) <> @markerPrefix)";
 
     private static readonly TimeSpan TestTimeout = TimeSpan.FromMinutes(10);
 
@@ -3068,7 +2491,7 @@ public sealed class SearchStatementBoundsTests : IAsyncLifetime
         await using var connection = await TestDatabase.OpenConnectionAsync(token);
         var form = await ReadFormAsync(connection, CaseReport, token);
 
-        var seeded = await SeededLastNamesAsync(connection, token);
+        var seeded = await SeededLastNamesAsync(connection, form, token);
         var excluded = await FirstActiveIdAsync(connection, seeded[0], token);
         var alternatives = ThresholdAlternatives(seeded, size);
         var condition = Assert.Single(Parse(form, [Text("LastName", string.Join(" or ", alternatives))]));
@@ -3206,7 +2629,7 @@ public sealed class SearchStatementBoundsTests : IAsyncLifetime
         await using var connection = await TestDatabase.OpenConnectionAsync(token);
         var form = await ReadFormAsync(connection, CaseReport, token);
         var field = Assert.Single(form.DataFields, candidate => candidate.Name == "LastName");
-        var seeded = await SeededLastNamesAsync(connection, token);
+        var seeded = await SeededLastNamesAsync(connection, form, token);
         Assert.True(seeded.Count >= 2, "The database holds too few seeded LastName values.");
 
         var condition = new SearchCondition(
@@ -3410,11 +2833,7 @@ public sealed class SearchStatementBoundsTests : IAsyncLifetime
     // each, spread evenly across the list, and values that match nothing in the rest.
     private static string[] ThresholdAlternatives(IReadOnlyList<string> seeded, int size)
     {
-        var matching = seeded
-            .SelectMany(value => value.Length > 1
-                ? new[] { value, value + "*", "*" + value[1..] }
-                : new[] { value, value + "*" })
-            .ToArray();
+        var matching = seeded.SelectMany(ThresholdAlternativesOf).ToArray();
         Assert.True(matching.Length < size);
 
         var alternatives = new string[size];
@@ -3430,16 +2849,47 @@ public sealed class SearchStatementBoundsTests : IAsyncLifetime
         return alternatives;
     }
 
-    // Seeded LastName values of active CaseReport records, fewest matches first, while their matches together stay
-    // within MaxSeededMatches; at least two, so excluding one record leaves a match.
+    // A seeded value's threshold alternatives: the value, and its trailing and leading wildcard patterns; a
+    // one-character value has no leading pattern.
+    private static string[] ThresholdAlternativesOf(string value) =>
+        value.Length > 1 ? [value, value + "*", "*" + value[1..]] : [value, value + "*"];
+
+    // Whether a value's threshold alternatives each fit the character length of the LastName column the reader
+    // describes and parse as one LastName condition with one alternative each. A value at the column's full length
+    // fails: its trailing pattern is one character longer, which the parser refuses.
+    private static bool FitsThresholdSearch(SeededForm form, ColumnMetadata column, string value)
+    {
+        var alternatives = ThresholdAlternativesOf(value);
+        if (column.MaxCharacters is { } maxCharacters
+            && alternatives.Any(alternative => alternative.Length > maxCharacters))
+        {
+            return false;
+        }
+
+        var parsed = SearchCriteriaParser.Parse(form.DataFields, [Text("LastName", Or(alternatives))]);
+        return parsed.IsSuccess
+            && parsed.Conditions.Count == 1
+            && parsed.Conditions[0].Alternatives.Count == alternatives.Length;
+    }
+
+    // LastName values of seeded active CaseReport records, fewest matches first, while their matches together stay
+    // within MaxSeededMatches; at least two, so excluding one record leaves a match. Records other tests create are
+    // left out by their marker, so they neither become a value nor crowd the seeded values out, and a value is taken
+    // only when its threshold alternatives fit the column and parse.
     private static async Task<IReadOnlyList<string>> SeededLastNamesAsync(
         SqlConnection connection,
+        SeededForm form,
         CancellationToken token)
     {
+        var field = Assert.Single(form.DataFields, candidate => candidate.Name == "LastName");
+        var column = form.Schema.FindDataColumn(field);
+        Assert.NotNull(column);
+
         var sql = "SELECT p1.[LastName], COUNT_BIG(*) FROM " + CompleteRecords[CaseReport]
-            + " WHERE b.[RecStatus] = 1 AND p1.[LastName] IS NOT NULL GROUP BY p1.[LastName]"
+            + SeededActiveRecords + " AND p1.[LastName] IS NOT NULL GROUP BY p1.[LastName]"
             + " ORDER BY COUNT_BIG(*), p1.[LastName]";
         await using var command = new SqlCommand(sql, connection);
+        AddSeededActiveParameters(command);
         await using var reader = await command.ExecuteReaderAsync(token);
 
         var values = new List<string>();
@@ -3448,7 +2898,7 @@ public sealed class SearchStatementBoundsTests : IAsyncLifetime
         {
             var value = reader.GetString(0);
             var count = reader.GetInt64(1);
-            if (!IsPlainCriterionText(value))
+            if (!IsPlainCriterionText(value) || !FitsThresholdSearch(form, column.Metadata, value))
             {
                 continue;
             }
@@ -3473,14 +2923,15 @@ public sealed class SearchStatementBoundsTests : IAsyncLifetime
         CancellationToken token)
     {
         var sql = "SELECT TOP (1) b.[GlobalRecordId] FROM " + CompleteRecords[CaseReport]
-            + " WHERE b.[RecStatus] = 1 AND p1.[LastName] = @lastName ORDER BY b.[UniqueKey]";
+            + " WHERE b.[RecStatus] = @activeStatus AND p1.[LastName] = @lastName ORDER BY b.[UniqueKey]";
         await using var command = new SqlCommand(sql, connection);
+        command.Parameters.Add(new SqlParameter("@activeStatus", SqlDbType.SmallInt) { Value = ActiveStatus });
         command.Parameters.Add(new SqlParameter("@lastName", SqlDbType.NVarChar, -1) { Value = lastName });
         var id = await command.ExecuteScalarAsync(token);
         return Assert.IsType<string>(id);
     }
 
-    // Up to count distinct values of one column of the form's complete active records, as criterion text.
+    // Up to count distinct values of one column of the form's seeded complete active records, as criterion text.
     private static async Task<IReadOnlyList<string>> SampleAsync(
         SqlConnection connection,
         string formName,
@@ -3488,9 +2939,11 @@ public sealed class SearchStatementBoundsTests : IAsyncLifetime
         int count,
         CancellationToken token)
     {
-        var sql = "SELECT DISTINCT TOP (40) " + expression + " AS [v] FROM " + CompleteRecords[formName]
-            + " WHERE b.[RecStatus] = 1 AND " + expression + " IS NOT NULL ORDER BY [v]";
+        var sql = "SELECT DISTINCT TOP (@sampleRows) " + expression + " AS [v] FROM " + CompleteRecords[formName]
+            + SeededActiveRecords + " AND " + expression + " IS NOT NULL ORDER BY [v]";
         await using var command = new SqlCommand(sql, connection);
+        AddSeededActiveParameters(command);
+        command.Parameters.Add(new SqlParameter("@sampleRows", SqlDbType.Int) { Value = SampleRows });
         await using var reader = await command.ExecuteReaderAsync(token);
 
         var values = new List<string>();
@@ -3506,18 +2959,21 @@ public sealed class SearchStatementBoundsTests : IAsyncLifetime
         return values;
     }
 
-    // One complete active record's values of the columns, as criterion text, for a multi-field search it must match.
+    // One seeded complete active record's values of the columns, as criterion text, for a multi-field search it must
+    // match.
     private static async Task<IReadOnlyList<string>> AnchorAsync(
         SqlConnection connection,
         string formName,
         IReadOnlyList<string> expressions,
         CancellationToken token)
     {
-        var sql = "SELECT TOP (40) " + string.Join(", ", expressions) + " FROM " + CompleteRecords[formName]
-            + " WHERE b.[RecStatus] = 1 AND "
+        var sql = "SELECT TOP (@sampleRows) " + string.Join(", ", expressions) + " FROM " + CompleteRecords[formName]
+            + SeededActiveRecords + " AND "
             + string.Join(" AND ", expressions.Select(expression => expression + " IS NOT NULL"))
             + " ORDER BY b.[UniqueKey]";
         await using var command = new SqlCommand(sql, connection);
+        AddSeededActiveParameters(command);
+        command.Parameters.Add(new SqlParameter("@sampleRows", SqlDbType.Int) { Value = SampleRows });
         await using var reader = await command.ExecuteReaderAsync(token);
 
         while (await reader.ReadAsync(token))
@@ -3539,6 +2995,20 @@ public sealed class SearchStatementBoundsTests : IAsyncLifetime
 
         Assert.Fail($"{formName} holds no record with every anchor value.");
         return [];
+    }
+
+    // Binds the values of SeededActiveRecords: the active status as the smallint RecStatus column, the marker prefix
+    // and its length.
+    private static void AddSeededActiveParameters(SqlCommand command)
+    {
+        command.Parameters.Add(new SqlParameter("@activeStatus", SqlDbType.SmallInt) { Value = ActiveStatus });
+        command.Parameters.Add(
+            new SqlParameter("@markerPrefix", SqlDbType.NVarChar, TestDatabase.MarkerPrefix.Length)
+            {
+                Value = TestDatabase.MarkerPrefix,
+            });
+        command.Parameters.Add(
+            new SqlParameter("@markerPrefixLength", SqlDbType.Int) { Value = TestDatabase.MarkerPrefix.Length });
     }
 
     // A stored value as the text a client would search it with, or null when the parser would not read it back as

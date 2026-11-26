@@ -8,12 +8,21 @@
 // Loading the form or a record sends GETs only and raises no field event (DATA-01): no
 // effect here calls a save or a field-event handler. Fields render only through
 // FieldRenderer and its field component map.
-import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+  type RefObject,
+} from 'react';
 
 import { apiClient, type ApiClient } from '../api/client';
 import { describeError, isAbortError, networkError, type ApiError } from '../api/errors';
-import type { FieldDefinition, FormDefinition, PageDefinition } from '../api/types';
-import { useRecordEditor, type BannerAction, type EditorBanner, type RecordEditor } from '../state/useRecordEditor';
+import type { DialogMessage, FieldDefinition, FormDefinition, PageDefinition } from '../api/types';
+import { useRecordEditor, type BannerAction, type EditorBanner } from '../state/useRecordEditor';
 import { useRecordNavigation } from '../state/useRecordNavigation';
 import { isDataField } from '../validation/clientValidation';
 import { ConfirmDialog } from './ConfirmDialog';
@@ -59,8 +68,11 @@ const DELETE = 'Delete';
 const FIND = 'Find';
 
 const LOADING_TEXT = 'Loading form…';
+const LOAD_FAILED_TEXT = 'The form could not be loaded.';
 const FORM_NOT_FOUND_TEXT = 'This form no longer exists.';
 const DELETED_TEXT = 'This record is deleted and is read-only.';
+// A status, not a control, so the toolbar-name rule above does not reach it.
+const SAVING_TEXT = 'Saving…';
 const RETRY = 'Retry';
 const DISMISS = 'Dismiss';
 const DISCARD_EDITS = 'Discard edits';
@@ -142,7 +154,19 @@ export function FormView({
     };
   }, [client, viewId, attempt]);
 
+  // Retry removes its own button and the toolbar while the definition reloads, which would
+  // drop focus to the page body. The status line stays one element from failure to loading
+  // and back, so it takes focus first and keeps it, one Tab before a repeated failure's Retry.
+  const statusRef = useRef<HTMLParagraphElement>(null);
+  // The workspace's heading, which takes focus once a retried load succeeds.
+  const headingRef = useRef<HTMLHeadingElement>(null);
+  // Set by Retry until its load settles. The first load moves no focus: the shell focuses
+  // its own title when a form opens.
+  const retriedRef = useRef(false);
+
   const reload = useCallback(() => {
+    statusRef.current?.focus();
+    retriedRef.current = true;
     setState(LOADING_STATE);
     setAttempt((previous) => previous + 1);
   }, []);
@@ -153,16 +177,32 @@ export function FormView({
   const formNotFound = current.status === 'failed' && current.error.kind === 'notFound' ? current.error : null;
   useReportOnce(formNotFound, onFormNotFound);
 
+  // A layout effect, so the heading takes focus in the commit that removes the status line,
+  // before the browser paints: focus never rests on the page body in between.
+  useLayoutEffect(() => {
+    if (current.status === 'loading' || !retriedRef.current) {
+      return;
+    }
+    retriedRef.current = false;
+    // A failure keeps focus on the status line. A success unmounted it, leaving focus on
+    // the page body unless the user has moved it elsewhere, where it stays.
+    const active = document.activeElement;
+    if (current.status === 'loaded' && (active === null || active === document.body)) {
+      headingRef.current?.focus();
+    }
+  }, [current.status]);
+
   switch (current.status) {
     case 'loading':
-      return (
-        <div className="form-view">
-          <p role="status">{LOADING_TEXT}</p>
-        </div>
-      );
-
     case 'failed':
-      return <DefinitionLoadFailure error={current.error} onRetry={reload} onExit={onExit} />;
+      return (
+        <DefinitionLoadStatus
+          error={current.status === 'failed' ? current.error : null}
+          statusRef={statusRef}
+          onRetry={reload}
+          onExit={onExit}
+        />
+      );
 
     case 'loaded':
       return (
@@ -172,6 +212,7 @@ export function FormView({
           viewId={current.viewId}
           definition={current.definition}
           initialPosition={initialPosition}
+          headingRef={headingRef}
           onExit={onExit}
           onFormNotFound={onFormNotFound}
           onPositionChange={onPositionChange}
@@ -180,18 +221,26 @@ export function FormView({
   }
 }
 
-interface DefinitionLoadFailureProps {
-  readonly error: ApiError;
+interface DefinitionLoadStatusProps {
+  /** Why the definition could not be loaded; `null` while it is loading. */
+  readonly error: ApiError | null;
+  /** The status line, which Retry focuses before the reload replaces the failure's controls. */
+  readonly statusRef: RefObject<HTMLParagraphElement>;
   readonly onRetry: () => void;
   readonly onExit: () => void;
 }
 
-/** The form definition could not be loaded; nothing is open, so going back needs no leave. */
-function DefinitionLoadFailure({ error, onRetry, onExit }: DefinitionLoadFailureProps) {
-  let banner: ReactNode;
-  if (isConnectionFailure(error)) {
+/**
+ * The form definition is loading, or could not be loaded; nothing is open, so going back
+ * needs no leave. Each part keeps its place among the children, so the status line stays
+ * the same element from loading to failure and back, and keeps the focus Retry gives it.
+ */
+function DefinitionLoadStatus({ error, statusRef, onRetry, onExit }: DefinitionLoadStatusProps) {
+  // While loading there is no banner, only the status line.
+  let banner: ReactNode = null;
+  if (error !== null && isConnectionFailure(error)) {
     banner = <ConnectionError error={error} method="GET" onRetry={onRetry} />;
-  } else {
+  } else if (error !== null) {
     // describeError's 404 text speaks of a record; here the form itself is unknown.
     const message = error.kind === 'notFound' ? FORM_NOT_FOUND_TEXT : describeError(error);
     const traceLine = traceLineOf(message, error.traceId);
@@ -214,11 +263,16 @@ function DefinitionLoadFailure({ error, onRetry, onExit }: DefinitionLoadFailure
 
   return (
     <div className="form-view">
-      <div className="form-toolbar" role="toolbar" aria-label="Form actions">
-        <button type="button" onClick={() => onExit()}>
-          {BACK_TO_FORMS}
-        </button>
-      </div>
+      {error !== null && (
+        <div className="form-toolbar" role="toolbar" aria-label="Form actions">
+          <button type="button" onClick={() => onExit()}>
+            {BACK_TO_FORMS}
+          </button>
+        </div>
+      )}
+      <p ref={statusRef} role="status" tabIndex={-1}>
+        {error === null ? LOADING_TEXT : LOAD_FAILED_TEXT}
+      </p>
       {banner}
     </div>
   );
@@ -230,6 +284,11 @@ interface FormWorkspaceProps {
   /** Kept as loaded while the form is open: the editor starts a new field-event queue for a new object. */
   readonly definition: FormDefinition;
   readonly initialPosition: number | undefined;
+  /**
+   * The form's heading, which FormView focuses once a retried definition load succeeds,
+   * and which takes focus from a banner control that its own action removed.
+   */
+  readonly headingRef: RefObject<HTMLHeadingElement>;
   readonly onExit: () => void;
   readonly onFormNotFound: () => void;
   readonly onPositionChange: ((n: number | null) => void) | undefined;
@@ -265,6 +324,35 @@ function pageOfField(pages: readonly PageDefinition[], fieldName: string): PageD
 }
 
 /**
+ * Each field name mapped to the field {@link pageOfField} shows for it: the data field of
+ * exactly that name, first by page position, else the first field by page position that
+ * lists the name. One walk of the pages answers every later lookup.
+ */
+function fieldsByName(pages: readonly PageDefinition[]): ReadonlyMap<string, FieldDefinition> {
+  const fields = new Map<string, FieldDefinition>();
+  for (const page of [...pages].sort(byPosition)) {
+    for (const field of page.fields) {
+      const known = fields.get(field.name);
+      if (known === undefined || (!isDataField(known) && isDataField(field))) {
+        fields.set(field.name, field);
+      }
+    }
+  }
+  return fields;
+}
+
+/**
+ * Whether an enabled field renders a control {@link focusFieldControl} can focus: any data
+ * field, except an option field with no option, whose fieldset holds no radio.
+ */
+function hasFocusableControl(field: FieldDefinition): boolean {
+  if (!isDataField(field)) {
+    return false;
+  }
+  return field.fieldType !== 'option' || (field.options ?? []).length > 0;
+}
+
+/**
  * Focuses a field's control. An option field's id names its fieldset, which cannot take
  * focus, so its checked radio, else its first enabled radio, takes it instead.
  */
@@ -279,6 +367,92 @@ function focusFieldControl(fieldName: string): void {
         element.querySelector<HTMLElement>('input:not(:disabled)'))
       : element;
   target?.focus();
+}
+
+/** The page on show in the workspace, and the two ways to change it. */
+interface PageSelection {
+  /** The page whose panel is shown; `null` when the form has no page. */
+  readonly selectedPageId: number | null;
+  /** Shows a page, as its tab does. */
+  readonly selectPage: (pageId: number) => void;
+  /** Shows the page that lists `fieldName` and focuses its control, as a validation summary jump does. */
+  readonly selectField: (fieldName: string) => void;
+}
+
+/**
+ * The workspace's selected page and the validation summary's field-focus requests. The
+ * selected page starts at the form's first page and survives record changes; only the user,
+ * through a tab, or the validation summary changes it. A jump shows the field's page and
+ * focuses the field's control once the commit that shows that page has run, and a repeated
+ * jump to the same field focuses it again.
+ */
+function usePageSelection(definition: FormDefinition): PageSelection {
+  const [selectedPageId, setSelectedPageId] = useState<number | null>(() => firstPageId(definition.pages));
+  const [focusRequest, setFocusRequest] = useState<FocusRequest | null>(null);
+  useEffect(() => {
+    // Runs after the commit that shows the field's page, so the control is no longer hidden.
+    if (focusRequest !== null) {
+      focusFieldControl(focusRequest.fieldName);
+    }
+  }, [focusRequest]);
+
+  const selectField = useCallback(
+    (fieldName: string) => {
+      const page = pageOfField(definition.pages, fieldName);
+      if (page !== null) {
+        setSelectedPageId(page.pageId);
+      }
+      setFocusRequest((previous) => ({ fieldName, sequence: (previous?.sequence ?? 0) + 1 }));
+    },
+    [definition],
+  );
+
+  return { selectedPageId, selectPage: setSelectedPageId, selectField };
+}
+
+/** The roles of the workspace's banners, each an alert or a status, whose buttons run the banner actions. */
+const BANNER_SELECTOR = '[role="alert"], [role="status"]';
+
+/**
+ * Keeps focus in the workspace when a banner action removes the control that held it.
+ * Retry, Save again, Discard edits and Dismiss each take their banner off the page, at
+ * once or when the resent write starts, which would leave focus on the page body. Each
+ * action runs through the returned function, which notes the banner control focused as
+ * the action starts. After the commit in which that control has left the page with focus
+ * on the body, `targetRef` takes focus, in the layout phase, before the browser paints.
+ *
+ * Focus the user moved elsewhere meanwhile stays there, and a banner that appears, such
+ * as a repeated failure's, moves no focus. A press that left focus outside the banner, as
+ * a pointer press does in browsers that do not focus buttons, has no focus to return.
+ */
+function useBannerFocusReturn(targetRef: RefObject<HTMLElement>): (action: () => void) => void {
+  // The banner control that held focus as its action ran, until it leaves the page or loses focus.
+  const originRef = useRef<Element | null>(null);
+  // Runs after every commit: the banner may leave in a later commit than the action's own,
+  // such as the one in which a retried write starts.
+  useLayoutEffect(() => {
+    const origin = originRef.current;
+    if (origin === null) {
+      return;
+    }
+    const active = document.activeElement;
+    if (origin.isConnected) {
+      // Still on the page: it keeps waiting while it holds focus, and focus moved on is not returned.
+      if (active !== origin) {
+        originRef.current = null;
+      }
+      return;
+    }
+    originRef.current = null;
+    if (active === null || active === document.body) {
+      targetRef.current?.focus();
+    }
+  });
+  return useCallback((action: () => void) => {
+    const active = document.activeElement;
+    originRef.current = active !== null && active.closest(BANNER_SELECTOR) !== null ? active : null;
+    action();
+  }, []);
 }
 
 /**
@@ -305,6 +479,7 @@ function FormWorkspace({
   viewId,
   definition,
   initialPosition,
+  headingRef,
   onExit,
   onFormNotFound,
   onPositionChange,
@@ -343,26 +518,7 @@ function FormWorkspace({
   const formGone = navigation.loadError?.kind === 'notFound' ? navigation.loadError : null;
   useReportOnce(formGone, onFormNotFound);
 
-  // The selected page survives record changes; only the user, or the validation summary, changes it.
-  const [selectedPageId, setSelectedPageId] = useState<number | null>(() => firstPageId(definition.pages));
-  const [focusRequest, setFocusRequest] = useState<FocusRequest | null>(null);
-  useEffect(() => {
-    // Runs after the commit that shows the field's page, so the control is no longer hidden.
-    if (focusRequest !== null) {
-      focusFieldControl(focusRequest.fieldName);
-    }
-  }, [focusRequest]);
-
-  const selectField = useCallback(
-    (fieldName: string) => {
-      const page = pageOfField(definition.pages, fieldName);
-      if (page !== null) {
-        setSelectedPageId(page.pageId);
-      }
-      setFocusRequest((previous) => ({ fieldName, sequence: (previous?.sequence ?? 0) + 1 }));
-    },
-    [definition],
-  );
+  const { selectedPageId, selectPage, selectField } = usePageSelection(definition);
 
   const [findOpen, setFindOpen] = useState(false);
 
@@ -393,6 +549,7 @@ function FormWorkspace({
   const { canInsert, canUpdate, canDelete } = definition;
   const saveDisabled =
     editor.saving ||
+    editor.savePending ||
     recordDeleted ||
     nothingOpen ||
     (navigation.isNew ? canInsert === false : canUpdate === false);
@@ -400,6 +557,18 @@ function FormWorkspace({
 
   const isProtected = (field: FieldDefinition): boolean => editor.isProtected(field.name);
   const isCheckCodeDisabled = (field: FieldDefinition): boolean => editor.checkCodeDisabled.has(field.name);
+  // The summary asks once per message on every render, so the fields on pages are looked up
+  // in a map built once per definition rather than by walking the pages each time.
+  const fieldsOnPages = useMemo(() => fieldsByName(definition.pages), [definition]);
+  // The summary's jump focuses a control, so it is offered only for a field rendered on a page
+  // whose control is enabled, not protected and not disabled by check code, and can take focus.
+  const canSelectField = (name: string): boolean => {
+    if (editor.isDisabled(name)) {
+      return false;
+    }
+    const field = fieldsOnPages.get(name);
+    return field !== undefined && hasFocusableControl(field);
+  };
   const renderPanel = (page: PageDefinition): ReactNode => (
     <FieldRenderer
       page={page}
@@ -418,74 +587,70 @@ function FormWorkspace({
   // A 409 banner says the same as the deleted banner, which is shown instead.
   const editorBanner =
     editor.banner !== null && !(recordDeleted && editor.banner.kind === 'deleted') ? editor.banner : null;
+  // Every banner action removes the banner whose control ran it, so each goes through
+  // runBannerAction, which hands that control's focus on to the heading.
+  const runBannerAction = useBannerFocusReturn(headingRef);
+  const bannerHandlers: EditorBannerHandlers = {
+    onRetry: () =>
+      runBannerAction(() => {
+        void editor.retry();
+      }),
+    onSaveAgain: () =>
+      runBannerAction(() => {
+        void editor.saveAgain();
+      }),
+    onDiscardEdits: () => runBannerAction(() => editor.discardEdits()),
+    onDismiss: () => runBannerAction(() => editor.dismissBanner()),
+  };
   const openRecordId = navigation.record?.globalRecordId ?? null;
 
   return (
     <div className="form-view">
-      <h2>{definition.name}</h2>
+      <h2 ref={headingRef} tabIndex={-1}>
+        {definition.name}
+      </h2>
 
-      <div className="form-toolbar" role="toolbar" aria-label="Form actions">
-        <button type="button" onClick={backToForms}>
-          {BACK_TO_FORMS}
-        </button>
-        <button
-          type="button"
-          disabled={saveDisabled}
-          onClick={() => {
-            void editor.save();
-          }}
-        >
-          {SAVE}
-        </button>
-        <button type="button" disabled={deleteDisabled} onClick={() => editor.requestDelete()}>
-          {DELETE}
-        </button>
-        <button type="button" onClick={() => setFindOpen(true)}>
-          {FIND}
-        </button>
-      </div>
+      <WorkspaceToolbar
+        saveDisabled={saveDisabled}
+        saving={editor.savePending}
+        deleteDisabled={deleteDisabled}
+        onBackToForms={backToForms}
+        onSave={() => {
+          void editor.save();
+        }}
+        onDelete={editor.requestDelete}
+        onFind={() => setFindOpen(true)}
+      />
 
       <RecordNavigator navigation={navigation} busy={editor.saving} canInsert={canInsert} />
 
-      {recordDeleted && (
-        <div className="banner banner--warning" role="status">
-          {DELETED_TEXT}
-        </div>
-      )}
-
-      {navigation.notice !== null && (
-        <div className="banner banner--info" role="status">
-          <p>{navigation.notice}</p>
-          <button type="button" onClick={() => navigation.dismissNotice()}>
-            {DISMISS}
-          </button>
-        </div>
-      )}
-
-      {navigation.loadError !== null && (
-        <NavigationLoadFailure
-          error={navigation.loadError}
-          onRetry={() => {
+      <WorkspaceNotices
+        recordDeleted={recordDeleted}
+        navigationNotice={navigation.notice}
+        onDismissNavigationNotice={() => runBannerAction(() => navigation.dismissNotice())}
+        loadError={navigation.loadError}
+        onRetryLoad={() =>
+          runBannerAction(() => {
             void navigation.retryLoad();
-          }}
-        />
-      )}
-
-      {editorBanner !== null && <EditorBannerView banner={editorBanner} editor={editor} />}
-
-      {editor.eventNotice !== null && (
-        <div className="banner banner--info" role="status">
-          <p>{editor.eventNotice}</p>
-        </div>
-      )}
+          })
+        }
+        editorBanner={editorBanner}
+        bannerHandlers={bannerHandlers}
+        eventNotice={editor.eventNotice}
+      />
 
       {/* A request-level 400 is the editor banner's text, so the summary shows field messages only. */}
-      <ValidationSummary definition={definition} fieldErrors={editor.fieldErrors} onSelectField={selectField} />
+      <ValidationSummary
+        definition={definition}
+        fieldErrors={editor.fieldErrors}
+        onSelectField={selectField}
+        canSelectField={canSelectField}
+      />
 
       <PageTabs
         pages={definition.pages}
         selectedPageId={selectedPageId}
-        onSelect={setSelectedPageId}
+        onSelect={selectPage}
         renderPanel={renderPanel}
       />
 
@@ -505,30 +670,194 @@ function FormWorkspace({
         disabled={editor.saving}
       />
 
-      <ConfirmDialog
-        open={editor.deleteDialogOpen}
+      <WorkspaceDialogs
+        client={client}
+        viewId={viewId}
+        definition={definition}
         busy={editor.saving}
         isNew={navigation.isNew}
-        onConfirm={editor.confirmDelete}
-        onCancel={editor.cancelDelete}
+        deleteDialogOpen={editor.deleteDialogOpen}
+        onConfirmDelete={editor.confirmDelete}
+        onCancelDelete={editor.cancelDelete}
+        dialogs={editor.dialogs}
+        onDismissDialog={editor.dismissDialog}
+        findOpen={findOpen}
+        includeDeleted={navigation.includeDeleted}
+        openRecordId={openRecordId}
+        onFindResult={(id) => {
+          setFindOpen(false);
+          void navigation.openById(id);
+        }}
+        onFindClose={() => setFindOpen(false)}
+      />
+    </div>
+  );
+}
+
+interface WorkspaceToolbarProps {
+  readonly saveDisabled: boolean;
+  /** A save is under way, from the field-event drain to the write's answer. */
+  readonly saving: boolean;
+  readonly deleteDisabled: boolean;
+  readonly onBackToForms: () => void;
+  readonly onSave: () => void;
+  readonly onDelete: () => void;
+  readonly onFind: () => void;
+}
+
+/** The form's actions, Back to forms, Save, Delete and Find, under the names the smoke test matches. */
+function WorkspaceToolbar({
+  saveDisabled,
+  saving,
+  deleteDisabled,
+  onBackToForms,
+  onSave,
+  onDelete,
+  onFind,
+}: WorkspaceToolbarProps) {
+  return (
+    <div className="form-toolbar" role="toolbar" aria-label="Form actions">
+      <button type="button" onClick={() => onBackToForms()}>
+        {BACK_TO_FORMS}
+      </button>
+      <button type="button" disabled={saveDisabled} onClick={() => onSave()}>
+        {SAVE}
+      </button>
+      <button type="button" disabled={deleteDisabled} onClick={() => onDelete()}>
+        {DELETE}
+      </button>
+      <button type="button" onClick={() => onFind()}>
+        {FIND}
+      </button>
+      {/* Always rendered, so the status text is announced when it appears; it tells a save
+          under way apart from a Save disabled by permission or protection. */}
+      <span role="status" className={saving ? undefined : 'visually-hidden'}>
+        {saving ? SAVING_TEXT : ''}
+      </span>
+    </div>
+  );
+}
+
+interface WorkspaceNoticesProps {
+  readonly recordDeleted: boolean;
+  /** Navigation's informational text, such as a record that no longer exists. */
+  readonly navigationNotice: string | null;
+  readonly onDismissNavigationNotice: () => void;
+  /** The failed navigation load, shown with Retry. */
+  readonly loadError: ApiError | null;
+  readonly onRetryLoad: () => void;
+  /** The failed save or delete; `null` when there is none or the deleted warning says the same. */
+  readonly editorBanner: EditorBanner | null;
+  /** The editor banner's actions. */
+  readonly bannerHandlers: EditorBannerHandlers;
+  /** The non-blocking notice that a field event could not be evaluated. */
+  readonly eventNotice: string | null;
+}
+
+/** The workspace's banners, in order: deleted record, navigation notice, failed load, failed write, field event. */
+function WorkspaceNotices({
+  recordDeleted,
+  navigationNotice,
+  onDismissNavigationNotice,
+  loadError,
+  onRetryLoad,
+  editorBanner,
+  bannerHandlers,
+  eventNotice,
+}: WorkspaceNoticesProps) {
+  return (
+    <>
+      {recordDeleted && (
+        <div className="banner banner--warning" role="status">
+          {DELETED_TEXT}
+        </div>
+      )}
+
+      {navigationNotice !== null && (
+        <div className="banner banner--info" role="status">
+          <p>{navigationNotice}</p>
+          <button type="button" onClick={() => onDismissNavigationNotice()}>
+            {DISMISS}
+          </button>
+        </div>
+      )}
+
+      {loadError !== null && <NavigationLoadFailure error={loadError} onRetry={onRetryLoad} />}
+
+      {editorBanner !== null && <EditorBannerView banner={editorBanner} handlers={bannerHandlers} />}
+
+      {eventNotice !== null && (
+        <div className="banner banner--info" role="status">
+          <p>{eventNotice}</p>
+        </div>
+      )}
+    </>
+  );
+}
+
+interface WorkspaceDialogsProps {
+  readonly client: ApiClient;
+  readonly viewId: number;
+  readonly definition: FormDefinition;
+  /** A save or delete is in flight. */
+  readonly busy: boolean;
+  readonly isNew: boolean;
+  readonly deleteDialogOpen: boolean;
+  readonly onConfirmDelete: () => Promise<void>;
+  readonly onCancelDelete: () => void;
+  /** Check-code DIALOG messages in execution order. */
+  readonly dialogs: readonly DialogMessage[];
+  readonly onDismissDialog: () => void;
+  readonly findOpen: boolean;
+  readonly includeDeleted: boolean;
+  /** The record on screen; `null` while nothing is open. */
+  readonly openRecordId: string | null;
+  /** A Find result was chosen. */
+  readonly onFindResult: (globalRecordId: string) => void;
+  readonly onFindClose: () => void;
+}
+
+/** The workspace's modals: delete confirmation, check-code messages and Find. */
+function WorkspaceDialogs({
+  client,
+  viewId,
+  definition,
+  busy,
+  isNew,
+  deleteDialogOpen,
+  onConfirmDelete,
+  onCancelDelete,
+  dialogs,
+  onDismissDialog,
+  findOpen,
+  includeDeleted,
+  openRecordId,
+  onFindResult,
+  onFindClose,
+}: WorkspaceDialogsProps) {
+  return (
+    <>
+      <ConfirmDialog
+        open={deleteDialogOpen}
+        busy={busy}
+        isNew={isNew}
+        onConfirm={onConfirmDelete}
+        onCancel={onCancelDelete}
       />
 
-      <MessageDialog dialogs={editor.dialogs} onDismiss={editor.dismissDialog} />
+      <MessageDialog dialogs={dialogs} onDismiss={onDismissDialog} />
 
       <FindRecordDialog
         open={findOpen}
         client={client}
         viewId={viewId}
         definition={definition}
-        includeDeleted={navigation.includeDeleted}
-        openRecordId={navigation.isNew ? null : openRecordId}
-        onOpen={(id) => {
-          setFindOpen(false);
-          void navigation.openById(id);
-        }}
-        onClose={() => setFindOpen(false)}
+        includeDeleted={includeDeleted}
+        openRecordId={isNew ? null : openRecordId}
+        onOpen={onFindResult}
+        onClose={onFindClose}
       />
-    </div>
+    </>
   );
 }
 
@@ -564,9 +893,24 @@ function NavigationLoadFailure({ error, onRetry }: NavigationLoadFailureProps) {
   );
 }
 
+/**
+ * The editor's banner actions, the only part of the editor the banner needs. Which of them
+ * a banner offers is decided by its `actions`.
+ */
+interface EditorBannerHandlers {
+  /** Resends the failed write; offered only when resending it is safe. */
+  readonly onRetry: () => void;
+  /** Resends the draft at the user's request, although the earlier save may have been applied. */
+  readonly onSaveAgain: () => void;
+  /** Drops the draft and opens the nearest record; offered when the record no longer exists. */
+  readonly onDiscardEdits: () => void;
+  /** Closes the banner and keeps the draft. */
+  readonly onDismiss: () => void;
+}
+
 interface EditorBannerViewProps {
   readonly banner: EditorBanner;
-  readonly editor: RecordEditor;
+  readonly handlers: EditorBannerHandlers;
 }
 
 /**
@@ -578,7 +922,7 @@ interface EditorBannerViewProps {
  * delete could not be confirmed. ConnectionError offers Retry only when resending is safe,
  * and otherwise an explicit "Save again".
  */
-function EditorBannerView({ banner, editor }: EditorBannerViewProps) {
+function EditorBannerView({ banner, handlers }: EditorBannerViewProps) {
   if (isConnectionFailure(banner.error)) {
     return (
       <ConnectionError
@@ -586,21 +930,9 @@ function EditorBannerView({ banner, editor }: EditorBannerViewProps) {
         method={banner.method}
         isCreate={banner.isCreate}
         message={banner.message}
-        onRetry={
-          banner.actions.includes('retry')
-            ? () => {
-                void editor.retry();
-              }
-            : undefined
-        }
-        onSaveAgain={
-          banner.actions.includes('saveAgain')
-            ? () => {
-                void editor.saveAgain();
-              }
-            : undefined
-        }
-        onDismiss={() => editor.dismissBanner()}
+        onRetry={banner.actions.includes('retry') ? handlers.onRetry : undefined}
+        onSaveAgain={banner.actions.includes('saveAgain') ? handlers.onSaveAgain : undefined}
+        onDismiss={handlers.onDismiss}
       />
     );
   }
@@ -617,9 +949,9 @@ function EditorBannerView({ banner, editor }: EditorBannerViewProps) {
       )}
       <div className="banner__actions">
         {banner.actions.map((action) => (
-          <BannerActionButton key={action} action={action} isCreate={banner.isCreate} editor={editor} />
+          <BannerActionButton key={action} action={action} isCreate={banner.isCreate} handlers={handlers} />
         ))}
-        <button type="button" onClick={() => editor.dismissBanner()}>
+        <button type="button" onClick={() => handlers.onDismiss()}>
           {DISMISS}
         </button>
       </div>
@@ -630,19 +962,14 @@ function EditorBannerView({ banner, editor }: EditorBannerViewProps) {
 interface BannerActionButtonProps {
   readonly action: BannerAction;
   readonly isCreate: boolean;
-  readonly editor: RecordEditor;
+  readonly handlers: EditorBannerHandlers;
 }
 
-function BannerActionButton({ action, isCreate, editor }: BannerActionButtonProps) {
+function BannerActionButton({ action, isCreate, handlers }: BannerActionButtonProps) {
   switch (action) {
     case 'retry':
       return (
-        <button
-          type="button"
-          onClick={() => {
-            void editor.retry();
-          }}
-        >
+        <button type="button" onClick={() => handlers.onRetry()}>
           {RETRY}
         </button>
       );
@@ -651,16 +978,14 @@ function BannerActionButton({ action, isCreate, editor }: BannerActionButtonProp
         <button
           type="button"
           aria-label={isCreate ? SAVE_AGAIN_CREATE_LABEL : SAVE_AGAIN_UPDATE_LABEL}
-          onClick={() => {
-            void editor.saveAgain();
-          }}
+          onClick={() => handlers.onSaveAgain()}
         >
           {SAVE_AGAIN}
         </button>
       );
     case 'discardEdits':
       return (
-        <button type="button" onClick={() => editor.discardEdits()}>
+        <button type="button" onClick={() => handlers.onDiscardEdits()}>
           {DISCARD_EDITS}
         </button>
       );

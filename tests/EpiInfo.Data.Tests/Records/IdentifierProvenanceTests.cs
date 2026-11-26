@@ -10,7 +10,6 @@ using EpiInfo.Data.Records;
 using EpiInfo.Data.Sql;
 using EpiInfo.Domain.Forms;
 using EpiInfo.Domain.Metadata;
-using EpiInfo.Domain.Records;
 using EpiInfo.Domain.Storage;
 using EpiInfo.Domain.Validation;
 using EpiInfo.Domain.Values;
@@ -356,22 +355,27 @@ public sealed class IdentifierProvenanceTests
 /// A <c>values</c> key the reader did not return is refused by the repository before any command names a base or
 /// page table, on insert and on update.
 /// </description></item>
-/// <item><description>
-/// Every bracketed identifier in the commands the repository sends to insert, update and soft-delete a record is a
-/// table or column name the reader returned for that form, or one of the builders' fixed aliases.
-/// </description></item>
 /// </list>
 /// </summary>
 /// <remarks>
+/// <para>
 /// Each form is resolved by name through the reader, never by a hard-coded id. The selected-set cases read only
-/// metadata and the catalogue and hold the shared test lock. The repository cases hold the exclusive lock: they write
-/// only records they create through the repository, each with a test marker in <c>LastName</c>, which stay in the
-/// database. No case edits a seeded row, a metadata row or the schema, and no failure message prints a parameter
-/// value.
+/// metadata and the catalogue and hold the shared test lock. The refusal cases hold the exclusive lock because they
+/// compare before-and-after snapshots, which must show no change: the only writes they attempt are refused, the
+/// update is refused on an id no row holds, and no record is created. The class writes nothing, edits no seeded
+/// row, metadata row or schema object, and no failure message prints a parameter value.
+/// </para>
+/// <para>
+/// The valid-save half of the provenance proof, that every identifier in the commands of an insert, an update and a
+/// soft delete on each seeded form is a name the reader returned, runs through the API in <c>EpiInfo.Api.Tests</c>
+/// (<c>RecordCommandIdentifierProvenanceTests</c> in <c>Persistence/SqlParameterizationTests.cs</c>): the only
+/// records a test may write are records created through the API (AAP 0.3.7, "Data reach of tests"), and this
+/// project references <c>EpiInfo.Data</c> alone.
+/// </para>
 /// </remarks>
 [Collection(DatabaseCollections.Database)]
 [Trait("Category", "Integration")]
-public sealed partial class IdentifierProvenanceIntegrationTests
+public sealed class IdentifierProvenanceIntegrationTests
 {
     // A values key shaped like an identifier that closes the bracket and appends a statement.
     private const string InjectedIdentifierKey = "LastName]; DROP TABLE x;--";
@@ -382,7 +386,8 @@ public sealed partial class IdentifierProvenanceIntegrationTests
     // The two seeded forms, resolved by name through the reader.
     private static readonly string[] SeededForms = ["CaseReport", "FoodHistory"];
 
-    // Covers the exclusive lock wait (up to 300 s) and the writes; xUnit 2.9.3 gives a test no cancellation token.
+    // Covers the exclusive lock wait (up to 300 s) and the refused writes; xUnit 2.9.3 gives a test no cancellation
+    // token.
     private static readonly TimeSpan TestTimeout = TimeSpan.FromMinutes(10);
 
     // The operations the repository reports for record writes: every command sent under one names a record table.
@@ -399,18 +404,6 @@ public sealed partial class IdentifierProvenanceIntegrationTests
 
     /// <summary>The seeded forms.</summary>
     public static TheoryData<string> Forms => new(SeededForms);
-
-    /// <summary>
-    /// Each seeded form with the text field it also writes beyond <c>LastName</c>, so every page table gets a column
-    /// write: none on single-page <c>CaseReport</c>; <c>Lab</c>, an <c>nvarchar(4000)</c> column of
-    /// <c>FoodHistory3</c> with no pattern or maximum length (<c>testdata/sql/03_forms.sql</c>, field 1149), on
-    /// <c>FoodHistory</c>, whose <c>LastName</c> is on <c>FoodHistory2</c>.
-    /// </summary>
-    public static TheoryData<string, string?> RecordWrites => new()
-    {
-        { "CaseReport", null },
-        { "FoodHistory", "Lab" },
-    };
 
     /// <summary>
     /// Each seeded form with each clause and set, and the keyword expected before the predicate:
@@ -529,13 +522,11 @@ public sealed partial class IdentifierProvenanceIntegrationTests
 
         AssertUnchanged(beforeInserts, await SqlSnapshot.CaptureAsync(cancellationToken));
 
-        // Update: the same keys beside a valid one, on a record this test created. The refusal comes before the
-        // locked read of the base row, so the required gate never runs either.
-        RecordDto created = await path.Repository.InsertAsync(
-            form.Metadata,
-            Values((TestDatabase.MarkerField, FieldValue.FromText(TestDatabase.NewMarker()))),
-            NewStamp(),
-            cancellationToken);
+        // Update: the same keys beside a valid one, on an id no row holds, so no record is created to refuse a write
+        // to. The values are resolved before the locked read of the base row, so the refusal needs no stored record
+        // and the required gate never runs either. Were the lock read first, the update would find no row and return
+        // NotFound instead of throwing, and the recorder would show that read naming the base table.
+        string unstoredId = Guid.NewGuid().ToString();
         SqlSnapshot beforeUpdates = await SqlSnapshot.CaptureAsync(cancellationToken);
         int gateCalls = 0;
         foreach (string unknownKey in unknownKeys)
@@ -548,7 +539,7 @@ public sealed partial class IdentifierProvenanceIntegrationTests
             ArgumentException rejected = await Assert.ThrowsAsync<ArgumentException>(
                 () => path.Repository.UpdateAsync(
                     form.Metadata,
-                    created.GlobalRecordId,
+                    unstoredId,
                     submitted,
                     NewStamp(),
                     _ =>
@@ -564,85 +555,6 @@ public sealed partial class IdentifierProvenanceIntegrationTests
 
         Assert.Equal(0, gateCalls);
         AssertUnchanged(beforeUpdates, await SqlSnapshot.CaptureAsync(cancellationToken));
-    }
-
-    [Theory]
-    [MemberData(nameof(RecordWrites))]
-    public async Task RecordCommandsUseOnlyReaderReturnedIdentifiers(string formName, string? laterPageTextField)
-    {
-        await TestDatabase.EnsureReachableAsync();
-        using var timeout = new CancellationTokenSource(TestTimeout);
-        CancellationToken cancellationToken = timeout.Token;
-        await using var writeLock = await DatabaseWriteLock.AcquireExclusiveAsync(cancellationToken);
-
-        RecordPath path = RecordPath.Create();
-        ProvenanceForm form = await path.ReadFormAsync(formName, cancellationToken);
-        ProvenanceForm otherForm = await path.ReadFormAsync(
-            Assert.Single(SeededForms, name => !string.Equals(name, formName, StringComparison.Ordinal)),
-            cancellationToken);
-        Assert.Empty(form.Tables.Intersect(otherForm.Tables, StringComparer.Ordinal));
-
-        string[] textFields = laterPageTextField is null
-            ? [TestDatabase.MarkerField]
-            : [TestDatabase.MarkerField, laterPageTextField];
-        form.RequireWritableTextFieldsOnEveryPage(textFields);
-
-        path.Recorder.Clear();
-        RecordDto created = await path.Repository.InsertAsync(
-            form.Metadata,
-            MarkedValues(textFields),
-            NewStamp(),
-            cancellationToken);
-        RecordWriteResult updated = await path.Repository.UpdateAsync(
-            form.Metadata,
-            created.GlobalRecordId,
-            MarkedValues(textFields),
-            NewStamp(),
-            _ => RequiredGatePasses,
-            permissions: null,
-            cancellationToken);
-        Assert.Equal(RecordWriteStatus.Success, updated.Status);
-        SoftDeleteResult deleted = await path.Repository.SoftDeleteAsync(
-            form.Metadata,
-            created.GlobalRecordId,
-            NewStamp(),
-            cancellationToken);
-        Assert.Equal(SoftDeleteResult.Deleted, deleted);
-
-        IReadOnlyList<RecordedCommand> commands = path.Recorder.Commands;
-        RecordedCommand[] recordCommands = [.. commands.Where(form.IsRecordCommand)];
-        Assert.NotEmpty(recordCommands);
-
-        // A write, or a command sent under a record operation, that names no table of the form would be record SQL
-        // whose tables escaped the provenance check below.
-        Assert.All(path.Recorder.Writes(), command => Assert.True(
-            form.IsRecordCommand(command),
-            "A write names no table of the form: " + command.Describe(includeParameterValues: false)));
-        Assert.All(
-            commands.Where(command => RecordWriteOperations.Contains(command.Operation)),
-            command => Assert.True(
-                form.IsRecordCommand(command),
-                "A record command names no table of the form: " + command.Describe(includeParameterValues: false)));
-
-        // The insert writes the base row and a row on every page; the update stamps the base row and writes every
-        // page, because a submitted field sits on each; the soft delete updates the base row.
-        string[] formTables = [.. form.Tables.Order(StringComparer.Ordinal)];
-        Assert.Equal(formTables, WrittenTables(recordCommands, "insert"));
-        Assert.Equal(formTables, WrittenTables(recordCommands, "update"));
-
-        foreach (RecordedCommand command in recordCommands)
-        {
-            foreach (string identifier in SqlCommandRecorder.BracketedIdentifiers(command.CommandText))
-            {
-                Assert.True(
-                    form.Allowed.Contains(identifier) || form.Ignored.Contains(identifier),
-                    $"[{identifier}] is not a name the metadata reader returned for {formName}, nor a fixed alias: " +
-                    command.Describe(includeParameterValues: false));
-                Assert.False(
-                    otherForm.Tables.Contains(identifier),
-                    $"[{identifier}] is a table of another form: " + command.Describe(includeParameterValues: false));
-            }
-        }
     }
 
     // The text a caller has written before the predicate: the reader-built base table and its alias, as
@@ -682,10 +594,6 @@ public sealed partial class IdentifierProvenanceIntegrationTests
 
         return values;
     }
-
-    // A new test marker in each named text field.
-    private static IReadOnlyDictionary<string, FieldValue> MarkedValues(IEnumerable<string> textFields) =>
-        Values([.. textFields.Select(name => (name, FieldValue.FromText(TestDatabase.NewMarker())))]);
 
     private static SaveStamp NewStamp() => new(Environment.UserName, SaveStamp.TruncateToSeconds(DateTime.Now));
 
@@ -736,23 +644,6 @@ public sealed partial class IdentifierProvenanceIntegrationTests
             $"{diff.SchemaChanges.Count} column sets changed, in {string.Join(", ", tables)}.");
     }
 
-    // The tables the record commands of one kind write, sorted: the first bracketed identifier of each INSERT INTO [t]
-    // or UPDATE [t] SET statement, the form every write statement of the builders starts with. The kind is the
-    // statement group of WriteStatement: "insert" or "update".
-    private static string[] WrittenTables(IEnumerable<RecordedCommand> recordCommands, string kind) =>
-    [
-        .. recordCommands
-            .Where(command => WriteStatement().Match(command.CommandText).Groups[kind].Success)
-            .Select(command => SqlCommandRecorder.BracketedIdentifiers(command.CommandText)[0])
-            .Distinct(StringComparer.Ordinal)
-            .Order(StringComparer.Ordinal),
-    ];
-
-    [GeneratedRegex(
-        @"^\s*(?:(?<insert>INSERT\s+INTO)|(?<update>UPDATE))\s+\[",
-        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
-    private static partial Regex WriteStatement();
-
     // The metadata reader and the record repository over one connection factory, both reporting every command they
     // send to one recorder, as the store composes them.
     private sealed class RecordPath
@@ -796,99 +687,33 @@ public sealed partial class IdentifierProvenanceIntegrationTests
         }
     }
 
-    // One form as the reader returned it, with the names its record commands may hold.
+    // One form as the reader returned it, with the tables its record commands name.
     private sealed class ProvenanceForm
     {
         public ProvenanceForm(FormMetadata metadata, FormSchema schema)
         {
             Metadata = metadata;
-            Schema = schema;
 
             var tables = new HashSet<string>(StringComparer.Ordinal) { schema.BaseTable.Name };
-            var allowed = new HashSet<string>(StringComparer.Ordinal) { schema.BaseTable.Name };
-            allowed.UnionWith(schema.BaseTable.Columns.Select(column => column.Name));
             foreach (PageTableSchema page in schema.Pages)
             {
                 if (page.Table is { } table)
                 {
                     tables.Add(table.Name);
-                    allowed.Add(table.Name);
-                    allowed.UnionWith(table.Columns.Select(column => column.Name));
                 }
             }
 
-            // The fixed names the record builders write, which no reader returns and the check does not compare.
-            var ignored = new HashSet<string>(StringComparer.Ordinal)
-            {
-                // A schema qualifier: the builders write one-part names, so it is listed only as never a table name.
-                "dbo",
-
-                // The base-table alias of every read, written unbracketed as b.[column].
-                RecordSqlBuilder.BaseAlias,
-
-                // RecordSqlBuilder's names for the intrinsic position and count that RecordAt and RecordById compute.
-                "ip",
-                "ic",
-            };
-
-            // The page aliases p{i}, i being the page's 0-based index in FormSchema.Pages, written unbracketed.
-            for (int index = 0; index < schema.Pages.Count; index++)
-            {
-                ignored.Add(RecordSqlBuilder.PageAlias(index));
-            }
-
-            // The result-column aliases [c{n}]: a record SELECT projects at most the base columns and the intrinsic
-            // coordinates (ordinals 0 to 4), one key per page and one column per data field.
-            int ordinals = RecordSqlBuilder.RecordIntrinsicCountOrdinal + 1 + schema.Pages.Count +
-                FormDefinitionFactory.GetDataFields(metadata).Count;
-            for (int ordinal = 0; ordinal < ordinals; ordinal++)
-            {
-                string alias = RecordSqlBuilder.ColumnAlias(ordinal);
-                ignored.Add(Assert.Single(SqlCommandRecorder.BracketedIdentifiers(alias)));
-            }
-
             Tables = tables;
-            Allowed = allowed;
-            Ignored = ignored;
         }
 
         public FormMetadata Metadata { get; }
 
-        public FormSchema Schema { get; }
-
         // The base table and every page table the catalogue returned.
         public IReadOnlySet<string> Tables { get; }
-
-        // Those tables and every column of each.
-        public IReadOnlySet<string> Allowed { get; }
-
-        public IReadOnlySet<string> Ignored { get; }
 
         // A record command names a base or page table of this form; metadata and catalogue reads are fixed text that
         // names only meta* tables and catalogue views.
         public bool IsRecordCommand(RecordedCommand command) =>
             SqlCommandRecorder.BracketedIdentifiers(command.CommandText).Any(Tables.Contains);
-
-        // Each name is a writable text field stored in a column the reader found, and together they sit on every page
-        // that has a table, so a write of all of them sends a column write to each page table.
-        public void RequireWritableTextFieldsOnEveryPage(IEnumerable<string> fieldNames)
-        {
-            DataFieldSet dataFields = FormDefinitionFactory.GetDataFields(Metadata);
-            var coveredPages = new HashSet<int>();
-            foreach (string name in fieldNames)
-            {
-                Assert.True(dataFields.TryGet(name, out DataFieldMetadata? field), $"{name} is not a data field.");
-                Assert.False(field.Field.IsReadOnly, $"{name} is read-only.");
-                Assert.Equal(FieldType.Text, field.FieldType);
-                Assert.NotNull(Schema.FindDataColumn(field));
-                coveredPages.Add(field.Page.PageId);
-            }
-
-            int[] pagesWithTables =
-            [
-                .. Schema.Pages.Where(page => page.Table is not null).Select(page => page.Page.PageId).Order(),
-            ];
-            Assert.Equal(pagesWithTables, coveredPages.Order());
-        }
     }
 }

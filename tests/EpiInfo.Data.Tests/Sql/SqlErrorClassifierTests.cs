@@ -1,9 +1,11 @@
+using System.Collections;
 using System.ComponentModel;
 using System.Data;
 using System.Globalization;
 using System.Net.Sockets;
 using System.Reflection;
 using System.Security.Authentication;
+using EpiInfo.Data.Records;
 using EpiInfo.Data.Sql;
 using EpiInfo.Domain.Storage;
 using EpiInfo.Tests.Shared;
@@ -692,6 +694,220 @@ public sealed class SqlErrorClassifierTests
             () => SqlErrorClassifier.ToDataStoreException(failure, "Update", (WriteOutcome)99, inner));
     }
 
+    // Failure metadata: the exception a failed write raises keeps the original failure's classification, and carries
+    // beside it in Data only the classified SQL error number of a cancellation and the type name and SQL error number
+    // of a rollback that failed, never a message.
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(null)]
+    public void CancelledFailure_IsTheFixedCancellationKeepingItsSqlErrorNumber(int? number)
+    {
+        using var culture = new UiCultureScope("en-US");
+        SqlException inner = AttentionAcknowledgement(SevereErrorEnglish, OperationCancelledEnglish);
+        var failure = new SqlFailure(SqlFailureKind.Cancelled, number);
+
+        Exception fromStoreException =
+            SqlErrorClassifier.ToDataStoreException(failure, "Read", WriteOutcome.NotWritten, inner);
+        Exception fromCancellation = SqlErrorClassifier.ToCancellation(failure, inner, CancelledToken);
+
+        foreach (Exception raised in new[] { fromStoreException, fromCancellation })
+        {
+            OperationCanceledException cancelled = Assert.IsType<OperationCanceledException>(raised);
+            Assert.Same(inner, cancelled.InnerException);
+            Assert.Equal(SqlErrorClassifier.CancelledMessage, cancelled.Message);
+            AssertFailureData(cancelled, number, expectedRollbackType: null, expectedRollbackNumber: null);
+        }
+
+        Assert.Equal(CancelledToken, Assert.IsType<OperationCanceledException>(fromCancellation).CancellationToken);
+    }
+
+    /// <summary>
+    /// An OperationCanceledException a write raised under the cancelled token, with the rollback failure that
+    /// followed it: the original, the rollback's exception, and the type name and SQL error number recorded for it.
+    /// </summary>
+    public static TheoryData<Exception, Exception, string, int?> OriginalCancellationsWithFailedRollback => new()
+    {
+        {
+            new OperationCanceledException(CancelledToken),
+            SqlExceptionFactory.Create(10054, SqlTextSentinel),
+            nameof(SqlException),
+            10054
+        },
+        {
+            new TaskCanceledException("x", null, CancelledToken),
+            SqlExceptionFactory.CreateWithoutErrors(SqlTextSentinel),
+            nameof(SqlException),
+            null
+        },
+        {
+            new OperationCanceledException(CancelledToken),
+            new InvalidOperationException(SqlTextSentinel),
+            nameof(InvalidOperationException),
+            null
+        },
+    };
+
+    [Theory]
+    [MemberData(nameof(OriginalCancellationsWithFailedRollback))]
+    public void BuildFailure_OriginalCancellation_IsRaisedItselfCarryingTheRollbackFailure(
+        Exception original,
+        Exception rollbackError,
+        string expectedRollbackType,
+        int? expectedRollbackNumber)
+    {
+        Exception raised = SqlRecordRepository.BuildFailure(
+            original,
+            RecordOperations.Update,
+            WriteStage.DmlSent,
+            rollbackCompleted: false,
+            rollbackError,
+            CancelledToken);
+
+        Assert.Same(original, raised);
+        AssertFailureData(raised, expectedNumber: null, expectedRollbackType, expectedRollbackNumber);
+    }
+
+    /// <summary>
+    /// SqlClient's acknowledgement of a cancelled command under the cancelled token, with no rollback failure and with
+    /// one: the rollback's exception, or none, and the type name and SQL error number recorded for it.
+    /// </summary>
+    public static TheoryData<Exception?, string?, int?> AcknowledgedCancellationRollbacks => new()
+    {
+        { null, null, null },
+        { SqlExceptionFactory.Create(10054, SqlTextSentinel), nameof(SqlException), 10054 },
+        { new InvalidOperationException(SqlTextSentinel), nameof(InvalidOperationException), null },
+    };
+
+    [Theory]
+    [MemberData(nameof(AcknowledgedCancellationRollbacks))]
+    public void BuildFailure_CancellationAcknowledgement_IsANewCancellationKeepingItsNumberAndTheRollbackFailure(
+        Exception? rollbackError,
+        string? expectedRollbackType,
+        int? expectedRollbackNumber)
+    {
+        using var culture = new UiCultureScope("en-US");
+        SqlException acknowledgement = AttentionAcknowledgement(SevereErrorEnglish, OperationCancelledEnglish);
+
+        Exception raised = SqlRecordRepository.BuildFailure(
+            acknowledgement,
+            RecordOperations.Update,
+            WriteStage.DmlSent,
+            rollbackCompleted: false,
+            rollbackError,
+            CancelledToken);
+
+        OperationCanceledException cancelled = Assert.IsType<OperationCanceledException>(raised);
+        Assert.Same(acknowledgement, cancelled.InnerException);
+        Assert.Equal(SqlErrorClassifier.CancelledMessage, cancelled.Message);
+        Assert.Equal(CancelledToken, cancelled.CancellationToken);
+        AssertFailureData(cancelled, expectedNumber: 0, expectedRollbackType, expectedRollbackNumber);
+    }
+
+    /// <summary>
+    /// Classified write failures with a rollback that failed: the original failure, the stage, the rollback's
+    /// exception, then the expected store exception type, outcome and SQL error number, and the type name and SQL error
+    /// number recorded for the rollback. The last case is the rollback of a write that sent no DML failing on its own,
+    /// so the rollback's exception is the original failure.
+    /// </summary>
+    public static TheoryData<Exception, WriteStage, Exception, Type, WriteOutcome, int?, string, int?>
+        ClassifiedFailuresWithFailedRollback
+    {
+        get
+        {
+            var noDmlRollbackFailure = new InvalidOperationException(SqlTextSentinel);
+            return new()
+            {
+                {
+                    SqlExceptionFactory.Create(547, SqlTextSentinel), WriteStage.DmlSent,
+                    SqlExceptionFactory.Create(10054, SqlTextSentinel), typeof(DataStoreWriteException),
+                    WriteOutcome.Unknown, 547, nameof(SqlException), 10054
+                },
+                {
+                    SqlExceptionFactory.Create(547, SqlTextSentinel), WriteStage.DmlSent,
+                    SqlExceptionFactory.CreateWithoutErrors(SqlTextSentinel), typeof(DataStoreWriteException),
+                    WriteOutcome.Unknown, 547, nameof(SqlException), null
+                },
+                {
+                    SqlExceptionFactory.Create(-2, SqlTextSentinel), WriteStage.BeforeDml,
+                    new InvalidOperationException(SqlTextSentinel), typeof(DataStoreUnavailableException),
+                    WriteOutcome.NotWritten, -2, nameof(InvalidOperationException), null
+                },
+                {
+                    noDmlRollbackFailure, WriteStage.BeforeDml, noDmlRollbackFailure, typeof(DataStoreWriteException),
+                    WriteOutcome.NotWritten, null, nameof(InvalidOperationException), null
+                },
+            };
+        }
+    }
+
+    [Theory]
+    [MemberData(nameof(ClassifiedFailuresWithFailedRollback))]
+    public void BuildFailure_ClassifiedFailure_KeepsItsClassificationAndCarriesTheRollbackFailure(
+        Exception original,
+        WriteStage stage,
+        Exception rollbackError,
+        Type expectedType,
+        WriteOutcome expectedOutcome,
+        int? expectedNumber,
+        string expectedRollbackType,
+        int? expectedRollbackNumber)
+    {
+        Exception raised = SqlRecordRepository.BuildFailure(
+            original,
+            RecordOperations.Update,
+            stage,
+            rollbackCompleted: false,
+            rollbackError,
+            CancellationToken.None);
+
+        Assert.IsType(expectedType, raised);
+        Assert.Same(original, raised.InnerException);
+        Assert.Equal((expectedOutcome, expectedNumber), StoreOutcome(raised));
+        AssertFailureData(raised, expectedNumber: null, expectedRollbackType, expectedRollbackNumber);
+    }
+
+    // The outcome and SQL error number of a raised store exception.
+    private static (WriteOutcome Outcome, int? SqlErrorNumber) StoreOutcome(Exception raised) => raised switch
+    {
+        DataStoreUnavailableException unavailable => (unavailable.Outcome, unavailable.SqlErrorNumber),
+        DataStoreWriteException failed => (failed.Outcome, failed.SqlErrorNumber),
+        _ => throw new InvalidOperationException("The raised failure is not a store exception."),
+    };
+
+    // The raised exception's Data holds exactly the expected entries: a cancellation's SQL error number, and a failed
+    // rollback's type name and SQL error number, each only when known, and no value carrying a message.
+    private static void AssertFailureData(
+        Exception raised,
+        int? expectedNumber,
+        string? expectedRollbackType,
+        int? expectedRollbackNumber)
+    {
+        var expected = new Dictionary<object, object?>();
+        if (expectedNumber is int number)
+        {
+            expected.Add(SqlErrorClassifier.SqlErrorNumberKey, number);
+        }
+
+        if (expectedRollbackType is not null)
+        {
+            expected.Add(SqlErrorClassifier.RollbackExceptionTypeKey, expectedRollbackType);
+        }
+
+        if (expectedRollbackNumber is int rollbackNumber)
+        {
+            expected.Add(SqlErrorClassifier.RollbackSqlErrorNumberKey, rollbackNumber);
+        }
+
+        Dictionary<object, object?> actual = raised.Data
+            .Cast<DictionaryEntry>()
+            .ToDictionary(entry => entry.Key, entry => entry.Value);
+        Assert.Equal(expected, actual);
+        Assert.DoesNotContain(
+            actual.Values,
+            value => value is string text && text.Contains(SqlTextSentinel, StringComparison.Ordinal));
+    }
+
     // Message is exactly the fixed text, while the inner exception still carries the sentinel the outer one must not.
     private static void AssertRedacted(string expectedMessage, string message, Exception inner)
     {
@@ -751,6 +967,142 @@ public sealed class SqlErrorClassifierTests
         Assert.Null(failure.SqlErrorNumber);
         Assert.IsType<ArgumentException>(failure.InnerException);
         Assert.Equal(DataStoreWriteException.FixedMessage, failure.Message);
+    }
+
+    // A failed open is classified before the unopened connection is released, so a release that throws neither
+    // replaces the open failure nor leaves it unclassified: nothing was sent, and the outcome stays NotWritten.
+
+    /// <summary>
+    /// Open failures, each with whether the request token is cancelled, the type it is reported as, whether that is the
+    /// original instance itself rather than an exception wrapping it, and the outcome and SQL error number the reported
+    /// store exception carries (both null for a cancellation).
+    /// </summary>
+    public static TheoryData<Exception, bool, Type, bool, WriteOutcome?, int?> OpenFailureCases => new()
+    {
+        {
+            SqlExceptionFactory.Create(53), false, typeof(DataStoreUnavailableException), false,
+            WriteOutcome.NotWritten, 53
+        },
+        {
+            SqlExceptionFactory.Create(18456), false, typeof(DataStoreUnavailableException), false,
+            WriteOutcome.NotWritten, 18456
+        },
+        {
+            new InvalidOperationException(PooledOpenTimeoutEnglish), false, typeof(DataStoreUnavailableException),
+            false, WriteOutcome.NotWritten, null
+        },
+        {
+            SqlExceptionFactory.Create([SqlExceptionFactory.Error(547, 16, "constraint")]), false,
+            typeof(DataStoreWriteException), false, WriteOutcome.NotWritten, 547
+        },
+        {
+            new OperationCanceledException(CancelledToken), true, typeof(OperationCanceledException), true, null, null
+        },
+        {
+            AttentionAcknowledgement(SevereErrorEnglish, OperationCancelledEnglish), true,
+            typeof(OperationCanceledException), false, null, null
+        },
+    };
+
+    [Theory]
+    [MemberData(nameof(OpenFailureCases))]
+    public async Task OpenFailureAsync_ReleaseThrows_ReportsTheClassifiedOpenFailure(
+        Exception openFailure,
+        bool tokenCancelled,
+        Type expectedType,
+        bool expectedOriginal,
+        WriteOutcome? expectedOutcome,
+        int? expectedNumber)
+    {
+        var connection = new ThrowingReleaseConnection();
+        CancellationToken token = tokenCancelled ? CancelledToken : CancellationToken.None;
+
+        Exception raised = await SqlConnectionFactory.OpenFailureAsync(connection, "InsertAsync", openFailure, token);
+
+        // The release was attempted, and its failure surfaced nowhere in what is reported.
+        Assert.Equal(1, connection.ReleaseCalls);
+        for (Exception? reported = raised; reported is not null; reported = reported.InnerException)
+        {
+            Assert.NotSame(connection.ReleaseFailure, reported);
+        }
+
+        Assert.IsType(expectedType, raised);
+        Assert.Same(openFailure, expectedOriginal ? raised : raised.InnerException);
+        (string? operation, WriteOutcome? outcome, int? number) = raised switch
+        {
+            DataStoreUnavailableException unavailable =>
+                (unavailable.Operation, unavailable.Outcome, unavailable.SqlErrorNumber),
+            DataStoreWriteException failed => (failed.Operation, failed.Outcome, failed.SqlErrorNumber),
+            _ => ((string?)null, (WriteOutcome?)null, (int?)null),
+        };
+        Assert.Equal(expectedOutcome is null ? null : "InsertAsync", operation);
+        Assert.Equal(expectedOutcome, outcome);
+        Assert.Equal(expectedNumber, number);
+    }
+
+    /// <summary>A connection stand-in whose release is counted and always fails.</summary>
+    private sealed class ThrowingReleaseConnection : IAsyncDisposable
+    {
+        public InvalidOperationException ReleaseFailure { get; } = new("release failed");
+
+        public int ReleaseCalls { get; private set; }
+
+        public ValueTask DisposeAsync()
+        {
+            ReleaseCalls++;
+            throw ReleaseFailure;
+        }
+    }
+
+    /// <summary>
+    /// A statement a local guard of <see cref="SqlExecution"/> refuses is never sent, so its dispatch callback is not
+    /// called and the observer hears nothing, for both forms a write sends: the state guard (a connection never
+    /// opened) and an argument guard (a timeout below one second). The connection is only constructed, from a
+    /// connection string naming no credential, and never opened, so nothing reaches a network.
+    /// </summary>
+    [Theory]
+    [InlineData(false, 30, typeof(InvalidOperationException))]
+    [InlineData(false, 0, typeof(ArgumentOutOfRangeException))]
+    [InlineData(true, 30, typeof(InvalidOperationException))]
+    [InlineData(true, 0, typeof(ArgumentOutOfRangeException))]
+    public async Task Execute_GuardRefusesTheStatement_NeverCallsTheDispatchCallback(
+        bool scalar,
+        int commandTimeoutSeconds,
+        Type expectedType)
+    {
+        await using var connection = new SqlConnection("Data Source=127.0.0.1,1;Initial Catalog=NeverOpened");
+        var recorder = new SqlCommandRecorder();
+        var statement = new SqlStatement(
+            "UPDATE [GuardFixture] SET [Value] = @p0",
+            [new SqlParameterValue("@p0", DbType.Int32, 1, Size: null)]);
+        var dispatches = 0;
+        void OnDispatch() => dispatches++;
+
+        Task execute = scalar
+            ? SqlExecution.ExecuteScalarAsync<int>(
+                connection,
+                transaction: null,
+                RecordOperations.Update,
+                statement,
+                commandTimeoutSeconds,
+                recorder,
+                CancellationToken.None,
+                OnDispatch)
+            : SqlExecution.ExecuteAsync(
+                connection,
+                transaction: null,
+                RecordOperations.Update,
+                statement,
+                commandTimeoutSeconds,
+                recorder,
+                CancellationToken.None,
+                OnDispatch);
+        Exception refused = await Assert.ThrowsAnyAsync<Exception>(() => execute);
+
+        Assert.IsType(expectedType, refused);
+        Assert.Equal(0, dispatches);
+        Assert.Empty(recorder.Commands);
+        Assert.Equal(ConnectionState.Closed, connection.State);
     }
 
     /// <summary>Sets <see cref="CultureInfo.CurrentUICulture"/> for one test and restores it on disposal.</summary>

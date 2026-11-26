@@ -18,7 +18,8 @@ namespace EpiInfo.Api.Errors;
 /// <list type="number">
 /// <item><description>
 /// A client abort (an <see cref="OperationCanceledException"/> or <see cref="IOException"/> while
-/// <see cref="HttpContext.RequestAborted"/> is cancelled): no body, one Information line. In the API pipeline
+/// <see cref="HttpContext.RequestAborted"/> is cancelled): no body, one Information line, with no status or write
+/// outcome but the same SQL error number and rollback arguments as a failure line. In the API pipeline
 /// <see cref="ApiExceptionBoundaryMiddleware"/> answers it, because the exception-handler middleware settles a client
 /// abort itself, without calling any handler.
 /// </description></item>
@@ -74,13 +75,22 @@ internal sealed partial class ApiExceptionHandler(ILogger<ApiExceptionHandler> l
         var endpoint = MatchedEndpoint(httpContext);
         var operation = ResolveOperation(exception, endpoint);
         var exceptionType = TypeName(exception);
+        var sqlErrorNumber = StoreSqlErrorNumber(exception);
+        var (rollbackExceptionType, rollbackSqlErrorNumber) = RollbackFailure(exception);
 
         // Defensive: in the API pipeline ApiExceptionBoundaryMiddleware answers a client abort first, because the
         // exception-handler middleware settles one itself, without calling any handler. This branch answers a handler
         // invoked outside that pipeline the same way.
         if (IsClientAbort(exception, httpContext))
         {
-            LogBestEffort(() => LogClientAbort(logger, operation, exceptionType, traceId));
+            LogBestEffort(() => LogClientAbort(
+                logger,
+                operation,
+                exceptionType,
+                sqlErrorNumber,
+                rollbackExceptionType,
+                rollbackSqlErrorNumber,
+                traceId));
 
             // The status the exception-handler middleware itself gives an aborted request; nobody receives a body.
             if (!httpContext.Response.HasStarted)
@@ -105,14 +115,13 @@ internal sealed partial class ApiExceptionHandler(ILogger<ApiExceptionHandler> l
             writeOutcome = outcome.ToWireValue();
         }
 
-        var (rollbackExceptionType, rollbackSqlErrorNumber) = RollbackFailure(exception);
         LogBestEffort(() => LogRequestFailed(
             logger,
             failure.Level,
             failure.StatusCode,
             exceptionType,
             operation,
-            StoreSqlErrorNumber(exception),
+            sqlErrorNumber,
             writeOutcome,
             rollbackExceptionType,
             rollbackSqlErrorNumber,
@@ -144,10 +153,12 @@ internal sealed partial class ApiExceptionHandler(ILogger<ApiExceptionHandler> l
     }
 
     /// <summary>
-    /// The <c>writeOutcome</c> of a failed record write, by this precedence: <see cref="WriteOutcome.Written"/> once
-    /// the store reported a commit; otherwise the store exception's own <c>Outcome</c>; otherwise
-    /// <see cref="WriteOutcome.NotWritten"/> when no store write call is outstanding: none was issued, or the store
-    /// reported that it wrote nothing; otherwise <see cref="WriteOutcome.Unknown"/>.
+    /// The <c>writeOutcome</c> of a failed record write, by this precedence, the feature first:
+    /// <see cref="WriteOutcome.Written"/> once the store reported a commit; otherwise
+    /// <see cref="WriteOutcome.NotWritten"/> once the store reported a result that wrote nothing, or while no store
+    /// write call was issued, such as when the metadata read fails, whatever outcome a store exception reports;
+    /// otherwise, for a started write still outstanding, the store exception's own <c>Outcome</c>; otherwise
+    /// <see cref="WriteOutcome.Unknown"/>.
     /// </summary>
     /// <param name="feature">The request's write record, or <see langword="null"/> when no write path created one.</param>
     /// <param name="exception">The failure being answered.</param>
@@ -161,11 +172,17 @@ internal sealed partial class ApiExceptionHandler(ILogger<ApiExceptionHandler> l
             return WriteOutcome.Written;
         }
 
+        // No store write call is outstanding: none was issued, or the store reported that its call wrote nothing. A
+        // store exception's outcome then describes no write, so it is not consulted.
+        if (feature is null || feature.NotWritten || !feature.WriteStarted)
+        {
+            return WriteOutcome.NotWritten;
+        }
+
         return exception switch
         {
             DataStoreUnavailableException unavailable => unavailable.Outcome,
             DataStoreWriteException failed => failed.Outcome,
-            _ when feature is null || !feature.WriteStarted => WriteOutcome.NotWritten,
             _ => WriteOutcome.Unknown,
         };
     }
@@ -251,11 +268,17 @@ internal sealed partial class ApiExceptionHandler(ILogger<ApiExceptionHandler> l
         ?? endpoint?.Metadata.GetMetadata<IEndpointNameMetadata>()?.EndpointName
         ?? DefaultOperation;
 
+    // A store exception's own SQL error number; for any other exception, such as the OperationCanceledException the
+    // store raises for SqlClient's acknowledgement of a cancelled command, the number the store kept beside it. Only
+    // an int stored under that key is read.
     internal static int? StoreSqlErrorNumber(Exception exception) => exception switch
     {
         DataStoreUnavailableException unavailable => unavailable.SqlErrorNumber,
         DataStoreWriteException failed => failed.SqlErrorNumber,
-        _ => null,
+        _ => exception.Data.Contains(SqlErrorClassifier.SqlErrorNumberKey)
+            && exception.Data[SqlErrorClassifier.SqlErrorNumberKey] is int number
+                ? number
+                : null,
     };
 
     // The repository records a failed rollback beside the original failure, as a type name and a SQL error number
@@ -317,8 +340,16 @@ internal sealed partial class ApiExceptionHandler(ILogger<ApiExceptionHandler> l
         EventId = 2,
         EventName = "RequestAborted",
         Level = LogLevel.Information,
-        Message = "Request aborted by the client during {Operation}: {ExceptionType}; TraceId {TraceId}")]
-    internal static partial void LogClientAbort(ILogger logger, string operation, string exceptionType, string traceId);
+        Message = "Request aborted by the client during {Operation}: {ExceptionType}; SQL error {SqlErrorNumber}; "
+            + "rollback {RollbackExceptionType} {RollbackSqlErrorNumber}; TraceId {TraceId}")]
+    internal static partial void LogClientAbort(
+        ILogger logger,
+        string operation,
+        string exceptionType,
+        int? sqlErrorNumber,
+        string? rollbackExceptionType,
+        int? rollbackSqlErrorNumber,
+        string traceId);
 
     [LoggerMessage(
         EventId = 3,
@@ -394,10 +425,14 @@ internal sealed partial class ApiExceptionBoundaryMiddleware
         }
         catch (Exception exception) when (ApiExceptionHandler.IsClientAbort(exception, httpContext))
         {
+            var (rollbackExceptionType, rollbackSqlErrorNumber) = ApiExceptionHandler.RollbackFailure(exception);
             ApiExceptionHandler.LogBestEffort(() => ApiExceptionHandler.LogClientAbort(
                 _logger,
                 ApiExceptionHandler.ResolveOperation(exception, httpContext.GetEndpoint()),
                 ApiExceptionHandler.TypeName(exception),
+                ApiExceptionHandler.StoreSqlErrorNumber(exception),
+                rollbackExceptionType,
+                rollbackSqlErrorNumber,
                 ApiExceptionHandler.TraceId(httpContext)));
 
             // The status the exception-handler middleware itself gives an aborted request; nobody receives a body.

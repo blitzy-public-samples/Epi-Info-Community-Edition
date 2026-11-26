@@ -17,9 +17,11 @@
 // open or Back to forms continues, and a failed save keeps the draft and cancels the move;
 // the first Save of a new record follows canInsert and Save of a stored record canUpdate,
 // and a 403 keeps the draft; the validation summary lists each errored field's prompt
-// with its message, from client validation or a field-level 400. The connection-banner
-// cases answer their own outage reads and failed writes, and check the banner each shows.
+// with its message, from client validation or a field-level 400; and the toolbar
+// announces Saving… while a save is under way. The connection-banner cases answer their
+// own outage reads and failed writes, and check the banner each shows.
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { Profiler } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vitest';
 
 import { createApiClient } from '../api/client';
@@ -366,6 +368,10 @@ interface RenderOptions {
   readonly records?: readonly RecordDto[];
   /** Answer field events with no effects, for a case that moves focus into a field. */
   readonly answersFieldEvents?: boolean;
+  /** Answers a GET of `path` before the read routes do, for a case that fails a read; `undefined` leaves it to them. */
+  readonly answerRead?: (path: string) => Response | undefined;
+  /** Called at the end of each commit of the form view, in its layout phase, after the form view's layout effects. */
+  readonly onCommit?: () => void;
 }
 
 /**
@@ -380,13 +386,35 @@ async function renderForm(
   const records = [...(options.records ?? [RECORD])];
   const onExit = vi.fn<() => void>();
   const onFormNotFound = vi.fn<() => void>();
+  const serve = fakeApi(definition, records, options.answersFieldEvents ?? false);
+  const { answerRead, onCommit } = options;
+  const fetch: typeof globalThis.fetch =
+    answerRead === undefined
+      ? serve
+      : (input, init) => {
+          const request = input instanceof Request ? input : new Request(input, init);
+          const url = new URL(request.url);
+          const answered = request.method === 'GET' ? answerRead(url.pathname) : undefined;
+          if (answered === undefined) {
+            return serve(request);
+          }
+          calls.push({ method: request.method, url, body: null });
+          return Promise.resolve(answered);
+        };
   // Absolute: openapi-fetch builds a Request, and Node's Request rejects a relative URL.
-  const client = createApiClient({
-    baseUrl: 'http://localhost',
-    fetch: fakeApi(definition, records, options.answersFieldEvents ?? false),
-  });
+  const client = createApiClient({ baseUrl: 'http://localhost', fetch });
+  const formView = (
+    <FormView viewId={definition.viewId} client={client} onExit={onExit} onFormNotFound={onFormNotFound} />
+  );
+  // A Profiler's onRender runs in the commit's layout phase, after the layout effects of the tree it wraps.
   const { container } = render(
-    <FormView viewId={definition.viewId} client={client} onExit={onExit} onFormNotFound={onFormNotFound} />,
+    onCommit === undefined ? (
+      formView
+    ) : (
+      <Profiler id="form-view" onRender={() => onCommit()}>
+        {formView}
+      </Profiler>
+    ),
   );
 
   const count = records.length;
@@ -1419,6 +1447,291 @@ describe('FormView field rendering: isolation, row identity, registry lookup and
   });
 });
 
+describe('FormView save progress', () => {
+  it('announces Saving… in the form toolbar while a save is under way, with Save disabled and still named Save', async () => {
+    const { definition } = await renderForm();
+    const formActions = screen.getByRole('toolbar', { name: 'Form actions' });
+    const status = within(formActions).getByRole('status');
+    const save = within(formActions).getByRole('button', { name: 'Save' });
+    expect(status.textContent).toBe('');
+    expect(isDisabled(save)).toBe(false);
+
+    edit(definition, 'LastName', EDITED_LAST_NAME);
+    const held = holdWrite();
+    fireEvent.click(save);
+    await waitFor(() => {
+      expect(writeCalls()).toHaveLength(1);
+    });
+
+    expect(within(formActions).getByRole('status')).toBe(status);
+    expect(status.textContent).toBe('Saving…');
+    expect(within(formActions).getByRole('button', { name: 'Save' })).toBe(save);
+    expect(isDisabled(save)).toBe(true);
+
+    held.release({ kind: 'saved', record: savedWith(RECORD, { LastName: EDITED_LAST_NAME }) });
+    await waitFor(() => {
+      expect(status.textContent).toBe('');
+    });
+
+    expect(isDisabled(save)).toBe(false);
+    const writes = writeCalls();
+    expect(writes.map(requestLine)).toEqual([`PUT ${FORM_PATH}/records/${RECORD.globalRecordId}`]);
+    expect(writtenValues(writes[0])).toEqual({ LastName: EDITED_LAST_NAME });
+  });
+});
+
+describe('FormView validation summary jumps', () => {
+  // A rejected save lists each message under its field's label, a button. The label of a field
+  // whose control can take focus shows the field's page and focuses the control. A protected,
+  // check-code-disabled or unrendered control, or a radio group with no radio, cannot take
+  // focus: its label stays the same button, marked aria-disabled and described by a note that
+  // the field cannot be edited, and activating it does nothing.
+  const WRITABLE = 'Lab';
+  const WRITABLE_MESSAGE = 'Lab must name a laboratory the state accepts.';
+  const BLOCKED_MESSAGE = 'The server rejected this value.';
+  const NOT_EDITABLE = '(This field cannot be edited right now.)';
+
+  /**
+   * `fakeApi`, plus a field-event route whose nth reply, counted from 1, disables the fields
+   * `disabledFor(n)` names once it settles, and a save route that rejects the open record's
+   * `PUT` with `errors`.
+   */
+  function rejectingSaveApi(
+    definition: FormDefinition,
+    disabledFor: (event: number) => readonly string[] | Promise<readonly string[]>,
+    errors: Readonly<Record<string, string[]>>,
+  ): typeof fetch {
+    const serve = fakeApi(definition, [RECORD]);
+    const form = `/api/forms/${definition.viewId}`;
+    let events = 0;
+    return async (input, init) => {
+      const request = input instanceof Request ? input : new Request(input, init);
+      const url = new URL(request.url);
+      const isFieldEvent = request.method === 'POST' && url.pathname === `${form}/checkcode/field-event`;
+      const isSave = request.method === 'PUT' && url.pathname === `${form}/records/${RECORD.globalRecordId}`;
+      if (!isFieldEvent && !isSave) {
+        return serve(request);
+      }
+      const text = await request.text();
+      calls.push({ method: request.method, url, body: text === '' ? null : text });
+      if (isFieldEvent) {
+        events += 1;
+        const disabled = await disabledFor(events);
+        const effects: FieldEventResponse = {
+          enabled: [],
+          disabled: [...disabled],
+          cleared: [],
+          assigned: {},
+          dialogs: [],
+          diagnostics: [],
+        };
+        return jsonResponse(200, effects);
+      }
+      const problem: HttpValidationProblemDetails = {
+        type: 'https://tools.ietf.org/html/rfc9110#section-15.5.1',
+        title: 'One or more validation errors occurred.',
+        status: 400,
+        detail: 'See the errors property for details.',
+        errors: { ...errors },
+        traceId: '00-test-validation-00',
+      };
+      return jsonResponse(400, problem);
+    };
+  }
+
+  /** Lets pending promise callbacks and zero-delay timers run inside act. */
+  async function settle(): Promise<void> {
+    await act(async () => {
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, 0);
+      });
+    });
+  }
+
+  function fieldEventCalls(): Call[] {
+    return calls.filter((call) => call.url.pathname.endsWith('/checkcode/field-event'));
+  }
+
+  /**
+   * The element of field `name` that can take focus: its enabled control, or for a radio
+   * group an enabled radio; `null` when it is not rendered, disabled or holds no radio.
+   */
+  function focusTargetOf(name: string): HTMLElement | null {
+    const control = document.getElementById(fieldControlId(name));
+    if (control === null || isDisabled(control)) {
+      return null;
+    }
+    return control instanceof HTMLFieldSetElement
+      ? control.querySelector<HTMLElement>('input:not(:disabled)')
+      : control;
+  }
+
+  /** A promise the test settles itself, to hold a reply until the test releases it. */
+  function deferred<T>(): { readonly promise: Promise<T>; readonly resolve: (value: T) => void } {
+    let resolve: (value: T) => void = () => undefined;
+    const promise = new Promise<T>((release) => {
+      resolve = release;
+    });
+    return { promise, resolve };
+  }
+
+  /** Asserts that a summary label button is marked unavailable and described by the note. */
+  function expectUnavailable(button: HTMLElement): void {
+    expect(button.getAttribute('aria-disabled')).toBe('true');
+    const noteId = present(button.getAttribute('aria-describedby'), 'aria-describedby of the label');
+    expect(document.getElementById(noteId)?.textContent).toBe(NOT_EDITABLE);
+  }
+
+  function isSelected(page: PageDefinition): boolean {
+    return screen.getByRole('tab', { name: page.name }).getAttribute('aria-selected') === 'true';
+  }
+
+  /**
+   * Opens the record of `definition`, edits Last Name, which raises FieldBefore, and saves.
+   * The save drains that event, then its `PUT` is rejected with `errors`. Returns the summary.
+   */
+  async function rejectedSave(
+    definition: FormDefinition,
+    disabledFor: (event: number) => readonly string[] | Promise<readonly string[]>,
+    errors: Readonly<Record<string, string[]>>,
+  ): Promise<HTMLElement> {
+    const client = createApiClient({
+      baseUrl: 'http://localhost',
+      fetch: rejectingSaveApi(definition, disabledFor, errors),
+    });
+    render(
+      <FormView
+        viewId={definition.viewId}
+        client={client}
+        onExit={() => undefined}
+        onFormNotFound={() => undefined}
+      />,
+    );
+    await screen.findByRole('heading', { name: definition.name });
+    await within(screen.getByRole('toolbar', { name: 'Record navigation' })).findByText('1 of 1');
+    await within(screen.getByRole('region', { name: 'Records' })).findByText('1 record');
+    // Past the tick in which installing the record suppresses field events.
+    await settle();
+
+    const lastName = screen.getByLabelText('Last Name');
+    act(() => {
+      lastName.focus();
+    });
+    fireEvent.change(lastName, { target: { value: 'Byron' } });
+    const formActions = screen.getByRole('toolbar', { name: 'Form actions' });
+    fireEvent.click(within(formActions).getByRole('button', { name: 'Save' }));
+
+    const summary = await screen.findByRole('alert');
+    expect(calls.filter((call) => call.method === 'PUT')).toHaveLength(1);
+    return summary;
+  }
+
+  it.each<{
+    reason: string;
+    blocked: string;
+    disabledByCheckCode: readonly string[];
+    form?: () => FormDefinition;
+  }>([
+    { reason: 'read-only in metadata', blocked: 'OnsetWeek', disabledByCheckCode: [] },
+    { reason: 'disabled by check code', blocked: 'FirstName', disabledByCheckCode: ['FirstName'] },
+    { reason: 'unsupported, so it has no control', blocked: 'ILL', disabledByCheckCode: [] },
+    {
+      // Valid metadata: the enabled fieldset renders, but holds no radio to focus.
+      reason: 'an option field with no option',
+      blocked: 'IllnessSeverity',
+      disabledByCheckCode: [],
+      form: () => withField('IllnessSeverity', (field) => ({ ...field, options: [] })),
+    },
+  ])(
+    'jumps to a focusable field, and marks the label of $blocked unavailable: $reason',
+    async ({ blocked, disabledByCheckCode, form = createFormDefinitionFixture }) => {
+      const definition = form();
+      const errors = { [blocked]: [BLOCKED_MESSAGE], [WRITABLE]: [WRITABLE_MESSAGE] };
+      // Every field-event reply applies the check-code disabling, the first before the save's PUT.
+      const summary = await rejectedSave(definition, () => disabledByCheckCode, errors);
+      const blockedPrompt = promptOf(fieldByName(blocked, definition));
+      const writablePrompt = promptOf(fieldByName(WRITABLE, definition));
+      expect(within(summary).getAllByRole('listitem').map((item) => item.textContent)).toEqual([
+        `${blockedPrompt}: ${BLOCKED_MESSAGE} ${NOT_EDITABLE}`,
+        `${writablePrompt} ${WRITABLE_MESSAGE}`,
+      ]);
+
+      // The blocked field: nothing of its control can take focus, so its label is unavailable.
+      expect(focusTargetOf(blocked), `focusable control of ${blocked}`).toBeNull();
+      const blockedLabel = within(summary).getByRole('button', { name: blockedPrompt });
+      expectUnavailable(blockedLabel);
+      const writableLabel = within(summary).getByRole('button', { name: writablePrompt });
+      expect(writableLabel.hasAttribute('aria-disabled')).toBe(false);
+      expect(writableLabel.hasAttribute('aria-describedby')).toBe(false);
+
+      // The writable field on page 2: its label shows that page and focuses its control.
+      const writablePage = pageOf(definition, fieldByName(WRITABLE, definition).pageId);
+      expect(isSelected(writablePage)).toBe(false);
+      fireEvent.click(writableLabel);
+      expect(isSelected(writablePage)).toBe(true);
+      expect(document.activeElement).toBe(screen.getByLabelText(writablePrompt));
+
+      // Activating the blocked label (Enter and Space on a button arrive as this click) shows
+      // its page, page 1, no more than it focuses a control: focus stays on the label.
+      expect(fieldByName(blocked, definition).pageId).not.toBe(writablePage.pageId);
+      act(() => {
+        blockedLabel.focus();
+      });
+      fireEvent.click(blockedLabel);
+      expect(isSelected(writablePage)).toBe(true);
+      expect(document.activeElement).toBe(blockedLabel);
+
+      // Moving focus raised FieldAfter on Last Name, then FieldBefore and FieldAfter on Lab;
+      // let their replies land.
+      await waitFor(() => {
+        expect(fieldEventCalls()).toHaveLength(4);
+      });
+      await settle();
+    },
+  );
+
+  it('keeps focus on a jump label whose field a later field-event reply disables', async () => {
+    const definition = createFormDefinitionFixture();
+    const writablePrompt = promptOf(fieldByName(WRITABLE, definition));
+    const writablePage = pageOf(definition, fieldByName(WRITABLE, definition).pageId);
+    // FieldBefore on Last Name disables nothing. The reply to the FieldAfter that focusing the
+    // jump raises is held until the test releases it, and then disables Lab.
+    const heldReply = deferred<readonly string[]>();
+    const summary = await rejectedSave(definition, (event) => (event === 1 ? [] : heldReply.promise), {
+      [WRITABLE]: [WRITABLE_MESSAGE],
+    });
+
+    const jump = within(summary).getByRole('button', { name: writablePrompt });
+    expect(jump.hasAttribute('aria-disabled')).toBe(false);
+    act(() => {
+      jump.focus();
+    });
+    await waitFor(() => {
+      expect(fieldEventCalls()).toHaveLength(2);
+    });
+    expect(document.activeElement).toBe(jump);
+
+    heldReply.resolve([WRITABLE]);
+    await waitFor(() => {
+      expect(focusTargetOf(WRITABLE), 'focusable control of Lab').toBeNull();
+    });
+    await settle();
+
+    // The same element, now unavailable, still holds focus.
+    expect(within(screen.getByRole('alert')).getByRole('button', { name: writablePrompt })).toBe(jump);
+    expectUnavailable(jump);
+    expect(document.activeElement).toBe(jump);
+    expect(within(summary).getAllByRole('listitem').map((item) => item.textContent)).toEqual([
+      `${writablePrompt} ${WRITABLE_MESSAGE} ${NOT_EDITABLE}`,
+    ]);
+
+    // Activating it now shows no page and moves no focus.
+    fireEvent.click(jump);
+    expect(isSelected(writablePage)).toBe(false);
+    expect(document.activeElement).toBe(jump);
+  });
+});
+
 describe('FormView permission flags', () => {
   // The server reports these flags from SQL Server permissions and enforces them on every
   // write; the client only disables what they deny. `null` means nothing was reported and
@@ -2023,5 +2336,502 @@ describe('FormView connection banners', () => {
     expect(screen.queryByRole('alert')).toBeNull();
     expect(linesOf('DELETE')).toEqual([`DELETE ${RECORD_PATH}`, `DELETE ${RECORD_PATH}`]);
     expect(linesOf('PUT')).toEqual([]);
+  });
+});
+
+describe('FormView definition reload focus', () => {
+  // Retry replaces the failure's toolbar and banner with the loading status, so it first
+  // moves focus to that status line, which stays one element through loading and failure.
+  // A retried load that succeeds hands focus on to the form's heading; nothing else moves it.
+
+  /** How the test answers a definition GET: an HTTP status, or no response at all. */
+  type DefinitionAnswer = 200 | 500 | 503 | 'network';
+
+  interface HeldApi {
+    readonly fetch: typeof fetch;
+    /** Answers the definition GET in flight, or else the next one when it arrives. */
+    readonly answer: (answer: DefinitionAnswer) => void;
+  }
+
+  /** `fakeApi`, except that each definition GET waits until the test answers it. */
+  function heldDefinitionApi(definition: FormDefinition): HeldApi {
+    const serve = fakeApi(definition, [RECORD]);
+    const formPath = `/api/forms/${String(definition.viewId)}`;
+    let held: ((response: Promise<Response>) => void) | null = null;
+    let queued: DefinitionAnswer | null = null;
+
+    const respond = (answer: DefinitionAnswer): Promise<Response> => {
+      switch (answer) {
+        case 200:
+          return Promise.resolve(jsonResponse(200, definition));
+        case 'network':
+          return Promise.reject(new TypeError('fetch failed'));
+        default: {
+          const problem: ProblemDetails = {
+            ...UNROUTED_PROBLEM,
+            status: answer,
+            detail: 'The test API failed the definition request.',
+            traceId: `00-test-${String(answer)}-00`,
+          };
+          return Promise.resolve(jsonResponse(answer, problem));
+        }
+      }
+    };
+
+    return {
+      fetch: (input, init) => {
+        const request = input instanceof Request ? input : new Request(input, init);
+        const url = new URL(request.url);
+        if (request.method !== 'GET' || url.pathname !== formPath) {
+          return serve(request);
+        }
+        calls.push({ method: request.method, url, body: null });
+        if (queued !== null) {
+          const answer = queued;
+          queued = null;
+          return respond(answer);
+        }
+        return new Promise<Response>((resolve) => {
+          held = resolve;
+        });
+      },
+      answer: (answer) => {
+        if (held === null) {
+          queued = answer;
+          return;
+        }
+        const release = held;
+        held = null;
+        release(respond(answer));
+      },
+    };
+  }
+
+  /** The form view of `definition`, served by `api`. */
+  function heldFormView(definition: FormDefinition, api: HeldApi) {
+    return (
+      <FormView
+        viewId={definition.viewId}
+        client={createApiClient({ baseUrl: 'http://localhost', fetch: api.fetch })}
+        onExit={() => undefined}
+        onFormNotFound={() => undefined}
+      />
+    );
+  }
+
+  /** Waits until the workspace has loaded its record and grid, so no request is left in flight. */
+  async function workspaceLoaded(): Promise<void> {
+    await within(screen.getByRole('toolbar', { name: 'Record navigation' })).findByText('1 of 1');
+    await within(screen.getByRole('region', { name: 'Records' })).findByText('1 record');
+  }
+
+  it.each<{ label: string; failure: Exclude<DefinitionAnswer, 200> }>([
+    { label: 'a 500, under the error banner', failure: 500 },
+    { label: 'a 503, under the connection banner', failure: 503 },
+    { label: 'no response, under the connection banner', failure: 'network' },
+  ])('keeps focus on the status line through Retry after $label, then gives it to the heading', async ({ failure }) => {
+    const definition = createFormDefinitionFixture();
+    const api = heldDefinitionApi(definition);
+    // While `recordCommits` is set, the focused element at the end of each commit. A Profiler's
+    // onRender runs in the commit's layout phase, after the form view's layout effects and
+    // before any passive effect, which may run only after the browser has painted.
+    const focusAtCommits: (Element | null)[] = [];
+    let recordCommits = false;
+    const recordFocus = (): void => {
+      if (recordCommits) {
+        focusAtCommits.push(document.activeElement);
+      }
+    };
+    render(
+      <Profiler id="form-view" onRender={recordFocus}>
+        {heldFormView(definition, api)}
+      </Profiler>,
+    );
+    const status = screen.getByRole('status');
+    expect(status.textContent).toBe('Loading form…');
+
+    /** Answers the pending definition GET with the failure, and returns the banner's Retry. */
+    const fail = async (): Promise<HTMLElement> => {
+      api.answer(failure);
+      const banner = await screen.findByRole('alert');
+      return within(banner).getByRole('button', { name: 'Retry' });
+    };
+
+    // The first load moves no focus, even when it fails.
+    let retry = await fail();
+    expect(document.activeElement).toBe(document.body);
+    expect(screen.getByRole('status')).toBe(status);
+    expect(status.textContent).toBe('The form could not be loaded.');
+    const formActions = screen.getByRole('toolbar', { name: 'Form actions' });
+    expect(within(formActions).getByRole('button', { name: 'Back to forms' })).toBeTruthy();
+
+    // Retry focuses the status line before its button and the toolbar leave the page.
+    retry.focus();
+    fireEvent.click(retry);
+    expect(document.activeElement).toBe(status);
+    expect(status.textContent).toBe('Loading form…');
+    expect(screen.queryAllByRole('button')).toEqual([]);
+
+    // A repeated failure leaves focus there, one Tab before the new Retry.
+    retry = await fail();
+    expect(document.activeElement).toBe(status);
+    expect(screen.getByRole('status')).toBe(status);
+    expect(status.textContent).toBe('The form could not be loaded.');
+    const following = screen
+      .getAllByRole('button')
+      .filter((button) => (status.compareDocumentPosition(button) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0);
+    expect(following).toEqual([retry]);
+
+    // A retried load that succeeds moves focus on to the form's heading, where it stays.
+    retry.focus();
+    fireEvent.click(retry);
+    expect(document.activeElement).toBe(status);
+    // The heading takes focus in the commit that removes the status line, before the browser
+    // could paint it, so focus never rests on the page body: every commit ends with it there.
+    recordCommits = true;
+    api.answer(200);
+    const heading = await screen.findByRole('heading', { level: 2, name: definition.name });
+    expect(document.activeElement).toBe(heading);
+    await workspaceLoaded();
+    expect(document.activeElement).toBe(heading);
+    expect(focusAtCommits.length).toBeGreaterThan(0);
+    const elsewhere = focusAtCommits.filter((element) => element !== heading);
+    expect(elsewhere.map((element) => element?.tagName ?? 'none')).toEqual([]);
+
+    // Each Retry repeated the same GET, and nothing but GETs was sent.
+    const formPath = `/api/forms/${String(definition.viewId)}`;
+    const definitionGets = calls.filter((call) => call.url.pathname === formPath).map(requestLine);
+    expect(definitionGets).toEqual([`GET ${formPath}`, `GET ${formPath}`, `GET ${formPath}`]);
+    expect(calls.filter((call) => call.method !== 'GET').map(requestLine)).toEqual([]);
+  });
+
+  it('moves no focus when the first load succeeds', async () => {
+    await renderForm();
+
+    expect(document.activeElement).toBe(document.body);
+  });
+
+  it('leaves focus where the user moved it while a retried load ran', async () => {
+    const definition = createFormDefinitionFixture();
+    const api = heldDefinitionApi(definition);
+    render(
+      <>
+        <button type="button">Elsewhere</button>
+        {heldFormView(definition, api)}
+      </>,
+    );
+    api.answer(500);
+    const retry = within(await screen.findByRole('alert')).getByRole('button', { name: 'Retry' });
+
+    retry.focus();
+    fireEvent.click(retry);
+    const elsewhere = screen.getByRole('button', { name: 'Elsewhere' });
+    elsewhere.focus();
+    api.answer(200);
+    await screen.findByRole('heading', { level: 2, name: definition.name });
+    await workspaceLoaded();
+
+    expect(document.activeElement).toBe(elsewhere);
+  });
+});
+
+describe('FormView banner action focus', () => {
+  // Retry, Save again, Discard edits and Dismiss each remove the banner whose button ran
+  // them, at once or when the resent write starts. The form's heading then takes focus in
+  // the commit that removes the button, before the browser could paint, so focus never
+  // rests on the page body. A banner that appears moves no focus, and focus the user moved
+  // elsewhere stays there.
+
+  const AT_1_PATH = `${FORM_PATH}/records/at/1`;
+  const AT_2_PATH = `${FORM_PATH}/records/at/2`;
+  const B_PATH = `${FORM_PATH}/records/${RECORD_B.globalRecordId}`;
+  const PUT_LINE = `PUT ${FORM_PATH}/records/${RECORD.globalRecordId}`;
+  /** RECORD's stored LastName, which Discard edits puts back on screen. */
+  const STORED_LAST_NAME = 'Lovelace';
+
+  const NOT_FOUND_PROBLEM: ProblemDetails = {
+    type: 'https://tools.ietf.org/html/rfc9110#section-15.5.5',
+    title: 'Not Found',
+    status: 404,
+    detail: 'The test server has no such record.',
+    traceId: '00-test-not-found-00',
+  };
+
+  /** A 503, carrying `writeOutcome` as a record write's does when one is given. */
+  function unavailableProblem(writeOutcome?: WriteOutcome): ProblemDetails | WriteProblemDetails {
+    const problem: ProblemDetails = {
+      type: 'https://tools.ietf.org/html/rfc9110#section-15.6.4',
+      title: 'Service Unavailable',
+      status: 503,
+      detail: 'The test database is unavailable.',
+      traceId: '00-test-banner-focus-00',
+    };
+    return writeOutcome === undefined ? problem : { ...problem, writeOutcome };
+  }
+
+  /** The form's heading, which takes the focus of a banner button its own action removed. */
+  function headingOf(definition: FormDefinition): HTMLElement {
+    return screen.getByRole('heading', { level: 2, name: definition.name });
+  }
+
+  /** Presses `button` as a keyboard user does: it holds focus when it is activated. */
+  function press(button: HTMLElement): void {
+    button.focus();
+    expect(document.activeElement).toBe(button);
+    fireEvent.click(button);
+  }
+
+  function noAlert(): Promise<void> {
+    return waitFor(() => {
+      expect(screen.queryByRole('alert')).toBeNull();
+    });
+  }
+
+  function readsOf(path: string): string[] {
+    return calls.filter((call) => call.method === 'GET' && call.url.pathname === path).map(requestLine);
+  }
+
+  /**
+   * Edits LastName and saves it with a PUT the fake answers with `problem`, and returns the
+   * banner that shows the failure. The click does not focus Save, so focus is on the page
+   * body when the banner appears, and stays there: a banner that appears moves no focus.
+   */
+  async function failedSave(
+    definition: FormDefinition,
+    problem: ProblemDetails | WriteProblemDetails,
+  ): Promise<HTMLElement> {
+    edit(definition, 'LastName', EDITED_LAST_NAME);
+    replyToWrite({ kind: 'problem', problem });
+    fireEvent.click(formActionButton('Save'));
+    const banner = await screen.findByRole('alert');
+    await flush();
+    expect(document.activeElement).toBe(document.body);
+    return banner;
+  }
+
+  /** Answers a held resend with the stored record, and waits until the save has ended. */
+  async function saveHeld(held: HeldWrite): Promise<void> {
+    await waitFor(() => {
+      expect(writeCalls()).toHaveLength(2);
+    });
+    held.release({ kind: 'saved', record: savedWith(RECORD, { LastName: EDITED_LAST_NAME }) });
+    await waitFor(() => {
+      expect(isDisabled(formActionButton('Save'))).toBe(false);
+    });
+  }
+
+  it.each<{
+    label: string;
+    problem: ProblemDetails | WriteProblemDetails;
+    /** The accessible name of the banner button the case presses. */
+    button: string;
+    /** The action resends the draft's PUT, which the fake holds until the case answers it. */
+    resends: boolean;
+    /** The action opens the nearest record again, the one at position 1. */
+    reopens: boolean;
+    /** LastName on screen once the action has run its course. */
+    lastName: string;
+  }>([
+    {
+      label: 'Retry of a 503 notWritten',
+      problem: unavailableProblem('notWritten'),
+      button: 'Retry',
+      resends: true,
+      reopens: false,
+      lastName: EDITED_LAST_NAME,
+    },
+    {
+      label: 'Retry of a 500 notWritten',
+      problem: NOT_WRITTEN_PROBLEM,
+      button: 'Retry',
+      resends: true,
+      reopens: false,
+      lastName: EDITED_LAST_NAME,
+    },
+    {
+      label: 'Save again after a 503 unknown',
+      problem: unavailableProblem('unknown'),
+      button: 'Save again (the earlier save may already have been applied)',
+      resends: true,
+      reopens: false,
+      lastName: EDITED_LAST_NAME,
+    },
+    {
+      label: 'Dismiss of a 503 notWritten',
+      problem: unavailableProblem('notWritten'),
+      button: 'Dismiss',
+      resends: false,
+      reopens: false,
+      lastName: EDITED_LAST_NAME,
+    },
+    {
+      label: 'Dismiss of a 500 notWritten',
+      problem: NOT_WRITTEN_PROBLEM,
+      button: 'Dismiss',
+      resends: false,
+      reopens: false,
+      lastName: EDITED_LAST_NAME,
+    },
+    {
+      label: 'Discard edits after a 404',
+      problem: NOT_FOUND_PROBLEM,
+      button: 'Discard edits',
+      resends: false,
+      reopens: true,
+      lastName: STORED_LAST_NAME,
+    },
+  ])('gives the heading the focus that $label removes with its banner', async ({
+    problem,
+    button,
+    resends,
+    reopens,
+    lastName,
+  }) => {
+    // While `recordCommits` is set, the focused element at the end of each commit.
+    const focusAtCommits: (Element | null)[] = [];
+    let recordCommits = false;
+    const { definition } = await renderForm(createFormDefinitionFixture(), {
+      onCommit: () => {
+        if (recordCommits) {
+          focusAtCommits.push(document.activeElement);
+        }
+      },
+    });
+    const banner = await failedSave(definition, problem);
+    const held = resends ? holdWrite() : null;
+
+    recordCommits = true;
+    press(within(banner).getByRole('button', { name: button }));
+    await noAlert();
+    const heading = headingOf(definition);
+    expect(document.activeElement).toBe(heading);
+
+    if (held !== null) {
+      await saveHeld(held);
+    }
+    if (reopens) {
+      await waitFor(() => {
+        expect(readsOf(AT_1_PATH)).toHaveLength(2);
+      });
+    }
+    await waitFor(() => {
+      expect(controlValue(controlOf(definition, 'LastName'))).toBe(lastName);
+    });
+    await flush();
+    expect(document.activeElement).toBe(heading);
+    // Every commit from the press on ended with focus on the pressed button, still on the
+    // page, or on the heading; none left it on the page body.
+    expect(focusAtCommits.length).toBeGreaterThan(0);
+    const unfocused = focusAtCommits.filter((element) => element === null || element === document.body);
+    expect(unfocused.map((element) => element?.tagName ?? 'none')).toEqual([]);
+    // The action sent what it always sends: the failed PUT, and the resend when it makes one.
+    const writes = writeCalls();
+    expect(writes.map(requestLine)).toEqual(resends ? [PUT_LINE, PUT_LINE] : [PUT_LINE]);
+    for (const write of writes) {
+      expect(writtenValues(write)).toEqual({ LastName: EDITED_LAST_NAME });
+    }
+  });
+
+  it('keeps focus on the heading when the retried save fails again and its banner returns', async () => {
+    const { definition } = await renderForm();
+    const banner = await failedSave(definition, unavailableProblem('notWritten'));
+    const held = holdWrite();
+
+    press(within(banner).getByRole('button', { name: 'Retry' }));
+    await noAlert();
+    const heading = headingOf(definition);
+    expect(document.activeElement).toBe(heading);
+
+    await waitFor(() => {
+      expect(writeCalls()).toHaveLength(2);
+    });
+    held.release({ kind: 'problem', problem: unavailableProblem('notWritten') });
+    const returned = await screen.findByRole('alert');
+    await flush();
+
+    expect(within(returned).getByRole('button', { name: 'Retry' })).toBeTruthy();
+    expect(document.activeElement).toBe(heading);
+    expect(writeCalls().map(requestLine)).toEqual([PUT_LINE, PUT_LINE]);
+  });
+
+  it('leaves focus where the user moved it before the retried save removed the banner', async () => {
+    const { definition } = await renderForm();
+    const banner = await failedSave(definition, unavailableProblem('notWritten'));
+    const held = holdWrite();
+
+    press(within(banner).getByRole('button', { name: 'Retry' }));
+    // The retried write starts, and removes the banner, only after the click has returned.
+    expect(screen.getByRole('alert')).toBe(banner);
+    const find = formActionButton('Find');
+    find.focus();
+    await noAlert();
+    expect(document.activeElement).toBe(find);
+
+    await saveHeld(held);
+    await flush();
+    expect(document.activeElement).toBe(find);
+    expect(writeCalls().map(requestLine)).toEqual([PUT_LINE, PUT_LINE]);
+  });
+
+  it('gives the heading the focus that Dismiss removes with the navigation notice', async () => {
+    const { definition } = await renderForm(createFormDefinitionFixture(), {
+      records: [RECORD_A, RECORD_B],
+      // B is gone by the time its grid row is opened.
+      answerRead: (path) => (path === B_PATH ? problemResponse(NOT_FOUND_PROBLEM) : undefined),
+    });
+    const records = screen.getByRole('region', { name: 'Records' });
+    fireEvent.click(within(records).getByRole('row', { name: new RegExp(B_LAST_NAME) }));
+
+    // The open lands on the nearest record with a notice that offers Dismiss, and moves no focus.
+    const notice = await waitFor(() =>
+      present(
+        screen
+          .queryAllByRole('status')
+          .find((status) => within(status).queryByRole('button', { name: 'Dismiss' }) !== null),
+        'the navigation notice',
+      ),
+    );
+    await flush();
+    expect(navigatorStatus()).toBe('1 of 2');
+    expect(document.activeElement).toBe(document.body);
+
+    press(within(notice).getByRole('button', { name: 'Dismiss' }));
+
+    expect(notice.isConnected).toBe(false);
+    expect(document.activeElement).toBe(headingOf(definition));
+    expect(readsOf(B_PATH)).toEqual([`GET ${B_PATH}`]);
+    expect(writeCalls()).toEqual([]);
+  });
+
+  it('gives the heading the focus that Retry removes with a failed navigation read', async () => {
+    let failedReads = 0;
+    const { definition } = await renderForm(createFormDefinitionFixture(), {
+      records: [RECORD_A, RECORD_B],
+      // The first read of position 2 finds the database unreachable; its retry is served.
+      answerRead: (path) => {
+        if (path !== AT_2_PATH || failedReads > 0) {
+          return undefined;
+        }
+        failedReads += 1;
+        return problemResponse(unavailableProblem());
+      },
+    });
+    fireEvent.click(navigatorButton('Next'));
+    const banner = await screen.findByRole('alert');
+    await flush();
+    expect(document.activeElement).toBe(document.body);
+
+    press(within(banner).getByRole('button', { name: 'Retry' }));
+
+    expect(banner.isConnected).toBe(false);
+    const heading = headingOf(definition);
+    expect(document.activeElement).toBe(heading);
+    await waitFor(() => {
+      expect(navigatorStatus()).toBe('2 of 2');
+    });
+    await flush();
+    expect(document.activeElement).toBe(heading);
+    expect(readsOf(AT_2_PATH)).toHaveLength(2);
+    expect(writeCalls()).toEqual([]);
   });
 });

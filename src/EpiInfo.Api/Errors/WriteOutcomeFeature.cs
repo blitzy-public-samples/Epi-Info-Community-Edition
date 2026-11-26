@@ -28,20 +28,30 @@ namespace EpiInfo.Api.Errors;
 /// <item><description>
 /// Call <see cref="MarkNotWritten"/> as soon as <c>UpdateAsync</c> returns any defined status other than
 /// <c>Success</c>, or <c>SoftDeleteAsync</c> returns <c>NotFound</c> or <c>AlreadyDeleted</c>: the store reports
-/// that it wrote nothing, so a failure while that response is written is <c>notWritten</c>, not <c>unknown</c>.
+/// that it wrote nothing, so a failure while that response is written is <c>notWritten</c>, not <c>unknown</c>,
+/// whatever outcome a later store exception reports.
 /// </description></item>
 /// <item><description>
 /// A <c>DELETE</c> of an already-deleted record wrote nothing, so it is marked not written, never written.
 /// </description></item>
 /// </list>
 /// <para>
-/// Semantics the exception handler relies on; the handler implements this precedence, this type only records the
-/// facts:
+/// The feature is in one of four states: unset (no store write call issued), started (<see cref="WriteStarted"/>
+/// alone), and the two definitive results the store reported, <see cref="Written"/> and <see cref="NotWritten"/>,
+/// which are never both true. Semantics the exception handler relies on; the handler implements this precedence,
+/// this type only records the facts:
 /// </para>
 /// <list type="number">
 /// <item><description><see cref="Written"/> is true: <c>written</c>.</description></item>
-/// <item><description>Otherwise the store exception's <c>Outcome</c>, when the failure is a store exception.</description></item>
-/// <item><description>Otherwise a missing feature, or <see cref="WriteStarted"/> false: <c>notWritten</c>.</description></item>
+/// <item><description>Otherwise <see cref="NotWritten"/> is true: <c>notWritten</c>.</description></item>
+/// <item><description>
+/// Otherwise a missing feature, or <see cref="WriteStarted"/> false: <c>notWritten</c>, whatever outcome a store
+/// exception reports, because no store write call was issued.
+/// </description></item>
+/// <item><description>
+/// Otherwise, for a started write still outstanding, the store exception's <c>Outcome</c>, when the failure is a store
+/// exception.
+/// </description></item>
 /// <item><description>Otherwise: <c>unknown</c>.</description></item>
 /// </list>
 /// </remarks>
@@ -61,22 +71,40 @@ public sealed class WriteOutcomeFeature
     /// </summary>
     public bool Written { get; private set; }
 
-    /// <summary>Records that a store write call is about to be issued. Calling it again has no further effect.</summary>
-    public void MarkWriteStarted() => WriteStarted = true;
+    /// <summary>
+    /// True once the store call returned a definitive result that wrote nothing, until the next
+    /// <see cref="MarkWriteStarted"/>. Never true together with <see cref="Written"/>. While it is true the request is
+    /// <c>notWritten</c>, whatever outcome a later store exception reports, because the store has already said what
+    /// its write did.
+    /// </summary>
+    public bool NotWritten { get; private set; }
 
     /// <summary>
-    /// Records that the store reported a commit; this also sets <see cref="WriteStarted"/>. Calling it again has no
-    /// further effect.
+    /// Records that a store write call is about to be issued. It sets <see cref="WriteStarted"/> and clears
+    /// <see cref="NotWritten"/>, because a new write call makes an earlier no-write result no longer the latest fact;
+    /// it never clears <see cref="Written"/>. Calling it again has no further effect.
+    /// </summary>
+    public void MarkWriteStarted()
+    {
+        WriteStarted = true;
+        NotWritten = false;
+    }
+
+    /// <summary>
+    /// Records that the store reported a commit; this also sets <see cref="WriteStarted"/> and clears
+    /// <see cref="NotWritten"/>. Calling it again has no further effect.
     /// </summary>
     public void MarkWritten()
     {
         WriteStarted = true;
         Written = true;
+        NotWritten = false;
     }
 
     /// <summary>
     /// Records that the store call returned a definitive result that wrote nothing: it rolled back or sent no data
-    /// statement. This clears <see cref="WriteStarted"/> unless <see cref="Written"/> is true, because a commit never
+    /// statement. Unless <see cref="Written"/> is true, this sets <see cref="NotWritten"/> and clears
+    /// <see cref="WriteStarted"/>; once <see cref="Written"/> is true it changes nothing, because a commit never
     /// reverts and <see cref="Written"/> always implies <see cref="WriteStarted"/>. Calling it again has no further
     /// effect.
     /// </summary>
@@ -85,6 +113,7 @@ public sealed class WriteOutcomeFeature
         if (!Written)
         {
             WriteStarted = false;
+            NotWritten = true;
         }
     }
 

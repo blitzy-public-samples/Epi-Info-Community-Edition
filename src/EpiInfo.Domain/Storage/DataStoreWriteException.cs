@@ -5,7 +5,8 @@ namespace EpiInfo.Domain.Storage;
 /// API never receives a SQL client exception. <c>ApiExceptionHandler</c> maps it to a 500 ProblemDetails whose
 /// <c>detail</c> is a fixed generic sentence plus the <c>traceId</c>, in every environment. On <c>POST</c>,
 /// <c>PUT</c> and <c>DELETE</c> of records the handler adds <c>writeOutcome</c>: the <c>WriteOutcomeFeature</c> value
-/// first, then <see cref="Outcome"/>.
+/// first, then <see cref="Outcome"/>, which applies only once a store write call was issued and while it is
+/// outstanding.
 /// </summary>
 /// <remarks>
 /// <para>

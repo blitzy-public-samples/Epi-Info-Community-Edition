@@ -1,6 +1,7 @@
 using System.Collections.ObjectModel;
 using System.Data;
 using System.Data.Common;
+using System.Runtime.ExceptionServices;
 using EpiInfo.Data.Metadata;
 using EpiInfo.Data.Permissions;
 using EpiInfo.Data.Sql;
@@ -823,7 +824,6 @@ internal sealed class SqlRecordRepository(
                 resolved.ByName));
         }
 
-        scope.MarkDmlSent();
         int uniqueKey = await SqlExecution.ExecuteScalarAsync<int>(
                 scope.Connection,
                 scope.Transaction,
@@ -831,7 +831,8 @@ internal sealed class SqlRecordRepository(
                 baseInsert,
                 options.CommandTimeoutSeconds,
                 observer,
-                cancellationToken)
+                cancellationToken,
+                onDispatch: scope.MarkDmlSent)
             .ConfigureAwait(false);
 
         foreach (SqlStatement pageInsert in pageInserts)
@@ -921,7 +922,6 @@ internal sealed class SqlRecordRepository(
             stamp);
         IReadOnlyList<PageUpdate> pageUpdates = PlanPageUpdates(schema, resolved, locked.GlobalRecordId);
 
-        scope.MarkDmlSent();
         if (baseStamp is not null)
         {
             await ExecuteOnLockedRowAsync(scope, RecordOperations.Update, baseStamp, cancellationToken)
@@ -1011,7 +1011,6 @@ internal sealed class SqlRecordRepository(
             locked.GlobalRecordId,
             stamp);
 
-        scope.MarkDmlSent();
         await ExecuteOnLockedRowAsync(scope, RecordOperations.Delete, softDelete, cancellationToken)
             .ConfigureAwait(false);
 
@@ -1096,6 +1095,10 @@ internal sealed class SqlRecordRepository(
         }
     }
 
+    // Sends one statement of the write. Every statement sent here is an INSERT or an UPDATE, so SqlExecution marks the
+    // scope's DML as sent once the statement has passed its local checks and immediately before it goes out; one those
+    // checks refuse, such as a statement on a closed connection, sends nothing and marks nothing. Reads go through
+    // SqlExecution directly and mark nothing.
     private Task<int> ExecuteAsync(
         WriteScope scope,
         string operation,
@@ -1108,13 +1111,14 @@ internal sealed class SqlRecordRepository(
             statement,
             options.CommandTimeoutSeconds,
             observer,
-            cancellationToken);
+            cancellationToken,
+            onDispatch: scope.MarkDmlSent);
 
 
     // Runs one write transaction on connection and, when it owns the connection, releases it. A release failure after
-    // a commit is the one failure left to the store once the data is written, so it is reported as written; after a
-    // rollback, or when the write already failed, nothing was written and the result or failure already decided
-    // stands.
+    // a confirmed commit is reported as written (ReleaseCommittedAsync), the one outcome the store can then prove. On
+    // every other path a release failure is discarded and the result or exception already decided stands unchanged,
+    // whatever outcome it carries, unknown included for a failed or unconfirmed commit or a failed rollback.
     private static async Task<T> RunWriteAsync<T>(
         SqlConnection connection,
         bool ownsConnection,
@@ -1163,8 +1167,9 @@ internal sealed class SqlRecordRepository(
         SqlTransaction transaction;
         try
         {
-            // SqlClient has no asynchronous begin: its BeginTransactionAsync makes this same call synchronously.
-            transaction = connection.BeginTransaction(IsolationLevel.ReadCommitted);
+            // The start observes the request's token and leaves the request's thread free (BeginTransactionAsync); a
+            // cancellation or failure here sends no DML, so it is classified at BeforeDml.
+            transaction = await BeginTransactionAsync(connection, cancellationToken).ConfigureAwait(false);
         }
         catch (Exception exception)
         {
@@ -1195,17 +1200,20 @@ internal sealed class SqlRecordRepository(
                 scope.MarkCommitting();
                 await transaction.CommitAsync(CancellationToken.None).ConfigureAwait(false);
             }
-            else
+            else if (await RollbackAsync(scope).ConfigureAwait(false) is { } rollbackError)
             {
-                scope.MarkRollbackAttempted();
-                await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+                // A rollback that fails is the write's failure: raised here, it reaches the catch below, which
+                // classifies it with the stage the body reached and the rollback failure the scope recorded.
+                ExceptionDispatchInfo.Capture(rollbackError).Throw();
             }
         }
         catch (Exception exception) when (ReferenceEquals(exception, scope.ContractViolation))
         {
             // A broken argument is refused before any base- or page-table statement, so the rollback has nothing to
-            // undo, and the ArgumentException reaches the caller unwrapped.
-            await RollbackQuietlyAsync(scope).ConfigureAwait(false);
+            // undo, and the ArgumentException reaches the caller unwrapped, carrying only the type and SQL error
+            // number of a rollback that failed.
+            Exception? rollbackError = await RollbackAsync(scope).ConfigureAwait(false);
+            SqlErrorClassifier.AttachRollbackFailure(exception, rollbackError);
             await ReleaseQuietlyAsync(transaction).ConfigureAwait(false);
             throw;
         }
@@ -1233,37 +1241,35 @@ internal sealed class SqlRecordRepository(
         return decision;
     }
 
-    // Rolls back a failed write unless the commit was already called, then builds the exception the caller throws.
-    // The rollback's own failure never replaces the original: it is only noted on the exception raised for it.
+    // Rolls back a failed write unless the commit or the rollback was already called, then builds the exception the
+    // caller throws from the stage and the rollback the scope recorded. The rollback's own failure never replaces the
+    // original: it is only noted on the exception raised for it.
     private static async Task<Exception> FailAsync(
         WriteScope scope,
         string operation,
         Exception exception,
         CancellationToken cancellationToken)
     {
-        bool rollbackCompleted = false;
-        Exception? rollbackError = null;
-        if (scope.Stage != WriteStage.Committing && !scope.RollbackAttempted)
+        if (!scope.CommitAttempted && !scope.RollbackAttempted)
         {
-            scope.MarkRollbackAttempted();
-            try
-            {
-                await scope.Transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
-                rollbackCompleted = true;
-            }
-            catch (Exception error)
-            {
-                rollbackError = error;
-            }
+            await RollbackAsync(scope).ConfigureAwait(false);
         }
 
-        return BuildFailure(exception, operation, scope.Stage, rollbackCompleted, rollbackError, cancellationToken);
+        return BuildFailure(
+            exception,
+            operation,
+            scope.Stage,
+            scope.RollbackCompleted,
+            scope.RollbackError,
+            cancellationToken);
     }
 
-    // The exception a failed write raises: the original cancellation unchanged, or one with the caller's token for
-    // SqlClient's acknowledgement of a cancelled command; otherwise the classified store exception carrying the
-    // outcome the stage and the rollback prove, and the type and SQL error number of a rollback that failed.
-    private static Exception BuildFailure(
+    // The exception a failed write raises, which keeps the original failure's classification: the original
+    // cancellation itself, or one with the caller's token and the classified SQL error number for SqlClient's
+    // acknowledgement of a cancelled command; otherwise the classified store exception carrying the outcome the stage
+    // and the rollback prove. Either also carries the type and SQL error number of a rollback that failed, never its
+    // message. Internal for its unit tests.
+    internal static Exception BuildFailure(
         Exception exception,
         string operation,
         WriteStage stage,
@@ -1272,24 +1278,14 @@ internal sealed class SqlRecordRepository(
         CancellationToken cancellationToken)
     {
         (SqlFailure failure, Exception inner) = ClassifyOriginal(exception, cancellationToken);
-        if (failure.Kind == SqlFailureKind.Cancelled)
-        {
-            return exception is OperationCanceledException
-                ? exception
-                : new OperationCanceledException(SqlErrorClassifier.CancelledMessage, exception, cancellationToken);
-        }
-
-        WriteOutcome outcome = SqlErrorClassifier.ResolveWriteOutcome(stage, rollbackCompleted, failure);
-        Exception result = SqlErrorClassifier.ToDataStoreException(failure, operation, outcome, inner);
-        if (rollbackError is not null)
-        {
-            result.Data[SqlErrorClassifier.RollbackExceptionTypeKey] = rollbackError.GetType().Name;
-            if (rollbackError is SqlException sqlError)
-            {
-                result.Data[SqlErrorClassifier.RollbackSqlErrorNumberKey] = sqlError.Number;
-            }
-        }
-
+        Exception result = failure.Kind == SqlFailureKind.Cancelled
+            ? SqlErrorClassifier.ToCancellation(failure, exception, cancellationToken)
+            : SqlErrorClassifier.ToDataStoreException(
+                failure,
+                operation,
+                SqlErrorClassifier.ResolveWriteOutcome(stage, rollbackCompleted, failure),
+                inner);
+        SqlErrorClassifier.AttachRollbackFailure(result, rollbackError);
         return result;
     }
 
@@ -1318,6 +1314,52 @@ internal sealed class SqlRecordRepository(
         storeException.InnerException is { } inner
             ? SqlErrorClassifier.Classify(inner, cancellationToken).SqlErrorNumber
             : null;
+
+    // The slots of the transaction starts that may wait on the server at once, process-wide (BeginTransactionAsync).
+    private static readonly SemaphoreSlim TransactionStarts = CreateTransactionStartGate();
+
+    // Half the thread pool's configured minimum of worker threads, and at least one. Each start blocks the pool thread
+    // it runs on for one round trip, so the bound keeps at least half of the workers the pool supplies without delay
+    // free of those waits however many writes arrive together; the writes over it wait for a slot holding no thread.
+    private static SemaphoreSlim CreateTransactionStartGate()
+    {
+        ThreadPool.GetMinThreads(out int workerThreads, out _);
+        int slots = Math.Max(1, workerThreads / 2);
+        return new SemaphoreSlim(slots, slots);
+    }
+
+    // Begins the write's one transaction at READ COMMITTED without blocking the caller's thread. SqlClient overrides
+    // only the synchronous BeginDbTransaction, so DbConnection.BeginTransactionAsync would make that same blocking
+    // round trip on the request's thread; here it runs on a pool thread, never more of them at once than
+    // TransactionStarts allows. The token is observed until the provider's start is entered: before the slot, while
+    // waiting for it, while the work item waits for a pool thread (a work item cancelled before it runs never runs, and
+    // its task ends cancelled), and as the work item's first step. Once entered, the start runs to its end and is
+    // awaited, never abandoned, because an abandoned start would leave the connection mid-begin; a cancellation after
+    // that reaches the first statement, and the rollback that follows undoes the start. The awaited task ends only when
+    // the start has returned or thrown, or when its work item was cancelled before running, so the slot is never
+    // released while a start is still running.
+    private static async Task<SqlTransaction> BeginTransactionAsync(
+        SqlConnection connection,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        await TransactionStarts.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            return await Task.Run(
+                    () =>
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        return connection.BeginTransaction(IsolationLevel.ReadCommitted);
+                    },
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
+        finally
+        {
+            TransactionStarts.Release();
+        }
+    }
 
     // Releases a transaction or connection after a confirmed commit. The port requires a failure here to be reported
     // as written, the one outcome the store can prove once the commit returned; the request's token is not consulted,
@@ -1349,19 +1391,24 @@ internal sealed class SqlRecordRepository(
         }
     }
 
-    // The rollback of a write refused for a broken argument: no data statement was sent, so a failed rollback leaves
-    // nothing behind and must not replace the ArgumentException.
-    private static async Task RollbackQuietlyAsync(WriteScope scope)
+    // The one rollback of a write, for every path that rolls back. It ignores the request's token, as the commit does,
+    // and never throws: it records on the scope that it was attempted and whether it completed, or what it threw, and
+    // returns that failure, or null when it completed. The caller decides what the failure means for the write.
+    private static async Task<Exception?> RollbackAsync(WriteScope scope)
     {
         scope.MarkRollbackAttempted();
         try
         {
             await scope.Transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
         }
-        catch (Exception)
+        catch (Exception error)
         {
-            // Discarded by design: see the comment above; closing the connection ends the transaction in any case.
+            scope.MarkRollbackFailed(error);
+            return error;
         }
+
+        scope.MarkRollbackCompleted();
+        return null;
     }
 
 
@@ -1624,18 +1671,32 @@ internal sealed class SqlRecordRepository(
         public static WriteDecision<T> RolledBack(T value) => new(value, Commit: false);
     }
 
-    // The state of one write transaction: how far it got, whether a rollback was already tried, and the one
-    // ArgumentException its contract check raised, which alone leaves the repository unwrapped. Used by one request
-    // on one thread.
+    // The state of one write transaction: whether an INSERT or UPDATE was dispatched, whether the commit or the
+    // rollback was tried and how the rollback ended, and the one ArgumentException its contract check raised, which
+    // alone leaves the repository unwrapped. It belongs to one write, whose steps run one after another: no two run at
+    // once, though an awaited step may resume on another thread, so the state needs no synchronisation.
     private sealed class WriteScope(SqlConnection connection, SqlTransaction transaction)
     {
         public SqlConnection Connection { get; } = connection;
 
         public SqlTransaction Transaction { get; } = transaction;
 
-        public WriteStage Stage { get; private set; } = WriteStage.BeforeDml;
+        // Set when the first INSERT or UPDATE is dispatched, and never cleared.
+        public bool DmlSent { get; private set; }
+
+        public bool CommitAttempted { get; private set; }
 
         public bool RollbackAttempted { get; private set; }
+
+        public bool RollbackCompleted { get; private set; }
+
+        // The failure of the rollback, when it was attempted and did not complete.
+        public Exception? RollbackError { get; private set; }
+
+        // How far the write got, decided by what it dispatched: a commit of a transaction that sent no INSERT or UPDATE
+        // is still BeforeDml, because it held nothing the server could keep.
+        public WriteStage Stage =>
+            !DmlSent ? WriteStage.BeforeDml : CommitAttempted ? WriteStage.Committing : WriteStage.DmlSent;
 
         public ArgumentException? ContractViolation { get; private set; }
 
@@ -1660,13 +1721,20 @@ internal sealed class SqlRecordRepository(
             return exception;
         }
 
-        // Called immediately before the first INSERT or UPDATE is sent.
-        public void MarkDmlSent() => Stage = WriteStage.DmlSent;
+        // Called by SqlExecution immediately before each INSERT or UPDATE is sent, after its local checks.
+        public void MarkDmlSent() => DmlSent = true;
 
         // Called immediately before Commit.
-        public void MarkCommitting() => Stage = WriteStage.Committing;
+        public void MarkCommitting() => CommitAttempted = true;
 
+        // Called immediately before Rollback.
         public void MarkRollbackAttempted() => RollbackAttempted = true;
+
+        // Called when Rollback returned without error.
+        public void MarkRollbackCompleted() => RollbackCompleted = true;
+
+        // Called when Rollback threw, with what it threw.
+        public void MarkRollbackFailed(Exception error) => RollbackError = error;
     }
 
     // One record row as read: the stored record, the joined pages with no row for it, and its intrinsic coordinates
@@ -1694,4 +1762,3 @@ internal sealed class SqlRecordRepository(
     // One page's update statements and the key-only insert that repairs its missing row.
     private sealed record PageUpdate(IReadOnlyList<SqlStatement> Chunks, SqlStatement InsertKey);
 }
-
