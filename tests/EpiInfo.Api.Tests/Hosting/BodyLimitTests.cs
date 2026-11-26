@@ -4,10 +4,10 @@ using System.Net.Http.Headers;
 using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
-using EpiInfo.Api.Errors;
 using EpiInfo.Api.Hosting;
 using EpiInfo.Api.Tests.Infrastructure;
 using EpiInfo.Domain.Values;
+using EpiInfo.Tests.Shared;
 using Microsoft.AspNetCore.Hosting.Server;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Http.Features;
@@ -23,9 +23,22 @@ namespace EpiInfo.Api.Tests.Hosting;
 
 /// <summary>
 /// The shared hosts of <see cref="BodyLimitTests"/>: a <see cref="GuardPipelineHost"/> on TestServer and on real
-/// Kestrel in each <see cref="GuardOrder"/>, all over one <see cref="FakeDataStore"/> holding
-/// <see cref="FakeForms.TwoPage"/> with one seeded record.
+/// Kestrel in each <see cref="GuardOrder"/>, all over one read-only <see cref="FakeDataStore"/> holding
+/// <see cref="FakeForms.TwoPage"/> with one seeded record, <see cref="RecordId"/>.
 /// </summary>
+/// <remarks>
+/// The hosts serve only the cases that reach no API handler: the probe routes, and the 413s, 415s, 404s, 405s and
+/// empty-body 400s of the body endpoints and of the routes outside them. No case seeds, writes or calls the store.
+/// Each case on these hosts, and each case on a guard-pipeline host of its own, asserts that the store has logged no
+/// call and holds <see cref="RecordId"/> alone, and each rejected case on a body endpoint or an outside route also
+/// asserts that record unchanged, so the state the hosts share is the same at every case boundary. A case that
+/// reaches an API handler runs instead on a <see cref="GuardPipelineHost"/> of its own over a fresh store, which holds
+/// that case's records and calls alone. Every case on a body endpoint sends a marker of its own,
+/// <see cref="TestDatabase.NewMarker"/>, as its text, and a case that reaches an API handler writes or finds only a
+/// record of its own: a create adds one, an update changes one seeded for it with another marker, and a search finds
+/// the one seeded for it with its text. The probe routes and the routes outside the body endpoints share one fixed
+/// body.
+/// </remarks>
 public sealed class BodyLimitHostFixture : IAsyncLifetime
 {
     private readonly Dictionary<(GuardHostKind Kind, GuardOrder Order), GuardPipelineHost> _hosts = new();
@@ -37,10 +50,13 @@ public sealed class BodyLimitHostFixture : IAsyncLifetime
         RecordId = Store.SeedRecord(FakeForms.TwoPageViewId);
     }
 
-    /// <summary>The store every host serves.</summary>
+    /// <summary>The store every host serves; no case seeds, writes or calls it.</summary>
     public FakeDataStore Store { get; }
 
-    /// <summary>The <c>GlobalRecordId</c> of the seeded record, the target of every <c>PUT</c> and <c>PATCH</c>.</summary>
+    /// <summary>
+    /// The <c>GlobalRecordId</c> of the seeded record, the store's only record and the target of every rejected
+    /// <c>PUT</c> and of every <c>PATCH</c>; no case writes it.
+    /// </summary>
     public string RecordId { get; }
 
     /// <inheritdoc />
@@ -111,13 +127,16 @@ public sealed class BodyLimitHostFixture : IAsyncLifetime
 /// reaches no handler; a valid JSON body padded with insignificant whitespace to exactly the limit gets the handler's
 /// exact success. Both rules are proved through the API's own composition, <c>Program.cs</c> hosted by
 /// <see cref="ApiFactory"/> on TestServer and by <see cref="KestrelApiFactory"/> on real Kestrel, each case on its own
-/// host and store, and again on the shared <see cref="GuardPipelineHost"/> hosts, which run the same guards in either
-/// order. Kestrel counts the framing of a chunked body against its own cap, so the guard raises that cap for a
-/// chunked request by a framing budget of 5 × limit + 5 bytes, and within that budget the decoded bytes decide: the
-/// exact limit passes and one byte more fails whatever the chunk size. The budget's own edge is pinned with chunk
-/// extensions: framing up to exactly the budget is created, and framing past it, by one byte or by many, is Kestrel's
-/// own 413. TestServer's streamed boundary is pinned on its own, byte for byte. An unacceptable media type keeps its
-/// 415, a route miss its 404 and a method mismatch its 405 however large the body, in either guard order.
+/// host and store, and again on <see cref="GuardPipelineHost"/> hosts, which run the same guards in either order: the
+/// 413 on the shared hosts of <see cref="BodyLimitHostFixture"/>, whose store no case calls, and the exact-limit
+/// success on a host of each case's own over a fresh store. Kestrel counts the framing of a chunked body against its
+/// own cap, so the guard raises that cap for a chunked request by a framing budget of 5 × limit + 5 bytes, and within
+/// that budget the decoded bytes decide: the exact limit passes and one byte more fails whatever the chunk size. The
+/// budget's own edge is pinned with chunk extensions: framing up to exactly the budget is created, and framing past
+/// it, by one byte or by many, is Kestrel's own 413. Each of these chunked cases, created or rejected, runs on a
+/// Kestrel host of its own over a fresh store. TestServer's streamed boundary is pinned on its own, byte for byte, on
+/// a shared host. An unacceptable media type keeps its 415, a route miss its 404 and a method mismatch its 405 however
+/// large the body, in either guard order, on the shared hosts.
 /// </para>
 /// <para>
 /// The guard's own rules are also pinned by invoking it directly: which requests get the raised server limit, which
@@ -144,18 +163,32 @@ public sealed class BodyLimitTests : IClassFixture<BodyLimitHostFixture>
 
     private const string LoopbackHost = "127.0.0.1";
 
-    private const string SubmittedText = "x";
+    // The fake form's writable text field, with no length limit or pattern, which every endpoint body names.
+    private const string TextField = "LastName";
 
+    // The fixed body of the probe routes and of the routes outside the body endpoints, none of which writes.
     private const string CreateBody = """{"values":{"LastName":"x"}}""";
-
-    private const string SearchBody = """{"criteria":[{"field":"LastName","value":"x"}]}""";
-
-    private const string FieldEventBody = """{"event":"FieldAfter","fieldName":"LastName","values":{"LastName":"x"}}""";
 
     private const string EmptyFieldEventEnvelope =
         """{"enabled":[],"disabled":[],"cleared":[],"assigned":{},"dialogs":[],"diagnostics":[]}""";
 
     private const string UnknownApiPath = "/api/unknown";
+
+    // The wire contract written out here rather than read from ApiProblems, so a changed or swapped product text fails
+    // these cases instead of moving the expectation with it.
+    private const string ProblemMediaType = "application/problem+json";
+
+    private const string TraceIdMember = "traceId";
+
+    private const string ExpectedRequestTooLargeDetail = "request too large";
+
+    private const string ExpectedUnsupportedMediaTypeDetail = "unsupported media type; use application/json";
+
+    private const string ExpectedRequestBodyRequiredDetail = "request body is required";
+
+    private const string ExpectedResourceNotFoundDetail = "the resource does not exist";
+
+    private const string ExpectedMethodNotAllowedDetail = "method not allowed";
 
     // The chunk size the raw client uses unless a case sets its own.
     private const int DefaultChunkSize = 64 * 1024;
@@ -677,9 +710,10 @@ public sealed class BodyLimitTests : IClassFixture<BodyLimitHostFixture>
 
         ReceivedResponse response = await SendAsync(Host(server, GuardSequence.BodyLimitFirst), request);
 
+        AssertSharedStoreUntouched();
         if (expected == HttpStatusCode.RequestEntityTooLarge)
         {
-            AssertProblem(response, expected, ApiProblems.RequestTooLargeDetail);
+            AssertProblem(response, expected, ExpectedRequestTooLargeDetail);
             AssertEchoesNoRequestContent(response);
             return;
         }
@@ -713,10 +747,11 @@ public sealed class BodyLimitTests : IClassFixture<BodyLimitHostFixture>
         ReceivedResponse response = await SendAsync(Host(server, order), request);
 
         AssertProbe(response, Limit, expectedServerLimit);
+        AssertSharedStoreUntouched();
     }
 
     // One byte over the limit, declared or chunked, is the fixed 413 on every body endpoint, server and guard order:
-    // nothing of the request is echoed and no store call is made.
+    // nothing of the request is echoed and the shared store is never called.
     [Theory]
     [MemberData(nameof(EndpointCases))]
     public async Task BodyOneByteOverTheLimitIsTheFixed413(
@@ -725,21 +760,22 @@ public sealed class BodyLimitTests : IClassFixture<BodyLimitHostFixture>
         BodyEndpoint endpoint,
         BodyFraming framing)
     {
-        int callsBefore = _fixture.Store.Calls.Count;
-        int writesBefore = _fixture.Store.WriteCalls.Count;
+        FakeRecordState seeded = SeededRecord();
 
         ReceivedResponse response = await SendAsync(
             Host(server, order),
-            EndpointRequest(endpoint, _fixture.RecordId, Limit + 1, JsonMediaType, framing));
+            EndpointRequest(endpoint, RejectedCase(), Limit + 1, JsonMediaType, framing));
 
-        AssertProblem(response, HttpStatusCode.RequestEntityTooLarge, ApiProblems.RequestTooLargeDetail);
+        AssertProblem(response, HttpStatusCode.RequestEntityTooLarge, ExpectedRequestTooLargeDetail);
         AssertEchoesNoRequestContent(response);
-        Assert.Equal(callsBefore, _fixture.Store.Calls.Count);
-        Assert.Equal(writesBefore, _fixture.Store.WriteCalls.Count);
+        AssertSharedStoreUntouched();
+        AssertSeededRecordUnchanged(seeded);
     }
 
     // A valid JSON body padded with insignificant whitespace to exactly the limit reaches the handler and gets its
-    // exact success, declared or chunked, so an unrelated failure cannot pass as "not rejected for size".
+    // exact success, declared or chunked, so an unrelated failure cannot pass as "not rejected for size". Each case
+    // runs on a host of its own over a fresh store, sends a marker of its own and writes or finds only a record of its
+    // own, so its success can come from its own request alone, and the shared store stays untouched.
     [Theory]
     [MemberData(nameof(EndpointCases))]
     public async Task BodyOfExactlyTheLimitGetsTheHandlersSuccess(
@@ -748,14 +784,17 @@ public sealed class BodyLimitTests : IClassFixture<BodyLimitHostFixture>
         BodyEndpoint endpoint,
         BodyFraming framing)
     {
-        int writesBefore = _fixture.Store.WriteCalls.Count;
-        BodyRequest request = EndpointRequest(endpoint, _fixture.RecordId, Limit, JsonMediaType, framing);
+        var store = new FakeDataStore(FakeForms.TwoPage);
+        await using GuardPipelineHost host = await StartOwnHostAsync(server, order, store);
+        CaseInput input = ArrangeAcceptedCase(store, endpoint);
+        BodyRequest request = EndpointRequest(endpoint, input, Limit, JsonMediaType, framing);
         Assert.Equal(1_048_576, request.Body.Length);
 
-        ReceivedResponse response = await SendAsync(Host(server, order), request);
+        ReceivedResponse response = await SendAsync(host, request);
 
         Assert.True(response.BodyFullySent ?? true, "The request body was not fully sent before the response.");
-        AssertHandlerSuccess(response, endpoint, _fixture.Store, _fixture.RecordId, writesBefore);
+        AssertHandlerSuccess(response, endpoint, store, input, writesBefore: 0);
+        AssertSharedStoreUntouched();
     }
 
     // Through the API's own composition, Program.cs on ApiFactory's TestServer and on KestrelApiFactory's real
@@ -769,12 +808,13 @@ public sealed class BodyLimitTests : IClassFixture<BodyLimitHostFixture>
         BodyFraming framing)
     {
         await using ComposedApiHost api = ComposedApiHost.Start(server);
-        BodyRequest request = EndpointRequest(endpoint, api.RecordId, Limit + 1, JsonMediaType, framing);
+        var input = new CaseInput(TestDatabase.NewMarker(), api.RecordId);
+        BodyRequest request = EndpointRequest(endpoint, input, Limit + 1, JsonMediaType, framing);
         Assert.Equal(1_048_577, request.Body.Length);
 
         ReceivedResponse response = await api.SendAsync(request);
 
-        AssertProblem(response, HttpStatusCode.RequestEntityTooLarge, ApiProblems.RequestTooLargeDetail);
+        AssertProblem(response, HttpStatusCode.RequestEntityTooLarge, ExpectedRequestTooLargeDetail);
         AssertEchoesNoRequestContent(response);
         Assert.Empty(api.Store.Calls);
     }
@@ -789,18 +829,20 @@ public sealed class BodyLimitTests : IClassFixture<BodyLimitHostFixture>
         BodyFraming framing)
     {
         await using ComposedApiHost api = ComposedApiHost.Start(server);
-        BodyRequest request = EndpointRequest(endpoint, api.RecordId, Limit, JsonMediaType, framing);
+        CaseInput input = ArrangeAcceptedCase(api.Store, endpoint);
+        BodyRequest request = EndpointRequest(endpoint, input, Limit, JsonMediaType, framing);
         Assert.Equal(1_048_576, request.Body.Length);
 
         ReceivedResponse response = await api.SendAsync(request);
 
         Assert.True(response.BodyFullySent ?? true, "The request body was not fully sent before the response.");
-        AssertHandlerSuccess(response, endpoint, api.Store, api.RecordId, writesBefore: 0);
+        AssertHandlerSuccess(response, endpoint, api.Store, input, writesBefore: 0);
     }
 
     // Exact HTTP/1.1 chunk framing on Kestrel: every chunking of the exact limit carries more wire bytes than the
     // configured cap, one-byte chunks exactly the framing allowance, and each is created; one byte more is a 413 in
-    // large, small and one-byte chunks alike.
+    // large, small and one-byte chunks alike, with no store call. Each case runs on a Kestrel host of its own over a
+    // fresh store, so the store holds that case's calls alone.
     [Theory]
     [MemberData(nameof(ChunkSizeCases))]
     public async Task KestrelHoldsDecodedBytesToTheLimitWhateverTheChunkSize(
@@ -823,35 +865,40 @@ public sealed class BodyLimitTests : IClassFixture<BodyLimitHostFixture>
             Assert.Equal(ChunkedFramingAllowance(Limit), wireLength);
         }
 
-        int writesBefore = _fixture.Store.WriteCalls.Count;
+        string text = TestDatabase.NewMarker();
         var request = new BodyRequest(
             HttpMethod.Post,
             CreatePath(),
             JsonMediaType,
-            PaddedJson(CreateBody, size),
+            PaddedJson(EndpointJson(BodyEndpoint.Create, text), size),
             BodyFraming.Chunked,
             chunkSize);
+        var store = new FakeDataStore(FakeForms.TwoPage);
+        await using GuardPipelineHost host =
+            await StartOwnHostAsync(ServerKind.Kestrel, GuardSequence.BodyLimitFirst, store);
 
-        ReceivedResponse response = await SendAsync(Host(ServerKind.Kestrel, GuardSequence.BodyLimitFirst), request);
+        ReceivedResponse response = await SendAsync(host, request);
 
+        AssertSharedStoreUntouched();
         if (expected == HttpStatusCode.Created)
         {
             Assert.True(response.BodyFullySent ?? true, "The request body was not fully sent before the response.");
-            AssertCreated(response, _fixture.Store, writesBefore);
+            AssertCreated(response, store, text, writesBefore: 0);
             return;
         }
 
         Assert.Equal(HttpStatusCode.RequestEntityTooLarge, expected);
-        AssertProblem(response, expected, ApiProblems.RequestTooLargeDetail);
+        AssertProblem(response, expected, ExpectedRequestTooLargeDetail);
         AssertEchoesNoRequestContent(response);
-        Assert.Equal(writesBefore, _fixture.Store.WriteCalls.Count);
+        Assert.Empty(store.Calls);
     }
 
     // The framing budget, 5 x limit + 5 bytes on top of the payload, is Kestrel's edge for a chunked body of exactly
     // the limit, whatever spends it: chunk extensions within the budget, up to exactly the budget, are created, and
     // framing past it, by one byte or by many, is Kestrel's own 413, surfaced as the fixed ProblemDetails, although the
-    // decoded bytes are the limit the guard lets through. The raw client sends exactly the computed wire length; its
-    // encoder asserts every byte it writes.
+    // decoded bytes are the limit the guard lets through, with no store call. The raw client sends exactly the computed
+    // wire length; its encoder asserts every byte it writes. Each case runs on a Kestrel host of its own over a fresh
+    // store, so the store holds that case's calls alone.
     [Theory]
     [MemberData(nameof(FramingBudgetCases))]
     public async Task KestrelHoldsChunkFramingToTheBudget(
@@ -861,11 +908,12 @@ public sealed class BodyLimitTests : IClassFixture<BodyLimitHostFixture>
         long expectedWireLength,
         HttpStatusCode expected)
     {
+        string text = TestDatabase.NewMarker();
         var request = new BodyRequest(
             HttpMethod.Post,
             CreatePath(),
             JsonMediaType,
-            PaddedJson(CreateBody, Limit),
+            PaddedJson(EndpointJson(BodyEndpoint.Create, text), Limit),
             BodyFraming.Chunked,
             chunkSize,
             extension,
@@ -880,20 +928,23 @@ public sealed class BodyLimitTests : IClassFixture<BodyLimitHostFixture>
             (framing <= ChunkFramingBudget(Limit)) == (expected == HttpStatusCode.Created),
             "The case's framing is not on the side of the budget its expected status implies.");
 
-        int writesBefore = _fixture.Store.WriteCalls.Count;
-        ReceivedResponse response = await SendAsync(Host(ServerKind.Kestrel, GuardSequence.BodyLimitFirst), request);
+        var store = new FakeDataStore(FakeForms.TwoPage);
+        await using GuardPipelineHost host =
+            await StartOwnHostAsync(ServerKind.Kestrel, GuardSequence.BodyLimitFirst, store);
+        ReceivedResponse response = await SendAsync(host, request);
 
+        AssertSharedStoreUntouched();
         if (expected == HttpStatusCode.Created)
         {
             Assert.True(response.BodyFullySent ?? true, "The request body was not fully sent before the response.");
-            AssertCreated(response, _fixture.Store, writesBefore);
+            AssertCreated(response, store, text, writesBefore: 0);
             return;
         }
 
         Assert.Equal(HttpStatusCode.RequestEntityTooLarge, expected);
-        AssertProblem(response, expected, ApiProblems.RequestTooLargeDetail);
+        AssertProblem(response, expected, ExpectedRequestTooLargeDetail);
         AssertEchoesNoRequestContent(response);
-        Assert.Equal(writesBefore, _fixture.Store.WriteCalls.Count);
+        Assert.Empty(store.Calls);
     }
 
     // TestServer has no chunk framing to count, so its boundary is the guard's alone: up to the limit the probe reads
@@ -913,9 +964,10 @@ public sealed class BodyLimitTests : IClassFixture<BodyLimitHostFixture>
         ReceivedResponse response = await SendAsync(Host(ServerKind.TestServer, GuardSequence.BodyLimitFirst), request);
 
         Assert.Null(response.BodyFullySent);
+        AssertSharedStoreUntouched();
         if (overLimit > 0)
         {
-            AssertProblem(response, HttpStatusCode.RequestEntityTooLarge, ApiProblems.RequestTooLargeDetail);
+            AssertProblem(response, HttpStatusCode.RequestEntityTooLarge, ExpectedRequestTooLargeDetail);
             AssertEchoesNoRequestContent(response);
             return;
         }
@@ -924,7 +976,7 @@ public sealed class BodyLimitTests : IClassFixture<BodyLimitHostFixture>
     }
 
     // The media type is decided before the size: an unacceptable media type is the 415 however large the body,
-    // declared or chunked, in either guard order, and no store call is made.
+    // declared or chunked, in either guard order, and the shared store is never called.
     [Theory]
     [MemberData(nameof(UnacceptableMediaTypeCases))]
     public async Task UnacceptableMediaTypeIs415WhateverTheBodySize(
@@ -934,15 +986,16 @@ public sealed class BodyLimitTests : IClassFixture<BodyLimitHostFixture>
         string? contentType,
         BodyFraming framing)
     {
-        int callsBefore = _fixture.Store.Calls.Count;
+        FakeRecordState seeded = SeededRecord();
 
         ReceivedResponse response = await SendAsync(
             Host(server, order),
-            EndpointRequest(endpoint, _fixture.RecordId, Limit + 1, contentType, framing));
+            EndpointRequest(endpoint, RejectedCase(), Limit + 1, contentType, framing));
 
-        AssertProblem(response, HttpStatusCode.UnsupportedMediaType, ApiProblems.UnsupportedMediaTypeDetail);
+        AssertProblem(response, HttpStatusCode.UnsupportedMediaType, ExpectedUnsupportedMediaTypeDetail);
         AssertEchoesNoRequestContent(response);
-        Assert.Equal(callsBefore, _fixture.Store.Calls.Count);
+        AssertSharedStoreUntouched();
+        AssertSeededRecordUnchanged(seeded);
     }
 
     // Outside the four body endpoints the guards never answer, so an oversized body keeps routing's 404 for a route
@@ -962,37 +1015,40 @@ public sealed class BodyLimitTests : IClassFixture<BodyLimitHostFixture>
                 HttpMethod.Post,
                 UnknownApiPath,
                 HttpStatusCode.NotFound,
-                ApiProblems.ResourceNotFoundDetail),
+                ExpectedResourceNotFoundDetail),
             OutsideRoute.RecordPatch => (
                 HttpMethod.Patch,
                 RecordPath(_fixture.RecordId),
                 HttpStatusCode.MethodNotAllowed,
-                ApiProblems.MethodNotAllowedDetail),
+                ExpectedMethodNotAllowedDetail),
             _ => throw new ArgumentOutOfRangeException(nameof(route), route, "Not an outside route."),
         };
-        int callsBefore = _fixture.Store.Calls.Count;
+        FakeRecordState seeded = SeededRecord();
         var request = new BodyRequest(method, path, contentType, PaddedJson(CreateBody, Limit + 1), framing);
 
         ReceivedResponse response = await SendAsync(Host(server, order), request);
 
         AssertProblem(response, expected, detail);
         AssertEchoesNoRequestContent(response);
-        Assert.Equal(callsBefore, _fixture.Store.Calls.Count);
+        AssertSharedStoreUntouched();
+        AssertSeededRecordUnchanged(seeded);
     }
 
-    // An empty application/json body is the request-level 400, not a size problem, in either guard order.
+    // An empty application/json body is the request-level 400, not a size problem, in either guard order, and the
+    // shared store is never called.
     [Theory]
     [MemberData(nameof(EmptyBodyCases))]
     public async Task EmptyJsonBodyIsTheRequestLevel400(ServerKind server, GuardSequence order, BodyEndpoint endpoint)
     {
-        int callsBefore = _fixture.Store.Calls.Count;
-        (HttpMethod method, string path, _) = EndpointTarget(endpoint, _fixture.RecordId);
+        FakeRecordState seeded = SeededRecord();
+        (HttpMethod method, string path, _) = EndpointTarget(endpoint, RejectedCase());
         var request = new BodyRequest(method, path, JsonMediaType, [], BodyFraming.ContentLength);
 
         ReceivedResponse response = await SendAsync(Host(server, order), request);
 
-        AssertProblem(response, HttpStatusCode.BadRequest, ApiProblems.RequestBodyRequiredDetail);
-        Assert.Equal(callsBefore, _fixture.Store.Calls.Count);
+        AssertProblem(response, HttpStatusCode.BadRequest, ExpectedRequestBodyRequiredDetail);
+        AssertSharedStoreUntouched();
+        AssertSeededRecordUnchanged(seeded);
     }
 
     // Invoked directly: a marked JSON request has its body counted, and only a chunked body without Content-Length
@@ -1440,7 +1496,7 @@ public sealed class BodyLimitTests : IClassFixture<BodyLimitHostFixture>
     private static void AssertProblem(ReceivedResponse response, HttpStatusCode status, string detail)
     {
         Assert.Equal((int)status, response.StatusCode);
-        Assert.Equal(ApiProblems.ProblemContentType, response.MediaType);
+        Assert.Equal(ProblemMediaType, response.MediaType);
         using JsonDocument document = ParseJson(response);
         JsonElement body = document.RootElement;
         Assert.Equal(JsonValueKind.Object, body.ValueKind);
@@ -1459,7 +1515,7 @@ public sealed class BodyLimitTests : IClassFixture<BodyLimitHostFixture>
         Assert.Equal((int)status, statusMember.GetInt32());
         Assert.Equal(detail, body.GetProperty("detail").GetString());
         Assert.True(
-            body.TryGetProperty(ApiProblems.TraceIdKey, out JsonElement traceId) &&
+            body.TryGetProperty(TraceIdMember, out JsonElement traceId) &&
             traceId.ValueKind == JsonValueKind.String &&
             !string.IsNullOrWhiteSpace(traceId.GetString()),
             "ProblemDetails member 'traceId' is missing or empty.");
@@ -1497,12 +1553,12 @@ public sealed class BodyLimitTests : IClassFixture<BodyLimitHostFixture>
     }
 
     // A Record DTO whose LastName is the submitted text; returns its globalRecordId.
-    private static string AssertRecordWithSubmittedText(JsonElement body)
+    private static string AssertRecordWithSubmittedText(JsonElement body, string submittedText)
     {
         Assert.Equal(JsonValueKind.Object, body.ValueKind);
         string? id = body.GetProperty("globalRecordId").GetString();
         Assert.False(string.IsNullOrEmpty(id));
-        Assert.Equal(SubmittedText, body.GetProperty("values").GetProperty("LastName").GetString());
+        Assert.Equal(submittedText, body.GetProperty("values").GetProperty(TextField).GetString());
         return id;
     }
 
@@ -1575,21 +1631,54 @@ public sealed class BodyLimitTests : IClassFixture<BodyLimitHostFixture>
             _ => throw new ArgumentOutOfRangeException(nameof(overload), overload, "Not a read overload."),
         };
 
-    private GuardPipelineHost Host(ServerKind server, GuardSequence order)
-    {
-        GuardHostKind kind = server switch
+    private static GuardHostKind HostKind(ServerKind server) =>
+        server switch
         {
             ServerKind.TestServer => GuardHostKind.TestServer,
             ServerKind.Kestrel => GuardHostKind.Kestrel,
             _ => throw new ArgumentOutOfRangeException(nameof(server), server, "Not a server kind."),
         };
-        GuardOrder guards = order switch
+
+    private static GuardOrder Guards(GuardSequence order) =>
+        order switch
         {
             GuardSequence.BodyLimitFirst => GuardOrder.BodyLimitFirst,
             GuardSequence.MediaTypeFirst => GuardOrder.MediaTypeFirst,
             _ => throw new ArgumentOutOfRangeException(nameof(order), order, "Not a guard order."),
         };
-        return _fixture.Host(kind, guards);
+
+    // A guard-pipeline host of the case's own on server with the guards in order, over store, which the case creates
+    // fresh, so whatever the case seeds, writes or reads stays out of the shared store. The caller disposes the host.
+    private static Task<GuardPipelineHost> StartOwnHostAsync(
+        ServerKind server,
+        GuardSequence order,
+        FakeDataStore store) =>
+        GuardPipelineHost.StartAsync(HostKind(server), store, Guards(order));
+
+    // The shared host of server with the guards in order, for a case that reaches no API handler.
+    private GuardPipelineHost Host(ServerKind server, GuardSequence order) =>
+        _fixture.Host(HostKind(server), Guards(order));
+
+    // A rejected case's input: a marker of its own as the text, and the seeded record as its target.
+    private CaseInput RejectedCase() => new(TestDatabase.NewMarker(), _fixture.RecordId);
+
+    // The seeded record as the shared store holds it now; reading it logs no store call.
+    private FakeRecordState SeededRecord() =>
+        Assert.IsType<FakeRecordState>(_fixture.Store.GetRecord(FakeForms.TwoPageViewId, _fixture.RecordId));
+
+    // A rejected request left the seeded record, its target, as it was.
+    private void AssertSeededRecordUnchanged(FakeRecordState before) => AssertSameRecordState(before, SeededRecord());
+
+    // The shared store is read-only at every case boundary: no case has called it, so nothing was read or written
+    // through it, and it still holds the seeded record alone, so no case has seeded one either. Inspecting it logs no
+    // store call.
+    private void AssertSharedStoreUntouched()
+    {
+        Assert.Empty(_fixture.Store.Calls);
+        Assert.Empty(_fixture.Store.WriteCalls);
+        Assert.Equal(
+            new[] { _fixture.RecordId },
+            _fixture.Store.GetRecords(FakeForms.TwoPageViewId).Select(record => record.GlobalRecordId));
     }
 
     private static string RecordPath(string recordId) =>
@@ -1599,68 +1688,118 @@ public sealed class BodyLimitTests : IClassFixture<BodyLimitHostFixture>
 
     private static BodyRequest EndpointRequest(
         BodyEndpoint endpoint,
-        string recordId,
+        CaseInput input,
         long size,
         string? contentType,
         BodyFraming framing)
     {
-        (HttpMethod method, string path, string json) = EndpointTarget(endpoint, recordId);
+        (HttpMethod method, string path, string json) = EndpointTarget(endpoint, input);
         return new BodyRequest(method, path, contentType, PaddedJson(json, size), framing);
     }
 
-    // The method, path and compact valid JSON body of each body endpoint, aimed at the form and the seeded record.
+    // The method, path and compact valid JSON body of each body endpoint, aimed at the form and, for an update, at the
+    // case's record, and carrying the case's text.
     private static (HttpMethod Method, string Path, string Json) EndpointTarget(
         BodyEndpoint endpoint,
-        string recordId) =>
+        CaseInput input) =>
         endpoint switch
         {
-            BodyEndpoint.Create => (HttpMethod.Post, CreatePath(), CreateBody),
-            BodyEndpoint.Update => (HttpMethod.Put, RecordPath(recordId), CreateBody),
-            BodyEndpoint.Search => (HttpMethod.Post, $"{CreatePath()}/search", SearchBody),
+            BodyEndpoint.Create => (HttpMethod.Post, CreatePath(), EndpointJson(endpoint, input.Text)),
+            BodyEndpoint.Update => (HttpMethod.Put, RecordPath(input.Target), EndpointJson(endpoint, input.Text)),
+            BodyEndpoint.Search => (HttpMethod.Post, $"{CreatePath()}/search", EndpointJson(endpoint, input.Text)),
             BodyEndpoint.FieldEvent => (
                 HttpMethod.Post,
                 string.Create(
                     CultureInfo.InvariantCulture,
                     $"/api/forms/{FakeForms.TwoPageViewId}/checkcode/field-event"),
-                FieldEventBody),
+                EndpointJson(endpoint, input.Text)),
             _ => throw new ArgumentOutOfRangeException(nameof(endpoint), endpoint, "Not a body endpoint."),
         };
 
-    // 201 with the new record, its Location, the submitted text stored and exactly one more write.
-    private static void AssertCreated(ReceivedResponse response, FakeDataStore store, int writesBefore)
+    // The compact valid JSON body of each body endpoint, submitting or searching for text in LastName. The text is
+    // JSON-encoded, so the body stays valid JSON whatever it holds.
+    private static string EndpointJson(BodyEndpoint endpoint, string text)
+    {
+        string value = JsonEncodedText.Encode(text).Value;
+        string values = $$"""{"{{TextField}}":"{{value}}"}""";
+        return endpoint switch
+        {
+            BodyEndpoint.Create or BodyEndpoint.Update => $$"""{"values":{{values}}}""",
+            BodyEndpoint.Search => $$"""{"criteria":[{"field":"{{TextField}}","value":"{{value}}"}]}""",
+            BodyEndpoint.FieldEvent => $$"""{"event":"FieldAfter","fieldName":"{{TextField}}","values":{{values}}}""",
+            _ => throw new ArgumentOutOfRangeException(nameof(endpoint), endpoint, "Not a body endpoint."),
+        };
+    }
+
+    // A case of its own on store: a fresh marker as the text it submits and, for an update, a record seeded with
+    // another marker for it to change or, for a search, a record seeded with its text for it to find. A create or a
+    // field event needs no record.
+    private static CaseInput ArrangeAcceptedCase(FakeDataStore store, BodyEndpoint endpoint)
+    {
+        string text = TestDatabase.NewMarker();
+        string? recordId = endpoint switch
+        {
+            BodyEndpoint.Update => SeedRecordWithText(store, TestDatabase.NewMarker()),
+            BodyEndpoint.Search => SeedRecordWithText(store, text),
+            BodyEndpoint.Create or BodyEndpoint.FieldEvent => null,
+            _ => throw new ArgumentOutOfRangeException(nameof(endpoint), endpoint, "Not a body endpoint."),
+        };
+        return new CaseInput(text, recordId);
+    }
+
+    // Adds an active record with every page row whose LastName holds text, as a seeded row; no call is logged.
+    private static string SeedRecordWithText(FakeDataStore store, string text) => store.SeedRecord(
+        FakeForms.TwoPageViewId,
+        new Dictionary<string, FieldValue> { [TextField] = FieldValue.FromText(text) });
+
+    // The value the store holds in the record's LastName.
+    private static FieldValue StoredText(FakeDataStore store, string recordId) =>
+        Assert.IsType<FakeRecordState>(store.GetRecord(FakeForms.TwoPageViewId, recordId)).Values[TextField];
+
+    // The record's state now equals its state before: the same status, values, page rows and stamps.
+    private static void AssertSameRecordState(FakeRecordState before, FakeRecordState after)
+    {
+        Assert.Equal(before.RecStatus, after.RecStatus);
+        Assert.Equal(before.Values, after.Values);
+        Assert.True(before.PresentPageIds.SetEquals(after.PresentPageIds), "The record's page rows changed.");
+        Assert.Equal(before.FirstSave, after.FirstSave);
+        Assert.Equal(before.LastSave, after.LastSave);
+    }
+
+    // 201 with the new record, its Location, the case's text stored in it and exactly one more write.
+    private static void AssertCreated(ReceivedResponse response, FakeDataStore store, string text, int writesBefore)
     {
         using JsonDocument document = ParseSuccess(response, HttpStatusCode.Created);
-        string createdId = AssertRecordWithSubmittedText(document.RootElement);
+        string createdId = AssertRecordWithSubmittedText(document.RootElement, text);
         Assert.Equal($"{CreatePath()}/{createdId}", response.Location);
-        Assert.Equal(
-            FieldValue.FromText(SubmittedText),
-            Assert.IsType<FakeRecordState>(store.GetRecord(FakeForms.TwoPageViewId, createdId))
-                .Values["LastName"]);
+        Assert.Equal(FieldValue.FromText(text), StoredText(store, createdId));
         Assert.Equal(writesBefore + 1, store.WriteCalls.Count);
     }
 
     // The exact success each body endpoint gives a valid body of exactly the limit, so an unrelated failure cannot
-    // pass as "not rejected for size": the created record, the updated record, an empty search result shape, or the
-    // empty field-event envelope, with exactly the writes each one makes.
+    // pass as "not rejected for size", tied to the case's own input: the created record holding the case's text, the
+    // case's record now holding that text in place of its seeded marker, a search result of exactly the case's
+    // record, or the empty field-event envelope, with exactly the writes each one makes.
     private static void AssertHandlerSuccess(
         ReceivedResponse response,
         BodyEndpoint endpoint,
         FakeDataStore store,
-        string recordId,
+        CaseInput input,
         int writesBefore)
     {
         switch (endpoint)
         {
             case BodyEndpoint.Create:
-                AssertCreated(response, store, writesBefore);
+                AssertCreated(response, store, input.Text, writesBefore);
                 break;
 
             case BodyEndpoint.Update:
                 using (JsonDocument record = ParseSuccess(response, HttpStatusCode.OK))
                 {
-                    Assert.Equal(recordId, AssertRecordWithSubmittedText(record.RootElement));
+                    Assert.Equal(input.Target, AssertRecordWithSubmittedText(record.RootElement, input.Text));
                 }
 
+                Assert.Equal(FieldValue.FromText(input.Text), StoredText(store, input.Target));
                 Assert.Equal(writesBefore + 1, store.WriteCalls.Count);
                 break;
 
@@ -1671,11 +1810,14 @@ public sealed class BodyLimitTests : IClassFixture<BodyLimitHostFixture>
                     Assert.Equal(
                         new[] { "items", "total", "truncated" },
                         body.EnumerateObject().Select(member => member.Name));
-                    Assert.Equal(JsonValueKind.Array, body.GetProperty("items").ValueKind);
+                    Assert.Equal(
+                        new[] { input.Target },
+                        body.GetProperty("items")
+                            .EnumerateArray()
+                            .Select(item => item.GetProperty("globalRecordId").GetString()));
                     Assert.Equal(JsonValueKind.Number, body.GetProperty("total").ValueKind);
-                    Assert.Contains(
-                        body.GetProperty("truncated").ValueKind,
-                        new[] { JsonValueKind.True, JsonValueKind.False });
+                    Assert.Equal(1, body.GetProperty("total").GetInt32());
+                    Assert.Equal(JsonValueKind.False, body.GetProperty("truncated").ValueKind);
                 }
 
                 Assert.Equal(writesBefore, store.WriteCalls.Count);
@@ -1725,7 +1867,10 @@ public sealed class BodyLimitTests : IClassFixture<BodyLimitHostFixture>
         /// <summary>The store the host serves; seeded with one record and no call.</summary>
         public FakeDataStore Store { get; }
 
-        /// <summary>The <c>GlobalRecordId</c> of the seeded record, the target of the <c>PUT</c>.</summary>
+        /// <summary>
+        /// The <c>GlobalRecordId</c> of the seeded record, the target of the over-limit <c>PUT</c>; an accepted case
+        /// seeds a record of its own.
+        /// </summary>
         public string RecordId { get; }
 
         /// <summary>Starts the composition on <paramref name="server"/>; the caller disposes the host.</summary>
@@ -1767,6 +1912,19 @@ public sealed class BodyLimitTests : IClassFixture<BodyLimitHostFixture>
             _client.Dispose();
             await _factory.DisposeAsync();
         }
+    }
+
+    /// <summary>The input one body-endpoint case sends.</summary>
+    /// <param name="Text">The text the body submits or searches for: a marker no other case sends.</param>
+    /// <param name="RecordId">
+    /// The record the case is about: the one an accepted update changes or an accepted search must find, the seeded
+    /// record for a rejected case, or <see langword="null"/> for an accepted create or field event, which needs none.
+    /// </param>
+    private sealed record CaseInput(string Text, string? RecordId)
+    {
+        /// <summary>The record the case is about.</summary>
+        /// <exception cref="InvalidOperationException">The case names no record.</exception>
+        public string Target => RecordId ?? throw new InvalidOperationException("The case names no record.");
     }
 
     /// <summary>A request a case sends.</summary>

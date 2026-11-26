@@ -86,6 +86,34 @@ public sealed class CheckCodeScenarioTests
     // The field-event response's list members, each a JSON array.
     private static readonly string[] ResponseListMembers = ["enabled", "disabled", "cleared", "dialogs", "diagnostics"];
 
+    // Every expectation the start state already meets, which the final-state comparison alone cannot tell apart from
+    // the program's own work, classified by the seeded programs (testdata/sql/03_forms.sql): as an effect the response
+    // must name (Enabled, Cleared, Assigned) or as a sent value the program must leave alone (Retained).
+    private static readonly Dictionary<string, RequiredEffect[]> EffectsBehindStartState = new(StringComparer.Ordinal)
+    {
+        // Sex "1" runs ENABLE Pregnant, and every field starts enabled.
+        ["LY-01"] = [new RequiredEffect("Pregnant", EffectKind.Enabled)],
+
+        // A missing Sex takes the ELSE branch's CLEAR Pregnant, and the unsent Pregnant starts null.
+        ["LY-04"] = [new RequiredEffect("Pregnant", EffectKind.Cleared)],
+
+        // YEARS with no interview date is null, which ASSIGN AGE returns in assigned as JSON null.
+        ["EC-AGE-05"] = [new RequiredEffect("Age", EffectKind.Assigned)],
+
+        // The FeverTemp After block only shows a DIALOG, so the sent FeverTemp is neither cleared nor assigned.
+        ["EC-FEVER-01"] = [new RequiredEffect("FeverTemp", EffectKind.Retained)],
+
+        // The client's click toggle sets Asian, and Asian's Click block assigns only the six other boxes.
+        ["EC-RACE-01"] = [new RequiredEffect("Asian", EffectKind.Retained)],
+
+        // Asian's Click block runs ASSIGN Black = (-) among the six other boxes and never assigns Asian itself.
+        ["EC-RACE-02"] =
+        [
+            new RequiredEffect("Asian", EffectKind.Retained),
+            new RequiredEffect("Black", EffectKind.Assigned),
+        ],
+    };
+
     private readonly ITestOutputHelper _output;
 
     /// <summary>Creates the test class with xUnit's output sink, which receives each request and response.</summary>
@@ -426,7 +454,8 @@ public sealed class CheckCodeScenarioTests
             ToggleCheckbox(values, fieldName, id);
         }
 
-        Dictionary<string, FieldState> state = StartState(fields, values);
+        Dictionary<string, FieldState> start = StartState(fields, values);
+        var state = new Dictionary<string, FieldState>(start, StringComparer.Ordinal);
         var request = new JsonObject
         {
             ["event"] = eventKind,
@@ -470,6 +499,7 @@ public sealed class CheckCodeScenarioTests
 
         ApplyResponse(state, fields, result, id);
         AssertExpectations(scenario, state, result);
+        AssertEffectsBehindStartState(scenario, start, result);
     }
 
     // The final state of every field after the response is applied, as web/src/checkcode/applyFieldEvent.ts computes
@@ -567,36 +597,190 @@ public sealed class CheckCodeScenarioTests
         }
     }
 
-    // The final value against one expectation: numbers numerically, booleans and strings exactly, and null as a null
-    // or absent value. The JSON kinds must agree, so "25" never equals 25.
+    // The effect table names only in-scope field-event scenarios, the expectations the start state already meets must
+    // be exactly those the table classifies for the scenario, and the response must bear out each classification:
+    // ENABLE in enabled, CLEAR in cleared, an ASSIGN as a present member of assigned holding the expected value, and a
+    // retained sent value in neither cleared nor assigned.
+    private static void AssertEffectsBehindStartState(
+        ScenarioCase scenario,
+        Dictionary<string, FieldState> start,
+        JsonElement result)
+    {
+        string id = scenario.Id;
+        IReadOnlyList<string> fieldEventIds = ScenarioCatalog.FieldEventIds;
+        string[] stale = EffectsBehindStartState.Keys
+            .Where(key => !fieldEventIds.Contains(key, StringComparer.Ordinal))
+            .ToArray();
+        Assert.True(
+            stale.Length == 0,
+            $"{id}: the effect table names [{string.Join(", ", stale)}], which are not in-scope field-event ids.");
+
+        RequiredEffect[] effects = EffectsBehindStartState.TryGetValue(id, out RequiredEffect[]? tabled) ? tabled : [];
+        string[] met = StartMetExpectations(scenario, start)
+            .Distinct(StringComparer.Ordinal)
+            .Order(StringComparer.Ordinal)
+            .ToArray();
+        string[] covered = effects
+            .Select(effect => effect.Field + (effect.Kind == EffectKind.Enabled ? ".enabled" : ".value"))
+            .Distinct(StringComparer.Ordinal)
+            .Order(StringComparer.Ordinal)
+            .ToArray();
+        Assert.True(
+            met.SequenceEqual(covered, StringComparer.Ordinal),
+            $"{id}: the start state already meets the expectations [{string.Join(", ", met)}], but the effect table " +
+            $"classifies [{string.Join(", ", covered)}]; the table must classify exactly the expectations the start " +
+            "state meets, each as an effect the response must name or a sent value the program must leave alone.");
+
+        foreach (RequiredEffect effect in effects)
+        {
+            switch (effect.Kind)
+            {
+                case EffectKind.Enabled:
+                    AssertNamedIn(result, "enabled", effect.Field, "ENABLE", id);
+                    break;
+                case EffectKind.Cleared:
+                    AssertNamedIn(result, "cleared", effect.Field, "CLEAR", id);
+                    break;
+                case EffectKind.Assigned:
+                    AssertAssigned(scenario, result, effect.Field);
+                    break;
+                case EffectKind.Retained:
+                    AssertRetained(result, effect.Field, id);
+                    break;
+                default:
+                    throw new XunitException($"{id}: the effect table holds the unknown effect kind {effect.Kind}.");
+            }
+        }
+    }
+
+    // Each expectation the start state already meets, as "<field>.enabled" or "<field>.value": an enabled expectation
+    // equal to the starting flag, or a value expectation the starting value already matches, compared as ValueMatches
+    // compares a final value. The starting value is the one the request sends, after the click toggle, or null for a
+    // field the request does not send. "dialog" is checked against the response alone.
+    private static IEnumerable<string> StartMetExpectations(ScenarioCase scenario, Dictionary<string, FieldState> start)
+    {
+        string id = scenario.Id;
+        foreach (JsonProperty expectation in scenario.Expect.EnumerateObject())
+        {
+            if (expectation.NameEquals(DialogExpectation))
+            {
+                continue;
+            }
+
+            string name = expectation.Name;
+            if (!start.TryGetValue(name, out FieldState initial))
+            {
+                throw new XunitException($"{id}: expects '{name}', which is not a field of {scenario.Form}.");
+            }
+
+            JsonElement expected = expectation.Value;
+            if (expected.ValueKind != JsonValueKind.Object)
+            {
+                if (ValueMatches(id, name, expected, initial.Value))
+                {
+                    yield return name + ".value";
+                }
+
+                continue;
+            }
+
+            if (expected.TryGetProperty("enabled", out JsonElement enabled) &&
+                (enabled.ValueKind is JsonValueKind.True or JsonValueKind.False) &&
+                enabled.GetBoolean() == initial.Enabled)
+            {
+                yield return name + ".enabled";
+            }
+
+            if (expected.TryGetProperty("value", out JsonElement value) && ValueMatches(id, name, value, initial.Value))
+            {
+                yield return name + ".value";
+            }
+        }
+    }
+
+    // assigned must hold the field as a present member whose value matches the scenario's expected value, compared as
+    // ValueMatches compares a final value, so an absent member fails even where the expectation is null.
+    private static void AssertAssigned(ScenarioCase scenario, JsonElement result, string field)
+    {
+        string id = scenario.Id;
+        JsonElement expected = ExpectedValue(scenario, field);
+        JsonElement assigned = Member(result, "assigned", id);
+        Assert.True(
+            assigned.TryGetProperty(field, out JsonElement assignedValue) &&
+            ValueMatches(id, field, expected, JsonNode.Parse(assignedValue.GetRawText())),
+            $"{id}: 'assigned' must hold '{field}' as {expected.GetRawText()}, because the start state already meets " +
+            $"the expectation and only the response shows the ASSIGN; assigned is {assigned.GetRawText()}.");
+    }
+
+    // A sent value the program leaves alone is named in neither cleared nor assigned, so the start value that meets
+    // the expectation is the one the program kept, not one it wrote back.
+    private static void AssertRetained(JsonElement result, string field, string id)
+    {
+        JsonElement cleared = Member(result, "cleared", id);
+        JsonElement assigned = Member(result, "assigned", id);
+        Assert.True(
+            !StringList(result, "cleared", id).Contains(field, StringComparer.Ordinal) &&
+            !assigned.TryGetProperty(field, out _),
+            $"{id}: neither 'cleared' nor 'assigned' may name '{field}', because the program leaves its sent value " +
+            $"alone; cleared is {cleared.GetRawText()} and assigned is {assigned.GetRawText()}.");
+    }
+
+    // The value a scenario expects for a field: a scalar expectation itself, or an object expectation's value.
+    private static JsonElement ExpectedValue(ScenarioCase scenario, string field)
+    {
+        if (!scenario.Expect.TryGetProperty(field, out JsonElement expectation))
+        {
+            throw new XunitException(
+                $"{scenario.Id}: the effect table names '{field}', which the scenario does not expect.");
+        }
+
+        if (expectation.ValueKind != JsonValueKind.Object)
+        {
+            return expectation;
+        }
+
+        return expectation.TryGetProperty("value", out JsonElement value)
+            ? value
+            : throw new XunitException(
+                $"{scenario.Id}: the effect table asserts the value of '{field}', whose expectation declares none.");
+    }
+
+    // A list member of the response must name the field ordinally; the command is the one the effect stands for.
+    private static void AssertNamedIn(JsonElement result, string member, string field, string command, string id) =>
+        Assert.True(
+            StringList(result, member, id).Contains(field, StringComparer.Ordinal),
+            $"{id}: '{member}' must name '{field}', because the start state already meets the expectation and only " +
+            $"the response shows the {command}; {member} is {Member(result, member, id).GetRawText()}.");
+
+    // The final value against one expectation, compared as ValueMatches compares them.
     private static void AssertValue(string id, string name, JsonElement expected, JsonNode? actual)
     {
-        JsonValueKind actualKind = actual?.GetValueKind() ?? JsonValueKind.Null;
         string actualText = actual?.ToJsonString() ?? "null";
         string message = $"{id}: '{name}' is {actualText} after the event, expected {expected.GetRawText()}.";
+        Assert.True(ValueMatches(id, name, expected, actual), message);
+    }
+
+    // A value against one expectation: numbers numerically, booleans and strings exactly, and null as a null or absent
+    // value. The JSON kinds must agree, so "25" never equals 25. Any other expected kind fails the case, because the
+    // scenario file's shape changed.
+    private static bool ValueMatches(string id, string name, JsonElement expected, JsonNode? actual)
+    {
+        JsonValueKind actualKind = actual?.GetValueKind() ?? JsonValueKind.Null;
         switch (expected.ValueKind)
         {
             case JsonValueKind.Null:
-                Assert.True(actualKind == JsonValueKind.Null, message);
-                break;
+                return actualKind == JsonValueKind.Null;
             case JsonValueKind.Number:
-                Assert.True(
-                    actual is not null &&
+                return actual is not null &&
                     actualKind == JsonValueKind.Number &&
-                    actual.GetValue<double>() == expected.GetDouble(),
-                    message);
-                break;
+                    actual.GetValue<double>() == expected.GetDouble();
             case JsonValueKind.True:
             case JsonValueKind.False:
-                Assert.True(actualKind == expected.ValueKind, message);
-                break;
+                return actualKind == expected.ValueKind;
             case JsonValueKind.String:
-                Assert.True(
-                    actual is not null &&
+                return actual is not null &&
                     actualKind == JsonValueKind.String &&
-                    string.Equals(actual.GetValue<string>(), expected.GetString(), StringComparison.Ordinal),
-                    message);
-                break;
+                    string.Equals(actual.GetValue<string>(), expected.GetString(), StringComparison.Ordinal);
             default:
                 throw new XunitException(
                     $"{id}: the expectation for '{name}' is a JSON {expected.ValueKind}, which the harness does not " +
@@ -1093,6 +1277,28 @@ public sealed class CheckCodeScenarioTests
     /// <summary>One field's value and check-code flag in the computed final state.</summary>
     private readonly record struct FieldState(JsonNode? Value, bool Enabled);
 
+    /// <summary>An expectation the start state already meets, with what the response must show for its field.</summary>
+    private readonly record struct RequiredEffect(string Field, EffectKind Kind);
+
+    /// <summary>
+    /// How the response accounts for an expectation the start state already meets: an effect it must name, or a sent
+    /// value the program must leave alone.
+    /// </summary>
+    private enum EffectKind
+    {
+        /// <summary>The field is named in <c>enabled</c>.</summary>
+        Enabled,
+
+        /// <summary>The field is named in <c>cleared</c>.</summary>
+        Cleared,
+
+        /// <summary>The field is a present member of <c>assigned</c> whose value matches the expected value.</summary>
+        Assigned,
+
+        /// <summary>The field is named in neither <c>cleared</c> nor <c>assigned</c>; its sent value stays.</summary>
+        Retained,
+    }
+
     /// <summary>The first soft-deleted base row of a form.</summary>
     private readonly record struct DeletedRecord(string GlobalRecordId, int UniqueKey);
 
@@ -1170,4 +1376,3 @@ public sealed class LegacyDefectLedgerTests
     private static bool HasText(string line, string prefix) =>
         line.StartsWith(prefix, StringComparison.Ordinal) && !string.IsNullOrWhiteSpace(line[prefix.Length..]);
 }
-

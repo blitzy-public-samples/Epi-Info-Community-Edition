@@ -40,9 +40,11 @@
  * text 15.8:1, muted text 6.0:1 or more, accent 5.2:1, danger 6.1:1 or more,
  * banner texts 9.1:1 or more, control borders 4.3:1 or more (3:1 needed),
  * hover borders 8.4:1 or more, text on the pressed surface 11.6:1, text
- * 11.6:1 and muted text 4.6:1 on the pressed row tint. White text on the
- * danger button: 6.5:1 at rest (danger), 10.5:1 on hover (danger text) and
- * 13.3:1 pressed (danger active). */
+ * 11.6:1 and muted text 4.6:1 on the pressed row tint. Selected tab text
+ * (accent strong) 6.7:1 on hover (accent subtle) and 5.6:1 pressed (accent
+ * muted), its accent top bar 4.6:1 and 3.8:1 there (3:1 needed). White text
+ * on the danger button: 6.5:1 at rest (danger), 10.5:1 on hover (danger
+ * text) and 13.3:1 pressed (danger active). */
 :root {
   color-scheme: light;
 
@@ -132,7 +134,8 @@
 
   h1,
   h2,
-  h3 {
+  h3,
+  h4 {
     margin-block: 0;
     line-height: 1.25;
     overflow-wrap: break-word;
@@ -146,7 +149,9 @@
     font-size: 1.375rem;
   }
 
-  h3 {
+  /* A field heading inside a group is an h4 for the outline only; it looks like an h3. */
+  h3,
+  h4 {
     font-size: 1.0625rem;
   }
 
@@ -455,12 +460,23 @@
     .page-tabs [role="tab"]:hover:not([aria-selected="true"]):not(:disabled):not([aria-disabled="true"]) {
       background-color: var(--color-surface-hover);
     }
+
+    .page-tabs [role="tab"][aria-selected="true"]:hover:not(:disabled):not([aria-disabled="true"]) {
+      background-color: var(--color-accent-subtle);
+    }
   }
 
-  /* The tab background is set in this layer, so the base pressed rule does
-   * not reach it. */
+  /* The tab background is set in this layer, so the base hover and pressed
+   * rules do not reach it. An unselected tab takes the neutral surfaces and
+   * the selected tab the accent tints, each pressed one darker than its
+   * hover; the selected tab keeps its top bar, bold accent text and focus
+   * ring in both states. */
   .page-tabs [role="tab"]:active:not([aria-selected="true"]):not(:disabled):not([aria-disabled="true"]) {
     background-color: var(--color-surface-active);
+  }
+
+  .page-tabs [role="tab"][aria-selected="true"]:active:not(:disabled):not([aria-disabled="true"]) {
+    background-color: var(--color-accent-muted);
   }
 
   /* Fields: one per row in tabIndex order. Each child of .field takes a full
@@ -583,7 +599,7 @@
     border-radius: var(--radius-large);
   }
 
-  .group-section > h3 {
+  .group-section > :is(h3, h4) {
     padding-block-end: var(--space-2);
     border-block-end: var(--border-width) solid var(--color-border);
   }

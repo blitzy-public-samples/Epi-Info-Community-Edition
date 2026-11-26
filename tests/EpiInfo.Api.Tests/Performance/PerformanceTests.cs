@@ -81,7 +81,7 @@ public sealed class PerformanceTests
         int count = await ReadActiveCountAsync(client, recordsPath, ct);
         Assert.True(count >= 1, $"Form {FormName} (view {viewId}) has no active record to open.");
 
-        // Warm-up, untimed and discarded: the first request compiles the endpoint and opens the first connection.
+        // Untimed warm-up of the at-position endpoint (GET .../records/at/1), read and discarded before timed samples.
         using (HttpResponseMessage warmUp = await client.GetAsync(RecordAtPath(recordsPath, 1), ct))
         {
             _ = await warmUp.Content.ReadAsByteArrayAsync(ct);

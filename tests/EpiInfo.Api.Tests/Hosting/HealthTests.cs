@@ -37,9 +37,10 @@ public sealed class HealthTests
     private const string Sentinel = "Sentinel-Health-7f3c9a2e";
 
     // Port 1 on IPv4 loopback, where nothing listens, so the real SQL Server store fails to connect within the
-    // 2-second connect timeout.
+    // 2-second connect timeout. The string names no database, because the server is never reached and the tests never
+    // name a database.
     private const string UnreachableConnectionString =
-        "Server=127.0.0.1,1;Database=EpiRehearsal;User Id=sa;Password=" + Sentinel +
+        "Server=127.0.0.1,1;User Id=sa;Password=" + Sentinel +
         ";TrustServerCertificate=True;Connect Timeout=2";
 
     private const string SqlTextFailure = "unclassified exception holding SQL text";
@@ -466,4 +467,3 @@ file static class HealthResponses
             $"The {RequestPath} body is not exactly {expectedBody}; it has {body.Length} characters.");
     }
 }
-

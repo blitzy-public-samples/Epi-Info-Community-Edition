@@ -48,7 +48,7 @@ import {
   writableCheckboxNames,
 } from '../test/formDefinitionFixture';
 import { FormView } from './FormView';
-import { fieldControlId } from './fields/fieldComponents';
+import { fieldComponents, fieldControlId, type FieldComponentProps } from './fields/fieldComponents';
 
 // The in-memory API
 
@@ -843,6 +843,270 @@ describe('FormView accessible structure (SC-8)', () => {
   });
 });
 
+describe('FormView field rendering: isolation, row identity, registry lookup and heading depth', () => {
+  /**
+   * Routes every registry entry through a wrapper that records the name of each field it
+   * renders, then renders the real component. Returns the live list of rendered names.
+   */
+  function recordFieldRenders(): string[] {
+    const rendered: string[] = [];
+    for (const type of Object.keys(fieldComponents) as FieldType[]) {
+      const Real = fieldComponents[type];
+      const Counted = (props: FieldComponentProps) => {
+        rendered.push(props.field.name);
+        return <Real {...props} />;
+      };
+      vi.spyOn(fieldComponents, type, 'get').mockReturnValue(Counted);
+    }
+    return rendered;
+  }
+
+  // Every panel stays mounted, so an edit re-renders the form view and every page; only
+  // the edited control, and the group holding it, may render again.
+  it.each([
+    { label: 'Zip', value: '30301', rerendered: ['Zip'] },
+    { label: 'Lab:', value: 'County lab', rerendered: ['Lab'] },
+    { label: 'Last Name', value: 'Byron', rerendered: ['DemographicInformation', 'LastName'] },
+  ])('re-renders only the edited field and the group holding it: $label', async ({ label, value, rerendered }) => {
+    const rendered = recordFieldRenders();
+    await renderForm();
+    rendered.length = 0;
+
+    fireEvent.change(screen.getByLabelText(label), { target: { value } });
+
+    expect(controlValue(screen.getByLabelText(label))).toBe(value);
+    expect([...new Set(rendered)].sort()).toEqual(rerendered);
+  });
+
+  type AddedField = Pick<FieldDefinition, 'name' | 'fieldType' | 'prompt' | 'tabIndex' | 'pageId'> &
+    Partial<Pick<FieldDefinition, 'unsupportedType' | 'members'>>;
+
+  /** A complete Field DTO with no validation and no options; `unsupported` follows `fieldType`. */
+  function addedField(init: AddedField): FieldDefinition {
+    return {
+      ...init,
+      unsupported: init.fieldType === 'unsupported',
+      unsupportedType: init.unsupportedType ?? null,
+      validation: { required: false, readOnly: false, maxLength: null, lower: null, upper: null, pattern: null },
+      options: null,
+      members: init.members ?? null,
+    };
+  }
+
+  /** Adds each field to its page after the fields with a lower or equal `tabIndex`, as the server orders them. */
+  function withAddedFields(definition: FormDefinition, ...fields: FieldDefinition[]): FormDefinition {
+    for (const added of fields) {
+      const page = pageOf(definition, added.pageId);
+      const after = page.fields.findIndex((field) => field.tabIndex > added.tabIndex);
+      page.fields.splice(after < 0 ? page.fields.length : after, 0, added);
+    }
+    return definition;
+  }
+
+  function pagesInPositionOrder(definition: FormDefinition): PageDefinition[] {
+    return [...definition.pages].sort((a, b) => a.position - b.position);
+  }
+
+  /** Names of the items laid out directly in a page panel's field list, in document order. */
+  function topLevelFieldNames(panel: HTMLElement): (string | undefined)[] {
+    const list = present(panel.querySelector<HTMLElement>('.page-fields'), 'field list of the panel');
+    return Array.from(list.children, (child) => (child instanceof HTMLElement ? child.dataset.fieldName : undefined));
+  }
+
+  // FormDefinitionFactory lists a row repeating a data field's exact name as an unsupported
+  // placeholder after the data field, and never resolves a group member to it.
+  it('keeps a repeated row and its data field apart on one page, across an edit', async () => {
+    const base = createFormDefinitionFixture();
+    const [firstPage] = pagesInPositionOrder(base);
+    const definition = withAddedFields(
+      base,
+      addedField({
+        name: 'Zip',
+        fieldType: 'unsupported',
+        prompt: 'Zip (repeated row)',
+        tabIndex: 11.5,
+        pageId: firstPage.pageId,
+        unsupportedType: 'Text',
+      }),
+    );
+    const consoleError = vi.spyOn(console, 'error');
+    const { container } = await renderForm(definition);
+    const control = screen.getByLabelText('Zip');
+
+    fireEvent.change(control, { target: { value: '30301' } });
+
+    expect(screen.getByLabelText('Zip')).toBe(control);
+    expect(controlValue(control)).toBe('30301');
+    const [canonical, repeat] = wrappersOf(container, 'Zip');
+    expect(wrappersOf(container, 'Zip')).toHaveLength(2);
+    expect(canonical.contains(control)).toBe(true);
+    expect(within(repeat).getByText('Unsupported field type: Text')).toBeTruthy();
+    expect(screen.getAllByText('Unsupported field type: Text')).toHaveLength(1);
+    const keyWarnings = consoleError.mock.calls.filter((args: unknown[]) =>
+      args.some((arg: unknown) => String(arg).includes('same key')),
+    );
+    expect(keyWarnings).toEqual([]);
+  });
+
+  it("never claims a repeated row for a group when the name's data field is on another page", async () => {
+    const base = createFormDefinitionFixture();
+    const [firstPage, secondPage] = pagesInPositionOrder(base);
+    const definition = withAddedFields(
+      base,
+      addedField({
+        name: 'LabGroup',
+        fieldType: 'group',
+        prompt: 'Laboratory',
+        tabIndex: 3.5,
+        pageId: secondPage.pageId,
+        members: ['Lab', 'LastName'],
+      }),
+      addedField({
+        name: 'LastName',
+        fieldType: 'unsupported',
+        prompt: 'Last Name (repeated row)',
+        tabIndex: 5,
+        pageId: secondPage.pageId,
+        unsupportedType: 'Text',
+      }),
+    );
+    const { container } = await renderForm(definition);
+
+    const section = wrapperOf(container, 'LabGroup');
+    expect(renderedFieldNames(section)).toEqual(['Lab']);
+    expect(topLevelFieldNames(panelOf(secondPage))).toEqual([
+      'FoodsLabel',
+      'BuyLastTenDays',
+      'Breastmilk',
+      'LabGroup',
+      'LastName',
+    ]);
+
+    const [canonical, repeat] = wrappersOf(container, 'LastName');
+    expect(wrappersOf(container, 'LastName')).toHaveLength(2);
+    expect(canonical.contains(screen.getByLabelText('Last Name'))).toBe(true);
+    expect(wrapperOf(container, 'DemographicInformation').contains(canonical)).toBe(true);
+    expect(panelOf(firstPage).contains(canonical)).toBe(true);
+    expect(within(repeat).getByText('Unsupported field type: Text')).toBeTruthy();
+    expect(section.contains(repeat)).toBe(false);
+    expect(panelOf(secondPage).contains(repeat)).toBe(true);
+  });
+
+  // A genuinely unsupported row listed before the data field of its exact name repeats no
+  // data field, so the server keeps it as a member candidate and, being first, resolves
+  // the group's entry to it.
+  it('claims a genuine unsupported row listed before the data field of its name for a group', async () => {
+    const base = withField('DemographicInformation', (group) => ({
+      ...group,
+      members: [...(group.members ?? []), 'Shared'],
+    }));
+    const [firstPage] = pagesInPositionOrder(base);
+    const definition = withAddedFields(
+      base,
+      addedField({
+        name: 'Shared',
+        fieldType: 'unsupported',
+        prompt: 'Shared grid',
+        tabIndex: 3.2,
+        pageId: firstPage.pageId,
+        unsupportedType: 'Grid',
+      }),
+      addedField({ name: 'Shared', fieldType: 'text', prompt: 'Shared text', tabIndex: 11.7, pageId: firstPage.pageId }),
+    );
+    const { container } = await renderForm(definition);
+
+    const section = wrapperOf(container, 'DemographicInformation');
+    expect(renderedFieldNames(section)).toEqual(['Shared', 'FirstName', 'LastName', 'Sex']);
+    expect(within(section).getByText('Unsupported field type: Grid')).toBeTruthy();
+    expect(screen.getAllByText('Unsupported field type: Grid')).toHaveLength(1);
+
+    const control = screen.getByLabelText('Shared text');
+    expect(screen.getAllByLabelText('Shared text')).toHaveLength(1);
+    expect(section.contains(control)).toBe(false);
+    expect(panelOf(firstPage).contains(control)).toBe(true);
+    expect(wrappersOf(container, 'Shared')).toHaveLength(2);
+    expect(topLevelFieldNames(panelOf(firstPage))).toEqual([
+      'Title',
+      'CaseID',
+      'DemographicInformation',
+      'DOB',
+      'Age',
+      'DateofInterview',
+      'PhoneNumber',
+      'Zip',
+      'Shared',
+      'PatientAddress',
+      'Asian',
+      'Black',
+      'Headache',
+      'IllnessSeverity',
+      'ILL',
+      'FeverTemp',
+      'OnsetDate',
+      'OnsetWeek',
+    ]);
+  });
+
+  // The contract closes `fieldType`, but a malformed response can carry any string, and
+  // these name members every object inherits.
+  it.each(['constructor', 'toString', '__proto__', 'hasOwnProperty', 'valueOf'])(
+    'renders a field of the malformed type %s as a protected placeholder',
+    async (malformed) => {
+      const fieldType: string = malformed;
+      const { container } = await renderForm(withField('Zip', (field) => ({ ...field, fieldType: fieldType as FieldType })));
+      const wrapper = wrapperOf(container, 'Zip');
+
+      expect(within(wrapper).getByText('Unsupported field type: unknown')).toBeTruthy();
+      expect(wrapper.classList.contains('field--protected')).toBe(true);
+      expect(wrapper.querySelectorAll(`${NATIVE_CONTROLS}, button`)).toHaveLength(0);
+    },
+  );
+
+  // The form's name is the h2, so a page's own labels and groups are h3, and a field a
+  // group holds is one level below the group's heading.
+  it.each([
+    {
+      held: 'a label',
+      heading: 'Food History Interview',
+      definition: () =>
+        withField('DemographicInformation', (group) => ({ ...group, members: [...(group.members ?? []), 'Title'] })),
+    },
+    {
+      held: 'a nested group',
+      heading: 'Nested group',
+      definition: () => {
+        const base = withField('DemographicInformation', (group) => ({
+          ...group,
+          members: [...(group.members ?? []), 'NestedGroup'],
+        }));
+        const [firstPage] = pagesInPositionOrder(base);
+        return withAddedFields(
+          base,
+          addedField({
+            name: 'NestedGroup',
+            fieldType: 'group',
+            prompt: 'Nested group',
+            tabIndex: 4.5,
+            pageId: firstPage.pageId,
+            members: ['Zip'],
+          }),
+        );
+      },
+    },
+  ])('renders $held that a group holds one heading level below the group', async ({ heading, definition }) => {
+    const { container, definition: rendered } = await renderForm(definition());
+    const section = wrapperOf(container, 'DemographicInformation');
+
+    expect(within(section).getByRole('heading', { level: 3, name: 'Demographic Information' })).toBeTruthy();
+    expect(within(section).getByRole('heading', { level: 4, name: heading })).toBeTruthy();
+    expect(screen.queryByRole('heading', { level: 3, name: heading })).toBeNull();
+
+    // A label at the top level of another page keeps level 3.
+    showPage(pagesInPositionOrder(rendered)[1]);
+    expect(screen.getByRole('heading', { level: 3, name: 'Foods eaten in the 10 days before illness' })).toBeTruthy();
+  });
+});
+
 describe('FormView permission flags', () => {
   // The server reports these flags from SQL Server permissions and enforces them on every
   // write; the client only disables what they deny. `null` means nothing was reported and
@@ -1213,5 +1477,21 @@ describe('FormView validation summary', () => {
       expect(controlValue(controlOf(definition, field.name)), field.name).toBe(entered);
     }
     expect(navigatorStatus()).toBe('1 of 1');
+  });
+});
+
+describe('FormView with no pages', () => {
+  it('shows a no-pages status instead of an empty tablist and keeps the rest of the workspace', async () => {
+    await renderForm({ ...createFormDefinitionFixture(), pages: [] });
+
+    expect(screen.queryByRole('tablist')).toBeNull();
+    expect(screen.queryAllByRole('tab', { hidden: true })).toEqual([]);
+    expect(screen.queryAllByRole('tabpanel', { hidden: true })).toEqual([]);
+    const noPages = screen.getAllByRole('status').filter((status) => status.textContent === 'This form has no pages.');
+    expect(noPages).toHaveLength(1);
+
+    expect(screen.getByRole('toolbar', { name: 'Form actions' })).toBeTruthy();
+    expect(screen.getByRole('toolbar', { name: 'Record navigation' })).toBeTruthy();
+    expect(screen.getByRole('region', { name: 'Records' })).toBeTruthy();
   });
 });

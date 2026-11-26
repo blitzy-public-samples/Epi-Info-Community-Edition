@@ -7,6 +7,7 @@ using EpiInfo.Api.Tests.Infrastructure;
 using EpiInfo.Domain.Storage;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace EpiInfo.Api.Tests.Hosting;
 
@@ -27,6 +28,10 @@ public sealed class LoopbackBindingTests
 
     /// <summary>The listen URL <c>appsettings.json</c> commits.</summary>
     private const string AllowedUrl = "http://127.0.0.1:5000";
+
+    // The listen URL a real-Kestrel test host must request: IPv4 loopback on port 0, so the operating system picks a
+    // free port. Written here rather than read from the factory, so a factory that requests another URL fails.
+    private const string EphemeralLoopbackUrl = "http://127.0.0.1:0";
 
     private const string LocalhostUrl = "http://localhost:5000";
 
@@ -262,17 +267,49 @@ public sealed class LoopbackBindingTests
     }
 
     // The bound addresses IServerAddressesFeature reports are the proof: each names IPv4 loopback exactly, on the port
-    // the operating system chose, and serves.
+    // the operating system chose, and serves. Two hosts run at once, as concurrent test classes run them: each requests
+    // port 0, gets a port of its own that is not the committed one, and answers /health from its own store.
     [Fact]
     public async Task KestrelBindsOnlyIpv4Loopback()
     {
-        var store = new FakeDataStore();
-        await using var factory = new KestrelApiFactory(ApiFactoryOptions.ForFake(store));
-        factory.Start();
+        var firstStore = new FakeDataStore();
+        var secondStore = new FakeDataStore();
+        await using var first = new KestrelApiFactory(ApiFactoryOptions.ForFake(firstStore));
+        await using var second = new KestrelApiFactory(ApiFactoryOptions.ForFake(secondStore));
 
+        // Both listen before either is examined, so every assertion below holds while the other host is alive.
+        first.Start();
+        second.Start();
+
+        IReadOnlySet<int> firstPorts = AssertListensOnEphemeralIpv4LoopbackOnly(first);
+        IReadOnlySet<int> secondPorts = AssertListensOnEphemeralIpv4LoopbackOnly(second);
+        Assert.False(
+            firstPorts.Overlaps(secondPorts),
+            $"Two hosts alive at once share port {string.Join(", ", firstPorts.Intersect(secondPorts))}.");
+
+        // Each request reaches its own host's socket and store: the other store records no ping for it.
+        await AssertServesHealthAsync(first, firstPorts);
+        Assert.Single(firstStore.Calls, IsPing);
+        Assert.DoesNotContain(secondStore.Calls, IsPing);
+
+        await AssertServesHealthAsync(second, secondPorts);
+        Assert.Single(secondStore.Calls, IsPing);
+        Assert.Single(firstStore.Calls, IsPing);
+    }
+
+    // Asserts that the started host's effective configuration requests the ephemeral loopback URL, and that every
+    // address it bound names IPv4 loopback exactly, on a port the operating system chose other than the committed one.
+    // Returns those ports.
+    private static IReadOnlySet<int> AssertListensOnEphemeralIpv4LoopbackOnly(KestrelApiFactory factory)
+    {
+        IConfiguration configuration = factory.Services.GetRequiredService<IConfiguration>();
+        Assert.Equal(EphemeralLoopbackUrl, configuration[HttpEndpointUrlKey]);
+
+        int committedPort = new Uri(AllowedUrl).Port;
         IReadOnlyList<string> addresses = factory.BoundAddresses;
-
         Assert.NotEmpty(addresses);
+
+        var ports = new HashSet<int>();
         foreach (string address in addresses)
         {
             // Uri cannot parse "*" or "+" hosts, so the raw text is checked before parsing.
@@ -288,15 +325,26 @@ public sealed class LoopbackBindingTests
             Assert.Equal(AddressFamily.InterNetwork, ip.AddressFamily);
             Assert.Equal(IPAddress.Loopback, ip);
             Assert.NotEqual(0, uri.Port);
+            Assert.NotEqual(committedPort, uri.Port);
             Assert.True(LoopbackBindingGuard.IsAllowedListenUrl(address), $"'{address}' breaks the listen rule.");
+            ports.Add(uri.Port);
         }
 
-        using HttpClient client = factory.CreateKestrelClient();
-        using HttpResponseMessage response = await client.GetAsync("/health");
-
-        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-        Assert.Contains(store.Calls, call => call.Method == nameof(IDataStore.PingAsync));
+        return ports;
     }
+
+    // GET /health through the host's own socket client, whose base address must be one of the host's bound ports.
+    private static async Task AssertServesHealthAsync(KestrelApiFactory factory, IReadOnlySet<int> ports)
+    {
+        using HttpClient client = factory.CreateKestrelClient();
+        Assert.NotNull(client.BaseAddress);
+        Assert.Contains(client.BaseAddress.Port, ports);
+
+        using HttpResponseMessage response = await client.GetAsync("/health");
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+    }
+
+    private static bool IsPing(FakeStoreCall call) => call.Method == nameof(IDataStore.PingAsync);
 
     private static IConfigurationRoot Configure(params (string Key, string? Value)[] settings)
     {

@@ -50,22 +50,30 @@ namespace EpiInfo.Api.Tests.Errors;
 /// ProblemDetails writer declines. Every HTTP case runs in the Production and the Development environment.
 /// </para>
 /// <para>
-/// No case needs a database. Each HTTP case starts its own <see cref="ApiFactory"/>, so captured logs never mix: with
-/// no connection string; over a <see cref="FakeDataStore"/>, which injects the store failures; or with the real SQL
-/// Server store pointed at a loopback port that refuses connections. The redaction cases place a fresh sentinel per
-/// placement and search the body and every line <see cref="ApiFactoryBase.Logs"/> captured under the committed
-/// filters, after asserting that the line they search exists. The writer cases execute the <see cref="ApiProblems"/>
-/// writers on a <see cref="DefaultHttpContext"/>. Assertion messages are fixed texts that never quote a response
-/// body. The body-classification, response
-/// serialization and exception-boundary cases start an <see cref="ErrorPipelineHost"/>, which composes the real
-/// exception handler, guards, endpoints and services in the pipeline order <c>Program.cs</c> uses, over a
-/// <see cref="FakeDataStore"/>. The class carries no <c>Integration</c> trait, joins no database collection and takes
-/// no <c>DatabaseWriteLock</c>.
+/// No case needs a database. Each HTTP case starts its own host, so captured logs never mix. Wherever the API as
+/// <c>Program.cs</c> composes it can show the behaviour, that host is an <see cref="ApiFactory"/>: with no connection
+/// string; over a <see cref="FakeDataStore"/>, which injects the store failures; or with the real SQL Server store
+/// pointed at a loopback port that refuses connections. The body-classification cases use the same composition over a
+/// <see cref="FakeDataStore"/>, on <see cref="ApiFactory"/> for the TestServer framings and on
+/// <see cref="KestrelApiFactory"/> for the Kestrel ones. The redaction cases place a fresh sentinel per placement and
+/// search the body and every line <see cref="ApiFactoryBase.Logs"/> captured under the committed filters, after
+/// asserting that the line they search exists. The writer cases execute the <see cref="ApiProblems"/> writers on a
+/// <see cref="DefaultHttpContext"/>. The response-serialization and exception-boundary cases need a failing JSON
+/// converter or an endpoint the API does not have, so they start an <see cref="ErrorPipelineHost"/>, which composes
+/// the real exception handler, guards, endpoints and services in the pipeline order <c>Program.cs</c> uses, over a
+/// <see cref="FakeDataStore"/>, and guards and freezes its listener as <c>Program.cs</c> does.
+/// </para>
+/// <para>
+/// Assertion messages are fixed texts that never quote a response body. Every raw HTTP/1.1 exchange goes through one
+/// client, which bounds the connect, the write and the reads by <see cref="HostedWait"/> and, past it, fails with a
+/// fixed message naming the request's method, path and framing, never a byte received; a cancellation the caller
+/// requests stays a cancellation. The class carries no <c>Integration</c> trait, joins no database collection and
+/// takes no <c>DatabaseWriteLock</c>.
 /// </para>
 /// </remarks>
 public sealed class ErrorContractTests
 {
-    private const string ProblemMediaType = "application/problem+json";
+    internal const string ProblemMediaType = "application/problem+json";
 
     private const string NotFoundType = "https://tools.ietf.org/html/rfc9110#section-15.5.5";
 
@@ -81,9 +89,52 @@ public sealed class ErrorContractTests
 
     // The 500 detail written out here rather than read from ApiProblems, so a change to the product's text fails
     // these cases: one fixed sentence, then the label that introduces the body's traceId.
-    private const string ExpectedUnexpectedSentence = "An unexpected error occurred.";
+    internal const string ExpectedUnexpectedSentence = "An unexpected error occurred.";
 
     private const string ExpectedTraceIdLabel = " Trace id: ";
+
+    // The rest of the wire contract, written out the same way so that a changed or swapped product text fails these
+    // cases and the other classes of this file: the traceId member, the fixed detail of each status and request-level
+    // problem, the errors key and message of a non-integer page, each writeOutcome value and the unhealthy status.
+    private const string TraceIdMember = "traceId";
+
+    private const string ExpectedInvalidRequestDetail = "the request is invalid";
+
+    private const string ExpectedValidationFailedDetail = "one or more values are invalid";
+
+    private const string ExpectedMalformedJsonDetail = "malformed JSON";
+
+    private const string ExpectedRequestBodyRequiredDetail = "request body is required";
+
+    private const string ExpectedValuesMustBeObjectDetail = "values must be an object";
+
+    private const string ExpectedFormNotFoundDetail = "the form does not exist";
+
+    internal const string ExpectedRecordNotFoundDetail = "the record does not exist";
+
+    internal const string ExpectedRecordDeletedDetail = "the record is deleted";
+
+    private const string ExpectedResourceNotFoundDetail = "the resource does not exist";
+
+    private const string ExpectedMethodNotAllowedDetail = "method not allowed";
+
+    private const string ExpectedRequestTooLargeDetail = "request too large";
+
+    private const string ExpectedUnsupportedMediaTypeDetail = "unsupported media type; use application/json";
+
+    private const string ExpectedUnavailableDetail = "the database is unavailable";
+
+    private const string ExpectedPageErrorsKey = "page";
+
+    private const string ExpectedIntegerExpectedMessage = "The value must be an integer.";
+
+    internal const string ExpectedNotWritten = "notWritten";
+
+    internal const string ExpectedUnknown = "unknown";
+
+    internal const string ExpectedWritten = "written";
+
+    private const string ExpectedUnhealthyStatus = "unhealthy";
 
     // The members of every plain ProblemDetails the API writes, in ordinal order.
     private static readonly string[] ProblemMembers = ["detail", "status", "title", "traceId", "type"];
@@ -143,7 +194,8 @@ public sealed class ErrorContractTests
 
     private const string ResponseAbortedEvent = "ResponseAborted";
 
-    // The longest a hosted case waits for its endpoint to start or for the server to finish its request.
+    // The longest a hosted case waits for its endpoint to start, for the server to finish its request, or for a raw
+    // HTTP/1.1 exchange to end.
     private static readonly TimeSpan HostedWait = TimeSpan.FromSeconds(10);
 
     /// <summary>The hosting environments every HTTP case runs in.</summary>
@@ -266,12 +318,12 @@ public sealed class ErrorContractTests
     /// </summary>
     public static TheoryData<int, string> StatusCodePageClientErrors => new()
     {
-        { StatusCodes.Status400BadRequest, ApiProblems.InvalidRequestDetail },
-        { StatusCodes.Status404NotFound, ApiProblems.ResourceNotFoundDetail },
-        { StatusCodes.Status405MethodNotAllowed, ApiProblems.MethodNotAllowedDetail },
-        { StatusCodes.Status413PayloadTooLarge, ApiProblems.RequestTooLargeDetail },
-        { StatusCodes.Status415UnsupportedMediaType, ApiProblems.UnsupportedMediaTypeDetail },
-        { StatusCodes.Status418ImATeapot, ApiProblems.InvalidRequestDetail },
+        { StatusCodes.Status400BadRequest, ExpectedInvalidRequestDetail },
+        { StatusCodes.Status404NotFound, ExpectedResourceNotFoundDetail },
+        { StatusCodes.Status405MethodNotAllowed, ExpectedMethodNotAllowedDetail },
+        { StatusCodes.Status413PayloadTooLarge, ExpectedRequestTooLargeDetail },
+        { StatusCodes.Status415UnsupportedMediaType, ExpectedUnsupportedMediaTypeDetail },
+        { StatusCodes.Status418ImATeapot, ExpectedInvalidRequestDetail },
     };
 
     /// <summary>A status the page never answers, and an error status of a request the client aborted.</summary>
@@ -322,19 +374,19 @@ public sealed class ErrorContractTests
                              })
                     {
                         // Content that is not JSON: an unterminated object and a bare word.
-                        data.Add(environment, framing, route, "{", ApiProblems.MalformedJsonDetail);
-                        data.Add(environment, framing, route, "x", ApiProblems.MalformedJsonDetail);
+                        data.Add(environment, framing, route, "{", ExpectedMalformedJsonDetail);
+                        data.Add(environment, framing, route, "x", ExpectedMalformedJsonDetail);
 
                         // No content: Content-Length 0, or a body of unknown length whose first read ends it (on
                         // Kestrel the zero-length chunk alone).
-                        data.Add(environment, framing, route, string.Empty, ApiProblems.RequestBodyRequiredDetail);
+                        data.Add(environment, framing, route, string.Empty, ExpectedRequestBodyRequiredDetail);
 
                         // One byte that holds no JSON token is content, not an empty body.
-                        data.Add(environment, framing, route, " ", ApiProblems.MalformedJsonDetail);
+                        data.Add(environment, framing, route, " ", ExpectedMalformedJsonDetail);
                     }
 
                     // A missing body: an HTTP/1.1 request without framing headers cannot carry one.
-                    data.Add(environment, KestrelUnframed, route, string.Empty, ApiProblems.RequestBodyRequiredDetail);
+                    data.Add(environment, KestrelUnframed, route, string.Empty, ExpectedRequestBodyRequiredDetail);
                 }
             }
 
@@ -365,7 +417,7 @@ public sealed class ErrorContractTests
             HttpStatusCode.NotFound,
             NotFoundType,
             "Not Found",
-            ApiProblems.ResourceNotFoundDetail);
+            ExpectedResourceNotFoundDetail);
     }
 
     // AAP 0.7.6: a text/plain POST to an unknown /api route is the route miss, never a 415, and with a non-JSON Accept
@@ -389,7 +441,7 @@ public sealed class ErrorContractTests
             HttpStatusCode.NotFound,
             NotFoundType,
             "Not Found",
-            ApiProblems.ResourceNotFoundDetail);
+            ExpectedResourceNotFoundDetail);
     }
 
     // AAP 0.3.4.2 and 0.3.4.7: a method mismatch stays a 405, becomes the 405 ProblemDetails whatever the Accept
@@ -422,7 +474,7 @@ public sealed class ErrorContractTests
                 HttpStatusCode.MethodNotAllowed,
                 MethodNotAllowedType,
                 "Method Not Allowed",
-                ApiProblems.MethodNotAllowedDetail);
+                ExpectedMethodNotAllowedDetail);
 
             ICollection<string> allow = response.Content.Headers.Allow;
             Assert.True(
@@ -450,14 +502,17 @@ public sealed class ErrorContractTests
         Assert.Equal(StatusCodes.Status500InternalServerError, context.Response.StatusCode);
         Assert.Equal(ProblemMediaType, context.Response.ContentType);
         JsonElement problem = ApiTestClient.AssertProblemDetails(Parse(body), StatusCodes.Status500InternalServerError);
-        string? traceId = StringMember(problem, ApiProblems.TraceIdKey);
+        string? traceId = StringMember(problem, TraceIdMember);
         AssertTraceId(traceId, activity, context);
         AssertUnexpectedDetail(StringMember(problem, "detail"), traceId);
 
         if (outcome is { } expected)
         {
             Assert.True(
-                string.Equals(expected.ToWireValue(), StringMember(problem, "writeOutcome"), StringComparison.Ordinal),
+                string.Equals(
+                    ExpectedWireOutcome(expected),
+                    StringMember(problem, "writeOutcome"),
+                    StringComparison.Ordinal),
                 "The write 500 does not carry its writeOutcome.");
         }
         else
@@ -484,7 +539,7 @@ public sealed class ErrorContractTests
 
             JsonElement problem = Parse(body);
             Assert.True(
-                string.Equals(traceId, StringMember(problem, ApiProblems.TraceIdKey), StringComparison.Ordinal),
+                string.Equals(traceId, StringMember(problem, TraceIdMember), StringComparison.Ordinal),
                 "The traceId member is not the trace identifier of the request written to.");
             AssertUnexpectedDetail(StringMember(problem, "detail"), traceId);
         }
@@ -528,7 +583,7 @@ public sealed class ErrorContractTests
                     Parse(body),
                     StatusCodes.Status503ServiceUnavailable);
                 detail = StringMember(problem, "detail");
-                traceId = StringMember(problem, ApiProblems.TraceIdKey);
+                traceId = StringMember(problem, TraceIdMember);
                 break;
 
             default:
@@ -542,7 +597,7 @@ public sealed class ErrorContractTests
 
         AssertTraceId(traceId, activity: null, context);
         Assert.True(
-            string.Equals(ApiProblems.UnavailableDetail, detail, StringComparison.Ordinal),
+            string.Equals(ExpectedUnavailableDetail, detail, StringComparison.Ordinal),
             "The 503 detail is not the fixed unavailable text.");
     }
 
@@ -573,7 +628,7 @@ public sealed class ErrorContractTests
         Assert.True(
             string.Equals(detail, StringMember(problem, "detail"), StringComparison.Ordinal),
             "The status-code page's detail is not the fixed text of its status.");
-        AssertTraceId(StringMember(problem, ApiProblems.TraceIdKey), Activity.Current, context);
+        AssertTraceId(StringMember(problem, TraceIdMember), Activity.Current, context);
     }
 
     // A status outside 400 to 599 gets no page, and a client that aborted the request receives no body.
@@ -632,13 +687,13 @@ public sealed class ErrorContractTests
         var text = await response.Content.ReadAsStringAsync();
 
         Assert.Equal(HttpStatusCode.InternalServerError, response.StatusCode);
-        Assert.Equal(ApiProblems.ProblemContentType, response.Content.Headers.ContentType?.MediaType);
+        Assert.Equal(ProblemMediaType, response.Content.Headers.ContentType?.MediaType);
         using var document = JsonDocument.Parse(text);
         var problem = ApiTestClient.AssertProblemDetails(
             document.RootElement,
             (int)HttpStatusCode.InternalServerError);
-        Assert.Contains(ApiProblems.UnexpectedDetail, problem.GetProperty("detail").GetString(), StringComparison.Ordinal);
-        Assert.Equal(WriteOutcomeExtensions.WireWritten, problem.GetProperty("writeOutcome").GetString());
+        Assert.Contains(ExpectedUnexpectedSentence, problem.GetProperty("detail").GetString(), StringComparison.Ordinal);
+        Assert.Equal(ExpectedWritten, problem.GetProperty("writeOutcome").GetString());
         Assert.DoesNotContain(sentinel, text, StringComparison.Ordinal);
 
         // The save was applied before its response failed.
@@ -659,7 +714,7 @@ public sealed class ErrorContractTests
         Assert.Equal(LogLevel.Error, entry.Level);
         Assert.Equal((int)HttpStatusCode.InternalServerError, StateValue(entry, "StatusCode"));
         Assert.Equal(typeof(JsonException).FullName, StateValue(entry, "ExceptionType"));
-        Assert.Equal(WriteOutcomeExtensions.WireWritten, StateValue(entry, "WriteOutcome"));
+        Assert.Equal(ExpectedWritten, StateValue(entry, "WriteOutcome"));
         Assert.False(host.Logs.ContainsText(sentinel));
     }
 
@@ -682,13 +737,13 @@ public sealed class ErrorContractTests
         var text = await response.Content.ReadAsStringAsync();
 
         Assert.Equal(HttpStatusCode.InternalServerError, response.StatusCode);
-        Assert.Equal(ApiProblems.ProblemContentType, response.Content.Headers.ContentType?.MediaType);
+        Assert.Equal(ProblemMediaType, response.Content.Headers.ContentType?.MediaType);
         using var document = JsonDocument.Parse(text);
         var problem = ApiTestClient.AssertProblemDetails(
             document.RootElement,
             (int)HttpStatusCode.InternalServerError);
-        Assert.Contains(ApiProblems.UnexpectedDetail, problem.GetProperty("detail").GetString(), StringComparison.Ordinal);
-        Assert.False(problem.TryGetProperty("writeOutcome", out _), text);
+        Assert.Contains(ExpectedUnexpectedSentence, problem.GetProperty("detail").GetString(), StringComparison.Ordinal);
+        Assert.False(problem.TryGetProperty("writeOutcome", out _), "The 500 of a read carries a writeOutcome.");
         Assert.DoesNotContain(sentinel, text, StringComparison.Ordinal);
         Assert.Empty(host.Store.WriteCalls);
 
@@ -700,7 +755,9 @@ public sealed class ErrorContractTests
     }
 
     // AAP 0.3.4.2 and 0.3.4.7: on each of the four body routes a body that cannot be bound is a request-level 400
-    // whose detail names the problem, with no errors map, no writeOutcome and nothing written.
+    // whose detail names the problem, with no errors map, no writeOutcome and nothing written. The API itself answers,
+    // composed by Program.cs over the fake store: on TestServer through ApiFactory, and on real Kestrel through
+    // KestrelApiFactory, whose listener the guard checked and froze before it bound.
     [Theory]
     [MemberData(nameof(UnusableBodies))]
     public async Task UnusableBodyIsARequestLevel400NamingTheProblem(
@@ -710,23 +767,26 @@ public sealed class ErrorContractTests
         string body,
         string expectedDetail)
     {
-        await using var host = await ErrorPipelineHost.StartAsync(new ErrorPipelineHostOptions
+        var store = FakeDataStore.WithStandardForms();
+        var options = ApiFactoryOptions.ForFake(store, environment) with
         {
-            EnvironmentName = environment,
-            UseKestrel = framing is KestrelContentLength or KestrelChunked or KestrelUnframed,
-        });
-        var (method, path) = ResolveRoute(host.Store, route);
+            ExtraSettings = ClientPathSetting(AbsentClientFolder()),
+        };
+        await using ApiFactoryBase factory = framing is KestrelContentLength or KestrelChunked or KestrelUnframed
+            ? new KestrelApiFactory(options)
+            : new ApiFactory(options);
+        var (method, path) = ResolveRoute(store, route);
 
-        var (status, mediaType, text) = await SendBodyAsync(host, method, path, framing, body);
+        var (status, mediaType, text) = await SendBodyAsync(factory, method, path, framing, body);
 
         Assert.Equal((int)HttpStatusCode.BadRequest, status);
-        Assert.Equal(ApiProblems.ProblemContentType, mediaType);
+        Assert.Equal(ProblemMediaType, mediaType);
         using var document = JsonDocument.Parse(text);
         var problem = ApiTestClient.AssertProblemDetails(document.RootElement, (int)HttpStatusCode.BadRequest);
         Assert.Equal(expectedDetail, problem.GetProperty("detail").GetString());
-        Assert.False(problem.TryGetProperty("errors", out _), text);
-        Assert.False(problem.TryGetProperty("writeOutcome", out _), text);
-        Assert.Empty(host.Store.WriteCalls);
+        Assert.False(problem.TryGetProperty("errors", out _), "The request-level 400 carries an errors map.");
+        Assert.False(problem.TryGetProperty("writeOutcome", out _), "The request-level 400 carries a writeOutcome.");
+        Assert.Empty(store.WriteCalls);
     }
 
     // AAP 0.3.4.6: a caller that aborts its request gets no response and leaves one Information line. The
@@ -808,12 +868,12 @@ public sealed class ErrorContractTests
         var text = await response.Content.ReadAsStringAsync();
 
         Assert.Equal(HttpStatusCode.InternalServerError, response.StatusCode);
-        Assert.Equal(ApiProblems.ProblemContentType, response.Content.Headers.ContentType?.MediaType);
+        Assert.Equal(ProblemMediaType, response.Content.Headers.ContentType?.MediaType);
         using var document = JsonDocument.Parse(text);
         var problem = ApiTestClient.AssertProblemDetails(
             document.RootElement,
             (int)HttpStatusCode.InternalServerError);
-        Assert.Contains(ApiProblems.UnexpectedDetail, problem.GetProperty("detail").GetString(), StringComparison.Ordinal);
+        Assert.Contains(ExpectedUnexpectedSentence, problem.GetProperty("detail").GetString(), StringComparison.Ordinal);
         Assert.DoesNotContain(sentinel, text, StringComparison.Ordinal);
 
         var entry = Assert.Single(host.Logs.Find(captured => captured.Category == HandlerCategory));
@@ -941,7 +1001,7 @@ public sealed class ErrorContractTests
         Assert.Equal(HttpStatusCode.Created, response.StatusCode);
         Assert.NotNull(read);
         var entry = AssertOneStartedResponseLine(host.Logs, sentinel, StatusCodes.Status201Created);
-        Assert.Equal(WriteOutcomeExtensions.WireWritten, StateValue(entry, "WriteOutcome"));
+        Assert.Equal(ExpectedWritten, StateValue(entry, "WriteOutcome"));
         Assert.Equal(WriteEndpointMetadata.Insert.Operation, StateValue(entry, "Operation"));
     }
 
@@ -977,6 +1037,65 @@ public sealed class ErrorContractTests
 
         Assert.Equal(HttpStatusCode.OK, status);
         AssertOneClientAbortLine(host.Logs);
+    }
+
+    // The raw HTTP/1.1 client is bounded. A listener that sends part of a response head and then neither finishes nor
+    // closes the connection makes the exchange fail within its timeout, with a fixed message that names the request
+    // and none of the bytes that arrived; a cancellation the caller requests ends the exchange as that cancellation.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task RawExchangeWithAStalledListenerFailsWithoutQuotingTheResponse(bool callerCancels)
+    {
+        var sentinel = NewSentinel();
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var address = new Uri(string.Create(
+            CultureInfo.InvariantCulture,
+            $"http://127.0.0.1:{((IPEndPoint)listener.LocalEndpoint).Port}"));
+        using var stop = new CancellationTokenSource();
+        var stalling = StallAsync(listener, "HTTP/1.1 200 OK\r\nX-Sentinel: " + sentinel + "\r\n", stop.Token);
+        var partialReceived = NewSignal();
+        using var caller = new CancellationTokenSource();
+        var timeout = callerCancels ? HostedWait : TimeSpan.FromSeconds(2);
+        var clock = Stopwatch.StartNew();
+
+        var failure = await Record.ExceptionAsync(() => RawHttp.SendAsync(
+            address,
+            "GET /stalled HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+            "GET /stalled (stalled listener)",
+            timeout,
+            caller.Token,
+            text =>
+            {
+                if (text.Contains(sentinel, StringComparison.Ordinal))
+                {
+                    partialReceived.TrySetResult();
+                    if (callerCancels)
+                    {
+                        caller.Cancel();
+                    }
+                }
+            }));
+        clock.Stop();
+        await stop.CancelAsync();
+        await stalling;
+
+        Assert.True(partialReceived.Task.IsCompleted, "The stalled listener's partial head never reached the client.");
+        Assert.True(clock.Elapsed < HostedWait, "The stalled exchange was not ended before HostedWait.");
+        if (callerCancels)
+        {
+            var cancelled = Assert.IsAssignableFrom<OperationCanceledException>(failure);
+            Assert.Equal(caller.Token, cancelled.CancellationToken);
+        }
+        else
+        {
+            var timedOut = Assert.IsType<Xunit.Sdk.FailException>(failure);
+            Assert.DoesNotContain(sentinel, timedOut.Message, StringComparison.Ordinal);
+            Assert.Equal(
+                "The raw HTTP/1.1 exchange GET /stalled (stalled listener) did not end within 2 s.",
+                timedOut.Message);
+        }
     }
 
     // The routing and lookup errors a request alone produces.
@@ -1146,17 +1265,17 @@ public sealed class ErrorContractTests
                 HttpMethod.Get,
                 "/api/forms/999999",
                 HttpStatusCode.NotFound,
-                ApiProblems.FormNotFoundDetail),
+                ExpectedFormNotFoundDetail),
             NonIntegerViewIdCase => (
                 HttpMethod.Get,
                 "/api/forms/abc",
                 HttpStatusCode.NotFound,
-                ApiProblems.ResourceNotFoundDetail),
+                ExpectedResourceNotFoundDetail),
             RecordPatchCase => (
                 HttpMethod.Patch,
                 $"{TwoPageRecordsPath}/{recordId}",
                 HttpStatusCode.MethodNotAllowed,
-                ApiProblems.MethodNotAllowedDetail),
+                ExpectedMethodNotAllowedDetail),
             _ => throw new ArgumentOutOfRangeException(nameof(errorCase), errorCase, "Unknown request error."),
         };
         await using ApiFactory factory = CreateFactory(environment, store);
@@ -1185,7 +1304,7 @@ public sealed class ErrorContractTests
         await using ApiFactory factory = CreateFactory(environment, store);
         using HttpClient client = factory.CreateClient();
 
-        string key = errorCase == PageZeroCase ? RequestParameters.Page : "Age";
+        string key = errorCase == PageZeroCase ? ExpectedPageErrorsKey : "Age";
         using HttpResponseMessage response = errorCase switch
         {
             PageZeroCase => await client.GetAsync($"{TwoPageRecordsPath}?{RequestParameters.Page}=0"),
@@ -1198,7 +1317,7 @@ public sealed class ErrorContractTests
         string body = await response.Content.ReadAsStringAsync();
 
         JsonElement problem = AssertProblemDetails(response, body, HttpStatusCode.BadRequest);
-        Assert.Equal(ApiProblems.ValidationFailedDetail, StringMember(problem, "detail"));
+        Assert.Equal(ExpectedValidationFailedDetail, StringMember(problem, "detail"));
         AssertErrorMessages(problem, key);
         Assert.False(problem.TryGetProperty("writeOutcome", out _), "A 400 carries writeOutcome.");
         Assert.Empty(store.WriteCalls);
@@ -1219,7 +1338,7 @@ public sealed class ErrorContractTests
         string body = await response.Content.ReadAsStringAsync();
 
         JsonElement problem = AssertProblemDetails(response, body, HttpStatusCode.BadRequest);
-        Assert.Equal(ApiProblems.ValuesMustBeObjectDetail, StringMember(problem, "detail"));
+        Assert.Equal(ExpectedValuesMustBeObjectDetail, StringMember(problem, "detail"));
         Assert.False(problem.TryGetProperty("errors", out _), "A request-level 400 carries an errors map.");
         Assert.False(problem.TryGetProperty("writeOutcome", out _), "A 400 carries writeOutcome.");
         Assert.Empty(store.WriteCalls);
@@ -1255,11 +1374,11 @@ public sealed class ErrorContractTests
         string? detail = StringMember(problem, "detail");
         if (unavailable)
         {
-            Assert.Equal(ApiProblems.UnavailableDetail, detail);
+            Assert.Equal(ExpectedUnavailableDetail, detail);
         }
         else
         {
-            AssertUnexpectedDetail(detail, StringMember(problem, ApiProblems.TraceIdKey));
+            AssertUnexpectedDetail(detail, StringMember(problem, TraceIdMember));
         }
 
         Assert.False(
@@ -1301,19 +1420,19 @@ public sealed class ErrorContractTests
 
         HttpStatusCode status = unavailable ? HttpStatusCode.ServiceUnavailable : HttpStatusCode.InternalServerError;
         JsonElement problem = AssertProblemDetails(response, body, status);
-        Assert.Equal(outcome.ToWireValue(), StringMember(problem, "writeOutcome"));
+        Assert.Equal(ExpectedWireOutcome(outcome), StringMember(problem, "writeOutcome"));
         string? detail = StringMember(problem, "detail");
         if (unavailable)
         {
-            Assert.Equal(ApiProblems.UnavailableDetail, detail);
+            Assert.Equal(ExpectedUnavailableDetail, detail);
         }
         else
         {
-            AssertUnexpectedDetail(detail, StringMember(problem, ApiProblems.TraceIdKey));
+            AssertUnexpectedDetail(detail, StringMember(problem, TraceIdMember));
         }
 
         CapturedLogEntry line = AssertOneHandlerLine(factory, status);
-        Assert.Equal(outcome.ToWireValue(), StateValue(line, "WriteOutcome"));
+        Assert.Equal(ExpectedWireOutcome(outcome), StateValue(line, "WriteOutcome"));
         if (stage == FakeFailureStage.AfterWrite)
         {
             Assert.Equal(storeMethod, Assert.Single(store.WriteCalls).Method);
@@ -1346,9 +1465,9 @@ public sealed class ErrorContractTests
 
         HttpStatusCode status = unavailable ? HttpStatusCode.ServiceUnavailable : HttpStatusCode.InternalServerError;
         JsonElement problem = AssertProblemDetails(response, body, status);
-        Assert.Equal(WriteOutcomeExtensions.WireNotWritten, StringMember(problem, "writeOutcome"));
+        Assert.Equal(ExpectedNotWritten, StringMember(problem, "writeOutcome"));
         CapturedLogEntry line = AssertOneHandlerLine(factory, status);
-        Assert.Equal(WriteOutcomeExtensions.WireNotWritten, StateValue(line, "WriteOutcome"));
+        Assert.Equal(ExpectedNotWritten, StateValue(line, "WriteOutcome"));
         Assert.Empty(store.WriteCalls);
         Assert.DoesNotContain(store.Calls, call => call.Method == nameof(IDataStore.InsertAsync));
         AssertRedacted(factory, body, storeSentinel, valueSentinel, failure.Message);
@@ -1456,8 +1575,8 @@ public sealed class ErrorContractTests
         else
         {
             JsonElement problem = AssertProblemDetails(response, body, HttpStatusCode.BadRequest);
-            string message = Assert.Single(AssertErrorMessages(problem, RequestParameters.Page));
-            Assert.Equal(RequestParameters.IntegerExpectedMessage, message);
+            string message = Assert.Single(AssertErrorMessages(problem, ExpectedPageErrorsKey));
+            Assert.Equal(ExpectedIntegerExpectedMessage, message);
         }
 
         AssertRedacted(factory, body, querySentinel, storeSentinel, failure.Message);
@@ -1531,7 +1650,7 @@ public sealed class ErrorContractTests
         if (placement == FailingInsertPlacement)
         {
             JsonElement problem = AssertProblemDetails(response, body, HttpStatusCode.InternalServerError);
-            Assert.Equal(WriteOutcomeExtensions.WireUnknown, StringMember(problem, "writeOutcome"));
+            Assert.Equal(ExpectedUnknown, StringMember(problem, "writeOutcome"));
             AssertOneHandlerLine(factory, HttpStatusCode.InternalServerError);
         }
         else
@@ -1561,7 +1680,7 @@ public sealed class ErrorContractTests
         string listBody = await list.Content.ReadAsStringAsync();
         AssertRefusedConnectionIsUnavailable(factory, list);
         JsonElement listProblem = AssertProblemDetails(list, listBody, HttpStatusCode.ServiceUnavailable);
-        Assert.Equal(ApiProblems.UnavailableDetail, StringMember(listProblem, "detail"));
+        Assert.Equal(ExpectedUnavailableDetail, StringMember(listProblem, "detail"));
         Assert.False(listProblem.TryGetProperty("writeOutcome", out _), "The forms list 503 carries writeOutcome.");
 
         using HttpResponseMessage create = await ApiTestClient.PostJsonAsync(
@@ -1571,8 +1690,8 @@ public sealed class ErrorContractTests
         string createBody = await create.Content.ReadAsStringAsync();
         AssertRefusedConnectionIsUnavailable(factory, create);
         JsonElement createProblem = AssertProblemDetails(create, createBody, HttpStatusCode.ServiceUnavailable);
-        Assert.Equal(ApiProblems.UnavailableDetail, StringMember(createProblem, "detail"));
-        Assert.Equal(WriteOutcomeExtensions.WireNotWritten, StringMember(createProblem, "writeOutcome"));
+        Assert.Equal(ExpectedUnavailableDetail, StringMember(createProblem, "detail"));
+        Assert.Equal(ExpectedNotWritten, StringMember(createProblem, "writeOutcome"));
 
         Assert.Equal(2, factory.Logs.Find(entry => entry.Category == HandlerCategory).Count);
         AssertRedacted(
@@ -1604,7 +1723,7 @@ public sealed class ErrorContractTests
         string body = await response.Content.ReadAsStringAsync();
 
         JsonElement problem = AssertProblemDetails(response, body, HttpStatusCode.InternalServerError);
-        AssertUnexpectedDetail(StringMember(problem, "detail"), StringMember(problem, ApiProblems.TraceIdKey));
+        AssertUnexpectedDetail(StringMember(problem, "detail"), StringMember(problem, TraceIdMember));
         CapturedLogEntry line = AssertOneHandlerLine(factory, HttpStatusCode.InternalServerError);
         Assert.Null(line.ExceptionType);
         Assert.Null(line.ExceptionMessage);
@@ -1634,7 +1753,7 @@ public sealed class ErrorContractTests
         {
             JsonProperty member = Assert.Single(document.RootElement.EnumerateObject());
             Assert.Equal("status", member.Name);
-            Assert.Equal(HealthResponse.UnhealthyStatus, member.Value.GetString());
+            Assert.Equal(ExpectedUnhealthyStatus, member.Value.GetString());
         }
 
         Assert.True(
@@ -1770,7 +1889,7 @@ public sealed class ErrorContractTests
                 Assert.Equal(status, problemContext.ProblemDetails.Status);
                 return (
                     problemContext.ProblemDetails.Detail,
-                    problemContext.ProblemDetails.Extensions.TryGetValue(ApiProblems.TraceIdKey, out object? traceId)
+                    problemContext.ProblemDetails.Extensions.TryGetValue(TraceIdMember, out object? traceId)
                         ? traceId as string
                         : null);
 
@@ -1781,7 +1900,7 @@ public sealed class ErrorContractTests
                 Assert.Equal(status, context.Response.StatusCode);
                 Assert.Equal(ProblemMediaType, context.Response.ContentType);
                 JsonElement problem = ApiTestClient.AssertProblemDetails(Parse(body), status);
-                return (StringMember(problem, "detail"), StringMember(problem, ApiProblems.TraceIdKey));
+                return (StringMember(problem, "detail"), StringMember(problem, TraceIdMember));
 
             default:
                 throw new ArgumentOutOfRangeException(nameof(path), path, "Unknown status-only path.");
@@ -1827,7 +1946,7 @@ public sealed class ErrorContractTests
             string.Equals(ApiProblems.UnexpectedDetailFor(traceId), detail, StringComparison.Ordinal),
             "The 500 detail is not the generic sentence plus the body's traceId.");
         Assert.True(
-            detail is not null && detail.StartsWith(ApiProblems.UnexpectedDetail, StringComparison.Ordinal),
+            detail is not null && detail.StartsWith(ExpectedUnexpectedSentence, StringComparison.Ordinal),
             "The 500 detail does not open with the generic sentence.");
     }
 
@@ -1852,6 +1971,15 @@ public sealed class ErrorContractTests
             ? value.GetString()
             : null;
 
+    // The writeOutcome wire value of each outcome, from the literals above rather than the product's own mapping.
+    private static string ExpectedWireOutcome(WriteOutcome outcome) => outcome switch
+    {
+        WriteOutcome.NotWritten => ExpectedNotWritten,
+        WriteOutcome.Unknown => ExpectedUnknown,
+        WriteOutcome.Written => ExpectedWritten,
+        _ => throw new ArgumentOutOfRangeException(nameof(outcome), outcome, "Not a write outcome."),
+    };
+
     // The method and path of a body route; the update route gets a freshly seeded active record.
     private static (HttpMethod Method, string Path) ResolveRoute(FakeDataStore store, string route) => route switch
     {
@@ -1862,9 +1990,11 @@ public sealed class ErrorContractTests
         _ => throw new ArgumentOutOfRangeException(nameof(route), route, "Unknown body route."),
     };
 
-    // Sends body as application/json exactly as framing says, and returns the status, media type and body text.
+    // Sends body as application/json exactly as framing says, and returns the status, media type and body text: the
+    // TestServer framings through the factory's in-memory client, the Kestrel framings as raw HTTP/1.1 over a socket to
+    // the address the factory's Kestrel bound.
     private static async Task<(int Status, string? MediaType, string Body)> SendBodyAsync(
-        ErrorPipelineHost host,
+        ApiFactoryBase factory,
         HttpMethod method,
         string path,
         string framing,
@@ -1877,7 +2007,7 @@ public sealed class ErrorContractTests
                 ? new UnknownLengthContent(bytes)
                 : new ByteArrayContent(bytes);
             content.Headers.ContentType = new(ApiTestClient.JsonMediaType);
-            using var client = host.CreateClient();
+            using var client = factory.CreateClient();
             using var request = new HttpRequestMessage(method, path) { Content = content };
             using var response = await client.SendAsync(request);
             return (
@@ -1912,8 +2042,14 @@ public sealed class ErrorContractTests
             raw.Append(CultureInfo.InvariantCulture, $"Content-Length: {bytes.Length}\r\n\r\n").Append(body);
         }
 
-        var exchange = await host.SendRawAsync(raw.ToString());
-        Assert.False(exchange.ConnectionReset, exchange.Response);
+        var address = factory is KestrelApiFactory kestrel
+            ? kestrel.BaseAddress
+            : throw new InvalidOperationException("Raw HTTP needs the Kestrel host.");
+        var label = $"{method.Method} {path} ({framing})";
+        var exchange = await RawHttp.SendAsync(address, raw.ToString(), label, HostedWait);
+        Assert.False(
+            exchange.ConnectionReset,
+            $"The connection of {label} ended with a reset instead of an orderly close.");
         return ParseRawResponse(exchange.Response);
     }
 
@@ -1921,19 +2057,24 @@ public sealed class ErrorContractTests
     private static (int Status, string? MediaType, string Body) ParseRawResponse(string response)
     {
         var headEnd = response.IndexOf("\r\n\r\n", StringComparison.Ordinal);
-        Assert.True(headEnd > 0, $"The response has no complete head: {response}");
+        Assert.True(headEnd > 0, "The raw response has no complete head.");
 
+        // Parsed without int.Parse, whose FormatException quotes the text it rejects.
         var lines = response[..headEnd].Split("\r\n");
         var statusLine = lines[0].Split(' ', 3);
-        Assert.True(statusLine.Length >= 2 && statusLine[0] == "HTTP/1.1", $"Unexpected status line: {lines[0]}");
-        var status = int.Parse(statusLine[1], NumberStyles.None, CultureInfo.InvariantCulture);
+        var status = 0;
+        Assert.True(
+            statusLine.Length >= 2
+            && statusLine[0] == "HTTP/1.1"
+            && int.TryParse(statusLine[1], NumberStyles.None, CultureInfo.InvariantCulture, out status),
+            "The raw response's status line is not HTTP/1.1 followed by a status code.");
 
         string? mediaType = null;
         var chunked = false;
         foreach (var line in lines.Skip(1))
         {
             var colon = line.IndexOf(':', StringComparison.Ordinal);
-            Assert.True(colon > 0, $"Malformed response header: {line}");
+            Assert.True(colon > 0, "A raw response header line has no name before a colon.");
             var name = line[..colon].Trim();
             var value = line[(colon + 1)..].Trim();
             if (name.Equals("Content-Type", StringComparison.OrdinalIgnoreCase))
@@ -1958,17 +2099,23 @@ public sealed class ErrorContractTests
         while (true)
         {
             var sizeEnd = body.IndexOf("\r\n", index, StringComparison.Ordinal);
-            Assert.True(sizeEnd >= 0, $"The chunked body ends before its last chunk: {body}");
-            var size = int.Parse(
-                body.AsSpan(index, sizeEnd - index),
-                NumberStyles.AllowHexSpecifier,
-                CultureInfo.InvariantCulture);
+            Assert.True(sizeEnd >= 0, "The chunked body ends before its last chunk.");
+            Assert.True(
+                int.TryParse(
+                    body.AsSpan(index, sizeEnd - index),
+                    NumberStyles.AllowHexSpecifier,
+                    CultureInfo.InvariantCulture,
+                    out var size),
+                "A chunk of the raw response has no hexadecimal size line.");
             if (size == 0)
             {
                 return payload.ToString();
             }
 
-            Assert.True(sizeEnd + 2 + size <= body.Length, $"A chunk is cut short: {body}");
+            Assert.True(
+                size > 0 && (long)sizeEnd + 2 + size + 2 <= body.Length
+                && body.AsSpan(sizeEnd + 2 + size, 2).SequenceEqual("\r\n"),
+                "A chunk of the raw response is cut short or not ended by CRLF.");
             payload.Append(body, sizeEnd + 2, size);
             index = sizeEnd + 2 + size + 2;
         }
@@ -2013,8 +2160,8 @@ public sealed class ErrorContractTests
     }
 
     // Sends a GET for path over a new TCP connection to the Kestrel listener, signals received once the response text
-    // holds expected, and reads until the server ends the connection, by a close or a reset. Returns every byte
-    // received, as text.
+    // holds expected, and reads until the server ends the connection, by a close or a reset, within HostedWait.
+    // Returns every byte received, as text.
     private static async Task<string> GetRawUntilClosedAsync(
         ErrorPipelineHost host,
         string path,
@@ -2022,33 +2169,38 @@ public sealed class ErrorContractTests
         TaskCompletionSource received)
     {
         var address = host.Address ?? throw new InvalidOperationException("Raw HTTP needs the Kestrel host.");
-        using var timeout = new CancellationTokenSource(HostedWait);
-        using var tcp = new TcpClient();
-        await tcp.ConnectAsync(address.Host, address.Port, timeout.Token);
-        var stream = tcp.GetStream();
         var request = "GET " + path + " HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
-        await stream.WriteAsync(Encoding.ASCII.GetBytes(request), timeout.Token);
-
-        var response = new StringBuilder();
-        var buffer = new byte[4096];
-        try
-        {
-            int read;
-            while ((read = await stream.ReadAsync(buffer, timeout.Token)) > 0)
+        var exchange = await RawHttp.SendAsync(
+            address,
+            request,
+            $"GET {path} (Kestrel, read until the connection ends)",
+            HostedWait,
+            onReceived: text =>
             {
-                response.Append(Encoding.UTF8.GetString(buffer, 0, read));
-                if (response.ToString().Contains(expected, StringComparison.Ordinal))
+                if (text.Contains(expected, StringComparison.Ordinal))
                 {
                     received.TrySetResult();
                 }
-            }
-        }
-        catch (IOException)
-        {
-            // An aborted connection can end with a reset; what arrived before it is the response.
-        }
+            });
 
-        return response.ToString();
+        // An aborted connection can end with a reset; what arrived before it is the response.
+        return exchange.Response;
+    }
+
+    // Accepts one connection on listener, sends partial, and then holds the connection open, neither finishing the
+    // response nor closing it, until stop is cancelled.
+    private static async Task StallAsync(TcpListener listener, string partial, CancellationToken stop)
+    {
+        try
+        {
+            using var connection = await listener.AcceptTcpClientAsync(stop);
+            await connection.GetStream().WriteAsync(Encoding.ASCII.GetBytes(partial), stop);
+            await Task.Delay(Timeout.Infinite, stop);
+        }
+        catch (OperationCanceledException) when (stop.IsCancellationRequested)
+        {
+            // The case is over; the connection was closed as it was disposed.
+        }
     }
 
     // Exactly one line for a client abort: the handler category's Information RequestAborted, with no exception
@@ -2097,7 +2249,7 @@ public sealed class ErrorContractTests
         Assert.Equal(expected, response.StatusCode);
         Assert.True(
             string.Equals(
-                ApiProblems.ProblemContentType,
+                ProblemMediaType,
                 response.Content.Headers.ContentType?.MediaType,
                 StringComparison.Ordinal),
             "The error response is not application/problem+json.");
@@ -2114,7 +2266,7 @@ public sealed class ErrorContractTests
         }
 
         ApiTestClient.AssertProblemDetails(problem, (int)expected);
-        foreach (string member in new[] { "type", "title", "detail", ApiProblems.TraceIdKey })
+        foreach (string member in new[] { "type", "title", "detail", TraceIdMember })
         {
             Assert.False(
                 string.IsNullOrWhiteSpace(StringMember(problem, member)),
@@ -2312,6 +2464,97 @@ public sealed class ErrorContractTests
             return false;
         }
     }
+
+    /// <summary>
+    /// The one raw HTTP/1.1 client of these cases: it sends a request byte for byte over a new TCP connection to an
+    /// IPv4 loopback listener and reads until the server ends the connection, so a case sees the exact framing, chunk
+    /// terminator included. One deadline bounds the connect, the write and every read.
+    /// </summary>
+    private static class RawHttp
+    {
+        /// <summary>
+        /// Sends <paramref name="request"/> to <paramref name="address"/> and reads until the server ends the
+        /// connection, by a close or a reset.
+        /// </summary>
+        /// <param name="address">The listener: <c>http://127.0.0.1</c> with the port it is bound to.</param>
+        /// <param name="request">The complete request, head and body; it should carry <c>Connection: close</c>.</param>
+        /// <param name="exchange">The request's method, path and framing, which the timeout failure names.</param>
+        /// <param name="timeout">The longest the exchange may take, from the connect to the connection's end.</param>
+        /// <param name="cancellationToken">Ends the exchange as a cancellation, never as a timeout failure.</param>
+        /// <param name="onReceived">Called after each read with every byte received so far, as text.</param>
+        /// <returns>
+        /// The raw response text, and whether the connection ended with a reset or I/O failure rather than an orderly
+        /// close.
+        /// </returns>
+        /// <exception cref="ArgumentException">
+        /// <paramref name="address"/> is not IPv4 loopback with a bound port.
+        /// </exception>
+        /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> was cancelled.</exception>
+        /// <exception cref="Xunit.Sdk.FailException">
+        /// The exchange outlived <paramref name="timeout"/>. The message names <paramref name="exchange"/> and the
+        /// timeout, never a byte received.
+        /// </exception>
+        public static async Task<RawExchange> SendAsync(
+            Uri address,
+            string request,
+            string exchange,
+            TimeSpan timeout,
+            CancellationToken cancellationToken = default,
+            Action<string>? onReceived = null)
+        {
+            ArgumentNullException.ThrowIfNull(address);
+            ArgumentNullException.ThrowIfNull(request);
+            if (!IPAddress.TryParse(address.Host, out var host)
+                || !IPAddress.Loopback.Equals(host)
+                || address.Port <= 0)
+            {
+                throw new ArgumentException(
+                    "Raw HTTP is sent only to an IPv4 loopback listener on its bound port.",
+                    nameof(address));
+            }
+
+            using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            deadline.CancelAfter(timeout);
+            using var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+            using var response = new MemoryStream();
+            var reset = false;
+            try
+            {
+                await socket.ConnectAsync(new IPEndPoint(host, address.Port), deadline.Token);
+                await using var stream = new NetworkStream(socket, ownsSocket: false);
+                await stream.WriteAsync(Encoding.ASCII.GetBytes(request), deadline.Token);
+
+                var buffer = new byte[4096];
+                try
+                {
+                    int read;
+                    while ((read = await stream.ReadAsync(buffer, deadline.Token)) > 0)
+                    {
+                        response.Write(buffer, 0, read);
+                        onReceived?.Invoke(Encoding.UTF8.GetString(response.GetBuffer(), 0, (int)response.Length));
+                    }
+                }
+                catch (IOException) when (!deadline.IsCancellationRequested)
+                {
+                    // An aborted connection can end with a reset; what arrived before it is the response.
+                    reset = true;
+                }
+            }
+            catch (Exception failure) when (
+                deadline.IsCancellationRequested
+                && failure is OperationCanceledException or IOException or SocketException)
+            {
+                // The caller's cancellation stays a cancellation. Only the deadline fails the case, with a message that
+                // names the request and never what the server sent.
+                cancellationToken.ThrowIfCancellationRequested();
+                Assert.Fail(string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"The raw HTTP/1.1 exchange {exchange} did not end within {timeout.TotalSeconds} s."));
+            }
+
+            return new RawExchange(Encoding.UTF8.GetString(response.ToArray()), reset);
+        }
+    }
 }
 
 /// <summary>
@@ -2413,7 +2656,7 @@ public sealed class RecordWriteOutcomeTests
         using var response = await SendAsync(host.Client, request);
 
         Assert.True(host.Seam.Fired, "The post-result failure seam never raised its failure.");
-        await AssertWriteProblemAsync(response, WriteOutcomeExtensions.WireWritten);
+        await AssertWriteProblemAsync(response, ErrorContractTests.ExpectedWritten);
         Assert.Equal(StoreWriteMethod(method), Assert.Single(store.WriteCalls).Method);
         AssertCommitted(store, request, before);
     }
@@ -2479,7 +2722,7 @@ public sealed class RecordWriteOutcomeTests
 
         using var response = await SendAsync(host.Client, request);
 
-        await AssertWriteProblemAsync(response, WriteOutcomeExtensions.WireUnknown);
+        await AssertWriteProblemAsync(response, ErrorContractTests.ExpectedUnknown);
         if (stage == FakeFailureStage.BeforeWrite)
         {
             Assert.Empty(store.WriteCalls);
@@ -2507,7 +2750,7 @@ public sealed class RecordWriteOutcomeTests
         using var response = await SendAsync(host.Client, request);
 
         Assert.True(host.Seam.Fired, "The post-result failure seam never raised its failure.");
-        await AssertWriteProblemAsync(response, WriteOutcomeExtensions.WireNotWritten);
+        await AssertWriteProblemAsync(response, ErrorContractTests.ExpectedNotWritten);
         Assert.Contains(store.Calls, call => call.Method == StoreWriteMethod(request.Method) && !call.IsWrite);
         Assert.Empty(store.WriteCalls);
         AssertSameRecords(before, store.GetRecords(request.ViewId));
@@ -2538,7 +2781,10 @@ public sealed class RecordWriteOutcomeTests
 
         using var response = await ApiTestClient.PutJsonAsync(host.Client, path, new { values = UpdatedValues() });
 
-        await AssertPlainProblemAsync(response, StatusCodes.Status409Conflict, ApiProblems.RecordDeletedDetail);
+        await AssertPlainProblemAsync(
+            response,
+            StatusCodes.Status409Conflict,
+            ErrorContractTests.ExpectedRecordDeletedDetail);
         Assert.Contains(store.Calls, call => call.Method == nameof(IDataStore.UpdateAsync) && !call.IsWrite);
         Assert.Empty(store.WriteCalls);
         AssertSameRecord(before, store.GetRecord(TwoPageViewId, created.GlobalRecordId));
@@ -2557,7 +2803,10 @@ public sealed class RecordWriteOutcomeTests
 
         using var response = await SendAsync(host.Client, request);
 
-        await AssertPlainProblemAsync(response, StatusCodes.Status404NotFound, ApiProblems.RecordNotFoundDetail);
+        await AssertPlainProblemAsync(
+            response,
+            StatusCodes.Status404NotFound,
+            ErrorContractTests.ExpectedRecordNotFoundDetail);
         Assert.Contains(store.Calls, call => call.Method == StoreWriteMethod(request.Method) && !call.IsWrite);
         Assert.Empty(store.WriteCalls);
         AssertSameRecords(before, store.GetRecords(request.ViewId));
@@ -2762,7 +3011,7 @@ public sealed class RecordWriteOutcomeTests
     {
         var body = await ReadProblemAsync(response, StatusCodes.Status500InternalServerError);
         Assert.StartsWith(
-            ApiProblems.UnexpectedDetail,
+            ErrorContractTests.ExpectedUnexpectedSentence,
             body.GetProperty("detail").GetString(),
             StringComparison.Ordinal);
         Assert.True(
@@ -2785,7 +3034,7 @@ public sealed class RecordWriteOutcomeTests
     private static async Task<JsonElement> ReadProblemAsync(HttpResponseMessage response, int status)
     {
         Assert.Equal(status, (int)response.StatusCode);
-        Assert.Equal(ApiProblems.ProblemContentType, response.Content.Headers.ContentType?.MediaType);
+        Assert.Equal(ErrorContractTests.ProblemMediaType, response.Content.Headers.ContentType?.MediaType);
         return ApiTestClient.AssertProblemDetails(await ApiTestClient.ReadJsonElementAsync(response), status);
     }
 
@@ -3135,7 +3384,8 @@ internal sealed record ErrorPipelineHostOptions
 }
 
 /// <summary>
-/// A host of the API's error pipeline for tests that need no database: the real <see cref="ApiExceptionHandler"/>,
+/// A host of the API's error pipeline for the tests that need a hook the real composition cannot be given, a failing
+/// JSON converter or an endpoint the API does not have, and no database: the real <see cref="ApiExceptionHandler"/>,
 /// its <see cref="ApiExceptionBoundaryMiddleware"/>, <see cref="ApiProblems.Customize"/>, the status-code pages of
 /// <see cref="ApiProblems.WriteStatusCodePageAsync"/>, the request <c>Host</c> guard, the request guards, endpoints and
 /// services, composed in the order <c>Program.cs</c> uses, over a <see cref="FakeDataStore"/>,
@@ -3145,10 +3395,20 @@ internal sealed record ErrorPipelineHostOptions
 /// <remarks>
 /// <para>
 /// The content root is <c>src/EpiInfo.Api</c>, so <c>appsettings.json</c> and <c>appsettings.{Environment}.json</c>
-/// supply the <c>Logging:LogLevel</c> filters and the body limit. Those committed filters govern the JSON console and
-/// the capture provider alike; the host changes no level, filter or console option, and the provider has no filter
-/// of its own, so it captures exactly what production emits. Only the Kestrel endpoint is overridden, to
-/// <c>http://127.0.0.1:0</c>, so a Kestrel host never binds the committed port.
+/// supply the <c>Logging:LogLevel</c> filters, the body limit and the listen endpoint. Those committed filters govern
+/// the JSON console and the capture provider alike; the host changes no level, filter or console option, and the
+/// provider has no filter of its own, so it captures exactly what production emits.
+/// </para>
+/// <para>
+/// The listener is held to the binding rule as <c>Program.cs</c> holds the API's. The committed endpoint is
+/// overridden to <c>http://127.0.0.1:0</c>, so a Kestrel host never binds the committed port, and
+/// <see cref="LoopbackBindingGuard.Validate"/> checks every effective listen setting before the host is built and
+/// again on the built configuration, on TestServer and on Kestrel. On Kestrel the server loads the fixed copy of the
+/// verified <c>Kestrel</c> section that <see cref="LoopbackBindingGuard.FreezeListenSettings"/> returns, with reload
+/// off, and applies the committed body cap. Once started, the address the server reports is checked without the
+/// guard's predicate: exactly one, an <c>http</c> URL whose host parses as the IPv4 <see cref="IPAddress.Loopback"/>,
+/// on a port other than 0. A host that fails to build, start or prove its address is disposed before the failure
+/// reaches the test.
 /// </para>
 /// <para>Each host is independent: create one per test and dispose it, so captured logs never mix.</para>
 /// </remarks>
@@ -3186,121 +3446,114 @@ internal sealed class ErrorPipelineHost : IAsyncDisposable
         options ??= new ErrorPipelineHostOptions();
         var store = options.Store ?? FakeDataStore.WithStandardForms();
         var logs = new CapturingLoggerProvider();
+        WebApplication? app = null;
+        var started = false;
+        try
+        {
+            var builder = WebApplication.CreateBuilder(new WebApplicationOptions
+            {
+                ContentRootPath = RepositoryPaths.ApiProjectDirectory,
+                EnvironmentName = options.EnvironmentName,
+            });
+            builder.Configuration.AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                [KestrelUrlKey] = EphemeralLoopbackUrl,
+            });
 
-        var builder = WebApplication.CreateBuilder(new WebApplicationOptions
-        {
-            ContentRootPath = RepositoryPaths.ApiProjectDirectory,
-            EnvironmentName = options.EnvironmentName,
-        });
-        builder.Configuration.AddInMemoryCollection(new Dictionary<string, string?>
-        {
-            [KestrelUrlKey] = EphemeralLoopbackUrl,
-        });
+            // As Program.cs does, on either server: every effective listen setting, from the committed files, the
+            // process environment and the override above alike, is checked before the host is built.
+            LoopbackBindingGuard.Validate(builder.Configuration);
 
-        if (options.UseKestrel)
-        {
-            // As Program.cs does: loading the Kestrel section binds endpoints, not limits.
-            builder.WebHost.ConfigureKestrel((context, kestrel) =>
-                kestrel.Limits.MaxRequestBodySize =
-                    ApiOptions.FromConfiguration(context.Configuration).MaxRequestBodySize);
+            if (options.UseKestrel)
+            {
+                // As Program.cs does: Kestrel loads the guard's frozen copy of the verified Kestrel section with reload
+                // off, the host's urls and ports keys are pinned to that copy, and, because loading the section binds
+                // endpoints and not limits, the body cap is applied from configuration here.
+                builder.WebHost.ConfigureKestrel((context, kestrel) =>
+                {
+                    kestrel.Configure(
+                        LoopbackBindingGuard.FreezeListenSettings(context.Configuration),
+                        reloadOnChange: false);
+                    kestrel.Limits.MaxRequestBodySize =
+                        ApiOptions.FromConfiguration(context.Configuration).MaxRequestBodySize;
+                });
+            }
+            else
+            {
+                builder.WebHost.UseTestServer();
+            }
+
+            // As Program.cs does, with the capture provider added beside the JSON console rather than in its place.
+            builder.Logging.ClearProviders();
+            builder.Logging.AddJsonConsole();
+            builder.Logging.AddProvider(logs);
+
+            var services = builder.Services;
+            services.AddSingleton(
+                provider => ApiOptions.FromConfiguration(provider.GetRequiredService<IConfiguration>()));
+            services.AddProblemDetails(problem => problem.CustomizeProblemDetails = ApiProblems.Customize);
+            services.AddExceptionHandler<ApiExceptionHandler>();
+            services.Configure<RouteHandlerOptions>(routing => routing.ThrowOnBadRequest = true);
+            services.AddApiJson();
+            if (options.ConfigureJson is { } configureJson)
+            {
+                services.ConfigureHttpJsonOptions(json => configureJson(json.SerializerOptions));
+            }
+
+            services.AddSingleton<IDataStore>(store);
+            services.AddSingleton<ICheckCodeEngine, CheckCodeEngine>();
+            services.AddSingleton(TimeProvider.System);
+            services.AddSingleton<SaveStampProvider>();
+            services.AddScoped<FormService>();
+            services.AddScoped<RecordService>();
+            services.AddScoped<FieldEventService>();
+
+            app = builder.Build();
+
+            // As Program.cs does: checked again on the built configuration, which holds the sources added during Build.
+            LoopbackBindingGuard.Validate(app.Configuration);
+
+            app.UseExceptionHandler();
+            app.UseApiExceptionBoundary();
+            app.UseStatusCodePages(ApiProblems.WriteStatusCodePageAsync);
+            app.UseLoopbackHostGuard();
+            app.UseRouting();
+            app.UseRequestBodyLimit();
+            app.UseJsonContentTypeGuard();
+
+            app.MapFormEndpoints();
+            app.MapRecordEndpoints();
+            app.MapCheckCodeEndpoints();
+            options.MapEndpoints?.Invoke(app);
+
+            await app.StartAsync();
+            started = true;
+
+            var address = options.UseKestrel ? VerifyLoopbackAddress(app) : null;
+            return new ErrorPipelineHost(app, logs, store, address);
         }
-        else
+        catch
         {
-            builder.WebHost.UseTestServer();
+            // A host that fails to build, start or prove its address is torn down before the failure reaches the test.
+            if (app is not null)
+            {
+                if (started)
+                {
+                    await app.StopAsync();
+                }
+
+                await app.DisposeAsync();
+            }
+
+            logs.Dispose();
+            throw;
         }
-
-        // As Program.cs does, with the capture provider added beside the JSON console rather than in its place.
-        builder.Logging.ClearProviders();
-        builder.Logging.AddJsonConsole();
-        builder.Logging.AddProvider(logs);
-
-        var services = builder.Services;
-        services.AddSingleton(provider => ApiOptions.FromConfiguration(provider.GetRequiredService<IConfiguration>()));
-        services.AddProblemDetails(problem => problem.CustomizeProblemDetails = ApiProblems.Customize);
-        services.AddExceptionHandler<ApiExceptionHandler>();
-        services.Configure<RouteHandlerOptions>(routing => routing.ThrowOnBadRequest = true);
-        services.AddApiJson();
-        if (options.ConfigureJson is { } configureJson)
-        {
-            services.ConfigureHttpJsonOptions(json => configureJson(json.SerializerOptions));
-        }
-
-        services.AddSingleton<IDataStore>(store);
-        services.AddSingleton<ICheckCodeEngine, CheckCodeEngine>();
-        services.AddSingleton(TimeProvider.System);
-        services.AddSingleton<SaveStampProvider>();
-        services.AddScoped<FormService>();
-        services.AddScoped<RecordService>();
-        services.AddScoped<FieldEventService>();
-
-        var app = builder.Build();
-
-        app.UseExceptionHandler();
-        app.UseApiExceptionBoundary();
-        app.UseStatusCodePages(ApiProblems.WriteStatusCodePageAsync);
-        app.UseLoopbackHostGuard();
-        app.UseRouting();
-        app.UseRequestBodyLimit();
-        app.UseJsonContentTypeGuard();
-
-        app.MapFormEndpoints();
-        app.MapRecordEndpoints();
-        app.MapCheckCodeEndpoints();
-        options.MapEndpoints?.Invoke(app);
-
-        await app.StartAsync();
-
-        Uri? address = null;
-        if (options.UseKestrel)
-        {
-            var addresses = app.Services.GetRequiredService<IServer>().Features.Get<IServerAddressesFeature>();
-            address = new Uri(Assert.Single(addresses?.Addresses ?? []));
-        }
-
-        return new ErrorPipelineHost(app, logs, store, address);
     }
 
     /// <summary>A client for the host: TestServer's own, or one addressed to the Kestrel listener.</summary>
     /// <returns>A client the caller disposes.</returns>
     public HttpClient CreateClient() =>
         Address is null ? App.GetTestClient() : new HttpClient { BaseAddress = Address };
-
-    /// <summary>
-    /// Sends <paramref name="request"/> byte for byte over a new TCP connection to the Kestrel listener and reads
-    /// until the server closes it, so a test can see the exact HTTP/1.1 framing, chunk terminator included.
-    /// </summary>
-    /// <param name="request">The complete request, head and body; it should carry <c>Connection: close</c>.</param>
-    /// <param name="cancellationToken">Ends the exchange.</param>
-    /// <returns>
-    /// The raw response text, and whether the connection ended with a reset or I/O failure rather than an orderly
-    /// close.
-    /// </returns>
-    /// <exception cref="InvalidOperationException">The host is not on Kestrel.</exception>
-    public async Task<RawExchange> SendRawAsync(string request, CancellationToken cancellationToken = default)
-    {
-        if (Address is null)
-        {
-            throw new InvalidOperationException("Raw HTTP needs the Kestrel host.");
-        }
-
-        using var tcp = new TcpClient();
-        await tcp.ConnectAsync(Address.Host, Address.Port, cancellationToken);
-        var stream = tcp.GetStream();
-        await stream.WriteAsync(Encoding.ASCII.GetBytes(request), cancellationToken);
-
-        using var received = new MemoryStream();
-        var reset = false;
-        try
-        {
-            await stream.CopyToAsync(received, cancellationToken);
-        }
-        catch (IOException)
-        {
-            reset = true;
-        }
-
-        return new RawExchange(Encoding.UTF8.GetString(received.ToArray()), reset);
-    }
 
     /// <inheritdoc />
     public async ValueTask DisposeAsync()
@@ -3309,9 +3562,27 @@ internal sealed class ErrorPipelineHost : IAsyncDisposable
         await App.DisposeAsync();
         Logs.Dispose();
     }
+
+    // The proof of the binding, made on the server's own report and without the guard's predicate: exactly one
+    // address, an http URL whose host parses as the IPv4 loopback address, on the port the operating system chose.
+    private static Uri VerifyLoopbackAddress(WebApplication app)
+    {
+        var feature = app.Services.GetRequiredService<IServer>().Features.Get<IServerAddressesFeature>();
+        var address = new Uri(Assert.Single(feature?.Addresses ?? []), UriKind.Absolute);
+        Assert.True(
+            string.Equals(Uri.UriSchemeHttp, address.Scheme, StringComparison.Ordinal),
+            "The Kestrel listener is not plain http.");
+        Assert.True(
+            IPAddress.TryParse(address.Host, out var host)
+            && host.AddressFamily == AddressFamily.InterNetwork
+            && host.Equals(IPAddress.Loopback),
+            "The Kestrel listener is not bound to the IPv4 loopback address 127.0.0.1.");
+        Assert.True(address.Port > 0, "The Kestrel listener reports no bound port.");
+        return address;
+    }
 }
 
-/// <summary>A raw HTTP/1.1 exchange with the Kestrel host.</summary>
+/// <summary>A raw HTTP/1.1 exchange with a Kestrel listener.</summary>
 /// <param name="Response">Every byte the server sent, as text.</param>
 /// <param name="ConnectionReset">Whether the connection ended with a reset or I/O failure.</param>
 internal sealed record RawExchange(string Response, bool ConnectionReset);

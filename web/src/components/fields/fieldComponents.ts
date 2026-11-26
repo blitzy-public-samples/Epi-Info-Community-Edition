@@ -35,6 +35,11 @@ export interface FieldComponentProps {
   onBlur?: () => void;
   /** Raises `FieldClick` on a checkbox or radio, after the value toggles. */
   onClick?: () => void;
+  /**
+   * LabelHeading and GroupSection only: the level of the field's heading. 3 at the page's
+   * top level, and 4 inside a group, whose own heading is level 3; defaults to 3.
+   */
+  headingLevel?: 3 | 4;
   /** GroupSection only: its members, already rendered by FieldRenderer. */
   children?: ReactNode;
 }

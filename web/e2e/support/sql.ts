@@ -141,6 +141,8 @@ const RESOURCE_PARAMETER = 'resource';
 const RESOURCE_LENGTH = 255;
 const GLOBAL_RECORD_ID_LENGTH = 255;
 const LAST_NAME_LENGTH = 4000;
+// RecStatus of an active record, bound as the column's smallint; the active set is RecStatus = 1 (C-16).
+const ACTIVE_REC_STATUS = 1;
 
 const ACQUIRE_STATEMENT =
   'DECLARE @rc int; ' +
@@ -234,9 +236,13 @@ export async function openSqlVerifier(): Promise<SqlVerifier> {
   return {
     async countRecords(form: SeededForm, includeDeleted: boolean): Promise<number> {
       assertSeededForm(form);
-      const filter = includeDeleted ? '' : ' WHERE [RecStatus] = 1';
       const result = await driverCall(VERIFIER_PART, `counting the records of ${form}`, () =>
-        pool.request().query<{ n: number }>(`SELECT COUNT(*) AS n FROM ${quoteTable(form)}${filter};`),
+        includeDeleted
+          ? pool.request().query<{ n: number }>(`SELECT COUNT(*) AS n FROM ${quoteTable(form)};`)
+          : pool
+              .request()
+              .input('recStatus', sql.SmallInt, ACTIVE_REC_STATUS)
+              .query<{ n: number }>(`SELECT COUNT(*) AS n FROM ${quoteTable(form)} WHERE [RecStatus] = @recStatus;`),
       );
       const row = result.recordset.at(0);
       if (row === undefined) {

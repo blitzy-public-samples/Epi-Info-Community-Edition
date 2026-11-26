@@ -1,12 +1,12 @@
 import { useMemo, useRef, type KeyboardEvent, type ReactNode } from 'react';
 import type { PageDefinition } from '../api/types';
 
-/** Id of a page's tab button; FormView uses it to switch pages from ValidationSummary. */
+/** Id of a page's tab button, which the page's tab panel names in `aria-labelledby`. */
 export function pageTabId(pageId: number): string {
   return `page-tab-${pageId}`;
 }
 
-/** Id of a page's tab panel. */
+/** Id of a page's tab panel, which the page's tab names in `aria-controls`. */
 export function pageTabPanelId(pageId: number): string {
   return `page-panel-${pageId}`;
 }
@@ -25,6 +25,7 @@ export interface PageTabsProps {
 }
 
 const DEFAULT_LABEL = 'Pages';
+const NO_PAGES_TEXT = 'This form has no pages.';
 
 function byPosition(a: PageDefinition, b: PageDefinition): number {
   return a.position - b.position || a.pageId - b.pageId;
@@ -44,6 +45,9 @@ function tabText(page: PageDefinition, index: number): string {
  * Every panel stays mounted and the inactive ones carry the native `hidden`
  * attribute, so each field's control exists exactly once across pages and the
  * editor's controlled values never remount when the page changes.
+ *
+ * A form with no pages gets no tablist and no panel, since a tablist without
+ * tabs names nothing; a status says the form has no pages instead.
  */
 export function PageTabs({
   pages,
@@ -54,6 +58,16 @@ export function PageTabs({
 }: PageTabsProps) {
   const orderedPages = useMemo(() => [...pages].sort(byPosition), [pages]);
   const tabRefs = useRef(new Map<number, HTMLButtonElement>());
+
+  if (orderedPages.length === 0) {
+    return (
+      <div className="page-tabs">
+        <div className="banner banner--info" role="status">
+          <p>{NO_PAGES_TEXT}</p>
+        </div>
+      </div>
+    );
+  }
 
   const selectedId =
     orderedPages.find((page) => page.pageId === selectedPageId)?.pageId ??

@@ -14,6 +14,7 @@ using EpiInfo.Domain.Forms;
 using EpiInfo.Domain.Metadata;
 using EpiInfo.Domain.Storage;
 using EpiInfo.Domain.Values;
+using EpiInfo.Tests.Shared;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Hosting.Server;
@@ -364,8 +365,12 @@ internal sealed class GuardPipelineHost : IAsyncDisposable
 /// </para>
 /// <para>
 /// The form's view id, its writable text field and the seeded record id come from <see cref="FakeForms.TwoPage"/> and
-/// the store, never from literals. Accepted cases write to <see cref="Store"/>; each test reads its write count before
-/// sending, and xUnit runs the tests of one class one at a time.
+/// the store, never from literals. Every valid body carries a marker of its own, <see cref="TestDatabase.NewMarker"/>,
+/// as its text, and an accepted case writes or finds only a record of its own: a create adds one, an update changes
+/// one seeded for it with another marker, and a search finds the one seeded for it with its text. No case writes the
+/// seeded <see cref="RecordId"/>, the target of every rejected <c>PUT</c>, so the 415 cases assert it unchanged; the
+/// 400 cases, whose bodies carry no text, assert that nothing is written. Each test reads the store's write count
+/// before sending, and xUnit runs the tests of one class one at a time.
 /// </para>
 /// </remarks>
 public sealed class MediaTypeFixture : IAsyncLifetime
@@ -399,12 +404,15 @@ public sealed class MediaTypeFixture : IAsyncLifetime
     /// <summary>The view id of <see cref="FakeForms.TwoPage"/>.</summary>
     public int ViewId { get; }
 
-    /// <summary>The <c>GlobalRecordId</c> of the seeded record, the target of every <c>PUT</c>.</summary>
+    /// <summary>
+    /// The <c>GlobalRecordId</c> of the seeded record, the target of every rejected <c>PUT</c> and of the
+    /// <c>PATCH</c>; no case writes it.
+    /// </summary>
     public string RecordId { get; }
 
     /// <summary>
-    /// A writable, page-bound <c>text</c> data field of the form with no length limit or pattern, so the value
-    /// <c>"x"</c> passes validation.
+    /// A writable, page-bound <c>text</c> data field of the form with no length limit or pattern, so a marker passes
+    /// validation.
     /// </summary>
     public string TextField { get; }
 
@@ -488,9 +496,21 @@ public sealed class MediaTypeTests : IClassFixture<MediaTypeFixture>
     private const string EmptyFieldEventEnvelope =
         """{"enabled":[],"disabled":[],"cleared":[],"assigned":{},"dialogs":[],"diagnostics":[]}""";
 
-    private const string SubmittedText = "x";
-
     private const string RecordPathFormat = "/api/forms/{0}/records/{1}";
+
+    // The wire contract written out here rather than read from ApiProblems, so a changed or swapped product text fails
+    // these cases instead of moving the expectation with it.
+    private const string ProblemMediaType = "application/problem+json";
+
+    private const string ExpectedUnsupportedMediaTypeDetail = "unsupported media type; use application/json";
+
+    private const string ExpectedMalformedJsonDetail = "malformed JSON";
+
+    private const string ExpectedRequestBodyRequiredDetail = "request body is required";
+
+    private const string ExpectedResourceNotFoundDetail = "the resource does not exist";
+
+    private const string ExpectedMethodNotAllowedDetail = "method not allowed";
 
     private static readonly BodyEndpoint[] AllEndpoints =
         [BodyEndpoint.Create, BodyEndpoint.Update, BodyEndpoint.Search, BodyEndpoint.FieldEvent];
@@ -609,6 +629,7 @@ public sealed class MediaTypeTests : IClassFixture<MediaTypeFixture>
         string? contentType,
         BodyShape shape)
     {
+        FakeRecordState seeded = SeededRecord();
         int writesBefore = _fixture.Store.WriteCalls.Count;
 
         using HttpRequestMessage request = CreateRequest(endpoint, shape, contentType);
@@ -617,8 +638,9 @@ public sealed class MediaTypeTests : IClassFixture<MediaTypeFixture>
         await AssertProblemAsync(
             response,
             HttpStatusCode.UnsupportedMediaType,
-            ApiProblems.UnsupportedMediaTypeDetail);
+            ExpectedUnsupportedMediaTypeDetail);
         Assert.Equal(writesBefore, _fixture.Store.WriteCalls.Count);
+        AssertSeededRecordUnchanged(seeded);
     }
 
     // Only one charset parameter, valued utf-8, is allowed: another charset, the misspelling utf8 (an unknown encoding
@@ -628,6 +650,7 @@ public sealed class MediaTypeTests : IClassFixture<MediaTypeFixture>
     [MemberData(nameof(RejectedParameterCases))]
     public async Task JsonWithAnyOtherParameterListIsUnsupported(BodyEndpoint endpoint, string contentType)
     {
+        FakeRecordState seeded = SeededRecord();
         int writesBefore = _fixture.Store.WriteCalls.Count;
 
         using HttpRequestMessage request = CreateRequest(endpoint, BodyShape.Valid, contentType);
@@ -636,18 +659,30 @@ public sealed class MediaTypeTests : IClassFixture<MediaTypeFixture>
         await AssertProblemAsync(
             response,
             HttpStatusCode.UnsupportedMediaType,
-            ApiProblems.UnsupportedMediaTypeDetail);
+            ExpectedUnsupportedMediaTypeDetail);
         Assert.Equal(writesBefore, _fixture.Store.WriteCalls.Count);
+        AssertSeededRecordUnchanged(seeded);
     }
 
     // Every accepted spelling reaches the handler and gets its exact success, so a 404 or 500 cannot pass as "not 415".
+    // Each row sends a marker of its own and writes or finds only a record of its own, so its result can come from its
+    // own request alone: the record it created holding its text, the record seeded for it with another marker now
+    // holding its text, or exactly the one record seeded with its text.
     [Theory]
     [MemberData(nameof(AcceptedMediaTypeCases))]
     public async Task JsonMediaTypeReachesTheHandler(BodyEndpoint endpoint, string contentType)
     {
+        string text = TestDatabase.NewMarker();
+        string recordId = endpoint switch
+        {
+            BodyEndpoint.Update => SeedRecordWithText(TestDatabase.NewMarker()),
+            BodyEndpoint.Search => SeedRecordWithText(text),
+            BodyEndpoint.Create or BodyEndpoint.FieldEvent => _fixture.RecordId,
+            _ => throw new ArgumentOutOfRangeException(nameof(endpoint), endpoint, "Not a body endpoint."),
+        };
         int writesBefore = _fixture.Store.WriteCalls.Count;
 
-        using HttpRequestMessage request = CreateRequest(endpoint, BodyShape.Valid, contentType);
+        using HttpRequestMessage request = CreateRequest(endpoint, BodyShape.Valid, contentType, text, recordId);
         using HttpResponseMessage response = await Client.SendAsync(request);
 
         HttpStatusCode expected = endpoint == BodyEndpoint.Create ? HttpStatusCode.Created : HttpStatusCode.OK;
@@ -658,17 +693,15 @@ public sealed class MediaTypeTests : IClassFixture<MediaTypeFixture>
         switch (endpoint)
         {
             case BodyEndpoint.Create:
-                string createdId = AssertRecordWithSubmittedText(body);
+                string createdId = AssertRecordWithSubmittedText(body, text);
                 Assert.Equal($"{RecordsPath()}/{createdId}", response.Headers.Location?.OriginalString);
-                Assert.Equal(
-                    FieldValue.FromText(SubmittedText),
-                    Assert.IsType<FakeRecordState>(_fixture.Store.GetRecord(_fixture.ViewId, createdId))
-                        .Values[_fixture.TextField]);
+                Assert.Equal(FieldValue.FromText(text), StoredText(createdId));
                 Assert.Equal(writesBefore + 1, _fixture.Store.WriteCalls.Count);
                 break;
 
             case BodyEndpoint.Update:
-                Assert.Equal(_fixture.RecordId, AssertRecordWithSubmittedText(body));
+                Assert.Equal(recordId, AssertRecordWithSubmittedText(body, text));
+                Assert.Equal(FieldValue.FromText(text), StoredText(recordId));
                 Assert.Equal(writesBefore + 1, _fixture.Store.WriteCalls.Count);
                 break;
 
@@ -676,9 +709,14 @@ public sealed class MediaTypeTests : IClassFixture<MediaTypeFixture>
                 Assert.Equal(
                     new[] { "items", "total", "truncated" },
                     body.EnumerateObject().Select(member => member.Name));
-                Assert.Equal(JsonValueKind.Array, body.GetProperty("items").ValueKind);
+                Assert.Equal(
+                    new[] { recordId },
+                    body.GetProperty("items")
+                        .EnumerateArray()
+                        .Select(item => item.GetProperty("globalRecordId").GetString()));
                 Assert.Equal(JsonValueKind.Number, body.GetProperty("total").ValueKind);
-                Assert.Contains(body.GetProperty("truncated").ValueKind, new[] { JsonValueKind.True, JsonValueKind.False });
+                Assert.Equal(1, body.GetProperty("total").GetInt32());
+                Assert.Equal(JsonValueKind.False, body.GetProperty("truncated").ValueKind);
                 Assert.Equal(writesBefore, _fixture.Store.WriteCalls.Count);
                 break;
 
@@ -702,11 +740,10 @@ public sealed class MediaTypeTests : IClassFixture<MediaTypeFixture>
     [MemberData(nameof(RequestLevelBodyCases))]
     public async Task MalformedAndEmptyJsonBodiesAreDistinctRequestLevel400s(BodyEndpoint endpoint, BodyShape shape)
     {
-        Assert.NotEqual(ApiProblems.MalformedJsonDetail, ApiProblems.RequestBodyRequiredDetail);
         string expectedDetail = shape switch
         {
-            BodyShape.Malformed => ApiProblems.MalformedJsonDetail,
-            BodyShape.Empty => ApiProblems.RequestBodyRequiredDetail,
+            BodyShape.Malformed => ExpectedMalformedJsonDetail,
+            BodyShape.Empty => ExpectedRequestBodyRequiredDetail,
             _ => throw new ArgumentOutOfRangeException(nameof(shape), shape, "Not a request-level 400 body."),
         };
         int writesBefore = _fixture.Store.WriteCalls.Count;
@@ -723,8 +760,8 @@ public sealed class MediaTypeTests : IClassFixture<MediaTypeFixture>
     // AAP 0.7.6: outside the four body endpoints the guard never answers, so a route miss stays 404 and a method the
     // record route does not map stays 405, each the framework's ProblemDetails, whatever the media type.
     [Theory]
-    [InlineData("POST", "/api/unknown", HttpStatusCode.NotFound, ApiProblems.ResourceNotFoundDetail)]
-    [InlineData("PATCH", RecordPathFormat, HttpStatusCode.MethodNotAllowed, ApiProblems.MethodNotAllowedDetail)]
+    [InlineData("POST", "/api/unknown", HttpStatusCode.NotFound, ExpectedResourceNotFoundDetail)]
+    [InlineData("PATCH", RecordPathFormat, HttpStatusCode.MethodNotAllowed, ExpectedMethodNotAllowedDetail)]
     public async Task OutsideTheBodyEndpointsRoutingKeepsItsStatus(
         string method,
         string pathFormat,
@@ -758,14 +795,14 @@ public sealed class MediaTypeTests : IClassFixture<MediaTypeFixture>
         HttpStatusCode expected)
     {
         GuardPipelineHost host = _fixture.GuardHost;
-        byte[] body = Encoding.UTF8.GetBytes(ValidBody(BodyEndpoint.Create));
+        byte[] body = Encoding.UTF8.GetBytes(ValidBody(BodyEndpoint.Create, TestDatabase.NewMarker()));
 
         using HttpRequestMessage request = CreateRequest(HttpMethod.Post, path, body, contentType);
         using HttpResponseMessage response = await host.Client.SendAsync(request);
 
         if (expected == HttpStatusCode.UnsupportedMediaType)
         {
-            await AssertProblemAsync(response, expected, ApiProblems.UnsupportedMediaTypeDetail);
+            await AssertProblemAsync(response, expected, ExpectedUnsupportedMediaTypeDetail);
             return;
         }
 
@@ -788,7 +825,8 @@ public sealed class MediaTypeTests : IClassFixture<MediaTypeFixture>
         var store = new FakeDataStore(FakeForms.TwoPage);
         await using GuardPipelineHost host = await GuardPipelineHost.StartAsync(GuardHostKind.TestServer, store);
         Assert.Equal(GuardHostKind.TestServer, host.Kind);
-        byte[] body = Encoding.UTF8.GetBytes(ValidBody(BodyEndpoint.Create));
+        string text = TestDatabase.NewMarker();
+        byte[] body = Encoding.UTF8.GetBytes(ValidBody(BodyEndpoint.Create, text));
 
         using (HttpRequestMessage rejected = CreateRequest(HttpMethod.Post, RecordsPath(), body, "text/plain"))
         using (HttpResponseMessage response = await host.Client.SendAsync(rejected))
@@ -796,7 +834,7 @@ public sealed class MediaTypeTests : IClassFixture<MediaTypeFixture>
             await AssertProblemAsync(
                 response,
                 HttpStatusCode.UnsupportedMediaType,
-                ApiProblems.UnsupportedMediaTypeDetail);
+                ExpectedUnsupportedMediaTypeDetail);
         }
 
         Assert.Empty(store.WriteCalls);
@@ -805,7 +843,7 @@ public sealed class MediaTypeTests : IClassFixture<MediaTypeFixture>
         using (HttpResponseMessage response = await host.Client.SendAsync(accepted))
         {
             Assert.Equal(HttpStatusCode.Created, response.StatusCode);
-            AssertRecordWithSubmittedText(await ApiTestClient.ReadJsonElementAsync(response));
+            AssertRecordWithSubmittedText(await ApiTestClient.ReadJsonElementAsync(response), text);
         }
 
         Assert.Single(store.WriteCalls);
@@ -814,7 +852,7 @@ public sealed class MediaTypeTests : IClassFixture<MediaTypeFixture>
         using (HttpResponseMessage response = await host.Client.SendAsync(quoted))
         {
             Assert.Equal(HttpStatusCode.Created, response.StatusCode);
-            AssertRecordWithSubmittedText(await ApiTestClient.ReadJsonElementAsync(response));
+            AssertRecordWithSubmittedText(await ApiTestClient.ReadJsonElementAsync(response), text);
         }
 
         Assert.Equal(2, store.WriteCalls.Count);
@@ -856,7 +894,7 @@ public sealed class MediaTypeTests : IClassFixture<MediaTypeFixture>
     private static async Task AssertProblemAsync(HttpResponseMessage response, HttpStatusCode status, string detail)
     {
         Assert.Equal(status, response.StatusCode);
-        Assert.Equal(ApiProblems.ProblemContentType, response.Content.Headers.ContentType?.MediaType);
+        Assert.Equal(ProblemMediaType, response.Content.Headers.ContentType?.MediaType);
         JsonElement body = ApiTestClient.AssertProblemDetails(
             await ApiTestClient.ReadJsonElementAsync(response),
             (int)status);
@@ -864,47 +902,88 @@ public sealed class MediaTypeTests : IClassFixture<MediaTypeFixture>
         Assert.False(body.TryGetProperty("errors", out _), "A request-level problem carries no errors member.");
     }
 
+    // The record's state now equals its state before: the same status, values, page rows and stamps.
+    private static void AssertSameRecordState(FakeRecordState before, FakeRecordState after)
+    {
+        Assert.Equal(before.RecStatus, after.RecStatus);
+        Assert.Equal(before.Values, after.Values);
+        Assert.True(before.PresentPageIds.SetEquals(after.PresentPageIds), "The record's page rows changed.");
+        Assert.Equal(before.FirstSave, after.FirstSave);
+        Assert.Equal(before.LastSave, after.LastSave);
+    }
+
     // A Record DTO whose text field holds the submitted text; returns its globalRecordId.
-    private string AssertRecordWithSubmittedText(JsonElement body)
+    private string AssertRecordWithSubmittedText(JsonElement body, string submittedText)
     {
         Assert.Equal(JsonValueKind.Object, body.ValueKind);
         string? id = body.GetProperty("globalRecordId").GetString();
         Assert.False(string.IsNullOrEmpty(id));
-        Assert.Equal(SubmittedText, body.GetProperty("values").GetProperty(_fixture.TextField).GetString());
+        Assert.Equal(submittedText, body.GetProperty("values").GetProperty(_fixture.TextField).GetString());
         return id;
     }
 
-    // The method, path and valid JSON body of each body endpoint, built from the fixture's form, record and text
-    // field. Update sends the create body to the seeded record.
-    private (HttpMethod Method, string Path, string ValidBody) Describe(BodyEndpoint endpoint) => endpoint switch
-    {
-        BodyEndpoint.Create => (HttpMethod.Post, RecordsPath(), ValidBody(endpoint)),
-        BodyEndpoint.Update => (HttpMethod.Put, RecordPath(), ValidBody(endpoint)),
-        BodyEndpoint.Search => (HttpMethod.Post, $"{RecordsPath()}/search", ValidBody(endpoint)),
-        BodyEndpoint.FieldEvent => (
-            HttpMethod.Post,
-            string.Create(CultureInfo.InvariantCulture, $"/api/forms/{_fixture.ViewId}/checkcode/field-event"),
-            ValidBody(endpoint)),
-        _ => throw new ArgumentOutOfRangeException(nameof(endpoint), endpoint, "Not a body endpoint."),
-    };
+    // The seeded record as the store holds it now; reading it logs no store call.
+    private FakeRecordState SeededRecord() =>
+        Assert.IsType<FakeRecordState>(_fixture.Store.GetRecord(_fixture.ViewId, _fixture.RecordId));
 
-    // The field name is JSON-encoded, so the bodies stay valid JSON whatever the form names its field.
-    private string ValidBody(BodyEndpoint endpoint)
+    // A rejected request left the seeded record, its target, as it was.
+    private void AssertSeededRecordUnchanged(FakeRecordState before) => AssertSameRecordState(before, SeededRecord());
+
+    // Adds an active record with every page row whose text field holds text, as a seeded row; no call is logged.
+    private string SeedRecordWithText(string text) => _fixture.Store.SeedRecord(
+        _fixture.ViewId,
+        new Dictionary<string, FieldValue> { [_fixture.TextField] = FieldValue.FromText(text) });
+
+    // The value the store holds in the text field of the record.
+    private FieldValue StoredText(string recordId) =>
+        Assert.IsType<FakeRecordState>(_fixture.Store.GetRecord(_fixture.ViewId, recordId)).Values[_fixture.TextField];
+
+    // The method, path and valid JSON body of each body endpoint, built from the fixture's form and text field, the
+    // text the body submits or searches for, and the record an update targets, which the other endpoints ignore.
+    // Update sends the create body to that record.
+    private (HttpMethod Method, string Path, string ValidBody) Describe(
+        BodyEndpoint endpoint,
+        string text,
+        string recordId) =>
+        endpoint switch
+        {
+            BodyEndpoint.Create => (HttpMethod.Post, RecordsPath(), ValidBody(endpoint, text)),
+            BodyEndpoint.Update => (HttpMethod.Put, RecordPath(recordId), ValidBody(endpoint, text)),
+            BodyEndpoint.Search => (HttpMethod.Post, $"{RecordsPath()}/search", ValidBody(endpoint, text)),
+            BodyEndpoint.FieldEvent => (
+                HttpMethod.Post,
+                string.Create(CultureInfo.InvariantCulture, $"/api/forms/{_fixture.ViewId}/checkcode/field-event"),
+                ValidBody(endpoint, text)),
+            _ => throw new ArgumentOutOfRangeException(nameof(endpoint), endpoint, "Not a body endpoint."),
+        };
+
+    // The field name and the text are JSON-encoded, so the bodies stay valid JSON whatever the form names its field.
+    private string ValidBody(BodyEndpoint endpoint, string text)
     {
         string field = JsonEncodedText.Encode(_fixture.TextField).Value;
-        string values = $$"""{"{{field}}":"{{SubmittedText}}"}""";
+        string value = JsonEncodedText.Encode(text).Value;
+        string values = $$"""{"{{field}}":"{{value}}"}""";
         return endpoint switch
         {
             BodyEndpoint.Create or BodyEndpoint.Update => $$"""{"values":{{values}}}""",
-            BodyEndpoint.Search => $$"""{"criteria":[{"field":"{{field}}","value":"{{SubmittedText}}"}]}""",
+            BodyEndpoint.Search => $$"""{"criteria":[{"field":"{{field}}","value":"{{value}}"}]}""",
             BodyEndpoint.FieldEvent => $$"""{"event":"FieldAfter","fieldName":"{{field}}","values":{{values}}}""",
             _ => throw new ArgumentOutOfRangeException(nameof(endpoint), endpoint, "Not a body endpoint."),
         };
     }
 
-    private HttpRequestMessage CreateRequest(BodyEndpoint endpoint, BodyShape shape, string? contentType)
+    // A rejected case's request: a marker of its own as the text, and the seeded record as the update's target.
+    private HttpRequestMessage CreateRequest(BodyEndpoint endpoint, BodyShape shape, string? contentType) =>
+        CreateRequest(endpoint, shape, contentType, TestDatabase.NewMarker(), _fixture.RecordId);
+
+    private HttpRequestMessage CreateRequest(
+        BodyEndpoint endpoint,
+        BodyShape shape,
+        string? contentType,
+        string text,
+        string recordId)
     {
-        (HttpMethod method, string path, string validBody) = Describe(endpoint);
+        (HttpMethod method, string path, string validBody) = Describe(endpoint, text, recordId);
 
         byte[] body = shape switch
         {
@@ -920,9 +999,9 @@ public sealed class MediaTypeTests : IClassFixture<MediaTypeFixture>
     private string RecordsPath() =>
         string.Create(CultureInfo.InvariantCulture, $"/api/forms/{_fixture.ViewId}/records");
 
-    private string RecordPath() => string.Format(
+    private string RecordPath(string recordId) => string.Format(
         CultureInfo.InvariantCulture,
         RecordPathFormat,
         _fixture.ViewId,
-        Uri.EscapeDataString(_fixture.RecordId));
+        Uri.EscapeDataString(recordId));
 }

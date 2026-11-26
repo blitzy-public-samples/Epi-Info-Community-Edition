@@ -5,8 +5,9 @@
  * names, and checks what each action stored through read-only SQL (`support/sql.ts`). Through the UI it creates,
  * edits and deletes only its own CaseReport record, marked in LastName; seeded records are opened and stepped
  * through without touching a field, so no save can reach them, and its last step leaves a FoodHistory draft unsaved.
- * The exclusive test lock is held for the whole test, so no .NET integration test writes while it counts and places
- * records, and the positions it expects come from SQL counts at run time.
+ * The exclusive test lock is held for the whole workflow, so no .NET integration test writes while it counts and places
+ * records, and the positions it expects come from SQL counts at run time. Before it waits for that lock, it checks,
+ * without a database, that `support/connection.ts` reads connection settings as SqlClient does.
  *
  * Locators use roles, accessible names and labels as `web/src` renders them. A name is matched exactly wherever it
  * is a prefix of another ("Save" and "Save again", "Delete" and "Delete record", "New" and "New record").
@@ -23,16 +24,21 @@ import {
   type Page,
   type Response as PlaywrightResponse,
 } from '@playwright/test';
+import type { config as MssqlConfig } from 'mssql';
 
 import {
   CONNECTION_STRING_VARIABLE,
   PASSWORD_VARIABLE,
   SQL_HOST_VARIABLE,
+  TestDatabaseConfigurationError,
   hasDatabaseSettings,
+  resolveConnectionString,
+  toMssqlConfig,
 } from './support/connection';
 import {
   acquireExclusiveTestLock,
   openSqlVerifier,
+  type ExclusiveTestLock,
   type PageTable,
   type SeededForm,
   type SqlVerifier,
@@ -66,7 +72,6 @@ const RECORD_PATH = /^\/api\/forms\/\d+\/records\/([^/]+)$/;
 const RECORD_AT_PATH = /^\/api\/forms\/\d+\/records\/at\/\d+$/;
 const SEARCH_PATH = /^\/api\/forms\/\d+\/records\/search$/;
 const FIELD_EVENT_PATH_SUFFIX = '/checkcode/field-event';
-const WRITE_METHODS: ReadonlySet<string> = new Set(['POST', 'PUT', 'DELETE']);
 
 type ActionName = 'Back to forms' | 'Save' | 'Delete' | 'Find';
 type NavigatorButtonName = 'First' | 'Previous' | 'Next' | 'Last' | 'New';
@@ -93,6 +98,42 @@ interface Traffic {
   /** Ends the clean-load window; later requests are no longer added to `loadWindow`. */
   endLoadWindow(): void;
 }
+
+/**
+ * A setting the parity step appends to the configured connection string, and how SqlClient 5.2.3, which the API and
+ * the .NET tests connect with, reads it: the verifier options it changes, where `undefined` unsets one and `{}`
+ * changes none, or a refusal whose message must not repeat `withheld`, the setting's value or unknown keyword.
+ */
+interface ConnectionSettingCase {
+  readonly setting: string;
+  readonly reads: { readonly changes: Partial<NonNullable<MssqlConfig['options']>> } | { readonly withheld: string };
+}
+
+// A DNS alias the server certificate would have to name; it is never resolved.
+const CERTIFICATE_ALIAS = 'sql-alias.example.test';
+
+// SqlClient 5.2.3's readings, recorded from SqlConnectionStringBuilder and SqlConnection, never from toMssqlConfig.
+// No value here is a credential, and the certificate path is never opened.
+const CONNECTION_SETTING_CASES: readonly ConnectionSettingCase[] = [
+  { setting: `HostNameInCertificate=${CERTIFICATE_ALIAS}`, reads: { changes: { serverName: CERTIFICATE_ALIAS } } },
+  { setting: `Host Name In Certificate=${CERTIFICATE_ALIAS}`, reads: { changes: { serverName: CERTIFICATE_ALIAS } } },
+  {
+    setting: `HostNameInCertificate=${CERTIFICATE_ALIAS};HostNameInCertificate=`,
+    reads: { changes: { serverName: undefined } },
+  },
+  { setting: 'MultiSubnetFailover=True', reads: { changes: { multiSubnetFailover: true } } },
+  { setting: 'Integrated Security=False', reads: { changes: {} } },
+  { setting: 'Authentication=SqlPassword', reads: { changes: {} } },
+  { setting: 'ApplicationIntent=ReadWrite', reads: { changes: {} } },
+  { setting: 'IP Address Preference=IPv4First', reads: { changes: {} } },
+  { setting: 'Application Name=smoke', reads: { changes: {} } },
+  { setting: 'Integrated Security=SSPI', reads: { withheld: 'SSPI' } },
+  { setting: 'ApplicationIntent=ReadOnly', reads: { withheld: 'ReadOnly' } },
+  { setting: 'Server Certificate=/certs/sql-alias.cer', reads: { withheld: '/certs/sql-alias.cer' } },
+  { setting: 'IP Address Preference=IPv6First', reads: { withheld: 'IPv6First' } },
+  { setting: 'Network Library=dbmssocn', reads: { withheld: 'dbmssocn' } },
+  { setting: 'SmokeUnknownKeyword=1', reads: { withheld: 'SmokeUnknownKeyword' } },
+];
 
 /** The parts of scenario EC-AGE-01 the browser step enters and checks. */
 interface AgeScenario {
@@ -262,6 +303,21 @@ function recordTraffic(page: Page): Traffic {
   };
 }
 
+/**
+ * DATA-01 in the browser: ends the clean-load window and checks every request it recorded, from the first
+ * navigation through the seeded records' loads and steps, the second CaseReport load and New. Each must be a GET
+ * and none may raise a field event. Call it immediately before the first deliberate edit.
+ */
+function assertCleanLoad(traffic: Traffic): void {
+  traffic.endLoadWindow();
+  const offending = traffic.loadWindow
+    .filter((sent) => sent.method !== 'GET' || sent.path.endsWith(FIELD_EVENT_PATH_SUFFIX))
+    .map((sent) => `${sent.method} ${sent.path}`);
+  expect(offending, 'requests other than a GET, or raising a field event, before the first edit').toEqual([]);
+  const positionReads = traffic.loadWindow.filter((sent) => sent.method === 'GET' && RECORD_AT_PATH.test(sent.path));
+  expect(positionReads.length, 'records read by position before the first edit').toBeGreaterThanOrEqual(4);
+}
+
 function formButton(page: Page, form: SeededForm): Locator {
   // The button text starts with the form name, then its page count: "FoodHistory — 2 pages".
   return page.getByRole('button', { name: new RegExp(`^${form}\\b`) });
@@ -352,6 +408,100 @@ async function checkHealthAndForms(request: APIRequestContext): Promise<void> {
   }
 }
 
+/** The paths at which two plain values differ, so that comparing configurations never prints one. */
+function differingPaths(actual: unknown, expected: unknown, path: string): string[] {
+  if (isObject(actual) && isObject(expected)) {
+    const keys = new Set([...Object.keys(actual), ...Object.keys(expected)]);
+    return [...keys].flatMap((key) => differingPaths(actual[key], expected[key], `${path}.${key}`));
+  }
+  return Object.is(actual, expected) ? [] : [path];
+}
+
+/** {@link toMssqlConfig} of `base` with `setting` appended, or the configuration error it throws. */
+function configWith(base: string, setting: string): MssqlConfig | TestDatabaseConfigurationError {
+  try {
+    return toMssqlConfig(`${base};${setting}`);
+  } catch (thrown: unknown) {
+    if (thrown instanceof TestDatabaseConfigurationError) {
+      return thrown;
+    }
+    throw thrown;
+  }
+}
+
+/**
+ * The SQL verifier reaches what the API reaches: each {@link CONNECTION_SETTING_CASES} setting, appended to the
+ * configured connection string, changes the verifier's configuration as SqlClient's reading changes the API's
+ * connection, or is refused. It needs no database. The string and every configuration hold the password, so neither
+ * is printed: a failure names the setting, and the configuration entries that differ.
+ */
+function checkConnectionSettingParity(): void {
+  const base = resolveConnectionString();
+  const baseConfig = toMssqlConfig(base);
+  for (const { setting, reads } of CONNECTION_SETTING_CASES) {
+    const outcome = configWith(base, setting);
+    if ('withheld' in reads) {
+      const message = outcome instanceof TestDatabaseConfigurationError ? outcome.message : undefined;
+      expect(message, `${setting} is refused`).toBeDefined();
+      expect(message, `the refusal of ${setting} repeats no value or unknown keyword`).not.toContain(reads.withheld);
+    } else {
+      const expected = { ...baseConfig, options: { ...baseConfig.options, ...reads.changes } };
+      const differing =
+        outcome instanceof TestDatabaseConfigurationError
+          ? [`refused: ${outcome.message}`]
+          : differingPaths(outcome, expected, 'config');
+      expect(differing, `${setting} changes the configuration as SqlClient's reading does`).toEqual([]);
+    }
+  }
+}
+
+/** The message of a thrown value, which need not be an `Error`. */
+function messageOf(thrown: unknown): string {
+  return thrown instanceof Error ? thrown.message : String(thrown);
+}
+
+/**
+ * Closes the verifier, when one was opened, then releases the test lock. Each is attempted even when the other
+ * fails, so a failed close still releases the lock. Resolves to one line per failure, naming what failed and the
+ * message `support/sql.ts` gave, which is fixed text that holds no connection setting or value.
+ */
+async function closeAndRelease(db: SqlVerifier | undefined, lock: ExclusiveTestLock): Promise<string[]> {
+  const failures: string[] = [];
+  if (db !== undefined) {
+    try {
+      await db.close();
+    } catch (thrown: unknown) {
+      failures.push(`Closing the SQL verifier failed: ${messageOf(thrown)}`);
+    }
+  }
+  try {
+    await lock.release();
+  } catch (thrown: unknown) {
+    failures.push(`Releasing the test lock failed: ${messageOf(thrown)}`);
+  }
+  return failures;
+}
+
+/**
+ * Reports cleanup failures beside the workflow's failure without ever throwing, so that failure stays the test's
+ * error. Each failure is first added as a 'cleanup failure' annotation, which cannot fail; then all are attached as
+ * text, and an attachment that fails, as one can while Playwright writes it, is noted as an annotation instead.
+ */
+async function reportCleanupFailures(failures: readonly string[]): Promise<void> {
+  const { annotations } = test.info();
+  for (const description of failures) {
+    annotations.push({ type: 'cleanup failure', description });
+  }
+  try {
+    await test.info().attach('cleanup failures', { body: failures.join('\n'), contentType: 'text/plain' });
+  } catch (thrown: unknown) {
+    annotations.push({
+      type: 'cleanup report failure',
+      description: `Attaching the cleanup failures failed: ${messageOf(thrown)}`,
+    });
+  }
+}
+
 test('data entry smoke: forms, create, edit, navigate, find, delete', async ({ page, request }) => {
   // The lock may wait up to 300 s for the .NET integration tests to finish; the workflow needs the rest.
   test.setTimeout(600_000);
@@ -365,17 +515,29 @@ test('data entry smoke: forms, create, edit, navigate, find, delete', async ({ p
     );
   }
 
+  // It needs no database, so it runs before the lock is waited for.
+  await test.step('the SQL verifier reads connection settings as SqlClient does', checkConnectionSettingParity);
+
   const lock = await acquireExclusiveTestLock();
   let db: SqlVerifier | undefined;
+  // Boxed, so that a thrown value of any kind, `undefined` included, still counts as the workflow's failure.
+  let workflowFailure: { readonly thrown: unknown } | undefined;
   try {
     db = await openSqlVerifier();
     await runWorkflow(page, request, db, externalApi);
-  } finally {
-    try {
-      await db?.close();
-    } finally {
-      await lock.release();
+  } catch (thrown: unknown) {
+    workflowFailure = { thrown };
+  }
+  const cleanupFailures = await closeAndRelease(db, lock);
+  if (workflowFailure !== undefined) {
+    // The workflow's failure stays the test's error; a cleanup failure after it is reported beside it.
+    if (cleanupFailures.length > 0) {
+      await reportCleanupFailures(cleanupFailures);
     }
+    throw workflowFailure.thrown;
+  }
+  if (cleanupFailures.length > 0) {
+    throw new Error(`The workflow passed, but its cleanup failed:\n${cleanupFailures.join('\n')}`);
   }
 });
 
@@ -416,11 +578,12 @@ async function runWorkflow(
   const nFood = await db.countRecords('FoodHistory', false);
   const nFoodAll = await db.countRecords('FoodHistory', true);
 
-  await test.step('seeded records open and step without a write or a field event', async () => {
+  await test.step('seeded records open and step inside the clean-load window', async () => {
     expect(nCase, 'active CaseReport records').toBeGreaterThanOrEqual(2);
     expect(nFood, 'active FoodHistory records').toBeGreaterThanOrEqual(2);
 
-    // No field is focused, clicked or typed into here: only form buttons, tabs and the navigator.
+    // No field is focused, clicked or typed into here: only form buttons, tabs and the navigator. The window stays
+    // open through the create step's CaseReport load and New, and assertCleanLoad checks it just before LastName.
     await openForm(page, 'CaseReport', nCase);
     await expect(lastName).toBeVisible();
     await navigatorButton(page, 'Next').click();
@@ -434,15 +597,6 @@ async function runWorkflow(
     await navigatorButton(page, 'Next').click();
     await expect(status).toHaveText(statusText(2, nFood));
     await backToForms(page);
-
-    // The window closes before the first action that edits.
-    traffic.endLoadWindow();
-    const offending = traffic.loadWindow
-      .filter((sent) => WRITE_METHODS.has(sent.method) || sent.path.endsWith(FIELD_EVENT_PATH_SUFFIX))
-      .map((sent) => `${sent.method} ${sent.path}`);
-    expect(offending, 'requests that wrote or raised a field event while seeded records loaded').toEqual([]);
-    const positionReads = traffic.loadWindow.filter((sent) => sent.method === 'GET' && RECORD_AT_PATH.test(sent.path));
-    expect(positionReads.length, 'records read by position while seeded records loaded').toBeGreaterThanOrEqual(4);
   });
 
   const marker = `T-${randomUUID().replaceAll('-', '')}`;
@@ -455,6 +609,8 @@ async function runWorkflow(
     await navigatorButton(page, 'New').click();
     await expect(status).toHaveText('New record');
     await expect(lastName).toHaveValue('');
+    // Every request so far loaded or stepped a record or opened the draft; LastName is the first deliberate edit.
+    assertCleanLoad(traffic);
     await lastName.fill(marker);
 
     const [created] = await Promise.all([page.waitForResponse(isRecordsPost), actionButton(page, 'Save').click()]);
@@ -488,6 +644,15 @@ async function runWorkflow(
   });
 
   await test.step('search the grid, open the record, edit, save and step', async () => {
+    // The created record is open after its save, so a different one is opened first: the grid row then has to
+    // install the created record for the position and LastName to change back. The saved record is clean, so
+    // leaving it writes nothing.
+    const writesBeforeLeaving = traffic.recordWrites.length;
+    await navigatorButton(page, 'Previous').click();
+    await expect(status).toHaveText(statusText(nAfterCreate - 1, nAfterCreate));
+    await expect(lastName).not.toHaveValue(marker);
+    expect(traffic.recordWrites.slice(writesBeforeLeaving), 'record writes while stepping away').toEqual([]);
+
     const records = recordsRegion(page);
     const search = records.getByLabel('Search records', { exact: true });
     const rows = dataRows(page, records.getByRole('table'));
@@ -496,7 +661,11 @@ async function runWorkflow(
     await expect(rows).toHaveCount(1);
     await expect(rows.first()).toContainText(marker);
 
-    await Promise.all([page.waitForResponse((response) => isRecordGet(response, id)), rows.first().click()]);
+    const [opened] = await Promise.all([
+      page.waitForResponse((response) => isRecordGet(response, id)),
+      rows.first().click(),
+    ]);
+    expect(opened.status(), 'GET of the record opened from the grid').toBe(200);
     await expect(status).toHaveText(statusText(nAfterCreate, nAfterCreate));
     await expect(lastName).toHaveValue(marker);
 

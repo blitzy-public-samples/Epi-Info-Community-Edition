@@ -112,19 +112,45 @@ export function hasDatabaseSettings(env: NodeJS.ProcessEnv = process.env): boole
  * Converts an ADO.NET-style SQL Server connection string, such as the one
  * {@link resolveConnectionString} returns, into an `mssql` pool configuration.
  *
- * Recognised keys, case-insensitive and with whitespace ignored: `Server` (`Data Source`, `Address`, `Addr`,
- * `Network Address`), `Database` (`Initial Catalog`), `User Id` (`UID`, `User`), `Password` (`PWD`),
- * `TrustServerCertificate` and `Encrypt`; other keys are ignored, and the last occurrence of a key wins.
+ * Keys are matched case-insensitively with whitespace ignored, and the last occurrence of a key or any of its
+ * aliases wins. Every keyword of SqlClient 5.2.3, which the API and `tests/Shared/TestDatabase.cs` use, is
+ * either read, ignored or refused, so no setting that changes the connection is silently dropped:
+ * - read: `Server` (`Data Source`, `Address`, `Addr`, `Network Address`), `Database` (`Initial Catalog`),
+ *   `User Id` (`UID`, `User`), `Password` (`PWD`), `Encrypt`, `TrustServerCertificate`
+ *   (`Trust Server Certificate`), `HostNameInCertificate` (`Host Name In Certificate`) and
+ *   `MultiSubnetFailover` (`Multi Subnet Failover`). A `HostNameInCertificate` that is not empty becomes, as
+ *   given, the `serverName` option, the name the server certificate is verified against and the TLS server
+ *   name; empty or unset, the server host is used, as in SqlClient. It never turns certificate verification
+ *   off. `MultiSubnetFailover` becomes the `multiSubnetFailover` option (default `false`): when true, Tedious,
+ *   like SqlClient, connects to every address of the host in parallel and keeps the first that answers;
+ * - ignored, because they tune only the client that reads them and change neither the server, database or
+ *   login reached, the address it is reached at, nor how the server certificate is verified: pooling,
+ *   connect and command timeouts, connect retries, application and workstation names, language, MARS, packet
+ *   size, enlistment, transaction binding, type system version, replication, persist security info, load
+ *   balance timeout, pool blocking period, and the SPN and enclave attestation keywords, which act only with
+ *   the integrated security or column encryption that are refused. This connection keeps its own timeouts
+ *   and pool;
+ * - refused unless at their default: `Integrated Security` (`Trusted_Connection`) unless `false` or `no`;
+ *   `Authentication` unless `SqlPassword` or `Sql Password`; `Application Intent` unless `ReadWrite`;
+ *   `Column Encryption Setting` unless `Disabled`; `User Instance` unless `false` or `no`;
+ *   `IP Address Preference` unless `IPv4First`, because Tedious tries a host's addresses in resolver order
+ *   and has no option to order them; each case-insensitive with edge whitespace ignored; and
+ *   `Failover Partner`, `Server Certificate` and `AttachDbFilename` (`Extended Properties`,
+ *   `Initial File Name`) unless empty. Only the value in effect, after the last occurrence, is checked;
+ * - refused whenever present, whatever the value: `Connection Reset`, `Context Connection` and
+ *   `Network Library` (`Net`, `Network`), which SqlClient 5.2.3 does not support on this platform, and any
+ *   keyword SqlClient does not know, which `SqlConnection` rejects as well.
+ *
  * The string is read as `tests/Shared/TestDatabase.cs` reads it through `SqlConnectionStringBuilder`:
  * - whitespace is the .NET `char.IsWhiteSpace` set, U+0009–U+000D, U+0020, U+0085, U+00A0, U+1680,
  *   U+2000–U+200A, U+2028, U+2029, U+202F, U+205F and U+3000, so U+0085 is whitespace and U+FEFF is not;
  * - an unquoted empty value such as a trailing `Encrypt=` leaves its key unset and clears an earlier
  *   occurrence or alias, while a quoted empty value (`Encrypt=""`) is an empty value and is invalid;
- * - every non-empty `Encrypt` or `TrustServerCertificate` occurrence, under any alias, must be valid, even
- *   one that a later occurrence replaces or clears;
- * - `TrustServerCertificate` takes `true`, `yes`, `false` or `no`, case-insensitive, with edge whitespace
- *   ignored; `Encrypt` takes `true`, `yes` or `Mandatory`, `false`, `no` or `Optional`, and `Strict`,
- *   case-insensitive and untrimmed. Neither takes `1` or `0`, which SqlClient rejects.
+ * - every non-empty `Encrypt`, `TrustServerCertificate` or `MultiSubnetFailover` occurrence, under any alias,
+ *   must be valid, even one that a later occurrence replaces or clears;
+ * - `TrustServerCertificate` and `MultiSubnetFailover` take `true`, `yes`, `false` or `no`, case-insensitive,
+ *   with edge whitespace ignored; `Encrypt` takes `true`, `yes` or `Mandatory`, `false`, `no` or `Optional`,
+ *   and `Strict`, case-insensitive and untrimmed. None takes `1` or `0`, which SqlClient rejects.
  *
  * The server may carry a `tcp:` prefix and a `,port` (default 1433) or a `\instance` name. Encryption is on
  * and the server certificate is verified unless the string says otherwise.
@@ -138,8 +164,8 @@ export function hasDatabaseSettings(env: NodeJS.ProcessEnv = process.env): boole
  * @param options Pool size and request timeout; defaults are 2 connections and 30 seconds.
  * @returns The configuration for `new sql.ConnectionPool(…)`.
  * @throws {TestDatabaseConfigurationError} The string is malformed, lacks the server, database, user or
- * password, or holds an invalid port, `Encrypt` or `TrustServerCertificate` value. The message names the
- * key only.
+ * password, holds an invalid port, `Encrypt`, `TrustServerCertificate` or `MultiSubnetFailover` value, or sets
+ * a keyword this connection refuses. The message names a known key only, never a value or an unknown key.
  * @throws {RangeError} An option is outside its documented range.
  */
 export function toMssqlConfig(connectionString: string, options?: MssqlConfigOptions): MssqlConfig {
@@ -156,6 +182,11 @@ export function toMssqlConfig(connectionString: string, options?: MssqlConfigOpt
   const target = parseServer(requireSetting(settings, 'server'));
   const trustValue = settings.get('trustServerCertificate');
   const encryptValue = settings.get('encrypt');
+  // An empty name leaves Tedious verifying the certificate against the server host, as SqlClient does. Any
+  // other name, edge whitespace included, is passed as given and must match the certificate exactly, so a
+  // name SqlClient cannot verify fails here too.
+  const certificateName = settings.get('hostNameInCertificate');
+  const multiSubnetFailoverValue = settings.get('multiSubnetFailover');
 
   return {
     server: target.host,
@@ -167,6 +198,11 @@ export function toMssqlConfig(connectionString: string, options?: MssqlConfigOpt
       encrypt: encryptValue === undefined ? true : parseEncrypt(encryptValue),
       trustServerCertificate:
         trustValue === undefined ? false : parseBoolean(trustValue, SETTING_NAMES.trustServerCertificate),
+      multiSubnetFailover:
+        multiSubnetFailoverValue === undefined
+          ? false
+          : parseBoolean(multiSubnetFailoverValue, SETTING_NAMES.multiSubnetFailover),
+      ...(certificateName === undefined || certificateName === '' ? {} : { serverName: certificateName }),
       ...(target.instanceName === undefined ? {} : { instanceName: target.instanceName }),
     },
     connectionTimeout: CONNECTION_TIMEOUT_MS,
@@ -175,7 +211,15 @@ export function toMssqlConfig(connectionString: string, options?: MssqlConfigOpt
   };
 }
 
-type SettingKey = 'server' | 'database' | 'user' | 'password' | 'trustServerCertificate' | 'encrypt';
+type SettingKey =
+  | 'server'
+  | 'database'
+  | 'user'
+  | 'password'
+  | 'trustServerCertificate'
+  | 'encrypt'
+  | 'hostNameInCertificate'
+  | 'multiSubnetFailover';
 
 // Keys are matched lower-cased with whitespace removed, so `Data Source` and `datasource` are one key.
 const SETTING_KEYS: ReadonlyMap<string, SettingKey> = new Map<string, SettingKey>([
@@ -193,6 +237,8 @@ const SETTING_KEYS: ReadonlyMap<string, SettingKey> = new Map<string, SettingKey
   ['pwd', 'password'],
   ['trustservercertificate', 'trustServerCertificate'],
   ['encrypt', 'encrypt'],
+  ['hostnameincertificate', 'hostNameInCertificate'],
+  ['multisubnetfailover', 'multiSubnetFailover'],
 ]);
 
 // The key names messages use; a message never repeats a value.
@@ -203,7 +249,108 @@ const SETTING_NAMES: Readonly<Record<SettingKey, string>> = {
   password: 'Password',
   trustServerCertificate: 'TrustServerCertificate',
   encrypt: 'Encrypt',
+  hostNameInCertificate: 'HostNameInCertificate',
+  multiSubnetFailover: 'MultiSubnetFailover',
 };
+
+// SqlClient 5.2.3 keywords that tune only the client reading them: pooling, timeouts and retries, session
+// naming and language, MARS and packet size, enlistment and transaction binding, SqlClient's own type
+// mapping, and the replication and persist-security-info flags. None changes which server, database or
+// login is reached, which address it is reached at, or how the server certificate is verified, so this
+// connection, which keeps its own timeouts and pool and reads values through its own driver, reads past
+// them. The SPN and enclave attestation keywords act only with integrated security or column encryption,
+// which RESTRICTED_KEYS refuses. Multi-subnet failover is read (SETTING_KEYS), and the address order is
+// restricted (RESTRICTED_KEYS), because both decide which address of a multi-address host is connected to.
+const IGNORED_KEYS: ReadonlySet<string> = new Set([
+  'applicationname',
+  'app',
+  'workstationid',
+  'wsid',
+  'currentlanguage',
+  'language',
+  'connecttimeout',
+  'connectiontimeout',
+  'timeout',
+  'commandtimeout',
+  'connectretrycount',
+  'connectretryinterval',
+  'pooling',
+  'maxpoolsize',
+  'minpoolsize',
+  'loadbalancetimeout',
+  'connectionlifetime',
+  'poolblockingperiod',
+  'enlist',
+  'transactionbinding',
+  'replication',
+  'persistsecurityinfo',
+  'multipleactiveresultsets',
+  'packetsize',
+  'typesystemversion',
+  'serverspn',
+  'failoverpartnerspn',
+  'attestationprotocol',
+  'enclaveattestationurl',
+]);
+
+/**
+ * A SqlClient keyword whose non-default values change the login, the server, address or file reached, the
+ * replica routing or how the server certificate is verified, none of which this connection can reproduce.
+ */
+interface RestrictedSetting {
+  /** The key name messages use. */
+  readonly name: string;
+  /** Whether the value in effect leaves the connection as this module makes it. */
+  readonly permits: (value: string) => boolean;
+}
+
+/**
+ * Accepts a value that is one of the lower-case spellings, case-insensitive once .NET edge whitespace is
+ * trimmed, as SqlClient reads these keywords.
+ */
+function spelledAs(...spellings: readonly string[]): (value: string) => boolean {
+  const accepted: ReadonlySet<string> = new Set(spellings);
+  return (value) => accepted.has(trimWhitespace(value).toLowerCase());
+}
+
+// SqlClient keeps an edge-whitespace value of these as given, so only the empty value is the default.
+function isEmpty(value: string): boolean {
+  return value === '';
+}
+
+const INTEGRATED_SECURITY: RestrictedSetting = {
+  name: 'Integrated Security',
+  permits: spelledAs('false', 'no'),
+};
+const ATTACH_DB_FILENAME: RestrictedSetting = { name: 'AttachDbFilename', permits: isEmpty };
+
+// Restricted keywords and their aliases, matched as SETTING_KEYS are; each is refused unless at its default.
+const RESTRICTED_KEYS: ReadonlyMap<string, RestrictedSetting> = new Map<string, RestrictedSetting>([
+  ['integratedsecurity', INTEGRATED_SECURITY],
+  ['trusted_connection', INTEGRATED_SECURITY],
+  ['authentication', { name: 'Authentication', permits: spelledAs('sqlpassword', 'sql password') }],
+  ['applicationintent', { name: 'Application Intent', permits: spelledAs('readwrite') }],
+  ['columnencryptionsetting', { name: 'Column Encryption Setting', permits: spelledAs('disabled') }],
+  ['userinstance', { name: 'User Instance', permits: spelledAs('false', 'no') }],
+  // Tedious tries a host's addresses in the order the resolver returns them and has no option to reorder them,
+  // so a string may state only SqlClient's default, which leaves the connection as the unset keyword does.
+  ['ipaddresspreference', { name: 'IP Address Preference', permits: spelledAs('ipv4first') }],
+  ['failoverpartner', { name: 'Failover Partner', permits: isEmpty }],
+  ['servercertificate', { name: 'Server Certificate', permits: isEmpty }],
+  ['attachdbfilename', ATTACH_DB_FILENAME],
+  ['extendedproperties', ATTACH_DB_FILENAME],
+  ['initialfilename', ATTACH_DB_FILENAME],
+]);
+
+// Keywords SqlClient 5.2.3 rejects on this platform whatever their value, an unquoted empty one included, and
+// the key names messages use.
+const UNSUPPORTED_KEYS: ReadonlyMap<string, string> = new Map([
+  ['connectionreset', 'Connection Reset'],
+  ['contextconnection', 'Context Connection'],
+  ['networklibrary', 'Network Library'],
+  ['net', 'Network Library'],
+  ['network', 'Network Library'],
+]);
 
 // SqlClient reads these data sources as the local machine.
 const LOCAL_SERVER_ALIASES: ReadonlySet<string> = new Set(['.', '(local)']);
@@ -259,22 +406,30 @@ function malformed(): TestDatabaseConfigurationError {
 }
 
 /**
- * Splits a connection string into its recognised settings, following the ADO.NET rules: `;` separates
- * settings outside quotes, a key ends at its first `=`, unquoted keys and values are trimmed, and a value
- * opened by `"` or `'` runs to the matching quote, where a doubled quote is a literal one. Whitespace is the
- * .NET set SqlClient uses ({@link DOTNET_WHITESPACE}): it includes U+0085 and excludes U+FEFF, unlike
- * JavaScript's `\s`. The last occurrence of a key or any of its aliases wins. An unquoted value that is empty
- * or only whitespace means the setting is unset, as `SqlConnectionStringBuilder` reads it: the key is
- * removed, clearing any earlier occurrence or alias, so its default applies. A quoted empty value (`""` or
- * `''`) is kept as `''`. Like `SqlConnectionStringBuilder`, which converts every occurrence as it reads it,
- * each non-empty `Encrypt` or `TrustServerCertificate` occurrence, quoted or not and under any alias, must
- * be valid on its own: an invalid one throws even when a later occurrence or alias replaces or clears it.
+ * Splits a connection string into the settings {@link SETTING_KEYS} reads, following the ADO.NET rules:
+ * `;` separates settings outside quotes, a key ends at its first `=`, unquoted keys and values are trimmed,
+ * and a value opened by `"` or `'` runs to the matching quote, where a doubled quote is a literal one.
+ * Whitespace is the .NET set SqlClient uses ({@link DOTNET_WHITESPACE}): it includes U+0085 and excludes
+ * U+FEFF, unlike JavaScript's `\s`. The last occurrence of a key or any of its aliases wins. An unquoted
+ * value that is empty or only whitespace means the setting is unset, as `SqlConnectionStringBuilder` reads
+ * it: the key is removed, clearing any earlier occurrence or alias, so its default applies. A quoted empty
+ * value (`""` or `''`) is kept as `''`. Like `SqlConnectionStringBuilder`, which converts every occurrence
+ * as it reads it, each non-empty `Encrypt`, `TrustServerCertificate` or `MultiSubnetFailover` occurrence,
+ * quoted or not and under any alias, must be valid on its own: an invalid one throws even when a later
+ * occurrence or alias replaces or clears it.
  *
- * @throws {TestDatabaseConfigurationError} The string is malformed, or an `Encrypt` or
- * `TrustServerCertificate` occurrence is invalid. The message names the key only.
+ * Every other key is a SqlClient keyword this connection ignores ({@link IGNORED_KEYS}) or refuses. A
+ * {@link RESTRICTED_KEYS} keyword follows the same occurrence rules, and only the value in effect at the end
+ * must be its default, as `SqlConnection` reads it. A {@link UNSUPPORTED_KEYS} keyword, or a key SqlClient
+ * does not know, is refused on sight, even with an unquoted empty value, as `SqlConnection` refuses it.
+ *
+ * @throws {TestDatabaseConfigurationError} The string is malformed, an `Encrypt`, `TrustServerCertificate` or
+ * `MultiSubnetFailover` occurrence is invalid, or it sets a keyword this connection refuses. The message
+ * names a known key only.
  */
 function parseConnectionString(connectionString: string): Map<SettingKey, string> {
   const settings = new Map<SettingKey, string>();
+  const restricted = new Map<RestrictedSetting, string>();
   const length = connectionString.length;
   let index = 0;
 
@@ -325,6 +480,7 @@ function parseConnectionString(connectionString: string): Map<SettingKey, string
     }
 
     const settingKey = SETTING_KEYS.get(key);
+    const restrictedSetting = RESTRICTED_KEYS.get(key);
     if (settingKey !== undefined) {
       if (value === undefined) {
         settings.delete(settingKey);
@@ -332,10 +488,40 @@ function parseConnectionString(connectionString: string): Map<SettingKey, string
         validateOccurrence(settingKey, value);
         settings.set(settingKey, value);
       }
+    } else if (restrictedSetting !== undefined) {
+      if (value === undefined) {
+        restricted.delete(restrictedSetting);
+      } else {
+        restricted.set(restrictedSetting, value);
+      }
+    } else if (!IGNORED_KEYS.has(key)) {
+      throw unsupportedKeyword(UNSUPPORTED_KEYS.get(key));
+    }
+  }
+
+  for (const [setting, value] of restricted) {
+    if (!setting.permits(value)) {
+      throw new TestDatabaseConfigurationError(
+        withGuidance(`The connection string sets ${setting.name} to a value the SQL verifier does not support.`),
+      );
     }
   }
 
   return settings;
+}
+
+/**
+ * Refuses a keyword SqlClient rejects. An unknown key is not named: it may be the tail of a password that
+ * holds an unquoted `;`, so only a known keyword's name reaches the message.
+ */
+function unsupportedKeyword(name: string | undefined): TestDatabaseConfigurationError {
+  return new TestDatabaseConfigurationError(
+    withGuidance(
+      name === undefined
+        ? 'The connection string has a keyword SqlClient does not support.'
+        : `The connection string sets ${name}, which SqlClient does not support on this platform.`,
+    ),
+  );
 }
 
 /** Reads a quoted value whose opening quote precedes `start`; returns it with the index after its closing quote. */
@@ -421,8 +607,8 @@ function parseServer(value: string): ServerTarget {
 function validateOccurrence(key: SettingKey, value: string): void {
   if (key === 'encrypt') {
     parseEncrypt(value);
-  } else if (key === 'trustServerCertificate') {
-    parseBoolean(value, SETTING_NAMES.trustServerCertificate);
+  } else if (key === 'trustServerCertificate' || key === 'multiSubnetFailover') {
+    parseBoolean(value, SETTING_NAMES[key]);
   }
 }
 
