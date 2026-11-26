@@ -137,11 +137,12 @@ internal enum SelectedSetClause
 /// <see cref="RecordByUniqueKey"/>, <see cref="UpdateBaseStamp"/> and <see cref="SoftDelete"/>, compares under the
 /// column's collation and, because of that padding, also requires equal byte lengths (<c>DATALENGTH</c>): an id
 /// longer than the column, or one that differs from a stored id only by trailing spaces, finds no row instead of
-/// failing to bind or matching that stored id, while letter case still follows the collation. The page statements
-/// (<see cref="UpdatePageColumns"/>, <see cref="InsertPageKey"/>) bind the stored id the locked read returned, and the
-/// page join of a record read compares two stored columns. Neither meets a request's spelling, so the page
-/// <c>UPDATE</c> and the join keep plain equality. The by-id reads return the id as the base row stores it, and every
-/// later statement binds that stored spelling, never the request's.
+/// failing to bind or matching that stored id, while letter case still follows the collation. The Find exclusion
+/// (<see cref="AppendGlobalRecordIdExclusion"/>) negates that same match, so such an id excludes no row. The page
+/// statements (<see cref="UpdatePageColumns"/>, <see cref="InsertPageKey"/>) bind the stored id the locked read
+/// returned, and the page join of a record read compares two stored columns. Neither meets a request's spelling, so
+/// the page <c>UPDATE</c> and the join keep plain equality. The by-id reads return the id as the base row stores it,
+/// and every later statement binds that stored spelling, never the request's.
 /// </para>
 /// <para>
 /// <b>Aliases.</b> Reads alias the base table <c>b</c> and each page <c>p{i}</c>, where <c>i</c> is the page's index in
@@ -341,6 +342,48 @@ internal static class RecordSqlBuilder
         AppendBaseColumn(sql, column);
         sql.Append(" = ").Append(name);
         return true;
+    }
+
+    /// <summary>
+    /// Appends the exclusion of a request-supplied id, the open record a Find leaves out:
+    /// <c>NOT (b.[GlobalRecordId] = @pN AND DATALENGTH(b.[GlobalRecordId]) = DATALENGTH(@pN))</c>. It negates the exact
+    /// match every lookup by id renders (class remarks, "Record identity"), so it excludes exactly the rows a lookup by
+    /// that id would find: a spelling that differs from a stored id only by trailing spaces, or one longer than the
+    /// column, excludes nothing, while letter case follows the column's collation. The id is bound at full length with
+    /// <see cref="ColumnValueConverter.Text"/>, like every request id the base table has not confirmed. Every piece of
+    /// the text is fixed here or quoted from the reader-built column, and the caller supplies none of it.
+    /// </summary>
+    /// <param name="sql">
+    /// The statement text being built, whose base table, or the derived set that keeps its columns, carries the alias
+    /// <see cref="BaseAlias"/>, and whose <c>WHERE</c> or <c>AND</c> keyword the caller has already written.
+    /// </param>
+    /// <param name="schema">The form's catalogue view.</param>
+    /// <param name="parameters">The statement's parameters; the id is added to them.</param>
+    /// <param name="globalRecordId">The id from the request whose record is left out.</param>
+    /// <exception cref="ArgumentNullException">An argument is null.</exception>
+    /// <exception cref="InvalidOperationException">
+    /// The base table has no <c>GlobalRecordId</c> column. Nothing is appended and no parameter is added.
+    /// </exception>
+    internal static void AppendGlobalRecordIdExclusion(
+        StringBuilder sql,
+        FormSchema schema,
+        PositionalParameters parameters,
+        string globalRecordId)
+    {
+        ArgumentNullException.ThrowIfNull(sql);
+        ArgumentNullException.ThrowIfNull(schema);
+        ArgumentNullException.ThrowIfNull(parameters);
+        ArgumentNullException.ThrowIfNull(globalRecordId);
+
+        // Built apart, so a missing column leaves the statement text unchanged.
+        var match = new StringBuilder();
+        AppendGlobalRecordIdMatch(
+            match,
+            schema,
+            parameters,
+            BaseAlias,
+            (n, _) => ColumnValueConverter.Text(n, globalRecordId));
+        sql.Append("NOT (").Append(match).Append(')');
     }
 
     /// <summary>Returns a base-table system column the record SQL cannot do without.</summary>

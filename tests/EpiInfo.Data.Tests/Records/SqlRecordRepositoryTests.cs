@@ -29,7 +29,8 @@ namespace EpiInfo.Data.Tests.Records;
 /// <item><description>
 /// Record identity: every lookup by <c>GlobalRecordId</c>, the locked read before a write included, matches a stored
 /// id exactly, so a spelling that differs from it only by trailing spaces, within or beyond the column's width, finds
-/// no row; and the base-row reads return the id as stored, the spelling every later statement binds.
+/// no row; the base-row reads return the id as stored, the spelling every later statement binds; and Find's exclusion
+/// of the open record matches the same way, so such a spelling excludes nothing.
 /// </description></item>
 /// <item><description>
 /// Stored reads: every stored data value of the seeded forms, with the runtime type SqlClient returns for its column,
@@ -41,8 +42,8 @@ namespace EpiInfo.Data.Tests.Records;
 /// The tests only read. The reader's commands are all <c>SELECT</c>, the page-row write statements are only built,
 /// never sent, and the stored-read case sends only <c>SELECT</c>. The identity lookups run their locked read in a
 /// transaction that is rolled back, and the record they look up is the seeded row with the lowest <c>UniqueKey</c>,
-/// chosen by SQL rather than hard-coded. Their failure messages are fixed text, so no id reaches the output except
-/// through an equality assertion.
+/// chosen by SQL rather than hard-coded; the Find exclusion uses the lowest such active row with a row on every page.
+/// Their failure messages are fixed text, so no id reaches the output except through an equality assertion.
 /// </remarks>
 [Collection(DatabaseCollections.Database)]
 [Trait("Category", "Integration")]
@@ -531,6 +532,52 @@ public sealed class SqlRecordRepositoryTests : IAsyncLifetime
         AssertOnlySuccessfulReads(recorder, expectedCommands: 1);
     }
 
+    // AAP 0.3.4.4 "Open record": Find leaves the open record out on the server, before the total and the cap. The
+    // exclusion matches the id as every lookup by id does, so the stored id excludes its record, while a spelling that
+    // differs from it only by trailing spaces, within or beyond the column's width, identifies no record, as the
+    // position lookup shows, and excludes nothing. The record is the active seeded one with the lowest UniqueKey that
+    // has a row on every page, chosen by SQL, and a criterion on its id selects it alone.
+    [Theory]
+    [MemberData(nameof(PaddedIds))]
+    public async Task Find_ExcludedId_LeavesOutOnlyTheRecordALookupByThatIdFinds(string formName, int padding)
+    {
+        await TestDatabase.EnsureReachableAsync();
+        await using DatabaseWriteLock dbLock = await DatabaseWriteLock.AcquireSharedAsync();
+
+        var recorder = new SqlCommandRecorder();
+        await using SeededForm form = await SeededForm.OpenAsync(formName, recorder);
+        IdRow record = await form.ReadCompleteActiveRowAsync();
+        string paddedId = record.GlobalRecordId + new string(' ', padding);
+        bool overWidth = paddedId.Length * sizeof(char) > form.GlobalRecordIdColumn.MaxLengthBytes;
+        Assert.True(
+            overWidth == (padding == OverWidthPadding),
+            "The padded id is not on the intended side of the id column's width.");
+        recorder.Clear();
+
+        IReadOnlyList<FoundRow> unexcluded = await form.FindByIdAsync(record.GlobalRecordId, excludeGlobalRecordId: null);
+        AssertSingleFoundRow(unexcluded, record, "The criterion on the record's id did not find exactly that record.");
+
+        IReadOnlyList<FoundRow> excluded = await form.FindByIdAsync(record.GlobalRecordId, record.GlobalRecordId);
+        Assert.True(excluded.Count == 0, "The stored id did not exclude its record and its total.");
+
+        IReadOnlyList<IdRow> positioned = await form.ReadBaseRowsAsync(
+            transaction: null,
+            RecordSqlBuilder.SetPositionLookup(form.Schema, paddedId));
+        Assert.True(positioned.Count == 0, "The position lookup matched a padded id to a stored row.");
+
+        IReadOnlyList<FoundRow> padded = await form.FindByIdAsync(record.GlobalRecordId, paddedId);
+        AssertSingleFoundRow(padded, record, "A padded id excluded the record it does not identify.");
+
+        AssertOnlySuccessfulReads(recorder, expectedCommands: 4);
+    }
+
+    private static void AssertSingleFoundRow(IReadOnlyList<FoundRow> rows, IdRow record, string message)
+    {
+        Assert.True(rows.Count == 1 && rows[0].Total == 1, message);
+        Assert.Equal(record.UniqueKey, rows[0].UniqueKey);
+        Assert.Equal(record.GlobalRecordId, rows[0].GlobalRecordId, StringComparer.Ordinal);
+    }
+
     // Every stored value of every data column of the form, read uncoerced with GetValue, converts through
     // FromDbValue to the value stored, and a float column's number is the stored double bit for bit. Each page table
     // is read whole, by a SELECT naming only reader-built identifiers, and the record projection the repository
@@ -690,6 +737,9 @@ public sealed class SqlRecordRepositoryTests : IAsyncLifetime
     // A base row's stored id and key, as a by-id statement returned them.
     private readonly record struct IdRow(string GlobalRecordId, int UniqueKey);
 
+    // A Find row's stored id and key, and the total of matches every row carries.
+    private readonly record struct FoundRow(string GlobalRecordId, int UniqueKey, long Total);
+
     /// <summary>
     /// A seeded form exactly as the metadata reader returns it: its metadata, its catalogue schema and the
     /// reader-built column of each data field, in storage order.
@@ -776,7 +826,7 @@ public sealed class SqlRecordRepositoryTests : IAsyncLifetime
             int commandTimeoutSeconds,
             ISqlCommandObserver observer,
             FormSchema schema,
-            IReadOnlyList<DataFieldMetadata> dataFields,
+            DataFieldSet dataFields,
             ColumnSchema globalRecordIdColumn,
             string globalRecordId,
             int uniqueKey)
@@ -793,7 +843,7 @@ public sealed class SqlRecordRepositoryTests : IAsyncLifetime
 
         public FormSchema Schema { get; }
 
-        public IReadOnlyList<DataFieldMetadata> DataFields { get; }
+        public DataFieldSet DataFields { get; }
 
         public ColumnSchema GlobalRecordIdColumn { get; }
 
@@ -820,7 +870,7 @@ public sealed class SqlRecordRepositoryTests : IAsyncLifetime
                 Assert.True(read is not null, "The seeded form has no metadata.");
 
                 FormSchema schema = read.Value.Schema;
-                IReadOnlyList<DataFieldMetadata> dataFields = FormDefinitionFactory.GetDataFields(read.Value.Form);
+                DataFieldSet dataFields = FormDefinitionFactory.GetDataFields(read.Value.Form);
                 ColumnSchema globalRecordIdColumn = RecordSqlBuilder.Require(schema.GlobalRecordId);
                 ColumnSchema uniqueKeyColumn = RecordSqlBuilder.Require(schema.UniqueKey);
 
@@ -885,6 +935,65 @@ public sealed class SqlRecordRepositoryTests : IAsyncLifetime
                 RecordSqlBuilder.RecordGlobalRecordIdOrdinal,
                 RecordSqlBuilder.RecordUniqueKeyOrdinal);
 
+        // Picks by SQL the active base row with the lowest UniqueKey that has a row on every page table, a record Find
+        // can return. The statement names only reader-built identifiers and holds no value, so it has no parameter.
+        public async Task<IdRow> ReadCompleteActiveRowAsync()
+        {
+            string baseId = SqlIdentifier.Quote(GlobalRecordIdColumn);
+            string uniqueKey = SqlIdentifier.Quote(RecordSqlBuilder.Require(Schema.UniqueKey));
+            var sql = new StringBuilder("SELECT TOP (1) b.").Append(baseId).Append(", b.").Append(uniqueKey)
+                .Append(" FROM ").Append(SqlIdentifier.Quote(Schema.BaseTable)).Append(" b WHERE b.")
+                .Append(SqlIdentifier.Quote(RecordSqlBuilder.Require(Schema.RecStatus))).Append(" = 1");
+            foreach (PageTableSchema page in Schema.Pages)
+            {
+                if (page.Table is { } table)
+                {
+                    sql.Append(" AND EXISTS (SELECT 1 FROM ").Append(SqlIdentifier.Quote(table)).Append(" p WHERE p.")
+                        .Append(SqlIdentifier.Quote(RecordSqlBuilder.RequirePageKey(table))).Append(" = b.")
+                        .Append(baseId).Append(')');
+                }
+            }
+
+            sql.Append(" ORDER BY b.").Append(uniqueKey);
+            IReadOnlyList<IdRow> rows = await ReadRowsAsync(
+                _connection,
+                transaction: null,
+                _commandTimeoutSeconds,
+                _observer,
+                new SqlStatement(sql.ToString(), Array.Empty<SqlParameterValue>()),
+                globalRecordIdOrdinal: 0,
+                uniqueKeyOrdinal: 1);
+            Assert.True(rows.Count == 1, "The seeded form has no active record with a row on every page.");
+            return rows[0];
+        }
+
+        // Parses a GlobalRecordId criterion as a client sends it, builds the Find statement over the active set with
+        // the given exclusion, runs it, and reads each row's stored id and key and the total every row carries.
+        public async Task<IReadOnlyList<FoundRow>> FindByIdAsync(string criterionId, string? excludeGlobalRecordId)
+        {
+            SearchParseResult parsed = SearchCriteriaParser.Parse(
+                DataFields,
+                [new SearchCriterion(SearchCriteriaParser.GlobalRecordIdFieldName, FieldValue.FromText(criterionId))]);
+            Assert.True(parsed.IsSuccess, "The GlobalRecordId criterion did not parse.");
+
+            SearchSelect select = SearchSqlBuilder.Search(
+                Schema,
+                DataFields,
+                RecordQueryRules.GetGridColumns(DataFields),
+                parsed.Conditions,
+                includeDeleted: false,
+                excludeGlobalRecordId);
+            return await SqlExecution.ReadAsync(
+                _connection,
+                transaction: null,
+                Operation,
+                select.Statement,
+                _commandTimeoutSeconds,
+                _observer,
+                CancellationToken.None,
+                ReadFoundRowsAsync);
+        }
+
         public ValueTask DisposeAsync() => _connection.DisposeAsync();
 
         private static Task<IReadOnlyList<IdRow>> ReadRowsAsync(
@@ -915,6 +1024,20 @@ public sealed class SqlRecordRepositoryTests : IAsyncLifetime
             while (await rows.ReadAsync(token))
             {
                 result.Add(new IdRow(rows.GetString(globalRecordIdOrdinal), rows.GetInt32(uniqueKeyOrdinal)));
+            }
+
+            return result.AsReadOnly();
+        }
+
+        private static async Task<IReadOnlyList<FoundRow>> ReadFoundRowsAsync(DbDataReader rows, CancellationToken token)
+        {
+            var result = new List<FoundRow>();
+            while (await rows.ReadAsync(token))
+            {
+                result.Add(new FoundRow(
+                    rows.GetString(SearchSqlBuilder.IdOrdinal),
+                    rows.GetInt32(SearchSqlBuilder.UniqueKeyOrdinal),
+                    rows.GetInt64(SearchSqlBuilder.TotalOrdinal)));
             }
 
             return result.AsReadOnly();
@@ -1005,6 +1128,11 @@ public sealed class ListAndFindSqlTests
     private const string ListPageOperation = "test.listPage";
     private const string ListCountOperation = "test.listCount";
     private const string FindOperation = "test.find";
+
+    // The selected-set case searches a window of complete records: this many before the first deleted one, and this
+    // many in all, which keeps every match under the cap.
+    private const int RecordsBeforeFirstDeleted = 25;
+    private const int SearchedRecords = 150;
 
     // Covers a wait of up to 300 seconds for the test lock and the work behind it.
     private static readonly TimeSpan TestTimeout = TimeSpan.FromMinutes(10);
@@ -1319,6 +1447,73 @@ public sealed class ListAndFindSqlTests
         }
     }
 
+    // AAP 0.3.4.4 "Order and cap": each result's position is its ROW_NUMBER() over the selected set by UniqueKey,
+    // numbered before the criteria, so it equals the navigation position, and its id, key and status are the base
+    // row's. Membership, position and status must describe one committed state, so the Find statement names the base
+    // table exactly once, in the numbered set, with HOLDLOCK on that read, and takes every base column it projects or
+    // compares from the numbered rows. A behavioural test would soft-delete a seeded row during the statement, a write
+    // this assembly may not make (AAP 0.3.7, "Data reach of tests"), so the statement's one held base read stands in
+    // for it. The rows are checked against direct SQL that places each record by the legacy formula, the number of
+    // selected rows whose UniqueKey is at most its own, over a window of complete records holding deleted ones, so the
+    // two sets number some of them differently.
+    [Theory]
+    [InlineData(CaseReportForm, false)]
+    [InlineData(CaseReportForm, true)]
+    [InlineData(FoodHistoryForm, false)]
+    [InlineData(FoodHistoryForm, true)]
+    public async Task Find_SelectedSet_ReadsTheBaseTableOnceAndPlacesRecordsAsDirectSql(string formName, bool includeDeleted)
+    {
+        await TestDatabase.EnsureReachableAsync();
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        var cancellationToken = timeout.Token;
+        await using var sharedLock = await DatabaseWriteLock.AcquireSharedAsync(cancellationToken);
+
+        var form = await FormUnderTest.LoadAsync(formName, cancellationToken);
+        var complete = await form.PlacedCompleteRecordsAsync(cancellationToken);
+        var firstDeleted = complete.FindIndex(record => record.RecStatus != RecordQueryRules.ActiveRecStatus);
+        Assert.True(firstDeleted >= 0, $"No deleted {formName} record has a row on every page.");
+        var window = complete
+            .Skip(Math.Max(0, firstDeleted - RecordsBeforeFirstDeleted))
+            .Take(SearchedRecords)
+            .ToArray();
+        Assert.True(
+            window.Any(record =>
+                record.RecStatus == RecordQueryRules.ActiveRecStatus && record.ActivePosition != record.EveryPosition),
+            $"The {formName} window holds no active record that the two sets place differently.");
+
+        var selected = window
+            .Where(record => includeDeleted || record.RecStatus == RecordQueryRules.ActiveRecStatus)
+            .ToArray();
+        var expected = selected
+            .Select(record => new PlacedRow(
+                record.GlobalRecordId,
+                record.UniqueKey,
+                record.RecStatus,
+                includeDeleted ? record.EveryPosition : record.ActivePosition,
+                selected.Length))
+            .ToArray();
+
+        var find = form.BuildFind(
+            SearchCriteriaParser.GlobalRecordIdFieldName,
+            string.Join(" or ", window.Select(record => record.GlobalRecordId)),
+            includeDeleted);
+
+        // The base table is named once, in the numbered set, and that read alone carries the hint.
+        var baseTable = SqlIdentifier.Quote(form.Schema.BaseTable);
+        Assert.Equal(1, CountOccurrences(find.Statement.Text, baseTable));
+        Assert.Equal(1, CountOccurrences(find.Statement.Text, "HOLDLOCK"));
+        Assert.Contains(
+            $"{baseTable} {RecordSqlBuilder.BaseAlias} WITH (HOLDLOCK)",
+            find.Statement.Text,
+            StringComparison.Ordinal);
+
+        Assert.Equal(expected, await form.FindPlacedAsync(find, cancellationToken));
+
+        // The builder's statement is a read: the recorder saw it and no write.
+        Assert.NotEmpty(form.Recorder.ForOperation(FindOperation));
+        Assert.Empty(form.Recorder.Writes());
+    }
+
     // The number of non-overlapping ordinal occurrences of value in text.
     private static int CountOccurrences(string text, string value)
     {
@@ -1341,6 +1536,20 @@ public sealed class ListAndFindSqlTests
 
     /// <summary>The ids a Find returned, in the order returned, and the total of its matches.</summary>
     private sealed record FindRows(IReadOnlyList<string> Ids, long Total);
+
+    /// <summary>
+    /// A base row with a row on every page table, as direct SQL reads it: its stored id, key and status, and its
+    /// position by the legacy formula in the active set and in the set of every row.
+    /// </summary>
+    private sealed record PlacedRecord(
+        string GlobalRecordId,
+        long UniqueKey,
+        long RecStatus,
+        long ActivePosition,
+        long EveryPosition);
+
+    /// <summary>One Find row at its five fixed ordinals: the id, key and status, the position and the total.</summary>
+    private sealed record PlacedRow(string GlobalRecordId, long UniqueKey, long RecStatus, long Position, long Total);
 
     /// <summary>
     /// One typed criterion: the field, the criterion text, the comparison it renders, and the type and value of the
@@ -1461,10 +1670,10 @@ public sealed class ListAndFindSqlTests
                 cancellationToken);
 
         /// <summary>
-        /// Parses one criterion with the search criteria parser and builds the Find statement over the active set,
-        /// excluding no record.
+        /// Parses one criterion with the search criteria parser and builds the Find statement over the selected set of
+        /// <paramref name="includeDeleted"/>, the active set by default, excluding no record.
         /// </summary>
-        public SearchSelect BuildFind(string fieldName, string criterion)
+        public SearchSelect BuildFind(string fieldName, string criterion, bool includeDeleted = false)
         {
             var parsed = SearchCriteriaParser.Parse(
                 DataFields,
@@ -1475,7 +1684,7 @@ public sealed class ListAndFindSqlTests
                 string.Join(" ", parsed.FieldErrors.Values.SelectMany(messages => messages)));
 
             return SearchSqlBuilder.Search(
-                Schema, DataFields, Grid, parsed.Conditions, includeDeleted: false, excludeGlobalRecordId: null);
+                Schema, DataFields, Grid, parsed.Conditions, includeDeleted, excludeGlobalRecordId: null);
         }
 
         /// <summary>Runs a Find statement and reads the ids it returns and the total every row carries.</summary>
@@ -1491,6 +1700,55 @@ public sealed class ListAndFindSqlTests
                 Recorder,
                 cancellationToken,
                 ReadFindRowsAsync);
+        }
+
+        /// <summary>Runs a Find statement and reads every row at its five fixed ordinals, in the order returned.</summary>
+        public async Task<IReadOnlyList<PlacedRow>> FindPlacedAsync(SearchSelect find, CancellationToken cancellationToken)
+        {
+            await using var connection = await TestDatabase.OpenConnectionAsync(cancellationToken);
+            return await SqlExecution.ReadAsync(
+                connection,
+                transaction: null,
+                FindOperation,
+                find.Statement,
+                Options.CommandTimeoutSeconds,
+                Recorder,
+                cancellationToken,
+                ReadPlacedRowsAsync);
+        }
+
+        /// <summary>
+        /// Every base row with a row on every page table, in <c>UniqueKey</c> order, read by a direct query: its
+        /// stored id, key and status, and its position by the legacy formula, the number of active rows
+        /// (<c>RecStatus = 1</c>) and of all rows of the base table alone whose <c>UniqueKey</c> is at most its own.
+        /// </summary>
+        public async Task<List<PlacedRecord>> PlacedCompleteRecordsAsync(CancellationToken cancellationToken)
+        {
+            // The all-page join of the Find source is the same whichever field it is built for.
+            var (from, _) = FindSource(Grid[0].Name);
+            var baseTable = SqlIdentifier.Quote(Schema.BaseTable);
+            var baseId = SqlIdentifier.Quote(RecordSqlBuilder.Require(Schema.GlobalRecordId));
+            var uniqueKey = SqlIdentifier.Quote(RecordSqlBuilder.Require(Schema.UniqueKey));
+            var recStatus = SqlIdentifier.Quote(RecordSqlBuilder.Require(Schema.RecStatus));
+            var placed = $"(SELECT COUNT_BIG(*) FROM {baseTable} s WHERE s.{uniqueKey} <= b.{uniqueKey}";
+            var sql = $"SELECT b.{baseId}, b.{uniqueKey}, b.{recStatus}, {placed} AND s.{recStatus} = 1), {placed})" +
+                $"{from} ORDER BY b.{uniqueKey};";
+
+            await using var connection = await TestDatabase.OpenConnectionAsync(cancellationToken);
+            await using var command = new SqlCommand(sql, connection) { CommandTimeout = Options.CommandTimeoutSeconds };
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+            var records = new List<PlacedRecord>();
+            while (await reader.ReadAsync(cancellationToken))
+            {
+                records.Add(new PlacedRecord(
+                    reader.GetString(0),
+                    Convert.ToInt64(reader.GetValue(1), CultureInfo.InvariantCulture),
+                    Convert.ToInt64(reader.GetValue(2), CultureInfo.InvariantCulture),
+                    reader.GetInt64(3),
+                    reader.GetInt64(4)));
+            }
+
+            return records;
         }
 
         /// <summary>
@@ -1802,6 +2060,24 @@ public sealed class ListAndFindSqlTests
             return new FindRows(ids, totals.Count == 0 ? 0 : Assert.Single(totals));
         }
 
+        private static async Task<IReadOnlyList<PlacedRow>> ReadPlacedRowsAsync(
+            DbDataReader reader,
+            CancellationToken cancellationToken)
+        {
+            var rows = new List<PlacedRow>();
+            while (await reader.ReadAsync(cancellationToken))
+            {
+                rows.Add(new PlacedRow(
+                    reader.GetString(SearchSqlBuilder.IdOrdinal),
+                    Convert.ToInt64(reader.GetValue(SearchSqlBuilder.UniqueKeyOrdinal), CultureInfo.InvariantCulture),
+                    Convert.ToInt64(reader.GetValue(SearchSqlBuilder.RecStatusOrdinal), CultureInfo.InvariantCulture),
+                    reader.GetInt64(SearchSqlBuilder.PositionOrdinal),
+                    reader.GetInt64(SearchSqlBuilder.TotalOrdinal)));
+            }
+
+            return rows;
+        }
+
         private static async Task<IReadOnlyList<string>> ReadIdsAsync(DbDataReader reader, CancellationToken cancellationToken)
         {
             var ids = new List<string>();
@@ -1834,6 +2110,14 @@ public sealed class ListAndFindSqlTests
 /// The tests only read. Each holds the shared <see cref="DatabaseWriteLock"/>, because it compares the results of
 /// several statements that no writer may change in between.
 /// </para>
+/// <para>
+/// No statement may use <c>OPENJSON</c>, which needs database compatibility level 130 or higher: packed values travel
+/// in a list every level decodes alike. Every packed statement, and no per-alternative one, ends with the plan hints
+/// that make SQL Server decode each packed list once rather than once per row, and every statement runs under the
+/// default command timeout, so a plan that decodes a long list per row fails its test by timeout. Run with
+/// <c>ConnectionStrings__EpiInfo</c> naming a database below level 130, the class proves the packed statements
+/// there; no test changes a database setting.
+/// </para>
 /// </remarks>
 [Collection(DatabaseCollections.Database)]
 [Trait("Category", "Integration")]
@@ -1848,6 +2132,30 @@ public sealed class SearchStatementBoundsTests : IAsyncLifetime
     // criteria: the RecStatus of the active set and the TOP cap.
     private const int ScalarParameterBudget = 2000;
     private const int FixedActiveSetParameters = 2;
+
+    // The element-token alias every packed list's decoding declares and no per-alternative statement has, and the
+    // carrier no statement may use because it needs database compatibility level 130 or higher.
+    private const string PackedListMarker = "AS [e]([t])";
+    private const string LevelBoundCarrier = "OPENJSON";
+
+    // The plan hints every packed statement ends with, and the start of any query hint, which no per-alternative
+    // statement has.
+    private const string PackedPlanHints =
+        " OPTION (USE HINT ('DISABLE_OPTIMIZER_ROWGOAL', 'FORCE_LEGACY_CARDINALITY_ESTIMATION'))";
+    private const string QueryHint = " OPTION (";
+
+    // The length of the equality and LIKE list on GlobalRecordId, five times the scalar budget: a plan that decodes
+    // and sorts the list again for every row takes minutes over it at every compatibility level, and one that decodes
+    // it once takes a few seconds.
+    private const int PerRowDecodingAlternatives = 5 * ScalarParameterBudget;
+
+    // Session options unlike SqlClient's defaults in each respect a decoding could depend on: quoted identifiers, which
+    // xml methods need; arithmetic aborts and warnings, and rounding aborts; NULL concatenation; and the language, date
+    // format and first weekday, which govern date text. The SELECT reads one option back.
+    private const string NonDefaultSessionOptions =
+        "SET QUOTED_IDENTIFIER OFF; SET ARITHABORT OFF; SET ANSI_WARNINGS OFF; SET NUMERIC_ROUNDABORT ON;"
+        + " SET CONCAT_NULL_YIELDS_NULL OFF; SET LANGUAGE Deutsch; SET DATEFORMAT ydm; SET DATEFIRST 3;"
+        + " SELECT CAST(SESSIONPROPERTY('QUOTED_IDENTIFIER') AS int);";
 
     // Chunks of the threshold searches, run per alternative to build the expected union.
     private const int ChunkSize = 500;
@@ -1871,25 +2179,36 @@ public sealed class SearchStatementBoundsTests : IAsyncLifetime
     public Task DisposeAsync() => Task.CompletedTask;
 
     // Every searchable kind, rendered per alternative and forced into packed form, returns the same rows, positions
-    // and total, in both selected sets.
+    // and total, in both selected sets and under session options unlike SqlClient's defaults.
     [Theory]
-    [InlineData(CaseReport, false)]
-    [InlineData(CaseReport, true)]
-    [InlineData(FoodHistory, false)]
-    [InlineData(FoodHistory, true)]
+    [InlineData(CaseReport, false, false)]
+    [InlineData(CaseReport, true, false)]
+    [InlineData(FoodHistory, false, false)]
+    [InlineData(FoodHistory, true, false)]
+    [InlineData(CaseReport, false, true)]
+    [InlineData(FoodHistory, false, true)]
     public async Task Search_PackedStatement_ReturnsExactlyTheRowsOfTheScalarStatement(
         string formName,
-        bool includeDeleted)
+        bool includeDeleted,
+        bool nonDefaultSessionOptions)
     {
         using var cancellation = new CancellationTokenSource(TestTimeout);
         var token = cancellation.Token;
         await using var databaseLock = await DatabaseWriteLock.AcquireSharedAsync(token);
-        await using var connection = await TestDatabase.OpenConnectionAsync(token);
+        await using var connection = nonDefaultSessionOptions
+            ? await OpenUnpooledConnectionAsync(token)
+            : await TestDatabase.OpenConnectionAsync(token);
         var form = await ReadFormAsync(connection, formName, token);
 
         var cases = formName == CaseReport
             ? await CaseReportCriteriaAsync(connection, token)
             : await FoodHistoryCriteriaAsync(connection, token);
+
+        // Set after the form and the samples are read, so only the Find statements run under them.
+        if (nonDefaultSessionOptions)
+        {
+            await SetNonDefaultSessionOptionsAsync(connection, token);
+        }
 
         foreach (var (label, criteria) in cases)
         {
@@ -1899,8 +2218,8 @@ public sealed class SearchStatementBoundsTests : IAsyncLifetime
             var packed = SearchSqlBuilder.Search(
                 form.Schema, form.DataFields, form.GridColumns, conditions, includeDeleted, null, 0);
 
-            Assert.DoesNotContain("OPENJSON", scalar.Statement.Text, StringComparison.Ordinal);
-            Assert.Contains("OPENJSON", packed.Statement.Text, StringComparison.Ordinal);
+            AssertCarrier(scalar, packed: false);
+            AssertCarrier(packed, packed: true);
 
             var scalarRows = await RunAsync(connection, scalar, token);
             var packedRows = await RunAsync(connection, packed, token);
@@ -1944,15 +2263,16 @@ public sealed class SearchStatementBoundsTests : IAsyncLifetime
         if (size <= ScalarParameterBudget)
         {
             Assert.Equal(size + FixedActiveSetParameters + 1, bound.Statement.Parameters.Count);
-            Assert.DoesNotContain("OPENJSON", bound.Statement.Text, StringComparison.Ordinal);
+            AssertCarrier(bound, packed: false);
         }
         else
         {
             Assert.Equal(packedParameters, bound.Statement.Parameters.Count);
-            Assert.Contains("OPENJSON", bound.Statement.Text, StringComparison.Ordinal);
+            AssertCarrier(bound, packed: true);
         }
 
         Assert.Equal(packedParameters, packed.Statement.Parameters.Count);
+        AssertCarrier(packed, packed: true);
 
         var union = new Dictionary<string, SearchRow>(StringComparer.Ordinal);
         foreach (var chunk in condition.Alternatives.Chunk(ChunkSize))
@@ -1960,7 +2280,7 @@ public sealed class SearchStatementBoundsTests : IAsyncLifetime
             var part = new SearchCondition(condition.FieldName, condition.Target, condition.FieldType, chunk);
             var select = SearchSqlBuilder.Search(
                 form.Schema, form.DataFields, form.GridColumns, [part], includeDeleted: false, excluded);
-            Assert.DoesNotContain("OPENJSON", select.Statement.Text, StringComparison.Ordinal);
+            AssertCarrier(select, packed: false);
 
             var rows = await RunAsync(connection, select, token);
             Assert.All(rows, row => Assert.Equal(rows.Count, row.Total));
@@ -1979,6 +2299,112 @@ public sealed class SearchStatementBoundsTests : IAsyncLifetime
             .ToArray();
 
         Assert.Equal(expected, await RunAsync(connection, bound, token));
+        Assert.Equal(expected, await RunAsync(connection, packed, token));
+    }
+
+    // Equality and LIKE alternatives on the unique GlobalRecordId far past the scalar budget, two of each matching a
+    // seeded record and the other patterns nothing: the packed statement, the only one with the plan hints, runs
+    // within the default command timeout at the database's compatibility level and returns the union of the
+    // per-alternative statements over chunks of the alternatives. The parser gives GlobalRecordId no wildcard path, so
+    // the patterns are built directly; they take the packed LIKE path a text field's patterns take, where an
+    // unhinted plan, or one under the row goal alone at level 130 and later, decodes the list once per row.
+    [Fact]
+    public async Task Search_PackedEqualityAndLikeOnGlobalRecordId_DecodesOnceWithinTheDefaultTimeout()
+    {
+        using var cancellation = new CancellationTokenSource(TestTimeout);
+        var token = cancellation.Token;
+        await using var databaseLock = await DatabaseWriteLock.AcquireSharedAsync(token);
+        await using var connection = await TestDatabase.OpenConnectionAsync(token);
+        var form = await ReadFormAsync(connection, CaseReport, token);
+
+        var ids = await SampleAsync(connection, CaseReport, "b.[GlobalRecordId]", 4, token);
+        var parsed = Assert.Single(Parse(form, [Text(SearchCriteriaParser.GlobalRecordIdFieldName, ids[0])]));
+        SearchAlternative Prefix(string id) =>
+            new(SearchOperator.Like, FieldValue.FromText(id[..Math.Max(1, id.Length / 2)] + "%"));
+
+        var alternatives = new List<SearchAlternative>(PerRowDecodingAlternatives)
+        {
+            new(SearchOperator.Equal, FieldValue.FromText(ids[0])),
+            Prefix(ids[1]),
+            new(SearchOperator.Equal, FieldValue.FromText(ids[2])),
+            Prefix(ids[3]),
+        };
+        while (alternatives.Count < PerRowDecodingAlternatives)
+        {
+            alternatives.Add(new(SearchOperator.Like, FieldValue.FromText(NoMatch(alternatives.Count) + "%")));
+        }
+
+        var condition = new SearchCondition(parsed.FieldName, parsed.Target, parsed.FieldType, alternatives);
+        var packed = SearchSqlBuilder.Search(
+            form.Schema, form.DataFields, form.GridColumns, [condition], includeDeleted: false, null);
+        AssertCarrier(packed, packed: true);
+        Assert.Equal(FixedActiveSetParameters + 2, packed.Statement.Parameters.Count);
+
+        var union = new Dictionary<string, SearchRow>(StringComparer.Ordinal);
+        foreach (var chunk in alternatives.Chunk(ChunkSize))
+        {
+            var part = new SearchCondition(condition.FieldName, condition.Target, condition.FieldType, chunk);
+            var select = SearchSqlBuilder.Search(
+                form.Schema, form.DataFields, form.GridColumns, [part], includeDeleted: false, null);
+            AssertCarrier(select, packed: false);
+
+            var rows = await RunAsync(connection, select, token);
+            Assert.All(rows, row => Assert.Equal(rows.Count, row.Total));
+            foreach (var row in rows)
+            {
+                union[row.Id] = row;
+            }
+        }
+
+        Assert.Superset(ids.ToHashSet(StringComparer.Ordinal), union.Keys.ToHashSet(StringComparer.Ordinal));
+        Assert.True(union.Count <= RecordQueryRules.SearchCap, "The seeded ids match more rows than one page.");
+        var expected = union.Values
+            .OrderBy(row => row.UniqueKey)
+            .Select(row => row with { Total = union.Count })
+            .ToArray();
+
+        Assert.Equal(expected, await RunAsync(connection, packed, token));
+    }
+
+    // A packed list decodes every element at the lengths where the digit tables that number its elements grow: an
+    // equality list whose first and last elements are two seeded values, each matching complete active records, and
+    // whose others match nothing, returns exactly the rows of its per-alternative statement.
+    [Theory]
+    [InlineData(2)]
+    [InlineData(10)]
+    [InlineData(11)]
+    [InlineData(100)]
+    [InlineData(101)]
+    [InlineData(1000)]
+    [InlineData(1001)]
+    public async Task Search_PackedListOfAnyLength_DecodesItsFirstAndLastElements(int length)
+    {
+        using var cancellation = new CancellationTokenSource(TestTimeout);
+        var token = cancellation.Token;
+        await using var databaseLock = await DatabaseWriteLock.AcquireSharedAsync(token);
+        await using var connection = await TestDatabase.OpenConnectionAsync(token);
+        var form = await ReadFormAsync(connection, CaseReport, token);
+        var field = Assert.Single(form.DataFields, candidate => candidate.Name == "LastName");
+        var seeded = await SeededLastNamesAsync(connection, token);
+        Assert.True(seeded.Count >= 2, "The database holds too few seeded LastName values.");
+
+        var condition = new SearchCondition(
+            field.Name,
+            SearchTarget.PageField,
+            field.FieldType,
+            [.. Enumerable.Range(0, length).Select(index => new SearchAlternative(
+                SearchOperator.Equal,
+                FieldValue.FromText(index == 0 ? seeded[0] : index == length - 1 ? seeded[1] : NoMatch(index))))]);
+
+        var scalar = SearchSqlBuilder.Search(form.Schema, form.DataFields, form.GridColumns, [condition], false, null);
+        var packed = SearchSqlBuilder.Search(
+            form.Schema, form.DataFields, form.GridColumns, [condition], false, null, 0);
+        AssertCarrier(scalar, packed: false);
+        AssertCarrier(packed, packed: true);
+        Assert.Equal(FixedActiveSetParameters + 1, packed.Statement.Parameters.Count);
+
+        var expected = await RunAsync(connection, scalar, token);
+        Assert.NotEmpty(expected);
         Assert.Equal(expected, await RunAsync(connection, packed, token));
     }
 
@@ -2317,6 +2743,49 @@ public sealed class SearchStatementBoundsTests : IAsyncLifetime
 
     private static string NoMatch(int index) =>
         "NoMatch-" + index.ToString(CultureInfo.InvariantCulture) + "-" + Guid.NewGuid().ToString("N");
+
+    // A statement decodes a packed list, and ends with the packed plan hints, exactly when it binds its values packed;
+    // a per-alternative statement has no query hint, and none uses OPENJSON.
+    private static void AssertCarrier(SearchSelect select, bool packed)
+    {
+        Assert.DoesNotContain(LevelBoundCarrier, select.Statement.Text, StringComparison.Ordinal);
+        if (packed)
+        {
+            Assert.Contains(PackedListMarker, select.Statement.Text, StringComparison.Ordinal);
+            Assert.EndsWith(PackedPlanHints, select.Statement.Text, StringComparison.Ordinal);
+        }
+        else
+        {
+            Assert.DoesNotContain(PackedListMarker, select.Statement.Text, StringComparison.Ordinal);
+            Assert.DoesNotContain(QueryHint, select.Statement.Text, StringComparison.Ordinal);
+        }
+    }
+
+    // A connection with an unpooled session of its own, so the SET options a test changes end when it is disposed.
+    private static async Task<SqlConnection> OpenUnpooledConnectionAsync(CancellationToken token)
+    {
+        var builder = TestDatabase.Builder();
+        builder.Pooling = false;
+        var connection = TestDatabase.CreateConnection(builder);
+        try
+        {
+            await connection.OpenAsync(token);
+            return connection;
+        }
+        catch
+        {
+            await connection.DisposeAsync();
+            throw;
+        }
+    }
+
+    // Applies NonDefaultSessionOptions to the connection's session and checks that they took effect.
+    private static async Task SetNonDefaultSessionOptionsAsync(SqlConnection connection, CancellationToken token)
+    {
+        await using var command = new SqlCommand(NonDefaultSessionOptions, connection);
+        var quotedIdentifier = await command.ExecuteScalarAsync(token);
+        Assert.Equal(0, Convert.ToInt32(quotedIdentifier, CultureInfo.InvariantCulture));
+    }
 
     private static string Or(IEnumerable<string> alternatives) => string.Join(" or ", alternatives);
 

@@ -71,6 +71,9 @@ public sealed class ReservedWordIdentifierTests
     // the value of @p1, even inside a bracketed identifier.
     private const string BinderMarkerColumn = "{=p1}";
 
+    // The element-token alias every packed list's decoding declares, which a per-alternative Find statement lacks.
+    private const string PackedListMarker = "AS [e]([t])";
+
     // Session temporary tables, one pair per fixture.
     private const string ExactBase = "#ExactBase";
     private const string ExactPage = "#ExactPage";
@@ -314,8 +317,9 @@ public sealed class ReservedWordIdentifierTests
             var found = await FindAsync(search.Statement);
             Assert.Equal(expectedRows, string.Concat(found.Select(id => labels[id])));
 
-            // Packed, as a search beyond the scalar budget binds it, the criterion travels as a JSON array element and
-            // selects exactly the same rows: bigint and decimal criteria decode to their own exact values.
+            // Packed, as a search beyond the scalar budget binds it, the criterion travels as a packed list element,
+            // never through OPENJSON, which needs compatibility level 130, and selects exactly the same rows: bigint,
+            // decimal and float criteria decode to their own exact values.
             var packed = SearchSqlBuilder.Search(
                 fixture.Schema,
                 fixture.DataFields,
@@ -324,7 +328,10 @@ public sealed class ReservedWordIdentifierTests
                 includeDeleted: false,
                 excludeGlobalRecordId: null,
                 scalarParameterBudget: 0);
-            Assert.Contains("OPENJSON", packed.Statement.Text, StringComparison.Ordinal);
+            Assert.Contains(PackedListMarker, packed.Statement.Text, StringComparison.Ordinal);
+            Assert.DoesNotContain(PackedListMarker, search.Statement.Text, StringComparison.Ordinal);
+            Assert.DoesNotContain("OPENJSON", packed.Statement.Text, StringComparison.Ordinal);
+            Assert.DoesNotContain("OPENJSON", search.Statement.Text, StringComparison.Ordinal);
 
             var packedFound = await FindAsync(packed.Statement);
             Assert.Equal(expectedRows, string.Concat(packedFound.Select(id => labels[id])));

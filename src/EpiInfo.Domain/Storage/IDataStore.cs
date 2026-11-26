@@ -340,6 +340,12 @@ public interface IDataStore
     /// equals the record's navigation position.
     /// </description></item>
     /// <item><description>
+    /// Each result's membership in the selected set, its position and its <c>RecStatus</c> come from one consistent
+    /// read: in the SQL store, one statement whose base-table read holds its shared locks until the statement completes
+    /// (<c>HOLDLOCK</c>), so no base row it read can change before it returns, and the three describe one committed
+    /// state even under a concurrent soft delete.
+    /// </description></item>
+    /// <item><description>
     /// Each result holds the grid columns of <see cref="RecordQueryRules.GetGridColumns(FormMetadata)"/>, which the
     /// store derives itself, and the response is built with <see cref="SearchResponse.Create"/>.
     /// </description></item>

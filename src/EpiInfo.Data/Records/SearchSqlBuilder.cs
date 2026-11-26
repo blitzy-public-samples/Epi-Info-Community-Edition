@@ -1,8 +1,6 @@
-using System.Buffers;
 using System.Data;
 using System.Globalization;
 using System.Text;
-using System.Text.Json;
 using EpiInfo.Data.Metadata;
 using EpiInfo.Data.Sql;
 using EpiInfo.Domain.Metadata;
@@ -47,10 +45,13 @@ internal sealed record ListSelect(SqlStatement Statement, IReadOnlyList<Projecte
 /// <para>
 /// <b>Identifiers and values.</b> Every table and column name comes from the reader-built <see cref="FormSchema"/>
 /// and reaches the text only through <see cref="SqlIdentifier"/>, by way of the <see cref="RecordSqlBuilder"/>
-/// helpers. The CTE name <c>[n]</c>, its columns <c>[k]</c> and <c>[pos]</c>, the aliases <c>b</c>, <c>n</c>,
-/// <c>p{i}</c>, <c>[a]</c> and <c>[c{n}]</c>, the collation name, the escape character and the decoding expressions
-/// of packed values are fixed literals. Every value (criteria, packed or not, the grid filter, the excluded id, the
-/// cap, the offset and the page size) is a positional parameter, so text that looks like SQL stays inert data.
+/// helpers. The CTE name <c>[n]</c>, its position column <c>[pos]</c>, the aliases <c>b</c>, <c>p{i}</c> and
+/// <c>[c{n}]</c>, the names a packed list is decoded under (the derived tables <c>[d]</c>, <c>[a]</c> and <c>[e]</c>,
+/// the digit tables <c>[r{k}]</c>, and their columns <c>[v]</c>, <c>[i]</c>, <c>[t]</c> and <c>[g]</c>), the
+/// collation name, the escape character, the decoding expressions of packed values and a packed statement's plan
+/// hints, <c>OPTION (USE HINT ('DISABLE_OPTIMIZER_ROWGOAL', 'FORCE_LEGACY_CARDINALITY_ESTIMATION'))</c>, are fixed
+/// literals. Every value (criteria, packed or not, the grid filter, the excluded id, the cap, the offset and the page
+/// size) is a positional parameter, so text that looks like SQL stays inert data.
 /// </para>
 /// <para>
 /// Every exception message is fixed text naming no table, column, field, value or id, as the redaction policy
@@ -97,7 +98,7 @@ internal static class SearchSqlBuilder
     private const string NTextTypeName = "ntext";
 
     // The most alternatives other than IS NULL a Find statement binds one parameter each; a search with more binds
-    // its values packed, a few JSON-array parameters per condition.
+    // its values packed, a few packed-list parameters per condition.
     private const int ScalarParameterBudget = 2000;
 
     // SQL Server accepts 2,100 parameters per command, and sp_executesql, which SqlClient sends a parameterised
@@ -107,34 +108,65 @@ internal static class SearchSqlBuilder
     // The name a criterion's scalar parameter is built under before its value is packed; it is never bound.
     private const string PackedValueName = "@v";
 
-    // The decoding of one element of a packed array, OPENJSON's [a].[value], into the SQL type and value the scalar
-    // parameter would bind. Text is hexadecimal UTF-16LE, so every code unit, a lone surrogate included, round-trips.
-    private const string PackedTextDecoder = "CAST(CONVERT(varbinary(max), [a].[value], 1) AS nvarchar(max))";
-    private const string PackedByteDecoder = "CAST([a].[value] AS tinyint)";
-    private const string PackedInt16Decoder = "CAST([a].[value] AS smallint)";
-    private const string PackedInt32Decoder = "CAST([a].[value] AS int)";
-    private const string PackedInt64Decoder = "CAST([a].[value] AS bigint)";
-    private const string PackedBooleanDecoder = "CAST([a].[value] AS bit)";
-    private const string PackedDateTimeDecoder = "CONVERT(datetime, [a].[value], 126)";
+    // A packed list is ASCII text: its element count, then the cumulative offsets of its element tokens, 0 first and
+    // one after each token, each a decimal number of PackedNumberWidth digits, then the tokens themselves. Ten digits
+    // hold every int, so every count and offset a .NET string can have. ASCII text is one code unit per character
+    // under every collation, so SUBSTRING reads the same positions whatever the database's collation is.
+    private const int PackedNumberWidth = 10;
+    private const string PackedNumberFormat = "D10";
 
-    // A float element is [sign, biased exponent, fraction], the fields of its IEEE 754 bits, rebuilt by arithmetic
-    // that is exact at every step: the significand, at most 2^53, converts to float exactly, and multiplying it by a
-    // power of two, the original value's own scale, rounds nothing. SQL Server's text-to-float parse is not correctly
-    // rounded and it refuses binary-to-float, so neither decimal text nor the raw bits would be exact.
+    // The decoding of one element token, [e].[t], into the SQL type and value the scalar parameter would bind. Text is
+    // the hexadecimal of its UTF-16LE code units, which CONVERT style 2 reads, so every code unit, a lone surrogate
+    // included, round-trips.
+    private const string PackedTextDecoder = "CAST(CONVERT(varbinary(max), [e].[t], 2) AS nvarchar(max))";
+
+    // A LIKE pattern's text decoding. LIKE reads an nvarchar(max) pattern as nvarchar(4000), the conversion the
+    // per-alternative statement applies to its parameter once; decoding a packed pattern to that type does it once per
+    // element instead of once per comparison, which with patterns of a few dozen characters made a long list about
+    // ten times slower to match. It holds every pattern, because none passes RecordQueryRules.MaxLikePatternLength.
+    private const string PackedPatternDecoder = "CAST(CONVERT(varbinary(max), [e].[t], 2) AS nvarchar(4000))";
+    private const string PackedByteDecoder = "CAST([e].[t] AS tinyint)";
+    private const string PackedInt16Decoder = "CAST([e].[t] AS smallint)";
+    private const string PackedInt32Decoder = "CAST([e].[t] AS int)";
+    private const string PackedInt64Decoder = "CAST([e].[t] AS bigint)";
+    private const string PackedBooleanDecoder = "CAST([e].[t] AS bit)";
+    private const string PackedDateTimeDecoder = "CONVERT(datetime, [e].[t], 126)";
+
+    // A float token is the fields of its IEEE 754 bits at fixed widths: the sign (one digit), the biased exponent
+    // (four) and the fraction (sixteen). They are rebuilt by arithmetic that is exact at every step: the significand,
+    // at most 2^53, converts to float exactly, and multiplying it by a power of two, the original value's own scale,
+    // rounds nothing. SQL Server's text-to-float parse is not correctly rounded and it refuses binary-to-float, so
+    // neither decimal text nor the raw bits would be exact.
     private const string PackedDoubleDecoder =
-        "CASE WHEN CAST(JSON_VALUE([a].[value], '$[0]') AS int) = 1 THEN -1e0 ELSE 1e0 END"
-        + " * CAST(CAST(JSON_VALUE([a].[value], '$[2]') AS bigint)"
-        + " + CASE WHEN CAST(JSON_VALUE([a].[value], '$[1]') AS int) = 0 THEN 0 ELSE 4503599627370496 END AS float)"
-        + " * POWER(CAST(2 AS float), CASE WHEN CAST(JSON_VALUE([a].[value], '$[1]') AS int) = 0 THEN -1074"
-        + " ELSE CAST(JSON_VALUE([a].[value], '$[1]') AS int) - 1075 END)";
+        "CASE WHEN CAST(SUBSTRING([e].[t], 1, 1) AS int) = 1 THEN -1e0 ELSE 1e0 END"
+        + " * CAST(CAST(SUBSTRING([e].[t], 6, 16) AS bigint)"
+        + " + CASE WHEN CAST(SUBSTRING([e].[t], 2, 4) AS int) = 0 THEN 0 ELSE 4503599627370496 END AS float)"
+        + " * POWER(CAST(2 AS float), CASE WHEN CAST(SUBSTRING([e].[t], 2, 4) AS int) = 0 THEN -1074"
+        + " ELSE CAST(SUBSTRING([e].[t], 2, 4) AS int) - 1075 END)";
+    private const string DoubleExponentFormat = "D4";
+    private const string DoubleFractionFormat = "D16";
 
     // The date and time form CONVERT style 126 reads exactly.
     private const string PackedDateTimeFormat = "yyyy-MM-ddTHH:mm:ss.fff";
 
-    // The row limit of the derived table an equality group's array is decoded in, int.MaxValue, so it keeps every
-    // element, and the name its decoded value takes there.
+    // The row limit of the derived table a packed list is decoded in, int.MaxValue, so it keeps every element, and
+    // the name its decoded value takes there.
     private const string PackedFenceRows = "2147483647";
     private const string PackedFencedValue = "[d].[v]";
+
+    // One digit table of the row source that numbers a packed list's elements: k of them, cross joined, give each
+    // index from 0 to 10^k - 1 once.
+    private const string PackedDigits = "(VALUES (0), (1), (2), (3), (4), (5), (6), (7), (8), (9))";
+    private const int PackedDigitBase = 10;
+
+    // The plan hints a packed statement ends with. The optimizer costs decoding a list as almost free, so with the
+    // row goal TOP (@cap) sets, or under the cardinality estimator of compatibility level 130 and later, it can pick a
+    // nested-loops semi-join that decodes and sorts the whole list again for every candidate row instead of spooling
+    // it once: a few thousand LIKE alternatives then run past the 30-second default command timeout. The row goal buys
+    // nothing, because COUNT_BIG(*) OVER () reads every match before TOP returns a row, and the estimator of levels 100
+    // and 110 is applied at every level, so each level plans the decoding as those do: once per list.
+    private const string PackedPlanHints =
+        " OPTION (USE HINT ('DISABLE_OPTIMIZER_ROWGOAL', 'FORCE_LEGACY_CARDINALITY_ESTIMATION'))";
 
     // SQL Server's largest decimal precision, the precision a packed decimal element is read back with.
     private const int MaxDecimalPrecision = 38;
@@ -170,19 +202,35 @@ internal static class SearchSqlBuilder
     /// <remarks>
     /// <para>The statement has this shape:</para>
     /// <code>
-    /// WITH [n] AS (SELECT b.[UniqueKey] AS [k], ROW_NUMBER() OVER (ORDER BY b.[UniqueKey]) AS [pos]
-    ///              FROM [base] b [WHERE b.[RecStatus] = @p0])
+    /// WITH [n] AS (SELECT b.[GlobalRecordId], b.[UniqueKey], b.[RecStatus],
+    ///                     ROW_NUMBER() OVER (ORDER BY b.[UniqueKey]) AS [pos]
+    ///              FROM [base] b WITH (HOLDLOCK) [WHERE b.[RecStatus] = @p0])
     /// SELECT TOP (@p1) b.[GlobalRecordId] AS [c0], b.[UniqueKey] AS [c1], b.[RecStatus] AS [c2],
-    ///        n.[pos] AS [c3], COUNT_BIG(*) OVER () AS [c4], p0.[col] AS [c5], ...
-    /// FROM [base] b INNER JOIN [n] n ON n.[k] = b.[UniqueKey]
-    ///      INNER JOIN [page] p0 ON p0.[GlobalRecordId] = b.[GlobalRecordId] ...
-    /// WHERE (alt OR alt ...) AND (alt OR ...) [AND b.[GlobalRecordId] &lt;&gt; @pX]
+    ///        b.[pos] AS [c3], COUNT_BIG(*) OVER () AS [c4], p0.[col] AS [c5], ...
+    /// FROM [n] b INNER JOIN [page] p0 ON p0.[GlobalRecordId] = b.[GlobalRecordId] ...
+    /// WHERE (alt OR alt ...) AND (alt OR ...)
+    ///   [AND NOT (b.[GlobalRecordId] = @pX AND DATALENGTH(b.[GlobalRecordId]) = DATALENGTH(@pX))]
     /// ORDER BY b.[UniqueKey]
+    /// [OPTION (USE HINT ('DISABLE_OPTIMIZER_ROWGOAL', 'FORCE_LEGACY_CARDINALITY_ESTIMATION'))]  -- packed only
     /// </code>
     /// <para>
     /// <b>Positions.</b> The CTE reads the base table only and applies only the selected-set predicate, so
     /// <c>[pos]</c> is numbered before any criterion and equals the navigation position, the count of selected rows
     /// with <c>UniqueKey &lt;= k</c>.
+    /// </para>
+    /// <para>
+    /// <b>One base read.</b> The CTE is the statement's only reference to the base table. It keeps the base system
+    /// columns under their catalogue names, and the outer query reads it as <c>b</c>, so the projected id, key and
+    /// status, the system-field criteria, the page joins and the exclusion all read the row that was numbered. The
+    /// reference carries the base-table hint <c>WITH (HOLDLOCK)</c> that <see cref="RecordSqlBuilder"/>'s class remarks
+    /// describe for its record reads: under the database's locking <c>READ COMMITTED</c>, every shared and key-range
+    /// lock taken through it is held until the statement completes, so no base row read can change, and no row can be
+    /// inserted among them, before it returns, and each result's membership in the selected set, its position and its
+    /// status describe one committed state even under a concurrent soft delete. That holds too where the plan reads the
+    /// reference more than once, as SQL Server may when it expands an <c>OR</c> into separate branches: every read
+    /// holds its locks, so each sees the rows the others hold. Only the base table carries the hint, and every
+    /// application write locks a record's base row before any of its page rows, so the page rows joined to a held base
+    /// row cannot change either.
     /// </para>
     /// <para>
     /// <b>Result set.</b> The base table is joined with <c>INNER JOIN</c> to every page that has a table, so a record
@@ -194,7 +242,10 @@ internal static class SearchSqlBuilder
     /// <para>
     /// <b>Open record, total and cap.</b> The excluded id is removed in the <c>WHERE</c> clause, so it is gone before
     /// <c>COUNT_BIG(*) OVER ()</c> counts the matches and before <c>TOP</c> caps them; legacy removed the open record
-    /// from the result afterwards (<c>:2256-2266</c>) and had neither a total nor a cap.
+    /// from the result afterwards (<c>:2256-2266</c>) and had neither a total nor a cap. The exclusion is
+    /// <see cref="RecordSqlBuilder.AppendGlobalRecordIdExclusion"/>, the negation of the exact match every lookup by id
+    /// uses, so it leaves out exactly the record a lookup by that id finds: an id that differs from a stored id only by
+    /// trailing spaces, or is longer than the column, excludes nothing, and letter case follows the collation.
     /// </para>
     /// <para>
     /// <b>Collation.</b> No <c>COLLATE</c> clause is written: equality and <c>LIKE</c> compare under the database
@@ -227,31 +278,48 @@ internal static class SearchSqlBuilder
     /// more renders every condition packed instead, so its parameter count no longer grows with its alternatives:
     /// </para>
     /// <code>
-    /// (column IS NULL OR EXISTS (SELECT 1 FROM OPENJSON(@p2) AS [a] WHERE column LIKE decoded) OR ...)
+    /// (column IS NULL OR EXISTS (SELECT 1 FROM (SELECT TOP (2147483647) decoded AS [v]
+    ///      FROM (SELECT [r0].[g] + 10 * [r1].[g] ... AS [i]
+    ///            FROM (VALUES (0), ..., (9)) AS [r0]([g]) CROSS JOIN ...) AS [a]
+    ///      CROSS APPLY (VALUES (CASE WHEN [a].[i] &lt; count THEN SUBSTRING(@p2, start, length) END)) AS [e]([t])
+    ///      WHERE [a].[i] &lt; count ORDER BY [v]) AS [d] WHERE column LIKE [d].[v]) OR ...)
     /// </code>
     /// <para>
     /// The <c>IS NULL</c> alternatives give one <c>IS NULL</c> term. The other values of a condition are grouped by
     /// operator and by the type of the scalar parameter each would bind, one type per condition except that a number
     /// on an integer column binds <c>bigint</c> or <c>decimal</c>, and each group is one <c>nvarchar(max)</c>
-    /// parameter holding a JSON array, at most twelve per condition. The <c>EXISTS</c> applies
-    /// the operator's own predicate to each element of the array, the comparison on the comparable column, <c>LIKE</c>
-    /// with no <c>ESCAPE</c> clause and the 255-character <c>SUBSTRING</c> equality, so an element matches exactly
-    /// when its scalar parameter would. For the two equalities the array is decoded in a
-    /// <c>SELECT TOP (2147483647) ... ORDER BY [a].[key]</c> derived table, which keeps every element; no predicate
-    /// can be pushed below its <c>TOP</c>, so SQL Server matches the decoded set with one hash or merge semi-join
-    /// rather than reading the whole array again for each row, which a list of thousands of values would make take
-    /// seconds; the other operators cannot use such a join and read the array directly. Each value is first built as
-    /// that scalar parameter by
-    /// <see cref="ColumnValueConverter.ToSearchParameter"/>, which checks its kind and range, and then encoded by the
-    /// parameter's type so that its decoding has that same SQL type and value: text as the hexadecimal of its UTF-16LE
-    /// code units, decoded through <c>varbinary(max)</c> to <c>nvarchar(max)</c>, which keeps every code unit and,
-    /// like a parameter, takes the database's coercible-default collation, so a column's collation governs the
-    /// comparison as it does for a parameter; integers and bits as invariant decimal text, cast to their own type;
-    /// a <c>decimal</c> as its invariant text, cast to <c>decimal(38, s)</c> with <c>s</c> the largest scale of its
-    /// array; a date as <c>yyyy-MM-ddTHH:mm:ss.fff</c> read with <c>CONVERT</c> style 126, exact for the midnight values
-    /// search binds; and a float as the sign, exponent and fraction of its IEEE 754 bits, rebuilt by exact
-    /// arithmetic, because SQL Server's text-to-float parse is not correctly rounded. <c>OPENJSON</c> needs database
-    /// compatibility level 130 or higher; the rehearsal database runs at 160.
+    /// parameter holding a packed list, at most twelve per condition. A packed list is ASCII text: the element count
+    /// and the cumulative offsets of the element tokens, starting with 0, each ten decimal digits, then the tokens.
+    /// The derived table <c>[d]</c> decodes it into one row per element: cross-joined digit tables, as many as the
+    /// count has digits, number the elements, and <c>SUBSTRING</c> reads each element's token at the offsets the
+    /// header gives, so the count, the offsets and the values all stay in the parameter and the text depends on the
+    /// count only through its number of digits. It uses only T-SQL that every database compatibility level and every
+    /// session <c>SET</c> option evaluate the same way, so Find runs on any database SQL Server 2022 accepts; no
+    /// <c>OPENJSON</c>, which needs level 130, <c>JSON_VALUE</c>, <c>STRING_SPLIT</c> or <c>xml</c> method. The
+    /// <c>EXISTS</c> applies the operator's own predicate to each decoded element, the comparison on the comparable
+    /// column, <c>LIKE</c> with no <c>ESCAPE</c> clause and the 255-character <c>SUBSTRING</c> equality, so an element
+    /// matches exactly when its scalar parameter would. The <c>TOP (2147483647) ... ORDER BY [v]</c> keeps every
+    /// element; ordering by the decoded value makes SQL Server decode each element once, before the sort, and no
+    /// predicate can be pushed below the <c>TOP</c>, so the decoded set stays uncorrelated: SQL Server can match an
+    /// equality with one merge or hash semi-join and scan the elements of any other operator from one spool, rather
+    /// than decoding the whole list again for each row, which a list of thousands of values would make take many
+    /// seconds. Because SQL Server costs that decoding as almost free, it may still choose to repeat it per row under
+    /// the row goal of <c>TOP</c>, which buys nothing since <c>COUNT_BIG(*) OVER ()</c> reads every match first, or
+    /// under the cardinality estimator of level 130 and later, so a packed statement alone ends with
+    /// <c>OPTION (USE HINT ('DISABLE_OPTIMIZER_ROWGOAL', 'FORCE_LEGACY_CARDINALITY_ESTIMATION'))</c>, which makes every
+    /// level plan it as levels 100 and 110 do without a row goal: once per list. Each value is first built as that
+    /// scalar parameter by <see cref="ColumnValueConverter.ToSearchParameter"/>, which checks its kind and range, and
+    /// then encoded by the parameter's type so that its decoding has that same SQL type and value: text as the
+    /// hexadecimal of its UTF-16LE code units, decoded through <c>varbinary(max)</c> with <c>CONVERT</c> style 2 to
+    /// <c>nvarchar(max)</c>, or for a <c>LIKE</c> pattern to the <c>nvarchar(4000)</c> that <c>LIKE</c> converts its
+    /// <c>nvarchar(max)</c> parameter to, which holds every pattern within the length bound below and is then not
+    /// converted again for each comparison; either keeps every code unit and, like a parameter, takes the database's
+    /// coercible-default collation, so a column's collation governs the comparison as it does for a parameter;
+    /// integers and bits as invariant decimal text, cast
+    /// to their own type; a <c>decimal</c> as its invariant text, cast to <c>decimal(38, s)</c> with <c>s</c> the
+    /// largest scale of its list; a date as <c>yyyy-MM-ddTHH:mm:ss.fff</c> read with <c>CONVERT</c> style 126, exact
+    /// for the midnight values search binds; and a float as the sign, exponent and fraction of its IEEE 754 bits at
+    /// fixed widths, rebuilt by exact arithmetic, because SQL Server's text-to-float parse is not correctly rounded.
     /// </para>
     /// <para>
     /// <b>Bounds.</b> A statement that would still bind more than 2,098 parameters, which only conditions beyond the
@@ -340,11 +408,17 @@ internal static class SearchSqlBuilder
         var resolved = ResolveConditions(schema, dataFields, conditions);
         var columns = ResolveGridColumns(schema, gridColumns, SearchFirstColumnOrdinal);
 
+        // The numbered selected set is the statement's one base-table reference. It keeps the base system columns
+        // under their catalogue names, so every b.[...] reference below reads the numbered row, and its HOLDLOCK keeps
+        // that row's membership, position and status one committed state until the statement completes.
         var parameters = new PositionalParameters();
         var sql = new StringBuilder("WITH [n] AS (SELECT ");
-        AppendBase(sql, uniqueKey).Append(" AS [k], ROW_NUMBER() OVER (ORDER BY ");
+        AppendBase(sql, globalRecordId).Append(", ");
+        AppendBase(sql, uniqueKey).Append(", ");
+        AppendBase(sql, recStatus).Append(", ROW_NUMBER() OVER (ORDER BY ");
         AppendBase(sql, uniqueKey).Append(") AS [pos] FROM ");
         AppendBaseTable(sql, schema);
+        sql.Append(" WITH (HOLDLOCK)");
         RecordSqlBuilder.AppendSelectedSetPredicate(sql, schema, includeDeleted, parameters, SelectedSetClause.Where);
 
         sql.Append(") SELECT TOP (")
@@ -353,14 +427,12 @@ internal static class SearchSqlBuilder
         AppendBase(sql, globalRecordId).Append(" AS ").Append(RecordSqlBuilder.ColumnAlias(IdOrdinal)).Append(", ");
         AppendBase(sql, uniqueKey).Append(" AS ").Append(RecordSqlBuilder.ColumnAlias(UniqueKeyOrdinal)).Append(", ");
         AppendBase(sql, recStatus).Append(" AS ").Append(RecordSqlBuilder.ColumnAlias(RecStatusOrdinal));
-        sql.Append(", n.[pos] AS ").Append(RecordSqlBuilder.ColumnAlias(PositionOrdinal))
+        sql.Append(", ").Append(RecordSqlBuilder.BaseAlias).Append(".[pos] AS ")
+            .Append(RecordSqlBuilder.ColumnAlias(PositionOrdinal))
             .Append(", COUNT_BIG(*) OVER () AS ").Append(RecordSqlBuilder.ColumnAlias(TotalOrdinal));
         AppendProjections(sql, schema, columns);
 
-        sql.Append(" FROM ");
-        AppendBaseTable(sql, schema);
-        sql.Append(" INNER JOIN [n] n ON n.[k] = ");
-        AppendBase(sql, uniqueKey);
+        sql.Append(" FROM [n] ").Append(RecordSqlBuilder.BaseAlias);
         for (var index = 0; index < schema.Pages.Count; index++)
         {
             if (schema.Pages[index].Table is { } table)
@@ -395,14 +467,20 @@ internal static class SearchSqlBuilder
 
         if (excludeGlobalRecordId is not null)
         {
-            // Bound at full length like every request-supplied id, so an over-long id excludes nothing.
+            // The negated exact match of every lookup by id, inside WHERE so the record is gone before the total and
+            // the cap: a spelling that finds no row by id, padded or over-long, excludes nothing.
             sql.Append(clause);
-            AppendBase(sql, globalRecordId).Append(" <> ")
-                .Append(parameters.Add(n => ColumnValueConverter.Text(n, excludeGlobalRecordId)));
+            RecordSqlBuilder.AppendGlobalRecordIdExclusion(sql, schema, parameters, excludeGlobalRecordId);
         }
 
         sql.Append(" ORDER BY ");
         AppendBase(sql, uniqueKey);
+
+        // Only a packed statement decodes lists; the per-alternative statement keeps the optimizer's own choices.
+        if (packed)
+        {
+            sql.Append(PackedPlanHints);
+        }
 
         if (parameters.Count > MaxStatementParameters)
         {
@@ -607,7 +685,7 @@ internal static class SearchSqlBuilder
     }
 
     // One condition in packed form: one IS NULL term for its IS NULL alternatives, then, for each operator and scalar
-    // parameter type in the order the alternatives first use them, an EXISTS over the JSON array of their values.
+    // parameter type in the order the alternatives first use them, an EXISTS over the packed list of their values.
     private static void AppendPackedAlternatives(
         StringBuilder sql,
         ResolvedCondition condition,
@@ -645,29 +723,84 @@ internal static class SearchSqlBuilder
 
         foreach (var group in groups)
         {
-            var array = PackValues(group.Values, out var decoder);
-            var name = parameters.Add(n => ColumnValueConverter.Text(n, array));
-            sql.Append(separator).Append("EXISTS (SELECT 1 FROM ");
-            string value;
-            if (group.Operator is SearchOperator.Equal or SearchOperator.PrefixEqual255)
+            var list = PackValues(group.Values, out var decoder);
+            if (group.Operator == SearchOperator.Like && group.DbType == DbType.String)
             {
-                // A predicate cannot be pushed below TOP, so the decoded array stays uncorrelated and SQL Server can
-                // match it with one hash or merge semi-join instead of reading the whole array again for every row.
-                sql.Append("(SELECT TOP (").Append(PackedFenceRows).Append(") ").Append(decoder)
-                    .Append(" AS [v] FROM OPENJSON(").Append(name)
-                    .Append(") AS [a] ORDER BY [a].[key]) AS [d] WHERE ");
-                value = PackedFencedValue;
-            }
-            else
-            {
-                sql.Append("OPENJSON(").Append(name).Append(") AS [a] WHERE ");
-                value = decoder;
+                decoder = PackedPatternDecoder;
             }
 
-            AppendPredicate(sql, condition, group.Operator, value);
+            var name = parameters.Add(n => ColumnValueConverter.Text(n, list));
+            sql.Append(separator).Append("EXISTS (SELECT 1 FROM ");
+            AppendPackedElements(sql, name, group.Values.Count, decoder);
+            sql.Append(" WHERE ");
+            AppendPredicate(sql, condition, group.Operator, PackedFencedValue);
             sql.Append(')');
             separator = " OR ";
         }
+    }
+
+    // The derived table [d] of a packed list's decoded elements, one row each, the value named [v]:
+    //   (SELECT TOP (2147483647) decoder AS [v]
+    //    FROM (SELECT [r0].[g] + 10 * [r1].[g] + ... AS [i] FROM digits AS [r0]([g]) CROSS JOIN ...) AS [a]
+    //    CROSS APPLY (VALUES (CASE WHEN [a].[i] < count THEN SUBSTRING(@p, token start, token length) END)) AS [e]([t])
+    //    WHERE [a].[i] < count ORDER BY [v]) AS [d]
+    // with count CAST(SUBSTRING(@p, 1, 10) AS int) and token i's start and end read from offsets i and i + 1. It uses
+    // only T-SQL that every compatibility level and every SET option evaluates the same way: no OPENJSON, JSON
+    // function, STRING_SPLIT or xml method. The digit tables, the fewest whose product reaches the element count,
+    // number the elements, so the text depends on the count only through its number of digits; the count, the
+    // offsets and the values are read from the parameter. The CASE keeps an index past the count from reading token
+    // text as an offset, whatever order SQL Server evaluates the filter in. Ordering by the decoded value makes SQL
+    // Server decode each element once, before the sort, instead of deferring the decoding into the predicate, where it
+    // would read the parameter again for every row compared; and no predicate can be pushed below the TOP, so the
+    // decoded set stays uncorrelated: SQL Server can match an equality with one merge or hash semi-join and scan the
+    // elements of any other operator from one spool rather than decoding the whole list again for every row.
+    private static void AppendPackedElements(StringBuilder sql, string name, int count, string decoder)
+    {
+        // 1-based positions: the count at 1, offset i at W + 1 + W * i, and the tokens from 2W + 1 + W * count, after
+        // the count and the count + 1 offsets; the element index [a].[i] is 0-based.
+        var width = PackedNumberWidth.ToString(CultureInfo.InvariantCulture);
+        var firstOffset = (PackedNumberWidth + 1).ToString(CultureInfo.InvariantCulture);
+        var afterHeader = ((2 * PackedNumberWidth) + 1).ToString(CultureInfo.InvariantCulture);
+        var elementCount = string.Concat("CAST(SUBSTRING(", name, ", 1, ", width, ") AS int)");
+        var tokenStart = string.Concat(
+            "CAST(SUBSTRING(", name, ", ", firstOffset, " + ", width, " * [a].[i], ", width, ") AS int)");
+        var tokenEnd = string.Concat(
+            "CAST(SUBSTRING(", name, ", ", afterHeader, " + ", width, " * [a].[i], ", width, ") AS int)");
+
+        // A .NET list's count needs at most ten digit tables, and a list long enough to need a tenth would have a
+        // header longer than any string, so the index sum stays within int.
+        var tables = 1;
+        for (var reach = (long)PackedDigitBase; reach < count; reach *= PackedDigitBase)
+        {
+            tables++;
+        }
+
+        sql.Append("(SELECT TOP (").Append(PackedFenceRows).Append(") ").Append(decoder)
+            .Append(" AS [v] FROM (SELECT ");
+        var multiplier = 1L;
+        for (var table = 0; table < tables; table++)
+        {
+            if (table > 0)
+            {
+                sql.Append(" + ").Append(multiplier.ToString(CultureInfo.InvariantCulture)).Append(" * ");
+            }
+
+            sql.Append("[r").Append(table.ToString(CultureInfo.InvariantCulture)).Append("].[g]");
+            multiplier *= PackedDigitBase;
+        }
+
+        sql.Append(" AS [i] FROM ");
+        for (var table = 0; table < tables; table++)
+        {
+            sql.Append(table == 0 ? string.Empty : " CROSS JOIN ").Append(PackedDigits)
+                .Append(" AS [r").Append(table.ToString(CultureInfo.InvariantCulture)).Append("]([g])");
+        }
+
+        sql.Append(") AS [a] CROSS APPLY (VALUES (CASE WHEN [a].[i] < ").Append(elementCount)
+            .Append(" THEN SUBSTRING(").Append(name).Append(", ").Append(afterHeader).Append(" + ").Append(width)
+            .Append(" * ").Append(elementCount).Append(" + ").Append(tokenStart).Append(", ").Append(tokenEnd)
+            .Append(" - ").Append(tokenStart).Append(") END)) AS [e]([t]) WHERE [a].[i] < ").Append(elementCount)
+            .Append(" ORDER BY [v]) AS [d]");
     }
 
     // An operator's predicate on a value expression, a parameter name or a packed element's decoding: a comparison on
@@ -738,27 +871,27 @@ internal static class SearchSqlBuilder
         return count;
     }
 
-    // One packed group's JSON array, and the decoding of one of its elements, which all share the group's type.
+    // One packed group's list, and the decoding of one of its elements, which all share the group's type: the element
+    // count, the offset of each token's start and then of the end of the last, every one PackedNumberWidth digits,
+    // and then the tokens.
     private static string PackValues(IReadOnlyList<SqlParameterValue> values, out string decoder)
     {
-        var buffer = new ArrayBufferWriter<byte>();
         decoder = string.Empty;
         var decimalScale = DecimalScale(values);
-        using (var writer = new Utf8JsonWriter(buffer))
+        var header = new StringBuilder((values.Count + 2) * PackedNumberWidth);
+        var tokens = new StringBuilder();
+        header.Append(values.Count.ToString(PackedNumberFormat, CultureInfo.InvariantCulture))
+            .Append(0.ToString(PackedNumberFormat, CultureInfo.InvariantCulture));
+        foreach (var value in values)
         {
-            writer.WriteStartArray();
-            foreach (var value in values)
-            {
-                decoder = WritePackedElement(writer, value, decimalScale);
-            }
-
-            writer.WriteEndArray();
+            decoder = WritePackedElement(tokens, value, decimalScale);
+            header.Append(tokens.Length.ToString(PackedNumberFormat, CultureInfo.InvariantCulture));
         }
 
-        return Encoding.UTF8.GetString(buffer.WrittenSpan);
+        return header.Append(tokens).ToString();
     }
 
-    // The largest scale among an array's decimal values, the scale each of them is read back with; 0 when it has none.
+    // The largest scale among a list's decimal values, the scale each of them is read back with; 0 when it has none.
     private static int DecimalScale(IReadOnlyList<SqlParameterValue> values)
     {
         var scale = 0;
@@ -780,54 +913,54 @@ internal static class SearchSqlBuilder
         return integer == 0m ? 1 : integer.ToString(CultureInfo.InvariantCulture).Length;
     }
 
-    // The one mapping from a scalar search parameter to its packed form: writes the parameter's value as the next
-    // array element and returns the expression that decodes such an element to the parameter's SQL type and value.
-    // decimalScale is the scale a decimal element is read back with, the largest of its array. Every token written is
-    // ASCII that JSON needs no escape for.
-    private static string WritePackedElement(Utf8JsonWriter writer, SqlParameterValue scalar, int decimalScale)
+    // The one mapping from a scalar search parameter to its packed form: appends the parameter's value as the next
+    // element token and returns the expression that decodes such a token to the parameter's SQL type and value.
+    // decimalScale is the scale a decimal element is read back with, the largest of its list. Every token written is
+    // ASCII.
+    private static string WritePackedElement(StringBuilder tokens, SqlParameterValue scalar, int decimalScale)
     {
         switch (scalar.DbType, scalar.Value)
         {
             case (DbType.String, string text):
-                writer.WriteStringValue(ToUtf16LittleEndianHex(text));
+                tokens.Append(ToUtf16LittleEndianHex(text));
                 return PackedTextDecoder;
 
             case (DbType.Byte, byte number):
-                writer.WriteStringValue(number.ToString(CultureInfo.InvariantCulture));
+                tokens.Append(number.ToString(CultureInfo.InvariantCulture));
                 return PackedByteDecoder;
 
             case (DbType.Int16, short number):
-                writer.WriteStringValue(number.ToString(CultureInfo.InvariantCulture));
+                tokens.Append(number.ToString(CultureInfo.InvariantCulture));
                 return PackedInt16Decoder;
 
             case (DbType.Int32, int number):
-                writer.WriteStringValue(number.ToString(CultureInfo.InvariantCulture));
+                tokens.Append(number.ToString(CultureInfo.InvariantCulture));
                 return PackedInt32Decoder;
 
             case (DbType.Int64, long number):
-                writer.WriteStringValue(number.ToString(CultureInfo.InvariantCulture));
+                tokens.Append(number.ToString(CultureInfo.InvariantCulture));
                 return PackedInt64Decoder;
 
             // A decimal, an integer column's criterion that holds no exact 64-bit integer, is its invariant text read
-            // back as decimal(38, s), s the largest scale of its array, which keeps every digit while its integer part
+            // back as decimal(38, s), s the largest scale of its list, which keeps every digit while its integer part
             // fits the other 38 - s digits; the converter's criteria have scale 1 and at most 19 integer digits.
             case (DbType.Decimal, decimal number) when IntegerDigits(number) <= MaxDecimalPrecision - decimalScale:
-                writer.WriteStringValue(number.ToString(CultureInfo.InvariantCulture));
+                tokens.Append(number.ToString(CultureInfo.InvariantCulture));
                 return string.Concat(
-                    "CAST([a].[value] AS decimal(",
+                    "CAST([e].[t] AS decimal(",
                     MaxDecimalPrecision.ToString(CultureInfo.InvariantCulture),
                     ", ",
                     decimalScale.ToString(CultureInfo.InvariantCulture),
                     "))");
 
             case (DbType.Boolean, bool flag):
-                writer.WriteStringValue(flag ? "1" : "0");
+                tokens.Append(flag ? '1' : '0');
                 return PackedBooleanDecoder;
 
             // Search binds dates at midnight; another time of day could round differently as text than as a
             // parameter, so it is refused rather than packed inexactly.
             case (DbType.DateTime, DateTime time) when time.TimeOfDay == TimeSpan.Zero:
-                writer.WriteStringValue(time.ToString(PackedDateTimeFormat, CultureInfo.InvariantCulture));
+                tokens.Append(time.ToString(PackedDateTimeFormat, CultureInfo.InvariantCulture));
                 return PackedDateTimeDecoder;
 
             case (DbType.Double, double number):
@@ -838,11 +971,9 @@ internal static class SearchSqlBuilder
                     throw new InvalidOperationException(UnpackableValueMessage);
                 }
 
-                writer.WriteStartArray();
-                writer.WriteNumberValue(bits < 0 ? 1 : 0);
-                writer.WriteNumberValue(exponent);
-                writer.WriteNumberValue(bits & DoubleFractionMask);
-                writer.WriteEndArray();
+                tokens.Append(bits < 0 ? '1' : '0')
+                    .Append(exponent.ToString(DoubleExponentFormat, CultureInfo.InvariantCulture))
+                    .Append((bits & DoubleFractionMask).ToString(DoubleFractionFormat, CultureInfo.InvariantCulture));
                 return PackedDoubleDecoder;
 
             case (DbType.String or DbType.Byte or DbType.Int16 or DbType.Int32 or DbType.Int64 or DbType.Decimal
@@ -854,8 +985,8 @@ internal static class SearchSqlBuilder
         }
     }
 
-    // "0x" and the uppercase hexadecimal of the text's UTF-16 code units, low byte first, the form CONVERT style 1
-    // reads as varbinary. The code units are copied, not encoded, so a lone surrogate is kept as it is.
+    // The uppercase hexadecimal of the text's UTF-16 code units, low byte first and with no "0x" prefix, the form
+    // CONVERT style 2 reads as varbinary. The code units are copied, not encoded, so a lone surrogate is kept as it is.
     private static string ToUtf16LittleEndianHex(string text)
     {
         var bytes = new byte[text.Length * sizeof(char)];
@@ -865,7 +996,7 @@ internal static class SearchSqlBuilder
             bytes[(2 * index) + 1] = (byte)(text[index] >> 8);
         }
 
-        return string.Concat("0x", Convert.ToHexString(bytes));
+        return Convert.ToHexString(bytes);
     }
 
     // Resolves the grid columns to reader-built columns with consecutive ordinals from firstOrdinal.
@@ -999,6 +1130,6 @@ internal static class SearchSqlBuilder
         string Comparable,
         ColumnMetadata Column);
 
-    // The scalar parameters of one packed array: a condition's values that share an operator and a parameter type.
+    // The scalar parameters of one packed list: a condition's values that share an operator and a parameter type.
     private sealed record PackedGroup(SearchOperator Operator, DbType DbType, List<SqlParameterValue> Values);
 }
