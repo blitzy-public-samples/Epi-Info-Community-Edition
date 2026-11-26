@@ -844,6 +844,15 @@
     font-size: 1.25rem;
   }
 
+  /* A dialog's heading and text break a long unbroken word, such as one in a
+   * check-code DIALOG message, inside the box. As flex items their automatic
+   * minimum width is their min-content width, which anywhere lowers and
+   * break-word does not; without it the word would overflow the dialog's
+   * start edge, where it cannot be scrolled into view. */
+  .dialog > :is(h2, p) {
+    overflow-wrap: anywhere;
+  }
+
   /* Destructive confirmation, such as a dialog's Delete record button. White
    * on --color-danger is 6.5:1. Disabled keeps the base button:disabled look,
    * and focus keeps the base :focus-visible ring. */
