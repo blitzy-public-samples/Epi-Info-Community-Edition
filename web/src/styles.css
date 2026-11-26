@@ -12,7 +12,7 @@
  *                .field-error  .group-section  .label-heading  .unsupported-placeholder
  *   Grid         .record-grid  .record-grid__row--deleted  .record-grid__paging
  *   Messages     .banner  .banner--error  .banner--warning  .banner--info
- *                .validation-summary
+ *                .banner__actions  .validation-summary
  *   Dialogs      .dialog-backdrop  .dialog  .button--danger  .find-dialog  .find-dialog__fields
  *                .find-dialog__criterion  .find-dialog__results
  *   Utilities    .visually-hidden
@@ -735,6 +735,17 @@
 
   .banner > button:first-of-type {
     margin-inline-start: auto;
+  }
+
+  /* Two or more buttons held as one unit: buttons that are direct children
+   * wrap one by one, so a later button can land alone at the start of the
+   * next line. The group wraps as a whole and keeps its buttons at the inline
+   * end, wrapping inside itself only when a line cannot hold them all. */
+  .banner__actions {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: var(--space-2) var(--space-4);
   }
 
   .banner--error {
