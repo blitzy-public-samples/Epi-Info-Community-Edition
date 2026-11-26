@@ -289,16 +289,13 @@ public interface IDataStore
     /// <item><description>
     /// <see cref="RecordListQuery.Filter"/>, when not <see langword="null"/>, keeps the rows in which any grid column
     /// contains it, ignoring case and independent of the database collation, with the filter text passed as a
-    /// parameter and its pattern characters matched literally. <see langword="null"/> applies no filter.
+    /// parameter and its pattern characters matched literally, whatever its length: the SQL Server store matches a
+    /// filter whose contains pattern exceeds SQL Server's <c>LIKE</c> pattern limit through a long-pattern program in
+    /// the same statement, with the same meaning. <see langword="null"/> applies no filter.
     /// </description></item>
     /// <item><description>
     /// Rows come from the selected set of <see cref="RecordListQuery.IncludeDeleted"/> and are paged at the 64-bit
     /// <see cref="RecordListQuery.Offset"/> for <see cref="RecordListQuery.PageSize"/> rows.
-    /// </description></item>
-    /// <item><description>
-    /// <b>Precondition:</b> a <see cref="RecordListQuery.Filter"/> that is not <see langword="null"/> passes
-    /// <see cref="RecordQueryRules.IsRepresentableFilter"/>, so its contains pattern fits SQL Server's <c>LIKE</c>
-    /// pattern limit. The API rejects a longer <c>q</c> with a 400 before it calls the store.
     /// </description></item>
     /// <item><description>
     /// <b>Consistency:</b> the items and the total come from one consistent read of the filtered set, so they always
@@ -312,7 +309,7 @@ public interface IDataStore
     /// </remarks>
     /// <param name="form">The form's metadata.</param>
     /// <param name="query">
-    /// The coerced list parameters, whose paging bounds and filter length the API has already checked.
+    /// The coerced list parameters, whose paging bounds the API has already checked.
     /// </param>
     /// <param name="cancellationToken">The request's abort token.</param>
     /// <returns>
@@ -321,10 +318,6 @@ public interface IDataStore
     /// <see cref="RecordPage.Page"/> and <see cref="RecordPage.PageSize"/> echo <paramref name="query"/>. A valid page
     /// past the end has no items and the correct total.
     /// </returns>
-    /// <exception cref="ArgumentException">
-    /// The filter fails <see cref="RecordQueryRules.IsRepresentableFilter"/>, raised before any base- or page-table
-    /// command is sent.
-    /// </exception>
     Task<RecordPage> ListAsync(FormMetadata form, RecordListQuery query, CancellationToken cancellationToken);
 
     /// <summary>
@@ -368,9 +361,9 @@ public interface IDataStore
     /// The parsed criteria, at most one per column; never empty, because the search criteria parser rejects an empty
     /// list before the store is called. They may hold any number of alternatives: the SQL Server store binds a large
     /// set in packed form, a few array parameters per condition, so the statement stays within SQL Server's parameter
-    /// limit with the same matches. <b>Precondition:</b> each <see cref="SearchOperator.Like"/> pattern is at most
-    /// <see cref="RecordQueryRules.MaxLikePatternLength"/> characters, SQL Server's <c>LIKE</c> pattern limit; the
-    /// parser rejects a longer one with a 400 before the store is called.
+    /// limit with the same matches. A <see cref="SearchOperator.Like"/> pattern may have any length: the SQL Server
+    /// store evaluates one longer than <see cref="RecordQueryRules.MaxLikePatternLength"/> code units, SQL Server's
+    /// <c>LIKE</c> pattern limit, window by window with the same meaning.
     /// </param>
     /// <param name="includeDeleted">Whether the selected set holds every row rather than the active set.</param>
     /// <param name="excludeGlobalRecordId">
@@ -382,8 +375,10 @@ public interface IDataStore
     /// The capped results with the uncapped match count; no match gives an empty list and a total of 0.
     /// </returns>
     /// <exception cref="ArgumentException">
-    /// <paramref name="conditions"/> hold a <see cref="SearchOperator.Like"/> pattern longer than
-    /// <see cref="RecordQueryRules.MaxLikePatternLength"/>, raised before any base- or page-table command is sent.
+    /// <paramref name="conditions"/> hold a <see cref="SearchOperator.Like"/> pattern with a <c>[...]</c> set longer
+    /// than <see cref="RecordQueryRules.MaxLikePatternLength"/> code units, which no SQL Server construct can
+    /// evaluate and the search criteria parser rejects with a 400; raised before any base- or page-table command is
+    /// sent.
     /// </exception>
     Task<SearchResponse> SearchAsync(
         FormMetadata form,

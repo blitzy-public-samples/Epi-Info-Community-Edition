@@ -29,9 +29,9 @@ namespace EpiInfo.Api.Endpoints;
 /// are rejected before the range conversion, and a token outside <see cref="int"/> is a 400.
 /// </para>
 /// <para>
-/// <b>Filter length.</b> A non-blank <c>q</c> must pass <see cref="RecordQueryRules.IsRepresentableFilter"/>, so its
-/// escaped and wrapped contains pattern fits SQL Server's <c>LIKE</c> pattern limit; a longer one is a 400 on
-/// <c>q</c> with <see cref="RecordQueryRules.FilterTooLongMessage"/>.
+/// <b>Filter.</b> A non-blank <c>q</c> of any length and any characters coerces, kept as sent: it has no 400 of its
+/// own. The store matches it as a literal, case-insensitive "contains" whatever its length, so a term longer than
+/// SQL Server's <c>LIKE</c> pattern limit is still matched rather than refused.
 /// </para>
 /// <para>
 /// <b>One 400 per request.</b> Every bad parameter of a request is reported in one
@@ -153,12 +153,11 @@ public static class RequestParameters
 
     /// <summary>
     /// Coerces the inputs of the records list, <c>GET .../records</c>, and checks the paging bounds with
-    /// <see cref="RecordQueryRules.ValidatePaging"/> and the filter length with
-    /// <see cref="RecordQueryRules.IsRepresentableFilter"/>.
+    /// <see cref="RecordQueryRules.ValidatePaging"/>.
     /// </summary>
     /// <param name="q">
-    /// The grid filter; absent, empty or whitespace means no filter, and any other value is kept unchanged, without
-    /// trimming. Its contains pattern must fit <see cref="RecordQueryRules.MaxLikePatternLength"/>.
+    /// The grid filter; absent, empty or whitespace means no filter, and any other value, whatever its length, is
+    /// kept unchanged, without trimming.
     /// </param>
     /// <param name="includeDeleted">
     /// The query occurrences of <c>includeDeleted</c> in the order sent, as <see cref="TryParseIncludeDeleted"/>
@@ -178,10 +177,9 @@ public static class RequestParameters
     /// <param name="query">The coerced query on success; otherwise <see langword="null"/>.</param>
     /// <param name="problem">
     /// <see langword="null"/> on success; otherwise one field-level 400 with an entry per bad parameter, each
-    /// <c>page</c> or <c>pageSize</c> entry carrying either <see cref="IntegerExpectedMessage"/> or its range message,
-    /// and a <c>q</c> entry carrying <see cref="RecordQueryRules.FilterTooLongMessage"/>.
+    /// <c>page</c> or <c>pageSize</c> entry carrying either <see cref="IntegerExpectedMessage"/> or its range message.
     /// </param>
-    /// <returns>Whether every parameter coerced and the paging and filter bounds hold.</returns>
+    /// <returns>Whether every parameter coerced and the paging bounds hold.</returns>
     public static bool TryParseListQuery(
         string? q,
         string[]? includeDeleted,
@@ -192,12 +190,8 @@ public static class RequestParameters
     {
         Dictionary<string, string[]>? errors = null;
 
-        // Blank stays no filter; any other q is kept untrimmed, so its own length and characters are what count.
+        // Blank stays no filter; any other q is kept untrimmed, so its own characters are what the store matches.
         var filter = string.IsNullOrWhiteSpace(q) ? null : q;
-        if (filter is not null && !RecordQueryRules.IsRepresentableFilter(filter))
-        {
-            AddError(Query, RecordQueryRules.FilterTooLongMessage, ref errors);
-        }
 
         CoerceIncludeDeleted(includeDeleted, out var parsedIncludeDeleted, ref errors);
 

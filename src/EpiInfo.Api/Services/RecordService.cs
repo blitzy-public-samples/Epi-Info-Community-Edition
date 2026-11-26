@@ -248,12 +248,14 @@ public sealed partial class RecordService(
     /// </summary>
     /// <remarks>
     /// <see cref="SearchCriteriaParser"/> owns the criteria rules: trimming, the <c>" or "</c> alternatives, comparison
-    /// prefixes, wildcards, the six-field limit, the rejection of a field named twice and the
-    /// <see cref="RecordQueryRules.MaxLikePatternLength"/> bound on wildcard patterns, so no pattern over SQL Server's
-    /// <c>LIKE</c> pattern limit reaches the store; a longer one is a 400 after the form's metadata is read and before
-    /// any Find statement is sent. Any number of alternatives reaches the store, which binds a large set in packed
-    /// form. The store applies the selected set, removes the open record before counting and capping, orders by
-    /// <c>UniqueKey</c> and caps the items at <see cref="RecordQueryRules.SearchCap"/>.
+    /// prefixes, wildcards, the six-field limit and the rejection of a field named twice. A wildcard pattern of any
+    /// length reaches the store, which evaluates one longer than SQL Server's <c>LIKE</c> pattern limit window by
+    /// window; only a pattern holding a <c>[...]</c> set longer than <see cref="RecordQueryRules.MaxLikePatternLength"/>
+    /// code units that is unclosed or that no cut keeping its members divides, which no SQL Server construct can
+    /// evaluate, is a 400, after the form's metadata is read and before any Find statement is sent. Any number of
+    /// alternatives reaches the store, which binds a large set in packed form. The store applies the selected set,
+    /// removes the open record before counting and capping, orders by <c>UniqueKey</c> and caps the items at
+    /// <see cref="RecordQueryRules.SearchCap"/>.
     /// </remarks>
     /// <param name="viewId">The form's <c>metaViews.ViewId</c> from the route.</param>
     /// <param name="request">

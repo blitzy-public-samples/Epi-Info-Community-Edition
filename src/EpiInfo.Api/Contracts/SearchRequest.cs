@@ -47,7 +47,7 @@ namespace EpiInfo.Api.Contracts;
 /// <para>
 /// The interpretation per field type, trimming, the six-field limit, the rejection of a field named twice and of an
 /// unknown or unsearchable field all belong to SearchCriteriaParser, each answered with a 400. A missing or
-/// <c>null</c> <c>criteria</c>, or an empty array, is the request-level 400 "<c>criteria</c> must not be empty", which
+/// <c>null</c> <c>criteria</c>, or an empty array, is the request-level 400 "criteria must not be empty", which
 /// RecordService raises; binding never rejects it. The serializer materialises the list as a
 /// <see cref="List{T}"/>. It leaves <see cref="SearchCriterion.Field"/> <see langword="null"/> for a criterion that
 /// omits <c>field</c>, because it does not enforce required constructor parameters, and for <c>"field": null</c>,

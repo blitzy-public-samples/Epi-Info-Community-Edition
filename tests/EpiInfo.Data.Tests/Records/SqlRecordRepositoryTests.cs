@@ -2353,8 +2353,9 @@ public sealed class ListAndFindSqlTests
 /// Integration tests of the SQL Server bounds of the Find statement the repository runs, against the rehearsal
 /// database through <see cref="SqlExecution"/>: a search beyond 2,000 alternatives other than <c>IS NULL</c> binds its
 /// values packed and returns exactly the rows the per-alternative statement returns, the statement never exceeds SQL
-/// Server's parameter limit, and a <c>LIKE</c> pattern is bounded at SQL Server's 4,000 code units before any SQL is
-/// built.
+/// Server's parameter limit, a <c>LIKE</c> pattern or grid filter past SQL Server's 4,000-code-unit pattern limit runs
+/// a long-pattern program that returns exactly the rows of native <c>LIKE</c>, and a pattern holding a <c>[...]</c> set
+/// that no SQL Server construct evaluates is refused before any SQL is built.
 /// </summary>
 /// <remarks>
 /// <para>
@@ -2417,6 +2418,35 @@ public sealed class SearchStatementBoundsTests : IAsyncLifetime
         "SET QUOTED_IDENTIFIER OFF; SET ARITHABORT OFF; SET ANSI_WARNINGS OFF; SET NUMERIC_ROUNDABORT ON;"
         + " SET CONCAT_NULL_YIELDS_NULL OFF; SET LANGUAGE Deutsch; SET DATEFORMAT ydm; SET DATEFIRST 3;"
         + " SELECT CAST(SESSIONPROPERTY('QUOTED_IDENTIFIER') AS int);";
+
+    // SQL Server's LIKE pattern limit in UTF-16 code units: error 8152 refuses a longer nvarchar pattern, so a longer
+    // one runs through its long-pattern program. The forced native limits make short patterns long: windows of one
+    // element with every seek too long to wrap in '%' (0), one-element seeks (3) and windows of several elements (8).
+    private const int NativeLikeLimit = 4000;
+    private static readonly int[] ForcedLikeLimits = [0, 3, 8];
+
+    // The collation cases' building blocks: the letters seeded values are sampled for, the ligature U+FB01 that
+    // collations may expand to them, and a supplementary character, which SQL_Latin1_General_CP1_CI_AS ignores. Up to
+    // CollationSamples values of each sampled column, of at most MaxCollationTextLength characters, are taken.
+    private const string LigatureLetters = "fi";
+    private const string Ligature = "\uFB01";
+    private const string Supplementary = "\uD83D\uDE00";
+    private const int CollationSamples = 2;
+    private const int MaxCollationTextLength = 100;
+
+    // What a statement running a long-pattern program holds: the first program's CTE and its recursion hint.
+    private const string LongPatternCte = "[x0] ([k], [v], [l], [z], [st]) AS (";
+    private const string LongPatternHint = " OPTION (MAXRECURSION 0)";
+
+    // What every list statement holds, long filter or not: the table hint of each base- and page-table read, and the
+    // plan hints that read a base row before its page rows, which a long filter's statement puts after the recursion
+    // hint.
+    private const string ListHoldLock = " WITH (HOLDLOCK)";
+    private const string ListPlanHints = " OPTION (FORCE ORDER, LOOP JOIN)";
+    private const string LongListPlanHints = " OPTION (MAXRECURSION 0, FORCE ORDER, LOOP JOIN)";
+
+    // The page size of the list cases, the largest the API admits.
+    private const int ListPageSize = 200;
 
     // Chunks of the threshold searches, run per alternative to build the expected union.
     private const int ChunkSize = 500;
@@ -2681,13 +2711,13 @@ public sealed class SearchStatementBoundsTests : IAsyncLifetime
         Assert.Equal(expected, await RunAsync(connection, packed, token));
     }
 
-    // SQL Server limits an nvarchar LIKE pattern to 4,000 code units: a 4,000-character pattern runs, per alternative
-    // and packed, on an nvarchar and an ntext column, and matches what its collapsed form '%' matches; one more
-    // character is refused before any SQL is built.
+    // SQL Server refuses an nvarchar LIKE pattern of more than 4,000 code units (error 8152): a pattern of 4,000 '%' is
+    // one native LIKE and one of 4,001 or 8,001 '%' runs through its program, per alternative and packed, on an
+    // nvarchar and an ntext column, and each matches exactly what '%' matches.
     [Theory]
     [InlineData(CaseReport, "LastName")]
     [InlineData(FoodHistory, "BuyLastTenDays")]
-    public async Task Search_LikePatternAtTheLimit_RunsAndOneLongerThrowsBeforeSql(string formName, string fieldName)
+    public async Task Search_PercentPatternOfAnyLength_MatchesWhatOnePercentMatches(string formName, string fieldName)
     {
         using var cancellation = new CancellationTokenSource(TestTimeout);
         var token = cancellation.Token;
@@ -2696,39 +2726,483 @@ public sealed class SearchStatementBoundsTests : IAsyncLifetime
         var form = await ReadFormAsync(connection, formName, token);
         var field = Assert.Single(form.DataFields, candidate => candidate.Name == fieldName);
 
-        SearchCondition Like(int length) => new(
-            field.Name,
-            SearchTarget.PageField,
-            field.FieldType,
-            [new SearchAlternative(SearchOperator.Like, FieldValue.FromText(new string('%', length)))]);
-
         var collapsed = await RunAsync(
             connection,
-            SearchSqlBuilder.Search(form.Schema, form.DataFields, form.GridColumns, [Like(1)], false, null),
+            SearchSqlBuilder.Search(
+                form.Schema, form.DataFields, form.GridColumns, [LikeCondition(field, "%")], false, null),
             token);
         Assert.NotEmpty(collapsed);
 
-        foreach (var budget in new[] { ScalarParameterBudget, 0 })
+        foreach (var (length, longPattern) in new[] { (NativeLikeLimit, false), (4001, true), (8001, true) })
         {
-            var select = SearchSqlBuilder.Search(
-                form.Schema,
-                form.DataFields,
-                form.GridColumns,
-                [Like(RecordQueryRules.MaxLikePatternLength)],
-                false,
-                null,
-                budget);
+            foreach (var budget in new[] { ScalarParameterBudget, 0 })
+            {
+                var select = SearchSqlBuilder.Search(
+                    form.Schema,
+                    form.DataFields,
+                    form.GridColumns,
+                    [LikeCondition(field, new string('%', length))],
+                    false,
+                    null,
+                    budget);
 
-            Assert.Equal(collapsed, await RunAsync(connection, select, token));
+                AssertProgram(select.Statement, longPattern);
+                Assert.Equal(collapsed, await RunAsync(connection, select, token));
+            }
+        }
+    }
+
+    // At the default limit, a pattern with a set, which the parser never collapses, and runs of '%' that take it past
+    // 4,000 code units runs through its program and returns exactly the rows of the native LIKE of the same pattern
+    // with each run written as one '%', which matches the same text. The patterns are built from stored values of a
+    // text column and an ntext column, so they match rows.
+    [Theory]
+    [InlineData(CaseReport, "LastName", "p1.[LastName]")]
+    [InlineData(FoodHistory, "BuyLastTenDays", "CAST(p2.[BuyLastTenDays] AS nvarchar(max))")]
+    public async Task Search_PatternLongerThanTheLimit_ReturnsTheRowsOfItsCollapsedForm(
+        string formName,
+        string fieldName,
+        string expression)
+    {
+        using var cancellation = new CancellationTokenSource(TestTimeout);
+        var token = cancellation.Token;
+        await using var databaseLock = await DatabaseWriteLock.AcquireSharedAsync(token);
+        await using var connection = await TestDatabase.OpenConnectionAsync(token);
+        var form = await ReadFormAsync(connection, formName, token);
+        var field = Assert.Single(form.DataFields, candidate => candidate.Name == fieldName);
+        var value = (await SampleAsync(connection, formName, expression, 1, token))[0];
+        Assert.True(value.Length >= 3, $"{formName}.{fieldName}: the sampled value is too short to build patterns.");
+
+        var run = new string('%', NativeLikeLimit);
+        var first = "[" + value[..1] + "]";
+        var last = "[" + value[^1..] + "]";
+        (string Long, string Collapsed)[] pairs =
+        [
+            ("%" + first + run + value[1..], "%" + first + "%" + value[1..]),
+            (value[..1] + run + last, value[..1] + "%" + last),
+            (run + first + value[1..^1] + run, "%" + first + value[1..^1] + "%"),
+            ("_" + run + "[^]" + run + last, "_%[^]%" + last),
+            (first + run + "_" + run, first + "%_%"),
+        ];
+
+        var matched = 0;
+        foreach (var (longPattern, collapsed) in pairs)
+        {
+            Assert.True(longPattern.Length > NativeLikeLimit);
+            var native = SearchSqlBuilder.Search(
+                form.Schema, form.DataFields, form.GridColumns, [LikeCondition(field, collapsed)], true, null);
+            var program = SearchSqlBuilder.Search(
+                form.Schema, form.DataFields, form.GridColumns, [LikeCondition(field, longPattern)], true, null);
+            AssertProgram(native.Statement, longPattern: false);
+            AssertProgram(program.Statement, longPattern: true);
+
+            var expected = await RunAsync(connection, native, token);
+            matched += expected.Count > 0 ? 1 : 0;
+            Assert.Equal(expected, await RunAsync(connection, program, token));
         }
 
-        var tooLong = Like(RecordQueryRules.MaxLikePatternLength + 1);
-        Assert.Throws<ArgumentException>(
-            "conditions",
-            () => SearchSqlBuilder.Search(form.Schema, form.DataFields, form.GridColumns, [tooLong], false, null));
-        Assert.Throws<ArgumentException>(
-            "conditions",
-            () => SearchSqlBuilder.Search(form.Schema, form.DataFields, form.GridColumns, [tooLong], false, null, 0));
+        Assert.True(matched >= 3, $"{formName}.{fieldName}: only {matched} patterns match a seeded row.");
+    }
+
+    // Differential proof of the long-pattern program: the same pattern rendered as native LIKE and, with the native
+    // limit forced low, through the program, so short patterns exercise every instruction, return exactly the same
+    // rows, positions and totals on the seeded rows, for a text column and an ntext column. The corpus covers
+    // literals, '_', sets (an empty set, a negated empty set, an unclosed set, ranges, a hyphen after a range and
+    // members '%', '_' and '['), runs of '%', leading, trailing and inner '%', several segments, trailing blanks and
+    // letter case, and patterns built from stored values, so each matches rows; the forced limits give windows of one
+    // element and seeks too long to wrap (0), single-element seeks (3) and windows of several elements (8).
+    [Theory]
+    [InlineData(CaseReport, "LastName", "p1.[LastName]")]
+    [InlineData(FoodHistory, "BuyLastTenDays", "CAST(p2.[BuyLastTenDays] AS nvarchar(max))")]
+    public async Task Search_LongPatternProgram_ReturnsExactlyTheRowsOfNativeLike(
+        string formName,
+        string fieldName,
+        string expression)
+    {
+        using var cancellation = new CancellationTokenSource(TestTimeout);
+        var token = cancellation.Token;
+        await using var databaseLock = await DatabaseWriteLock.AcquireSharedAsync(token);
+        await using var connection = await TestDatabase.OpenConnectionAsync(token);
+        var form = await ReadFormAsync(connection, formName, token);
+        var field = Assert.Single(form.DataFields, candidate => candidate.Name == fieldName);
+        var corpus = PatternCorpus(await SampleAsync(connection, formName, expression, 3, token));
+
+        var matched = 0;
+        for (var index = 0; index < corpus.Count; index++)
+        {
+            var condition = LikeCondition(field, corpus[index]);
+            var native = SearchSqlBuilder.Search(
+                form.Schema, form.DataFields, form.GridColumns, [condition], true, null);
+            AssertProgram(native.Statement, longPattern: false);
+            var expected = await RunAsync(connection, native, token);
+            matched += expected.Count > 0 ? 1 : 0;
+
+            foreach (var limit in ForcedLikeLimits)
+            {
+                var program = SearchSqlBuilder.Search(
+                    form.Schema,
+                    form.DataFields,
+                    form.GridColumns,
+                    [condition],
+                    true,
+                    null,
+                    ScalarParameterBudget,
+                    limit);
+                AssertProgram(program.Statement, longPattern: corpus[index].Length > limit);
+
+                // The program replaces the pattern's one parameter, however long the pattern is.
+                Assert.Equal(native.Statement.Parameters.Count, program.Statement.Parameters.Count);
+                Assert.True(
+                    expected.SequenceEqual(await RunAsync(connection, program, token)),
+                    $"{formName}.{fieldName}: corpus pattern {index} at limit {limit} differs from native LIKE.");
+            }
+        }
+
+        Assert.True(matched > corpus.Count / 2, $"Only {matched} of {corpus.Count} patterns match a seeded row.");
+    }
+
+    // A search mixing native and long patterns in one condition, long patterns in two conditions, packed or not, has
+    // one program per condition and returns the rows of the all-native statement.
+    [Theory]
+    [InlineData(ScalarParameterBudget)]
+    [InlineData(0)]
+    public async Task Search_NativeAndLongPatternsAcrossConditions_ReturnTheRowsOfNativeLike(int budget)
+    {
+        using var cancellation = new CancellationTokenSource(TestTimeout);
+        var token = cancellation.Token;
+        await using var databaseLock = await DatabaseWriteLock.AcquireSharedAsync(token);
+        await using var connection = await TestDatabase.OpenConnectionAsync(token);
+        var form = await ReadFormAsync(connection, CaseReport, token);
+        var lastName = Assert.Single(form.DataFields, candidate => candidate.Name == "LastName");
+        var firstName = Assert.Single(form.DataFields, candidate => candidate.Name == "FirstName");
+        var lastNames = await SampleAsync(connection, CaseReport, "p1.[LastName]", 3, token);
+        var anchor = await AnchorAsync(connection, CaseReport, ["p1.[LastName]", "p1.[FirstName]"], token);
+
+        SearchCondition[] conditions =
+        [
+            new(lastName.Name, SearchTarget.PageField, lastName.FieldType,
+            [
+                new SearchAlternative(SearchOperator.Like, FieldValue.FromText(lastNames[0][..1] + "%")),
+                new SearchAlternative(SearchOperator.Equal, FieldValue.FromText(lastNames[1])),
+                new SearchAlternative(SearchOperator.Like, FieldValue.FromText("%" + lastNames[2][1..] + "%")),
+                new SearchAlternative(SearchOperator.Like, FieldValue.FromText(anchor[0] + "%")),
+                SearchAlternative.Null,
+            ]),
+            new(firstName.Name, SearchTarget.PageField, firstName.FieldType,
+            [
+                new SearchAlternative(SearchOperator.Like, FieldValue.FromText("%" + anchor[1][^2..])),
+                new SearchAlternative(SearchOperator.Like, FieldValue.FromText("_%")),
+            ]),
+        ];
+
+        var native = SearchSqlBuilder.Search(
+            form.Schema, form.DataFields, form.GridColumns, conditions, false, null, budget);
+        AssertProgram(native.Statement, longPattern: false);
+        var expected = await RunAsync(connection, native, token);
+        Assert.NotEmpty(expected);
+
+        // Limit 2 keeps the patterns of up to two characters native and makes every longer one a long pattern, so each
+        // condition mixes native and long patterns.
+        var mixed = SearchSqlBuilder.Search(
+            form.Schema, form.DataFields, form.GridColumns, conditions, false, null, budget, 2);
+        AssertProgram(mixed.Statement, longPattern: true);
+        Assert.Contains("[x0]", mixed.Statement.Text, StringComparison.Ordinal);
+        Assert.Contains("[x1]", mixed.Statement.Text, StringComparison.Ordinal);
+        Assert.Equal(budget == 0, mixed.Statement.Text.Contains(PackedListMarker, StringComparison.Ordinal));
+        Assert.EndsWith(
+            budget == 0 ? " OPTION (MAXRECURSION 0, " + PackedPlanHints[" OPTION (".Length..] : LongPatternHint,
+            mixed.Statement.Text,
+            StringComparison.Ordinal);
+        Assert.Equal(expected, await RunAsync(connection, mixed, token));
+    }
+
+    // The grid q: a filter matched through the program, with the native limit forced low, lists exactly the page and
+    // the total of the native contains predicate, on both forms and both selected sets, for filters built from stored
+    // grid values, in upper case too, which each match, and filters of the pattern and escape characters and a
+    // supplementary character, which must match literally. LastName is a grid column of both forms.
+    [Theory]
+    [InlineData(CaseReport, false)]
+    [InlineData(CaseReport, true)]
+    [InlineData(FoodHistory, true)]
+    public async Task List_LongFilterProgram_ListsExactlyThePageAndTotalOfTheNativeFilter(
+        string formName,
+        bool includeDeleted)
+    {
+        using var cancellation = new CancellationTokenSource(TestTimeout);
+        var token = cancellation.Token;
+        await using var databaseLock = await DatabaseWriteLock.AcquireSharedAsync(token);
+        await using var connection = await TestDatabase.OpenConnectionAsync(token);
+        var form = await ReadFormAsync(connection, formName, token);
+        var lastNames = await SampleAsync(connection, formName, "p1.[LastName]", 2, token);
+        Assert.True(lastNames[0].Length >= 3, $"{formName}: the sampled LastName is too short for an inner filter.");
+
+        // The filters built from stored values come first.
+        const int storedFilters = 3;
+        string[] filters =
+        [
+            lastNames[0],
+            lastNames[1].ToUpperInvariant(),
+            lastNames[0][1..^1],
+            "a",
+            "e n",
+            "-0",
+            "20",
+            "%",
+            "_",
+            "[",
+            "]",
+            "\\",
+            "^",
+            "a%",
+            "[a]",
+            "e_",
+            "T-",
+            "a\uD83D\uDE00",
+        ];
+
+        for (var index = 0; index < filters.Length; index++)
+        {
+            var filter = filters[index];
+            var query = new RecordListQuery(filter, includeDeleted, 1, ListPageSize);
+            var native = SearchSqlBuilder.ListPage(form.Schema, form.GridColumns, query);
+            AssertProgram(native.Statement, longPattern: false);
+            AssertHeldList(form, native.Statement, longPattern: false);
+            var (expectedIds, expectedTotal) = await ListRowsAsync(connection, native.Statement, token);
+            Assert.True(
+                index >= storedFilters || expectedTotal > 0,
+                $"{formName}: the stored-value filter {index} matches no row.");
+
+            // The native contains pattern: the filter between two '%', each %, _, [ and \ escaped by one more unit.
+            var containsLength = filter.Length + 2 + filter.Count(character => character is '%' or '_' or '[' or '\\');
+            foreach (var limit in ForcedLikeLimits)
+            {
+                var page = SearchSqlBuilder.ListPage(form.Schema, form.GridColumns, query, limit);
+                AssertProgram(page.Statement, longPattern: containsLength > limit);
+                AssertHeldList(form, page.Statement, longPattern: containsLength > limit);
+                var (ids, total) = await ListRowsAsync(connection, page.Statement, token);
+                Assert.Equal(expectedIds, ids);
+                Assert.Equal(expectedTotal, total);
+            }
+        }
+    }
+
+    // A [...] set longer than SQL Server's 4,000-unit pattern limit is cut into pieces that keep its members and its
+    // negation, so a pattern holding one returns exactly the rows of the native LIKE of the same pattern with each
+    // distinct member written once: a sampled value's leading characters and a set of its last character repeated past
+    // the limit, which finds its record, and of a character no value holds, which does not; their negations; distinct
+    // letters and ranges repeated, at the start, in the middle and at the end; and a set of exactly the limit's length,
+    // which no PATINDEX wraps.
+    [Fact]
+    public async Task Search_SetLongerThanTheLimit_ReturnsTheRowsOfItsDeduplicatedSet()
+    {
+        using var cancellation = new CancellationTokenSource(TestTimeout);
+        var token = cancellation.Token;
+        await using var databaseLock = await DatabaseWriteLock.AcquireSharedAsync(token);
+        await using var connection = await TestDatabase.OpenConnectionAsync(token);
+        var form = await ReadFormAsync(connection, CaseReport, token);
+        var field = Assert.Single(form.DataFields, candidate => candidate.Name == "LastName");
+        var value = (await SampleAsync(connection, CaseReport, "p1.[LastName]", 1, token))[0];
+        Assert.True(value.Length >= 2, "The sampled LastName is too short for a leading run and a set.");
+        var id = await FirstActiveIdAsync(connection, value, token);
+        var head = value[..^1];
+        var last = value[^1..];
+        const string Absent = "\u00A7";
+        static string Repeated(string members, int count) => string.Concat(Enumerable.Repeat(members, count));
+        var atLimit = "[" + Repeated("abcde", NativeLikeLimit / 5)[..(NativeLikeLimit - 2)] + "]";
+        Assert.Equal(NativeLikeLimit, atLimit.Length);
+
+        // Each long pattern, its native equivalent, and whether it must find the sampled record, or null when either
+        // outcome is the oracle's alone.
+        (string Long, string Native, bool? FindsSample)[] cases =
+        [
+            (head + "[" + Repeated(last, 4096) + "]%", head + "[" + last + "]%", true),
+            (head + "[" + Repeated(Absent, 4096) + "]%", head + "[" + Absent + "]%", false),
+            (head + "[^" + Repeated(Absent, 4096) + "]%", head + "[^" + Absent + "]%", true),
+            (head + "[^" + Repeated(last, 4096) + "]%", head + "[^" + last + "]%", false),
+            ("[" + Repeated("abcde", 820) + "]%", "[abcde]%", null),
+            ("%[" + Repeated("abcde", 820) + "]%", "%[abcde]%", true),
+            ("%[" + Repeated("abcde", 820) + "]", "%[abcde]", null),
+            ("%[^" + Repeated("abcde", 820) + "]", "%[^abcde]", null),
+            ("%[" + Repeated("a-e0-9", 700) + "]%", "%[a-e0-9]%", true),
+            ("%" + atLimit + "%", "%[abcde]%", true),
+            (atLimit + "%", "[abcde]%", null),
+            ("%" + atLimit, "%[abcde]", null),
+        ];
+        foreach (var (longPattern, nativePattern, findsSample) in cases)
+        {
+            Assert.True(longPattern.Length > NativeLikeLimit);
+            var native = SearchSqlBuilder.Search(
+                form.Schema, form.DataFields, form.GridColumns, [LikeCondition(field, nativePattern)], false, null);
+            var program = SearchSqlBuilder.Search(
+                form.Schema, form.DataFields, form.GridColumns, [LikeCondition(field, longPattern)], false, null);
+            AssertProgram(native.Statement, longPattern: false);
+            AssertProgram(program.Statement, longPattern: true);
+
+            var expected = await RunAsync(connection, native, token);
+            if (findsSample is { } finds)
+            {
+                Assert.True(
+                    finds == expected.Any(row => row.Id == id),
+                    $"The native pattern {nativePattern} does not select the sampled record as the case expects.");
+            }
+
+            Assert.True(
+                expected.SequenceEqual(await RunAsync(connection, program, token)),
+                $"The long form of {nativePattern} differs from its native LIKE.");
+        }
+    }
+
+    // The one pattern no SQL Server construct can evaluate, one holding a set longer than the limit that is unclosed,
+    // whose meaning depends on the collation, or whose members have no cut that keeps them and its negation (a chain
+    // of ranges, a run of combining marks, a negated set whose members start with '^'), is refused before any SQL is
+    // built, at the default limit and the forced ones, as the search-criteria parser refuses it with a 400.
+    [Theory]
+    [InlineData("unclosed")]
+    [InlineData("ranges")]
+    [InlineData("combining")]
+    [InlineData("caret")]
+    public async Task Search_UnsearchableSet_ThrowsBeforeSql(string kind)
+    {
+        using var cancellation = new CancellationTokenSource(TestTimeout);
+        var token = cancellation.Token;
+        await using var databaseLock = await DatabaseWriteLock.AcquireSharedAsync(token);
+        await using var connection = await TestDatabase.OpenConnectionAsync(token);
+        var form = await ReadFormAsync(connection, CaseReport, token);
+        var field = Assert.Single(form.DataFields, candidate => candidate.Name == "LastName");
+        var pattern = kind switch
+        {
+            "unclosed" => "%[" + new string('a', NativeLikeLimit + 1),
+            "ranges" => "%[" + string.Concat(Enumerable.Repeat("a-", 2001)) + "a]%",
+            "combining" => "%[e" + new string('\u0301', NativeLikeLimit + 1) + "]%",
+            "caret" => "%[^^" + string.Concat(Enumerable.Repeat("ab", 2001)) + "]%",
+            _ => throw new ArgumentOutOfRangeException(nameof(kind), kind, "Unknown set kind."),
+        };
+        Assert.True(LikePatternSyntax.HoldsUnsearchableSet(pattern));
+
+        foreach (var limit in ForcedLikeLimits.Append(NativeLikeLimit))
+        {
+            Assert.Throws<ArgumentException>(
+                "pattern",
+                () => SearchSqlBuilder.Search(
+                    form.Schema,
+                    form.DataFields,
+                    form.GridColumns,
+                    [LikeCondition(field, pattern)],
+                    false,
+                    null,
+                    ScalarParameterBudget,
+                    limit));
+        }
+    }
+
+    // Differential proof of the long-pattern program on patterns whose matching turns on the collation, over seeded
+    // values alone, so the test creates no record. The values are those of a text column of the seeded active records
+    // that hold "fi" in either case, and the patterns built from each carry the collation-sensitive part: the ligature
+    // U+FB01 in place of "fi", with either end open, inside and in either case; '_' in place of it, beside it and for
+    // either letter; sets of it, of its first letter and negated; NUL, U+00AD and a supplementary character inside the
+    // literal, which a collation may ignore; a combining acute appended or in place of a letter and accented letters,
+    // which no seeded value holds; and tails led by a set, which past a forced limit run backwards from the value's
+    // end. With the native limit forced low, each returns exactly the rows, positions and totals of native LIKE under
+    // the database collation, so an expansion is never cut between steps and an ignorable character is skipped as LIKE
+    // skips it, and more than half of the patterns match a seeded record, so the comparisons are not of empty results.
+    [Theory]
+    [InlineData("LastName", "p1.[LastName]")]
+    [InlineData("City", "p1.[City]")]
+    public async Task Search_LongPatternProgram_MatchesCollationSensitivePatternsAsNativeLike(
+        string fieldName,
+        string expression)
+    {
+        using var cancellation = new CancellationTokenSource(TestTimeout);
+        var token = cancellation.Token;
+        await using var databaseLock = await DatabaseWriteLock.AcquireSharedAsync(token);
+        await using var connection = await TestDatabase.OpenConnectionAsync(token);
+        var form = await ReadFormAsync(connection, CaseReport, token);
+        var field = Assert.Single(form.DataFields, candidate => candidate.Name == fieldName);
+        var seeded = await SeededActiveIdsAsync(connection, token);
+        var corpus = (await SeededTextsHoldingAsync(connection, [expression], LigatureLetters, token))
+            .SelectMany(CollationCorpus)
+            .ToList();
+
+        var matched = 0;
+        for (var index = 0; index < corpus.Count; index++)
+        {
+            var condition = LikeCondition(field, corpus[index]);
+            var native = SearchSqlBuilder.Search(
+                form.Schema, form.DataFields, form.GridColumns, [condition], true, null);
+            AssertProgram(native.Statement, longPattern: false);
+            var expected = await RunAsync(connection, native, token);
+            matched += expected.Any(row => seeded.Contains(row.Id)) ? 1 : 0;
+
+            foreach (var limit in ForcedLikeLimits)
+            {
+                var program = SearchSqlBuilder.Search(
+                    form.Schema,
+                    form.DataFields,
+                    form.GridColumns,
+                    [condition],
+                    true,
+                    null,
+                    ScalarParameterBudget,
+                    limit);
+                AssertProgram(program.Statement, longPattern: corpus[index].Length > limit);
+                Assert.True(
+                    expected.SequenceEqual(await RunAsync(connection, program, token)),
+                    $"{fieldName}: collation pattern {index} at limit {limit} differs from native LIKE.");
+            }
+        }
+
+        Assert.True(
+            matched > corpus.Count / 2,
+            $"{fieldName}: only {matched} of {corpus.Count} patterns match a seeded record.");
+    }
+
+    // The grid q over seeded values alone, so the test creates no record: filters built from the seeded grid texts of
+    // LastName and City that hold "fi" in either case. Matched through the program with the native limit forced low,
+    // each lists exactly the page and the total of the native contains predicate, under Latin1_General_100_CI_AS
+    // whatever the database collation. The ligature U+FB01 alone and in place of "fi", with the text before or after
+    // it and in either case, lists a record, since that collation expands it, so the expansion is exercised; a
+    // combining acute appended or in place of a letter, or an accented letter, lists none; and NUL, U+00AD and a
+    // supplementary character inside the literal, or a set of the ligature written literally, are the collation's
+    // alone.
+    [Fact]
+    public async Task List_LongFilterProgram_MatchesCollationSensitivePatternsAsTheNativeFilter()
+    {
+        using var cancellation = new CancellationTokenSource(TestTimeout);
+        var token = cancellation.Token;
+        await using var databaseLock = await DatabaseWriteLock.AcquireSharedAsync(token);
+        await using var connection = await TestDatabase.OpenConnectionAsync(token);
+        var form = await ReadFormAsync(connection, CaseReport, token);
+        var texts = await SeededTextsHoldingAsync(
+            connection, ["p1.[LastName]", "p1.[City]"], LigatureLetters, token);
+
+        // Each filter with whether its native total must be above zero or zero, or null when the collation alone
+        // decides.
+        List<(string Filter, bool? Lists)> filters = [(Ligature, true), ("[" + Ligature + "]", null)];
+        filters.AddRange(texts.SelectMany(CollationFilters));
+        for (var index = 0; index < filters.Count; index++)
+        {
+            var (filter, lists) = filters[index];
+            var query = new RecordListQuery(filter, false, 1, ListPageSize);
+            var native = SearchSqlBuilder.ListPage(form.Schema, form.GridColumns, query);
+            AssertProgram(native.Statement, longPattern: false);
+            AssertHeldList(form, native.Statement, longPattern: false);
+            var (expectedIds, expectedTotal) = await ListRowsAsync(connection, native.Statement, token);
+            Assert.True(
+                lists is not { } listsAny || listsAny == expectedTotal > 0,
+                $"The native filter {index} lists {expectedTotal} records, not {(lists == true ? "some" : "none")}.");
+
+            // The native contains pattern: the filter between two '%', each %, _, [ and \ escaped by one more unit.
+            var containsLength = filter.Length + 2 + filter.Count(character => character is '%' or '_' or '[' or '\\');
+            foreach (var limit in ForcedLikeLimits)
+            {
+                var page = SearchSqlBuilder.ListPage(form.Schema, form.GridColumns, query, limit);
+                AssertProgram(page.Statement, longPattern: containsLength > limit);
+                AssertHeldList(form, page.Statement, longPattern: containsLength > limit);
+                var (ids, total) = await ListRowsAsync(connection, page.Statement, token);
+                Assert.Equal(expectedIds, ids);
+                Assert.Equal(expectedTotal, total);
+            }
+        }
     }
 
     // A command carries at most 2,098 parameters of its own: a statement of exactly 2,098 runs, and the builder refuses
@@ -2885,7 +3359,7 @@ public sealed class SearchStatementBoundsTests : IAsyncLifetime
 
     // Whether a value's threshold alternatives each fit the character length of the LastName column the reader
     // describes and parse as one LastName condition with one alternative each. A value at the column's full length
-    // fails: its trailing pattern is one character longer, which the parser refuses.
+    // fails: its trailing pattern is one character longer than the column.
     private static bool FitsThresholdSearch(SeededForm form, ColumnMetadata column, string value)
     {
         var alternatives = ThresholdAlternativesOf(value);
@@ -2904,7 +3378,9 @@ public sealed class SearchStatementBoundsTests : IAsyncLifetime
     // LastName values of seeded active CaseReport records, fewest matches first, while their matches together stay
     // within MaxSeededMatches; at least two, so excluding one record leaves a match. Records other tests create are
     // left out by their marker, so they neither become a value nor crowd the seeded values out, and a value is taken
-    // only when its threshold alternatives fit the column and parse.
+    // only when its threshold alternatives fit the column and parse. A value of NativeLikeLimit characters or more is
+    // skipped as well, whatever the column's length: its trailing-wildcard pattern is a long pattern, which binds no
+    // parameter of its own, so the threshold searches' parameter counts would not hold.
     private static async Task<IReadOnlyList<string>> SeededLastNamesAsync(
         SqlConnection connection,
         SeededForm form,
@@ -2927,7 +3403,9 @@ public sealed class SearchStatementBoundsTests : IAsyncLifetime
         {
             var value = reader.GetString(0);
             var count = reader.GetInt64(1);
-            if (!IsPlainCriterionText(value) || !FitsThresholdSearch(form, column.Metadata, value))
+            if (!IsPlainCriterionText(value)
+                || value.Length >= NativeLikeLimit
+                || !FitsThresholdSearch(form, column.Metadata, value))
             {
                 continue;
             }
@@ -3063,6 +3541,250 @@ public sealed class SearchStatementBoundsTests : IAsyncLifetime
 
     private static string NoMatch(int index) =>
         "NoMatch-" + index.ToString(CultureInfo.InvariantCulture) + "-" + Guid.NewGuid().ToString("N");
+
+    // The differential corpus: fixed patterns over every LIKE construct, then patterns built from each stored value so
+    // that the corpus matches rows: the value itself, with one end or both open, with '_' for a character, a set for
+    // its first character, its upper case, an inner run, the value with one more '_' and with a trailing blank. The
+    // characters a collation expands or ignores are CollationCorpus's.
+    private static List<string> PatternCorpus(IReadOnlyList<string> samples)
+    {
+        var corpus = new List<string>
+        {
+            "%", "%%", "_%", "%_", "__%", "%_%_%_%", "%a%", "%e%n%", "%A%E%", "%%%a%%%e%%", "a%", "%s", "S%",
+            "%[aeiou]%", "%[^a-m]%", "[A-M]%", "%[a-c-e]%", "[]%", "%[]", "%[^]%", "[^]%[^]", "%[a", "%[", "%[^",
+            "%[%]%", "%[_]%", "%[[]%", "% %", "%  %", "%y", "%[0-9]%", "%-%", "%]%", "%^%", "%e_%", "%[a-]%",
+            "%_e_%_",
+        };
+
+        foreach (var value in samples)
+        {
+            corpus.Add(value);
+            corpus.Add(value + "%");
+            corpus.Add("%" + value);
+            corpus.Add("%" + value + "%");
+            corpus.Add(value[..^1] + "_");
+            corpus.Add("_" + value[1..]);
+            corpus.Add("[" + value[..1] + "]" + value[1..] + "%");
+            corpus.Add(value.ToUpperInvariant() + "%");
+            corpus.Add(value + "_");
+            corpus.Add(value + " ");
+            if (value.Length >= 3)
+            {
+                corpus.Add("%" + value[1..^1] + "%");
+                corpus.Add(value[..1] + "%" + value[^1..]);
+                corpus.Add("%" + value[..2] + "%" + value[^2..] + "%");
+                corpus.Add(value[..1] + "%" + value[1..2] + "%" + value[2..]);
+            }
+        }
+
+        return corpus;
+    }
+
+    // The GlobalRecordId of every seeded complete active CaseReport record, so a match of one can be told from a match
+    // of a record another test created.
+    private static async Task<HashSet<string>> SeededActiveIdsAsync(SqlConnection connection, CancellationToken token)
+    {
+        var sql = "SELECT b.[GlobalRecordId] FROM " + CompleteRecords[CaseReport] + SeededActiveRecords;
+        await using var command = new SqlCommand(sql, connection);
+        AddSeededActiveParameters(command);
+        await using var reader = await command.ExecuteReaderAsync(token);
+
+        var ids = new HashSet<string>(StringComparer.Ordinal);
+        while (await reader.ReadAsync(token))
+        {
+            ids.Add(reader.GetString(0));
+        }
+
+        return ids;
+    }
+
+    // Up to CollationSamples distinct values of each column of the seeded complete active CaseReport records that hold
+    // the fragment in either case, at least one in all. The fragment is sought in the value lowercased under a binary
+    // collation, so the database collation does not decide which values hold it. A value is taken only when two or more
+    // characters follow the fragment's first occurrence, it holds no '%', '_' or '[', and it is at most
+    // MaxCollationTextLength characters long, so every pattern built from it stays a native LIKE pattern of that value.
+    private static async Task<IReadOnlyList<string>> SeededTextsHoldingAsync(
+        SqlConnection connection,
+        IReadOnlyList<string> expressions,
+        string fragment,
+        CancellationToken token)
+    {
+        var texts = new List<string>();
+        foreach (var expression in expressions)
+        {
+            var sql = "SELECT DISTINCT " + expression + " AS [v] FROM " + CompleteRecords[CaseReport]
+                + SeededActiveRecords + " AND CHARINDEX(@fragment, LOWER(" + expression
+                + " COLLATE Latin1_General_100_BIN2)) > 0 ORDER BY [v]";
+            await using var command = new SqlCommand(sql, connection);
+            AddSeededActiveParameters(command);
+            command.Parameters.Add(
+                new SqlParameter("@fragment", SqlDbType.NVarChar, fragment.Length) { Value = fragment });
+            await using var reader = await command.ExecuteReaderAsync(token);
+
+            var taken = 0;
+            while (taken < CollationSamples && await reader.ReadAsync(token))
+            {
+                var text = reader.GetString(0);
+                var at = text.IndexOf(fragment, StringComparison.OrdinalIgnoreCase);
+                if (at >= 0
+                    && at + fragment.Length + 2 <= text.Length
+                    && text.Length <= MaxCollationTextLength
+                    && text.IndexOfAny(['%', '_', '[']) < 0)
+                {
+                    texts.Add(text);
+                    taken++;
+                }
+            }
+        }
+
+        Assert.True(
+            texts.Count > 0,
+            $"No seeded value of {string.Join(", ", expressions)} holds \"{fragment}\" in either case.");
+        return texts;
+    }
+
+    // The collation corpus over one seeded value, built around the first occurrence of LigatureLetters in it, with the
+    // head before them and the tail after: the ligature in place of them, with either end open, inside and in either
+    // case; '_' in place of them, beside the ligature and for either letter; sets of the ligature, which as one member
+    // stands for two letters only if the collation says so, of the first letter and negated; NUL, U+00AD and a
+    // supplementary character inside the literal; a combining acute on the last letter, appended with an 'e' and in
+    // place of the tail's first letter, and accented letters, which no seeded value holds; tails led by a set, which
+    // past a forced limit run backwards from the value's end, an ignorable character among them; and the value itself
+    // with one end or both open.
+    private static string[] CollationCorpus(string value)
+    {
+        var at = value.IndexOf(LigatureLetters, StringComparison.OrdinalIgnoreCase);
+        var head = value[..at];
+        var tail = value[(at + LigatureLetters.Length)..];
+        var (first, second) = (value[at], value[at + 1]);
+        var ligated = head + Ligature + tail;
+        return
+        [
+            ligated, "%" + Ligature + tail, head + Ligature + "%", "%" + Ligature + "%", ligated.ToUpperInvariant(),
+            ligated.ToLowerInvariant(), "%" + Ligature + tail.ToUpperInvariant(),
+            head + "_" + tail, head + first + "_" + tail, head + "_" + second + tail, head + "__" + tail,
+            head + Ligature + "_" + tail[1..], "%_" + Ligature + "%",
+            head + "[" + first + "]" + second + tail, head + "[" + Ligature + "]" + tail,
+            head + "[" + Ligature + first + "]" + second + tail, head + "[^" + Ligature + "]" + second + tail,
+            "%[" + Ligature + "]%",
+            head + first + "\0" + second + tail, head + first + "\u00AD" + second + tail,
+            head + first + Supplementary + second + tail, head + Ligature + "\0" + tail, "%" + Ligature + "\u00AD%",
+            value + "\u0301", value + "e\u0301", head + first + second + "e\u0301" + tail[1..],
+            head + first + "\u00ED" + tail, value[..^1] + "\u00E9",
+            "%[a-z]" + Ligature + tail, "%[a-z]" + tail, "%[a-z]" + second + tail, "%[a-z]" + tail[..^1] + "_",
+            "%[a-z]" + tail + "\0", "%[a-z]" + tail[..^1] + "\u00AD" + tail[^1..], "%[a-z]" + tail + Supplementary,
+            value, value + "%", "%" + value[1..], "%" + value + "%",
+        ];
+    }
+
+    // The grid filters over one seeded text, built around the first occurrence of LigatureLetters in it, each with
+    // whether it lists a record: the ligature in place of them with the text before and after it, after it only,
+    // before it only, and in upper and lower case, each of which lists the text's record; NUL, U+00AD and a
+    // supplementary character inside the literal, which Latin1_General_100_CI_AS alone decides; and a combining acute
+    // on the last letter or in place of the tail's first letter, and accented letters in place of the second ligature
+    // letter and of the last letter, which no seeded text holds, so each lists none.
+    private static (string Filter, bool? Lists)[] CollationFilters(string text)
+    {
+        var at = text.IndexOf(LigatureLetters, StringComparison.OrdinalIgnoreCase);
+        var head = text[..at];
+        var tail = text[(at + LigatureLetters.Length)..];
+        var (first, second) = (text[at], text[at + 1]);
+        var ligated = head + Ligature + tail;
+        return
+        [
+            (ligated, true), (Ligature + tail, true), (head + Ligature, true), (ligated.ToUpperInvariant(), true),
+            (ligated.ToLowerInvariant(), true),
+            (head + first + "\0" + second + tail, null), (head + first + "\u00AD" + second + tail, null),
+            (head + first + Supplementary + second + tail, null), (head + Ligature + "\0" + tail, null),
+            (text + "\u0301", false), (head + first + second + "e\u0301" + tail[1..], false),
+            (head + first + "\u00ED" + tail, false), (text[..^1] + "\u00E9", false),
+        ];
+    }
+
+    private static SearchCondition LikeCondition(DataFieldMetadata field, string pattern) => new(
+        field.Name,
+        SearchTarget.PageField,
+        field.FieldType,
+        [new SearchAlternative(SearchOperator.Like, FieldValue.FromText(pattern))]);
+
+    // A statement runs a long-pattern program exactly when it should, and is in every case one read: a single SELECT or
+    // WITH statement with no batch separator and no write.
+    private static void AssertProgram(SqlStatement statement, bool longPattern)
+    {
+        Assert.DoesNotContain(";", statement.Text, StringComparison.Ordinal);
+        Assert.False(SqlCommandRecorder.ContainsWriteStatement(statement.Text), "A read holds a write statement.");
+        if (longPattern)
+        {
+            Assert.Contains(LongPatternCte, statement.Text, StringComparison.Ordinal);
+            Assert.Contains(LongPatternHint.Trim()[..^1], statement.Text, StringComparison.Ordinal);
+        }
+        else
+        {
+            Assert.DoesNotContain(LongPatternCte, statement.Text, StringComparison.Ordinal);
+            Assert.DoesNotContain("MAXRECURSION", statement.Text, StringComparison.Ordinal);
+        }
+    }
+
+    // A list statement is one held read whether or not its filter is long: the base table and each page table it
+    // joins carry HOLDLOCK wherever they are read, once by the filtered set and, for a long filter, once more by the
+    // program, and the statement ends with the list's plan hints, after the recursion hint when it runs a program.
+    private static void AssertHeldList(SeededForm form, SqlStatement statement, bool longPattern)
+    {
+        var text = statement.Text;
+        var baseTable = SqlIdentifier.Quote(form.Schema.BaseTable);
+        Assert.Equal(longPattern ? 2 : 1, Occurrences(text, " FROM " + baseTable + " "));
+        var heldBase = baseTable + " " + RecordSqlBuilder.BaseAlias + ListHoldLock;
+        Assert.Equal(longPattern ? 2 : 1, Occurrences(text, heldBase));
+        var pageJoins = Occurrences(text, " LEFT JOIN ");
+        Assert.NotEqual(0, pageJoins);
+        Assert.Equal(pageJoins, Occurrences(text, ListHoldLock + " ON "));
+        Assert.EndsWith(longPattern ? LongListPlanHints : ListPlanHints, text, StringComparison.Ordinal);
+    }
+
+    // The number of non-overlapping ordinal occurrences of value in text.
+    private static int Occurrences(string text, string value)
+    {
+        var count = 0;
+        for (var at = text.IndexOf(value, StringComparison.Ordinal);
+             at >= 0;
+             at = text.IndexOf(value, at + value.Length, StringComparison.Ordinal))
+        {
+            count++;
+        }
+
+        return count;
+    }
+
+    // The GlobalRecordId of every row a list statement flags as on the page, in order, and the total of the filtered
+    // set every row carries; an empty page arrives as one row flagged 0, which carries the total alone.
+    private static Task<(IReadOnlyList<string> Ids, long Total)> ListRowsAsync(
+        SqlConnection connection,
+        SqlStatement statement,
+        CancellationToken token) =>
+        SqlExecution.ReadAsync(
+            connection,
+            null,
+            Operation,
+            statement,
+            DatabaseOptions.DefaultCommandTimeoutSeconds,
+            NullSqlCommandObserver.Instance,
+            token,
+            async (reader, cancellationToken) =>
+            {
+                var ids = new List<string>();
+                long? total = null;
+                while (await reader.ReadAsync(cancellationToken))
+                {
+                    total = reader.GetInt64(SearchSqlBuilder.TotalOrdinal);
+                    if (reader.GetInt32(SearchSqlBuilder.InPageOrdinal) == 1)
+                    {
+                        ids.Add(reader.GetString(SearchSqlBuilder.IdOrdinal));
+                    }
+                }
+
+                Assert.True(total.HasValue, "The list statement returned no row, so no total.");
+                return ((IReadOnlyList<string>)ids, total.Value);
+            });
 
     // A statement decodes a packed list, and ends with the packed plan hints, exactly when it binds its values packed;
     // a per-alternative statement has no query hint, and none uses OPENJSON.

@@ -1,4 +1,3 @@
-using System.Globalization;
 using EpiInfo.Domain.Forms;
 using EpiInfo.Domain.Metadata;
 using EpiInfo.Domain.Records;
@@ -409,48 +408,31 @@ public sealed class RecordQueryRulesTests
     }
 
     /// <summary>
-    /// SQL Server's <c>LIKE</c> pattern is at most 4,000 UTF-16 code units, so a plain filter may hold 3,998
-    /// characters and a filter of escaped characters half as many; the count agrees with the pattern itself.
+    /// The contains pattern of a filter of any length is the whole filter, escaped and wrapped, past SQL Server's
+    /// 4,000-unit <c>LIKE</c> pattern limit too, which bounds no filter: each escaped character counts two units.
     /// </summary>
     [Theory]
-    [InlineData("a", 3998, true)]
-    [InlineData("a", 3999, false)]
-    [InlineData("%", 1999, true)]
-    [InlineData("%", 2000, false)]
-    [InlineData("_", 1999, true)]
-    [InlineData("[", 2000, false)]
-    [InlineData("\\", 1999, true)]
-    [InlineData("\\", 2000, false)]
-    [InlineData("a%", 1332, true)]
-    [InlineData("a%", 1333, false)]
-    public void IsRepresentableFilter_CountsTheEscapedAndWrappedPattern(string unit, int repeat, bool expected)
+    [InlineData("a", 3998, 4000)]
+    [InlineData("a", 3999, 4001)]
+    [InlineData("%", 2000, 4002)]
+    [InlineData("[", 2000, 4002)]
+    [InlineData("\\", 4001, 8004)]
+    [InlineData("a%", 1333, 4001)]
+    public void ToContainsPattern_OfAnyLength_KeepsTheWholeFilter(string unit, int repeat, int expectedLength)
     {
         var filter = string.Concat(Enumerable.Repeat(unit, repeat));
 
-        Assert.Equal(expected, RecordQueryRules.IsRepresentableFilter(filter));
-        Assert.Equal(
-            expected,
-            RecordQueryRules.ToContainsPattern(filter).Length <= RecordQueryRules.MaxLikePatternLength);
+        var pattern = RecordQueryRules.ToContainsPattern(filter);
+
+        var escaped = unit.Replace("\\", "\\\\").Replace("%", "\\%").Replace("[", "\\[");
+        Assert.Equal(expectedLength, pattern.Length);
+        Assert.Equal("%" + string.Concat(Enumerable.Repeat(escaped, repeat)) + "%", pattern);
     }
 
     [Fact]
-    public void FilterTooLongMessage_StatesTheLongestPlainFilter()
-    {
-        var longest = RecordQueryRules.MaxLikePatternLength - 2;
-
-        Assert.Contains(
-            string.Create(CultureInfo.InvariantCulture, $" {longest} "),
-            RecordQueryRules.FilterTooLongMessage,
-            StringComparison.Ordinal);
-        Assert.True(RecordQueryRules.IsRepresentableFilter(new string('a', longest)));
-        Assert.False(RecordQueryRules.IsRepresentableFilter(new string('a', longest + 1)));
-    }
-
-    [Fact]
-    public void ContainsPatternMembers_NullFilter_Throw()
+    public void ToContainsPattern_NullFilter_Throws()
     {
         Assert.Throws<ArgumentNullException>("filter", () => RecordQueryRules.ToContainsPattern(null!));
-        Assert.Throws<ArgumentNullException>("filter", () => RecordQueryRules.IsRepresentableFilter(null!));
     }
 
     [Theory]

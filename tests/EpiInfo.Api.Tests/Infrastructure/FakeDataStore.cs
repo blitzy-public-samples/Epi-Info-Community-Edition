@@ -375,14 +375,15 @@ public static class FakeForms
 /// <c>LEFT JOIN</c> (missing pages give <see cref="FieldValue.Null"/>), search over records that have every page row,
 /// base-only soft delete, delta updates, and the gates of <see cref="UpdateAsync"/> in the interface's order. A
 /// <c>values</c> key that is not a data field, a value not of its field's kind, or a value its column cannot store,
-/// is an <see cref="ArgumentException"/> raised before any change, as the SQL builders raise it, and so are search
-/// conditions with a <c>LIKE</c> pattern over <see cref="RecordQueryRules.MaxLikePatternLength"/>, and a grid filter
-/// that fails <see cref="RecordQueryRules.IsRepresentableFilter"/>. Search takes any number of alternatives, as the SQL
-/// builder does by packing them. Text comparisons, record ids and the grid filter ignore case ordinally, the common
-/// case-insensitive collation; the fake claims no collation parity beyond that. Find's comparisons, its 255-character
-/// prefix equality included, pad the shorter text with spaces, as SQL Server compares character values, so adding or
-/// removing trailing blanks changes none of them, while <c>LIKE</c> keeps them significant, as SQL Server does on
-/// Unicode text.
+/// is an <see cref="ArgumentException"/> raised before any change, as the SQL builders raise it, and so is a search
+/// condition with a <c>LIKE</c> pattern holding a <c>[...]</c> set that no SQL Server construct can evaluate
+/// (<see cref="LikePatternSyntax.HoldsUnsearchableSet"/>). A <c>LIKE</c> pattern and a grid filter of any other length
+/// are matched, as the SQL builders match them beyond SQL Server's pattern limit. Search takes any number of
+/// alternatives, as the SQL builder does by packing them. Text comparisons, record ids and the grid filter ignore
+/// case ordinally, the common case-insensitive collation; the fake claims no collation parity beyond that. Find's
+/// comparisons, its 255-character prefix equality included, pad the shorter text with spaces, as SQL Server compares
+/// character values, so adding or removing trailing blanks changes none of them, while <c>LIKE</c> keeps them
+/// significant, as SQL Server does on Unicode text.
 /// </para>
 /// <para>
 /// The grid filter searches the text the list builder's <c>q</c> predicate converts each grid column to, as
@@ -1012,13 +1013,6 @@ public sealed class FakeDataStore : IDataStore
 
             var filter = query.Filter;
 
-            // The list builder's bound: a filter whose contains pattern exceeds SQL Server's LIKE limit.
-            if (filter is not null && !RecordQueryRules.IsRepresentableFilter(filter))
-            {
-                throw new ArgumentException(
-                    "The grid filter's pattern is longer than SQL Server's LIKE pattern limit.", nameof(query));
-            }
-
             // One pass over the rows taken under the lock, outside it: the filter reads only the grid columns, every
             // match is counted, and only the page's rows are projected. The offset is 64-bit, so a valid page far past
             // the end gives no item rather than overflowing.
@@ -1626,14 +1620,18 @@ public sealed class FakeDataStore : IDataStore
                 throw new ArgumentException("A search condition needs an alternative.", nameof(conditions));
             }
 
-            // The search builder's LIKE pattern bound, so the fake keeps its argument contract.
+            // The one pattern the search builder refuses, a [...] set longer than SQL Server's LIKE pattern limit that
+            // is unclosed or cannot be cut into shorter sets, so the fake keeps its argument contract; a pattern of
+            // any other length is matched.
             if (condition.Alternatives.Any(alternative =>
                     alternative is { Operator: SearchOperator.Like, Value: { } pattern }
                     && pattern.TryGetText(out var text)
-                    && text.Length > RecordQueryRules.MaxLikePatternLength))
+                    && LikePatternSyntax.HoldsUnsearchableSet(text)))
             {
                 throw new ArgumentException(
-                    "A search pattern is longer than SQL Server's LIKE pattern limit.", nameof(conditions));
+                    "A search pattern holds a [...] set longer than SQL Server's LIKE pattern limit that is unclosed"
+                    + " or cannot be cut into shorter sets.",
+                    nameof(conditions));
             }
 
             switch (condition.Target)

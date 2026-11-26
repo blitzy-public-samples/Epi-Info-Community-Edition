@@ -1442,6 +1442,10 @@ public sealed class ErrorContractTests
     public static TheoryData<string, string> EnvironmentsAndBodiesWithoutAValuesObject =>
         EnvironmentsWith("""{"values":5}""", "{}");
 
+    /// <summary>Each environment with each search body whose <c>criteria</c> is empty, <c>null</c> or absent.</summary>
+    public static TheoryData<string, string> EnvironmentsAndSearchBodiesWithoutCriteria =>
+        EnvironmentsWith("""{"criteria":[]}""", """{"criteria":null}""", "{}");
+
     /// <summary>Each environment with each read endpoint and each store failure that ends it.</summary>
     public static TheoryData<string, string, string> ReadFailures
     {
@@ -1639,6 +1643,31 @@ public sealed class ErrorContractTests
         Assert.Equal(ExpectedValuesMustBeObjectDetail, StringMember(problem, "detail"));
         Assert.False(problem.TryGetProperty("errors", out _), "A request-level 400 carries an errors map.");
         Assert.False(problem.TryGetProperty("writeOutcome", out _), "A 400 carries writeOutcome.");
+        Assert.Empty(store.WriteCalls);
+    }
+
+    // AAP 0.3.4.2: a search whose criteria is empty, null or absent is the request-level 400, a plain ProblemDetails
+    // whose detail is the wire text itself, written out here rather than read from the constant the API sends, with no
+    // errors map and no search run.
+    [Theory]
+    [MemberData(nameof(EnvironmentsAndSearchBodiesWithoutCriteria))]
+    public async Task SearchWithoutCriteriaIsARequestLevel400(string environment, string json)
+    {
+        FakeDataStore store = FakeDataStore.WithStandardForms();
+        await using ApiFactory factory = CreateFactory(environment, store);
+        using HttpClient client = factory.CreateClient();
+        using var request = new HttpRequestMessage(HttpMethod.Post, $"{TwoPageRecordsPath}/search")
+        {
+            Content = JsonBody(json),
+        };
+
+        using HttpResponseMessage response = await client.SendAsync(request);
+        string body = await response.Content.ReadAsStringAsync();
+
+        JsonElement problem = AssertProblemDetails(response, body, HttpStatusCode.BadRequest);
+        Assert.Equal("criteria must not be empty", StringMember(problem, "detail"));
+        Assert.False(problem.TryGetProperty("errors", out _), "A request-level 400 carries an errors map.");
+        Assert.DoesNotContain(store.Calls, call => call.Method == nameof(IDataStore.SearchAsync));
         Assert.Empty(store.WriteCalls);
     }
 

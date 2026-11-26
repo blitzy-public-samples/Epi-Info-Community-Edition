@@ -1077,7 +1077,7 @@ public sealed class SearchCriteriaParserTests
     }
 
     // A longer pattern without '[' has each run of '%' (after '*' becomes '%') collapsed to one, which LIKE matches
-    // identically, and is kept when that brings it within the bound; '_', '?' and quotes stay as written.
+    // identically, whatever length that leaves; '_', '?' and quotes stay as written.
     [Theory]
     [MemberData(nameof(CollapsiblePatterns))]
     public void Limits_LongPatternWhosePercentRunsCollapse_IsOneLikeOfTheCollapsedPattern(
@@ -1085,34 +1085,113 @@ public sealed class SearchCriteriaParserTests
         string written,
         string expected)
     {
-        Assert.True(written.Length > RecordQueryRules.MaxLikePatternLength);
-        Assert.True(expected.Length <= RecordQueryRules.MaxLikePatternLength);
+        Assert.True(written.Length > 4000);
 
         AssertAlternatives(SingleCondition(Parse(Text(field, written))), LikeText(expected));
     }
 
-    // Over the bound a pattern holding '[' is never rewritten, because inside a set '%' is a member rather than a
-    // wildcard; one without a run of '%', or whose collapse still leaves it too long, cannot be shortened exactly.
+    // Past SQL Server's 4,000-unit pattern limit a pattern is still searched whole, so it is one LIKE of any length:
+    // one without a run of '%' as written, one holding '[' as written, because inside a set '%' is a member rather than
+    // a wildcard, one with a set of 4,000 units or more as written, which the search builder cuts into shorter sets,
+    // and one whose collapse still leaves it longer than the limit with its run collapsed; beside another alternative
+    // too.
     [Theory]
     [InlineData("LastName", "", PlainPattern, 4001)]
     [InlineData("Notes", "", PlainPattern, 4001)]
     [InlineData("LastName", "Sm* or ", PlainPattern, 4001)]
+    [InlineData("LastName", "", PlainPattern, 20000)]
     [InlineData("LastName", "", BracketPattern, 4001)]
     [InlineData("Notes", "", BracketPattern, 4001)]
+    [InlineData("LastName", "", SetPattern, 4000)]
+    [InlineData("LastName", "", SetPattern, 4001)]
+    [InlineData("Notes", "Sm* or ", SetPattern, 9000)]
     [InlineData("LastName", "", RunPattern, 4002)]
     [InlineData("Notes", "", RunPattern, 4002)]
-    public void Limits_LongPatternThatDoesNotCollapseToTheBound_IsAFieldError(
+    public void Limits_LongPatternThatDoesNotCollapseToTheBound_IsOneLikeOfTheWholePattern(
         string field,
         string leadingAlternative,
         string kind,
         int length)
     {
-        SearchParseResult result = Parse(Text(field, leadingAlternative + LongPattern(kind, length)));
+        var translated = LongPattern(kind, length).Replace('*', '%');
+        var expected = kind == RunPattern ? translated[..^1] : translated;
+        Assert.True(expected.Length > 4000);
+
+        var condition = SingleCondition(Parse(Text(field, leadingAlternative + LongPattern(kind, length))));
+
+        if (leadingAlternative.Length == 0)
+        {
+            AssertAlternatives(condition, LikeText(expected));
+        }
+        else
+        {
+            AssertAlternatives(condition, LikeText("Sm%"), LikeText(expected));
+        }
+    }
+
+    // A [...] set longer than 4,000 units, which neither LIKE nor PATINDEX takes, that is unclosed, whose meaning then
+    // depends on the collation, or that no cut keeping its members and negation divides (a chain of ranges, a run of
+    // combining marks, a negated set whose members start with '^') is the one pattern no SQL Server construct
+    // evaluates: a fixed field-level error naming the case and echoing nothing, beside another alternative too.
+    [Theory]
+    [InlineData("LastName", "", UnclosedSetPattern)]
+    [InlineData("Notes", "", UnclosedSetPattern)]
+    [InlineData("LastName", "Sm* or ", UnclosedSetPattern)]
+    [InlineData("LastName", "", RangeChainSetPattern)]
+    [InlineData("Notes", "Sm* or ", RangeChainSetPattern)]
+    [InlineData("LastName", "", CombiningSetPattern)]
+    [InlineData("LastName", "", CaretSetPattern)]
+    public void Limits_PatternWithAnUnsearchableSet_IsAFieldError(string field, string leadingAlternative, string kind)
+    {
+        SearchParseResult result = Parse(Text(field, leadingAlternative + LongPattern(kind, 4001)));
 
         AssertFieldError(result, field);
         Assert.Single(result.FieldErrors);
-        Assert.Single(result.FieldErrors[field]);
+        Assert.Equal(
+            new[]
+            {
+                field + " search patterns cannot hold a [...] set longer than 4000 characters that has no closing ] or"
+                + " that cannot be cut into sets of at most 3998 characters that keep its members and negation.",
+            },
+            result.FieldErrors[field]);
         AssertCarriesNoSubmittedText(result);
+    }
+
+    // LikePatternSyntax.TrySplitSet cuts a set as late as each piece's length allows, between two members where neither
+    // is '-' or the zero-width joiner, the second is not '^' or a combining mark and the two are not one surrogate
+    // pair, so each piece keeps the members and ranges it held; it fails for an unclosed or empty set, a negated set
+    // whose members start with '^', and a set with no such cut. Expected pieces are separated by '|'.
+    [Theory]
+    [InlineData("[abcdef]", 5, false, "[abc]|[def]")]
+    [InlineData("[^abcdef]", 5, true, "[abc]|[def]")]
+    [InlineData("[abc]", 5, false, "[abc]")]
+    [InlineData("[a-cd-f]", 5, false, "[a-c]|[d-f]")]
+    [InlineData("[ab-de]", 5, false, "[a]|[b-d]|[e]")]
+    [InlineData("[a^b]", 4, false, "[a^]|[b]")]
+    [InlineData("[[ab]", 4, false, "[[a]|[b]")]
+    [InlineData("[ae\u0301i]", 4, false, "[a]|[e\u0301]|[i]")]
+    [InlineData("[a\uD83D\uDE00b]", 4, false, "[a]|[\uD83D\uDE00]|[b]")]
+    [InlineData("[a^b]", 3, false, null)]
+    [InlineData("[a\u200Db]", 4, false, null)]
+    [InlineData("[a-c-e]", 6, false, null)]
+    [InlineData("[^^ab]", 5, false, null)]
+    [InlineData("[abc", 5, false, null)]
+    [InlineData("[]", 5, false, null)]
+    [InlineData("[abc]", 2, false, null)]
+    public void LikePatternSyntax_TrySplitSet_CutsOnlyWhereEachPieceKeepsItsMembers(
+        string set,
+        int maxPieceLength,
+        bool negated,
+        string? pieces)
+    {
+        var element = Assert.Single(LikePatternSyntax.Tokenize(set));
+
+        var split = LikePatternSyntax.TrySplitSet(set, element, maxPieceLength, out var isNegated, out var cut);
+
+        Assert.Equal(pieces is not null, split);
+        Assert.Equal(negated, isNegated);
+        Assert.Equal(pieces?.Split('|') ?? [], cut);
+        Assert.All(cut, piece => Assert.True(piece.Length <= maxPieceLength));
     }
 
     // Equality, the 255-character multiline comparison and the comparisons without a wildcard path bind a value
@@ -1131,11 +1210,18 @@ public sealed class SearchCriteriaParserTests
         AssertAlternatives(SingleCondition(Parse(Text(field, value))), (expected, FieldValue.FromText(value)));
     }
 
-    // The pattern kinds of the bound tests: one '*' and no run of '%'; a set followed by a run of '*'; and other
-    // characters ending in a run of two '*', so collapsing saves one character.
+    // The pattern kinds of the bound tests: one '*' and no run of '%'; a set followed by a run of '*'; other
+    // characters ending in a run of two '*', so collapsing saves one character; and '*' then a set of the length,
+    // closed, unclosed, a chain of ranges of an odd length, a letter and combining marks, or negated with members
+    // starting with '^'.
     private const string PlainPattern = "plain";
     private const string BracketPattern = "bracket";
     private const string RunPattern = "run";
+    private const string SetPattern = "set";
+    private const string UnclosedSetPattern = "unclosed set";
+    private const string RangeChainSetPattern = "range chain set";
+    private const string CombiningSetPattern = "combining set";
+    private const string CaretSetPattern = "caret set";
 
     // Each row is (field, value written, the one LIKE pattern expected); every value is over 4,000 characters.
     public static TheoryData<string, string, string> CollapsiblePatterns => new()
@@ -1148,8 +1234,9 @@ public sealed class SearchCriteriaParserTests
         { "LastName", "Sm" + string.Concat(Enumerable.Repeat("*%", 2000)) + "th", "Sm%th" },
         { "Notes", "Sm" + string.Concat(Enumerable.Repeat("*%", 2000)) + "th", "Sm%th" },
 
-        // Collapsing lands exactly on the bound.
+        // Collapsing lands exactly on 4,000 units, and leaves a pattern still longer than that.
         { "LastName", new string('x', 3999) + "%%", new string('x', 3999) + "%" },
+        { "LastName", new string('x', 4000) + "**y%%", new string('x', 4000) + "%y%" },
 
         // Several runs, with '_', '?' and a quote kept as written.
         {
@@ -1165,12 +1252,18 @@ public sealed class SearchCriteriaParserTests
 
     private static string AlternativeText(int index) => Sentinel + index.ToString(CultureInfo.InvariantCulture);
 
-    // A wildcard pattern of exactly length characters that carries the sentinel, of one of the pattern kinds.
+    // A wildcard pattern that carries the sentinel, of one of the pattern kinds: of exactly length characters, or for
+    // the set kind the sentinel and '*' before a set of exactly length characters.
     private static string LongPattern(string kind, int length) => kind switch
     {
         PlainPattern => Sentinel + "*" + new string('x', length - Sentinel.Length - 1),
         BracketPattern => Sentinel + "[a-%]" + new string('*', length - Sentinel.Length - 5),
         RunPattern => Sentinel + new string('x', length - Sentinel.Length - 2) + "**",
+        SetPattern => Sentinel + "*[" + new string('a', length - 2) + "]",
+        UnclosedSetPattern => Sentinel + "*[" + new string('a', length - 1),
+        RangeChainSetPattern => Sentinel + "*[" + string.Concat(Enumerable.Repeat("a-", (length - 3) / 2)) + "a]",
+        CombiningSetPattern => Sentinel + "*[e" + new string('\u0301', length - 3) + "]",
+        CaretSetPattern => Sentinel + "*[^^" + new string('a', length - 4) + "]",
         _ => throw new ArgumentOutOfRangeException(nameof(kind), kind, "Unknown pattern kind."),
     };
 
@@ -1194,7 +1287,7 @@ public sealed class SearchCriteriaParserTests
                  })
         {
             Assert.False(result.IsSuccess);
-            Assert.Equal(SearchCriteriaParser.EmptyCriteriaMessage, result.RequestError);
+            Assert.Equal("criteria must not be empty", result.RequestError);
             Assert.Empty(result.FieldErrors);
             Assert.Empty(result.Conditions);
         }

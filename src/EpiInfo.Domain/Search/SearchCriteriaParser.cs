@@ -177,12 +177,18 @@ public sealed class SearchParseResult
 /// twice.</description></item>
 /// <item><description><c>GlobalRecordId</c> and <c>RecStatus</c> are base-table conditions, where the legacy join
 /// on their unbound page failed before any result.</description></item>
-/// <item><description>A wildcard pattern still longer than <see cref="RecordQueryRules.MaxLikePatternLength"/>
-/// UTF-16 code units once each run of <c>%</c> in a pattern without <c>[</c> is collapsed to one <c>%</c> is a 400
-/// on the field. Legacy inlined the pattern as an ANSI literal and so ran patterns of up to 8,000 single-byte
-/// characters; the target binds it as an <c>nvarchar</c> parameter, whose <c>LIKE</c> pattern SQL Server limits to
-/// 4,000 code units. A shorter pattern is never rewritten. Any number of alternatives is accepted, as in legacy, and
-/// equality and the 255-character multiline comparison have no length bound.</description></item>
+/// <item><description>A wildcard pattern of any length matches by its whole text. Legacy inlined the pattern as an
+/// ANSI literal, which SQL Server shortened to its first 4,000 characters against the <c>nvarchar</c> column and
+/// refused past 8,000 bytes. The target binds it as a parameter, and the search builder evaluates a pattern longer
+/// than SQL Server's 4,000-code-unit <c>LIKE</c> limit piece by piece with the same meaning under the column's
+/// collation. A pattern within <see cref="RecordQueryRules.MaxLikePatternLength"/> code units is kept exactly as
+/// written; a longer one without <c>[</c> has each run of <c>%</c> collapsed to one <c>%</c>, which matches exactly
+/// the same text. The one pattern no SQL Server construct can evaluate, one holding a <c>[...]</c> set longer than
+/// <see cref="RecordQueryRules.MaxLikePatternLength"/> code units that is unclosed or that
+/// <see cref="LikePatternSyntax.TrySplitSet"/> cannot cut into shorter sets
+/// (<see cref="LikePatternSyntax.HoldsUnsearchableSet"/>), is a 400 on the field. Any number of alternatives is
+/// accepted, as in legacy, and equality and the 255-character multiline comparison have no length
+/// bound.</description></item>
 /// </list>
 /// </para>
 /// <para>
@@ -207,7 +213,7 @@ public static class SearchCriteriaParser
     public const string RecStatusFieldName = "RecStatus";
 
     /// <summary>The request-level 400 <c>detail</c> for a missing, null or empty <c>criteria</c>.</summary>
-    public const string EmptyCriteriaMessage = "`criteria` must not be empty";
+    public const string EmptyCriteriaMessage = "criteria must not be empty";
 
     // The legacy dialog's alternative separators, matched ordinally by string.Split.
     private static readonly string[] OrSeparators = [" or ", " OR ", " Or ", " oR "];
@@ -254,7 +260,7 @@ public static class SearchCriteriaParser
         None,
         Blank,
         Invalid,
-        PatternTooLong,
+        UnsearchableSet,
     }
 
     private enum TextReading
@@ -282,8 +288,9 @@ public static class SearchCriteriaParser
     /// <item><description>A field-level failure holding every error found in one pass: under
     /// <see cref="CriteriaKey"/>, one message per null entry, unknown or unsearchable name and repeated field, and
     /// one for exceeding <see cref="RecordQueryRules.MaxSearchFields"/> distinct fields, whose excess criteria are not
-    /// parsed; and under each field's canonical name, the error in its value, a wildcard pattern longer than
-    /// <see cref="RecordQueryRules.MaxLikePatternLength"/> after its <c>%</c> runs collapse included.</description></item>
+    /// parsed; and under each field's canonical name, the error in its value, a wildcard pattern holding a
+    /// <c>[...]</c> set that <see cref="LikePatternSyntax.HoldsUnsearchableSet"/> finds no SQL Server construct can
+    /// evaluate included.</description></item>
     /// <item><description>Otherwise a success with one condition per criterion, in criteria order.</description></item>
     /// </list>
     /// </returns>
@@ -345,8 +352,8 @@ public static class SearchCriteriaParser
                 case ValueError.Blank:
                     AddError(errors, field.Name, $"{field.Name} needs a search value.");
                     break;
-                case ValueError.PatternTooLong:
-                    AddError(errors, field.Name, PatternTooLongMessage(field));
+                case ValueError.UnsearchableSet:
+                    AddError(errors, field.Name, UnsearchableSetMessage(field));
                     break;
                 default:
                     AddError(errors, field.Name, InvalidValueMessage(field));
@@ -478,9 +485,10 @@ public static class SearchCriteriaParser
             {
                 // Only '*' is translated. '?', '_', '[...]' and single quotes stay as written; the pattern is a
                 // parameter, so a quote cannot end it.
-                if (!TryFitLikePattern(rest.Replace('*', '%'), out var pattern))
+                var pattern = NormaliseLikePattern(rest.Replace('*', '%'));
+                if (LikePatternSyntax.HoldsUnsearchableSet(pattern))
                 {
-                    return ValueError.PatternTooLong;
+                    return ValueError.UnsearchableSet;
                 }
 
                 parsed[i] = new SearchAlternative(SearchOperator.Like, FieldValue.FromText(pattern));
@@ -496,25 +504,20 @@ public static class SearchCriteriaParser
         return ValueError.None;
     }
 
-    // Fits a translated LIKE pattern to SQL Server's limit, RecordQueryRules.MaxLikePatternLength UTF-16 code units of an
-    // nvarchar pattern. A pattern within it is kept exactly as written. A longer one without '[' has each run of '%'
-    // collapsed to one '%', which matches exactly the same text: with no ESCAPE clause and no character set every '%'
-    // is a wildcard, and a run of them matches what one does. Inside a [...] set a '%' is a member, not a wildcard, so
-    // a pattern holding '[' is never rewritten. The pattern fits only if it is within the limit after that.
-    private static bool TryFitLikePattern(string pattern, out string fitted)
+    // Normalises a translated LIKE pattern longer than RecordQueryRules.MaxLikePatternLength, SQL Server's limit in
+    // UTF-16 code units of an nvarchar pattern, the longest the search builder binds as one LIKE parameter. A pattern
+    // within it is kept exactly as written. A longer one without '[' has each run of '%' collapsed to one '%', which
+    // matches exactly the same text: with no ESCAPE clause and no character set every '%' is a wildcard, and a run of
+    // them matches what one does. Inside a [...] set a '%' is a member, not a wildcard, so a pattern holding '[' is
+    // never rewritten. Whatever its length afterwards, the pattern is searched by its whole text.
+    private static string NormaliseLikePattern(string pattern)
     {
-        fitted = pattern;
-        if (pattern.Length <= RecordQueryRules.MaxLikePatternLength)
+        if (pattern.Length <= RecordQueryRules.MaxLikePatternLength || pattern.Contains('['))
         {
-            return true;
+            return pattern;
         }
 
-        if (pattern.Contains('['))
-        {
-            return false;
-        }
-
-        var collapsed = new StringBuilder(RecordQueryRules.MaxLikePatternLength + 1);
+        var collapsed = new StringBuilder(pattern.Length);
         var afterPercent = false;
         foreach (var character in pattern)
         {
@@ -522,17 +525,12 @@ public static class SearchCriteriaParser
             if (!(isPercent && afterPercent))
             {
                 collapsed.Append(character);
-                if (collapsed.Length > RecordQueryRules.MaxLikePatternLength)
-                {
-                    return false;
-                }
             }
 
             afterPercent = isPercent;
         }
 
-        fitted = collapsed.ToString();
-        return true;
+        return collapsed.ToString();
     }
 
     // Number: blank matches a column holding no value; otherwise each alternative is the prefix operator on an
@@ -791,12 +789,16 @@ public static class SearchCriteriaParser
         _ => throw new UnreachableException("Every criterion kind has an error message."),
     };
 
-    // Fixed text naming the canonical field and the bound; never the submitted pattern.
-    private static string PatternTooLongMessage(ResolvedField field) =>
+    // Fixed text naming the canonical field and the one case LikePatternSyntax.HoldsUnsearchableSet refuses, a long set
+    // that is unclosed or that TrySplitSet cannot cut without changing a member, a range or the negation; never the
+    // submitted pattern.
+    private static string UnsearchableSetMessage(ResolvedField field) =>
         string.Create(
             CultureInfo.InvariantCulture,
-            $"{field.Name} search patterns can be at most {RecordQueryRules.MaxLikePatternLength} characters long, " +
-            $"each run of * and % counting as one in a pattern without [.");
+            $"{field.Name} search patterns cannot hold a [...] set longer than " +
+            $"{RecordQueryRules.MaxLikePatternLength} characters that has no closing ] or that cannot be cut into " +
+            $"sets of at most {RecordQueryRules.MaxLikePatternLength - 2} characters that keep its members and " +
+            $"negation.");
 
     // Names the criterion by its 0-based position only, because the caller's raw name is never echoed.
     private static string CriteriaMessage(int index, string problem) =>

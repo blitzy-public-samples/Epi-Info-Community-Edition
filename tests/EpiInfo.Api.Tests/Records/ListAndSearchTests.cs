@@ -2,6 +2,7 @@ using System.Data;
 using System.Globalization;
 using System.Net;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using EpiInfo.Api.Contracts;
 using EpiInfo.Api.Endpoints;
 using EpiInfo.Api.Errors;
@@ -112,16 +113,19 @@ public sealed class SearchRequestBindingTests
 }
 
 /// <summary>
-/// The SQL Server bounds of the records-list filter and of Find (AAP 0.3.4.1, 0.3.4.2, 0.3.4.4): a filter or wildcard
-/// pattern over SQL Server's <c>LIKE</c> pattern limit is a field-level 400 before any store call, a request within it
-/// reaches the store whatever its number of alternatives, and the in-memory store keeps the SQL builders' argument
-/// contract for input over the bounds.
+/// The records-list filter and Find have no length bound (AAP 0.3.4.1, 0.3.4.2, 0.3.4.4): a filter or a wildcard
+/// pattern past SQL Server's 4,000-code-unit <c>LIKE</c> pattern limit coerces and reaches the store, which matches it
+/// as the SQL builders do, whatever the number of alternatives, a <c>[...]</c> set longer than that limit included.
+/// The one 400 left is a pattern holding such a set that is unclosed or that no cut keeping its members and negation
+/// divides, which no SQL Server construct can evaluate, and the in-memory store keeps the SQL builders' argument
+/// contract for it.
 /// </summary>
 /// <remarks>
 /// The class needs no database: it carries no <c>Integration</c> trait and joins no database collection, so
 /// <c>--filter "Category!=Integration"</c> selects it. It calls <see cref="RequestParameters"/> and
-/// <see cref="RecordService"/> directly, the service over <see cref="FakeDataStore"/>, and reads the published Find
-/// array bounds from the OpenAPI document of an <see cref="ApiFactory"/> host with no connection string.
+/// <see cref="RecordService"/> directly, the service over <see cref="FakeDataStore"/>, and the store itself, and reads
+/// the published Find array bounds from the OpenAPI document of an <see cref="ApiFactory"/> host with no connection
+/// string.
 /// </remarks>
 public sealed class ListAndSearchBoundsTests
 {
@@ -135,13 +139,42 @@ public sealed class ListAndSearchBoundsTests
 
     private const string BracketKind = "bracket";
 
-    // A q whose contains pattern fits 4,000 characters: 3,998 plain characters, 1,999 escaped ones, or any blank text,
-    // which is no filter however long.
+    private const string SetKind = "set";
+
+    private const string UnclosedSetKind = "unclosed set";
+
+    private const string RangeChainSetKind = "range chain set";
+
+    // A LastName value of 4,000 characters, the most its nvarchar(4000) column stores, for the filter cases.
+    private static readonly string LongLastName = "Q" + new string('x', 3998) + "Z";
+
+    /// <summary>
+    /// Grid filters past SQL Server's <c>LIKE</c> pattern limit, whose contains patterns run to 4,002 units and more,
+    /// with whether each finds the record whose LastName is <see cref="LongLastName"/>: the whole value in another
+    /// case, an inner part of it, and filters that differ from it in one character or hold only pattern characters.
+    /// </summary>
+    public static TheoryData<string, bool> LongFilterCases => new()
+    {
+        { LongLastName.ToLowerInvariant(), true },
+        { new string('X', 3998) + "z", true },
+        { LongLastName[..^1] + "Y", false },
+        { new string('x', 3999), false },
+        { new string('%', 2000), false },
+        { new string('_', 3999), false },
+    };
+
+    // Any nonblank q coerces untrimmed whatever its length, with its contains pattern within 4,000 units (3,998 plain
+    // characters, 1,999 escaped ones) or past them (3,999 plain, 2,000 escaped and more); a blank q, however long, is
+    // no filter.
     [Theory]
     [InlineData("a", 3998)]
+    [InlineData("a", 3999)]
     [InlineData("%", 1999)]
+    [InlineData("%", 2000)]
+    [InlineData("\\", 4001)]
+    [InlineData("_", 9000)]
     [InlineData(" ", 5000)]
-    public void ListQuery_FilterWithinTheBound_Coerces(string unit, int repeat)
+    public void ListQuery_FilterOfAnyLength_Coerces(string unit, int repeat)
     {
         var q = string.Concat(Enumerable.Repeat(unit, repeat));
 
@@ -151,35 +184,32 @@ public sealed class ListAndSearchBoundsTests
         Assert.Equal(string.IsNullOrWhiteSpace(q) ? null : q, query.Filter);
     }
 
-    // A longer q is a 400 on q, in the same single 400 as any other bad parameter.
-    [Theory]
-    [InlineData("a", 3999, null)]
-    [InlineData("%", 2000, null)]
-    [InlineData("a", 3999, "0")]
-    public void ListQuery_FilterOverTheBound_IsA400OnQ(string unit, int repeat, string? page)
+    // A long q beside a bad page: the single 400 reports the page alone.
+    [Fact]
+    public void ListQuery_LongFilterBesideABadPage_IsA400OnThePageOnly()
     {
-        var q = string.Concat(Enumerable.Repeat(unit, repeat));
-
-        string[]? pageOccurrences = page is null ? null : [page];
-
-        Assert.False(
-            RequestParameters.TryParseListQuery(q, null, pageOccurrences, null, out var query, out var problem));
+        Assert.False(RequestParameters.TryParseListQuery(
+            new string('a', 3999), null, ["0"], null, out var query, out var problem));
 
         Assert.Null(query);
-        var errors = ValidationErrors(problem);
-        Assert.Equal(new[] { RecordQueryRules.FilterTooLongMessage }, errors[RequestParameters.Query]);
-        string[] expectedKeys =
-            page is null ? [RequestParameters.Query] : [RequestParameters.Page, RequestParameters.Query];
-        Assert.Equal(expectedKeys, errors.Keys.Order(StringComparer.Ordinal).ToArray());
+        Assert.Equal("page", Assert.Single(ValidationErrors(problem).Keys));
     }
 
-    // Any number of alternatives reaches the store, which binds a large set packed; so do a 4,000-character pattern,
-    // the longest SQL Server takes, and a longer one whose run of '*' collapses within it.
+    // Any number of alternatives reaches the store, which binds a large set packed, and so does a wildcard pattern of
+    // any length: 4,000 characters, the longest SQL Server matches in one LIKE, and longer ones with no run of '*',
+    // with a run of '*', with a set before a run of '*', which the parser leaves as written, or with a set of 4,000
+    // characters or more, which the search builder cuts into shorter sets.
     [Theory]
     [InlineData(AlternativesKind, 5000)]
     [InlineData(PatternKind, 4000)]
+    [InlineData(PatternKind, 4001)]
+    [InlineData(PatternKind, 9000)]
     [InlineData(RunKind, 4001)]
-    public async Task Search_WithinTheBounds_ReachesTheStore(string kind, int size)
+    [InlineData(BracketKind, 4001)]
+    [InlineData(SetKind, 4000)]
+    [InlineData(SetKind, 4001)]
+    [InlineData(SetKind, 9000)]
+    public async Task Search_OfAnyLength_ReachesTheStore(string kind, int size)
     {
         var store = FakeDataStore.WithStandardForms();
 
@@ -191,58 +221,76 @@ public sealed class ListAndSearchBoundsTests
         Assert.Contains(store.Calls, call => call.Method == nameof(IDataStore.SearchAsync));
     }
 
-    // A longer pattern that does not collapse within the bound, with no run of '*' or holding '[', is a fixed
-    // field-level 400 on the field, and the store is never asked to search.
+    // A pattern holding a set longer than 4,000 characters that is unclosed, or that no cut keeping its members divides,
+    // which no SQL Server construct evaluates, is the one fixed field-level 400 on the field, echoing nothing, and the
+    // store is never asked to search.
     [Theory]
-    [InlineData(PatternKind, 4001)]
-    [InlineData(BracketKind, 4001)]
-    public async Task Search_PatternOverTheBound_IsA400BeforeTheStore(string kind, int size)
+    [InlineData(UnclosedSetKind)]
+    [InlineData(RangeChainSetKind)]
+    public async Task Search_UnsearchableSet_IsA400BeforeTheStore(string kind)
     {
         var store = FakeDataStore.WithStandardForms();
 
         var result = await CreateService(store).SearchAsync(
-            FakeForms.TwoPageViewId, LastNameSearch(kind, size), CancellationToken.None);
+            FakeForms.TwoPageViewId, LastNameSearch(kind, 4001), CancellationToken.None);
 
         var errors = ValidationErrors(result);
         Assert.Equal(new[] { "LastName" }, errors.Keys.ToArray());
-        Assert.All(
-            errors.Values.SelectMany(messages => messages),
-            message => Assert.DoesNotContain(Sentinel, message, StringComparison.Ordinal));
+        Assert.Equal(
+            "LastName search patterns cannot hold a [...] set longer than 4000 characters that has no closing ] or"
+            + " that cannot be cut into sets of at most 3998 characters that keep its members and negation.",
+            Assert.Single(errors["LastName"]));
         Assert.DoesNotContain(store.Calls, call => call.Method == nameof(IDataStore.SearchAsync));
     }
 
-    // The fake keeps the search builder's contract: a LIKE pattern over the bound, in any condition, is an
-    // ArgumentException.
-    [Fact]
-    public async Task FakeStoreSearch_PatternOverTheBound_ThrowsArgumentException()
+    // The fake keeps the search builder's contract: a LIKE pattern holding a set longer than 4,000 characters that is
+    // unclosed or that no cut keeping its members divides, in any condition, is an ArgumentException, while one the
+    // builder cuts is matched.
+    [Theory]
+    [InlineData("%[", "", true)]
+    [InlineData("%[", "]%", false)]
+    [InlineData("%[^", "]%", false)]
+    public async Task FakeStoreSearch_SetLongerThanTheLikeLimit_ThrowsOnlyWhereNoCutKeepsIt(
+        string open,
+        string close,
+        bool throws)
     {
         var store = FakeDataStore.WithStandardForms();
         var form = await TwoPageFormAsync(store);
         SearchCondition[] conditions =
         [
-            LikeCondition("LastName", 1, 1),
-            LikeCondition("Notes", 1, RecordQueryRules.MaxLikePatternLength + 1),
+            LikeCondition("LastName", "%"),
+            LikeCondition("Notes", open + new string('a', 4001) + close),
         ];
 
-        await Assert.ThrowsAsync<ArgumentException>(
-            "conditions",
+        var failure = await Record.ExceptionAsync(
             () => store.SearchAsync(form, conditions, includeDeleted: false, null, CancellationToken.None));
+
+        if (throws)
+        {
+            Assert.Equal("conditions", Assert.IsType<ArgumentException>(failure).ParamName);
+        }
+        else
+        {
+            Assert.Null(failure);
+        }
     }
 
-    // The fake keeps the list builder's contract: a filter whose contains pattern is over the bound is an
-    // ArgumentException, and one at the bound lists.
-    [Fact]
-    public async Task FakeStoreList_FilterOverTheBound_ThrowsArgumentException()
+    // The fake lists a filter of any length, matching it literally and ignoring case as the list builder's contains
+    // predicate does past SQL Server's LIKE pattern limit.
+    [Theory]
+    [MemberData(nameof(LongFilterCases))]
+    public async Task FakeStoreList_FilterPastTheLikeLimit_ListsItsMatches(string q, bool matches)
     {
         var store = FakeDataStore.WithStandardForms();
         var form = await TwoPageFormAsync(store);
+        var id = store.SeedRecord(
+            FakeForms.TwoPageViewId,
+            new Dictionary<string, FieldValue> { ["LastName"] = FieldValue.FromText(LongLastName) });
 
-        await Assert.ThrowsAsync<ArgumentException>(
-            "query",
-            () => store.ListAsync(form, ListQuery(new string('%', 2000)), CancellationToken.None));
+        var page = await store.ListAsync(form, ListQuery(q), CancellationToken.None);
 
-        var page = await store.ListAsync(form, ListQuery(new string('%', 1999)), CancellationToken.None);
-        Assert.Empty(page.Items);
+        Assert.Equal(matches, page.Items.Any(item => item.GlobalRecordId == id));
     }
 
     // The published contract carries the same bounds: 1 to 6 criteria, since an empty list, a seventh field and a field
@@ -276,7 +324,9 @@ public sealed class ListAndSearchBoundsTests
         NullLogger<RecordService>.Instance);
 
     // A LastName criterion of size alternatives, or a single wildcard pattern of size characters: one '*', a run of '*',
-    // or a set followed by a run of '*'. Each carries the sentinel, so an error message that echoed it would be caught.
+    // or a set followed by a run of '*'; or the sentinel, '*' and a set of size characters: closed, unclosed, or a
+    // chain of ranges, odd-sized, no cut between whose members keeps them. Each carries the sentinel, so an error
+    // message that echoed it would be caught.
     private static SearchRequest LastNameSearch(string kind, int size)
     {
         var value = kind switch
@@ -287,21 +337,22 @@ public sealed class ListAndSearchBoundsTests
             PatternKind => Sentinel + "*" + new string('x', size - Sentinel.Length - 1),
             RunKind => Sentinel + new string('*', size - Sentinel.Length),
             BracketKind => Sentinel + "[a-z]" + new string('*', size - Sentinel.Length - 5),
+            SetKind => Sentinel + "*[" + new string('a', size - 2) + "]",
+            UnclosedSetKind => Sentinel + "*[" + new string('a', size - 1),
+            RangeChainSetKind => Sentinel + "*[" + string.Concat(Enumerable.Repeat("a-", (size - 3) / 2)) + "a]",
             _ => throw new ArgumentOutOfRangeException(nameof(kind), kind, "Unknown search kind."),
         };
 
         return new SearchRequest([new SearchCriterion("LastName", FieldValue.FromText(value))]);
     }
 
-    private static SearchCondition LikeCondition(string field, int count, int patternLength) => new(
+    private static SearchCondition LikeCondition(string field, string pattern) => new(
         field,
         SearchTarget.PageField,
         FieldType.Text,
-        [.. Enumerable.Range(0, count).Select(_ =>
-            new SearchAlternative(SearchOperator.Like, FieldValue.FromText(new string('%', patternLength))))]);
+        [new SearchAlternative(SearchOperator.Like, FieldValue.FromText(pattern))]);
 
-    private static RecordListQuery ListQuery(string q) =>
-        new(q, IncludeDeleted: false, RecordQueryRules.DefaultPage, RecordQueryRules.DefaultPageSize);
+    private static RecordListQuery ListQuery(string q) => new(q, IncludeDeleted: false, 1, 50);
 
     private static async Task<FormMetadata> TwoPageFormAsync(FakeDataStore store)
     {
@@ -366,12 +417,22 @@ public sealed class FakeDataStoreFindTests
     /// <summary>Text and SQL <c>LIKE</c> patterns, with whether the pattern matches the whole text.</summary>
     public static TheoryData<string, string, bool> LikeCases => new()
     {
-        // Patterns long enough for a regular-expression automaton to exceed its size limit, at the store's 4,000
-        // character LIKE pattern bound.
+        // Patterns long enough for a regular-expression automaton to exceed its size limit, at and past SQL Server's
+        // 4,000-character LIKE pattern limit, which bounds no pattern.
         { new string('a', 4000), new string('a', 3999) + "%", true },
         { new string('a', 4000), new string('a', 3998) + "_", false },
+        { new string('a', 4000), new string('A', 4000) + "%", true },
+        { new string('a', 4000), new string('a', 3999) + "b%", false },
+        { new string('a', 4000), new string('%', 4001) + "a", true },
+        { new string('a', 4000), new string('_', 4001), false },
+        { new string('a', 4000), "a" + new string('%', 2000) + "_a" + new string('%', 2000) + "a", true },
         { new string('a', 1000), string.Concat(Enumerable.Repeat("%a", 1000)), true },
         { new string('a', 999), string.Concat(Enumerable.Repeat("%a", 1000)), false },
+
+        // A set past the limit, which the search builder cuts into shorter sets, holds every member it lists.
+        { "a", "[" + new string('b', 4096) + "a]", true },
+        { "c", "[" + new string('b', 4096) + "a]", false },
+        { "c", "[^" + new string('b', 4096) + "a]", true },
 
         // A trailing line feed is a character the pattern must cover.
         { "abc\n", "ab_", false },
@@ -2137,8 +2198,10 @@ public sealed class FindPaddingSqlTests : IAsyncLifetime
 /// </summary>
 /// <remarks>
 /// <para>
-/// Every expected value is computed by a direct SQL query read under the test lock, never hard-coded, so each case
-/// holds on a freshly loaded database and after any number of earlier runs. A test that creates records holds the
+/// Every expected record, count and position is computed by a direct SQL query read under the test lock, never
+/// hard-coded, so each case holds on a freshly loaded database and after any number of earlier runs. The contract's
+/// parameter names, paging defaults and bounds, search cap and row states are the class's own literals, never the
+/// production constants, so the code under test cannot move an expectation. A test that creates records holds the
 /// exclusive <see cref="DatabaseWriteLock"/> from before its first SQL read to its last assertion; a read-only case
 /// whose expectations are SQL counts or positions holds it shared; a coercion 400 takes none (AAP 0.7.5).
 /// </para>
@@ -2151,7 +2214,7 @@ public sealed class FindPaddingSqlTests : IAsyncLifetime
 /// </remarks>
 [Trait("Category", "Integration")]
 [Collection(DatabaseCollections.Database)]
-public sealed class ListAndSearchTests
+public sealed partial class ListAndSearchTests
 {
     private const string CaseReport = "CaseReport";
 
@@ -2183,6 +2246,36 @@ public sealed class ListAndSearchTests
 
     private const int InnerLength = 12;
 
+    // The list and search contract (AAP 0.3.4.1, 0.3.4.3, 0.3.4.4), written out here rather than read from
+    // RequestParameters or RecordQueryRules, so a changed wire name, default, bound or cap in the code under test fails
+    // these cases instead of moving their expected values with it.
+    private const string PageParameter = "page";
+
+    private const string PageSizeParameter = "pageSize";
+
+    private const string QueryParameter = "q";
+
+    private const string IncludeDeletedParameter = "includeDeleted";
+
+    // A missing page is the first page, and a missing pageSize is 50.
+    private const int DefaultPage = 1;
+
+    private const int DefaultPageSize = 50;
+
+    // The largest pageSize the list admits, and the most items one search returns.
+    private const int MaxPageSize = 200;
+
+    private const int SearchCap = 200;
+
+    // The base-table system field a RecStatus criterion names (testdata/sql/03_forms.sql).
+    private const string RecStatusField = "RecStatus";
+
+    // The row states of C-16, typed as the seeded smallint RecStatus column holds them
+    // (testdata/sql/05_data_tables.sql).
+    private const short ActiveRecStatus = 1;
+
+    private const short DeletedRecStatus = 0;
+
     // The selected set on the base table b (AAP C-16): every row when @includeDeleted is 1, otherwise RecStatus = 1.
     private const string SelectedSetFilter = "(@includeDeleted = 1 OR b.[RecStatus] = @active)";
 
@@ -2200,15 +2293,15 @@ public sealed class ListAndSearchTests
     }
 
     /// <summary>
-    /// A paging parameter and a value it rejects: a <c>pageSize</c> below and above its range, a <c>page</c> below its
-    /// minimum, and a <c>page</c> that is not an integer.
+    /// A paging parameter and a value it rejects: a <c>pageSize</c> just below and just above 1 to 200, a <c>page</c>
+    /// just below 1, and a <c>page</c> that is not an integer (AAP 0.7.1, SC-5).
     /// </summary>
     public static TheoryData<string, string> InvalidPagingCases => new()
     {
-        { RequestParameters.PageSize, Text(RecordQueryRules.MinPageSize - 1) },
-        { RequestParameters.PageSize, Text(RecordQueryRules.MaxPageSize + 1) },
-        { RequestParameters.Page, Text(RecordQueryRules.MinPage - 1) },
-        { RequestParameters.Page, "abc" },
+        { PageSizeParameter, "0" },
+        { PageSizeParameter, "201" },
+        { PageParameter, "0" },
+        { PageParameter, "abc" },
     };
 
     // AAP 0.3.4.1 and 0.3.4.4: the list is the active set (RecStatus = 1) in UniqueKey order, paged with OFFSET/FETCH
@@ -2230,24 +2323,33 @@ public sealed class ListAndSearchTests
         await using var dbLock = await DatabaseWriteLock.AcquireSharedAsync(ct);
 
         var viewId = await ApiTestClient.GetViewIdAsync(client, form, ct);
-        var expectedPage = page ?? RecordQueryRules.DefaultPage;
-        var offset = RecordQueryRules.ComputeOffset(expectedPage, RecordQueryRules.DefaultPageSize);
+        var expectedPage = page ?? DefaultPage;
+
+        // (page - 1) x pageSize in 64-bit arithmetic, so the largest admitted page cannot wrap (AAP 0.3.4.1).
+        var offset = (expectedPage - 1L) * DefaultPageSize;
         var activeCount = await CountBaseRowsAsync(form, includeDeleted: false, ct);
-        var expected = await ReadActivePageAsync(form, offset, RecordQueryRules.DefaultPageSize, ct);
+        var expected = await ReadActivePageAsync(form, offset, DefaultPageSize, ct);
 
         // The SQL page is full before the end and empty past it, so no case passes on two empty lists by accident.
-        var expectedItems = (int)Math.Clamp(activeCount - offset, 0L, RecordQueryRules.DefaultPageSize);
+        var expectedItems = (int)Math.Clamp(activeCount - offset, 0L, DefaultPageSize);
         Assert.Equal(expectedItems, expected.Length);
 
-        var query = page is null ? string.Empty : "?" + RequestParameters.Page + "=" + Text(expectedPage);
+        var query = page is null ? string.Empty : "?" + PageParameter + "=" + Text(expectedPage);
         var list = await GetListAsync(client, viewId, query, ct);
 
         Assert.Equal(expectedPage, Property(list, "page").GetInt32());
-        Assert.Equal(RecordQueryRules.DefaultPageSize, Property(list, "pageSize").GetInt32());
+        Assert.Equal(DefaultPageSize, Property(list, "pageSize").GetInt32());
         Assert.Equal(activeCount, Property(list, "total").GetInt32());
         var items = Items(list);
         Assert.Equal(expected, items.Select(item => new BaseRow(Id(item), UniqueKey(item))).ToArray());
-        Assert.All(items, item => Assert.Equal(RecordQueryRules.ActiveRecStatus, RecStatus(item)));
+        Assert.All(items, item => Assert.Equal(ActiveRecStatus, RecStatus(item)));
+
+        // Page 2,147,483,647 lies past the end of every seeded form: no items, and still the full total.
+        if (expectedPage == int.MaxValue)
+        {
+            Assert.Empty(items);
+            Assert.True(activeCount > 0, "SQL shows no active record, so the empty last page proves nothing.");
+        }
     }
 
     // AAP 0.3.4.1 (RequestParameters): a pageSize outside 1 to 200, a page below 1 and a page that is not an integer
@@ -2300,7 +2402,7 @@ public sealed class ListAndSearchTests
         var (activeTotal, active) = await ListEveryPageAsync(client, viewId, includeDeleted: false, ct);
         Assert.Equal(activeCount, activeTotal);
         Assert.Equal(activeCount, active.Count);
-        Assert.All(active, record => Assert.Equal(RecordQueryRules.ActiveRecStatus, record.RecStatus));
+        Assert.All(active, record => Assert.Equal(ActiveRecStatus, record.RecStatus));
         var activeIds = active.Select(record => record.GlobalRecordId).ToHashSet(StringComparer.Ordinal);
         Assert.Equal(activeCount, activeIds.Count);
         Assert.False(activeIds.Overlaps(deletedIds), "The default list holds a record SQL shows as deleted.");
@@ -2313,7 +2415,7 @@ public sealed class ListAndSearchTests
         Assert.Subset(allIds, deletedIds);
         Assert.All(
             all.Where(record => deletedIds.Contains(record.GlobalRecordId)),
-            record => Assert.Equal(RecordQueryRules.DeletedRecStatus, record.RecStatus));
+            record => Assert.Equal(DeletedRecStatus, record.RecStatus));
 
         // Both walks keep UniqueKey order across page boundaries.
         foreach (var listed in new[] { active, all })
@@ -2323,9 +2425,12 @@ public sealed class ListAndSearchTests
         }
     }
 
-    // AAP 0.3.4.4, grid q: a case-insensitive "contains" over the grid columns. The statement converts each column and
-    // the pattern to Latin1_General_100_CI_AS, so the match is collation-independent by design and holds under a _CI_
-    // and a _CS_ database collation alike. A whitespace-only q applies no filter.
+    // AAP 0.3.4.4, grid q: a case-insensitive "contains" over the grid columns that does not depend on the database
+    // collation. Upper-case, lower-case and inner-substring variants of a stored marker each find exactly its record,
+    // and a whitespace-only q applies no filter. A case-insensitive database collation alone would produce those
+    // matches, so the one recorded statement of every request, which pages and counts the filtered set, is checked
+    // too: it compares every grid column under Latin1_General_100_CI_AS on both sides of LIKE with ESCAPE '\', holds no
+    // other LIKE, and carries the q text only as a parameter value; the blank q's statement holds no LIKE.
     [Fact]
     public async Task GridQ_MatchesTheMarkerInAnyCaseAndAsAnInnerSubstring()
     {
@@ -2351,21 +2456,61 @@ public sealed class ListAndSearchTests
             Assert.DoesNotContain(q, marker, StringComparison.Ordinal);
             Assert.Contains(q, marker, StringComparison.OrdinalIgnoreCase);
 
-            var list = await GetListAsync(
-                client, viewId, "?" + RequestParameters.Query + "=" + Uri.EscapeDataString(q), ct);
+            factory.Recorder.Clear();
+            var list = await GetListAsync(client, viewId, "?" + QueryParameter + "=" + Uri.EscapeDataString(q), ct);
 
             Assert.Equal(1, Property(list, "total").GetInt32());
             var item = Assert.Single(Items(list));
             Assert.Equal(created.GlobalRecordId, Id(item));
             Assert.Equal(marker, StringValue(Property(item, "values"), TestDatabase.MarkerField));
+            AssertGridFilterStatements(factory.Recorder, q);
         }
 
         var activeCount = await CountBaseRowsAsync(CaseReport, includeDeleted: false, ct);
-        var blank = await GetListAsync(
-            client, viewId, "?" + RequestParameters.Query + "=" + Uri.EscapeDataString("   "), ct);
+        factory.Recorder.Clear();
+        var blank = await GetListAsync(client, viewId, "?" + QueryParameter + "=" + Uri.EscapeDataString("   "), ct);
         Assert.Equal(activeCount, Property(blank, "total").GetInt32());
+        AssertGridFilterStatements(factory.Recorder, filter: null);
     }
 
+    // The one statement one GET .../records sent under the list operation, which both pages (ORDER BY ... OFFSET ...
+    // FETCH NEXT) and totals (SELECT COUNT) the filtered set. For a filter, it must hold the AAP 0.3.4.4 grid predicate
+    // once per CaseReport grid column of AAP 0.3.4.3, with the explicit collation on both sides of LIKE and the escape
+    // clause, no other LIKE, and one parameter bound to the filter's contains pattern, while the filter's text appears
+    // in no command text. A null filter stands for a blank q, whose statement holds no LIKE. The operation name, the
+    // collation and the predicate shape are written out here rather than read from the SQL builders, so a builder that
+    // stops forcing the collation fails this check whatever the database collation is.
+    private static void AssertGridFilterStatements(SqlCommandRecorder recorder, string? filter)
+    {
+        const string ListOperation = "records.list";
+        string[] gridColumns = ["PhoneNumber", "LastName", "FirstName", "Address", "City", "State"];
+
+        var statement = Assert.Single(recorder.ForOperation(ListOperation));
+        Assert.True(statement.Succeeded, statement.ToString());
+        var text = statement.CommandText;
+        Assert.Matches(PagedSelect(), text);
+        Assert.Matches(CountSelect(), text);
+        if (filter is null)
+        {
+            Assert.Equal(0, LikeKeyword().Count(text));
+            return;
+        }
+
+        var predicates = GridContains().Matches(text);
+        Assert.Equal(
+            gridColumns.Order(StringComparer.Ordinal),
+            predicates.Select(match => match.Groups["column"].Value).Order(StringComparer.Ordinal));
+        Assert.Equal(predicates.Count, LikeKeyword().Count(text));
+
+        // The filter holds none of %, _, [ and \, so its contains pattern is the filter wrapped in %.
+        Assert.False(filter.AsSpan().ContainsAny(@"%_[\"), "The filter holds a LIKE pattern character.");
+        var name = Assert.Single(predicates.Select(match => match.Groups["parameter"].Value).Distinct());
+        var bound = Assert.Single(
+            statement.Parameters,
+            parameter => string.Equals(parameter.Name, name, StringComparison.Ordinal));
+        Assert.Equal("%" + filter + "%", Assert.IsType<string>(bound.Value));
+        Assert.DoesNotContain(filter, text, StringComparison.OrdinalIgnoreCase);
+    }
 
     // AAP 0.3.4.4, multiline: legacy Find compares a multiline field as
     // SUBSTRING(col, 1, 255) = SUBSTRING(@p, 1, 255) (CollectedDataProvider.cs:2212-2222). A 300-character criterion
@@ -2521,10 +2666,13 @@ public sealed class ListAndSearchTests
 
     // AAP 0.3.4.4 (C-19): excludeGlobalRecordId removes the open record on the server before total is counted. The
     // alternatives of one field, split on " or " (FindRecordDialog.cs:708-770), combine with OR, and criteria on
-    // different fields combine with AND.
+    // different fields combine with AND. Each record's marker stays in LastName, the one marker field (AAP 0.7.5). The
+    // FirstName both records share, and the FirstName neither holds, are fresh lowercase hexadecimal text instead:
+    // unique to this run, so no earlier run's record matches, and never read as a prefix, a wildcard or an alternative.
     [Fact]
     public async Task Exclusion_Alternatives_AndCriteria_SelectTheExpectedRecords()
     {
+        const int firstNameLength = 32;
         using var timeout = new CancellationTokenSource(TestTimeout);
         var ct = timeout.Token;
         await using var factory = await ApiFactory.ForDatabaseAsync();
@@ -2534,31 +2682,41 @@ public sealed class ListAndSearchTests
         var viewId = await ApiTestClient.GetViewIdAsync(client, CaseReport, ct);
         var markerA = TestDatabase.NewMarker();
         var markerB = TestDatabase.NewMarker();
-        var shared = TestDatabase.NewMarker();
+        var sharedFirstName = LettersAndDigits(firstNameLength);
+        var absentFirstName = LettersAndDigits(firstNameLength);
         var a = (await CreateAsync(
-            client, viewId, new() { [TestDatabase.MarkerField] = markerA, [FirstNameField] = shared }, ct))
+            client, viewId, new() { [TestDatabase.MarkerField] = markerA, [FirstNameField] = sharedFirstName }, ct))
             .GlobalRecordId;
         var b = (await CreateAsync(
-            client, viewId, new() { [TestDatabase.MarkerField] = markerB, [FirstNameField] = shared }, ct))
+            client, viewId, new() { [TestDatabase.MarkerField] = markerB, [FirstNameField] = sharedFirstName }, ct))
             .GlobalRecordId;
 
-        AssertFound(await SearchAsync(client, viewId, [new(FirstNameField, shared)], ct: ct), a, b);
-        AssertFound(await SearchAsync(client, viewId, [new(FirstNameField, shared)], exclude: a, ct: ct), b);
+        AssertFound(await SearchAsync(client, viewId, [new(FirstNameField, sharedFirstName)], ct: ct), a, b);
+        AssertFound(await SearchAsync(client, viewId, [new(FirstNameField, sharedFirstName)], exclude: a, ct: ct), b);
 
         var either = markerA + " or " + markerB;
         AssertFound(await SearchAsync(client, viewId, [new(TestDatabase.MarkerField, either)], ct: ct), a, b);
         AssertFound(
             await SearchAsync(
-                client, viewId, [new(TestDatabase.MarkerField, either), new(FirstNameField, shared)], ct: ct),
+                client,
+                viewId,
+                [new(TestDatabase.MarkerField, either), new(FirstNameField, sharedFirstName)],
+                ct: ct),
             a,
             b);
         AssertFound(
             await SearchAsync(
-                client, viewId, [new(TestDatabase.MarkerField, markerA), new(FirstNameField, shared)], ct: ct),
+                client,
+                viewId,
+                [new(TestDatabase.MarkerField, markerA), new(FirstNameField, sharedFirstName)],
+                ct: ct),
             a);
         AssertFound(
             await SearchAsync(
-                client, viewId, [new(TestDatabase.MarkerField, markerA), new(FirstNameField, markerB)], ct: ct));
+                client,
+                viewId,
+                [new(TestDatabase.MarkerField, markerA), new(FirstNameField, absentFirstName)],
+                ct: ct));
     }
 
 
@@ -2598,25 +2756,335 @@ public sealed class ListAndSearchTests
         }
 
         // The seeded deleted records, searched in the set that holds them.
-        var deletedTotal = await CountSearchMatchesAsync(
-            CaseReport, includeDeleted: true, RecordQueryRules.DeletedRecStatus, ct);
+        var deletedTotal = await CountSearchMatchesAsync(CaseReport, includeDeleted: true, DeletedRecStatus, ct);
         var expectedDeleted = await ReadSearchMatchesAsync(
-            CaseReport, includeDeleted: true, RecordQueryRules.DeletedRecStatus, RecordQueryRules.SearchCap, ct);
+            CaseReport, includeDeleted: true, DeletedRecStatus, SearchCap, ct);
         Assert.NotEmpty(expectedDeleted);
 
-        var deletedCriterion = new CriterionBody(
-            SearchCriteriaParser.RecStatusFieldName, Text(RecordQueryRules.DeletedRecStatus));
+        var deletedCriterion = new CriterionBody(RecStatusField, Text(DeletedRecStatus));
         var deleted = await SearchAsync(client, viewId, [deletedCriterion], includeDeleted: true, ct: ct);
         Assert.Equal(deletedTotal, Property(deleted, "total").GetInt32());
         var deletedItems = Items(deleted);
         Assert.Equal(
             expectedDeleted,
             deletedItems.Select(item => new SearchMatch(Id(item), Position(item))).ToArray());
-        Assert.All(deletedItems, item => Assert.Equal(RecordQueryRules.DeletedRecStatus, RecStatus(item)));
+        Assert.All(deletedItems, item => Assert.Equal(DeletedRecStatus, RecStatus(item)));
         await AssertEndpointPositionsAsync(client, viewId, deletedItems, includeDeleted: true, ct);
 
         AssertFound(await SearchAsync(client, viewId, [deletedCriterion], ct: ct));
     }
+
+    // SQL Server's LIKE and PATINDEX take a pattern of at most 4,000 UTF-16 code units (error 8152 beyond it), a limit
+    // the q and Find semantics do not have; the two cases below straddle it with this literal of their own.
+    private const int LikePatternLimit = 4000;
+
+    // AAP 0.3.4.4, grid q: every nonblank q is a case-insensitive literal "contains", whatever its length. Four records
+    // hold the marker followed, to 4,000 characters, by fresh hexadecimal text, by '_' only, by '%' only and by 'x'
+    // only. A q of 3,998 characters, whose contains pattern is exactly 4,000 units and runs as the native LIKE, and
+    // longer ones, in either case and as an inner part, find the hexadecimal record; one character changed finds
+    // nothing; and a q of the marker and '_' or '%' finds only the record holding those characters, so neither acts as
+    // a wildcard. The expected records are the marked rows SQL reads whose LastName contains q ignoring case. Every
+    // statement carries q only as a parameter, and only a contains pattern past the limit runs the long-pattern
+    // recursion.
+    [Fact]
+    public async Task GridQ_PastTheLikePatternLimit_IsALiteralCaseInsensitiveContains()
+    {
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        var ct = timeout.Token;
+        await using var factory = await ApiFactory.ForDatabaseAsync();
+        using var client = factory.CreateClient();
+        await using var dbLock = await DatabaseWriteLock.AcquireExclusiveAsync(ct);
+
+        var viewId = await ApiTestClient.GetViewIdAsync(client, CaseReport, ct);
+        var marker = TestDatabase.NewMarker();
+        var fill = LikePatternLimit - marker.Length;
+        var hex = marker + LettersAndDigits(fill);
+        var underscores = marker + new string('_', fill);
+        var percents = marker + new string('%', fill);
+        foreach (var lastName in new[] { hex, underscores, percents, marker + new string('x', fill) })
+        {
+            await CreateAsync(client, viewId, new() { [TestDatabase.MarkerField] = lastName }, ct);
+        }
+
+        var marked = await ReadLastNamesLikeAsync(marker + "%", ct);
+        Assert.Equal(4, marked.Length);
+
+        // Each q with the number of marked records whose LastName contains it; the hexadecimal text holds no 'z'.
+        (string Q, int Matches)[] filters =
+        [
+            (hex[..(LikePatternLimit - 2)], 1),
+            (hex[..(LikePatternLimit - 2)].ToUpperInvariant(), 1),
+            (hex[..(LikePatternLimit - 1)], 1),
+            (hex.ToUpperInvariant(), 1),
+            (hex[1..].ToUpperInvariant(), 1),
+            (hex[..^1] + "z", 0),
+            (underscores, 1),
+            (percents, 1),
+        ];
+        foreach (var (q, matches) in filters)
+        {
+            var expected = marked
+                .Where(row => row.LastName.Contains(q, StringComparison.OrdinalIgnoreCase))
+                .Select(row => row.Id)
+                .ToArray();
+            Assert.Equal(matches, expected.Length);
+
+            factory.Recorder.Clear();
+            var list = await GetListAsync(client, viewId, "?" + QueryParameter + "=" + Uri.EscapeDataString(q), ct);
+
+            Assert.Equal(expected.Length, Property(list, "total").GetInt32());
+            Assert.Equal(expected, Items(list).Select(Id).ToArray());
+
+            // The contains pattern escapes each %, _, [ and \ with one more unit and wraps q in two '%'.
+            var patternLength = q.Length + 2 + q.Count(character => character is '%' or '_' or '[' or '\\');
+            AssertLikeStatements(
+                factory.Recorder, "records.list", 1, marker[^32..], longPattern: patternLength > LikePatternLimit);
+        }
+    }
+
+    // AAP 0.3.4.4, grid q past the pattern limit keeps the contains of Latin1_General_100_CI_AS, under which an
+    // expansion matches across the comparison, whatever the database collation. Two records hold the marker and fresh
+    // hexadecimal text with "ae" in it, 4,000 characters each, the first storing it as "æ" and the second as written.
+    // The first text with "ae", 4,001 characters, in either case, finds the first record, and so does its
+    // 3,998-character prefix, whose contains pattern runs as the native LIKE, as SQL Server's own LIKE under that
+    // collation finds it; the second text with "æ", 3,999 characters, in either case, finds the second record; and the
+    // first with its last character changed finds nothing.
+    [Fact]
+    public async Task GridQ_PastTheLikePatternLimit_KeepsTheCollationsExpansions()
+    {
+        const int split = 1000;
+        const string ligature = "\u00E6";
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        var ct = timeout.Token;
+        await using var factory = await ApiFactory.ForDatabaseAsync();
+        using var client = factory.CreateClient();
+        await using var dbLock = await DatabaseWriteLock.AcquireExclusiveAsync(ct);
+
+        var viewId = await ApiTestClient.GetViewIdAsync(client, CaseReport, ct);
+        var marker = TestDatabase.NewMarker();
+        var firstHex = LettersAndDigits(LikePatternLimit - marker.Length - 1);
+        var secondHex = LettersAndDigits(LikePatternLimit - marker.Length - 2);
+        var firstWithLigature = marker + firstHex[..split] + ligature + firstHex[split..];
+        var firstWithAe = marker + firstHex[..split] + "ae" + firstHex[split..];
+        var secondWithAe = marker + secondHex[..split] + "ae" + secondHex[split..];
+        var secondWithLigature = marker + secondHex[..split] + ligature + secondHex[split..];
+        Assert.Equal(LikePatternLimit, firstWithLigature.Length);
+        Assert.Equal(LikePatternLimit, secondWithAe.Length);
+        var first = await CreateAsync(client, viewId, new() { [TestDatabase.MarkerField] = firstWithLigature }, ct);
+        var second = await CreateAsync(client, viewId, new() { [TestDatabase.MarkerField] = secondWithAe }, ct);
+
+        var nativePrefix = firstWithAe[..(LikePatternLimit - 2)];
+        Assert.Equal(new[] { first.GlobalRecordId }, await ReadGridContainsAsync(nativePrefix, ct));
+
+        (string Q, string[] Expected)[] filters =
+        [
+            (firstWithAe, new[] { first.GlobalRecordId }),
+            (firstWithAe.ToUpperInvariant(), new[] { first.GlobalRecordId }),
+            (nativePrefix, new[] { first.GlobalRecordId }),
+            (secondWithLigature, new[] { second.GlobalRecordId }),
+            (secondWithLigature.ToUpperInvariant(), new[] { second.GlobalRecordId }),
+            (firstWithAe[..^1] + "z", Array.Empty<string>()),
+        ];
+        foreach (var (q, expected) in filters)
+        {
+            factory.Recorder.Clear();
+            var list = await GetListAsync(client, viewId, "?" + QueryParameter + "=" + Uri.EscapeDataString(q), ct);
+
+            Assert.Equal(expected.Length, Property(list, "total").GetInt32());
+            Assert.Equal(expected, Items(list).Select(Id).ToArray());
+            AssertLikeStatements(
+                factory.Recorder, "records.list", 1, marker[^32..], longPattern: q.Length + 2 > LikePatternLimit);
+        }
+    }
+
+    // The ids of the active CaseReport records, in UniqueKey order, whose LastName contains the filter, of at most
+    // 3,998 characters, as SQL Server's own LIKE finds it under Latin1_General_100_CI_AS with the filter's LIKE
+    // characters escaped.
+    private static Task<string[]> ReadGridContainsAsync(string filter, CancellationToken ct) =>
+        ReadRowsAsync(
+            $"SELECT b.[GlobalRecordId] FROM {Tables(CaseReport).Base} AS b{PageJoins(CaseReport, "b")}" +
+            " WHERE b.[RecStatus] = @active AND p0.[LastName] COLLATE Latin1_General_100_CI_AS" +
+            " LIKE @pattern COLLATE Latin1_General_100_CI_AS ESCAPE '\\' ORDER BY b.[UniqueKey];",
+            reader => reader.GetString(0),
+            ct,
+            new SqlParameter("@active", SqlDbType.SmallInt) { Value = ActiveRecStatus },
+            new SqlParameter("@pattern", SqlDbType.NVarChar, LikePatternLimit)
+            {
+                Value = "%" + filter.Replace("\\", "\\\\").Replace("%", "\\%").Replace("_", "\\_").Replace("[", "\\[")
+                    + "%",
+            });
+
+    // AAP 0.3.4.4, Find: a criterion holding '*' is col LIKE @p with each '*' as '%' and '_' and [...] keeping their
+    // SQL meaning, under the database collation, whatever its length. Two records hold the marker followed, to 4,000
+    // characters, by fresh hexadecimal text, the second with its last character changed to 'z'; a third holds the
+    // marker and other text with a supplementary character in it; and a fourth the marker and other text with "æ" in
+    // it, between two digits, so no letter of the text sits beside it or its expansion. Each pattern finds exactly the
+    // records SQL Server's own LIKE finds with an equivalent pattern within the limit: a 3,999-character prefix and
+    // '*', 4,000 units and the native LIKE, finds the first two; each whole text and '*', 4,001 units, finds its own
+    // record, since a LastName holds at most 4,000 characters; a text with one character changed and '*' finds none;
+    // a 4,700-unit pattern of a prefix, '*', a middle written as one-member sets with one '_', '*' and a suffix finds
+    // the records its suffix selects; the marker's first 33 characters before a set of its 34th repeated 4,096 times
+    // and '*' find the four records, and with a set of a character no marker holds none; and the fourth text with "ae"
+    // for "æ" and '*', 4,002 units, as stored and upper-cased, finds what its first 3,999 characters and '%' find: the
+    // fourth record where the collation matches "æ" with that "ae", as a shorter native LIKE shows first, and nothing
+    // otherwise; with one more character changed it finds none. Only a pattern past the limit runs the long-pattern
+    // recursion, every value is a parameter, and a pattern holding a set longer than 4,000 units that is unclosed or
+    // that no cut keeping its members divides, which no SQL Server construct evaluates, is the one field-level 400.
+    [Fact]
+    public async Task Find_PatternsPastTheLikePatternLimit_FindWhatLikeFinds()
+    {
+        const string supplementary = "\uD83D\uDE00";
+        const string ligature = "\u00E6";
+        const int ligatureAt = 1000;
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        var ct = timeout.Token;
+        await using var factory = await ApiFactory.ForDatabaseAsync();
+        using var client = factory.CreateClient();
+        await using var dbLock = await DatabaseWriteLock.AcquireExclusiveAsync(ct);
+
+        var viewId = await ApiTestClient.GetViewIdAsync(client, CaseReport, ct);
+        var marker = TestDatabase.NewMarker();
+        var first = marker + LettersAndDigits(LikePatternLimit - marker.Length);
+        var second = first[..^1] + "z";
+        var thirdHex = LettersAndDigits(LikePatternLimit - marker.Length - supplementary.Length);
+        var third = marker + thirdHex[..1500] + supplementary + thirdHex[1500..];
+
+        // "æ" after 1,000 hexadecimal characters, with a '0' on either side.
+        var fourthHex = LettersAndDigits(LikePatternLimit - marker.Length - 3);
+        var fourth = marker + fourthHex[..ligatureAt] + "0" + ligature + "0" + fourthHex[ligatureAt..];
+        Assert.Equal(LikePatternLimit, fourth.Length);
+        var ids = new List<string>();
+        foreach (var lastName in new[] { first, second, third, fourth })
+        {
+            var created = await CreateAsync(client, viewId, new() { [TestDatabase.MarkerField] = lastName }, ct);
+            ids.Add(created.GlobalRecordId);
+        }
+
+        // Whether the LastName collation matches the fourth record's "æ" with "ae", as stored and upper-cased, as SQL
+        // Server's own LIKE of the text with "ae" for "æ" up to 100 characters past it and '%' shows.
+        var withAe = fourth.Replace(ligature, "ae", StringComparison.Ordinal);
+        var upperWithAe = withAe.ToUpperInvariant();
+        var throughLigature = marker.Length + ligatureAt + 100;
+        var expands = (await ReadLastNamesLikeAsync(withAe[..throughLigature] + "%", ct)).Any(row => row.Id == ids[3]);
+        var expandsUpper = (await ReadLastNamesLikeAsync(upperWithAe[..throughLigature] + "%", ct))
+            .Any(row => row.Id == ids[3]);
+        _output.WriteLine(
+            $"The LastName collation {(expands ? "matches" : "does not match")} U+00E6 with \"ae\" and "
+            + $"{(expandsUpper ? "matches" : "does not match")} it with \"AE\" in upper-cased text.");
+        var changedAt = withAe.Length - 500;
+        var changed = withAe[..changedAt] + "z" + withAe[(changedAt + 1)..];
+
+        // Characters 1,500 to 2,499 of the first text with the tenth as '_', plain and with every other one as a set.
+        var head = first[..1500];
+        var plainMiddle = first[1500..1509] + "_" + first[1510..2500];
+        var setMiddle = string.Concat(plainMiddle.Select(character => character == '_' ? "_" : "[" + character + "]"));
+        (string Criterion, string Equivalent, int Matches)[] cases =
+        [
+            (first[..^1] + "*", first[..^1] + "%", 2),
+            (first + "*", first, 1),
+            (second + "*", second, 1),
+            (third + "*", third, 1),
+            (fourth + "*", fourth, 1),
+            (first[..^2] + "y" + first[^1] + "*", first[..^2] + "y" + first[^1], 0),
+            (head + "*" + setMiddle + "*" + first[3800..], head + "%" + plainMiddle + "%" + first[3800..], 1),
+            (
+                head + "*" + setMiddle + "*" + first[3800..^1] + "_",
+                head + "%" + plainMiddle + "%" + first[3800..^1] + "_",
+                2),
+            (marker[..33] + "[" + new string(marker[33], 4096) + "]*", marker[..33] + "[" + marker[33] + "]%", 4),
+            (marker[..33] + "[" + new string('z', 4096) + "]*", marker[..33] + "[z]%", 0),
+            (withAe + "*", withAe[..(LikePatternLimit - 1)] + "%", expands ? 1 : 0),
+            (upperWithAe + "*", upperWithAe[..(LikePatternLimit - 1)] + "%", expandsUpper ? 1 : 0),
+            (changed + "*", changed[..(LikePatternLimit - 1)] + "%", 0),
+        ];
+        foreach (var (criterion, equivalent, matches) in cases)
+        {
+            Assert.True(equivalent.Length <= LikePatternLimit, "The equivalent pattern is past the LIKE limit.");
+            var expected = (await ReadLastNamesLikeAsync(equivalent, ct)).Select(row => row.Id).ToArray();
+            Assert.Equal(matches, expected.Length);
+
+            factory.Recorder.Clear();
+            var response = await SearchAsync(client, viewId, [new(TestDatabase.MarkerField, criterion)], ct: ct);
+
+            AssertFound(response, expected);
+            AssertLikeStatements(
+                factory.Recorder, "records.search", 1, marker[^32..], longPattern: criterion.Length > LikePatternLimit);
+        }
+
+        // A literal run repeating the third record's supplementary character 1,300 times matches that record only
+        // where the column's collation ignores the character, as SQL_Latin1_General_CP1_CI_AS does, which SQL Server's
+        // own LIKE shows when the text around the character, without it, finds the record. Then the 4,235-unit
+        // pattern finds what native LIKE of the 1,637-unit pattern holding the character once finds; otherwise it
+        // finds nothing, since no value repeats the character.
+        var before = third[..(marker.Length + 1500)];
+        var after = third[(marker.Length + 1502)..(marker.Length + 1602)];
+        var ignored = (await ReadLastNamesLikeAsync(before + after + "%", ct)).Any(row => row.Id == ids[2]);
+        _output.WriteLine("The LastName collation " + (ignored ? "ignores" : "matches") + " U+1F600.");
+        var repeated = before + string.Concat(Enumerable.Repeat(supplementary, 1300)) + after + "*";
+        var expectedRepeated = ignored
+            ? (await ReadLastNamesLikeAsync(before + supplementary + after + "%", ct)).Select(row => row.Id).ToArray()
+            : Array.Empty<string>();
+        Assert.Equal(ignored ? new[] { ids[2] } : Array.Empty<string>(), expectedRepeated);
+        factory.Recorder.Clear();
+        var found = await SearchAsync(client, viewId, [new(TestDatabase.MarkerField, repeated)], ct: ct);
+        AssertFound(found, expectedRepeated);
+        AssertLikeStatements(factory.Recorder, "records.search", 1, marker[^32..], longPattern: true);
+
+        // The residual sets: unclosed, and a chain of ranges with no cut that keeps them.
+        foreach (var unsearchable in new[]
+                 {
+                     marker + "*[" + new string('a', LikePatternLimit + 1),
+                     marker + "*[" + string.Concat(Enumerable.Repeat("a-", 2001)) + "a]",
+                 })
+        {
+            var body = new Dictionary<string, object?>
+            {
+                ["criteria"] = new[] { new CriterionBody(TestDatabase.MarkerField, unsearchable) },
+            };
+            using var rejected = await ApiTestClient.PostJsonAsync(client, RecordsPath(viewId, "/search"), body, ct);
+            Assert.Equal(HttpStatusCode.BadRequest, rejected.StatusCode);
+            var errors = Property(await ApiTestClient.ReadJsonElementAsync(rejected, ct), "errors");
+            Assert.Equal(
+                UnsearchableSetMessage,
+                Assert.Single(Property(errors, TestDatabase.MarkerField).EnumerateArray()).GetString());
+        }
+    }
+
+    // The fixed 400 text of a LastName pattern holding a set no SQL Server construct evaluates.
+    private const string UnsearchableSetMessage =
+        "LastName search patterns cannot hold a [...] set longer than 4000 characters that has no closing ] or that"
+        + " cannot be cut into sets of at most 3998 characters that keep its members and negation.";
+
+    // The statements one list or Find request sent under its operation, as many as given: each succeeded, holds no part
+    // of the submitted text, which travels only as a parameter value, and carries OPTION (MAXRECURSION 0), which only
+    // the long-pattern recursion needs, exactly when the pattern is past the LIKE pattern limit.
+    private static void AssertLikeStatements(
+        SqlCommandRecorder recorder,
+        string operation,
+        int count,
+        string submitted,
+        bool longPattern)
+    {
+        var statements = recorder.ForOperation(operation);
+        Assert.Equal(count, statements.Count);
+        foreach (var statement in statements)
+        {
+            Assert.True(statement.Succeeded, statement.ToString());
+            Assert.DoesNotContain(submitted, statement.CommandText, StringComparison.OrdinalIgnoreCase);
+            Assert.Equal(longPattern, statement.CommandText.Contains("MAXRECURSION 0", StringComparison.Ordinal));
+        }
+    }
+
+    // The active CaseReport records whose LastName is LIKE the pattern, of at most 4,000 units, in UniqueKey order, as
+    // SQL Server's own LIKE under the database collation selects them, with that LastName.
+    private static Task<(string Id, string LastName)[]> ReadLastNamesLikeAsync(string pattern, CancellationToken ct) =>
+        ReadRowsAsync<(string Id, string LastName)>(
+            $"SELECT b.[GlobalRecordId], p0.[LastName] FROM {Tables(CaseReport).Base} AS b{PageJoins(CaseReport, "b")}" +
+            " WHERE b.[RecStatus] = @active AND p0.[LastName] LIKE @pattern ORDER BY b.[UniqueKey];",
+            reader => (reader.GetString(0), reader.GetString(1)),
+            ct,
+            new SqlParameter("@active", SqlDbType.SmallInt) { Value = ActiveRecStatus },
+            new SqlParameter("@pattern", SqlDbType.NVarChar, LikePatternLimit) { Value = pattern });
 
     // AAP 0.3.4.4 "Order and cap" (C-19): results are ordered by UniqueKey and capped at 200, total counts every match
     // and truncated is total > 200; the open record is excluded before total and the cap, so the 201st match moves up
@@ -2631,22 +3099,24 @@ public sealed class ListAndSearchTests
         await using var dbLock = await DatabaseWriteLock.AcquireSharedAsync(ct);
 
         var viewId = await ApiTestClient.GetViewIdAsync(client, CaseReport, ct);
-        var expectedTotal = await CountSearchMatchesAsync(
-            CaseReport, includeDeleted: false, RecordQueryRules.ActiveRecStatus, ct);
+        var expectedTotal = await CountSearchMatchesAsync(CaseReport, includeDeleted: false, ActiveRecStatus, ct);
+
+        // Every CaseReport base row has its page row (the 99_verify orphan check), so the matches are the active set.
+        Assert.Equal(await CountBaseRowsAsync(CaseReport, includeDeleted: false, ct), expectedTotal);
         Assert.True(
-            expectedTotal > RecordQueryRules.SearchCap + 1,
+            expectedTotal > SearchCap + 1,
             "SQL shows too few active CaseReport records for the cap to apply after an exclusion.");
         var expected = await ReadSearchMatchesAsync(
-            CaseReport, includeDeleted: false, RecordQueryRules.ActiveRecStatus, RecordQueryRules.SearchCap + 1, ct);
-        var criterion = new CriterionBody(
-            SearchCriteriaParser.RecStatusFieldName, Text(RecordQueryRules.ActiveRecStatus));
+            CaseReport, includeDeleted: false, ActiveRecStatus, SearchCap + 1, ct);
+        var criterion = new CriterionBody(RecStatusField, Text(ActiveRecStatus));
 
         var capped = await SearchAsync(client, viewId, [criterion], ct: ct);
         Assert.Equal(expectedTotal, Property(capped, "total").GetInt32());
         Assert.True(Property(capped, "truncated").GetBoolean());
         var cappedItems = Items(capped);
+        Assert.Equal(SearchCap, cappedItems.Count);
         Assert.Equal(
-            expected.Take(RecordQueryRules.SearchCap).ToArray(),
+            expected.Take(SearchCap).ToArray(),
             cappedItems.Select(item => new SearchMatch(Id(item), Position(item))).ToArray());
         await AssertEndpointPositionsAsync(client, viewId, cappedItems, includeDeleted: false, ct);
 
@@ -2655,11 +3125,12 @@ public sealed class ListAndSearchTests
         Assert.Equal(expectedTotal - 1, Property(excluded, "total").GetInt32());
         Assert.True(Property(excluded, "truncated").GetBoolean());
         var excludedItems = Items(excluded);
+        Assert.Equal(SearchCap, excludedItems.Count);
         Assert.Equal(
             expected.Skip(1).ToArray(),
             excludedItems.Select(item => new SearchMatch(Id(item), Position(item))).ToArray());
         Assert.DoesNotContain(excludedItems, item => Id(item) == excludedId);
-        Assert.Equal(expected[RecordQueryRules.SearchCap].GlobalRecordId, Id(excludedItems[^1]));
+        Assert.Equal(expected[SearchCap].GlobalRecordId, Id(excludedItems[^1]));
     }
 
     // AAP 0.3.4.4 and SC-5: a criterion that matches nothing is a 200 with no items, a total of 0 and truncated false,
@@ -2682,12 +3153,20 @@ public sealed class ListAndSearchTests
         AssertFound(response);
     }
 
-    // AAP 0.3.4.4 "Collation": Find's equality compares under the database collation exactly as legacy did, and
-    // testdata/sql/00_create_database.sql pins none. The collation found is written to the test output for the
-    // "Search semantics" section of docs/parity-notes.md, and direct SQL on the same column must give the same answer.
+    // AAP 0.3.4.4 "Collation": Find's equality and LIKE compare under the database collation exactly as legacy did, and
+    // testdata/sql/00_create_database.sql pins none, so the case assumes no collation and reads no meaning into its
+    // name. The collation found is written to the test output for the "Search semantics" section of
+    // docs/parity-notes.md, and LastName must carry it. Each expected result is direct SQL shaped as Find selects it,
+    // comparing on that column with no COLLATE clause: an equality on the marker, a LIKE through '*' on its first
+    // characters, and one through '_' in place of its hyphen. The marker's own case must find the created record, so no
+    // comparison passes on two empty results; the upper-cased marker differs from it inside the LIKE prefix too, so the
+    // collation alone decides whether it matches, and case-insensitive, case-sensitive and binary collations all pass.
     [Fact]
-    public async Task FindEquality_FollowsTheDatabaseCollation()
+    public async Task Find_FollowsTheDatabaseCollation()
     {
+        // The marker's leading characters a LIKE criterion keeps: they hold the inner run NewMarkerWithHexLetter
+        // gives a hexadecimal letter.
+        const int likePrefixLength = InnerStart + InnerLength;
         using var timeout = new CancellationTokenSource(TestTimeout);
         var ct = timeout.Token;
         await using var factory = await ApiFactory.ForDatabaseAsync();
@@ -2696,33 +3175,42 @@ public sealed class ListAndSearchTests
 
         var collation = await ReadDatabaseCollationAsync(ct);
         _output.WriteLine("Database collation: " + collation);
-        int expectedMatches;
-        if (collation.Contains("_CI", StringComparison.Ordinal))
-        {
-            expectedMatches = 1;
-        }
-        else if (collation.Contains("_CS", StringComparison.Ordinal))
-        {
-            expectedMatches = 0;
-        }
-        else
-        {
-            Assert.Fail(
-                $"The database collation '{collation}' is neither case-insensitive (_CI) nor case-sensitive (_CS).");
-            return;
-        }
+        Assert.Equal(collation, await ReadLastNameCollationAsync(ct));
 
         var viewId = await ApiTestClient.GetViewIdAsync(client, CaseReport, ct);
         var marker = NewMarkerWithHexLetter();
         var created = await CreateAsync(client, viewId, new() { [TestDatabase.MarkerField] = marker }, ct);
         var upper = marker.ToUpperInvariant();
-        Assert.NotEqual(marker, upper);
-        Assert.Equal(expectedMatches, await CountLastNameEqualsAsync(upper, ct));
+        Assert.NotEqual(marker[..likePrefixLength], upper[..likePrefixLength]);
 
-        var response = await SearchAsync(client, viewId, [new(TestDatabase.MarkerField, upper)], ct: ct);
-        AssertFound(response, expectedMatches == 1 ? [created.GlobalRecordId] : []);
+        foreach (var (text, storedCase) in new[] { (marker, true), (upper, false) })
+        {
+            var prefix = text[..likePrefixLength];
+            var underscored = prefix[..1] + "_" + prefix[2..];
+            (string Criterion, bool Like, string SqlValue)[] comparisons =
+            [
+                (text, false, text),
+                (prefix + "*", true, prefix + "%"),
+                (underscored + "*", true, underscored + "%"),
+            ];
+            foreach (var (criterion, like, sqlValue) in comparisons)
+            {
+                var expected = await ReadLastNameMatchesAsync(like, sqlValue, ct);
+                var matched = expected.Contains(created.GlobalRecordId, StringComparer.Ordinal);
+                _output.WriteLine(
+                    $"Criterion {criterion}: LastName {(like ? "LIKE" : "=")} {sqlValue} " +
+                    $"{(matched ? "matches" : "does not match")} the created record.");
+                if (storedCase)
+                {
+                    Assert.True(matched, $"Direct SQL does not find the created record for '{criterion}'.");
+                }
+
+                var response = await SearchAsync(
+                    client, viewId, [new(TestDatabase.MarkerField, criterion)], ct: ct);
+                AssertFound(response, expected);
+            }
+        }
     }
-
 
     // An integer as the query string and the criteria write it.
     private static string Text(int value) => value.ToString(CultureInfo.InvariantCulture);
@@ -2774,14 +3262,14 @@ public sealed class ListAndSearchTests
         CancellationToken ct)
     {
         var records = new List<ListedRecord>();
-        var set = includeDeleted ? "&" + RequestParameters.IncludeDeleted + "=true" : string.Empty;
-        for (var page = RecordQueryRules.DefaultPage; ; page++)
+        var set = includeDeleted ? "&" + IncludeDeletedParameter + "=true" : string.Empty;
+        for (var page = DefaultPage; ; page++)
         {
-            var query = "?" + RequestParameters.PageSize + "=" + Text(RecordQueryRules.MaxPageSize) +
-                "&" + RequestParameters.Page + "=" + Text(page) + set;
+            var query = "?" + PageSizeParameter + "=" + Text(MaxPageSize) +
+                "&" + PageParameter + "=" + Text(page) + set;
             var list = await GetListAsync(client, viewId, query, ct);
             Assert.Equal(page, Property(list, "page").GetInt32());
-            Assert.Equal(RecordQueryRules.MaxPageSize, Property(list, "pageSize").GetInt32());
+            Assert.Equal(MaxPageSize, Property(list, "pageSize").GetInt32());
 
             var total = Property(list, "total").GetInt32();
             var items = Items(list);
@@ -2829,7 +3317,7 @@ public sealed class ListAndSearchTests
     {
         var path = RecordsPath(
             viewId,
-            "/" + Uri.EscapeDataString(globalRecordId) + "/position?" + RequestParameters.IncludeDeleted + "=" +
+            "/" + Uri.EscapeDataString(globalRecordId) + "/position?" + IncludeDeletedParameter + "=" +
             (includeDeleted ? "true" : "false"));
         var body = await GetJsonAsync(client, path, ct);
         var position = Property(body, "position");
@@ -2904,7 +3392,7 @@ public sealed class ListAndSearchTests
     private static SqlParameter[] SelectedSetParameters(bool includeDeleted) =>
     [
         new("@includeDeleted", SqlDbType.Bit) { Value = includeDeleted },
-        new("@active", SqlDbType.SmallInt) { Value = (short)RecordQueryRules.ActiveRecStatus },
+        new("@active", SqlDbType.SmallInt) { Value = ActiveRecStatus },
     ];
 
     private static SqlParameter IdParameter(string globalRecordId) =>
@@ -2944,7 +3432,7 @@ public sealed class ListAndSearchTests
             "ORDER BY b.[UniqueKey] OFFSET @offset ROWS FETCH NEXT @pageSize ROWS ONLY;",
             reader => new BaseRow(reader.GetString(0), reader.GetInt32(1)),
             ct,
-            new SqlParameter("@active", SqlDbType.SmallInt) { Value = (short)RecordQueryRules.ActiveRecStatus },
+            new SqlParameter("@active", SqlDbType.SmallInt) { Value = ActiveRecStatus },
             new SqlParameter("@offset", SqlDbType.BigInt) { Value = offset },
             new SqlParameter("@pageSize", SqlDbType.Int) { Value = pageSize });
 
@@ -2954,7 +3442,7 @@ public sealed class ListAndSearchTests
             "ORDER BY b.[UniqueKey];",
             reader => reader.GetString(0),
             ct,
-            new SqlParameter("@deleted", SqlDbType.SmallInt) { Value = (short)RecordQueryRules.DeletedRecStatus });
+            new SqlParameter("@deleted", SqlDbType.SmallInt) { Value = DeletedRecStatus });
 
     // The number of Find matches of a RecStatus criterion: base rows of the selected set with that status and a row
     // on every page.
@@ -3017,16 +3505,30 @@ public sealed class ListAndSearchTests
             ct,
             IdParameter(globalRecordId));
 
-    // The CaseReport rows whose LastName equals the text under the column's collation, the database default.
-    private static Task<int> CountLastNameEqualsAsync(string lastName, CancellationToken ct) =>
-        ScalarIntAsync(
-            "SELECT COUNT(*) FROM [dbo].[CaseReport1] WHERE [LastName] = @lastName;",
+    // The CaseReport records Find must return for one LastName comparison, as it selects them: active base rows with a
+    // row on every page table, in UniqueKey order, whose LastName equals the value or, with like, matches it as a LIKE
+    // pattern with no ESCAPE clause. No COLLATE clause is written, so the comparison runs under the column's
+    // collation, which a parameter's coercible default never overrides.
+    private static Task<string[]> ReadLastNameMatchesAsync(bool like, string value, CancellationToken ct) =>
+        ReadRowsAsync(
+            $"SELECT b.[GlobalRecordId] FROM {Tables(CaseReport).Base} AS b{PageJoins(CaseReport, "b")} " +
+            $"WHERE b.[RecStatus] = @active AND p0.[LastName] {(like ? "LIKE" : "=")} @value " +
+            "ORDER BY b.[UniqueKey];",
+            reader => reader.GetString(0),
             ct,
-            new SqlParameter("@lastName", SqlDbType.NVarChar, 4000) { Value = lastName });
+            new SqlParameter("@active", SqlDbType.SmallInt) { Value = ActiveRecStatus },
+            new SqlParameter("@value", SqlDbType.NVarChar, 4000) { Value = value });
 
     private static async Task<string> ReadDatabaseCollationAsync(CancellationToken ct) =>
         Assert.IsType<string>(await ScalarAsync(
             "SELECT CONVERT(nvarchar(128), DATABASEPROPERTYEX(DB_NAME(), 'Collation'));",
+            ct));
+
+    // The collation of the CaseReport1.LastName column, the one Find's LastName comparisons run under.
+    private static async Task<string> ReadLastNameCollationAsync(CancellationToken ct) =>
+        Assert.IsType<string>(await ScalarAsync(
+            "SELECT c.[collation_name] FROM sys.columns AS c " +
+            "WHERE c.[object_id] = OBJECT_ID(N'[dbo].[CaseReport1]') AND c.[name] = N'LastName';",
             ct));
 
     private static async Task<object?> ScalarAsync(string sql, CancellationToken ct, params SqlParameter[] parameters)
@@ -3061,6 +3563,31 @@ public sealed class ListAndSearchTests
         return rows.ToArray();
     }
 
+    // A list statement's page: ORDER BY, then OFFSET ... ROWS FETCH NEXT; the keywords in any case.
+    [GeneratedRegex(
+        @"\bORDER\s+BY\b[\s\S]*\bOFFSET\b[\s\S]*\bROWS\s+FETCH\s+NEXT\b",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
+    private static partial Regex PagedSelect();
+
+    // A list statement's total: SELECT COUNT(*) or COUNT_BIG(*); the keywords in any case.
+    [GeneratedRegex(
+        @"\bSELECT\s+COUNT(?:_BIG)?\s*\(\s*\*\s*\)",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
+    private static partial Regex CountSelect();
+
+    // The LIKE keyword, in any case.
+    [GeneratedRegex(@"\bLIKE\b", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
+    private static partial Regex LikeKeyword();
+
+    // CONVERT(nvarchar(max), alias.[column]) COLLATE Latin1_General_100_CI_AS LIKE @p COLLATE
+    // Latin1_General_100_CI_AS ESCAPE '\'. Every CaseReport grid column is nvarchar, so none takes style 23.
+    [GeneratedRegex(
+        @"CONVERT\(\s*nvarchar\(\s*max\s*\)\s*,\s*\w+\.\[(?<column>[^\]]+)\]\s*\)" +
+        @"\s+COLLATE\s+Latin1_General_100_CI_AS\s+LIKE\s+(?<parameter>@\w+)" +
+        @"\s+COLLATE\s+Latin1_General_100_CI_AS\s+ESCAPE\s+'\\'",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
+    private static partial Regex GridContains();
+
     // One search criterion on the wire: {"field": ..., "value": ...}.
     private sealed record CriterionBody(string Field, string Value);
 
@@ -3073,4 +3600,3 @@ public sealed class ListAndSearchTests
     // One Find result's identity and its position over the selected set.
     private readonly record struct SearchMatch(string GlobalRecordId, int Position);
 }
-

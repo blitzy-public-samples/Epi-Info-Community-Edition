@@ -3910,13 +3910,14 @@ describe('FormView record grid', () => {
   });
 
   it('shows a 400 about q beside the search box and other parameters in the banner, and drops the stale message on an edit', async () => {
-    const tooLong = 'q must be at most 3998 characters long, counting each %, _, [ and \\ as two.';
+    // The server sends no q error today; this case guards the grid's routing of one should it come.
+    const searchMessage = 'q is not accepted here.';
     const rejected = {
       type: 'https://tools.ietf.org/html/rfc9110#section-15.5.1',
       title: 'One or more validation errors occurred.',
       status: 400,
       traceId: '00-test-list-00',
-      errors: { q: [tooLong], pageSize: ['The value must be an integer.'] },
+      errors: { q: [searchMessage], pageSize: ['The value must be an integer.'] },
     };
     await renderForm(undefined, {
       route: (call) =>
@@ -3925,15 +3926,15 @@ describe('FormView record grid', () => {
     const search = searchBox();
 
     fireEvent.change(search, { target: { value: 'Ada' } });
-    await findInGrid(tooLong);
+    await findInGrid(searchMessage);
     expect(search.getAttribute('aria-invalid')).toBe('true');
     const describedBy = present(search.getAttribute('aria-describedby'), 'aria-describedby of the search box');
     const message = present(document.getElementById(describedBy), 'the search box message');
     expect(message.getAttribute('role')).toBe('alert');
-    expect(message.textContent).toBe(tooLong);
+    expect(message.textContent).toBe(searchMessage);
     // The other parameter's message names it in the banner, which offers no Retry for a 400.
     expect(within(records()).getAllByRole('alert').map((alert) => alert.textContent)).toEqual([
-      tooLong,
+      searchMessage,
       'The record list could not be loaded.pageSize: The value must be an integer.Trace id: 00-test-list-00',
     ]);
     expect(within(records()).queryByRole('button', { name: 'Retry' })).toBeNull();
@@ -3942,10 +3943,10 @@ describe('FormView record grid', () => {
     fireEvent.change(search, { target: { value: 'Adam' } });
     expect(search.getAttribute('aria-invalid')).toBeNull();
     expect(search.getAttribute('aria-describedby')).toBeNull();
-    expect(within(records()).queryByText(tooLong)).toBeNull();
+    expect(within(records()).queryByText(searchMessage)).toBeNull();
 
     // The new text gets its own answer, shown beside the box in turn.
-    await findInGrid(tooLong);
+    await findInGrid(searchMessage);
     expect(listCalls().map((call) => call.url.searchParams.get('q'))).toEqual([null, 'Ada', 'Adam']);
   });
 

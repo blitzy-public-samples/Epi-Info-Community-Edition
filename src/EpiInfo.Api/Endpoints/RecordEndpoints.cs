@@ -157,9 +157,8 @@ public static class RecordEndpoints
     /// <summary>Handles <c>GET /api/forms/{viewId}/records</c>.</summary>
     /// <param name="viewId">The form's <c>metaViews.ViewId</c>, already an integer by its route constraint.</param>
     /// <param name="q">
-    /// The grid filter; absent or whitespace means no filter. A filter longer than 3,998 characters, counting each
-    /// <c>%</c>, <c>_</c>, <c>[</c> and <c>\</c> as two (<see cref="RecordQueryRules.IsRepresentableFilter"/>), is a
-    /// 400 on <c>q</c>.
+    /// The grid filter; absent or whitespace means no filter. Any other filter, whatever its length, is a literal,
+    /// case-insensitive "contains" over the grid columns.
     /// </param>
     /// <param name="includeDeleted">
     /// Every sent occurrence of the deleted toggle, in order and as sent; none means <c>false</c>.

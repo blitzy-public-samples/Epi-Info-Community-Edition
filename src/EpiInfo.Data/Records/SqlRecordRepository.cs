@@ -318,10 +318,6 @@ internal sealed class SqlRecordRepository(
     /// The page's summaries with the total of the filtered set; no items and a total of 0 when the form is no longer
     /// present. A valid page past the end has no items and the correct total.
     /// </returns>
-    /// <exception cref="ArgumentException">
-    /// The filter fails <see cref="RecordQueryRules.IsRepresentableFilter"/>, raised before any base- or page-table
-    /// statement is sent.
-    /// </exception>
     public async Task<RecordPage> ListAsync(FormMetadata form, RecordListQuery query, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(form);
@@ -342,7 +338,7 @@ internal sealed class SqlRecordRepository(
                 RecordQueryRules.GetGridColumns(FormDefinitionFactory.GetDataFields(read.Form));
 
             // One statement returns the page and the total of the filtered set, holding every row it reads, so both
-            // describe one committed state. It is built before it is sent, so a filter the builder refuses sends
+            // describe one committed state. It is built before it is sent, so a grid column the builder refuses sends
             // nothing.
             ListSelect page = SearchSqlBuilder.ListPage(read.Schema, gridColumns, query);
 

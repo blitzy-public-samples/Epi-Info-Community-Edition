@@ -45,9 +45,12 @@ internal sealed record ListSelect(SqlStatement Statement, IReadOnlyList<Projecte
 /// <para>
 /// <b>Input.</b> Search conditions arrive already parsed by <c>SearchCriteriaParser</c>, which owns every criterion
 /// rule: trimming, the <c>" or "</c> split, the comparison prefixes, per-type coercion, the six-field limit, the
-/// wildcard-pattern bound and the <c>*</c> to <c>%</c> rewrite. This class renders each alternative exactly as given,
-/// however many a condition holds; it reads a value only to reject, as a programming error, a <c>LIKE</c> pattern over
-/// that bound, and to pack the values of a large search into parameters ("Packed binding" under <c>Search</c>).
+/// rejection of a <c>[...]</c> set no SQL Server construct evaluates and the <c>*</c> to <c>%</c> rewrite. This class
+/// renders each alternative exactly as given, however many a condition holds and however long its pattern; it reads a
+/// value only to pack the values of a large search into parameters ("Packed binding" under <c>Search</c>), to compile
+/// a <c>LIKE</c> pattern longer than SQL Server's pattern limit into a program ("Long patterns" under
+/// <c>Search</c>), and to reject, as a programming error, a set longer than that limit that is unclosed or that no cut
+/// keeping its members divides.
 /// </para>
 /// <para>
 /// <b>Identifiers and values.</b> Every table and column name comes from the reader-built <see cref="FormSchema"/>
@@ -55,12 +58,15 @@ internal sealed record ListSelect(SqlStatement Statement, IReadOnlyList<Projecte
 /// helpers. The CTE name <c>[n]</c>, Find's position column <c>[pos]</c>, the list's derived tables <c>[ct]</c> and
 /// <c>[pg]</c> and its count column <c>[tot]</c>, the aliases <c>b</c>, <c>p{i}</c> and <c>[c{n}]</c>, the names a
 /// packed list is decoded under (the derived tables <c>[d]</c>, <c>[a]</c> and <c>[e]</c>, the digit tables
-/// <c>[r{k}]</c>, and their columns <c>[v]</c>, <c>[i]</c>, <c>[t]</c> and <c>[g]</c>), the collation name, the escape
-/// character, the decoding expressions of packed values, a packed statement's plan hints,
-/// <c>OPTION (USE HINT ('DISABLE_OPTIMIZER_ROWGOAL', 'FORCE_LEGACY_CARDINALITY_ESTIMATION'))</c>, and the list's,
-/// <c>OPTION (FORCE ORDER, LOOP JOIN)</c>, are fixed literals.
-/// Every value (criteria, packed or not, the grid filter, the excluded id, the cap, the offset and the page
-/// size) is a positional parameter, so text that looks like SQL stays inert data.
+/// <c>[r{k}]</c>, and their columns <c>[v]</c>, <c>[i]</c>, <c>[t]</c> and <c>[g]</c>), the names a long-pattern
+/// program runs under (the recursive CTEs <c>[x{n}]</c>, their columns <c>[k]</c>, <c>[v]</c>, <c>[l]</c>,
+/// <c>[z]</c> and <c>[st]</c>, and the aliases <c>[u]</c>, <c>[h]</c>, <c>[x]</c>, <c>[q]</c>, <c>[f]</c>,
+/// <c>[g]</c>, <c>[o]</c> and <c>[y]</c> with their columns), the collation name, the escape character, the decoding
+/// expressions of packed values and of programs, and the query hints, <c>MAXRECURSION 0</c>, a packed statement's
+/// <c>USE HINT ('DISABLE_OPTIMIZER_ROWGOAL', 'FORCE_LEGACY_CARDINALITY_ESTIMATION')</c> and the list's
+/// <c>FORCE ORDER, LOOP JOIN</c>, are fixed literals. Every value (criteria, packed, compiled or not, the grid filter,
+/// the excluded id, the cap, the offset and the page size) is a positional parameter, so text that looks like SQL
+/// stays inert data.
 /// </para>
 /// <para>
 /// Every exception message is fixed text naming no table, column, field, value or id, as the redaction policy
@@ -145,7 +151,8 @@ internal static class SearchSqlBuilder
     // A LIKE pattern's text decoding. LIKE reads an nvarchar(max) pattern as nvarchar(4000), the conversion the
     // per-alternative statement applies to its parameter once; decoding a packed pattern to that type does it once per
     // element instead of once per comparison, which with patterns of a few dozen characters made a long list about
-    // ten times slower to match. It holds every pattern, because none passes RecordQueryRules.MaxLikePatternLength.
+    // ten times slower to match. It holds every packed pattern, because a pattern longer than the native LIKE limit,
+    // at most RecordQueryRules.MaxLikePatternLength, is never packed: its long-pattern program evaluates it instead.
     private const string PackedPatternDecoder = "CAST(CONVERT(varbinary(max), [e].[t], 2) AS nvarchar(4000))";
     private const string PackedByteDecoder = "CAST([e].[t] AS tinyint)";
     private const string PackedInt16Decoder = "CAST([e].[t] AS smallint)";
@@ -188,11 +195,77 @@ internal static class SearchSqlBuilder
     // nothing, because COUNT_BIG(*) OVER () reads every match before TOP returns a row, and the estimator of levels 100
     // and 110 is applied at every level, so each level plans the decoding as those do: once per list.
     private const string PackedPlanHints =
-        " OPTION (USE HINT ('DISABLE_OPTIMIZER_ROWGOAL', 'FORCE_LEGACY_CARDINALITY_ESTIMATION'))";
+        "USE HINT ('DISABLE_OPTIMIZER_ROWGOAL', 'FORCE_LEGACY_CARDINALITY_ESTIMATION')";
+
+    // The query hint of a statement that runs a long-pattern program: a recursive CTE takes one level per instruction,
+    // bisection, extension or seek a value runs, more than the default limit of 100 levels for a long value or a long
+    // program.
+    private const string LongPatternHint = "MAXRECURSION 0";
+
+    // A long-pattern program is ASCII text, as a packed list is: the number of patterns, the number of records, one
+    // record of LongPatternFieldCount fields, each PackedNumberWidth decimal digits, per entry, instruction and data
+    // record, and then the texts of the records, one after another, as the hexadecimal of their UTF-16LE code units.
+    // The fields are: the kind; the record to run after a success, plus one, 0 meaning the pattern matched (for an
+    // entry, its pattern's first instruction); the record to retry from after a failure, plus one, 0 meaning the value
+    // fails; the step's character count, first in UTF-16 code units, as a collation without supplementary-character
+    // support counts, and then with each surrogate pair counted once, as an _SC collation counts; the number of data
+    // records after the instruction, the pieces of its set or the cuts of its run; whether its set is negated; a cut's
+    // length in code units; and the end of the record's text, in code units from the start of the text area.
+    private const int LongPatternFieldCount = 9;
+    private const int LongPatternHeaderWidth = 2 * PackedNumberWidth;
+    private const int LongPatternRecordWidth = LongPatternFieldCount * PackedNumberWidth;
+    private const int KindField = 0;
+    private const int NextField = 1;
+    private const int FailField = 2;
+    private const int CountField = 3;
+    private const int ItemsField = 5;
+    private const int NegatedField = 6;
+    private const int CutField = 7;
+    private const int TextEndField = 8;
+
+    // The record kinds of a long-pattern program, the [f].[t] its statement branches on: an entry, one per pattern,
+    // which only names the pattern's first instruction; the nine instructions; and a data record, a piece of the set
+    // or a cut of the run of the instruction before it, which is never run.
+    private const int EntryRecord = 0;
+    private const int WindowStep = 1;
+    private const int RunStep = 2;
+    private const int SeekStep = 3;
+    private const int SeekRunStep = 4;
+    private const int ScanStep = 5;
+    private const int TailStep = 6;
+    private const int EndStep = 7;
+    private const int DataRecord = 8;
+    private const int EndAnchorStep = 9;
+    private const int BackWindowStep = 10;
+
+    // A window is wrapped in a '%' on each side for PATINDEX, and followed by one for the bisection's LIKE, so it is
+    // two less than the native limit; a tail window is preceded by one '%' only.
+    private const int SeekWrapping = 2;
+    private const int TailWrapping = 1;
+
+    // The prefixes of a long literal run that a seek looks for: the longest that fits a seek window and the 32 before
+    // it, each one text element shorter. A value character that a collation expands into several pattern characters,
+    // such as Æ for AE, can straddle the end of one prefix, which then misses the match, but not the end of every one
+    // of 33 consecutive prefixes unless it expands into more than 33 text elements. Measured, of the 11,557 BMP
+    // characters whose compatibility decomposition has three or more code units, the 314 that
+    // Latin1_General_100_CI_AS ranks equal to it span at most three text elements (U+FB03 for ffi).
+    private const int RunCuts = 33;
+
+    // The phases of a step, the [q].[p] of a row: run the step afresh, bisect for the first end its pattern fits,
+    // extend that end to a character boundary or scan a run's equal ends, and apply a seek's hit.
+    private const int FreshPhase = 0;
+    private const int BisectPhase = 1;
+    private const int ExtendPhase = 2;
+    private const int HitPhase = 3;
+
+    // In a long-pattern step: the rest of the value after the end [e] of the text matched so far, and the midpoint of
+    // a bisection's bounds [t] and [h].
+    private const string Rest = "SUBSTRING([x].[v], [q].[e] + 1, [f].[r])";
+    private const string Midpoint = "([q].[t] + [q].[h]) / 2";
 
     // The plan hints the list statement ends with: the joins run in written order, each as nested loops, so the base
     // table is the outer input of every page join and each page row is read only after its base row is held (ListPage).
-    private const string ListPlanHints = " OPTION (FORCE ORDER, LOOP JOIN)";
+    private const string ListPlanHints = "FORCE ORDER, LOOP JOIN";
 
     // SQL Server's largest decimal precision, the precision a packed decimal element is read back with.
     private const int MaxDecimalPrecision = 38;
@@ -216,9 +289,11 @@ internal static class SearchSqlBuilder
         "The search conditions need more parameters than one SQL Server statement can bind.";
     private const string UnpackableTypeMessage = "A search parameter of this type has no packed form.";
     private const string UnpackableValueMessage = "A search parameter value has no exact packed form.";
-    private const string PatternTooLongMessage = "A search pattern is longer than SQL Server's LIKE pattern limit.";
-    private const string FilterTooLongMessage =
-        "The grid filter's pattern is longer than SQL Server's LIKE pattern limit.";
+    private const string SetTooLongMessage =
+        "A search pattern holds a [...] set longer than SQL Server's LIKE pattern limit that is unclosed or cannot be"
+        + " cut into shorter sets.";
+    private const string LikeLimitMessage =
+        "The native LIKE limit must be from 0 to SQL Server's LIKE pattern limit.";
 
     /// <summary>
     /// Builds the Find statement: the selected set numbered by <c>UniqueKey</c>, joined to every page table, filtered
@@ -231,14 +306,20 @@ internal static class SearchSqlBuilder
     /// WITH [n] AS (SELECT b.[GlobalRecordId], b.[UniqueKey], b.[RecStatus],
     ///                     ROW_NUMBER() OVER (ORDER BY b.[UniqueKey]) AS [pos]
     ///              FROM [base] b WITH (HOLDLOCK) [WHERE b.[RecStatus] = @p0])
+    ///      [, [x{n}] ([k], [v], [l], [z], [st]) AS (anchor UNION ALL step) ...]  -- long patterns only
     /// SELECT TOP (@p1) b.[GlobalRecordId] AS [c0], b.[UniqueKey] AS [c1], b.[RecStatus] AS [c2],
     ///        b.[pos] AS [c3], COUNT_BIG(*) OVER () AS [c4], p0.[col] AS [c5], ...
     /// FROM [n] b INNER JOIN [page] p0 ON p0.[GlobalRecordId] = b.[GlobalRecordId] ...
-    /// WHERE (alt OR alt ...) AND (alt OR ...)
+    /// WHERE (alt OR alt ... [OR EXISTS (SELECT 1 FROM [x{n}] AS [y] WHERE [y].[k] = b.[GlobalRecordId]
+    ///                                     AND CAST(SUBSTRING([y].[st], 1, 8) AS bigint) = -1)]) AND (alt OR ...)
     ///   [AND NOT (b.[GlobalRecordId] = @pX AND DATALENGTH(b.[GlobalRecordId]) = DATALENGTH(@pX))]
     /// ORDER BY b.[UniqueKey]
-    /// [OPTION (USE HINT ('DISABLE_OPTIMIZER_ROWGOAL', 'FORCE_LEGACY_CARDINALITY_ESTIMATION'))]  -- packed only
+    /// [OPTION ([MAXRECURSION 0][, ][USE HINT ('DISABLE_OPTIMIZER_ROWGOAL', 'FORCE_LEGACY_CARDINALITY_ESTIMATION')])]
     /// </code>
+    /// <para>
+    /// <c>MAXRECURSION 0</c> is written only with a long-pattern program and the <c>USE HINT</c> only in a packed
+    /// statement.
+    /// </para>
     /// <para>
     /// <b>Positions.</b> The CTE reads the base table only and applies only the selected-set predicate, so
     /// <c>[pos]</c> is numbered before any criterion and equals the navigation position, the count of selected rows
@@ -298,10 +379,11 @@ internal static class SearchSqlBuilder
     /// keeps the column's collation and compares the whole text.
     /// </para>
     /// <para>
-    /// <b>Packed binding.</b> A search binds one parameter per alternative other than <c>IS NULL</c> while it holds at
-    /// most 2,000 of them, so the statement, at most 2,003 parameters with the selected-set status, the cap and the
-    /// excluded id, stays under the 2,098 a <c>sp_executesql</c> command leaves of SQL Server's 2,100. A search with
-    /// more renders every condition packed instead, so its parameter count no longer grows with its alternatives:
+    /// <b>Packed binding.</b> A search binds one parameter per alternative other than <c>IS NULL</c> and other than a
+    /// long pattern, plus one per condition holding long patterns (below), while those are at most 2,000, so the
+    /// statement, at most 2,003 parameters with the selected-set status, the cap and the excluded id, stays under the
+    /// 2,098 a <c>sp_executesql</c> command leaves of SQL Server's 2,100. A search with more renders every condition
+    /// packed instead, so its parameter count no longer grows with its alternatives; long patterns are never packed:
     /// </para>
     /// <code>
     /// (column IS NULL OR EXISTS (SELECT 1 FROM (SELECT TOP (2147483647) decoded AS [v]
@@ -338,8 +420,8 @@ internal static class SearchSqlBuilder
     /// then encoded by the parameter's type so that its decoding has that same SQL type and value: text as the
     /// hexadecimal of its UTF-16LE code units, decoded through <c>varbinary(max)</c> with <c>CONVERT</c> style 2 to
     /// <c>nvarchar(max)</c>, or for a <c>LIKE</c> pattern to the <c>nvarchar(4000)</c> that <c>LIKE</c> converts its
-    /// <c>nvarchar(max)</c> parameter to, which holds every pattern within the length bound below and is then not
-    /// converted again for each comparison; either keeps every code unit and, like a parameter, takes the database's
+    /// <c>nvarchar(max)</c> parameter to, which holds every packed pattern, since none is a long pattern, and is then
+    /// not converted again for each comparison; either keeps every code unit and, like a parameter, takes the database's
     /// coercible-default collation, so a column's collation governs the comparison as it does for a parameter;
     /// integers and bits as invariant decimal text, cast
     /// to their own type; a <c>decimal</c> as its invariant text, cast to <c>decimal(38, s)</c> with <c>s</c> the
@@ -348,10 +430,44 @@ internal static class SearchSqlBuilder
     /// fixed widths, rebuilt by exact arithmetic, because SQL Server's text-to-float parse is not correctly rounded.
     /// </para>
     /// <para>
+    /// <b>Long patterns.</b> SQL Server refuses a <c>LIKE</c> or <c>PATINDEX</c> pattern of more than
+    /// <see cref="RecordQueryRules.MaxLikePatternLength"/> UTF-16 code units with error 8152. A <c>LIKE</c> pattern
+    /// within that native limit is rendered as above; a longer one, a long pattern, is compiled into a program that
+    /// gives the same answer with no pattern over the limit. The pattern is read as atoms, from the elements of
+    /// <see cref="LikePatternSyntax"/>: maximal literal runs, each <c>_</c>, each <c>[...]</c> set, and <c>%</c> runs,
+    /// which split it into segments. A literal run is never cut between two steps, because SQL Server matches it by
+    /// the collation's equality, under which one character can equal several (<c>Æ</c> and <c>AE</c>) or none (an
+    /// ignorable character), while <c>_</c> and a set match one character and an expansion never straddles a literal
+    /// and a wildcard. A step is a window of whole atoms of at most the native limit less two units, compared with
+    /// <c>LIKE</c>; a literal run longer than that, compared with <c>=</c>, which has no limit, and an <c>x</c>
+    /// appended to both sides, since <c>=</c> ignores trailing blanks; or a set longer than that, one character
+    /// <c>LIKE</c> one of the pieces <see cref="LikePatternSyntax.TrySplitSet"/> cuts it into, or none for a negated
+    /// set. Each step tracks where the text matched so far ends: it tries its own character count, else bisects for
+    /// the shortest prefix of the rest that starts a match, extends it to a character boundary of the collation and
+    /// checks it. The first segment is matched from the start of the value; each middle one from the leftmost
+    /// candidate <c>PATINDEX</c> finds for its first atoms, a long literal run by the leftmost hit of 33 of its
+    /// prefixes, and again after a candidate whose steps fail; the last by <c>LIKE '%' + window</c> when it fits,
+    /// else backwards from the end of the value, or as a middle one followed by an end that only ignorable characters
+    /// fill, as a pattern with no <c>%</c> ends. A set longer than the limit that is unclosed or that no cut keeping
+    /// its members divides, which the search-criteria parser rejects with a 400, is rejected here.
+    /// </para>
+    /// <para>
+    /// The patterns of one condition share one program, the ASCII parameter that <c>LongPatternFieldCount</c>
+    /// describes, and one recursive CTE <c>[x{n}]</c>, <c>n</c> the condition's index. Its anchor reads every
+    /// non-<c>NULL</c> value of the condition's column in the selected set, as <c>nvarchar(max)</c> under the column's
+    /// collation, with its length in characters, <c>LEN(v + N'.') - 1</c>, and whether the collation counts a surrogate
+    /// pair as one character; each recursion step runs one instruction for one value, decoding it from the parameter
+    /// by its index, so neither the text nor the parameter count grows with the pattern. A value matches when one of
+    /// its rows reaches state -1, which the condition's <c>EXISTS</c> term tests, and the statement carries
+    /// <c>MAXRECURSION 0</c>. Every comparison, <c>LIKE</c>, <c>PATINDEX</c>, <c>=</c> or <c>&lt;</c>, runs under the
+    /// column's collation, as the native predicate compares, so the program returns the rows of native <c>LIKE</c>,
+    /// expansions and ignorable characters included. The seek of a long literal run finds a match while no character
+    /// of the collation equals more than 33 text elements of the run, a bound recorded under "Parity gaps" in the
+    /// parity notes.
+    /// </para>
+    /// <para>
     /// <b>Bounds.</b> A statement that would still bind more than 2,098 parameters, which only conditions beyond the
-    /// parser's six fields can need, is rejected here before it is returned. Each <c>LIKE</c> pattern is at most
-    /// <see cref="RecordQueryRules.MaxLikePatternLength"/> characters, SQL Server's 8,000-byte pattern limit; the
-    /// search-criteria parser enforces it with a 400, and longer input is rejected here before any text is built.
+    /// parser's six fields can need, is rejected here before it is returned.
     /// </para>
     /// </remarks>
     /// <param name="schema">The form's catalogue view.</param>
@@ -367,9 +483,9 @@ internal static class SearchSqlBuilder
     /// </exception>
     /// <exception cref="ArgumentException">
     /// A list holds a null entry; a condition names no data field of the form, names one whose type differs from the
-    /// condition's, or has no alternative; the conditions hold a <c>LIKE</c> pattern longer than
-    /// <see cref="RecordQueryRules.MaxLikePatternLength"/>; a field or grid column has no column in the form's page
-    /// tables; a value does not fit its column; or the statement would bind more than 2,098 parameters.
+    /// condition's, or has no alternative; the conditions hold a <c>LIKE</c> pattern with a <c>[...]</c> set longer
+    /// than <see cref="RecordQueryRules.MaxLikePatternLength"/>; a field or grid column has no column in the form's
+    /// page tables; a value does not fit its column; or the statement would bind more than 2,098 parameters.
     /// </exception>
     /// <exception cref="ArgumentOutOfRangeException">A target or an operator is not a defined member.</exception>
     /// <exception cref="InvalidOperationException">
@@ -418,25 +534,84 @@ internal static class SearchSqlBuilder
         IReadOnlyList<SearchCondition> conditions,
         bool includeDeleted,
         string? excludeGlobalRecordId,
-        int scalarParameterBudget)
+        int scalarParameterBudget) =>
+        Search(
+            schema,
+            dataFields,
+            gridColumns,
+            conditions,
+            includeDeleted,
+            excludeGlobalRecordId,
+            scalarParameterBudget,
+            RecordQueryRules.MaxLikePatternLength);
+
+    /// <summary>
+    /// Builds the Find statement as the seven-argument overload does, with the length above which a <c>LIKE</c>
+    /// pattern is a long pattern given explicitly, so tests can evaluate short patterns through the long-pattern
+    /// program and compare it with native <c>LIKE</c>.
+    /// </summary>
+    /// <param name="schema">The form's catalogue view.</param>
+    /// <param name="dataFields">The form's data fields, to resolve each page-field condition by name.</param>
+    /// <param name="gridColumns">The grid columns to project.</param>
+    /// <param name="conditions">The parsed conditions; AND across conditions, OR across one condition's alternatives.</param>
+    /// <param name="includeDeleted">Whether the selected set holds every row rather than the active set.</param>
+    /// <param name="excludeGlobalRecordId">The open record's id to leave out of the result, or <see langword="null"/>.</param>
+    /// <param name="scalarParameterBudget">
+    /// The most bound values, alternatives other than <c>IS NULL</c> or a long pattern plus one per condition holding
+    /// long patterns, that bind one parameter each; 0 packs every search that binds a value.
+    /// </param>
+    /// <param name="nativeLikeLimit">
+    /// The longest pattern, in UTF-16 code units, rendered as one <c>LIKE</c>, which also bounds a long pattern's
+    /// windows and set pieces, two units less, and its last window, one less; from 0 to
+    /// <see cref="RecordQueryRules.MaxLikePatternLength"/>, which the other overloads pass.
+    /// </param>
+    /// <returns>The statement and its result layout.</returns>
+    /// <exception cref="ArgumentNullException">
+    /// <paramref name="schema"/>, <paramref name="dataFields"/>, <paramref name="gridColumns"/> or
+    /// <paramref name="conditions"/> is null.
+    /// </exception>
+    /// <exception cref="ArgumentException">As for the six-argument overload.</exception>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// <paramref name="scalarParameterBudget"/> is negative, <paramref name="nativeLikeLimit"/> is outside 0 to
+    /// <see cref="RecordQueryRules.MaxLikePatternLength"/>, or a target or an operator is not a defined member.
+    /// </exception>
+    /// <exception cref="InvalidOperationException">As for the six-argument overload.</exception>
+    internal static SearchSelect Search(
+        FormSchema schema,
+        DataFieldSet dataFields,
+        IReadOnlyList<DataFieldMetadata> gridColumns,
+        IReadOnlyList<SearchCondition> conditions,
+        bool includeDeleted,
+        string? excludeGlobalRecordId,
+        int scalarParameterBudget,
+        int nativeLikeLimit)
     {
         ArgumentNullException.ThrowIfNull(schema);
         ArgumentNullException.ThrowIfNull(dataFields);
         ArgumentNullException.ThrowIfNull(gridColumns);
         ArgumentNullException.ThrowIfNull(conditions);
         ArgumentOutOfRangeException.ThrowIfNegative(scalarParameterBudget);
+        CheckNativeLikeLimit(nativeLikeLimit);
 
         var uniqueKey = RecordSqlBuilder.Require(schema.UniqueKey);
         var recStatus = RecordSqlBuilder.Require(schema.RecStatus);
         var globalRecordId = RecordSqlBuilder.Require(schema.GlobalRecordId);
 
-        // Every field and column is resolved before any text is written, so an unknown field fails with no SQL built.
+        // Every field and column is resolved before any text is written, so an unknown field fails with no SQL built,
+        // and every long pattern is compiled before then too, so a set no cut keeping its members divides fails the
+        // same way.
         var resolved = ResolveConditions(schema, dataFields, conditions);
         var columns = ResolveGridColumns(schema, gridColumns, SearchFirstColumnOrdinal);
+        var programs = new LongPatternProgram?[resolved.Count];
+        for (var index = 0; index < resolved.Count; index++)
+        {
+            programs[index] = CompileConditionPatterns(resolved[index], nativeLikeLimit);
+        }
 
         // The numbered selected set is the statement's one base-table reference. It keeps the base system columns
         // under their catalogue names, so every b.[...] reference below reads the numbered row, and its HOLDLOCK keeps
-        // that row's membership, position and status one committed state until the statement completes.
+        // that row's membership, position and status one committed state until the statement completes. A long-pattern
+        // CTE reads the values it evaluates through [n] as well.
         var parameters = new PositionalParameters();
         var sql = new StringBuilder("WITH [n] AS (SELECT ");
         AppendBase(sql, globalRecordId).Append(", ");
@@ -446,8 +621,36 @@ internal static class SearchSqlBuilder
         AppendBaseTable(sql, schema);
         sql.Append(" WITH (HOLDLOCK)");
         RecordSqlBuilder.AppendSelectedSetPredicate(sql, schema, includeDeleted, parameters, SelectedSetClause.Where);
+        sql.Append(')');
 
-        sql.Append(") SELECT TOP (")
+        var hasLongPatterns = false;
+        for (var index = 0; index < resolved.Count; index++)
+        {
+            if (programs[index] is not { } program)
+            {
+                continue;
+            }
+
+            var condition = resolved[index];
+            var source = new StringBuilder("[n] " + RecordSqlBuilder.BaseAlias);
+            if (condition.PageIndex is { } pageIndex && schema.Pages[pageIndex].Table is { } pageTable)
+            {
+                AppendPageJoin(source, schema, pageIndex, pageTable, "INNER JOIN", holdLock: false);
+            }
+
+            sql.Append(", ");
+            AppendLongPatternProgram(
+                sql,
+                LongPatternName(index),
+                BaseReference(globalRecordId),
+                source.ToString(),
+                [string.Concat("CONVERT(nvarchar(max), ", condition.Reference, ")")],
+                parameters.Add(n => ColumnValueConverter.Text(n, program.Text)),
+                program);
+            hasLongPatterns = true;
+        }
+
+        sql.Append(" SELECT TOP (")
             .Append(parameters.Add(n => ColumnValueConverter.Int32(n, RecordQueryRules.SearchCap)))
             .Append(") ");
         AppendBase(sql, globalRecordId).Append(" AS ").Append(RecordSqlBuilder.ColumnAlias(IdOrdinal)).Append(", ");
@@ -468,23 +671,41 @@ internal static class SearchSqlBuilder
         }
 
         // Within the budget each alternative binds its own parameter; beyond it every condition is packed, so the
-        // parameter count no longer grows with the alternatives.
-        var packed = CountBindingAlternatives(resolved) > scalarParameterBudget;
+        // parameter count no longer grows with the alternatives. A condition's long patterns are one EXISTS on its
+        // program's CTE, whichever way its other alternatives bind.
+        var packed = CountBindingAlternatives(resolved, nativeLikeLimit) > scalarParameterBudget;
         var clause = " WHERE ";
-        foreach (var condition in resolved)
+        for (var conditionIndex = 0; conditionIndex < resolved.Count; conditionIndex++)
         {
+            var condition = resolved[conditionIndex];
             sql.Append(clause).Append('(');
+            var separator = string.Empty;
             if (packed)
             {
-                AppendPackedAlternatives(sql, condition, parameters);
+                if (AppendPackedAlternatives(sql, condition, parameters, nativeLikeLimit))
+                {
+                    separator = " OR ";
+                }
             }
             else
             {
-                for (var index = 0; index < condition.Condition.Alternatives.Count; index++)
+                foreach (var alternative in condition.Condition.Alternatives)
                 {
-                    sql.Append(index == 0 ? string.Empty : " OR ");
-                    AppendAlternative(sql, condition, condition.Condition.Alternatives[index], parameters);
+                    if (IsLongPattern(alternative, nativeLikeLimit))
+                    {
+                        continue;
+                    }
+
+                    sql.Append(separator);
+                    AppendAlternative(sql, condition, alternative, parameters);
+                    separator = " OR ";
                 }
+            }
+
+            if (programs[conditionIndex] is not null)
+            {
+                sql.Append(separator);
+                AppendLongPatternMatch(sql, LongPatternName(conditionIndex), BaseReference(globalRecordId));
             }
 
             sql.Append(')');
@@ -503,10 +724,7 @@ internal static class SearchSqlBuilder
         AppendBase(sql, uniqueKey);
 
         // Only a packed statement decodes lists; the per-alternative statement keeps the optimizer's own choices.
-        if (packed)
-        {
-            sql.Append(PackedPlanHints);
-        }
+        AppendQueryHints(sql, hasLongPatterns, packed ? PackedPlanHints : null);
 
         if (parameters.Count > MaxStatementParameters)
         {
@@ -523,7 +741,8 @@ internal static class SearchSqlBuilder
     /// <remarks>
     /// <para>The statement has this shape:</para>
     /// <code>
-    /// WITH [n] AS (SELECT b.[GlobalRecordId] AS [c0], b.[UniqueKey] AS [c1], b.[RecStatus] AS [c2],
+    /// WITH [[x0] ([k], [v], [l], [z], [st]) AS (anchor UNION ALL step), ]   -- long filter only
+    ///      [n] AS (SELECT b.[GlobalRecordId] AS [c0], b.[UniqueKey] AS [c1], b.[RecStatus] AS [c2],
     ///                     p0.[col] AS [c5], ...
     ///              FROM [base] b WITH (HOLDLOCK)
     ///              LEFT JOIN [page] p0 WITH (HOLDLOCK) ON p0.[GlobalRecordId] = b.[GlobalRecordId] ...
@@ -534,7 +753,7 @@ internal static class SearchSqlBuilder
     /// OUTER APPLY (SELECT [c0], [c1], [c2], [c5], ... FROM [n]
     ///              ORDER BY [c1] OFFSET @p2 ROWS FETCH NEXT @p3 ROWS ONLY) AS [pg]
     /// ORDER BY [pg].[c1]
-    /// OPTION (FORCE ORDER, LOOP JOIN)
+    /// OPTION ([MAXRECURSION 0, ]FORCE ORDER, LOOP JOIN)
     /// </code>
     /// <para>
     /// <b>Page and total.</b> <c>[n]</c> is the filtered set. <c>[ct]</c> counts it, and <c>[pg]</c> is the page,
@@ -580,6 +799,14 @@ internal static class SearchSqlBuilder
     /// nothing written. None of them returns a page and a total from two different states.
     /// </para>
     /// <para>
+    /// <b>Long filters.</b> A grid filter whose contains pattern is longer than SQL Server's <c>LIKE</c> pattern limit
+    /// is matched by the long-pattern program <c>[x0]</c>, which leads the statement. Its anchor reads the base table
+    /// and the same page tables as <c>[n]</c>, with the same joins and the same <c>HOLDLOCK</c> hints, under the same
+    /// plan hints, so its reads belong to the one consistent read and follow the same lock order; <c>[n]</c> keeps a
+    /// row whose value the program matched (<c>EXISTS</c> on <c>[x0]</c>), and the statement's hints start with
+    /// <c>MAXRECURSION 0</c>.
+    /// </para>
+    /// <para>
     /// Only the pages holding a grid column are joined, with <c>LEFT JOIN</c>, so a record missing a page row is still
     /// listed with <c>NULL</c> grid values and still counted.
     /// </para>
@@ -591,35 +818,73 @@ internal static class SearchSqlBuilder
     /// <exception cref="ArgumentNullException">An argument is null.</exception>
     /// <exception cref="ArgumentOutOfRangeException">The query's paging bounds were not validated.</exception>
     /// <exception cref="ArgumentException">
-    /// <paramref name="gridColumns"/> holds a null entry or a field with no column in the form's page tables; or the
-    /// query's filter fails <see cref="RecordQueryRules.IsRepresentableFilter"/>, so its contains pattern would be
-    /// longer than <see cref="RecordQueryRules.MaxLikePatternLength"/>.
+    /// <paramref name="gridColumns"/> holds a null entry or a field with no column in the form's page tables.
     /// </exception>
     /// <exception cref="InvalidOperationException">A table lacks a required system or key column.</exception>
     internal static ListSelect ListPage(
         FormSchema schema,
         IReadOnlyList<DataFieldMetadata> gridColumns,
-        RecordListQuery query)
+        RecordListQuery query) =>
+        ListPage(schema, gridColumns, query, RecordQueryRules.MaxLikePatternLength);
+
+    /// <summary>
+    /// Builds one page of the records list as the three-argument overload does, with the length above which the grid
+    /// filter's contains pattern is a long pattern given explicitly, so tests can evaluate a short filter through the
+    /// long-pattern program.
+    /// </summary>
+    /// <param name="schema">The form's catalogue view.</param>
+    /// <param name="gridColumns">The grid columns to project.</param>
+    /// <param name="query">The coerced list query.</param>
+    /// <param name="nativeLikeLimit">
+    /// The longest contains pattern, in UTF-16 code units, rendered as one <c>LIKE</c>; a longer one runs the
+    /// long-pattern program; from 0 to <see cref="RecordQueryRules.MaxLikePatternLength"/>, which the other overload
+    /// passes.
+    /// </param>
+    /// <returns>The statement and its result layout.</returns>
+    /// <exception cref="ArgumentNullException">An argument is null.</exception>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// The query's paging bounds were not validated, or <paramref name="nativeLikeLimit"/> is outside 0 to
+    /// <see cref="RecordQueryRules.MaxLikePatternLength"/>.
+    /// </exception>
+    /// <exception cref="ArgumentException">As for the three-argument overload.</exception>
+    /// <exception cref="InvalidOperationException">As for the three-argument overload.</exception>
+    internal static ListSelect ListPage(
+        FormSchema schema,
+        IReadOnlyList<DataFieldMetadata> gridColumns,
+        RecordListQuery query,
+        int nativeLikeLimit)
     {
         ArgumentNullException.ThrowIfNull(schema);
         ArgumentNullException.ThrowIfNull(gridColumns);
         ArgumentNullException.ThrowIfNull(query);
+        CheckNativeLikeLimit(nativeLikeLimit);
 
         var offset = query.Offset;
         var uniqueKey = RecordSqlBuilder.Require(schema.UniqueKey);
         var columns = ResolveGridColumns(schema, gridColumns, ListFirstColumnOrdinal);
 
         // The filtered set is the statement's one source of base and page rows, read by the count and by the page with
-        // every table under HOLDLOCK and, through the plan hints at the end, the base table first.
+        // every table under HOLDLOCK and, through the plan hints at the end, the base table first. Its source is built
+        // first, so a long filter's CTE, which reads the same tables under the same hints, can lead the statement; it
+        // allocates the parameters it binds before the paging ones, in the same order whether or not the filter is long.
         var parameters = new PositionalParameters();
-        var sql = new StringBuilder("WITH ").Append(ListSetName).Append(" AS (SELECT ");
+        var source = new StringBuilder();
+        var program = AppendListSource(source, schema, columns, query, parameters, nativeLikeLimit);
+
+        var sql = new StringBuilder("WITH ");
+        if (program is not null)
+        {
+            sql.Append(program).Append(", ");
+        }
+
+        sql.Append(ListSetName).Append(" AS (SELECT ");
         AppendBase(sql, RecordSqlBuilder.Require(schema.GlobalRecordId))
             .Append(" AS ").Append(RecordSqlBuilder.ColumnAlias(IdOrdinal)).Append(", ");
         AppendBase(sql, uniqueKey).Append(" AS ").Append(RecordSqlBuilder.ColumnAlias(UniqueKeyOrdinal)).Append(", ");
         AppendBase(sql, RecordSqlBuilder.Require(schema.RecStatus))
             .Append(" AS ").Append(RecordSqlBuilder.ColumnAlias(RecStatusOrdinal));
         AppendProjections(sql, schema, columns);
-        AppendListSource(sql, schema, columns, query, parameters);
+        sql.Append(source);
 
         // The page's columns as the filtered set names them, and as the outer query reads them from the page.
         var setColumns = new StringBuilder();
@@ -654,15 +919,14 @@ internal static class SearchSqlBuilder
             .Append(" OFFSET ").Append(parameters.Add(n => ColumnValueConverter.Int64(n, offset)))
             .Append(" ROWS FETCH NEXT ").Append(parameters.Add(n => ColumnValueConverter.Int32(n, query.PageSize)))
             .Append(" ROWS ONLY) AS ").Append(ListPageName)
-            .Append(" ORDER BY ").Append(pageKey)
-            .Append(ListPlanHints);
+            .Append(" ORDER BY ").Append(pageKey);
+        AppendQueryHints(sql, program is not null, ListPlanHints);
 
         return new ListSelect(parameters.ToStatement(sql.ToString()), columns);
     }
 
     // Resolves every condition to the column text it compares, before any statement text is written. A page field
-    // resolves through the form's data fields and the reader-built schema, a system target to its base column. The
-    // parser's LIKE pattern bound is checked again here, so a longer pattern fails with no statement built.
+    // resolves through the form's data fields and the reader-built schema, a system target to its base column.
     private static IReadOnlyList<ResolvedCondition> ResolveConditions(
         FormSchema schema,
         DataFieldSet dataFields,
@@ -679,16 +943,6 @@ internal static class SearchSqlBuilder
             if (condition.Alternatives.Count == 0)
             {
                 throw new ArgumentException(EmptyAlternativesMessage, nameof(conditions));
-            }
-
-            foreach (var alternative in condition.Alternatives)
-            {
-                if (alternative is { Operator: SearchOperator.Like, Value: { } pattern }
-                    && pattern.TryGetText(out var text)
-                    && text.Length > RecordQueryRules.MaxLikePatternLength)
-                {
-                    throw new ArgumentException(PatternTooLongMessage, nameof(conditions));
-                }
             }
 
             switch (condition.Target)
@@ -712,20 +966,25 @@ internal static class SearchSqlBuilder
                         column.Column.Metadata.SqlTypeName, NTextTypeName, StringComparison.OrdinalIgnoreCase)
                         ? string.Concat("CONVERT(nvarchar(max), ", reference, ")")
                         : reference;
-                    resolved.Add(new ResolvedCondition(condition, reference, comparable, column.Column.Metadata));
+                    resolved.Add(new ResolvedCondition(
+                        condition,
+                        reference,
+                        comparable,
+                        column.Column.Metadata,
+                        RecordSqlBuilder.PageIndexOf(schema, field.Page.PageId)));
                     break;
 
                 case SearchTarget.BaseGlobalRecordId:
                     var idColumn = RecordSqlBuilder.Require(schema.GlobalRecordId);
                     var idReference = BaseReference(idColumn);
-                    resolved.Add(new ResolvedCondition(condition, idReference, idReference, idColumn.Metadata));
+                    resolved.Add(new ResolvedCondition(condition, idReference, idReference, idColumn.Metadata, null));
                     break;
 
                 case SearchTarget.BaseRecStatus:
                     var statusColumn = RecordSqlBuilder.Require(schema.RecStatus);
                     var statusReference = BaseReference(statusColumn);
-                    resolved.Add(
-                        new ResolvedCondition(condition, statusReference, statusReference, statusColumn.Metadata));
+                    resolved.Add(new ResolvedCondition(
+                        condition, statusReference, statusReference, statusColumn.Metadata, null));
                     break;
 
                 default:
@@ -753,11 +1012,13 @@ internal static class SearchSqlBuilder
     }
 
     // One condition in packed form: one IS NULL term for its IS NULL alternatives, then, for each operator and scalar
-    // parameter type in the order the alternatives first use them, an EXISTS over the packed list of their values.
-    private static void AppendPackedAlternatives(
+    // parameter type in the order the alternatives first use them, an EXISTS over the packed list of their values. Its
+    // long patterns are left to its program. Returns whether it wrote a term.
+    private static bool AppendPackedAlternatives(
         StringBuilder sql,
         ResolvedCondition condition,
-        PositionalParameters parameters)
+        PositionalParameters parameters,
+        int nativeLikeLimit)
     {
         var matchesNull = false;
         var groups = new List<PackedGroup>();
@@ -766,6 +1027,11 @@ internal static class SearchSqlBuilder
             if (alternative.Operator == SearchOperator.IsNull)
             {
                 matchesNull = true;
+                continue;
+            }
+
+            if (IsLongPattern(alternative, nativeLikeLimit))
+            {
                 continue;
             }
 
@@ -805,6 +1071,8 @@ internal static class SearchSqlBuilder
             sql.Append(')');
             separator = " OR ";
         }
+
+        return separator.Length > 0;
     }
 
     // The derived table [d] of a packed list's decoded elements, one row each, the value named [v]:
@@ -835,6 +1103,23 @@ internal static class SearchSqlBuilder
         var tokenEnd = string.Concat(
             "CAST(SUBSTRING(", name, ", ", afterHeader, " + ", width, " * [a].[i], ", width, ") AS int)");
 
+        sql.Append("(SELECT TOP (").Append(PackedFenceRows).Append(") ").Append(decoder)
+            .Append(" AS [v] FROM ");
+        AppendDigitIndex(sql, count);
+        sql.Append(" CROSS APPLY (VALUES (CASE WHEN [a].[i] < ").Append(elementCount)
+            .Append(" THEN SUBSTRING(").Append(name).Append(", ").Append(afterHeader).Append(" + ").Append(width)
+            .Append(" * ").Append(elementCount).Append(" + ").Append(tokenStart).Append(", ").Append(tokenEnd)
+            .Append(" - ").Append(tokenStart).Append(") END)) AS [e]([t]) WHERE [a].[i] < ").Append(elementCount)
+            .Append(" ORDER BY [v]) AS [d]");
+    }
+
+    // The derived table [a] that numbers the indexes 0 to 10^k - 1 in [a].[i], with the fewest k digit tables whose
+    // product reaches count:
+    //   (SELECT [r0].[g] + 10 * [r1].[g] + ... AS [i] FROM digits AS [r0]([g]) CROSS JOIN ...) AS [a]
+    // The caller keeps the indexes below its count, which it reads from its parameter, so the text depends on the
+    // count only through its number of digits.
+    private static void AppendDigitIndex(StringBuilder sql, long count)
+    {
         // A .NET list's count needs at most ten digit tables, and a list long enough to need a tenth would have a
         // header longer than any string, so the index sum stays within int.
         var tables = 1;
@@ -843,8 +1128,7 @@ internal static class SearchSqlBuilder
             tables++;
         }
 
-        sql.Append("(SELECT TOP (").Append(PackedFenceRows).Append(") ").Append(decoder)
-            .Append(" AS [v] FROM (SELECT ");
+        sql.Append("(SELECT ");
         var multiplier = 1L;
         for (var table = 0; table < tables; table++)
         {
@@ -864,11 +1148,7 @@ internal static class SearchSqlBuilder
                 .Append(" AS [r").Append(table.ToString(CultureInfo.InvariantCulture)).Append("]([g])");
         }
 
-        sql.Append(") AS [a] CROSS APPLY (VALUES (CASE WHEN [a].[i] < ").Append(elementCount)
-            .Append(" THEN SUBSTRING(").Append(name).Append(", ").Append(afterHeader).Append(" + ").Append(width)
-            .Append(" * ").Append(elementCount).Append(" + ").Append(tokenStart).Append(", ").Append(tokenEnd)
-            .Append(" - ").Append(tokenStart).Append(") END)) AS [e]([t]) WHERE [a].[i] < ").Append(elementCount)
-            .Append(" ORDER BY [v]) AS [d]");
+        sql.Append(") AS [a]");
     }
 
     // An operator's predicate on a value expression, a parameter name or a packed element's decoding: a comparison on
@@ -921,22 +1201,818 @@ internal static class SearchSqlBuilder
             name, condition.Condition.Target, condition.Condition.FieldType, condition.Column, value);
     }
 
-    // The alternatives the scalar path binds a parameter for: every one but IS NULL.
-    private static long CountBindingAlternatives(IReadOnlyList<ResolvedCondition> conditions)
+    // The parameters the scalar path binds for the conditions' values: one per alternative but IS NULL and the long
+    // patterns, and one program per condition that holds long patterns.
+    private static long CountBindingAlternatives(IReadOnlyList<ResolvedCondition> conditions, int nativeLikeLimit)
     {
         var count = 0L;
         foreach (var condition in conditions)
         {
+            var hasLongPatterns = false;
             foreach (var alternative in condition.Condition.Alternatives)
             {
-                if (alternative.Operator != SearchOperator.IsNull)
+                if (IsLongPattern(alternative, nativeLikeLimit))
+                {
+                    hasLongPatterns = true;
+                }
+                else if (alternative.Operator != SearchOperator.IsNull)
                 {
                     count++;
                 }
             }
+
+            if (hasLongPatterns)
+            {
+                count++;
+            }
         }
 
         return count;
+    }
+
+    // Whether an alternative is a long pattern: a LIKE whose text is longer than the native limit, which its
+    // condition's program evaluates instead of LIKE.
+    private static bool IsLongPattern(SearchAlternative alternative, int nativeLikeLimit) =>
+        alternative is { Operator: SearchOperator.Like, Value: { } pattern }
+        && pattern.TryGetText(out var text)
+        && text.Length > nativeLikeLimit;
+
+    private static void CheckNativeLikeLimit(int nativeLikeLimit)
+    {
+        if (nativeLikeLimit < 0 || nativeLikeLimit > RecordQueryRules.MaxLikePatternLength)
+        {
+            throw new ArgumentOutOfRangeException(nameof(nativeLikeLimit), LikeLimitMessage);
+        }
+    }
+
+    // The fixed name of the program CTE of the condition, or of the grid filter, at index.
+    private static string LongPatternName(int index) =>
+        string.Concat("[x", index.ToString(CultureInfo.InvariantCulture), "]");
+
+    // The program of a condition's long patterns, in their order, or null when it holds none. Each value is first built
+    // as the scalar parameter the native path would bind, so it is checked the same way.
+    private static LongPatternProgram? CompileConditionPatterns(ResolvedCondition condition, int nativeLikeLimit)
+    {
+        List<List<LikeRecord>>? patterns = null;
+        foreach (var alternative in condition.Condition.Alternatives)
+        {
+            if (IsLongPattern(alternative, nativeLikeLimit))
+            {
+                var scalar = ToScalarParameter(condition, alternative, PackedValueName);
+                (patterns ??= []).Add(CompileLongPattern((string)scalar.Value, nativeLikeLimit));
+            }
+        }
+
+        return patterns is null ? null : AssembleProgram(patterns);
+    }
+
+    // The program of the grid filter past the native limit: the filter as one literal run between two runs of '%',
+    // a middle segment of one run step, found by a seek for its prefixes, or by a scan where none fits PATINDEX.
+    // The run is compared with '=', which reads no pattern character, and its prefixes are written with %, _ and [ as
+    // the one-member sets [%], [_] and [[], since PATINDEX takes no ESCAPE clause, so it matches what the contains
+    // pattern with its ESCAPE clause matches.
+    private static LongPatternProgram CompileContainsProgram(string filter)
+    {
+        var records = new List<LikeRecord>();
+        var seek = AppendRunSeek(records, string.Empty, filter);
+        records.Add(new LikeRecord(RunStep, 0, seek, LikeMeasure.Of(filter), 0, false, 0, filter));
+        LinkInstructions(records);
+        return AssembleProgram([records]);
+    }
+
+    // The program of the patterns: one entry record per pattern, at the pattern's index, naming its first instruction,
+    // then each pattern's records in order, every Next and Fail made an index into the whole program. As ASCII text: the
+    // pattern count and the record count, then one record of LongPatternFieldCount fields per record, each
+    // PackedNumberWidth digits, then the hexadecimal of the records' texts.
+    private static LongPatternProgram AssembleProgram(List<List<LikeRecord>> patterns)
+    {
+        var entries = new List<LikeRecord>(patterns.Count);
+        var records = new List<LikeRecord>();
+        foreach (var pattern in patterns)
+        {
+            var first = patterns.Count + records.Count;
+            entries.Add(new LikeRecord(EntryRecord, pattern.Count > 0 ? first : -1, -1, default, 0, false, 0, string.Empty));
+            foreach (var record in pattern)
+            {
+                records.Add(record with
+                {
+                    Next = record.Next < 0 ? record.Next : record.Next + first,
+                    Fail = record.Fail < 0 ? record.Fail : record.Fail + first,
+                });
+            }
+        }
+
+        var all = entries.Concat(records).ToArray();
+        var text = new StringBuilder(LongPatternHeaderWidth + (all.Length * LongPatternRecordWidth));
+        var texts = new StringBuilder();
+        AppendNumber(text, patterns.Count);
+        AppendNumber(text, all.Length);
+        var maxItems = 0;
+        foreach (var record in all)
+        {
+            texts.Append(record.Text);
+            maxItems = Math.Max(maxItems, record.Items);
+            AppendNumber(text, record.Kind);
+            AppendNumber(text, record.Next + 1L);
+            AppendNumber(text, record.Fail + 1L);
+            AppendNumber(text, record.Count.CodeUnits);
+            AppendNumber(text, record.Count.Characters);
+            AppendNumber(text, record.Items);
+            AppendNumber(text, record.Negated ? 1 : 0);
+            AppendNumber(text, record.Cut);
+            AppendNumber(text, texts.Length);
+        }
+
+        text.Append(ToUtf16LittleEndianHex(texts.ToString()));
+        return new LongPatternProgram(text.ToString(), patterns.Count, maxItems);
+    }
+
+    private static void AppendNumber(StringBuilder text, long number) =>
+        text.Append(number.ToString(PackedNumberFormat, CultureInfo.InvariantCulture));
+
+    // One pattern's records, whose Next and Fail are indexes into them; Next -1 means the pattern matched and Fail -1
+    // that the value fails. The pattern's atoms, each a whole literal run, '_' or set, split at each run of '%' into
+    // segments, a run of '%' giving empty segments that are dropped between the first and the last:
+    //   - with no '%', the one segment runs from the start of the value, and the rest of the value must be empty or
+    //     ignorable (an end step);
+    //   - otherwise the first segment runs from the start; each middle segment, in order, is placed at its leftmost
+    //     match after the previous one, a seek for its candidates followed by its steps, a failed step retrying the
+    //     seek after the candidate; and the last is one tail window matched against the whole rest with LIKE '%' +
+    //     window where it fits; or else, when its every literal run fits a window, its steps matched backwards from
+    //     the end of the value, each at its latest start, within the rest; or else it is placed as a middle one and
+    //     followed by an end step.
+    // A literal run is never cut between two steps, because a collation expansion such as Æ for AE never straddles a
+    // literal and a wildcard but can straddle a cut in a literal run. Leftmost placement is exact, because the matches
+    // a step can make at one position differ only by characters the collation ignores, and latest-start placement
+    // backwards from the end is exact for the same reason; a failed middle step retries its seek, while a failed
+    // backward step fails the value, since a later placement of the segments before it only shortens the rest.
+    private static List<LikeRecord> CompileLongPattern(string pattern, int nativeLikeLimit)
+    {
+        var segments = Segments(pattern);
+        var records = new List<LikeRecord>();
+        if (segments.Count == 1)
+        {
+            AppendChain(records, pattern, segments[0], -1, nativeLikeLimit);
+            records.Add(new LikeRecord(EndStep, 0, -1, default, 0, false, 0, string.Empty));
+            LinkInstructions(records);
+            return records;
+        }
+
+        AppendChain(records, pattern, segments[0], -1, nativeLikeLimit);
+        foreach (var segment in segments.Skip(1).Take(segments.Count - 2).Where(segment => segment.Count > 0))
+        {
+            var seek = AppendSeek(records, pattern, segment);
+            AppendChain(records, pattern, segment, seek, nativeLikeLimit);
+        }
+
+        var tail = segments[^1];
+        if (tail.Count > 0)
+        {
+            var tailText = Text(pattern, tail[0], tail[^1]);
+            var limit = nativeLikeLimit - SeekWrapping;
+            if (tailText.Length <= nativeLikeLimit - TailWrapping)
+            {
+                records.Add(new LikeRecord(TailStep, 0, -1, default, 0, false, 0, tailText));
+            }
+            else if (tail.All(atom => atom.Kind != LikeAtomKind.Run || FitsWindow(pattern, atom, limit)))
+            {
+                records.Add(new LikeRecord(EndAnchorStep, 0, -1, default, 0, false, 0, string.Empty));
+                AppendBackChain(records, pattern, tail, nativeLikeLimit);
+            }
+            else
+            {
+                var seek = AppendSeek(records, pattern, tail);
+                AppendChain(records, pattern, tail, seek, nativeLikeLimit);
+                records.Add(new LikeRecord(EndStep, 0, seek, default, 0, false, 0, string.Empty));
+            }
+        }
+
+        LinkInstructions(records);
+        return records;
+    }
+
+    // Sets each instruction's Next to the instruction after it, past the data records that follow it, and the last
+    // one's to -1, the pattern matched.
+    private static void LinkInstructions(List<LikeRecord> records)
+    {
+        var next = -1;
+        for (var index = records.Count - 1; index >= 0; index--)
+        {
+            if (records[index].Kind != DataRecord)
+            {
+                records[index] = records[index] with { Next = next };
+                next = index;
+            }
+        }
+    }
+
+    // The pattern's atoms, split at each run of '%' into segments: consecutive literal characters make one run, and a
+    // '_' or a set is an atom of its own that matches one character.
+    private static List<List<LikeAtom>> Segments(string pattern)
+    {
+        var segments = new List<List<LikeAtom>> { new() };
+        foreach (var element in LikePatternSyntax.Tokenize(pattern))
+        {
+            var segment = segments[^1];
+            switch (element.Kind)
+            {
+                case LikePatternElementKind.AnyRun:
+                    segments.Add([]);
+                    break;
+
+                case LikePatternElementKind.Literal when segment.Count > 0 && segment[^1].Kind == LikeAtomKind.Run:
+                    var run = segment[^1];
+                    segment[^1] = run with
+                    {
+                        Length = run.Length + element.Length,
+                        Count = run.Count + LikeMeasure.Of(element),
+                    };
+                    break;
+
+                case LikePatternElementKind.Literal:
+                    segment.Add(new LikeAtom(LikeAtomKind.Run, element.Start, element.Length, LikeMeasure.Of(element)));
+                    break;
+
+                case LikePatternElementKind.AnyCharacter:
+                    segment.Add(new LikeAtom(LikeAtomKind.AnyCharacter, element.Start, element.Length, LikeMeasure.One));
+                    break;
+
+                default:
+                    segment.Add(new LikeAtom(LikeAtomKind.Set, element.Start, element.Length, LikeMeasure.One));
+                    break;
+            }
+        }
+
+        return segments;
+    }
+
+    // The steps of a segment, appended in order, each failing to fail: windows of consecutive whole atoms whose text
+    // fits the window limit, two less than the native limit; a literal run longer than that, as a run step compared
+    // with '='; and a set longer than that, or unclosed, whose meaning a '%' appended to it would change, as a
+    // one-character window followed by its pieces. A '_' always makes a window, alone where none fits.
+    private static void AppendChain(
+        List<LikeRecord> records,
+        string pattern,
+        List<LikeAtom> atoms,
+        int fail,
+        int nativeLikeLimit)
+    {
+        var limit = nativeLikeLimit - SeekWrapping;
+        var index = 0;
+        while (index < atoms.Count)
+        {
+            var atom = atoms[index];
+            if (!FitsWindow(pattern, atom, limit))
+            {
+                switch (atom.Kind)
+                {
+                    case LikeAtomKind.Run:
+                        records.Add(new LikeRecord(
+                            RunStep, 0, fail, atom.Count, 0, false, 0, Text(pattern, atom, atom)));
+                        break;
+
+                    case LikeAtomKind.Set:
+                        AppendCharacterSet(records, pattern, atom, WindowStep, fail, nativeLikeLimit);
+                        break;
+
+                    default:
+                        records.Add(new LikeRecord(WindowStep, 0, fail, atom.Count, 0, false, 0, "_"));
+                        break;
+                }
+
+                index++;
+                continue;
+            }
+
+            var end = WindowEnd(pattern, atoms, index, limit);
+            records.Add(new LikeRecord(
+                WindowStep,
+                0,
+                fail,
+                Measure(atoms, index, end),
+                0,
+                false,
+                0,
+                Text(pattern, atoms[index], atoms[end - 1])));
+            index = end;
+        }
+    }
+
+    // The steps of a tail whose every literal run fits a window, appended in the order they run, from its last atom
+    // back to its first, each failing the value: windows of consecutive whole atoms that fit the window limit, taken
+    // from the right, and a set too long for a window, or unclosed, or a '_' where no window fits, as a one-character
+    // back window, a set's followed by its pieces.
+    private static void AppendBackChain(
+        List<LikeRecord> records,
+        string pattern,
+        List<LikeAtom> atoms,
+        int nativeLikeLimit)
+    {
+        var limit = nativeLikeLimit - SeekWrapping;
+        var end = atoms.Count;
+        while (end > 0)
+        {
+            var atom = atoms[end - 1];
+            if (!FitsWindow(pattern, atom, limit))
+            {
+                if (atom.Kind == LikeAtomKind.Set)
+                {
+                    AppendCharacterSet(records, pattern, atom, BackWindowStep, -1, nativeLikeLimit);
+                }
+                else
+                {
+                    records.Add(new LikeRecord(BackWindowStep, 0, -1, atom.Count, 0, false, 0, "_"));
+                }
+
+                end--;
+                continue;
+            }
+
+            var start = end - 1;
+            var length = atom.Length;
+            while (start > 0
+                   && FitsWindow(pattern, atoms[start - 1], limit)
+                   && length + atoms[start - 1].Length <= limit)
+            {
+                start--;
+                length += atoms[start].Length;
+            }
+
+            records.Add(new LikeRecord(
+                BackWindowStep,
+                0,
+                -1,
+                Measure(atoms, start, end),
+                0,
+                false,
+                0,
+                Text(pattern, atoms[start], atoms[end - 1])));
+            end = start;
+        }
+    }
+
+    // The character count of the atoms from first to end, exclusive.
+    private static LikeMeasure Measure(List<LikeAtom> atoms, int first, int end) =>
+        atoms.Skip(first).Take(end - first).Aggregate(default(LikeMeasure), (sum, item) => sum + item.Count);
+
+    // The end, exclusive, of the window that starts at the atom at first, which fits the limit: it takes each next
+    // atom that fits a window while the window's text stays within the limit.
+    private static int WindowEnd(string pattern, List<LikeAtom> atoms, int first, int limit)
+    {
+        var end = first + 1;
+        var length = atoms[first].Length;
+        while (end < atoms.Count && FitsWindow(pattern, atoms[end], limit) && length + atoms[end].Length <= limit)
+        {
+            length += atoms[end].Length;
+            end++;
+        }
+
+        return end;
+    }
+
+    // Whether the atom can be part of a window of the limit: its text fits, and it is not an unclosed set, which runs
+    // to the end of the pattern and whose meaning a '%' after it would change.
+    private static bool FitsWindow(string pattern, LikeAtom atom, int limit) =>
+        atom.Length <= limit && !(atom.Kind == LikeAtomKind.Set && !IsClosedSet(pattern, atom));
+
+    private static bool IsClosedSet(string pattern, LikeAtom atom) =>
+        atom.Length >= 2 && pattern[atom.Start + atom.Length - 1] == ']';
+
+    // A set too long for a window, or unclosed: a window '_' of the kind given, forward or back, which finds the one
+    // character, followed by data records holding the pieces it must be in, or for a negated set be in none of. A
+    // closed set is cut into pieces of at most the window limit by LikePatternSyntax.TrySplitSet, or where it has no
+    // such cut, of at most SQL Server's pattern limit less two, the rule the search-criteria parser applies; one it
+    // cannot cut, or an unclosed one, is one piece written as it is, so that SQL Server reads it as it reads the whole
+    // pattern, while it fits SQL Server's pattern limit; a longer one, which the parser rejects with a 400, is rejected
+    // here.
+    private static void AppendCharacterSet(
+        List<LikeRecord> records,
+        string pattern,
+        LikeAtom atom,
+        int kind,
+        int fail,
+        int nativeLikeLimit)
+    {
+        var element = new LikePatternElement(LikePatternElementKind.Set, atom.Start, atom.Length);
+        var windowLimit = nativeLikeLimit - SeekWrapping;
+        if (!LikePatternSyntax.TrySplitSet(pattern, element, windowLimit, out var negated, out var pieces)
+            && !LikePatternSyntax.TrySplitSet(
+                pattern, element, RecordQueryRules.MaxLikePatternLength - SeekWrapping, out negated, out pieces))
+        {
+            if (atom.Length > RecordQueryRules.MaxLikePatternLength)
+            {
+                throw new ArgumentException(SetTooLongMessage, nameof(pattern));
+            }
+
+            negated = false;
+            pieces = [Text(pattern, atom, atom)];
+        }
+
+        records.Add(new LikeRecord(kind, 0, fail, LikeMeasure.One, pieces.Count, negated, 0, "_"));
+        foreach (var piece in pieces)
+        {
+            records.Add(new LikeRecord(DataRecord, 0, -1, default, 0, false, 0, piece));
+        }
+    }
+
+    // The seek of a segment, appended, and its index. Any position the segment can match at is a hit of the seek, so
+    // the seek finds every candidate in order. The segment's leading whole atoms whose text fits PATINDEX('%' + text +
+    // '%') within SQL Server's pattern limit, the lead, are sought with that PATINDEX, since whatever the segment
+    // matches starts with what they match; a literal run after the lead, too long to join it, by the leftmost hit of
+    // the lead followed by each of the run's prefixes (AppendRunSeek); a first literal run too long for PATINDEX, by
+    // its prefixes alone; and a first set too long for PATINDEX, or an unclosed set, whose meaning a '%' after it would
+    // change, by a scan of every position. A seek's patterns are bounded by SQL Server's pattern limit rather than by
+    // the native limit, which only decides the steps, so a forced low limit still seeks.
+    private static int AppendSeek(List<LikeRecord> records, string pattern, List<LikeAtom> atoms)
+    {
+        var limit = RecordQueryRules.MaxLikePatternLength - SeekWrapping;
+        var first = atoms[0];
+        if (FitsWindow(pattern, first, limit))
+        {
+            var end = WindowEnd(pattern, atoms, 0, limit);
+            var lead = Text(pattern, first, atoms[end - 1]);
+            if (end < atoms.Count && atoms[end].Kind == LikeAtomKind.Run)
+            {
+                return AppendRunSeek(records, lead, Text(pattern, atoms[end], atoms[end]));
+            }
+
+            records.Add(new LikeRecord(SeekStep, 0, -1, default, 0, false, 0, lead));
+            return records.Count - 1;
+        }
+
+        if (first.Kind == LikeAtomKind.Run)
+        {
+            return AppendRunSeek(records, string.Empty, Text(pattern, first, first));
+        }
+
+        records.Add(new LikeRecord(ScanStep, 0, -1, default, 0, false, 0, string.Empty));
+        return records.Count - 1;
+    }
+
+    // The seek of a lead, written as LIKE text, followed by a literal run, appended, and its index: the lead followed
+    // by each of the run's prefixes ending at text-element boundaries, the longest whose LIKE form fits PATINDEX('%' +
+    // text + '%') within SQL Server's pattern limit and up to RunCuts - 1 before it, each one text element shorter, as
+    // one seek run step holding the longest and one data record per prefix holding its length with the lead's; the
+    // step's candidate is the leftmost hit of any of them. The run's LIKE form writes %, _ and [ as the one-member sets
+    // [%], [_] and [[], which only the grid filter holds, since a pattern's literal run has none. With no prefix that
+    // fits, the seek is the lead's alone, or with no lead a scan.
+    private static int AppendRunSeek(List<LikeRecord> records, string lead, string run)
+    {
+        var limit = RecordQueryRules.MaxLikePatternLength - SeekWrapping;
+        var cuts = new List<long>();
+        var likeLength = (long)lead.Length;
+        var index = 0;
+        while (index < run.Length)
+        {
+            var end = index + StringInfo.GetNextTextElementLength(run, index);
+            for (; index < end; index++)
+            {
+                likeLength += run[index] is '%' or '_' or '[' ? 3 : 1;
+            }
+
+            if (likeLength > limit)
+            {
+                break;
+            }
+
+            cuts.Add(likeLength);
+        }
+
+        var seek = records.Count;
+        if (cuts.Count == 0)
+        {
+            records.Add(lead.Length > 0
+                ? new LikeRecord(SeekStep, 0, -1, default, 0, false, 0, lead)
+                : new LikeRecord(ScanStep, 0, -1, default, 0, false, 0, string.Empty));
+            return seek;
+        }
+
+        // A whole run that fits, which the loop measured to its end, is its one cut: a match of the run ends where the
+        // run ends, so no character can straddle its end, and a shorter prefix would only add candidates.
+        cuts.Reverse();
+        cuts = likeLength <= limit ? [cuts[0]] : cuts.Take(RunCuts).ToList();
+        var longest = new StringBuilder(lead, (int)cuts[0]);
+        foreach (var character in run)
+        {
+            if (longest.Length >= cuts[0])
+            {
+                break;
+            }
+
+            longest.Append(character is '%' or '_' or '['
+                ? string.Concat("[", character.ToString(), "]")
+                : character.ToString());
+        }
+
+        records.Add(new LikeRecord(SeekRunStep, 0, -1, default, cuts.Count, false, 0, longest.ToString()));
+        foreach (var cut in cuts)
+        {
+            records.Add(new LikeRecord(DataRecord, 0, -1, default, 0, false, cut, string.Empty));
+        }
+
+        return seek;
+    }
+
+    // The pattern's text from the first atom through the last.
+    private static string Text(string pattern, LikeAtom first, LikeAtom last) =>
+        pattern[first.Start..(last.Start + last.Length)];
+
+    // [name] ([k], [v], [l], [z], [st]) AS (anchor UNION ALL step): the recursive CTE that runs a long-pattern program
+    // over the values the anchor reads from source, one value expression per row and column. A row is one value at one
+    // state: its key [k], the base row's GlobalRecordId; the value [v]; its length in characters [l]; [z] 1 when its
+    // collation counts a surrogate pair as one character; and the state [st], six bigints packed as binary(48): the
+    // record [s] to run, -1 once the pattern matched and -2 once the value failed; the step's phase [p]; the end [e] of
+    // the text matched so far; the candidate [c] where the current segment started, or in a tail matched backwards
+    // the start of the text it matched so far; and the phase's two numbers [t] and [h]. The anchor starts each
+    // non-NULL value at the first instruction of every pattern. Each level unpacks a
+    // row's state as [q], decodes its record from the parameter by index as [f], so neither the text nor the parameter
+    // count grows with the program, and computes the next state as one expression, [o], so that no comparison is
+    // evaluated twice; the record texts are read from the text area, decoded from hexadecimal once, an expression of
+    // the parameter alone. Every step but a run step reads its text as [g].[w], an nvarchar(4000), which SQL Server's
+    // pattern limit bounds it to, so its LIKE and PATINDEX patterns, a seek run's cuts included, are no large-object
+    // values. A row whose state is -1 or -2 is not run again. All comparisons are under the value's
+    // collation, which the decoded texts, coercible-default, never override. With boundary(j) meaning that a character
+    // of the collation ends before position j (j beyond either end, the two code units at j - 1 and j not one '_',
+    // either of them ignorable), a step at end e on the rest of r characters:
+    //   1 window W of n characters, a '_' when its pieces follow: when SUBSTRING(v, e + 1, n) LIKE W and boundary(e + n
+    //     + 1), it matches n; else when the rest LIKE W + '%', it bisects for the smallest k with SUBSTRING(v, e + 1, k)
+    //     LIKE W + '%', which is monotone in k, extends k to a boundary, and matches k when SUBSTRING(v, e + 1, k) LIKE
+    //     W; a set also needs its one character in a piece, or for a negated set in none;
+    //   2 run R of n characters: it matches n when SUBSTRING(v, e + 1, n) + 'x' = R + 'x' and boundary(e + n + 1); else
+    //     it bisects for the smallest k with SUBSTRING(v, e + 1, k) not below R, monotone too, then scans the k that
+    //     compare equal, '=' ignoring trailing blanks, for the first equal with the 'x' sentinel at a boundary;
+    //   3 seek W and 4 seek run: from e + 1, once it is a boundary, the candidate c is e + PATINDEX('%' + W + '%') of
+    //     the rest, or for a run the leftmost such hit of its prefixes; a candidate at a boundary starts the segment's
+    //     steps at c - 1, another one, or the next boundary, is sought again;
+    //   5 scan: the candidate is e + 1, once it is a boundary;
+    //   6 tail W: the rest LIKE '%' + W;
+    //   7 end: the rest LIKE N'', empty or ignorable;
+    //   9 end anchor: c becomes the value's length, so the tail's back windows start at its end;
+    //   10 back window W of n characters, a '_' when its pieces follow, on the a = c - e characters between the text
+    //     matched forwards and the text matched backwards: when n <= a, SUBSTRING(v, c - n + 1, n) LIKE W and
+    //     boundary(c - n + 1), it matches n; else when SUBSTRING(v, e + 1, a) LIKE '%' + W, it bisects for the
+    //     smallest k with SUBSTRING(v, c - k + 1, k) LIKE '%' + W, monotone in k as well, extends k leftwards to a
+    //     boundary, and matches k when SUBSTRING(v, c - k + 1, k) LIKE W, moving c to c - k; a set's character must be
+    //     in a piece or for a negated set in none. The text between e and c is the tail's leading '%'.
+    // A match moves e, or c for a back window, and runs the next instruction; a failure in a middle segment or a last
+    // one matched forwards returns to its seek with e at the candidate, and elsewhere fails the value. Every row
+    // advances its state, its e or its c, so each row ends. Every SUBSTRING length is a decoded count, a bisection
+    // bound, a remaining length clamped at 0, c - e, 1 or 2, so none raises error 537.
+    private static void AppendLongPatternProgram(
+        StringBuilder sql,
+        string name,
+        string key,
+        string source,
+        List<string> values,
+        string program,
+        LongPatternProgram compiled)
+    {
+        var width = PackedNumberWidth.ToString(CultureInfo.InvariantCulture);
+        var record = LongPatternRecordWidth.ToString(CultureInfo.InvariantCulture);
+
+        // 1-based positions: the pattern count at 1, the record count at W + 1, field f of record r at
+        // 2W + 1 + R * r + W * f, and the text area after the records.
+        string Field(int field, string index) => string.Concat(
+            "CAST(SUBSTRING(", program, ", ",
+            (LongPatternHeaderWidth + 1 + (field * PackedNumberWidth)).ToString(CultureInfo.InvariantCulture),
+            " + ", record, " * (", index, "), ", width, ") AS bigint)");
+        var area = string.Concat(
+            "CONVERT(varbinary(max), SUBSTRING(", program, ", ",
+            (LongPatternHeaderWidth + 1).ToString(CultureInfo.InvariantCulture), " + ", record, " * CAST(SUBSTRING(",
+            program, ", ", (PackedNumberWidth + 1).ToString(CultureInfo.InvariantCulture), ", ", width,
+            ") AS bigint), 2147483647), 2)");
+        string TextStart(string index) =>
+            string.Concat("CASE WHEN ", index, " > 0 THEN ", Field(TextEndField, index + " - 1"), " ELSE 0 END");
+        string TextAt(string index, string length) => string.Concat(
+            "CAST(SUBSTRING(", area, ", 2 * (", TextStart(index), ") + 1, 2 * (", length, ")) AS nvarchar(max))");
+        string RecordText(string index) =>
+            TextAt(index, string.Concat(Field(TextEndField, index), " - (", TextStart(index), ")"));
+
+        sql.Append(name).Append(" ([k], [v], [l], [z], [st]) AS (SELECT ")
+            .Append(key).Append(", [u].[v], [h].[l], [h].[z], ")
+            .Append(Pack(Field(NextField, "[a].[i]") + " - 1", "0", "0", "0", "0", "0")).Append(" FROM ")
+            .Append(source).Append(" CROSS APPLY (VALUES ");
+        for (var index = 0; index < values.Count; index++)
+        {
+            sql.Append(index == 0 ? "(" : ", (").Append(values[index]).Append(')');
+        }
+
+        sql.Append(") AS [u]([v]) CROSS APPLY (VALUES (CAST(LEN([u].[v] + N'.') - 1 AS bigint), ")
+            .Append("CASE WHEN LEN(SUBSTRING([u].[v], 1, 0) + NCHAR(55357) + NCHAR(56832)) = 1 THEN 1 ELSE 0 END))")
+            .Append(" AS [h]([l], [z]) CROSS JOIN ");
+        AppendDigitIndex(sql, compiled.PatternCount);
+        sql.Append(" WHERE [u].[v] IS NOT NULL AND [a].[i] < CAST(SUBSTRING(").Append(program).Append(", 1, ")
+            .Append(width).Append(") AS int)");
+
+        sql.Append(" UNION ALL SELECT [x].[k], [x].[v], [x].[l], [x].[z], [o].[st] FROM ").Append(name)
+            .Append(" AS [x] CROSS APPLY (VALUES (");
+        for (var part = 0; part < 6; part++)
+        {
+            sql.Append(part == 0 ? string.Empty : ", ").Append("CAST(SUBSTRING([x].[st], ")
+                .Append((1 + (8 * part)).ToString(CultureInfo.InvariantCulture)).Append(", 8) AS bigint)");
+        }
+
+        sql.Append(")) AS [q]([s], [p], [e], [c], [t], [h]) CROSS APPLY (VALUES (")
+            .Append(Field(KindField, "[q].[s]")).Append(", ")
+            .Append(Field(NextField, "[q].[s]")).Append(" - 1, ")
+            .Append(Field(FailField, "[q].[s]")).Append(" - 1, CASE WHEN [x].[z] = 1 THEN ")
+            .Append(Field(CountField + 1, "[q].[s]")).Append(" ELSE ").Append(Field(CountField, "[q].[s]"))
+            .Append(" END, ").Append(Field(ItemsField, "[q].[s]")).Append(", ")
+            .Append(Field(NegatedField, "[q].[s]")).Append(", ").Append(RecordText("[q].[s]"))
+            .Append(", CASE WHEN [x].[l] > [q].[e] THEN [x].[l] - [q].[e] ELSE 0 END))")
+            .Append(" AS [f]([t], [nx], [fl], [n], [ic], [ng], [pt], [r]) CROSS APPLY (VALUES (CAST(SUBSTRING([f].[pt], 1, ")
+            .Append(RecordQueryRules.MaxLikePatternLength.ToString(CultureInfo.InvariantCulture))
+            .Append(") AS nvarchar(4000)))) AS [g]([w]) CROSS APPLY (VALUES (CASE [f].[t] WHEN ")
+            .Append(WindowStep.ToString(CultureInfo.InvariantCulture)).Append(" THEN ")
+            .Append(WindowOutcome(compiled.MaxItems, RecordText)).Append(" WHEN ")
+            .Append(RunStep.ToString(CultureInfo.InvariantCulture)).Append(" THEN ").Append(RunOutcome()).Append(" WHEN ")
+            .Append(SeekStep.ToString(CultureInfo.InvariantCulture)).Append(" THEN ")
+            .Append(SeekOutcome(string.Concat("PATINDEX(N'%' + [g].[w] + N'%', ", Rest, ")"))).Append(" WHEN ")
+            .Append(SeekRunStep.ToString(CultureInfo.InvariantCulture)).Append(" THEN ")
+            .Append(SeekOutcome(LeftmostCutHit(Field))).Append(" WHEN ")
+            .Append(ScanStep.ToString(CultureInfo.InvariantCulture)).Append(" THEN CASE WHEN [q].[e] > [x].[l] THEN ")
+            .Append(Ended).Append(" WHEN NOT ").Append(Boundary("[q].[e] + 1")).Append(" THEN ")
+            .Append(Stay("[q].[e] + 1")).Append(" ELSE ").Append(Found("[q].[e] + 1")).Append(" END WHEN ")
+            .Append(TailStep.ToString(CultureInfo.InvariantCulture)).Append(" THEN CASE WHEN ").Append(Rest)
+            .Append(" LIKE N'%' + [g].[w] THEN ").Append(Matched("[f].[r]")).Append(" ELSE ").Append(Failed)
+            .Append(" END WHEN ").Append(EndAnchorStep.ToString(CultureInfo.InvariantCulture)).Append(" THEN ")
+            .Append(Pack("[f].[nx]", "0", "[q].[e]", "[x].[l]", "0", "0")).Append(" WHEN ")
+            .Append(BackWindowStep.ToString(CultureInfo.InvariantCulture)).Append(" THEN ")
+            .Append(BackWindowOutcome(compiled.MaxItems, RecordText))
+            .Append(" ELSE CASE WHEN ").Append(Rest).Append(" LIKE N'' THEN ").Append(Matched("[f].[r]"))
+            .Append(" ELSE ").Append(Failed).Append(" END END)) AS [o]([st]) WHERE [q].[s] >= 0)");
+    }
+
+    // The next states a long-pattern step can give: failed, retrying the segment's seek from its candidate or failing
+    // the value; failed the value; matched count more characters, forwards or backwards, running the next instruction;
+    // bisecting; extending; staying at a seek or a scan with a new end; and a found candidate, which starts the
+    // segment's steps.
+    private static string Failed => Pack(
+        "CASE WHEN [f].[fl] >= 0 THEN [f].[fl] ELSE -2 END",
+        "0",
+        "CASE WHEN [f].[fl] >= 0 THEN [q].[c] ELSE [q].[e] END",
+        "[q].[c]",
+        "0",
+        "0");
+
+    private static string Ended => Pack("-2", "0", "[q].[e]", "[q].[c]", "0", "0");
+
+    private static string Matched(string count) =>
+        Pack("[f].[nx]", "0", string.Concat("[q].[e] + ", count), "[q].[c]", "0", "0");
+
+    private static string MatchedBack(string count) =>
+        Pack("[f].[nx]", "0", "[q].[e]", string.Concat("[q].[c] - ", count), "0", "0");
+
+    private static string Bisect(string low, string high) =>
+        Pack("[q].[s]", BisectPhase.ToString(CultureInfo.InvariantCulture), "[q].[e]", "[q].[c]", low, high);
+
+    private static string Extend(string count) =>
+        Pack("[q].[s]", ExtendPhase.ToString(CultureInfo.InvariantCulture), "[q].[e]", "[q].[c]", count, "0");
+
+    private static string Stay(string end) =>
+        Pack("[q].[s]", FreshPhase.ToString(CultureInfo.InvariantCulture), end, "[q].[c]", "0", "0");
+
+    private static string Found(string candidate) =>
+        Pack("[f].[nx]", "0", string.Concat("(", candidate, ") - 1"), candidate, "0", "0");
+
+    // The state the six numbers give, each a bigint of eight bytes.
+    private static string Pack(string record, string phase, string end, string candidate, string first, string second) =>
+        string.Concat(
+            "CAST(",
+            string.Join(
+                " + ",
+                new[] { record, phase, end, candidate, first, second }
+                    .Select(part => string.Concat("CAST(CAST(", part, " AS bigint) AS binary(8))"))),
+            " AS binary(48))");
+
+    // Whether a character of the value's collation ends before position j: beyond the value, at its start, where the
+    // code units at j - 1 and j are not one '_', or where either is ignorable, matching N''.
+    private static string Boundary(string position)
+    {
+        var j = string.Concat("(", position, ")");
+        return string.Concat(
+            "(", j, " > [x].[l] OR ", j, " <= 1 OR NOT (SUBSTRING([x].[v], ", j, " - 1, 2) LIKE N'_') OR SUBSTRING([x].[v], ",
+            j, ", 1) LIKE N'' OR SUBSTRING([x].[v], ", j, " - 1, 1) LIKE N'')");
+    }
+
+    // Whether the count characters of the value from start are in a piece of the step's set, or for a negated set in
+    // none; always true for a step with no pieces.
+    private static string Membership(int maxItems, Func<string, string> recordText, string start, string count)
+    {
+        if (maxItems == 0)
+        {
+            return "1 = 1";
+        }
+
+        var digits = new StringBuilder();
+        AppendDigitIndex(digits, maxItems);
+        return string.Concat(
+            "CASE WHEN [f].[ic] = 0 THEN 1 WHEN EXISTS (SELECT 1 FROM ", digits.ToString(),
+            " WHERE [a].[i] < [f].[ic] AND SUBSTRING([x].[v], ", start, ", ", count, ") LIKE ",
+            recordText("[q].[s] + 1 + [a].[i]"), ") THEN 1 - [f].[ng] ELSE [f].[ng] END = 1");
+    }
+
+    // The next state of a back window step, a '_' followed by its pieces for a set, on the text between the end [e] of
+    // the text matched forwards and the start [c] of the text matched backwards: the fast path of its own character
+    // count, then the bisection for the shortest end of that text that ends with what the window matches, the
+    // extension leftwards to a boundary and the final LIKE, with the set's membership.
+    private static string BackWindowOutcome(int maxItems, Func<string, string> recordText)
+    {
+        const string Span = "([q].[c] - [q].[e])";
+        static string Start(string count) => string.Concat("[q].[c] - ", count, " + 1");
+        return string.Concat(
+            "CASE WHEN [q].[p] = ", FreshPhase.ToString(CultureInfo.InvariantCulture), " THEN CASE WHEN [f].[n] <= ",
+            Span, " AND SUBSTRING([x].[v], ", Start("[f].[n]"), ", [f].[n]) LIKE [g].[w] AND ",
+            Boundary(Start("[f].[n]")), " THEN CASE WHEN ", Membership(maxItems, recordText, Start("[f].[n]"), "[f].[n]"),
+            " THEN ", MatchedBack("[f].[n]"), " ELSE ", Failed, " END WHEN SUBSTRING([x].[v], [q].[e] + 1, ", Span,
+            ") LIKE N'%' + [g].[w] THEN ", Bisect("0", Span), " ELSE ", Failed, " END WHEN [q].[p] = ",
+            BisectPhase.ToString(CultureInfo.InvariantCulture), " AND [q].[t] < [q].[h] THEN CASE WHEN SUBSTRING(",
+            "[x].[v], ", Start(Midpoint), ", ", Midpoint, ") LIKE N'%' + [g].[w] THEN ", Bisect("[q].[t]", Midpoint),
+            " ELSE ", Bisect(Midpoint + " + 1", "[q].[h]"), " END WHEN NOT ", Boundary(Start("[q].[t]")), " THEN ",
+            Extend("[q].[t] + 1"), " WHEN SUBSTRING([x].[v], ", Start("[q].[t]"), ", [q].[t]) LIKE [g].[w] THEN ",
+            "CASE WHEN ", Membership(maxItems, recordText, Start("[q].[t]"), "[q].[t]"), " THEN ",
+            MatchedBack("[q].[t]"), " ELSE ", Failed, " END ELSE ", Failed, " END");
+    }
+
+    // The next state of a window step, a '_' followed by its pieces for a set: the fast path of its own character
+    // count, then the bisection, the extension to a boundary and the final LIKE, with the set's membership.
+    private static string WindowOutcome(int maxItems, Func<string, string> recordText)
+    {
+        string Membership(string count) => SearchSqlBuilder.Membership(maxItems, recordText, "[q].[e] + 1", count);
+
+        return string.Concat(
+            "CASE WHEN [q].[p] = ", FreshPhase.ToString(CultureInfo.InvariantCulture), " THEN CASE WHEN [f].[n] <= [f].[r]",
+            " AND SUBSTRING([x].[v], [q].[e] + 1, [f].[n]) LIKE [g].[w] AND ", Boundary("[q].[e] + [f].[n] + 1"),
+            " THEN CASE WHEN ", Membership("[f].[n]"), " THEN ", Matched("[f].[n]"), " ELSE ", Failed, " END WHEN ", Rest,
+            " LIKE [g].[w] + N'%' THEN ", Bisect("0", "[f].[r]"), " ELSE ", Failed, " END WHEN [q].[p] = ",
+            BisectPhase.ToString(CultureInfo.InvariantCulture), " AND [q].[t] < [q].[h] THEN CASE WHEN SUBSTRING([x].[v],",
+            " [q].[e] + 1, ", Midpoint, ") LIKE [g].[w] + N'%' THEN ", Bisect("[q].[t]", Midpoint), " ELSE ",
+            Bisect(Midpoint + " + 1", "[q].[h]"), " END WHEN NOT ", Boundary("[q].[e] + [q].[t] + 1"), " THEN ",
+            Extend("[q].[t] + 1"), " WHEN SUBSTRING([x].[v], [q].[e] + 1, [q].[t]) LIKE [g].[w] THEN CASE WHEN ",
+            Membership("[q].[t]"), " THEN ", Matched("[q].[t]"), " ELSE ", Failed, " END ELSE ", Failed, " END");
+    }
+
+    // The next state of a run step: the fast path of its own character count, then the bisection for the first end
+    // not below the run, and the scan of the ends that compare equal.
+    private static string RunOutcome() => string.Concat(
+        "CASE WHEN [q].[p] = ", FreshPhase.ToString(CultureInfo.InvariantCulture), " THEN CASE WHEN [f].[n] <= [f].[r]",
+        " AND SUBSTRING([x].[v], [q].[e] + 1, [f].[n]) + N'x' = [f].[pt] + N'x' AND ", Boundary("[q].[e] + [f].[n] + 1"),
+        " THEN ", Matched("[f].[n]"), " WHEN ", Rest, " < [f].[pt] THEN ", Failed, " ELSE ", Bisect("0", "[f].[r]"),
+        " END WHEN [q].[p] = ", BisectPhase.ToString(CultureInfo.InvariantCulture), " AND [q].[t] < [q].[h] THEN CASE",
+        " WHEN SUBSTRING([x].[v], [q].[e] + 1, ", Midpoint, ") < [f].[pt] THEN ", Bisect(Midpoint + " + 1", "[q].[h]"),
+        " ELSE ", Bisect("[q].[t]", Midpoint), " END WHEN SUBSTRING([x].[v], [q].[e] + 1, [q].[t]) + N'x' = [f].[pt]",
+        " + N'x' AND ", Boundary("[q].[e] + [q].[t] + 1"), " THEN ", Matched("[q].[t]"),
+        " WHEN [q].[t] < [f].[r] AND NOT (SUBSTRING([x].[v], [q].[e] + 1, [q].[t] + 1) > [f].[pt]) THEN ",
+        Extend("[q].[t] + 1"), " ELSE ", Failed, " END");
+
+    // The next state of a seek whose hit, relative to the rest, is hit: past the value, fail it; not at a boundary,
+    // move to the next position; else hold the hit, which the next level applies, so the hit is computed once.
+    private static string SeekOutcome(string hit) => string.Concat(
+        "CASE WHEN [q].[p] = ", HitPhase.ToString(CultureInfo.InvariantCulture), " THEN CASE WHEN [q].[t] = 0 THEN ",
+        Ended, " WHEN ", Boundary("[q].[e] + [q].[t]"), " THEN ", Found("[q].[e] + [q].[t]"), " ELSE ",
+        Stay("[q].[e] + [q].[t]"), " END WHEN [q].[e] > [x].[l] THEN ", Ended, " WHEN NOT ", Boundary("[q].[e] + 1"),
+        " THEN ", Stay("[q].[e] + 1"), " ELSE ",
+        Pack("[q].[s]", HitPhase.ToString(CultureInfo.InvariantCulture), "[q].[e]", "[q].[c]", hit, "0"), " END");
+
+    // The leftmost PATINDEX hit in the rest of any of a seek run's cuts, the prefixes of its text of the lengths its
+    // data records hold, or 0: LEAST ignores the NULL of a cut that is not there or has no hit.
+    private static string LeftmostCutHit(Func<int, string, string> field)
+    {
+        var hits = new StringBuilder("ISNULL(LEAST(");
+        for (var cut = 0; cut < RunCuts; cut++)
+        {
+            var index = cut.ToString(CultureInfo.InvariantCulture);
+            hits.Append(cut == 0 ? string.Empty : ", ").Append("CASE WHEN [f].[ic] > ").Append(index)
+                .Append(" THEN NULLIF(PATINDEX(N'%' + SUBSTRING([g].[w], 1, ")
+                .Append(field(CutField, string.Concat("[q].[s] + 1 + ", index)))
+                .Append(") + N'%', ").Append(Rest).Append("), 0) END");
+        }
+
+        return hits.Append("), 0)").ToString();
+    }
+
+    // EXISTS (SELECT 1 FROM [name] AS [y] WHERE [y].[k] = b.[GlobalRecordId] AND the state of [y] is -1): the base row,
+    // whose key column reference is key, has a value the program matched.
+    private static void AppendLongPatternMatch(StringBuilder sql, string name, string key) =>
+        sql.Append("EXISTS (SELECT 1 FROM ").Append(name).Append(" AS [y] WHERE [y].[k] = ").Append(key)
+            .Append(" AND CAST(SUBSTRING([y].[st], 1, 8) AS bigint) = -1)");
+
+    // OPTION ([MAXRECURSION 0][, ][plan hints]): the recursion hint of a statement that runs a program, then the plan
+    // hints of a packed statement or of the list; nothing when the statement has neither.
+    private static void AppendQueryHints(StringBuilder sql, bool hasLongPatterns, string? planHints)
+    {
+        if (!hasLongPatterns && planHints is null)
+        {
+            return;
+        }
+
+        sql.Append(" OPTION (");
+        if (hasLongPatterns)
+        {
+            sql.Append(LongPatternHint).Append(planHints is null ? string.Empty : ", ");
+        }
+
+        sql.Append(planHints).Append(')');
     }
 
     // One packed group's list, and the decoding of one of its elements, which all share the group's type: the element
@@ -1092,17 +2168,25 @@ internal static class SearchSqlBuilder
     // filter is a case-insensitive "contains" over the grid columns that does not depend on the database collation:
     // each column is converted to text (a datetime as yyyy-mm-dd), and both sides are compared under one
     // case-insensitive collation, with the filter's pattern characters escaped by RecordQueryRules.ToContainsPattern.
-    // It has no legacy counterpart.
-    private static void AppendListSource(
+    // It has no legacy counterpart. A filter whose contains pattern is longer than the native limit is matched by the
+    // long-pattern program instead (CompileContainsProgram), over the same converted text of the same held joins, which
+    // carries the same collation into every comparison: the filter is one literal run between two runs of '%',
+    // compared with '=' under Latin1_General_100_CI_AS, so it keeps that collation's case-insensitive literal
+    // "contains", its expansions and ignorable characters included, and is found by PATINDEX of its prefixes with %, _
+    // and [ written as one-member sets, since PATINDEX takes no ESCAPE clause. The program's CTE, [x0], reads the base
+    // table and those page tables under HOLDLOCK and in the same order, so its reads belong to the list's one
+    // consistent read; it is returned for the caller to lead the statement with, and null when there is none.
+    private static string? AppendListSource(
         StringBuilder sql,
         FormSchema schema,
         IReadOnlyList<ProjectedColumn> columns,
         RecordListQuery query,
-        PositionalParameters parameters)
+        PositionalParameters parameters,
+        int nativeLikeLimit)
     {
-        sql.Append(" FROM ");
-        AppendBaseTable(sql, schema);
-        sql.Append(" WITH (HOLDLOCK)");
+        var from = new StringBuilder();
+        AppendBaseTable(from, schema);
+        from.Append(" WITH (HOLDLOCK)");
 
         var joined = new bool[schema.Pages.Count];
         foreach (var column in columns)
@@ -1114,51 +2198,78 @@ internal static class SearchSqlBuilder
         {
             if (joined[index] && schema.Pages[index].Table is { } table)
             {
-                AppendPageJoin(sql, schema, index, table, "LEFT JOIN", holdLock: true);
+                AppendPageJoin(from, schema, index, table, "LEFT JOIN", holdLock: true);
             }
         }
 
+        sql.Append(" FROM ").Append(from);
         var filtered = RecordSqlBuilder.AppendSelectedSetPredicate(
             sql, schema, query.IncludeDeleted, parameters, SelectedSetClause.Where);
         if (query.Filter is not { } filter)
         {
-            return;
+            return null;
         }
 
-        // Checked whatever the columns, so a filter over SQL Server's LIKE pattern limit always fails the same way.
         var containsPattern = RecordQueryRules.ToContainsPattern(filter);
-        if (containsPattern.Length > RecordQueryRules.MaxLikePatternLength)
-        {
-            throw new ArgumentException(FilterTooLongMessage, nameof(query));
-        }
-
         sql.Append(filtered ? " AND " : " WHERE ");
         if (columns.Count == 0)
         {
             // A filter with no column to search matches nothing.
             sql.Append("1 = 0");
-            return;
+            return null;
+        }
+
+        var texts = new List<string>(columns.Count);
+        foreach (var column in columns)
+        {
+            var text = new StringBuilder();
+            AppendGridFilterText(text, schema, column);
+            texts.Add(text.ToString());
+        }
+
+        if (containsPattern.Length > nativeLikeLimit)
+        {
+            var name = LongPatternName(0);
+            var key = BaseReference(RecordSqlBuilder.Require(schema.GlobalRecordId));
+            var compiled = CompileContainsProgram(filter);
+            var program = new StringBuilder();
+            AppendLongPatternProgram(
+                program,
+                name,
+                key,
+                from.ToString(),
+                texts,
+                parameters.Add(n => ColumnValueConverter.Text(n, compiled.Text)),
+                compiled);
+            AppendLongPatternMatch(sql, name, key);
+            return program.ToString();
         }
 
         // One parameter serves every column's term.
         var pattern = parameters.Add(n => ColumnValueConverter.Text(n, containsPattern));
         sql.Append('(');
-        for (var index = 0; index < columns.Count; index++)
+        for (var index = 0; index < texts.Count; index++)
         {
-            var column = columns[index];
-            sql.Append(index == 0 ? string.Empty : " OR ")
-                .Append("CONVERT(nvarchar(max), ").Append(RecordSqlBuilder.ColumnReference(schema, column));
-            if (column.Column.Metadata.Family == ColumnFamily.DateTime)
-            {
-                sql.Append(", ").Append(IsoDateStyle);
-            }
-
-            sql.Append(") COLLATE ").Append(ContainsCollation)
+            sql.Append(index == 0 ? string.Empty : " OR ").Append(texts[index])
                 .Append(" LIKE ").Append(pattern).Append(" COLLATE ").Append(ContainsCollation)
                 .Append(" ESCAPE '").Append(RecordQueryRules.ContainsPatternEscape).Append('\'');
         }
 
         sql.Append(')');
+        return null;
+    }
+
+    // CONVERT(nvarchar(max), p{i}.[col][, 23]) COLLATE Latin1_General_100_CI_AS: the text the grid filter searches in
+    // one grid column.
+    private static void AppendGridFilterText(StringBuilder sql, FormSchema schema, ProjectedColumn column)
+    {
+        sql.Append("CONVERT(nvarchar(max), ").Append(RecordSqlBuilder.ColumnReference(schema, column));
+        if (column.Column.Metadata.Family == ColumnFamily.DateTime)
+        {
+            sql.Append(", ").Append(IsoDateStyle);
+        }
+
+        sql.Append(") COLLATE ").Append(ContainsCollation);
     }
 
     // , p{i}.[col] AS [cN] for each projected column.
@@ -1206,12 +2317,78 @@ internal static class SearchSqlBuilder
     // A condition with the column text it is rendered on: Reference for IS NULL, LIKE and SUBSTRING, and Comparable
     // for the comparison operators, which differs from Reference only for an ntext column. Column is the reader-built
     // column it reads, whose type the converter binds each value for, so a number on an integer column stays exact.
+    // PageIndex is the index in FormSchema.Pages of a page field's page, which a long-pattern program joins to read
+    // the column, and null for a base-table column.
     private sealed record ResolvedCondition(
         SearchCondition Condition,
         string Reference,
         string Comparable,
-        ColumnMetadata Column);
+        ColumnMetadata Column,
+        int? PageIndex);
 
     // The scalar parameters of one packed list: a condition's values that share an operator and a parameter type.
     private sealed record PackedGroup(SearchOperator Operator, DbType DbType, List<SqlParameterValue> Values);
+
+    // A compiled long-pattern program: its ASCII text, the number of patterns it holds, and the most data records any
+    // of its instructions has, which sizes the row source a set's pieces are read through.
+    private sealed record LongPatternProgram(string Text, int PatternCount, int MaxItems);
+
+    // One record of a long-pattern program: its kind; the record to run after it succeeds, -1 when the pattern has
+    // matched; the record to retry from after it fails, -1 when the value fails; its character count; the number of
+    // data records after it; whether its set is negated; a cut's length; and its text, a window, a run, a piece or a
+    // seek run's longest prefix, or empty.
+    private sealed record LikeRecord(
+        int Kind,
+        int Next,
+        int Fail,
+        LikeMeasure Count,
+        int Items,
+        bool Negated,
+        long Cut,
+        string Text);
+
+    // The kinds of atom a long pattern is compiled from.
+    private enum LikeAtomKind
+    {
+        // A run of literal characters, never cut between two steps.
+        Run,
+
+        // A '_'.
+        AnyCharacter,
+
+        // A [...] set, closed or not.
+        Set,
+    }
+
+    // One atom of a long pattern: its kind, its text's start and length in the pattern, and its character count.
+    private readonly record struct LikeAtom(LikeAtomKind Kind, int Start, int Length, LikeMeasure Count);
+
+    // A number of characters as both kinds of collation count them: in UTF-16 code units, as a collation without
+    // supplementary-character support counts, and with a surrogate pair as one character, as an _SC collation counts.
+    // Only a literal surrogate pair differs; a set or a '_' matches one character under both.
+    private readonly record struct LikeMeasure(long CodeUnits, long Characters)
+    {
+        public static LikeMeasure One => new(1, 1);
+
+        public static LikeMeasure operator +(LikeMeasure left, LikeMeasure right) =>
+            new(left.CodeUnits + right.CodeUnits, left.Characters + right.Characters);
+
+        public static LikeMeasure Of(LikePatternElement element) => element.IsSurrogatePair ? new(2, 1) : One;
+
+        // The measure of literal text: each surrogate pair one character, every other code unit one.
+        public static LikeMeasure Of(string text)
+        {
+            var pairs = 0L;
+            for (var index = 0; index + 1 < text.Length; index++)
+            {
+                if (char.IsSurrogatePair(text[index], text[index + 1]))
+                {
+                    pairs++;
+                    index++;
+                }
+            }
+
+            return new(text.Length, text.Length - pairs);
+        }
+    }
 }

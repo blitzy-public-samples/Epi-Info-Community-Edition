@@ -103,10 +103,13 @@ public static class RecordQueryRules
     public const int MaxSearchFields = 6;
 
     /// <summary>
-    /// The longest <c>LIKE</c> pattern, SQL Server's 8,000-byte pattern limit counted in UTF-16 code units of an
-    /// <c>nvarchar</c> pattern. It applies to Find's wildcard patterns, after the search-criteria parser has collapsed
-    /// each run of <c>%</c> in a pattern without <c>[</c>, and to the grid filter's contains pattern
-    /// (<see cref="ToContainsPattern"/>); Find's equality and its 255-character multiline comparison are not limited.
+    /// SQL Server's <c>LIKE</c> pattern limit, 8,000 bytes, counted in UTF-16 code units of an <c>nvarchar</c>
+    /// pattern; <c>LIKE</c>, <c>PATINDEX</c> and <c>CHARINDEX</c> refuse a longer one with error 8152. It bounds no
+    /// input. A Find wildcard pattern or a grid filter contains pattern (<see cref="ToContainsPattern"/>) within it is
+    /// sent as one <c>LIKE</c> parameter, and a longer one is evaluated window by window with the same meaning. The
+    /// search-criteria parser collapses each run of <c>%</c> in a longer pattern without <c>[</c>, and rejects only a
+    /// pattern holding a <c>[...]</c> set longer than this that is unclosed or that no cut keeping its members divides
+    /// (<see cref="Search.LikePatternSyntax.HoldsUnsearchableSet"/>).
     /// </summary>
     public const int MaxLikePatternLength = 4000;
 
@@ -115,13 +118,6 @@ public static class RecordQueryRules
     /// <c>ESCAPE</c> clause.
     /// </summary>
     public const char ContainsPatternEscape = '\\';
-
-    /// <summary>
-    /// The fixed message for a <c>q</c> whose contains pattern would exceed <see cref="MaxLikePatternLength"/>. It
-    /// never echoes the submitted value.
-    /// </summary>
-    public const string FilterTooLongMessage =
-        "q must be at most 3998 characters long, counting each %, _, [ and \\ as two.";
 
     /// <summary>The number of grid columns a record summary and a search result carry.</summary>
     public const int GridColumnCount = 6;
@@ -292,35 +288,6 @@ public static class RecordQueryRules
         }
 
         return pattern.Append('%').ToString();
-    }
-
-    /// <summary>
-    /// Whether the contains pattern of <paramref name="filter"/>, as <see cref="ToContainsPattern"/> builds it, fits
-    /// <see cref="MaxLikePatternLength"/>: the filter's length, plus one per <c>\</c>, <c>%</c>, <c>_</c> and
-    /// <c>[</c>, plus the two wrapping <c>%</c>. It counts without building the pattern.
-    /// </summary>
-    /// <param name="filter">The filter text, unchanged and untrimmed.</param>
-    /// <returns>Whether the pattern is at most <see cref="MaxLikePatternLength"/> characters long.</returns>
-    /// <exception cref="ArgumentNullException"><paramref name="filter"/> is null.</exception>
-    public static bool IsRepresentableFilter(string filter)
-    {
-        ArgumentNullException.ThrowIfNull(filter);
-
-        var length = filter.Length + 2;
-        if (length > MaxLikePatternLength)
-        {
-            return false;
-        }
-
-        foreach (var character in filter)
-        {
-            if (IsContainsPatternCharacter(character) && ++length > MaxLikePatternLength)
-            {
-                return false;
-            }
-        }
-
-        return true;
     }
 
     /// <summary>
