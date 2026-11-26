@@ -1,3 +1,4 @@
+using System.ComponentModel;
 using System.Data;
 using System.Globalization;
 using System.Net.Sockets;
@@ -80,6 +81,101 @@ public sealed class SqlErrorClassifierTests
 
         Assert.Equal(new SqlFailure(SqlFailureKind.Unavailable, number), failure);
     }
+
+    // A Win32Exception counts only as the inner exception of a SqlException with a listed number: the number decides,
+    // and the inner exception never promotes an unlisted one.
+    [Theory]
+    [InlineData(10054, SqlFailureKind.Unavailable)]
+    [InlineData(53, SqlFailureKind.Unavailable)]
+    [InlineData(547, SqlFailureKind.Unexpected)]
+    public void Classify_SqlExceptionWithWin32Inner_IsDecidedByItsNumber(int number, SqlFailureKind expectedKind)
+    {
+        SqlException exception = SqlExceptionFactory.Create(number, inner: new Win32Exception(10054));
+
+        SqlFailure failure = SqlErrorClassifier.Classify(exception, CancellationToken.None, duringOpen: true);
+
+        Assert.Equal(new SqlFailure(expectedKind, number), failure);
+    }
+
+    // Unexpected failures (500) under a request that was not aborted, while opening and during a command.
+
+    /// <summary>
+    /// Unlisted SQL Server errors with the severity class the server raises them with, each while opening and during
+    /// a command: permission (229, 230), constraint (547) and conversion (245). Number, class and whether it was
+    /// raised while opening.
+    /// </summary>
+    public static TheoryData<int, byte, bool> UnlistedNumberCases
+    {
+        get
+        {
+            (int Number, byte Class)[] errors = [(229, 14), (230, 14), (547, 16), (245, 16)];
+            var cases = new TheoryData<int, byte, bool>();
+            foreach ((int number, byte errorClass) in errors)
+            {
+                cases.Add(number, errorClass, true);
+                cases.Add(number, errorClass, false);
+            }
+
+            return cases;
+        }
+    }
+
+    [Theory]
+    [MemberData(nameof(UnlistedNumberCases))]
+    public void Classify_UnlistedNumber_IsUnexpectedWithThatNumber(int number, byte errorClass, bool duringOpen)
+    {
+        SqlException exception = SqlExceptionFactory.Create([SqlExceptionFactory.Error(number, errorClass, "test error")]);
+
+        SqlFailure failure = SqlErrorClassifier.Classify(exception, CancellationToken.None, duringOpen);
+
+        Assert.Equal(new SqlFailure(SqlFailureKind.Unexpected, number), failure);
+    }
+
+    /// <summary>
+    /// Failures that are not a <see cref="SqlException"/>, each while opening and during a command: a bare or wrapped
+    /// <see cref="Win32Exception"/>, a malformed connection string's <see cref="ArgumentException"/> and other non-SQL
+    /// exceptions. Exception and whether it was raised while opening.
+    /// </summary>
+    public static TheoryData<Exception, bool> NonSqlFailureCases
+    {
+        get
+        {
+            Exception[] failures =
+            [
+                new Win32Exception(10061),
+                new IOException("x", new Win32Exception(10061)),
+                new InvalidOperationException("x", new Win32Exception(10061)),
+                MalformedConnectionStringException(),
+                new NullReferenceException(),
+                new FormatException(),
+                new Exception("boom"),
+            ];
+
+            var cases = new TheoryData<Exception, bool>();
+            foreach (Exception failure in failures)
+            {
+                cases.Add(failure, true);
+                cases.Add(failure, false);
+            }
+
+            return cases;
+        }
+    }
+
+    [Theory]
+    [MemberData(nameof(NonSqlFailureCases))]
+    public void Classify_NonSqlFailure_IsUnexpectedWithNoNumber(Exception exception, bool duringOpen)
+    {
+        SqlFailure failure = SqlErrorClassifier.Classify(exception, CancellationToken.None, duringOpen);
+
+        Assert.Equal(new SqlFailure(SqlFailureKind.Unexpected, null), failure);
+    }
+
+    // SqlClient parses the connection string in the SqlConnection constructor; nothing is opened.
+    private const string MalformedConnectionString = "this is not a connection string";
+
+    private static ArgumentException MalformedConnectionStringException() =>
+        Assert.Throws<ArgumentException>(() => new SqlConnection(MalformedConnectionString));
 
     // Cancellation: a cancelled request token decides only together with evidence that the failure is the abort.
 
@@ -171,11 +267,7 @@ public sealed class SqlErrorClassifierTests
             SqlFailureKind.Unexpected,
             230
         },
-        {
-            Assert.Throws<ArgumentException>(() => new SqlConnection("this is not a connection string")),
-            SqlFailureKind.Unexpected,
-            null
-        },
+        { MalformedConnectionStringException(), SqlFailureKind.Unexpected, null },
         { new Exception("boom"), SqlFailureKind.Unexpected, null },
         {
             SqlExceptionFactory.Create([SqlExceptionFactory.Error(0, 11, SevereErrorEnglish, 0)]),
@@ -533,6 +625,132 @@ public sealed class SqlErrorClassifierTests
         Assert.Equal(WriteOutcome.NotWritten, unavailable.Outcome);
         Assert.Equal(1205, unavailable.SqlErrorNumber);
         Assert.Same(deadlock, unavailable.InnerException);
+    }
+
+    // Store exceptions: the class decides the type, and the message is fixed text, never the database's message. Unlike
+    // legacy Epi Info's SqlException, which re-exposed the inner message and kept the SQL statement, nothing of the
+    // original failure reaches Message; the original is attached only as the inner exception.
+
+    private const string SqlTextSentinel = "SELECT secret FROM [CaseReport] WHERE LastName = 'T-sentinel'";
+
+    [Fact]
+    public void ToDataStoreException_Unavailable_IsUnavailableExceptionWithFixedMessage()
+    {
+        SqlException inner = SqlExceptionFactory.Create(-2, SqlTextSentinel);
+
+        Exception raised = SqlErrorClassifier.ToDataStoreException(
+            new SqlFailure(SqlFailureKind.Unavailable, -2), "Insert", WriteOutcome.Unknown, inner);
+
+        DataStoreUnavailableException unavailable = Assert.IsType<DataStoreUnavailableException>(raised);
+        Assert.Equal("Insert", unavailable.Operation);
+        Assert.Equal(WriteOutcome.Unknown, unavailable.Outcome);
+        Assert.Equal(-2, unavailable.SqlErrorNumber);
+        Assert.Same(inner, unavailable.InnerException);
+        AssertRedacted(DataStoreUnavailableException.FixedMessage, unavailable.Message, inner);
+    }
+
+    [Fact]
+    public void ToDataStoreException_Unexpected_IsWriteExceptionWithFixedMessage()
+    {
+        SqlException inner = SqlExceptionFactory.Create(547, SqlTextSentinel);
+
+        Exception raised = SqlErrorClassifier.ToDataStoreException(
+            new SqlFailure(SqlFailureKind.Unexpected, 547), "Update", WriteOutcome.NotWritten, inner);
+
+        DataStoreWriteException unexpected = Assert.IsType<DataStoreWriteException>(raised);
+        Assert.Equal("Update", unexpected.Operation);
+        Assert.Equal(WriteOutcome.NotWritten, unexpected.Outcome);
+        Assert.Equal(547, unexpected.SqlErrorNumber);
+        Assert.Same(inner, unexpected.InnerException);
+        AssertRedacted(DataStoreWriteException.FixedMessage, unexpected.Message, inner);
+    }
+
+    [Fact]
+    public void ToDataStoreException_Cancelled_IsOperationCanceledWithFixedMessage()
+    {
+        SqlException inner = SqlExceptionFactory.Create([SqlExceptionFactory.Error(0, 11, SqlTextSentinel, 0)]);
+
+        Exception raised = SqlErrorClassifier.ToDataStoreException(
+            new SqlFailure(SqlFailureKind.Cancelled, 0), "Read", WriteOutcome.NotWritten, inner);
+
+        OperationCanceledException cancelled = Assert.IsType<OperationCanceledException>(raised);
+        Assert.Same(inner, cancelled.InnerException);
+        AssertRedacted(SqlErrorClassifier.CancelledMessage, cancelled.Message, inner);
+    }
+
+    [Theory]
+    [InlineData(SqlFailureKind.Unavailable)]
+    [InlineData(SqlFailureKind.Unexpected)]
+    public void ToDataStoreException_BlankOperationOrUndefinedOutcome_IsRejected(SqlFailureKind kind)
+    {
+        var failure = new SqlFailure(kind, 547);
+        SqlException inner = SqlExceptionFactory.Create(547);
+
+        Assert.Throws<ArgumentException>(
+            () => SqlErrorClassifier.ToDataStoreException(failure, " ", WriteOutcome.NotWritten, inner));
+        Assert.Throws<ArgumentOutOfRangeException>(
+            () => SqlErrorClassifier.ToDataStoreException(failure, "Update", (WriteOutcome)99, inner));
+    }
+
+    // Message is exactly the fixed text, while the inner exception still carries the sentinel the outer one must not.
+    private static void AssertRedacted(string expectedMessage, string message, Exception inner)
+    {
+        Assert.Contains(SqlTextSentinel, inner.Message, StringComparison.Ordinal);
+        Assert.Equal(expectedMessage, message);
+        Assert.DoesNotContain(SqlTextSentinel, message, StringComparison.Ordinal);
+        Assert.DoesNotContain("SELECT", message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    // Connection factory and store: an absent or blank connection string is unavailable before any connection object
+    // exists, and a malformed one is a configuration fault (500). Neither reaches the network.
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("  ")]
+    public async Task OpenAsync_AbsentOrBlankConnectionString_IsUnavailableAndNotWritten(string? connectionString)
+    {
+        var factory = new SqlConnectionFactory(new DatabaseOptions(connectionString));
+
+        DataStoreUnavailableException failure = await Assert.ThrowsAsync<DataStoreUnavailableException>(
+            () => factory.OpenAsync("Ping", CancellationToken.None));
+
+        Assert.Equal("Ping", failure.Operation);
+        Assert.Equal(WriteOutcome.NotWritten, failure.Outcome);
+        Assert.Null(failure.SqlErrorNumber);
+        // No inner exception: the absence is detected before SqlClient is asked to parse or open anything.
+        Assert.Null(failure.InnerException);
+        Assert.Equal(DataStoreUnavailableException.FixedMessage, failure.Message);
+    }
+
+    [Fact]
+    public async Task PingAsync_AbsentConnectionString_ThrowsUnavailableForThePing()
+    {
+        var store = new SqlServerDataStore(new DatabaseOptions(null), NullSqlCommandObserver.Instance);
+
+        DataStoreUnavailableException failure = await Assert.ThrowsAsync<DataStoreUnavailableException>(
+            () => store.PingAsync(CancellationToken.None));
+
+        Assert.Equal(nameof(IDataStore.PingAsync), failure.Operation);
+        Assert.Equal(WriteOutcome.NotWritten, failure.Outcome);
+        Assert.Null(failure.SqlErrorNumber);
+        Assert.Null(failure.InnerException);
+        Assert.Equal(DataStoreUnavailableException.FixedMessage, failure.Message);
+    }
+
+    [Fact]
+    public async Task OpenAsync_MalformedConnectionString_IsUnexpectedWriteExceptionAndNotWritten()
+    {
+        var factory = new SqlConnectionFactory(new DatabaseOptions(MalformedConnectionString));
+
+        DataStoreWriteException failure = await Assert.ThrowsAsync<DataStoreWriteException>(
+            () => factory.OpenAsync("Ping", CancellationToken.None));
+
+        Assert.Equal("Ping", failure.Operation);
+        Assert.Equal(WriteOutcome.NotWritten, failure.Outcome);
+        Assert.Null(failure.SqlErrorNumber);
+        Assert.IsType<ArgumentException>(failure.InnerException);
+        Assert.Equal(DataStoreWriteException.FixedMessage, failure.Message);
     }
 
     /// <summary>Sets <see cref="CultureInfo.CurrentUICulture"/> for one test and restores it on disposal.</summary>
