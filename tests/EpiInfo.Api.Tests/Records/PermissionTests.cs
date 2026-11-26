@@ -1,22 +1,13 @@
 using System.Globalization;
 using System.Net.Http.Headers;
 using System.Text.Json;
-using EpiInfo.Api.Endpoints;
 using EpiInfo.Api.Errors;
-using EpiInfo.Api.Json;
-using EpiInfo.Api.Services;
 using EpiInfo.Api.Tests.Infrastructure;
-using EpiInfo.CheckCode;
 using EpiInfo.Domain.Metadata;
 using EpiInfo.Domain.Records;
 using EpiInfo.Domain.Storage;
 using EpiInfo.Domain.Values;
-using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
-using Microsoft.AspNetCore.TestHost;
-using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Hosting;
-using Microsoft.Extensions.Logging;
 
 namespace EpiInfo.Api.Tests.Records;
 
@@ -26,13 +17,12 @@ namespace EpiInfo.Api.Tests.Records;
 /// write returns, and that a denied write changes nothing.
 /// </summary>
 /// <remarks>
-/// The class needs no database, so it carries no <c>Integration</c> trait. Each case sends HTTP requests to an
-/// in-memory host that maps the API's form and record endpoint groups with the services they resolve, over a
+/// The class needs no database, so it carries no <c>Integration</c> trait. Each case hosts the API's own composition
+/// root, <c>Program.cs</c>, through an <see cref="ApiFactory"/> on TestServer whose store is a
 /// <see cref="FakeDataStore"/> holding <see cref="FakeForms.TwoPage"/> with synthetic per-table permissions. Every
-/// request therefore travels routing, JSON binding, the endpoint handler, the service and result execution, and every
-/// assertion reads the status, headers and body the client receives. The test adds no middleware and maps no other
-/// route, so each response is the one the endpoint groups produce. A real denied database principal is not created,
-/// because the database's logins and users stay unchanged.
+/// request therefore travels the production pipeline, its error handling, guards, routing, JSON binding, the endpoint
+/// handler, the service and result execution, and every assertion reads the status, headers and body the client
+/// receives. A real denied database principal is not created, because the database's logins and users stay unchanged.
 /// </remarks>
 public sealed class PermissionTests
 {
@@ -690,27 +680,26 @@ public sealed class PermissionTests
     }
 
     /// <summary>
-    /// <see cref="FakeForms.TwoPage"/> in a <see cref="FakeDataStore"/>, behind a started in-memory host that maps the
-    /// API's form and record endpoint groups, and the client that sends requests to it.
+    /// <see cref="FakeForms.TwoPage"/> in a <see cref="FakeDataStore"/>, behind a started <see cref="ApiFactory"/>
+    /// host of the API, and the client that sends requests to it.
     /// </summary>
     private sealed class Harness : IAsyncDisposable
     {
-        private readonly WebApplication app;
+        private readonly ApiFactory factory;
 
         private readonly HttpClient client;
 
-        private Harness(FormMetadata form, FakeDataStore store, WebApplication app)
+        private Harness(FormMetadata form, FakeDataStore store, ApiFactory factory, HttpClient client)
         {
             Form = form;
             Store = store;
-            this.app = app;
+            this.factory = factory;
+            this.client = client;
 
             // The cases rely on one text field on each page, read from the metadata rather than assumed.
             Assert.Equal(2, Form.Pages.Count);
             Assert.Equal(FirstPage.PageId, PageOf(FirstPageField).PageId);
             Assert.Equal(SecondPage.PageId, PageOf(SecondPageField).PageId);
-
-            client = app.GetTestClient();
         }
 
         public FormMetadata Form { get; }
@@ -727,37 +716,22 @@ public sealed class PermissionTests
 
         public FormPermissions AllGranted => Permissions(Grant.Both, Grant.Both, Grant.Both);
 
-        // Registers exactly the services the two endpoint groups resolve: the API's JSON settings, the store, the
-        // check-code facade, a controlled clock, and the save-stamp, form and record services. A host that fails to
-        // start, or whose form lacks the fields the cases rely on, is disposed before the failure propagates.
+        // The factory replaces only the store, the clock, the SQL observer and the check-code engine, so every other
+        // registration and the whole pipeline are production's; the store being in memory, no connection is made. The
+        // first client starts the host. A host that fails to start, or whose form lacks the fields the cases rely on,
+        // is disposed before the failure propagates.
         public static async Task<Harness> StartAsync()
         {
             var form = FakeForms.TwoPage;
             var store = new FakeDataStore(form);
-
-            var builder = WebApplication.CreateBuilder(
-                new WebApplicationOptions { EnvironmentName = Environments.Production });
-            builder.WebHost.UseTestServer();
-            builder.Logging.ClearProviders();
-            builder.Services.AddApiJson();
-            builder.Services.AddSingleton<IDataStore>(store);
-            builder.Services.AddSingleton<ICheckCodeEngine>(new CheckCodeEngine());
-            builder.Services.AddSingleton<TimeProvider>(new ControlledTimeProvider());
-            builder.Services.AddSingleton<SaveStampProvider>();
-            builder.Services.AddScoped<FormService>();
-            builder.Services.AddScoped<RecordService>();
-
-            var app = builder.Build();
+            var factory = new ApiFactory(ApiFactoryOptions.ForFake(store));
             try
             {
-                app.MapFormEndpoints();
-                app.MapRecordEndpoints();
-                await app.StartAsync().ConfigureAwait(false);
-                return new Harness(form.Metadata, store, app);
+                return new Harness(form.Metadata, store, factory, factory.CreateClient());
             }
             catch
             {
-                await app.DisposeAsync().ConfigureAwait(false);
+                await factory.DisposeAsync().ConfigureAwait(false);
                 throw;
             }
         }
@@ -843,8 +817,7 @@ public sealed class PermissionTests
         public async ValueTask DisposeAsync()
         {
             client.Dispose();
-            await app.StopAsync().ConfigureAwait(false);
-            await app.DisposeAsync().ConfigureAwait(false);
+            await factory.DisposeAsync().ConfigureAwait(false);
         }
 
         private static void AddEntry(List<TablePermission> entries, string tableName, Grant grant)
