@@ -1,27 +1,42 @@
+using System.Net;
 using EpiInfo.Api.Health;
+using EpiInfo.Api.Hosting;
 using EpiInfo.Api.Tests.Infrastructure;
 using EpiInfo.Domain.Storage;
+using EpiInfo.Tests.Shared;
 using Microsoft.Extensions.Diagnostics.HealthChecks;
 using Microsoft.Extensions.Logging;
 
 namespace EpiInfo.Api.Tests.Hosting;
 
 /// <summary>
-/// The check-level contract of <see cref="SqlServerHealthCheck"/>, the check behind <c>GET /health</c> (AAP 0.3.4.7):
-/// Healthy only when the store's ping answers <see langword="true"/>; Unhealthy with the fixed description, no
-/// exception and no data for a <see langword="false"/> answer and for every store failure, whatever the registration's
-/// failure status; and only the caller's own cancellation propagated. Its log lines carry no exception and name only
-/// the exception type, the store operation and the SQL error number (AAP 0.9.3).
+/// The <c>GET /health</c> contract of <see cref="EpiInfo.Api.Endpoints.HealthEndpoints"/> (AAP 0.3.4.7) without a
+/// database: 503 <c>{"status":"unhealthy"}</c>, plain JSON and not ProblemDetails, for an unreachable server and for a
+/// missing connection string; 200
+/// <c>{"status":"healthy"}</c> when the store's ping answers. Beneath it, the check-level contract of
+/// <see cref="SqlServerHealthCheck"/>: Healthy only when the store's ping answers <see langword="true"/>; Unhealthy
+/// with the fixed description, no exception and no data for a <see langword="false"/> answer and for every store
+/// failure, whatever the registration's failure status; and only the caller's own cancellation propagated. Its log
+/// lines carry no exception and name only the exception type, the store operation and the SQL error number (AAP 0.9.3).
 /// </summary>
 /// <remarks>
-/// The class needs no database: it runs the check directly over <see cref="FakeDataStore"/>, carries no
-/// <c>Integration</c> trait and joins no database collection, so <c>--filter "Category!=Integration"</c> selects it.
-/// These cases exercise the check itself over that store; the response body of <c>GET /health</c>, 200
-/// <c>{"status":"healthy"}</c> or 503 <c>{"status":"unhealthy"}</c>, is the contract of
-/// <see cref="EpiInfo.Api.Endpoints.HealthEndpoints"/>.
+/// The class needs no SQL Server: the endpoint cases run the API on TestServer against a port where nothing listens,
+/// without a connection string, or over <see cref="FakeDataStore"/>, and the check cases run the check directly over
+/// that store. It carries no <c>Integration</c> trait and joins no database collection, so
+/// <c>--filter "Category!=Integration"</c> selects it. <see cref="HealthIntegrationTests"/> holds the case that needs
+/// the rehearsal database.
 /// </remarks>
 public sealed class HealthTests
 {
+    // The password of the unreachable connection string: a sentinel no real login uses, searched for in every log line.
+    private const string Sentinel = "Sentinel-Health-7f3c9a2e";
+
+    // Port 1 on IPv4 loopback, where nothing listens, so the real SQL Server store fails to connect within the
+    // 2-second connect timeout.
+    private const string UnreachableConnectionString =
+        "Server=127.0.0.1,1;Database=EpiRehearsal;User Id=sa;Password=" + Sentinel +
+        ";TrustServerCertificate=True;Connect Timeout=2";
+
     private const string SqlTextFailure = "unclassified exception holding SQL text";
     private const string LoginFailure = "unavailable: login failed";
     private const string MissingConnectionStringFailure = "unavailable: no connection string";
@@ -42,6 +57,65 @@ public sealed class HealthTests
     private const string ExceptionTypeKey = "ExceptionType";
     private const string OperationKey = "Operation";
     private const string SqlErrorNumberKey = "SqlErrorNumber";
+
+    // The logger category of the check's own lines.
+    private static readonly string HealthCheckCategory = typeof(SqlServerHealthCheck).FullName!;
+
+    // The real SQL Server store runs: the connection to port 1 fails, the store reports the database unavailable, and
+    // the check answers Unhealthy without passing the exception on, so neither the body nor any log line carries the
+    // password sentinel or exception text.
+    [Fact]
+    public async Task UnreachableServerReturnsUnhealthy()
+    {
+        await using var factory = new ApiFactory(new ApiFactoryOptions
+        {
+            ConnectionMode = ApiConnectionMode.Supplied,
+            ConnectionString = UnreachableConnectionString,
+        });
+        using HttpClient client = factory.CreateClient();
+
+        using HttpResponseMessage response = await client.GetAsync(HealthResponses.RequestPath);
+
+        await HealthResponses.AssertAsync(response, HttpStatusCode.ServiceUnavailable, HealthResponses.Unhealthy);
+        Assert.False(factory.Logs.ContainsText(Sentinel), "A captured log entry holds the password sentinel.");
+        AssertNoExceptionLogged(factory.Logs);
+        AssertPingFailureLogged(factory.Logs);
+    }
+
+    // A blank connection string is absent: the API warns at startup naming the key, never a value, keeps serving, and
+    // the store fails the ping before any connection is attempted.
+    [Fact]
+    public async Task MissingConnectionStringReturnsUnhealthy()
+    {
+        await using var factory = new ApiFactory(new ApiFactoryOptions { ConnectionMode = ApiConnectionMode.None });
+        using HttpClient client = factory.CreateClient();
+
+        using HttpResponseMessage response = await client.GetAsync(HealthResponses.RequestPath);
+
+        await HealthResponses.AssertAsync(response, HttpStatusCode.ServiceUnavailable, HealthResponses.Unhealthy);
+        Assert.True(
+            factory.Logs.ContainsText(ApiOptions.ConnectionStringKey),
+            $"No captured log entry names the configuration key {ApiOptions.ConnectionStringKey}.");
+        AssertNoExceptionLogged(factory.Logs);
+        CapturedLogEntry pingFailed = AssertPingFailureLogged(factory.Logs);
+        Assert.Null(StateValue(pingFailed, SqlErrorNumberKey));
+    }
+
+    // The healthy branch without SQL Server: the endpoint answers 200 from exactly one ping of the store, and the check
+    // logs nothing.
+    [Fact]
+    public async Task AnsweringStoreReturnsHealthy()
+    {
+        var store = new FakeDataStore();
+        await using var factory = new ApiFactory(ApiFactoryOptions.ForFake(store));
+        using HttpClient client = factory.CreateClient();
+
+        using HttpResponseMessage response = await client.GetAsync(HealthResponses.RequestPath);
+
+        await HealthResponses.AssertAsync(response, HttpStatusCode.OK, HealthResponses.Healthy);
+        Assert.Equal(new FakeStoreCall(PingOperation, IsWrite: false), Assert.Single(store.Calls));
+        Assert.DoesNotContain(factory.Logs.Entries, entry => entry.Category == HealthCheckCategory);
+    }
 
     [Fact]
     public async Task PingAnsweredIsHealthy()
@@ -208,6 +282,20 @@ public sealed class HealthTests
             Assert.Null(entry.ExceptionMessage);
         });
 
+    // The check's one line for a ping the store failed by reporting the database unavailable, as it does for an
+    // unreachable server and for a missing connection string alike.
+    private static CapturedLogEntry AssertPingFailureLogged(CapturingLoggerProvider logs)
+    {
+        CapturedLogEntry entry = Assert.Single(logs.Entries, candidate => candidate.Category == HealthCheckCategory);
+        Assert.Equal(LogLevel.Warning, entry.Level);
+        Assert.Equal(PingFailedEventId, entry.EventId.Id);
+        AssertStateKeys(entry, CheckNameKey, ExceptionTypeKey, OperationKey, SqlErrorNumberKey);
+        Assert.Equal<object?>(SqlServerHealthCheck.Name, StateValue(entry, CheckNameKey));
+        Assert.Equal<object?>(nameof(DataStoreUnavailableException), StateValue(entry, ExceptionTypeKey));
+        Assert.Equal<object?>(PingOperation, StateValue(entry, OperationKey));
+        return entry;
+    }
+
     // The structured state holds exactly the template's arguments plus the template itself, so the line can carry
     // nothing the template does not name.
     private static void AssertStateKeys(CapturedLogEntry entry, params string[] arguments) =>
@@ -261,3 +349,64 @@ public sealed class HealthTests
         }
     }
 }
+
+/// <summary>
+/// The SC-1 health proof (AAP 0.7.1): with the rehearsal database reachable, <c>GET /health</c> answers 200
+/// <c>{"status":"healthy"}</c> from one <c>SELECT 1</c> through the SQL Server store.
+/// </summary>
+/// <remarks>
+/// The case writes nothing and depends on no count, so it takes no <see cref="DatabaseWriteLock"/>. It never skips:
+/// an unreachable or unconfigured database fails it through <see cref="TestDatabase"/>, naming <c>SQL_HOST</c> and
+/// <c>MSSQL_SA_PASSWORD</c>.
+/// </remarks>
+[Collection(DatabaseCollections.Database)]
+[Trait("Category", "Integration")]
+public sealed class HealthIntegrationTests
+{
+    [Fact]
+    public async Task HealthyWhenDatabaseAnswers()
+    {
+        await using ApiFactory factory = await ApiFactory.ForDatabaseAsync();
+        using HttpClient client = factory.CreateClient();
+
+        using HttpResponseMessage response = await client.GetAsync(HealthResponses.RequestPath);
+
+        await HealthResponses.AssertAsync(response, HttpStatusCode.OK, HealthResponses.Healthy);
+
+        // The one command of the request is the ping's trivial query, outside a transaction, and it succeeded.
+        RecordedCommand ping = Assert.Single(factory.Recorder.Commands);
+        Assert.Equal(nameof(IDataStore.PingAsync), ping.Operation);
+        Assert.Equal("SELECT 1;", ping.CommandText.Trim());
+        Assert.Empty(ping.Parameters);
+        Assert.False(ping.InTransaction);
+        Assert.True(ping.Succeeded);
+    }
+}
+
+/// <summary>The two <c>GET /health</c> bodies and the assertion both test classes apply to a response.</summary>
+file static class HealthResponses
+{
+    public const string RequestPath = "/health";
+    public const string Healthy = """{"status":"healthy"}""";
+    public const string Unhealthy = """{"status":"unhealthy"}""";
+
+    /// <summary>Asserts the status, the plain JSON media type and the exact body.</summary>
+    /// <remarks>
+    /// Exact equality is the shape and redaction proof: it admits no ProblemDetails member (<c>type</c>,
+    /// <c>title</c>, <c>detail</c>, <c>traceId</c>), no exception text, server address or password, no whitespace and
+    /// no other member. <c>application/json</c> rather than <c>application/problem+json</c> shows the 503 is not
+    /// ProblemDetails. The failure message gives the body's length only, never the body, as every message of the suite
+    /// describes a response by its shape.
+    /// </remarks>
+    public static async Task AssertAsync(HttpResponseMessage response, HttpStatusCode status, string expectedBody)
+    {
+        Assert.Equal(status, response.StatusCode);
+        Assert.Equal(ApiTestClient.JsonMediaType, response.Content.Headers.ContentType?.MediaType);
+
+        string body = await response.Content.ReadAsStringAsync();
+        Assert.True(
+            string.Equals(expectedBody, body, StringComparison.Ordinal),
+            $"The {RequestPath} body is not exactly {expectedBody}; it has {body.Length} characters.");
+    }
+}
+

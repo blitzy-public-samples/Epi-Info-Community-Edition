@@ -62,14 +62,16 @@ The precondition passed, so this list only separates the steps that do not depen
 
 ### OpenAPI staleness checks
 
-Each is `not run`: `web/scripts/api-generate.mjs`, `web/scripts/check-api-fresh.mjs`, `src/EpiInfo.Api/openapi/EpiInfo.Api.json` and `web/src/api/schema.ts` are not in the tree.
+Run 2026-11-26 on tree `b71d2dba` plus the generated pair, with .NET SDK 10.0.115 and Node v22.23.5, after `npm ci` in `web/`. `npm run api:generate` wrote `src/EpiInfo.Api/openapi/EpiInfo.Api.json` and `web/src/api/schema.ts` with no database and no connection string. The build-time host logged only the two expected warnings: no `ConnectionStrings:EpiInfo`, and no `web/dist`.
 
-| Check | Expected | Status |
-|-------|----------|--------|
-| `npm run lint` on a clean tree | passes | not run |
-| `npm run lint` on a warm tree | passes | not run |
-| After editing only `src/EpiInfo.Api/openapi/EpiInfo.Api.json` | fails with the stale message | not run |
-| After editing only `web/src/api/schema.ts` | fails with the stale message | not run |
+| Check | Expected | Status | Evidence |
+|-------|----------|--------|----------|
+| `npm run lint` on a clean tree | passes | pass | `src/*/bin` and `src/*/obj` deleted first. Exit 0; `eslint .` clean, then "OpenAPI document and generated client are current." |
+| `npm run lint` on a warm tree | passes | pass | Rerun with no clean: exit 0 with the same line. The fresh pair was byte-identical to the committed pair on both runs |
+| After editing only `src/EpiInfo.Api/openapi/EpiInfo.Api.json` | fails with the stale message | pass | A double space in one `summary`: exit 1, `stale: src/EpiInfo.Api/openapi/EpiInfo.Api.json`, then the stale message. After `npm run api:generate` the file was byte-identical to the original and lint passed |
+| After editing only `web/src/api/schema.ts` | fails with the stale message | pass | One appended space: exit 1, `stale: web/src/api/schema.ts`, then the stale message. After `npm run api:generate` the file was byte-identical to the original and lint passed |
+
+The generated client compiles under `strict`: `npx tsc --noEmit` exits 0. `npm run build` stopped at its `vite build` step only because `web/index.html` was not yet in the tree.
 
 ### Docker check
 
@@ -92,7 +94,7 @@ Each is `not run`: `web/scripts/api-generate.mjs`, `web/scripts/check-api-fresh.
 ### Proofs not made
 
 - **`tests/Directory.Build.props` inert for `Tests/Tests.csproj`**: not provable on the snapshot tree, which did not hold the props file; proved once it was added (see "Boundary checks").
-- **OpenAPI clean and warm byte-identity**: not re-proved; the generation scripts are not in the tree.
+- **OpenAPI clean and warm byte-identity**: proved 2026-11-26 (see "OpenAPI staleness checks"). A clean-tree and a warm-tree generation each produced a document and client byte-identical to the committed pair.
 
 ### Tree checks at the snapshot
 
