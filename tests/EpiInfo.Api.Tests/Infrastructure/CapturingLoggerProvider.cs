@@ -1,5 +1,6 @@
 using System.Globalization;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace EpiInfo.Api.Tests.Infrastructure;
 
@@ -398,6 +399,80 @@ public sealed class CapturingLoggerProvider : ILoggerProvider, ISupportExternalS
             {
                 return ExceptionTextFailed;
             }
+        }
+    }
+}
+
+/// <summary>
+/// A logger provider that stands for a failing log sink: its loggers for the categories it was given are enabled at
+/// every level and throw from every log call, counting each throw; every other category gets a logger that writes
+/// nothing.
+/// </summary>
+/// <remarks>
+/// Register it beside <see cref="CapturingLoggerProvider"/>, never in its place. The logging pipeline hands each call
+/// to every provider before it rethrows a provider's failure to the caller, so the capture provider still records
+/// the line, and a test can assert both what the code under test logged and that a throwing sink changed nothing it
+/// answers. The provider is thread-safe; <see cref="Dispose"/> only marks it disposed.
+/// </remarks>
+public sealed class ThrowingLoggerProvider : ILoggerProvider
+{
+    private readonly HashSet<string> _categories;
+
+    private int _throws;
+    private int _disposed;
+
+    /// <summary>Creates a provider whose loggers throw for the categories of <paramref name="categories"/>.</summary>
+    /// <param name="categories">The types whose full names are the throwing logger categories.</param>
+    /// <exception cref="ArgumentException">No type is given, or a type has no full name.</exception>
+    public ThrowingLoggerProvider(params Type[] categories)
+    {
+        ArgumentNullException.ThrowIfNull(categories);
+        if (categories.Length == 0)
+        {
+            throw new ArgumentException("At least one category type is required.", nameof(categories));
+        }
+
+        _categories = new HashSet<string>(StringComparer.Ordinal);
+        foreach (Type category in categories)
+        {
+            ArgumentNullException.ThrowIfNull(category, nameof(categories));
+            string name = category.FullName
+                ?? throw new ArgumentException("A category type has no full name.", nameof(categories));
+            _categories.Add(name);
+        }
+    }
+
+    /// <summary>How many log calls have thrown.</summary>
+    public int Throws => Volatile.Read(ref _throws);
+
+    /// <inheritdoc />
+    /// <exception cref="ObjectDisposedException">The provider has been disposed.</exception>
+    public ILogger CreateLogger(string categoryName)
+    {
+        ArgumentNullException.ThrowIfNull(categoryName);
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) == 1, this);
+        return _categories.Contains(categoryName) ? new ThrowingLogger(this) : NullLogger.Instance;
+    }
+
+    /// <summary>Marks the provider disposed; <see cref="Throws"/> stays readable.</summary>
+    public void Dispose() => Volatile.Write(ref _disposed, 1);
+
+    private sealed class ThrowingLogger(ThrowingLoggerProvider provider) : ILogger
+    {
+        public IDisposable? BeginScope<TState>(TState state)
+            where TState : notnull => null;
+
+        public bool IsEnabled(LogLevel logLevel) => logLevel != LogLevel.None;
+
+        public void Log<TState>(
+            LogLevel logLevel,
+            EventId eventId,
+            TState state,
+            Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+            Interlocked.Increment(ref provider._throws);
+            throw new InvalidOperationException("Log sink failure injected by ThrowingLoggerProvider.");
         }
     }
 }

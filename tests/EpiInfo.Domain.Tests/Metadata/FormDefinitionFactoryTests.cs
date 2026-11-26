@@ -1296,37 +1296,31 @@ public sealed class FormDefinitionFactoryTests
     }
 
     /// <summary>
-    /// An option is stored as its 0-based index. 256 items on <c>tinyint</c> are offered with indexes 0 to 255, its
-    /// largest value; 257 would offer index 256, which no write can store, so that field is unsupported, carries no
-    /// options and is not a data field.
+    /// An option is stored as its 0-based index, and the column alone decides admission. An Option on
+    /// <c>tinyint</c>, whose largest value is 255, is a data field offering every item at its index, 0 to 255 for
+    /// 256 items and 0 to 256 for 257; a submitted 256 the column cannot store is the validator's field error.
     /// </summary>
     [Theory]
-    [InlineData(256, FieldType.Option, null, true)]
-    [InlineData(257, FieldType.Unsupported, "Option", false)]
-    public void Create_OptionOnTinyint_OffersEveryItemOnlyWhileTheLastIndexFits(
-        int itemCount,
-        FieldType expectedType,
-        string? expectedUnsupportedType,
-        bool expectedDataField)
+    [InlineData(256)]
+    [InlineData(257)]
+    public void Create_OptionOnTinyint_OffersEveryItemWhateverItsCount(int itemCount)
     {
         string[] labels = Enumerable.Range(0, itemCount)
             .Select(index => "Item" + index.ToString(CultureInfo.InvariantCulture))
             .ToArray();
         FormMetadata form = SinglePageForm(
             Field(1, "Colour", "Option", tabIndex: 1, sqlType: "tinyint", list: string.Join(',', labels)));
-        FieldOption[]? expectedOptions = expectedDataField
-            ? labels.Select((label, index) => new FieldOption(FieldValue.FromIndex(index), label)).ToArray()
-            : null;
+        FieldOption[] expectedOptions = labels
+            .Select((label, index) => new FieldOption(FieldValue.FromIndex(index), label))
+            .ToArray();
 
         FieldDefinition field = Assert.Single(Assert.Single(Create(form).Pages).Fields);
 
-        Assert.Equal(expectedType, field.FieldType);
-        Assert.Equal(expectedUnsupportedType is not null, field.Unsupported);
-        Assert.Equal(expectedUnsupportedType, field.UnsupportedType);
+        Assert.Equal(FieldType.Option, field.FieldType);
+        Assert.False(field.Unsupported);
+        Assert.Null(field.UnsupportedType);
         Assert.Equal(expectedOptions, field.Options);
-        Assert.Equal(
-            expectedDataField,
-            FormDefinitionFactory.GetDataFields(form).Any(dataField => dataField.Name == "Colour"));
+        Assert.Contains(FormDefinitionFactory.GetDataFields(form), dataField => dataField.Name == "Colour");
     }
 
     /// <summary>

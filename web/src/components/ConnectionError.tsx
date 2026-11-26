@@ -1,4 +1,4 @@
-import { describeError, isSafeToResend, type ApiError, type ApiMethod } from '../api/errors';
+import { describeError, errorMessages, isSafeToResend, type ApiError, type ApiMethod } from '../api/errors';
 
 /** The method of the failed request; whether Retry may resend it depends on it. */
 export type ResendMethod = ApiMethod;
@@ -10,6 +10,11 @@ export interface ConnectionErrorProps {
   method?: ResendMethod;
   /** The failed request was the first `POST` of a new record, so a resend may duplicate it. */
   isCreate?: boolean;
+  /**
+   * The text the owner of the failed request decided, such as the editor's save or delete
+   * message, shown as is. Absent or blank, the text follows from `error` and `method`.
+   */
+  message?: string;
   /** Resends the failed request, or reloads. Offered only when resending is safe. */
   onRetry?: () => void;
   /** Resends the draft at the user's explicit request although the earlier save may have been applied. */
@@ -17,11 +22,12 @@ export interface ConnectionErrorProps {
   onDismiss?: () => void;
 }
 
-const UNREACHABLE = 'Cannot reach the database server.';
-const UNREACHABLE_WITH_DRAFT = 'Cannot reach the database server. Your changes are still on screen.';
 const UNCERTAIN_WRITE =
   'The save may already have been applied, and the record list cannot prove whether it was. ' +
   'Your changes are still on screen.';
+// The risk the create's "Save again" names, also shown as text before the button; the
+// editor's own uncertain-create message ends with the same sentence.
+const DUPLICATE_RISK = 'Saving again may create a duplicate record.';
 
 // The visible text stays "Save again", never the toolbar's exact "Save", and the
 // accessible name starts with it and adds the risk of resending.
@@ -29,12 +35,28 @@ const SAVE_AGAIN_TEXT = 'Save again';
 const SAVE_AGAIN_CREATE_LABEL = 'Save again (this may create a duplicate record)';
 const SAVE_AGAIN_UPDATE_LABEL = 'Save again (the earlier save may already have been applied)';
 
-function safeMessage(error: ApiError, method: ResendMethod): string {
-  const described = describeError(error);
-  if (described.trim() !== '') {
-    return described;
+/**
+ * The text when the caller decided none. A `POST` or `PUT` failed with the draft on
+ * screen: when it is safe to resend, describeError's text says the draft is kept;
+ * otherwise the save may have been applied, which for a create risks a duplicate. A
+ * `GET` or `DELETE` holds no draft, since a read loads nothing the user typed and a
+ * delete's confirmation discarded it, so its text says only what cannot be reached.
+ */
+function defaultMessage(error: ApiError, method: ResendMethod, safe: boolean, isCreate: boolean): string {
+  if (!safe) {
+    return isCreate ? `${UNCERTAIN_WRITE} ${DUPLICATE_RISK}` : UNCERTAIN_WRITE;
   }
-  return method === 'POST' || method === 'PUT' ? UNREACHABLE_WITH_DRAFT : UNREACHABLE;
+  if (method === 'POST' || method === 'PUT') {
+    return describeError(error);
+  }
+  switch (error.kind) {
+    case 'unavailable':
+      return errorMessages.unavailableWithoutDraft;
+    case 'network':
+      return errorMessages.networkWithoutDraft;
+    default:
+      return describeError(error);
+  }
 }
 
 /**
@@ -43,6 +65,9 @@ function safeMessage(error: ApiError, method: ResendMethod): string {
  * keeps the draft and performs the resend. A `POST` or `PUT` not proven `notWritten`
  * offers no Retry, only an explicit "Save again" that names its risk.
  *
+ * The text is the caller's `message` when it has one, so the request's owner states what
+ * happened to the draft; otherwise it follows from the method, as `defaultMessage` says.
+ *
  * The banner shows fixed text and the server's trace id only, never a field value, a
  * URL or exception text, which the API also keeps out of its error bodies.
  */
@@ -50,12 +75,16 @@ export function ConnectionError({
   error,
   method = 'GET',
   isCreate = false,
+  message: callerMessage,
   onRetry,
   onSaveAgain,
   onDismiss,
 }: ConnectionErrorProps) {
   const safe = isSafeToResend(error, method);
-  const message = safe ? safeMessage(error, method) : UNCERTAIN_WRITE;
+  const message =
+    callerMessage !== undefined && callerMessage.trim() !== ''
+      ? callerMessage
+      : defaultMessage(error, method, safe, isCreate);
 
   // Shown in both variants, because an uncertain write is the case support needs it
   // for. describeError already ends a 500's text with the trace id, so it is never

@@ -52,6 +52,12 @@ public sealed class RecordValidatorTests
     private const string PatientNamePrompt = "Patient's Name";
     private const string CollectionDatePrompt = "Collection date:";
     private const string ReporterPrompt = "Reported by:";
+    private const string AssignedCodePrompt = "Assigned code:";
+
+    // FIELD_IS_REQUIRED_LONG after its {0}, with {1} the page name "Page 1", typed out so the prompt cases compare with
+    // text built independently of ValidationMessages; note the trailing space.
+    private const string IsRequiredOnPage1 =
+        " is a required field (page Page 1). Please fill in this field before attempting to leave the record, save data, or close the form. ";
     private const string AgePrompt = "Age in years";
     private const string AgeGroupPrompt = "Age group";
     private const string PhoneMask = "###-###-####";
@@ -168,9 +174,9 @@ public sealed class RecordValidatorTests
     /// Fixture D: the storage ranges of the admitted column types no seeded field exercises: number fields on
     /// <c>tinyint</c>, <c>smallint</c>, <c>int</c> and <c>bigint</c>, Option fields with and without items, an
     /// unbounded <c>datetime</c> date, <c>nvarchar(4000)</c> and <c>ntext</c>. <c>WideChoice</c> and
-    /// <c>OverfullChoice</c> are Options on <c>tinyint</c>, which stores 0 to 255, with 256 and 257 items. The 256
-    /// indexes of <c>WideChoice</c> all fit the column. The 257th item of <c>OverfullChoice</c> has index 256, which
-    /// <c>tinyint</c> cannot store, so the mapper leaves the field unsupported and no value of it can be written.
+    /// <c>OverfullChoice</c> are Options on <c>tinyint</c>, which stores 0 to 255, with 256 and 257 items, and both
+    /// offer every item. The 256 indexes of <c>WideChoice</c> all fit the column. The 257th item of
+    /// <c>OverfullChoice</c> has index 256, which <c>tinyint</c> cannot store, so the storage-range check rejects it.
     /// </summary>
     private static readonly FormMetadata StorageForm = new(
         ViewId: 4,
@@ -213,8 +219,10 @@ public sealed class RecordValidatorTests
 
     /// <summary>
     /// Fixture F: a field both required and read-only, which no seeded field is, beside a required writable field and
-    /// an optional one. It pins the C-3 reconciliation of the two flags: a read-only field can never be supplied, so
-    /// its required flag never blocks a save, while submitting it is still rejected.
+    /// an optional one. It pins how the two flags combine: submitting the read-only field is rejected (C-3), and the
+    /// required gate still takes it, because legacy's required check exempts no read-only field. Its stored value
+    /// decides a <c>PUT</c>, and a <c>POST</c>, which can never supply it, always lists it as missing once the create
+    /// passes the empty-record rule.
     /// </summary>
     private static readonly FormMetadata RequiredReadOnlyForm = new(
         ViewId: 10,
@@ -225,7 +233,7 @@ public sealed class RecordValidatorTests
         [
             Row(1, "AssignedCode", TextType, pageId: 1, Nvarchar(4000)) with
             {
-                Prompt = "Assigned code:",
+                Prompt = AssignedCodePrompt,
                 IsRequired = true,
                 IsReadOnly = true,
             },
@@ -365,13 +373,11 @@ public sealed class RecordValidatorTests
         },
         { "Required", ["PatientName", "Notes", "CollectionDate", "Flag"] },
         { "NullPrompt", ["CaseCode", "Other"] },
-
-        // OverfullChoice is absent: the index 256 of its 257th item does not fit tinyint, so it maps to unsupported.
         {
             "Storage",
             [
                 "SmallCount", "Choice", "EmptyChoice", "WholeCount", "EventDate", "LongText", "Memo",
-                "TinyCount", "BigCount", "WideChoice",
+                "TinyCount", "BigCount", "WideChoice", "OverfullChoice",
             ]
         },
         { "OneSidedRange", ["LowerOnlyNumber", "UpperOnlyNumber", "LowerOnlyDate", "UpperOnlyDate"] },
@@ -433,8 +439,8 @@ public sealed class RecordValidatorTests
     /// <summary>
     /// The integer-column cases rely on number fields staying <c>number</c> on <c>tinyint</c> and <c>bigint</c>, on
     /// <c>WideChoice</c> staying an Option that offers one item per <c>tinyint</c> index, 0 to 255, and on
-    /// <c>OverfullChoice</c> being unsupported: the index 256 of its 257th item does not fit <c>tinyint</c>, so the
-    /// field is named by its <c>metaFieldTypes</c> name, offers no options and can never be written.
+    /// <c>OverfullChoice</c> staying an Option that offers all 257 items, 0 to 256, though <c>tinyint</c> cannot
+    /// store the last index.
     /// </summary>
     [Fact]
     public void StorageForm_MapsTheIntegerColumnsTheCasesRelyOn()
@@ -450,10 +456,10 @@ public sealed class RecordValidatorTests
         Assert.False(fields["WideChoice"].Unsupported);
         Assert.Null(fields["WideChoice"].UnsupportedType);
         Assert.Equal(ExpectedOptions(256), fields["WideChoice"].Options);
-        Assert.Equal(FieldType.Unsupported, fields["OverfullChoice"].FieldType);
-        Assert.True(fields["OverfullChoice"].Unsupported);
-        Assert.Equal("Option", fields["OverfullChoice"].UnsupportedType);
-        Assert.Null(fields["OverfullChoice"].Options);
+        Assert.Equal(FieldType.Option, fields["OverfullChoice"].FieldType);
+        Assert.False(fields["OverfullChoice"].Unsupported);
+        Assert.Null(fields["OverfullChoice"].UnsupportedType);
+        Assert.Equal(ExpectedOptions(257), fields["OverfullChoice"].Options);
 
         static FieldOption[] ExpectedOptions(int count) =>
             Enumerable.Range(0, count)
@@ -912,11 +918,13 @@ public sealed class RecordValidatorTests
 
     /// <summary>
     /// 0 and 255, the smallest and largest indexes <c>tinyint</c> stores, are the first and last items of
-    /// <c>WideChoice</c>.
+    /// <c>WideChoice</c>, and are accepted on <c>OverfullChoice</c> too, whose 257th item has the index 256.
     /// </summary>
     [Theory]
     [InlineData("WideChoice", 0)]
     [InlineData("WideChoice", 255)]
+    [InlineData("OverfullChoice", 0)]
+    [InlineData("OverfullChoice", 255)]
     public void ValidateInput_OptionIndexWithinTinyint_BecomesIndex(string field, int index)
     {
         var values = AssertValid(Validate(Validator(StorageForm), (field, FieldValue.FromInteger(index))));
@@ -929,17 +937,14 @@ public sealed class RecordValidatorTests
         // One past the 256 items of WideChoice: the option count rejects it before the column is consulted.
         { "WideChoice", 256, ValidationMessages.FormatOptionIndexOutOfRange(256) },
 
-        // OverfullChoice is unsupported, so it holds no value: 255, which tinyint stores, and 256, the index of its
-        // 257th item, are both rejected as not a data field.
-        { "OverfullChoice", 255, ValidationMessages.UnknownField },
-        { "OverfullChoice", 256, ValidationMessages.UnknownField },
+        // 256, the index of the 257th item of OverfullChoice, is within its option count, but tinyint cannot store it.
+        { "OverfullChoice", 256, ValidationMessages.ValueNotStorable },
     };
 
     /// <summary>
     /// An option index a <c>tinyint</c> field cannot take is one field error under the canonical name, never a storage
-    /// exception. <c>WideChoice</c> rejects 256 on its option count. <c>OverfullChoice</c>, left unsupported because
-    /// the index 256 of its 257th item does not fit <c>tinyint</c>, is not a data field, so any index sent to it is
-    /// the unknown-field error.
+    /// exception. <c>WideChoice</c> rejects 256 on its option count. <c>OverfullChoice</c> offers 256 as its 257th
+    /// item and rejects it on the storage range, the column's limit.
     /// </summary>
     [Theory]
     [MemberData(nameof(UnwritableOptionIndexOnTinyint))]
@@ -1708,10 +1713,10 @@ public sealed class RecordValidatorTests
         Assert.Equal(new[] { RequiredMessage(PatientNamePrompt, "Page 1") }, result.FieldErrors["PatientName"]);
         Assert.Equal(new[] { RequiredMessage(CollectionDatePrompt, "Page 2") }, result.FieldErrors["CollectionDate"]);
         Assert.Equal(
-            ValidationMessages.FormatFieldIsRequired(PatientNamePrompt, "PatientName", "Page 1"),
+            ValidationMessages.FormatFieldIsRequired(PatientNamePrompt, "Page 1"),
             result.FieldErrors["PatientName"][0]);
         Assert.Equal(
-            ValidationMessages.FormatFieldIsRequired(CollectionDatePrompt, "CollectionDate", "Page 2"),
+            ValidationMessages.FormatFieldIsRequired(CollectionDatePrompt, "Page 2"),
             result.FieldErrors["CollectionDate"][0]);
     }
 
@@ -1751,27 +1756,46 @@ public sealed class RecordValidatorTests
         AssertRequestError(result, ValidationMessages.RecordHasNoValues);
     }
 
-    /// <summary>A field without a prompt is named by its field name in the required message.</summary>
-    [Fact]
-    public void CheckNewRecord_RequiredFieldWithoutPrompt_IsNamedByFieldName()
+    /// <summary>
+    /// The required message takes the prompt exactly as stored, as legacy passes it to <c>string.Format</c>
+    /// (<c>GuiMediator.Events.ViewExplorer.cs</c>, line 79): a null prompt is empty text, and an empty or whitespace
+    /// prompt is inserted as it is, never replaced by the field name. <paramref name="expected"/> is typed out,
+    /// independently of <see cref="ValidationMessages"/>.
+    /// </summary>
+    [Theory]
+    [InlineData(null, IsRequiredOnPage1)]
+    [InlineData("", IsRequiredOnPage1)]
+    [InlineData("   ", "   " + IsRequiredOnPage1)]
+    [InlineData("Case code:", "Case code:" + IsRequiredOnPage1)]
+    public void CheckNewRecord_RequiredFieldPrompt_IsInsertedVerbatim(string? prompt, string expected)
     {
-        var result = Validator(NullPromptForm).CheckNewRecord(Normalised(("Other", FieldValue.FromText("x"))));
+        var form = NullPromptForm with
+        {
+            Fields = [.. NullPromptForm.Fields.Select(row => row.Name == "CaseCode" ? row with { Prompt = prompt } : row)],
+        };
 
-        AssertOnlyFieldError(result, "CaseCode", ValidationMessages.FormatFieldIsRequired(null, "CaseCode", "Page 1"));
-        Assert.Equal(RequiredMessage("CaseCode", "Page 1"), result.FieldErrors["CaseCode"][0]);
+        var result = Validator(form).CheckNewRecord(Normalised(("Other", FieldValue.FromText("x"))));
+
+        AssertOnlyFieldError(result, "CaseCode", expected);
+        Assert.Equal(expected, RequiredMessage(prompt, "Page 1"));
+        Assert.Equal(expected, ValidationMessages.FormatFieldIsRequired(prompt, "Page 1"));
+        Assert.DoesNotContain("CaseCode", expected, StringComparison.Ordinal);
     }
 
     /// <summary>
-    /// C-3: a create never includes a read-only field, so a required read-only field is left out of the gate and is
-    /// never listed; the writable required field beside it is still gated. A null
-    /// <paramref name="submittedReporter"/> leaves <c>Reporter</c> out of the create.
+    /// A create can never supply a read-only field (C-3), yet the required gate takes every required data field,
+    /// because legacy's required check exempts no read-only field. Each create here carries a non-null value
+    /// (<c>Remarks</c> "x"), so the empty-record rule does not answer first, and a required read-only field is always
+    /// listed as missing, with its prompt and page name, and the writable required field beside it is listed after
+    /// it, in data-field order, when that one is missing too. A null <paramref name="submittedReporter"/> leaves
+    /// <c>Reporter</c> out of the create.
     /// </summary>
     [Theory]
-    [InlineData("Jones", false)]
-    [InlineData(null, true)]
-    public void CheckNewRecord_RequiredReadOnlyFieldAbsent_IsNeverMissing(
+    [InlineData("Jones", new[] { "AssignedCode" })]
+    [InlineData(null, new[] { "AssignedCode", "Reporter" })]
+    public void CheckNewRecord_RequiredReadOnlyField_IsAlwaysMissing(
         string? submittedReporter,
-        bool reporterMissing)
+        string[] expectedMissing)
     {
         var normalised = submittedReporter is null
             ? Normalised(("Remarks", FieldValue.FromText("x")))
@@ -1779,15 +1803,7 @@ public sealed class RecordValidatorTests
 
         var result = Validator(RequiredReadOnlyForm).CheckNewRecord(normalised);
 
-        if (reporterMissing)
-        {
-            AssertOnlyFieldError(result, "Reporter", RequiredMessage(ReporterPrompt, "Page 1"));
-            return;
-        }
-
-        var values = AssertValid(result);
-        Assert.Equal(normalised.Keys, values.Keys);
-        Assert.DoesNotContain("AssignedCode", values.Keys);
+        AssertMissingOnRequiredReadOnlyForm(result, expectedMissing);
     }
 
     // ---- Phase 2 of a PUT: CheckRequired over the stored record ----
@@ -1885,23 +1901,28 @@ public sealed class RecordValidatorTests
     }
 
     /// <summary>
-    /// C-3: an update can never supply a read-only field, so a required read-only field stored as null or as an empty
-    /// string never blocks the save, while the writable required field beside it is still gated on the effective
-    /// record. A null <paramref name="storedAssignedCode"/> stores null; a null <paramref name="submittedReporter"/>
-    /// leaves <c>Reporter</c>, stored as null, untouched.
+    /// An update can never supply a read-only field (C-3), so the stored value of a required read-only field decides
+    /// the gate: stored as null or as an empty string it is listed as missing, and stored with a value it passes. The
+    /// writable required field beside it is gated on the effective record as before. A null
+    /// <paramref name="storedAssignedCode"/> or <paramref name="storedReporter"/> stores null; a null
+    /// <paramref name="submittedReporter"/> leaves <c>Reporter</c> untouched.
     /// </summary>
     [Theory]
-    [InlineData(null, "Jones", false)]
-    [InlineData("", "Jones", false)]
-    [InlineData("", null, true)]
-    public void CheckRequired_RequiredReadOnlyFieldEmpty_IsNeverMissing(
+    [InlineData(null, null, "Jones", new[] { "AssignedCode" })]
+    [InlineData("", null, "Jones", new[] { "AssignedCode" })]
+    [InlineData("", null, null, new[] { "AssignedCode", "Reporter" })]
+    [InlineData("A-1", null, "Jones", new string[0])]
+    [InlineData("A-1", "Smith", null, new string[0])]
+    [InlineData("A-1", null, null, new[] { "Reporter" })]
+    public void CheckRequired_RequiredReadOnlyField_IsDecidedByItsStoredValue(
         string? storedAssignedCode,
+        string? storedReporter,
         string? submittedReporter,
-        bool reporterMissing)
+        string[] expectedMissing)
     {
         var stored = Stored(Normalised(
             ("AssignedCode", storedAssignedCode is null ? FieldValue.Null : FieldValue.FromText(storedAssignedCode)),
-            ("Reporter", FieldValue.Null),
+            ("Reporter", storedReporter is null ? FieldValue.Null : FieldValue.FromText(storedReporter)),
             ("Remarks", FieldValue.FromText("stored remark"))));
         var submitted = submittedReporter is null
             ? Normalised(("Remarks", FieldValue.FromText("x")))
@@ -1909,9 +1930,9 @@ public sealed class RecordValidatorTests
 
         var result = Validator(RequiredReadOnlyForm).CheckRequired(stored, submitted);
 
-        if (reporterMissing)
+        if (expectedMissing.Length > 0)
         {
-            AssertOnlyFieldError(result, "Reporter", RequiredMessage(ReporterPrompt, "Page 1"));
+            AssertMissingOnRequiredReadOnlyForm(result, expectedMissing);
             return;
         }
 
@@ -2253,8 +2274,9 @@ public sealed class RecordValidatorTests
         ("OnsetWeek", FieldValue.FromNumber(22)),
         ("FreeNumber", FieldValue.Null));
 
-    // The required message as legacy formats FIELD_IS_REQUIRED_LONG: {0} the prompt, {1} the page name.
-    private static string RequiredMessage(string prompt, string pageName) =>
+    // The required message as legacy formats FIELD_IS_REQUIRED_LONG: {0} the prompt, {1} the page name; a null prompt
+    // is empty text, as string.Format renders a null argument.
+    private static string RequiredMessage(string? prompt, string pageName) =>
         string.Format(CultureInfo.InvariantCulture, ValidationMessages.FieldIsRequiredLong, prompt, pageName);
 
     private static IReadOnlyDictionary<string, FieldValue> AssertValid(RecordValidationResult result)
@@ -2289,6 +2311,27 @@ public sealed class RecordValidatorTests
         var (key, messages) = Assert.Single(result.FieldErrors);
         Assert.Equal(field, key);
         Assert.Equal(new[] { expected }, messages);
+    }
+
+    // A required-gate failure of RequiredReadOnlyForm listing exactly these fields, in this order, each with its own
+    // required message only; both required fields are on page 1.
+    private static void AssertMissingOnRequiredReadOnlyForm(RecordValidationResult result, string[] expectedMissing)
+    {
+        AssertFieldFailure(result);
+        Assert.Equal(expectedMissing, result.FieldErrors.Keys);
+        foreach (var field in expectedMissing)
+        {
+            var expected = field switch
+            {
+                "AssignedCode" => RequiredMessage(AssignedCodePrompt, "Page 1"),
+                "Reporter" => RequiredMessage(ReporterPrompt, "Page 1"),
+                _ => throw new ArgumentOutOfRangeException(
+                    nameof(expectedMissing),
+                    field,
+                    "Not a required field of RequiredReadOnlyForm."),
+            };
+            Assert.Equal(new[] { expected }, result.FieldErrors[field]);
+        }
     }
 
     // One metaFields row; a page-bound row's TabIndex is its FieldId, so tab order follows declaration order.

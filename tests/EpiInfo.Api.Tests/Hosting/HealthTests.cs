@@ -67,6 +67,10 @@ public sealed class HealthTests
     // The logger category of the check's own lines.
     private static readonly string HealthCheckCategory = typeof(SqlServerHealthCheck).FullName!;
 
+    // The logger category of the framework's health-check service, which runs the check for the endpoint.
+    private const string HealthCheckServiceCategory =
+        "Microsoft.Extensions.Diagnostics.HealthChecks.DefaultHealthCheckService";
+
     // The real SQL Server store runs: the connection to port 1 fails, the store reports the database unavailable, and
     // the check answers Unhealthy without passing the exception on, so neither the body nor any log line carries the
     // password sentinel or exception text.
@@ -190,7 +194,7 @@ public sealed class HealthTests
         Assert.Equal(PingOperation, Assert.Single(harness.Store.Calls).Method);
         AssertNoExceptionLogged(harness.Logs);
         var entry = Assert.Single(harness.Logs.Entries);
-        Assert.Equal(LogLevel.Warning, entry.Level);
+        Assert.Equal(LogLevel.Error, entry.Level);
         Assert.Equal(PingNotAnsweredEventId, entry.EventId.Id);
         AssertStateKeys(entry, CheckNameKey);
         Assert.Equal<object?>(SqlServerHealthCheck.Name, StateValue(entry, CheckNameKey));
@@ -208,7 +212,8 @@ public sealed class HealthTests
 
     // Every failure other than the caller's own cancellation is Unhealthy, cancellation inside the store included. The
     // sentinel sits in the message or the inner exception, and so in Exception.ToString, which must reach neither the
-    // result nor any log line; the one Warning names only the exception type, the operation and the SQL error number.
+    // result nor any log line; the one Error line names only the exception type, the operation and the SQL error
+    // number.
     [Theory]
     [InlineData(SqlTextFailure, nameof(InvalidOperationException), null, null)]
     [InlineData(LoginFailure, nameof(DataStoreUnavailableException), PingOperation, LoginFailedNumber)]
@@ -234,13 +239,43 @@ public sealed class HealthTests
         Assert.False(harness.Logs.ContainsText(sentinel));
         AssertNoExceptionLogged(harness.Logs);
         var entry = Assert.Single(harness.Logs.Entries);
-        Assert.Equal(LogLevel.Warning, entry.Level);
+        Assert.Equal(LogLevel.Error, entry.Level);
         Assert.Equal(PingFailedEventId, entry.EventId.Id);
         AssertStateKeys(entry, CheckNameKey, ExceptionTypeKey, OperationKey, SqlErrorNumberKey);
         Assert.Equal<object?>(SqlServerHealthCheck.Name, StateValue(entry, CheckNameKey));
         Assert.Equal<object?>(expectedExceptionType, StateValue(entry, ExceptionTypeKey));
         Assert.Equal<object?>(expectedOperation, StateValue(entry, OperationKey));
         Assert.Equal<object?>(expectedSqlErrorNumber, StateValue(entry, SqlErrorNumberKey));
+    }
+
+    // A log sink that throws for the check's line changes no result: a ping that fails and a ping answering false
+    // (a null failure) are still the fixed Unhealthy result with no exception, the check never throws, and its one
+    // line still reaches the working sink.
+    [Theory]
+    [InlineData(LoginFailure, PingFailedEventId)]
+    [InlineData(SqlTextFailure, PingFailedEventId)]
+    [InlineData(null, PingNotAnsweredEventId)]
+    public async Task ThrowingLogSinkLeavesTheUnhealthyResultUnchanged(string? failure, int eventId)
+    {
+        var sentinel = "Sentinel-Health-" + Guid.NewGuid().ToString("N");
+        using var throwing = new ThrowingLoggerProvider(typeof(SqlServerHealthCheck));
+        using var harness = new CheckHarness(throwing);
+        if (failure is null)
+        {
+            harness.Store.SetPingResult(false);
+        }
+        else
+        {
+            harness.Store.ThrowOn(PingOperation, CreateFailure(failure, sentinel));
+        }
+
+        var result = await harness.CheckAsync(HealthStatus.Unhealthy);
+
+        AssertUnhealthy(result);
+        Assert.Equal(1, throwing.Throws);
+        Assert.Equal(eventId, Assert.Single(harness.Logs.Entries).EventId.Id);
+        AssertNoExceptionLogged(harness.Logs);
+        Assert.False(harness.Logs.ContainsText(sentinel));
     }
 
     // The check passes the caller's token to the store and lets the store's cancellation for it propagate.
@@ -326,11 +361,13 @@ public sealed class HealthTests
         });
 
     // The check's one line for a ping the store failed by reporting the database unavailable, as it does for an
-    // unreachable server and for a missing connection string alike.
+    // unreachable server and for a missing connection string alike. It is the only health-failure line: the
+    // health-check service writes none of its own for the same result.
     private static CapturedLogEntry AssertPingFailureLogged(CapturingLoggerProvider logs)
     {
+        Assert.DoesNotContain(logs.Entries, candidate => candidate.Category == HealthCheckServiceCategory);
         CapturedLogEntry entry = Assert.Single(logs.Entries, candidate => candidate.Category == HealthCheckCategory);
-        Assert.Equal(LogLevel.Warning, entry.Level);
+        Assert.Equal(LogLevel.Error, entry.Level);
         Assert.Equal(PingFailedEventId, entry.EventId.Id);
         AssertStateKeys(entry, CheckNameKey, ExceptionTypeKey, OperationKey, SqlErrorNumberKey);
         Assert.Equal<object?>(SqlServerHealthCheck.Name, StateValue(entry, CheckNameKey));
@@ -369,11 +406,18 @@ public sealed class HealthTests
     {
         private readonly ILoggerFactory _loggerFactory;
 
-        public CheckHarness()
+        public CheckHarness(ILoggerProvider? extraLogs = null)
         {
             Store = new FakeDataStore();
             Logs = new CapturingLoggerProvider();
-            _loggerFactory = LoggerFactory.Create(builder => builder.SetMinimumLevel(LogLevel.Trace).AddProvider(Logs));
+            _loggerFactory = LoggerFactory.Create(builder =>
+            {
+                builder.SetMinimumLevel(LogLevel.Trace).AddProvider(Logs);
+                if (extraLogs is not null)
+                {
+                    builder.AddProvider(extraLogs);
+                }
+            });
             Check = new SqlServerHealthCheck(Store, _loggerFactory.CreateLogger<SqlServerHealthCheck>());
         }
 

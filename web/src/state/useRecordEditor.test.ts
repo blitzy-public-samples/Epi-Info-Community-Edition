@@ -17,7 +17,7 @@ import { afterEach, describe, expect, it, vi, type Mock } from 'vitest';
 
 import { createApiClient } from '../api/client';
 import { errorMessages } from '../api/errors';
-import type { FieldDefinition, FieldValue, RecordDto, Values, WriteOutcome } from '../api/types';
+import type { FieldDefinition, FieldValue, FormDefinition, RecordDto, Values, WriteOutcome } from '../api/types';
 import {
   allFields,
   createFormDefinitionFixture,
@@ -27,6 +27,7 @@ import {
   isDataField,
   readOnlyFieldNames,
   recordFixture,
+  withField,
   writableCheckboxNames,
 } from '../test/formDefinitionFixture';
 import { clientMessages } from '../validation/clientValidation';
@@ -324,10 +325,14 @@ interface MountedRecord extends Mounted {
   readonly record: RecordDto;
 }
 
-function mount(record: RecordDto | null, isNew: boolean): Mounted {
+// The definition is fresh per test, and the same object across rerenders: a new definition starts a
+// new form.
+function mount(
+  record: RecordDto | null,
+  isNew: boolean,
+  definition: FormDefinition = createFormDefinitionFixture(),
+): Mounted {
   const api = createFakeApi();
-  // Fresh per test, and the same object across rerenders: a new definition starts a new form.
-  const definition = createFormDefinitionFixture();
   const onSaved = vi.fn<(saved: RecordDto) => void>();
   const onDeleted = vi.fn<() => void>();
   const onDiscardToNearest = vi.fn<(notice?: string) => void>();
@@ -348,12 +353,12 @@ function mount(record: RecordDto | null, isNew: boolean): Mounted {
   return { api, result, props, rerender, onSaved, onDeleted, onDiscardToNearest };
 }
 
-function mountNew(): Mounted {
-  return mount(null, true);
+function mountNew(definition?: FormDefinition): Mounted {
+  return mount(null, true, definition);
 }
 
-function mountExisting(record: RecordDto = storedRecord()): MountedRecord {
-  return { ...mount(record, false), record };
+function mountExisting(record: RecordDto = storedRecord(), definition?: FormDefinition): MountedRecord {
+  return { ...mount(record, false, definition), record };
 }
 
 /** Runs an action inside act and returns what it resolved to. */
@@ -547,6 +552,27 @@ describe('validation', () => {
     expect(result.current.banner).toBeNull();
   });
 
+  // A digit in a text '#' mask is a literal, as on the server: '##-2' needs two digits, a hyphen and a 2.
+  it.each<[string, string, boolean]>([
+    ['stops a save without a request', '12-3', false],
+    ['sends a save', '12-2', true],
+  ])('%s when a text mask with a literal digit is given %s', async (_outcome, value, fits) => {
+    const mask = '##-2';
+    const definition = withField(TEXT, (field) => ({ ...field, validation: { ...field.validation, pattern: mask } }));
+    const { api, result, record } = mountExisting(storedRecord(), definition);
+    edit(result, TEXT, value);
+    if (fits) {
+      api.reply(jsonResponse(200, savedCopy(record, { [TEXT]: value })));
+    }
+
+    expect(await perform(() => result.current.save())).toBe(fits);
+
+    expect(api.lines()).toEqual(fits ? [`PUT ${recordPath(record)}`] : []);
+    expect(api.calls.map((call) => sentValues(call))).toEqual(fits ? [{ [TEXT]: value }] : []);
+    expect(result.current.fieldErrors).toEqual(fits ? {} : { [TEXT]: [clientMessages.patternMismatch(mask)] });
+    expect(result.current.banner).toBeNull();
+  });
+
   it('shows a field-level 400 by canonical field name and keeps the user on the record', async () => {
     const { api, result, onSaved } = mountExisting();
     edit(result, TEXT, 'Jones');
@@ -577,6 +603,63 @@ describe('validation', () => {
     expect(result.current.fieldErrors).toEqual({});
     expect(result.current.values[TEXT]).toBe('Jones');
     expect(api.lines()).toHaveLength(1);
+  });
+
+  // Synthetic metadata: a plain writable text field renamed `__proto__`, the name of Object's
+  // prototype accessor. Its message must stay an own entry of the editor's error map, so the
+  // invalid new record is stopped before any request. The required messages are the legacy text
+  // typed out, the prompt inserted verbatim, a blank one included.
+  it.each<{
+    readonly feedback: string;
+    readonly update: (field: FieldDefinition) => FieldDefinition;
+    readonly enter: readonly (readonly [string, FieldValue])[];
+    readonly expected: readonly string[];
+  }>([
+    {
+      feedback: 'a format message',
+      update: (field) => ({ ...field, validation: { ...field.validation, maxLength: 3 } }),
+      enter: [['__proto__', 'abcd']],
+      expected: [clientMessages.maxLength(3)],
+    },
+    {
+      feedback: 'the required message with its prompt',
+      update: (field) => ({ ...field, prompt: 'Nickname', validation: { ...field.validation, required: true } }),
+      enter: [[OTHER_TEXT, 'Smith']],
+      expected: [
+        'Nickname is a required field (page Page 1). Please fill in this field before attempting to leave the record, save data, or close the form. ',
+      ],
+    },
+    {
+      feedback: 'the required message with a whitespace prompt',
+      update: (field) => ({ ...field, prompt: '   ', validation: { ...field.validation, required: true } }),
+      enter: [[OTHER_TEXT, 'Smith']],
+      expected: [
+        '    is a required field (page Page 1). Please fill in this field before attempting to leave the record, save data, or close the form. ',
+      ],
+    },
+    {
+      feedback: 'the required message with an empty prompt',
+      update: (field) => ({ ...field, prompt: '', validation: { ...field.validation, required: true } }),
+      enter: [[OTHER_TEXT, 'Smith']],
+      expected: [
+        ' is a required field (page Page 1). Please fill in this field before attempting to leave the record, save data, or close the form. ',
+      ],
+    },
+  ])('keeps $feedback for a field named __proto__ and sends nothing', async ({ update, enter, expected }) => {
+    const definition = withField(TEXT, (field) => update({ ...field, name: '__proto__' }));
+    const page = definition.pages.find((candidate) => candidate.fields.some((field) => field.name === '__proto__'));
+    expect(page?.name).toBe('Page 1');
+    const { api, result } = mountNew(definition);
+    for (const [name, value] of enter) {
+      edit(result, name, value);
+    }
+
+    expect(await perform(() => result.current.save())).toBe(false);
+
+    expect(api.calls).toEqual([]);
+    // Own enumerable entries only: an inherited `__proto__` would read as the messages too.
+    expect(Object.entries(result.current.fieldErrors)).toEqual([['__proto__', expected]]);
+    expect(result.current.banner).toBeNull();
   });
 });
 
@@ -925,4 +1008,3 @@ describe('protected state', () => {
     expect(api.lines()).toHaveLength(2);
   });
 });
-

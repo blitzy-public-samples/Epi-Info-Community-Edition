@@ -1,6 +1,7 @@
 using System.Collections.ObjectModel;
 using EpiInfo.Api.Errors;
 using EpiInfo.CheckCode;
+using EpiInfo.CheckCode.Parsing;
 using EpiInfo.Domain.Diagnostics;
 using EpiInfo.Domain.Forms;
 using EpiInfo.Domain.Metadata;
@@ -54,6 +55,13 @@ public sealed record LoadedForm(FormMetadata Metadata, FormDefinition Definition
 /// <exception cref="ArgumentNullException">An argument is <see langword="null"/>.</exception>
 public sealed partial class FormService(IDataStore store, ICheckCodeEngine checkCode, ILogger<FormService> logger)
 {
+    /// <summary>
+    /// The fixed code a check-code diagnostic's log line names in place of a command taken from the program text: the
+    /// command of every unsupported function's diagnostic, whatever its name's spelling; see
+    /// <see cref="LoggedCommand"/>.
+    /// </summary>
+    internal const string UnregisteredFunctionCommand = "UNREGISTERED-FUNCTION";
+
     private readonly IDataStore store = store ?? throw new ArgumentNullException(nameof(store));
 
     private readonly ICheckCodeEngine checkCode = checkCode ?? throw new ArgumentNullException(nameof(checkCode));
@@ -175,18 +183,46 @@ public sealed partial class FormService(IDataStore store, ICheckCodeEngine check
         {
             LogLevel level = diagnostic.Severity == DiagnosticSeverity.Info ? LogLevel.Information : LogLevel.Warning;
 
-            // The diagnostic's message is never logged, only its position and the command keyword from the program
-            // text, which is metadata rather than a value.
-            LogCheckCodeDiagnostic(
-                logger,
-                level,
-                form.Name,
-                form.ViewId,
-                diagnostic.Severity,
-                diagnostic.Line,
-                diagnostic.Command);
+            // The diagnostic's message is never logged, only its position and its command as LoggedCommand maps it.
+            try
+            {
+                LogCheckCodeDiagnostic(
+                    logger,
+                    level,
+                    form.Name,
+                    form.ViewId,
+                    diagnostic.Severity,
+                    diagnostic.Line,
+                    LoggedCommand(diagnostic));
+            }
+            catch (Exception)
+            {
+                // Deliberately swallowed: a failing log provider must never turn the definition already built into an
+                // error, nor keep the remaining diagnostics from the providers that work.
+            }
         }
     }
+
+    /// <summary>
+    /// The command a check-code diagnostic's log line names: the diagnostic's own command when the diagnostic is not
+    /// an unsupported function's (<see cref="Parser.ReportsUnsupportedFunction"/>) and
+    /// <see cref="Parser.IsVocabularyCommand"/> accepts the command as fixed language vocabulary, such as
+    /// <c>GEOCODE</c>, a <c>GOTO</c> statement's <c>GOTO</c> or <c>&lt;&gt;</c>; otherwise
+    /// <see cref="UnregisteredFunctionCommand"/>.
+    /// </summary>
+    /// <remarks>
+    /// An unsupported function's command is its name as the program spells it, which is program text whatever its
+    /// spelling: <c>[GOTO](1)</c> and <c>FORMAT(x)</c> are reported under <c>GOTO</c> and <c>FORMAT</c>, which pass the
+    /// vocabulary check, so every unsupported function's diagnostic is logged under the fixed code. The diagnostics a
+    /// response carries keep their own command; only the log line is mapped.
+    /// </remarks>
+    /// <param name="diagnostic">The diagnostic whose log line is written.</param>
+    /// <returns>The diagnostic's command or <see cref="UnregisteredFunctionCommand"/>.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="diagnostic"/> is <see langword="null"/>.</exception>
+    internal static string LoggedCommand(Diagnostic diagnostic) =>
+        !Parser.ReportsUnsupportedFunction(diagnostic) && Parser.IsVocabularyCommand(diagnostic.Command)
+            ? diagnostic.Command
+            : UnregisteredFunctionCommand;
 
     [LoggerMessage(
         EventId = 1,

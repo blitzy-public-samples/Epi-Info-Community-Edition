@@ -9,7 +9,9 @@ using EpiInfo.Api.Tests.Infrastructure;
 using EpiInfo.CheckCode;
 using EpiInfo.Domain.Storage;
 using EpiInfo.Tests.Shared;
+using Microsoft.AspNetCore.TestHost;
 using Microsoft.Data.SqlClient;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Xunit.Abstractions;
 using Xunit.Sdk;
@@ -1552,6 +1554,13 @@ public sealed class FormDefinitionCheckCodeTests
 
     private const int DiagnosticEventId = 1;
 
+    // The line of the statement TwoDiagnosticsProgram places before its GEOCODE.
+    private const int StatementLine = 3;
+
+    // The request path of the fake form's definition.
+    private static readonly string DefinitionPath =
+        string.Create(CultureInfo.InvariantCulture, $"/api/forms/{FakeForms.CheckCodeViewId}");
+
     [Theory]
     [InlineData("Production")]
     [InlineData("Development")]
@@ -1626,6 +1635,121 @@ public sealed class FormDefinitionCheckCodeTests
         Assert.False(logs.ContainsText(message), "A captured log entry holds the diagnostic's message.");
     }
 
+    // An unsupported function's name is program text, and a bracketed one keeps its whitespace and line breaks. The
+    // definition reports each unsupported function as the engine did, while its log line names the fixed
+    // UNREGISTERED-FUNCTION code whatever its name's spelling: [GOTO] and FORMAT are spelled like vocabulary, yet only
+    // the GOTO statement after them is logged as GOTO. The GEOCODE is vocabulary and keeps its own command in the log.
+    [Theory]
+    [InlineData("Production")]
+    [InlineData("Development")]
+    public async Task UnsupportedFunctionNameIsReportedButLoggedAsTheFixedCode(string environment)
+    {
+        string sentinel = "SentinelFn" + Guid.NewGuid().ToString("N");
+        string functionName = sentinel + "\r\n Secret";
+        string program = TwoDiagnosticsProgram(
+            $"ASSIGN LastName = [{functionName}](1)\n"
+            + "ASSIGN LastName = [GOTO](1)\n"
+            + "ASSIGN LastName = FORMAT(1)\n"
+            + "GOTO LastName");
+        int keywordFunctionLine = SingleLineNumber(program, "ASSIGN LastName = [GOTO]");
+        int formatLine = SingleLineNumber(program, "ASSIGN LastName = FORMAT");
+        int gotoLine = SingleLineNumber(program, "GOTO ");
+        int geocodeLine = SingleLineNumber(program, GeocodeCommand + " ");
+
+        var store = new FakeDataStore(FakeForms.WithCheckCode(program));
+        await using var factory = new ApiFactory(ApiFactoryOptions.ForFake(store, environment));
+        CapturingLoggerProvider logs = factory.Logs;
+
+        // Creating the client builds and starts the host through Program.cs; only the request below is captured.
+        using HttpClient client = factory.CreateClient();
+        logs.Clear();
+
+        using HttpResponseMessage response = await client.GetAsync(DefinitionPath);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        JsonElement definition = await ApiTestClient.ReadJsonElementAsync(response);
+        Assert.Equal(
+            new (string?, string?, int)[]
+            {
+                ("warning", functionName.ToUpperInvariant(), StatementLine),
+                ("warning", "GOTO", keywordFunctionLine),
+                ("warning", "FORMAT", formatLine),
+                ("warning", "GOTO", gotoLine),
+                ("info", GeocodeCommand, geocodeLine),
+            },
+            Summaries(definition.GetProperty("unsupportedCheckCode")));
+
+        IReadOnlyList<CapturedLogEntry> entries =
+            logs.Find(captured => captured.Category == typeof(FormService).FullName);
+        Assert.Equal(
+            new object?[]
+            {
+                FormService.UnregisteredFunctionCommand,
+                FormService.UnregisteredFunctionCommand,
+                FormService.UnregisteredFunctionCommand,
+                "GOTO",
+                GeocodeCommand,
+            },
+            entries.Select(entry => StateValue(entry, "Command")));
+        Assert.Equal(
+            new object?[] { StatementLine, keywordFunctionLine, formatLine, gotoLine, geocodeLine },
+            entries.Select(entry => StateValue(entry, "Line")));
+        Assert.False(logs.ContainsText(sentinel), "A captured log entry holds the function name.");
+        Assert.False(logs.ContainsText(sentinel.ToUpperInvariant()), "A captured log entry holds the function name.");
+    }
+
+    // A log sink that throws for every diagnostic line changes nothing the definition answers, and the lines still
+    // reach every other sink: each diagnostic's line is attempted on its own.
+    [Theory]
+    [InlineData("Production")]
+    [InlineData("Development")]
+    public async Task ThrowingLogSinkLeavesTheDefinitionAndItsDiagnosticsUnchanged(string environment)
+    {
+        string program = TwoDiagnosticsProgram("GOTO LastName");
+        int geocodeLine = SingleLineNumber(program, GeocodeCommand + " ");
+
+        var store = new FakeDataStore(FakeForms.WithCheckCode(program));
+        using var throwing = new ThrowingLoggerProvider(typeof(FormService));
+        await using var factory = new ApiFactory(ApiFactoryOptions.ForFake(store, environment));
+        CapturingLoggerProvider logs = factory.Logs;
+
+        // The derived factory runs the factory's own configuration first, so the throwing sink stands beside the
+        // capturing one, and disposing the factory disposes it too.
+        using HttpClient client = factory
+            .WithWebHostBuilder(builder => builder.ConfigureTestServices(
+                services => services.AddSingleton<ILoggerProvider>(throwing)))
+            .CreateClient();
+        logs.Clear();
+
+        using HttpResponseMessage response = await client.GetAsync(DefinitionPath);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        JsonElement definition = await ApiTestClient.ReadJsonElementAsync(response);
+        Assert.Equal(FakeForms.CheckCodeViewId, definition.GetProperty("viewId").GetInt32());
+        Assert.Equal(
+            new (string?, string?, int)[] { ("warning", "GOTO", StatementLine), ("info", GeocodeCommand, geocodeLine) },
+            Summaries(definition.GetProperty("unsupportedCheckCode")));
+
+        Assert.Equal(2, throwing.Throws);
+        Assert.Equal(
+            new object?[] { "GOTO", GeocodeCommand },
+            logs.Find(captured => captured.Category == typeof(FormService).FullName)
+                .Select(entry => StateValue(entry, "Command")));
+        Assert.Empty(logs.Find(captured => captured.ExceptionType is not null));
+    }
+
+    // One Click block on LastName: the statement text from line 3, one statement or several, then the program's one
+    // GEOCODE. Line breaks are normalised before the text is placed, so a line break the text itself holds is kept as
+    // written.
+    private static string TwoDiagnosticsProgram(string statement) => """
+        Field LastName
+            Click
+                {0}
+                GEOCODE LastName, Age, OnsetWeek
+            End-Click
+        End-Field
+        """.ReplaceLineEndings("\n").Replace("{0}", statement, StringComparison.Ordinal);
+
     // Three Field blocks over the fake form's fields. The DOB and Asian blocks hold runnable statements of the
     // supported subset, the Asian block's carrying the sentinel; the LastName Click block holds the program's one
     // GEOCODE. Line breaks are normalised so the 1-based line numbers do not depend on the source file's endings.
@@ -1666,6 +1790,15 @@ public sealed class FormDefinitionCheckCodeTests
 
     private static object? StateValue(CapturedLogEntry entry, string key) =>
         Assert.Single(entry.State, pair => pair.Key == key).Value;
+
+    // Each diagnostic of an unsupportedCheckCode array as its severity, command and line, in array order.
+    private static (string? Severity, string? Command, int Line)[] Summaries(JsonElement diagnostics) =>
+    [
+        .. diagnostics.EnumerateArray().Select(diagnostic => (
+            diagnostic.GetProperty("severity").GetString(),
+            diagnostic.GetProperty("command").GetString(),
+            diagnostic.GetProperty("line").GetInt32())),
+    ];
 }
 
 /// <summary>

@@ -51,7 +51,12 @@ namespace EpiInfo.Api.Services;
 /// </para>
 /// <para>
 /// Each returned diagnostic is logged once through a fixed template holding the form name, severity, line and
-/// command only. A diagnostic's message, the program text and every field value stay out of the log.
+/// command only. The logged command is the one <see cref="FormService.LoggedCommand"/> maps it to: the diagnostic's
+/// own when it is fixed language vocabulary and the diagnostic is not an unsupported function's, otherwise
+/// <see cref="FormService.UnregisteredFunctionCommand"/>. Every unsupported function's diagnostic is therefore logged
+/// under the fixed code, whatever its name's spelling, <c>[GOTO](1)</c> and <c>FORMAT(x)</c> included, so a name
+/// taken from the program text is never logged; the response keeps the diagnostic as the engine reported it. A
+/// diagnostic's message, the program text and every field value stay out of the log.
 /// </para>
 /// <para>The type keeps no mutable state; the API registers it as a scoped service.</para>
 /// </remarks>
@@ -162,13 +167,21 @@ public sealed partial class FieldEventService(
 
         foreach (var diagnostic in response.Diagnostics)
         {
-            LogDiagnostic(
-                logger,
-                LevelFor(diagnostic.Severity),
-                metadata.Name,
-                diagnostic.Severity,
-                diagnostic.Line,
-                diagnostic.Command);
+            try
+            {
+                LogDiagnostic(
+                    logger,
+                    LevelFor(diagnostic.Severity),
+                    metadata.Name,
+                    diagnostic.Severity,
+                    diagnostic.Line,
+                    FormService.LoggedCommand(diagnostic));
+            }
+            catch (Exception)
+            {
+                // Deliberately swallowed: a failing log provider must never turn the evaluated event into an error,
+                // nor keep the remaining diagnostics from the providers that work.
+            }
         }
 
         return TypedResults.Ok(response);

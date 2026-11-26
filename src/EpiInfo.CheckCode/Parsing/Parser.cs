@@ -53,9 +53,16 @@ namespace EpiInfo.CheckCode.Parsing;
 /// <para>
 /// Diagnostics carry the form name and the 1-based line of the token where the construct starts. Their
 /// <see cref="Diagnostic.Command"/> and <see cref="Diagnostic.Message"/> come only from fixed text, keyword and
-/// operator spellings and function names, never from string, character or number literals, paths, URLs or field
-/// names, because the API logs diagnostics. A literal the subset does not run, such as <c>12L</c>, <c>#1a</c> or
-/// <c>'x'</c> (lines 38-41), is reported once under its kind's pseudo-command and drops its statement.
+/// operator spellings and function names, never from string, character or number literals, paths or URLs. A function
+/// name is fixed text only for a supported function: an unsupported function's command is its name as written in
+/// the program, in upper case, which can be any identifier, a field's name or a bracketed name holding whitespace and
+/// line breaks, and its message repeats it. Such a name can also be spelled like vocabulary, as <c>[GOTO]</c> and
+/// <c>FORMAT</c> are, so only <see cref="ReportsUnsupportedFunction"/> tells its diagnostic apart. That is why the API
+/// logs a diagnostic's command only when <see cref="ReportsUnsupportedFunction"/> rejects the diagnostic and
+/// <see cref="IsVocabularyCommand"/> accepts the command, logs every unsupported function's diagnostic under one fixed
+/// code, whatever its name's spelling, and never logs a message. A literal the subset does not run, such as
+/// <c>12L</c>, <c>#1a</c> or <c>'x'</c> (lines 38-41), is reported once under its kind's pseudo-command and drops its
+/// statement.
 /// </para>
 /// <para>
 /// Each call works on its own state and the keyword tables are immutable, so the parser is safe to call
@@ -73,6 +80,10 @@ public static class Parser
 
     private const string StatementSkipped = "statement skipped";
     private const string IfSkipped = "IF skipped";
+
+    // The opening of the message of every unsupported function's diagnostic, and of no other diagnostic's message;
+    // ReportsUnsupportedFunction recognises that diagnostic by it.
+    private const string UnsupportedFunctionText = "Unsupported function ";
 
     private static readonly FrozenSet<string> SupportedCommands = Set(
         Commands.If, Commands.Assign, Commands.Enable, Commands.Disable, Commands.Clear, Commands.Dialog,
@@ -144,6 +155,22 @@ public static class Parser
     private static readonly FrozenSet<string> Reserved = Set(
         [.. BoundaryKeywords, .. ExpressionKeywords, .. ZeroArgFunctions]);
 
+    // Every Diagnostic.Command spelling that is language vocabulary rather than program text: the keyword tables
+    // above, the lexer's reserved words, the supported function names and the Commands constants the tables do not
+    // already hold. Declared after the sets it is built from, because static initialisers run in textual order.
+    private static readonly FrozenSet<string> VocabularyCommands = Set(
+        [
+            .. CommandKeywords, .. IfTerminators, .. EventStarts.Keys, .. EventTerminators, .. BlockStarts.Keys,
+            .. BlockTerminators, .. ExpressionKeywords, .. ZeroArgFunctions, .. Lexer.Keywords,
+            .. Lexer.HyphenatedKeywords, .. FunctionNames.Supported,
+            Commands.Syntax, Commands.Nesting, Commands.ImplicitAssign, Commands.QualifiedName, Commands.GridField,
+            Commands.ExpressionList, Commands.NumberLiteral, Commands.CharLiteral, Commands.DateLiteral,
+            Commands.TimeLiteral, Commands.CheckedLiteral, Commands.EnableExcept, Commands.DisableExcept,
+            Commands.NotEqual, Commands.Less, Commands.Greater, Commands.LessOrEqual, Commands.GreaterOrEqual,
+            Commands.Concatenate, Commands.Plus, Commands.Minus, Commands.Multiply, Commands.Divide, Commands.Power,
+            Commands.Percent, Commands.LibraryCall,
+        ]);
+
     /// <summary>Parses the tokens of one form's check-code program.</summary>
     /// <param name="tokens">
     /// The tokens as <see cref="Lexer.Tokenize(string?)"/> returns them. <see langword="null"/> is treated as an
@@ -169,6 +196,61 @@ public static class Parser
     /// </param>
     /// <returns>The parsed program, as for <see cref="Parse(IReadOnlyList{Token}, string)"/>.</returns>
     public static ProgramNode Parse(IReadOnlyList<Token>? tokens, FormMetadata? form) => Parse(tokens, form?.Name);
+
+    /// <summary>
+    /// Whether a <see cref="Diagnostic.Command"/> is fixed language vocabulary: a keyword or reserved word of the
+    /// lexer, a supported function name, or one of the <see cref="Commands"/> spellings, compared ordinally as the
+    /// parser and the evaluator report them, in upper case.
+    /// </summary>
+    /// <remarks>
+    /// Every command the parser and the evaluator report is such a spelling, except an unsupported function's name:
+    /// that is taken from the program as written, in upper case, such as <c>DAYS</c> or a bracketed name like
+    /// <c>[Any Text]</c> with its inner whitespace and line breaks, and it passes this check whenever it is spelled
+    /// like vocabulary, as <c>FORMAT</c> and the bracketed <c>[GOTO]</c> are. The spelling alone therefore cannot tell
+    /// such a name from a statement's keyword. A caller that must keep program text out of what it writes, such as a
+    /// log, first sets aside every diagnostic <see cref="ReportsUnsupportedFunction"/> recognises and only then accepts
+    /// a command this check accepts, so every unsupported function's diagnostic gets the caller's fixed code, whatever
+    /// its name's spelling.
+    /// </remarks>
+    /// <param name="command">A diagnostic's command; <see langword="null"/> is accepted.</param>
+    /// <returns>
+    /// <see langword="true"/> for a vocabulary spelling; <see langword="false"/> for <see langword="null"/> and for any
+    /// other text, which is the name of an unsupported function taken from the program text.
+    /// </returns>
+    public static bool IsVocabularyCommand(string? command) =>
+        command is not null && VocabularyCommands.Contains(command);
+
+    /// <summary>
+    /// Whether a diagnostic is the parser's report of an unsupported function: a call of a function the subset does
+    /// not support, such as <c>DAYS(a, b)</c>, <c>FORMAT(x)</c> or <c>[GOTO](1)</c>, or a built-in value written
+    /// without parentheses, such as <c>SYSTEMDATE</c> (line 254).
+    /// </summary>
+    /// <remarks>
+    /// Such a diagnostic's <see cref="Diagnostic.Command"/> is the function's name as the program writes it, in upper
+    /// case, which is program text even where it is spelled like vocabulary, so <see cref="IsVocabularyCommand"/>
+    /// cannot tell it from a statement's keyword. Its <see cref="Diagnostic.Message"/> starts, compared ordinally,
+    /// with <c>Unsupported function </c>, the command and <c>;</c>, which the message of no other diagnostic the
+    /// parser or the evaluator reports does: an unsupported statement's message starts <c>Unsupported command</c>, and
+    /// the evaluator's guard against an unregistered function in a hand-built tree names the function in quotes under
+    /// the enclosing statement's command, so neither is such a report.
+    /// </remarks>
+    /// <param name="diagnostic">A diagnostic the parser or the evaluator reported.</param>
+    /// <returns>
+    /// <see langword="true"/> for an unsupported function's diagnostic; <see langword="false"/> for every other
+    /// diagnostic, and for one without a command or a message.
+    /// </returns>
+    /// <exception cref="ArgumentNullException"><paramref name="diagnostic"/> is <see langword="null"/>.</exception>
+    public static bool ReportsUnsupportedFunction(Diagnostic diagnostic)
+    {
+        ArgumentNullException.ThrowIfNull(diagnostic);
+
+        // Members a deserialiser or a caller left null hold no report.
+        string? message = diagnostic.Message;
+        string? command = diagnostic.Command;
+        return message is not null
+            && command is not null
+            && message.StartsWith(string.Concat(UnsupportedFunctionText, command, ";"), StringComparison.Ordinal);
+    }
 
     private static FrozenSet<string> Set(params string[] entries) => entries.ToFrozenSet(StringComparer.Ordinal);
 
@@ -1814,7 +1896,7 @@ public static class Parser
             if (IsKeywordIn(token, ZeroArgFunctions))
             {
                 string name = token.Keyword!;
-                Warn(token, name, $"Unsupported function {name}; {context.Suffix}");
+                Warn(token, name, $"{UnsupportedFunctionText}{name}; {context.Suffix}");
                 return null;
             }
 
@@ -1899,7 +1981,7 @@ public static class Parser
             string name = nameToken.Text.ToUpperInvariant();
             if (!FunctionNames.IsSupported(name))
             {
-                Warn(nameToken, name, $"Unsupported function {name}; {context.Suffix}");
+                Warn(nameToken, name, $"{UnsupportedFunctionText}{name}; {context.Suffix}");
                 return null;
             }
 

@@ -310,7 +310,7 @@ The mapper matches the seeded `metaFieldTypes` names (`testdata/sql/02_reference
 
 - **Families seen**: `bit`, `datetime`, `float`, `int`, `ntext`, `nvarchar(n)` (20, 255, 4000), `smallint` and `tinyint`; `int` and `smallint` occur only in the base tables.
 - **Column-type mismatches**: none found by direct SQL. Every supported field's column is in its admitted set, and Yes/No falls to `unsupported` under the non-character rule (C-2), not as a mismatch. `SqlMetadataReaderTests` did not run.
-- **Option index range**: an Option field is admitted only when the 0-based index of its last item fits its integer column, so 257 items on `tinyint` leave it `unsupported`; no seeded field is an Option.
+- **Option index range**: an Option field is admitted on `tinyint`, `smallint` or `int` with every item of `metaFields.List` at its 0-based index, whatever the item count. A submitted index the column cannot store, such as 256 on `tinyint` for the 257th item, is a field-level 400 from the validator's storage-range check, never a storage exception; no seeded field is an Option.
 - **Repeated field names**: `metaFields` does not make `Name` unique (`testdata/sql/01_metadata_schema.sql:145-149`), and a later page-bound row of a value-holding type that repeats a data field's name exactly is `unsupported`, with its `metaFieldTypes` name; see "Repeated field names" in "Parity gaps".
 
 ### Patterns and other field rules

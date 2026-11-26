@@ -18,6 +18,8 @@ using EpiInfo.Domain.Validation;
 using EpiInfo.Domain.Values;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Http.HttpResults;
+using Microsoft.AspNetCore.TestHost;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
@@ -673,6 +675,18 @@ public sealed class FieldEventEndpointTests
         End-Field
         """;
 
+    // A warning for the GOTO on line 3, then the runtime error of RuntimeErrorProgram on line 5, after line 4 has
+    // enabled LastName.
+    private const string RuntimeErrorAfterGotoProgram = """
+        Field Age
+            After
+                GOTO DOB
+                ENABLE LastName
+                ASSIGN OnsetWeek = EPIWEEK(DOB)
+            End-After
+        End-Field
+        """;
+
     /// <summary>
     /// Programs whose After block on <c>Age</c> runs without a diagnostic, as (program, the expected response, the
     /// expected key order of <c>assigned</c>).
@@ -795,6 +809,91 @@ public sealed class FieldEventEndpointTests
         Assert.Empty(body.GetProperty("dialogs").EnumerateArray());
         AssertDiagnosticLogged(host, LogLevel.Warning, form.Metadata.Name, line: 4, command: "ASSIGN");
     }
+
+    /// <summary>
+    /// An unsupported function's name is program text, and a bracketed one keeps its whitespace and line breaks: the
+    /// response's diagnostics name each unsupported function as the engine reported it, while each one's log line
+    /// names the fixed <see cref="FormService.UnregisteredFunctionCommand"/> whatever its name's spelling, and no
+    /// captured line holds the name. <c>[GOTO]</c> and <c>FORMAT</c> are spelled like vocabulary, yet only the
+    /// <c>GOTO</c> statement after them is logged as <c>GOTO</c>.
+    /// </summary>
+    [Fact]
+    public async Task UnsupportedFunctionNameIsReturnedButLoggedAsTheFixedCode()
+    {
+        string sentinel = "SentinelFn" + Guid.NewGuid().ToString("N");
+        string functionName = sentinel + "\r\n Secret";
+        var form = FakeForms.WithCheckCode(UnsupportedFunctionProgram(functionName));
+        await using var host = EndpointHost.Start(new FakeDataStore(form));
+
+        var body = await SendAcceptedEventAsync(
+            host,
+            FakeForms.CheckCodeViewId,
+            """{"event":"FieldAfter","fieldName":"Age","values":{"Age":37}}""");
+
+        var diagnostics = body.GetProperty("diagnostics").EnumerateArray().ToArray();
+        Assert.Equal(4, diagnostics.Length);
+        string formName = form.Metadata.Name;
+        AssertDiagnostic(diagnostics[0], "warning", formName, line: 3, command: functionName.ToUpperInvariant());
+        AssertDiagnostic(diagnostics[1], "warning", formName, line: 5, command: "GOTO");
+        AssertDiagnostic(diagnostics[2], "warning", formName, line: 6, command: "FORMAT");
+        AssertDiagnostic(diagnostics[3], "warning", formName, line: 7, command: "GOTO");
+        Assert.Equal("after-function", body.GetProperty("assigned").GetProperty("LastName").GetString());
+
+        // One line per diagnostic, in order, each at Warning under its form, line and mapped command.
+        string unregistered = FormService.UnregisteredFunctionCommand;
+        AssertDiagnosticLogged(host, LogLevel.Warning, formName, line: 3, command: unregistered);
+        AssertDiagnosticLogged(host, LogLevel.Warning, formName, line: 5, command: unregistered);
+        AssertDiagnosticLogged(host, LogLevel.Warning, formName, line: 6, command: unregistered);
+        AssertDiagnosticLogged(host, LogLevel.Warning, formName, line: 7, command: "GOTO");
+        Assert.Equal(4, host.Logs.Find(entry => entry.Category == typeof(FieldEventService).FullName).Count);
+        Assert.False(host.Logs.ContainsText(sentinel), "A log entry holds the function name.");
+        Assert.False(host.Logs.ContainsText(sentinel.ToUpperInvariant()), "A log entry holds the function name.");
+    }
+
+    /// <summary>
+    /// A log sink that throws for the field-event service's lines changes nothing the event answers: the response is
+    /// the 200 with its effects and every diagnostic, and each diagnostic's line still reaches the other sinks.
+    /// </summary>
+    [Fact]
+    public async Task ThrowingLogSinkLeavesTheFieldEventResponseUnchanged()
+    {
+        var form = FakeForms.WithCheckCode(RuntimeErrorAfterGotoProgram);
+        using var throwing = new ThrowingLoggerProvider(typeof(FieldEventService));
+        await using var host = EndpointHost.Start(new FakeDataStore(form), throwing);
+
+        var body = await SendAcceptedEventAsync(
+            host,
+            FakeForms.CheckCodeViewId,
+            """{"event":"FieldAfter","fieldName":"Age","values":{"Age":37,"DOB":null}}""");
+
+        var diagnostics = body.GetProperty("diagnostics").EnumerateArray().ToArray();
+        Assert.Equal(2, diagnostics.Length);
+        AssertDiagnostic(diagnostics[0], "warning", form.Metadata.Name, line: 3, command: "GOTO");
+        AssertDiagnostic(diagnostics[1], "error", form.Metadata.Name, line: 5, command: "ASSIGN");
+        Assert.Equal(
+            new string?[] { "LastName" },
+            body.GetProperty("enabled").EnumerateArray().Select(name => name.GetString()));
+        Assert.Equal(2, throwing.Throws);
+        AssertDiagnosticLogged(host, LogLevel.Warning, form.Metadata.Name, line: 3, command: "GOTO");
+        AssertDiagnosticLogged(host, LogLevel.Warning, form.Metadata.Name, line: 5, command: "ASSIGN");
+        Assert.Empty(host.Logs.Find(entry => entry.ExceptionType is not null));
+    }
+
+    // The After block on Age: from line 3, a call of an unsupported function whose bracketed name is the argument,
+    // then on lines 5 and 6 calls of the unsupported functions [GOTO] and FORMAT, a GOTO statement on line 7 and an
+    // ASSIGN that still runs; those line numbers hold for a name with one line break. Line breaks are normalised
+    // before the name is placed, so a line break in it is kept.
+    private static string UnsupportedFunctionProgram(string functionName) => """
+        Field Age
+            After
+                ASSIGN OnsetWeek = [{0}](Age)
+                ASSIGN OnsetWeek = [GOTO](Age)
+                ASSIGN OnsetWeek = FORMAT(Age)
+                GOTO LastName
+                ASSIGN LastName = "after-function"
+            End-After
+        End-Field
+        """.ReplaceLineEndings("\n").Replace("{0}", functionName, StringComparison.Ordinal);
 
     // Asserts one diagnostic of the response: its severity, form, 1-based line and command, and a message.
     private static void AssertDiagnostic(JsonElement diagnostic, string severity, string form, int line, string command)
@@ -1030,11 +1129,19 @@ public sealed class FieldEventEndpointTests
 
         private readonly CancellationTokenSource _timeout = new(RequestTimeout);
 
-        private EndpointHost(ApiFactory factory, FakeDataStore store)
+        private EndpointHost(ApiFactory factory, FakeDataStore store, ILoggerProvider? extraLogs)
         {
             _factory = factory;
             Store = store;
-            Client = factory.CreateClient();
+
+            // The derived factory runs the factory's own configuration first, so its doubles stay the ones this host
+            // exposes, and disposing the factory disposes it too.
+            Client = extraLogs is { } provider
+                ? factory
+                    .WithWebHostBuilder(builder => builder.ConfigureTestServices(
+                        services => services.AddSingleton(provider)))
+                    .CreateClient()
+                : factory.CreateClient();
         }
 
         /// <summary>The store the host reads and writes.</summary>
@@ -1054,13 +1161,14 @@ public sealed class FieldEventEndpointTests
 
         /// <summary>Starts a host over <paramref name="store"/>.</summary>
         /// <param name="store">The in-memory store the endpoints use.</param>
+        /// <param name="extraLogs">One more logger provider beside the factory's, or <see langword="null"/>.</param>
         /// <returns>The started host; the caller disposes it.</returns>
-        public static EndpointHost Start(FakeDataStore store)
+        public static EndpointHost Start(FakeDataStore store, ILoggerProvider? extraLogs = null)
         {
             var factory = new ApiFactory(ApiFactoryOptions.ForFake(store));
             try
             {
-                return new EndpointHost(factory, store);
+                return new EndpointHost(factory, store, extraLogs);
             }
             catch
             {

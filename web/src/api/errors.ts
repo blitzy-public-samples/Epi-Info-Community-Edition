@@ -75,8 +75,14 @@ export const errorMessages = {
   server: 'An unexpected error occurred.',
   /** Appended to the `server` text when the response carried a trace id. */
   traceIdSuffix: (traceId: string): string => ` Trace id: ${traceId}.`,
+  /** A 503 where a draft exists: a failed save keeps it on screen. */
   unavailable: 'The database cannot be reached. Your changes are still on screen.',
+  /** No response where a draft exists: a failed save keeps it on screen. */
   network: 'The server could not be reached. Your changes are still on screen.',
+  /** A 503 where no draft exists: a read, or a delete whose confirmation discarded the draft. */
+  unavailableWithoutDraft: 'The database cannot be reached.',
+  /** No response where no draft exists: a read, or a delete whose confirmation discarded the draft. */
+  networkWithoutDraft: 'The server could not be reached.',
 } as const;
 
 // A writeOutcome outside this list (a newer server's value, a typo) parses as null, which

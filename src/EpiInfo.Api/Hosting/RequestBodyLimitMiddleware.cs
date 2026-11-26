@@ -1,3 +1,4 @@
+using System.Runtime.ExceptionServices;
 using Microsoft.AspNetCore.Http.Features;
 using Microsoft.Net.Http.Headers;
 
@@ -48,10 +49,16 @@ namespace EpiInfo.Api.Hosting;
 /// either sees every byte counted.
 /// </para>
 /// <para>
-/// No response is written and nothing is logged here. A throw before the endpoint reaches the API exception handler,
-/// which keeps the 413 and writes the fixed ProblemDetails; a throw the framework catches during JSON binding leaves
-/// an empty 413 that status-code pages turn into the same ProblemDetails. The exception message is fixed and never
-/// states a size.
+/// No response is written and nothing is logged here: each failure reaches the API's exception boundary and handler,
+/// which keep its status, write the fixed ProblemDetails and log the one failure line, so a 413 is answered and
+/// correlated the same way however the body is framed. A declared length over the limit throws before the endpoint
+/// runs, and a failed read the endpoint does not catch propagates as it is. JSON binding, however, catches a
+/// <see cref="BadHttpRequestException"/> from its body read and ends the request with that exception's status and no
+/// body. The counting stream therefore records, without catching it, the first such exception to leave any of its
+/// reads: its own 413, or one the server's body stream raised, such as Kestrel's own limit. When the rest of the
+/// pipeline returns without starting the response and with that exception's status, the guard rethrows the same
+/// instance with its original stack trace; a response the endpoint started, or a status it chose itself, is left as it
+/// is. The exception message is fixed and never states a size.
 /// </para>
 /// </remarks>
 public sealed class RequestBodyLimitMiddleware
@@ -94,14 +101,18 @@ public sealed class RequestBodyLimitMiddleware
     /// On an endpoint marked with <see cref="JsonBodyMetadata"/> whose media type the JSON media-type guard accepts,
     /// rejects a declared length over the limit, otherwise wraps a request body that may exist in the counting
     /// stream, which it also sets as the request's <see cref="IRequestBodyReadFeature"/>, first raising the server
-    /// limit of a chunked body by its framing allowance; then calls the rest of the pipeline. Every other request
-    /// passes through unchanged.
+    /// limit of a chunked body by its framing allowance; then calls the rest of the pipeline, and rethrows a failed
+    /// body read that it turned into an empty response of the failure's status. Every other request passes through
+    /// unchanged.
     /// </summary>
     /// <param name="context">The current request.</param>
     /// <exception cref="ArgumentNullException"><paramref name="context"/> is <see langword="null"/>.</exception>
     /// <exception cref="BadHttpRequestException">
     /// With status 413, when <c>Content-Length</c> exceeds the limit; the counting stream throws the same exception
-    /// from a read that takes the body past the limit.
+    /// from a read that takes the body past the limit. When a body read failed with a
+    /// <see cref="BadHttpRequestException"/> that the rest of the pipeline caught, and it returned without starting the
+    /// response and with that exception's status, as JSON binding does, the first such exception is rethrown, the same
+    /// instance with its original stack trace.
     /// </exception>
     public Task InvokeAsync(HttpContext context)
     {
@@ -134,9 +145,27 @@ public sealed class RequestBodyLimitMiddleware
             // The reads binding makes leave their state here, so the exception handler can tell a body that ended
             // before its first byte from content that is not JSON without reading the body again.
             context.Features.Set<IRequestBodyReadFeature>(stream);
+            return InvokeCountedAsync(context, stream);
         }
 
         return _next(context);
+    }
+
+    // JSON binding catches a BadHttpRequestException from its body read, sets the response status to the exception's
+    // and returns with no body, so the exception handler would never see the failure and log its line. The stream
+    // recorded that exception; while the response is still unstarted and carries exactly its status, it is rethrown
+    // so it reaches the handler the way a throw before the endpoint does. A status the endpoint chose, or a response
+    // it started, stands.
+    private async Task InvokeCountedAsync(HttpContext context, LimitedReadStream stream)
+    {
+        await _next(context);
+
+        if (stream.ReadFailure is { } failure
+            && !context.Response.HasStarted
+            && context.Response.StatusCode == failure.StatusCode)
+        {
+            ExceptionDispatchInfo.Throw(failure);
+        }
     }
 
     // The most a chunked body of exactly the limit makes Kestrel count when it carries no chunk extensions and no
@@ -186,7 +215,8 @@ public sealed class RequestBodyLimitMiddleware
     /// A read-only, forward-only view of the request body that counts the bytes read and fails every read once the
     /// count exceeds the limit, never taking more than one byte past the limit from the inner stream, and the
     /// request's <see cref="IRequestBodyReadFeature"/>. A body of exactly the limit ends with an ordinary zero-byte
-    /// read. It is used by one request at a time, as the body stream it wraps is.
+    /// read. It also records, without catching it, the first <see cref="BadHttpRequestException"/> that leaves a read.
+    /// It is used by one request at a time, as the body stream it wraps is.
     /// </summary>
     private sealed class LimitedReadStream : Stream, IRequestBodyReadFeature
     {
@@ -220,21 +250,40 @@ public sealed class RequestBodyLimitMiddleware
             set => throw new NotSupportedException();
         }
 
+        // The first BadHttpRequestException that left any read, or null: this stream's own 413, or a failure the
+        // server's body stream raised, such as Kestrel's own limit. The guard rethrows it when binding swallowed it.
+        internal BadHttpRequestException? ReadFailure { get; private set; }
+
         // Synchronous reads forward to the inner stream's synchronous read, so the server's AllowSynchronousIO policy
-        // still applies to it.
+        // still applies to it. Each read records a BadHttpRequestException leaving it through a filter that never
+        // matches, so its catch block is never entered and the exception unwinds unchanged, stack trace included.
         public override int Read(byte[] buffer, int offset, int count)
         {
             ValidateBufferArguments(buffer, offset, count);
-            ThrowIfOverLimit();
-            int requested = Bound(count);
-            return Count(_inner.Read(buffer, offset, requested), requested);
+            try
+            {
+                ThrowIfOverLimit();
+                int requested = Bound(count);
+                return Count(_inner.Read(buffer, offset, requested), requested);
+            }
+            catch (BadHttpRequestException failure) when (Remember(failure))
+            {
+                throw;
+            }
         }
 
         public override int Read(Span<byte> buffer)
         {
-            ThrowIfOverLimit();
-            int requested = Bound(buffer.Length);
-            return Count(_inner.Read(buffer[..requested]), requested);
+            try
+            {
+                ThrowIfOverLimit();
+                int requested = Bound(buffer.Length);
+                return Count(_inner.Read(buffer[..requested]), requested);
+            }
+            catch (BadHttpRequestException failure) when (Remember(failure))
+            {
+                throw;
+            }
         }
 
         public override async Task<int> ReadAsync(
@@ -244,22 +293,36 @@ public sealed class RequestBodyLimitMiddleware
             CancellationToken cancellationToken)
         {
             ValidateBufferArguments(buffer, offset, count);
-            ThrowIfOverLimit();
-            int requested = Bound(count);
-            return Count(
-                await _inner.ReadAsync(buffer, offset, requested, cancellationToken).ConfigureAwait(false),
-                requested);
+            try
+            {
+                ThrowIfOverLimit();
+                int requested = Bound(count);
+                return Count(
+                    await _inner.ReadAsync(buffer, offset, requested, cancellationToken).ConfigureAwait(false),
+                    requested);
+            }
+            catch (BadHttpRequestException failure) when (Remember(failure))
+            {
+                throw;
+            }
         }
 
         public override async ValueTask<int> ReadAsync(
             Memory<byte> buffer,
             CancellationToken cancellationToken = default)
         {
-            ThrowIfOverLimit();
-            int requested = Bound(buffer.Length);
-            return Count(
-                await _inner.ReadAsync(buffer[..requested], cancellationToken).ConfigureAwait(false),
-                requested);
+            try
+            {
+                ThrowIfOverLimit();
+                int requested = Bound(buffer.Length);
+                return Count(
+                    await _inner.ReadAsync(buffer[..requested], cancellationToken).ConfigureAwait(false),
+                    requested);
+            }
+            catch (BadHttpRequestException failure) when (Remember(failure))
+            {
+                throw;
+            }
         }
 
         public override void Flush()
@@ -307,6 +370,14 @@ public sealed class RequestBodyLimitMiddleware
             {
                 throw TooLarge();
             }
+        }
+
+        // The filter of every read: keeps the first failure, the one that ended the body for its reader, and never
+        // matches, so nothing is caught or swallowed.
+        private bool Remember(BadHttpRequestException failure)
+        {
+            ReadFailure ??= failure;
+            return false;
         }
     }
 }

@@ -19,8 +19,9 @@ public enum MaskPatternKind
     None,
 
     /// <summary>
-    /// A text-family field with a digit mask such as the seeded <c>###-###-####</c>: every <c>#</c> is an
-    /// ASCII digit and every other character is a literal.
+    /// A text-family field with a digit mask such as the seeded <c>###-###-####</c>: a pattern with at least one
+    /// <c>#</c> and no letter, where every <c>#</c> is an ASCII digit and every other character, a digit such as
+    /// the <c>2</c> of <c>##-2</c> included, is a literal.
     /// </summary>
     TextDigitMask,
 
@@ -52,9 +53,10 @@ public enum MaskPatternKind
 /// </para>
 /// <list type="bullet">
 /// <item><description>
-/// a text-family <c>#</c> mask (seeded <c>###-###-####</c>) needs exactly the mask's length, an ASCII digit
-/// at each <c>#</c> and the literal at every other position, so <c>555-014-8636</c> is accepted and
-/// <c>5550148636</c>, <c>555-014-863</c> and the seeded <c>(555) 0148-6367</c> are rejected;
+/// a text-family <c>#</c> mask (seeded <c>###-###-####</c>), a pattern with at least one <c>#</c> and no
+/// letter, needs exactly the mask's length, an ASCII digit at each <c>#</c> and the literal, a digit included,
+/// at every other position, so <c>555-014-8636</c> is accepted and <c>5550148636</c>, <c>555-014-863</c> and
+/// the seeded <c>(555) 0148-6367</c> are rejected;
 /// </description></item>
 /// <item><description>
 /// a number mask (seeded <c>###</c>, <c>###.#</c>) allows at most as many integer digits as <c>#</c> before
@@ -101,10 +103,10 @@ public static class MaskPattern
     /// <returns>
     /// <see cref="MaskPatternKind.None"/> for a null, empty or whitespace pattern, and for field types patterns
     /// never apply to; <see cref="MaskPatternKind.TextDigitMask"/> for a text-family field whose pattern holds
-    /// at least one <c>#</c> and no other letter or digit; <see cref="MaskPatternKind.NumberMask"/> for a number
-    /// field whose pattern is exactly one or more <c>#</c>, optionally followed by a point and one or more
-    /// <c>#</c>; and <see cref="MaskPatternKind.Unchecked"/> for every other pattern on a text-family, number or
-    /// date field.
+    /// at least one <c>#</c> and no letter, its other characters, digits included, being literals;
+    /// <see cref="MaskPatternKind.NumberMask"/> for a number field whose pattern is exactly one or more <c>#</c>,
+    /// optionally followed by a point and one or more <c>#</c>; and <see cref="MaskPatternKind.Unchecked"/> for
+    /// every other pattern on a text-family, number or date field.
     /// </returns>
     public static MaskPatternKind Classify(string? pattern, FieldType fieldType) => Interpret(pattern, fieldType).Kind;
 
@@ -395,8 +397,9 @@ public static class MaskPattern
             {
                 hasDigitPosition = true;
             }
-            else if (char.IsLetterOrDigit(c))
+            else if (char.IsLetter(c))
             {
+                // A letter marks another kind of pattern, such as a date expression; a digit is a literal.
                 return false;
             }
         }

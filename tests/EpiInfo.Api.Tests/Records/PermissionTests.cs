@@ -328,10 +328,7 @@ public sealed class PermissionTests
         Assert.Equal(FakeForms.RequiredFieldName, entry.Name);
         var message = Assert.Single(entry.Value.EnumerateArray());
         Assert.Equal(
-            ValidationMessages.FormatFieldIsRequired(
-                FakeForms.RequiredFieldPrompt,
-                FakeForms.RequiredFieldName,
-                FakeForms.RequiredFieldPageName),
+            ValidationMessages.FormatFieldIsRequired(FakeForms.RequiredFieldPrompt, FakeForms.RequiredFieldPageName),
             message.GetString());
 
         Assert.Empty(response.Writes);

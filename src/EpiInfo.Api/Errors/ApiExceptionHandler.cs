@@ -47,7 +47,8 @@ namespace EpiInfo.Api.Errors;
 /// line whose arguments are the status, the exception type, the store's SQL error number and operation, the write
 /// outcome, a failed rollback's type and SQL error number, and the trace id. The exception object is never given to
 /// the logger and its message is never read, because the inner exception of a store failure can hold SQL text,
-/// values or a connection string. The handler is stateless and safe to share across requests.
+/// values or a connection string. Each line is written best effort (<see cref="LogBestEffort"/>), so a failing log
+/// provider never prevents the response. The handler is stateless and safe to share across requests.
 /// </para>
 /// <para>
 /// A failure after the response has started never reaches a handler: the exception-handler middleware would log the
@@ -79,7 +80,7 @@ internal sealed partial class ApiExceptionHandler(ILogger<ApiExceptionHandler> l
         // invoked outside that pipeline the same way.
         if (IsClientAbort(exception, httpContext))
         {
-            LogClientAbort(logger, operation, exceptionType, traceId);
+            LogBestEffort(() => LogClientAbort(logger, operation, exceptionType, traceId));
 
             // The status the exception-handler middleware itself gives an aborted request; nobody receives a body.
             if (!httpContext.Response.HasStarted)
@@ -105,7 +106,7 @@ internal sealed partial class ApiExceptionHandler(ILogger<ApiExceptionHandler> l
         }
 
         var (rollbackExceptionType, rollbackSqlErrorNumber) = RollbackFailure(exception);
-        LogRequestFailed(
+        LogBestEffort(() => LogRequestFailed(
             logger,
             failure.Level,
             failure.StatusCode,
@@ -115,7 +116,7 @@ internal sealed partial class ApiExceptionHandler(ILogger<ApiExceptionHandler> l
             writeOutcome,
             rollbackExceptionType,
             rollbackSqlErrorNumber,
-            traceId);
+            traceId));
 
         // Defensive: the exception-handler middleware never calls a handler once the response has started, and in the
         // API pipeline ApiExceptionBoundaryMiddleware answers that failure first. The sent status and headers cannot
@@ -135,7 +136,7 @@ internal sealed partial class ApiExceptionHandler(ILogger<ApiExceptionHandler> l
             // text, into the server log. A client that disconnected mid-write needs no further line.
             if (!IsClientAbort(writeFailure, httpContext))
             {
-                LogErrorBodyWriteFailed(logger, TypeName(writeFailure), traceId);
+                LogBestEffort(() => LogErrorBodyWriteFailed(logger, TypeName(writeFailure), traceId));
             }
         }
 
@@ -173,7 +174,7 @@ internal sealed partial class ApiExceptionHandler(ILogger<ApiExceptionHandler> l
     {
         BadHttpRequestException badRequest => ClassifyBadRequest(httpContext.Request, badRequest),
         DataStoreUnavailableException =>
-            new(StatusCodes.Status503ServiceUnavailable, LogLevel.Warning, ApiProblems.Unavailable()),
+            new(StatusCodes.Status503ServiceUnavailable, LogLevel.Error, ApiProblems.Unavailable()),
         _ => new(StatusCodes.Status500InternalServerError, LogLevel.Error, ApiProblems.Unexpected()),
     };
 
@@ -227,7 +228,10 @@ internal sealed partial class ApiExceptionHandler(ILogger<ApiExceptionHandler> l
     internal static bool IsClientAbort(Exception exception, HttpContext httpContext) =>
         (exception is OperationCanceledException or IOException) && httpContext.RequestAborted.IsCancellationRequested;
 
-    // The trace id every log line and error body of a request carries.
+    // The trace id that correlates one request's failure lines, those of this handler and of
+    // ApiExceptionBoundaryMiddleware, with the traceId member of the ProblemDetails bodies ApiProblems writes for it.
+    // No other log line carries it, the health, write-audit and check-code diagnostic lines included, and neither
+    // does the /health body.
     internal static string TraceId(HttpContext httpContext) => Activity.Current?.Id ?? httpContext.TraceIdentifier;
 
     // UseExceptionHandler clears the request's endpoint before it calls any handler and keeps the matched one on
@@ -273,6 +277,23 @@ internal sealed partial class ApiExceptionHandler(ILogger<ApiExceptionHandler> l
     {
         var type = exception.GetType();
         return type.FullName ?? type.Name;
+    }
+
+    // Writes one failure line of this handler or of ApiExceptionBoundaryMiddleware. The logger rethrows a provider's
+    // failure only after every provider has had the line, so the working sinks still get it.
+    internal static void LogBestEffort(Action log)
+    {
+        try
+        {
+            log();
+        }
+        catch (Exception)
+        {
+            // Deliberately swallowed, with nothing logged in its place: a failing log provider must never stop the
+            // error body, the 499 status or the abort that follows the line, and a throw from here would let the
+            // exception-handler middleware log and rethrow the original failure, whose inner exception can hold SQL
+            // text or a connection string.
+        }
     }
 
     [LoggerMessage(
@@ -332,7 +353,8 @@ internal sealed partial class ApiExceptionHandler(ILogger<ApiExceptionHandler> l
 /// </list>
 /// <para>
 /// Neither case is rethrown. The lines share the handler's log category and argument rules: the exception object is
-/// never given to the logger and its message is never read. The matched endpoint is still on the request here,
+/// never given to the logger and its message is never read. They are written best effort, so a failing log provider
+/// never prevents the 499 status or the abort. The matched endpoint is still on the request here,
 /// because the exception-handler middleware clears it only once it handles an exception itself.
 /// </para>
 /// </remarks>
@@ -372,11 +394,11 @@ internal sealed partial class ApiExceptionBoundaryMiddleware
         }
         catch (Exception exception) when (ApiExceptionHandler.IsClientAbort(exception, httpContext))
         {
-            ApiExceptionHandler.LogClientAbort(
+            ApiExceptionHandler.LogBestEffort(() => ApiExceptionHandler.LogClientAbort(
                 _logger,
                 ApiExceptionHandler.ResolveOperation(exception, httpContext.GetEndpoint()),
                 ApiExceptionHandler.TypeName(exception),
-                ApiExceptionHandler.TraceId(httpContext));
+                ApiExceptionHandler.TraceId(httpContext)));
 
             // The status the exception-handler middleware itself gives an aborted request; nobody receives a body.
             if (!httpContext.Response.HasStarted)
@@ -391,7 +413,7 @@ internal sealed partial class ApiExceptionBoundaryMiddleware
                 ? null
                 : ApiExceptionHandler.ResolveWriteOutcome(WriteOutcomeFeature.Get(httpContext), exception).ToWireValue();
             var (rollbackExceptionType, rollbackSqlErrorNumber) = ApiExceptionHandler.RollbackFailure(exception);
-            LogResponseAborted(
+            ApiExceptionHandler.LogBestEffort(() => LogResponseAborted(
                 _logger,
                 httpContext.Response.StatusCode,
                 ApiExceptionHandler.TypeName(exception),
@@ -400,7 +422,7 @@ internal sealed partial class ApiExceptionBoundaryMiddleware
                 writeOutcome,
                 rollbackExceptionType,
                 rollbackSqlErrorNumber,
-                ApiExceptionHandler.TraceId(httpContext));
+                ApiExceptionHandler.TraceId(httpContext)));
 
             // The client already holds a status and part of a body. Aborting the connection, which withholds the final
             // chunk, keeps it from reading the incomplete response as a whole one.

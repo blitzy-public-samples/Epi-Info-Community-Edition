@@ -13,10 +13,15 @@ namespace EpiInfo.Api.Health;
 /// <para>
 /// <b>Redaction.</b> Every result carries only the fixed <see cref="HealthyDescription"/> or
 /// <see cref="UnhealthyDescription"/>: never an exception object, an exception message or a data dictionary. The
-/// health-check service logs a result's description and exception under its own log category, which the
-/// <c>Microsoft.AspNetCore</c> level filter does not cover, and a store exception's inner exception may hold a
-/// connection string or SQL text. The check therefore catches every store failure itself, and its own log line names
-/// only the exception type, the failed store operation and the SQL error number.
+/// health-check service logs a result's description and exception, and the exception of a check that throws, under
+/// its own log category, and a store exception's inner exception may hold a connection string or SQL text. The check
+/// therefore catches every store failure itself, and its own log line names only the exception type, the failed store
+/// operation and the SQL error number.
+/// </para>
+/// <para>
+/// <b>Logging.</b> The health-check service's own per-check line is suppressed by the API's logging floors
+/// (<c>ProtectedLogLevels</c> in <c>Program.cs</c>), so this check's single Error line is the one event a failed
+/// health check writes; a healthy run writes none.
 /// </para>
 /// <para>
 /// <b>Failures.</b> A ping that returns <see langword="false"/> and a ping that throws are both Unhealthy, whatever
@@ -87,17 +92,30 @@ public sealed partial class SqlServerHealthCheck : IHealthCheck
             // The exception is never passed to the logger or the result: its ToString includes the inner exception,
             // which may hold a connection string or SQL text.
             var (operation, sqlErrorNumber) = DescribeStoreFailure(exception);
-            LogPingFailed(_logger, Name, exception.GetType().Name, operation, sqlErrorNumber);
+            LogBestEffort(() => LogPingFailed(_logger, Name, exception.GetType().Name, operation, sqlErrorNumber));
             return HealthCheckResult.Unhealthy(UnhealthyDescription);
         }
 
         if (!answered)
         {
-            LogPingNotAnswered(_logger, Name);
+            LogBestEffort(() => LogPingNotAnswered(_logger, Name));
             return HealthCheckResult.Unhealthy(UnhealthyDescription);
         }
 
         return HealthCheckResult.Healthy(HealthyDescription);
+    }
+
+    private static void LogBestEffort(Action log)
+    {
+        try
+        {
+            log();
+        }
+        catch (Exception)
+        {
+            // Deliberately swallowed: a failing log provider must never replace the Unhealthy result, since the
+            // health-check service would then report the check as thrown, with the logger's exception attached.
+        }
     }
 
     // Only the members the store exceptions document as safe to log: a fixed operation name and the SQL error number.
@@ -112,7 +130,7 @@ public sealed partial class SqlServerHealthCheck : IHealthCheck
     [LoggerMessage(
         EventId = 1,
         EventName = "HealthCheckPingFailed",
-        Level = LogLevel.Warning,
+        Level = LogLevel.Error,
         Message = "Health check {CheckName} failed with {ExceptionType} during {Operation} (SQL error {SqlErrorNumber}).")]
     private static partial void LogPingFailed(
         ILogger logger,
@@ -124,7 +142,7 @@ public sealed partial class SqlServerHealthCheck : IHealthCheck
     [LoggerMessage(
         EventId = 2,
         EventName = "HealthCheckPingNotAnswered",
-        Level = LogLevel.Warning,
+        Level = LogLevel.Error,
         Message = "Health check {CheckName} failed: the data store reported that the database did not answer.")]
     private static partial void LogPingNotAnswered(ILogger logger, string checkName);
 }

@@ -43,7 +43,9 @@ namespace EpiInfo.Domain.Diagnostics;
 /// The 1-based line number, in the form's <c>metaViews.CheckCode</c> program text, on which the construct begins.
 /// </param>
 /// <param name="Command">
-/// The keyword of the command or construct the diagnostic concerns, for example <c>GEOCODE</c> or <c>GOTO</c>.
+/// The keyword of the command or construct the diagnostic concerns, for example <c>GEOCODE</c> or <c>GOTO</c>; for an
+/// unsupported function, its name as the program writes it, in upper case, which is program text even when it is
+/// spelled like a keyword, so the log names such a diagnostic by a fixed code instead.
 /// </param>
 /// <param name="Message">
 /// Fixed, human-readable text describing the problem. It is client diagnostic text, returned in the response: a form

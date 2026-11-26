@@ -153,9 +153,9 @@ public static class FieldTypeMapper
     /// <c>smallint</c> or <c>int</c> for option. Labels and groups need no column.
     /// </description></item>
     /// <item><description>
-    /// An option is stored as its 0-based index, so the index of the last item of <c>metaFields.List</c> must fit
-    /// its column: 256 items fit <c>tinyint</c>, while 257 leave the field unsupported rather than offer index 256,
-    /// which no write could store. No item is dropped or renumbered, and a list with no item is admitted.
+    /// An option on an admitted column stays an option whatever the item count of <c>metaFields.List</c>, keeping
+    /// every item at its 0-based index. A submitted index its column cannot store, such as 256 on <c>tinyint</c>,
+    /// is rejected when the record is validated, by the storage-range check of <see cref="IsRepresentable"/>.
     /// </description></item>
     /// </list>
     /// </remarks>
@@ -188,19 +188,7 @@ public static class FieldTypeMapper
             return UnsupportedResult(field);
         }
 
-        if (!IsAdmitted(candidate, field.Column))
-        {
-            return UnsupportedResult(field);
-        }
-
-        // The column admission judges the column alone. An option is stored as its 0-based index, so the index of the
-        // last item must fit the column too.
-        if (candidate == FieldType.Option && field.Column is { } column && !LastOptionIndexFits(field.List, column))
-        {
-            return UnsupportedResult(field);
-        }
-
-        return (candidate, false, null);
+        return IsAdmitted(candidate, field.Column) ? (candidate, false, null) : UnsupportedResult(field);
     }
 
     /// <summary>
@@ -218,8 +206,9 @@ public static class FieldTypeMapper
     /// <see cref="FieldType.Unsupported"/>.
     /// </returns>
     /// <remarks>
-    /// The rule judges the column alone. The items of an Option field are <see cref="Map"/>'s separate check: the
-    /// index of the last item must also fit the column.
+    /// The rule judges the column alone, so an Option field keeps every item and its index numbering whatever its
+    /// item count. A submitted index the column cannot store is rejected by <see cref="IsRepresentable"/>, the
+    /// record validator's storage-range check.
     /// </remarks>
     public static bool IsAdmitted(FieldType type, ColumnMetadata? column) => type switch
     {
@@ -414,33 +403,6 @@ public static class FieldTypeMapper
         var itemText = list.AsSpan();
         var separator = itemText.IndexOf("||", StringComparison.Ordinal);
         return separator >= 0 ? itemText[..separator] : itemText;
-    }
-
-    // 257 items on tinyint would offer index 256, which no write can store, so such a field is unsupported rather
-    // than offering a choice it cannot save; no item is dropped or renumbered. A list with no item offers no index.
-    // The items are counted in place, as ParseOptionItems splits them: each comma starts the next index, and the
-    // count stops at the first index past the column's maximum, so a stored list of any length allocates nothing
-    // here. A column with no integer range stores no index.
-    private static bool LastOptionIndexFits(string? list, ColumnMetadata column)
-    {
-        if (IntegerRange(column.SqlTypeName) is not { } range)
-        {
-            return false;
-        }
-
-        var remaining = OptionItemText(list);
-        var lastIndex = 0L;
-        for (var comma = remaining.IndexOf(','); comma >= 0; comma = remaining.IndexOf(','))
-        {
-            if (++lastIndex > range.Max)
-            {
-                return false;
-            }
-
-            remaining = remaining[(comma + 1)..];
-        }
-
-        return true;
     }
 
     // Integer columns decide on the exact integer, never on the nearest double, as FieldValue requires: a number

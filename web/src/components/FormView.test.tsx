@@ -17,7 +17,8 @@
 // open or Back to forms continues, and a failed save keeps the draft and cancels the move;
 // the first Save of a new record follows canInsert and Save of a stored record canUpdate,
 // and a 403 keeps the draft; the validation summary lists each errored field's prompt
-// with its message, from client validation or a field-level 400.
+// with its message, from client validation or a field-level 400. The connection-banner
+// cases answer their own outage reads and failed writes, and check the banner each shows.
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vitest';
 
@@ -35,6 +36,7 @@ import type {
   RecordDto,
   RecordPage,
   Values,
+  WriteOutcome,
   WriteProblemDetails,
 } from '../api/types';
 import {
@@ -757,7 +759,7 @@ describe('FormView accessible structure (SC-8)', () => {
     }));
     const severity = fieldByName('IllnessSeverity', definition);
     const prompt = promptOf(severity);
-    const message = formatRequiredMessage(severity.prompt, severity.name, pageOf(definition, severity.pageId).name);
+    const message = formatRequiredMessage(severity.prompt, pageOf(definition, severity.pageId).name);
     const recordsPath = `/api/forms/${definition.viewId}/records`;
     // The one write this case makes: a POST the server's required gate rejects. The client
     // leaves option fields to that gate, as legacy data entry never required them.
@@ -1803,5 +1805,223 @@ describe('FormView with no pages', () => {
     expect(screen.getByRole('toolbar', { name: 'Form actions' })).toBeTruthy();
     expect(screen.getByRole('toolbar', { name: 'Record navigation' })).toBeTruthy();
     expect(screen.getByRole('region', { name: 'Records' })).toBeTruthy();
+  });
+});
+
+describe('FormView connection banners', () => {
+  // These cases answer the writes they make, so they route their own requests. Reads fall
+  // through to the read routes above, and any other request still fails the test.
+
+  /** The answer a case gives one request instead of the read routes; `undefined` leaves it to them. */
+  type Answer = Response | 'no response' | undefined;
+
+  const RECORD_PATH = `${FORM_PATH}/records/${RECORD.globalRecordId}`;
+  const TRACE_ID = '00-test-unavailable-00';
+  const UNAVAILABLE_PROBLEM = {
+    type: 'https://tools.ietf.org/html/rfc9110#section-15.6.4',
+    title: 'Service Unavailable',
+    status: 503,
+    detail: 'The database is unavailable.',
+    traceId: TRACE_ID,
+  } as const satisfies ProblemDetails;
+
+  /** A 503, carrying `writeOutcome` as a record write's does when one is given. */
+  function unavailable(writeOutcome?: WriteOutcome): Response {
+    if (writeOutcome === undefined) {
+      return jsonResponse(503, UNAVAILABLE_PROBLEM);
+    }
+    const body: WriteProblemDetails = { ...UNAVAILABLE_PROBLEM, writeOutcome };
+    return jsonResponse(503, body);
+  }
+
+  /** A fetch that answers through `answer` first, then the read routes, recording every request. */
+  function answeringApi(definition: FormDefinition, answer: (call: Call) => Answer): typeof fetch {
+    return async (input, init) => {
+      const request = input instanceof Request ? input : new Request(input, init);
+      const url = new URL(request.url);
+      const text = await request.text();
+      const call: Call = { method: request.method, url, body: text === '' ? null : text };
+      calls.push(call);
+
+      const answered = answer(call);
+      if (answered === 'no response') {
+        // What fetch does when no response arrives.
+        throw new TypeError('Failed to fetch');
+      }
+      if (answered !== undefined) {
+        return answered;
+      }
+      const body = readRouteBody(call.method, url.pathname, definition, [RECORD]);
+      if (body === null) {
+        unrouted.push(requestLine(call));
+        return jsonResponse(500, UNROUTED_PROBLEM);
+      }
+      return jsonResponse(200, body);
+    };
+  }
+
+  function renderWith(answer: (call: Call) => Answer): void {
+    const definition = createFormDefinitionFixture();
+    const client = createApiClient({ baseUrl: 'http://localhost', fetch: answeringApi(definition, answer) });
+    render(<FormView viewId={definition.viewId} client={client} onExit={vi.fn()} onFormNotFound={vi.fn()} />);
+  }
+
+  async function loaded(): Promise<void> {
+    await within(await screen.findByRole('toolbar', { name: 'Record navigation' })).findByText('1 of 1');
+  }
+
+  function linesOf(method: string): string[] {
+    return calls.filter((call) => call.method === method).map(requestLine);
+  }
+
+  function formAction(name: string): HTMLElement {
+    return within(screen.getByRole('toolbar', { name: 'Form actions' })).getByRole('button', { name });
+  }
+
+  it.each<{ label: string; failure: () => Answer; text: string }>([
+    { label: 'a 503', failure: () => unavailable(), text: 'The database cannot be reached.' },
+    { label: 'no response', failure: () => 'no response', text: 'The server could not be reached.' },
+  ])('says only what cannot be reached, with Retry, when the form definition gets $label', async ({
+    failure,
+    text,
+  }) => {
+    let failed = false;
+    renderWith((call) => {
+      if (!failed && call.method === 'GET' && call.url.pathname === FORM_PATH) {
+        failed = true;
+        return failure();
+      }
+      return undefined;
+    });
+
+    const alert = await screen.findByRole('alert');
+    // Nothing is open yet, so there is no draft to speak of.
+    expect(within(alert).getByText(text)).toBeTruthy();
+    expect(alert.textContent).not.toContain('still on screen');
+
+    fireEvent.click(within(alert).getByRole('button', { name: 'Retry' }));
+
+    await loaded();
+    expect(linesOf('GET').filter((line) => line === `GET ${FORM_PATH}`)).toHaveLength(2);
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+
+  it.each<{
+    label: string;
+    create: boolean;
+    failure: () => Answer;
+    saveAgainName: string;
+    duplicate: boolean;
+  }>([
+    {
+      label: 'a create that got no response',
+      create: true,
+      failure: () => 'no response',
+      saveAgainName: 'Save again (this may create a duplicate record)',
+      duplicate: true,
+    },
+    {
+      label: 'an update answered 503 with writeOutcome unknown',
+      create: false,
+      failure: () => unavailable('unknown'),
+      saveAgainName: 'Save again (the earlier save may already have been applied)',
+      duplicate: false,
+    },
+  ])('shows the risk before an explicit Save again, and no Retry, for $label', async ({
+    create,
+    failure,
+    saveAgainName,
+    duplicate,
+  }) => {
+    const method = create ? 'POST' : 'PUT';
+    const path = create ? `${FORM_PATH}/records` : RECORD_PATH;
+    renderWith((call) => (call.method === method && call.url.pathname === path ? failure() : undefined));
+    await loaded();
+    const navigator = screen.getByRole('toolbar', { name: 'Record navigation' });
+    if (create) {
+      fireEvent.click(within(navigator).getByRole('button', { name: 'New' }));
+      await within(navigator).findByText('New record');
+    }
+
+    fireEvent.change(screen.getByLabelText('Last Name'), { target: { value: 'Byron' } });
+    fireEvent.click(formAction('Save'));
+
+    const alert = await screen.findByRole('alert');
+    // Visible text, not only an accessible name: the banner says what the save may have done.
+    const text = alert.textContent ?? '';
+    expect(text).toContain('may already have been applied');
+    expect(text).toContain('cannot prove');
+    expect(text).toContain('Your changes are still on screen.');
+    if (duplicate) {
+      expect(text).toContain('Saving again may create a duplicate record.');
+    } else {
+      expect(text).not.toContain('duplicate');
+    }
+    const saveAgain = within(alert).getByRole('button', { name: saveAgainName });
+    expect(saveAgain.textContent).toBe('Save again');
+    expect(within(alert).queryByRole('button', { name: 'Retry' })).toBeNull();
+    expect(within(alert).getByRole('button', { name: 'Dismiss' })).toBeTruthy();
+    // Nothing was resent without the user's explicit action.
+    expect(linesOf(method)).toEqual([`${method} ${path}`]);
+  });
+
+  it.each<{ label: string; failure: () => Answer; text: string; traced: boolean }>([
+    {
+      label: 'a 503 with writeOutcome notWritten',
+      failure: () => unavailable('notWritten'),
+      text: 'The delete could not be confirmed: the database cannot be reached.',
+      traced: true,
+    },
+    {
+      label: 'a 503 without writeOutcome',
+      failure: () => unavailable(),
+      text: 'The delete could not be confirmed: the database cannot be reached.',
+      traced: true,
+    },
+    {
+      label: 'no response',
+      failure: () => 'no response',
+      text: 'The delete could not be confirmed: the server could not be reached.',
+      traced: false,
+    },
+  ])('shows the connection banner with Retry when a confirmed delete gets $label', async ({
+    failure,
+    text,
+    traced,
+  }) => {
+    let deletes = 0;
+    renderWith((call) => {
+      if (call.method !== 'DELETE' || call.url.pathname !== RECORD_PATH) {
+        return undefined;
+      }
+      deletes += 1;
+      return deletes === 1 ? failure() : new Response(null, { status: 204 });
+    });
+    await loaded();
+
+    fireEvent.click(formAction('Delete'));
+    const dialog = await screen.findByRole('dialog');
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Delete record' }));
+
+    const alert = await screen.findByRole('alert');
+    // The confirmation discarded the draft, so the banner does not speak of one.
+    expect(within(alert).getByText(text)).toBeTruthy();
+    expect(alert.textContent).not.toContain('still on screen');
+    // The server's trace id, on a line of its own, whenever a response carried one.
+    expect(within(alert).queryByText(`Trace id: ${TRACE_ID}`) !== null).toBe(traced);
+    expect(within(alert).getByRole('button', { name: 'Dismiss' })).toBeTruthy();
+    expect(within(alert).queryByRole('button', { name: /Save again/ })).toBeNull();
+    expect(linesOf('DELETE')).toEqual([`DELETE ${RECORD_PATH}`]);
+
+    fireEvent.click(within(alert).getByRole('button', { name: 'Retry' }));
+
+    // The resent DELETE succeeds, and the navigator opens the nearest record, the first again.
+    await waitFor(() => {
+      expect(linesOf('GET').filter((line) => line.startsWith(`GET ${FORM_PATH}/records/at/1`))).toHaveLength(2);
+    });
+    await loaded();
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(linesOf('DELETE')).toEqual([`DELETE ${RECORD_PATH}`, `DELETE ${RECORD_PATH}`]);
+    expect(linesOf('PUT')).toEqual([]);
   });
 });

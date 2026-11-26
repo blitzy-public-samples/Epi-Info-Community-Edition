@@ -28,6 +28,29 @@ function formButtonText(form: FormSummary): string {
   return `${form.name} — ${String(form.pageCount)} ${unit}`;
 }
 
+/**
+ * The status line's text, and whether it is shown. Loading and an empty result are shown;
+ * the loaded count is visually hidden, because the buttons already show the forms. A
+ * failure leaves it empty: the error banner is an alert of its own.
+ */
+function statusOf(state: FormsListState): { readonly text: string; readonly shown: boolean } {
+  switch (state.status) {
+    case 'loading':
+      return { text: 'Loading forms…', shown: true };
+
+    case 'loaded': {
+      const count = state.forms.length;
+      if (count === 0) {
+        return { text: 'No forms found.', shown: true };
+      }
+      return { text: `${String(count)} ${count === 1 ? 'form' : 'forms'}`, shown: false };
+    }
+
+    case 'failed':
+      return { text: '', shown: false };
+  }
+}
+
 /** Lists the project's forms, one button per form, with loading, empty and error states. */
 export function FormsList({ client = apiClient, onOpen }: FormsListProps) {
   const headingId = useId();
@@ -75,11 +98,18 @@ export function FormsList({ client = apiClient, onOpen }: FormsListProps) {
     load();
   }, [load]);
 
+  const status = statusOf(state);
+
   return (
     <section className="forms-list" aria-labelledby={headingId}>
       <h2 id={headingId} ref={headingRef} tabIndex={-1}>
         Forms
       </h2>
+      {/* Always rendered, so the loaded count and the empty result are announced as well as
+          the loading text: a live region replaced, or inserted with its text, is not. */}
+      <p role="status" className={status.shown ? undefined : 'visually-hidden'}>
+        {status.text}
+      </p>
       <FormsListBody state={state} onOpen={onOpen} onRetry={retry} />
     </section>
   );
@@ -94,11 +124,13 @@ interface FormsListBodyProps {
 function FormsListBody({ state, onOpen, onRetry }: FormsListBodyProps) {
   switch (state.status) {
     case 'loading':
-      return <p role="status">Loading forms…</p>;
+      // The status line says so.
+      return null;
 
     case 'loaded':
       if (state.forms.length === 0) {
-        return <p>No forms found.</p>;
+        // The status line says so.
+        return null;
       }
       return (
         <ul>

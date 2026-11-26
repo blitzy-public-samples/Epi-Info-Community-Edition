@@ -571,18 +571,21 @@ interface EditorBannerViewProps {
 
 /**
  * A failed save or delete. The editor decided the text and the actions; this only shows
- * them, and the draft stays on screen in every case. A POST or PUT that got a 503 or no
- * response goes through ConnectionError, which offers Retry only when nothing was written
- * and otherwise an explicit "Save again". A DELETE keeps the editor's own text, because
- * its confirmation already discarded the draft that ConnectionError's text speaks of.
+ * them. A POST, PUT or DELETE that got a 503 or no response goes through ConnectionError
+ * with the editor's text. A save's text says that the draft is still on screen, or that
+ * the save may already have been applied, which for a create risks a duplicate record. A
+ * delete's confirmation already discarded the draft, so its text says only that the
+ * delete could not be confirmed. ConnectionError offers Retry only when resending is safe,
+ * and otherwise an explicit "Save again".
  */
 function EditorBannerView({ banner, editor }: EditorBannerViewProps) {
-  if (banner.method !== 'DELETE' && isConnectionFailure(banner.error)) {
+  if (isConnectionFailure(banner.error)) {
     return (
       <ConnectionError
         error={banner.error}
         method={banner.method}
         isCreate={banner.isCreate}
+        message={banner.message}
         onRetry={
           banner.actions.includes('retry')
             ? () => {
@@ -663,4 +666,3 @@ function BannerActionButton({ action, isCreate, editor }: BannerActionButtonProp
       );
   }
 }
-

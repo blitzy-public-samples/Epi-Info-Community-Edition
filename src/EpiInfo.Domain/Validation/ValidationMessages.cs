@@ -107,23 +107,19 @@ public static class ValidationMessages
     public const string NotALegalValue = "The value is not one of the field's legal values.";
 
     /// <summary>
-    /// Formats <see cref="FieldIsRequiredLong"/> for one missing field. The prompt is used exactly as stored,
-    /// line breaks included; a field without a prompt is named by its field name instead.
+    /// Formats <see cref="FieldIsRequiredLong"/> for one missing field, as legacy formats it with the field's prompt
+    /// and its page name. The prompt is inserted exactly as stored, line breaks, an empty prompt and a prompt of
+    /// whitespace only included, and a <c>null</c> prompt is inserted as empty text, as <c>string.Format</c> renders
+    /// a null argument.
     /// </summary>
     /// <param name="prompt">The field's <c>metaFields.PromptText</c>, or <c>null</c> when it has none.</param>
-    /// <param name="fieldName">The canonical <c>metaFields.Name</c>, used when the prompt is blank.</param>
     /// <param name="pageName">The name of the page that holds the field.</param>
-    /// <exception cref="ArgumentNullException"><paramref name="fieldName"/> or <paramref name="pageName"/> is <c>null</c>.</exception>
-    public static string FormatFieldIsRequired(string? prompt, string fieldName, string pageName)
+    /// <exception cref="ArgumentNullException"><paramref name="pageName"/> is <c>null</c>.</exception>
+    public static string FormatFieldIsRequired(string? prompt, string pageName)
     {
-        ArgumentNullException.ThrowIfNull(fieldName);
         ArgumentNullException.ThrowIfNull(pageName);
 
-        return string.Format(
-            CultureInfo.InvariantCulture,
-            FieldIsRequiredLong,
-            string.IsNullOrWhiteSpace(prompt) ? fieldName : prompt,
-            pageName);
+        return string.Format(CultureInfo.InvariantCulture, FieldIsRequiredLong, prompt ?? string.Empty, pageName);
     }
 
     /// <summary>Formats <see cref="OptionIndexOutOfRange"/> from the number of options the field offers.</summary>

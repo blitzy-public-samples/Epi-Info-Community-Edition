@@ -25,15 +25,28 @@ public sealed class MaskPatternTests
     private const string TemperatureMask = "###.#";
     private const string DateMask = "MM-DD-YYYY";
 
+    // A digit mask whose last position is the literal digit 2.
+    private const string LiteralDigitMask = "##-2";
+
     // 18 and 19 integer positions: 999999999999999999 has 18 digits, and long.MaxValue and 1E+18 have 19.
     private const string EighteenDigitMask = "##################";
     private const string NineteenDigitMask = "###################";
 
+    /// <summary>
+    /// A pattern with a <c>#</c> and no letter is a digit mask; a digit in it, such as the <c>2</c> of
+    /// <c>##-2</c>, is a literal like any other non-<c>#</c> character.
+    /// </summary>
     [Theory]
     [InlineData(PhoneMask, FieldType.Text)]
     [InlineData(ShortPhoneMask, FieldType.Text)]
     [InlineData(PhoneMask, FieldType.Multiline)]
     [InlineData(ShortPhoneMask, FieldType.LegalValues)]
+    [InlineData(LiteralDigitMask, FieldType.Text)]
+    [InlineData(LiteralDigitMask, FieldType.Multiline)]
+    [InlineData(LiteralDigitMask, FieldType.LegalValues)]
+    [InlineData("2##", FieldType.Text)]
+    [InlineData("(0)###", FieldType.Multiline)]
+    [InlineData("1-###-###-####", FieldType.LegalValues)]
     public void Classify_DigitMaskOnTextFamilyField_IsTextDigitMask(string pattern, FieldType fieldType)
     {
         Assert.Equal(MaskPatternKind.TextDigitMask, MaskPattern.Classify(pattern, fieldType));
@@ -58,7 +71,8 @@ public sealed class MaskPatternTests
 
     /// <summary>
     /// A date pattern is a display and entry format for the client only, even when written as a <c>#</c> mask,
-    /// and any pattern of a shape the rule does not recognise gets no server check.
+    /// and any pattern of a shape the rule does not recognise, such as a text pattern with a letter beside its
+    /// <c>#</c> positions, gets no server check.
     /// </summary>
     [Theory]
     [InlineData(DateMask, FieldType.Date)]
@@ -67,6 +81,9 @@ public sealed class MaskPatternTests
     [InlineData("AAA", FieldType.Text)]
     [InlineData(DateMask, FieldType.Text)]
     [InlineData("---", FieldType.Text)]
+    [InlineData("ABC-###", FieldType.Text)]
+    [InlineData("ABC-###", FieldType.Multiline)]
+    [InlineData("A2##", FieldType.LegalValues)]
     [InlineData("AAA", FieldType.Number)]
     [InlineData(PhoneMask, FieldType.Number)]
     [InlineData("##.", FieldType.Number)]
@@ -169,6 +186,8 @@ public sealed class MaskPatternTests
     [Theory]
     [InlineData(PhoneMask, "555-014-8636")]
     [InlineData(ShortPhoneMask, "014-8636")]
+    [InlineData(LiteralDigitMask, "12-2")]
+    [InlineData("(0)###", "(0)555")]
     public void TextMask_ValueFittingMaskExactly_IsAccepted(string mask, string text)
     {
         Assert.True(MaskPattern.MatchesTextMask(mask, text));
@@ -189,6 +208,11 @@ public sealed class MaskPatternTests
     [InlineData(PhoneMask, "")]
     [InlineData(ShortPhoneMask, "0148636")]
     [InlineData(ShortPhoneMask, "014-863")]
+    [InlineData(LiteralDigitMask, "12-3")] // another digit in place of the literal digit
+    [InlineData(LiteralDigitMask, "1222")] // a digit in place of the literal hyphen
+    [InlineData(LiteralDigitMask, "12-22")] // too long
+    [InlineData(LiteralDigitMask, "12-")] // too short: the literal digit is missing
+    [InlineData("(0)###", "(1)555")] // another digit in place of the literal digit
     public void TextMask_ValueNotFittingMask_IsRejected(string mask, string text)
     {
         Assert.False(MaskPattern.MatchesTextMask(mask, text));

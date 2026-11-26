@@ -4,6 +4,7 @@ using System.Net.Http.Headers;
 using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
+using EpiInfo.Api.Errors;
 using EpiInfo.Api.Hosting;
 using EpiInfo.Api.Tests.Infrastructure;
 using EpiInfo.Domain.Values;
@@ -15,6 +16,7 @@ using Microsoft.AspNetCore.Server.Kestrel.Core;
 using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Xunit.Sdk;
 using BadHttpRequestException = Microsoft.AspNetCore.Http.BadHttpRequestException;
@@ -125,7 +127,9 @@ public sealed class BodyLimitHostFixture : IAsyncLifetime
 /// <para>
 /// On the body endpoints a body one byte over the limit, declared or chunked, is the fixed 413 ProblemDetails and
 /// reaches no handler; a valid JSON body padded with insignificant whitespace to exactly the limit gets the handler's
-/// exact success. Both rules are proved through the API's own composition, <c>Program.cs</c> hosted by
+/// exact success. Through the API's own composition the 413 also leaves exactly one Information <c>RequestFailed</c>
+/// line of <see cref="ApiExceptionHandler"/> whose <c>TraceId</c> is the body's <c>traceId</c>, however the body is
+/// framed. Both rules are proved through the API's own composition, <c>Program.cs</c> hosted by
 /// <see cref="ApiFactory"/> on TestServer and by <see cref="KestrelApiFactory"/> on real Kestrel, each case on its own
 /// host and store, and again on <see cref="GuardPipelineHost"/> hosts, which run the same guards in either order: the
 /// 413 on the shared hosts of <see cref="BodyLimitHostFixture"/>, whose store no case calls, and the exact-limit
@@ -140,7 +144,7 @@ public sealed class BodyLimitHostFixture : IAsyncLifetime
 /// </para>
 /// <para>
 /// The guard's own rules are also pinned by invoking it directly: which requests get the raised server limit, which
-/// pass through untouched, and the counting stream's read bound.
+/// pass through untouched, the counting stream's read bound, and when a body-read failure a reader caught is rethrown.
 /// </para>
 /// <para>
 /// TestServer is reached through its in-process <see cref="HttpClient"/>, and the composition's Kestrel through
@@ -205,6 +209,13 @@ public sealed class BodyLimitTests : IClassFixture<BodyLimitHostFixture>
     private const int SmallBuffer = 3;
 
     private const char Padding = ' ';
+
+    // The exception handler's failure line: its event id and name, under the handler's log category.
+    private const int RequestFailedEventId = 1;
+
+    private const string RequestFailedEvent = "RequestFailed";
+
+    private static readonly string HandlerCategory = typeof(ApiExceptionHandler).FullName!;
 
     private static readonly CommittedSettings Committed = CommittedSettings.Read();
 
@@ -336,6 +347,29 @@ public sealed class BodyLimitTests : IClassFixture<BodyLimitHostFixture>
 
         /// <summary>An offset and count that run past the end of the buffer.</summary>
         CountPastEnd,
+    }
+
+    /// <summary>Where the <see cref="BadHttpRequestException"/> of a failed body read comes from.</summary>
+    public enum ReadFailureSource
+    {
+        /// <summary>The guard's counting stream, past its limit.</summary>
+        Guard,
+
+        /// <summary>The server's body stream under the guard, as Kestrel's own limit raises it.</summary>
+        ServerBodyStream,
+    }
+
+    /// <summary>How a reader that caught a failed body read ends the request, as binding or an endpoint may.</summary>
+    public enum ReaderEnding
+    {
+        /// <summary>The exception's status and no body, as JSON binding ends it.</summary>
+        EmptyWithItsStatus,
+
+        /// <summary>Another status of the reader's own choosing, with no body.</summary>
+        OtherStatus,
+
+        /// <summary>The exception's status on a response that has already started.</summary>
+        StartedWithItsStatus,
     }
 
     /// <summary>The configured limit: 1,048,576 bytes, read from the committed <c>appsettings.json</c>.</summary>
@@ -665,6 +699,29 @@ public sealed class BodyLimitTests : IClassFixture<BodyLimitHostFixture>
         }
     }
 
+    /// <summary>
+    /// Each source of a failed body read, read overload, and way the reader that caught the failure ends the request.
+    /// </summary>
+    public static TheoryData<ReadFailureSource, ReadOverload, ReaderEnding> SwallowedReadFailureCases
+    {
+        get
+        {
+            var data = new TheoryData<ReadFailureSource, ReadOverload, ReaderEnding>();
+            foreach (ReadFailureSource source in Enum.GetValues<ReadFailureSource>())
+            {
+                foreach (ReadOverload overload in AllReadOverloads)
+                {
+                    foreach (ReaderEnding ending in Enum.GetValues<ReaderEnding>())
+                    {
+                        data.Add(source, overload, ending);
+                    }
+                }
+            }
+
+            return data;
+        }
+    }
+
     // The API's own composition, Program.cs on real Kestrel, sets Kestrel's cap to the committed limit, which is also
     // the default and the largest limit the API options allow.
     [Fact]
@@ -837,6 +894,43 @@ public sealed class BodyLimitTests : IClassFixture<BodyLimitHostFixture>
 
         Assert.True(response.BodyFullySent ?? true, "The request body was not fully sent before the response.");
         AssertHandlerSuccess(response, endpoint, api.Store, input, writesBefore: 0);
+    }
+
+    // AAP 0.3.4.2: through the API's own composition, the 413 of one byte over the limit leaves exactly one line of
+    // the exception handler, its Information RequestFailed line with status 413 and the guard's exception type, whose
+    // TraceId is the 413 body's traceId, declared or chunked, on every body endpoint and both servers. A declared
+    // length throws before the endpoint; a chunked body overflows inside JSON binding, which answers it with an empty
+    // 413, so the chunked cases pin the guard's rethrow of the failure binding swallowed.
+    [Theory]
+    [MemberData(nameof(CompositionCases))]
+    public async Task ApiCompositionLogsOneRequestFailedLineCarryingThe413BodysTraceId(
+        ServerKind server,
+        BodyEndpoint endpoint,
+        BodyFraming framing)
+    {
+        await using ComposedApiHost api = ComposedApiHost.Start(server);
+        var input = new CaseInput(TestDatabase.NewMarker(), api.RecordId);
+        BodyRequest request = EndpointRequest(endpoint, input, Limit + 1, JsonMediaType, framing);
+        Assert.Equal(1_048_577, request.Body.Length);
+
+        ReceivedResponse response = await api.SendAsync(request);
+
+        AssertProblem(response, HttpStatusCode.RequestEntityTooLarge, ExpectedRequestTooLargeDetail);
+        string? traceId;
+        using (JsonDocument document = ParseJson(response))
+        {
+            traceId = document.RootElement.GetProperty(TraceIdMember).GetString();
+        }
+
+        CapturedLogEntry line = Assert.Single(api.Logs.Find(entry => entry.Category == HandlerCategory));
+        Assert.Equal(RequestFailedEventId, line.EventId.Id);
+        Assert.Equal(RequestFailedEvent, line.EventId.Name);
+        Assert.Equal(LogLevel.Information, line.Level);
+        Assert.Null(line.ExceptionType);
+        Assert.Equal(StatusCodes.Status413PayloadTooLarge, StateValue(line, "StatusCode"));
+        Assert.Equal(typeof(BadHttpRequestException).FullName, StateValue(line, "ExceptionType"));
+        Assert.Equal(traceId, StateValue(line, "TraceId"));
+        Assert.Empty(api.Store.Calls);
     }
 
     // Exact HTTP/1.1 chunk framing on Kestrel: every chunking of the exact limit carries more wire bytes than the
@@ -1338,6 +1432,93 @@ public sealed class BodyLimitTests : IClassFixture<BodyLimitHostFixture>
         Assert.Empty(inner.Requests);
     }
 
+    // Invoked directly, with a reader that catches the BadHttpRequestException of a failed body read, the guard's own
+    // 413 or one the server's body stream raised, through any read overload. Ended as JSON binding ends it, with the
+    // exception's status and no body, the guard rethrows that same instance with the stack trace of its read, so the
+    // exception handler answers and logs it. A status the reader chose itself, or a response it started, stands, and
+    // nothing is thrown.
+    [Theory]
+    [MemberData(nameof(SwallowedReadFailureCases))]
+    public async Task SwallowedReadFailureIsRethrownOnlyFromAnEmptyResponseWithItsStatus(
+        ReadFailureSource source,
+        ReadOverload overload,
+        ReaderEnding ending)
+    {
+        var serverFailure = new BadHttpRequestException("Body too large.", StatusCodes.Status413PayloadTooLarge);
+        using Stream inner = source switch
+        {
+            ReadFailureSource.Guard => new RecordingBodyStream(SmallLimit + 1, int.MaxValue),
+            ReadFailureSource.ServerBodyStream => new FailingBodyStream(serverFailure),
+            _ => throw new ArgumentOutOfRangeException(nameof(source), source, "Not a read failure source."),
+        };
+        DefaultHttpContext context = CreateContext(
+            EndpointShape.JsonBody,
+            JsonMediaType,
+            contentLength: null,
+            chunked: true,
+            inner,
+            feature: null);
+        BadHttpRequestException? swallowed = null;
+
+        Exception? thrown = await Record.ExceptionAsync(() => InvokeGuardAsync(context, SmallLimit, async downstream =>
+        {
+            var buffer = new byte[LargeBuffer];
+            try
+            {
+                int read;
+                do
+                {
+                    read = await ReadOnceAsync(downstream.Request.Body, overload, buffer);
+                }
+                while (read > 0);
+            }
+            catch (BadHttpRequestException failure)
+            {
+                swallowed = failure;
+            }
+
+            Assert.NotNull(swallowed);
+            switch (ending)
+            {
+                case ReaderEnding.EmptyWithItsStatus:
+                    downstream.Response.StatusCode = swallowed.StatusCode;
+                    break;
+
+                case ReaderEnding.OtherStatus:
+                    downstream.Response.StatusCode = StatusCodes.Status400BadRequest;
+                    break;
+
+                case ReaderEnding.StartedWithItsStatus:
+                    downstream.Features.Set<IHttpResponseFeature>(
+                        new StartedResponseFeature { StatusCode = swallowed.StatusCode });
+                    break;
+
+                default:
+                    throw new ArgumentOutOfRangeException(nameof(ending), ending, "Not a reader ending.");
+            }
+        }));
+
+        Assert.NotNull(swallowed);
+        Assert.Equal(StatusCodes.Status413PayloadTooLarge, swallowed.StatusCode);
+        if (source == ReadFailureSource.ServerBodyStream)
+        {
+            Assert.Same(serverFailure, swallowed);
+        }
+
+        if (ending == ReaderEnding.EmptyWithItsStatus)
+        {
+            BadHttpRequestException rethrown = Assert.IsType<BadHttpRequestException>(thrown);
+            Assert.Same(swallowed, rethrown);
+            Assert.Contains("LimitedReadStream", rethrown.StackTrace, StringComparison.Ordinal);
+            return;
+        }
+
+        Assert.Null(thrown);
+        Assert.Equal(
+            ending == ReaderEnding.OtherStatus ? StatusCodes.Status400BadRequest : StatusCodes.Status413PayloadTooLarge,
+            context.Response.StatusCode);
+    }
+
     // The framing budget the guard gives a chunked body on top of its payload: one-byte chunks carry the most framing
     // an extension-free, canonically sized chunking can, "1\r\n" before and "\r\n" after each byte, 5 bytes per payload
     // byte, and the last chunk "0\r\n" with the "\r\n" ending an empty trailer adds 5.
@@ -1561,6 +1742,10 @@ public sealed class BodyLimitTests : IClassFixture<BodyLimitHostFixture>
         Assert.Equal(submittedText, body.GetProperty("values").GetProperty(TextField).GetString());
         return id;
     }
+
+    // The value of one structured state pair of a captured log entry.
+    private static object? StateValue(CapturedLogEntry entry, string key) =>
+        Assert.Single(entry.State, pair => pair.Key == key).Value;
 
     private static void AssertEveryReadBounded(RecordingBodyStream inner, long limit)
     {
@@ -1873,6 +2058,9 @@ public sealed class BodyLimitTests : IClassFixture<BodyLimitHostFixture>
         /// </summary>
         public string RecordId { get; }
 
+        /// <summary>Every log entry the committed filters let through on this host.</summary>
+        public CapturingLoggerProvider Logs => _factory.Logs;
+
         /// <summary>Starts the composition on <paramref name="server"/>; the caller disposes the host.</summary>
         /// <param name="server">The server to host it on.</param>
         /// <returns>The started host.</returns>
@@ -2115,6 +2303,61 @@ public sealed class BodyLimitTests : IClassFixture<BodyLimitHostFixture>
             Supplied += served;
             return served;
         }
+    }
+
+    /// <summary>
+    /// A server body stream whose every read fails with one <see cref="BadHttpRequestException"/>, as Kestrel's does
+    /// once a body passes its own limit.
+    /// </summary>
+    private sealed class FailingBodyStream : Stream
+    {
+        private readonly BadHttpRequestException _failure;
+
+        public FailingBodyStream(BadHttpRequestException failure)
+        {
+            _failure = failure;
+        }
+
+        public override bool CanRead => true;
+
+        public override bool CanSeek => false;
+
+        public override bool CanWrite => false;
+
+        public override long Length => throw new NotSupportedException();
+
+        public override long Position
+        {
+            get => throw new NotSupportedException();
+            set => throw new NotSupportedException();
+        }
+
+        public override int Read(byte[] buffer, int offset, int count) => throw _failure;
+
+        public override int Read(Span<byte> buffer) => throw _failure;
+
+        public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken) =>
+            Task.FromException<int>(_failure);
+
+        public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default) =>
+            ValueTask.FromException<int>(_failure);
+
+        public override void Flush()
+        {
+            // Read-only: nothing is ever written, so there is nothing to flush.
+        }
+
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+
+        public override void SetLength(long value) => throw new NotSupportedException();
+
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    }
+
+    /// <summary>A response feature whose response has started, as once an endpoint has sent its headers.</summary>
+    private sealed class StartedResponseFeature : HttpResponseFeature
+    {
+        public override bool HasStarted => true;
     }
 
     /// <summary>A read-only, non-seekable view of a byte array, so its length cannot be computed.</summary>

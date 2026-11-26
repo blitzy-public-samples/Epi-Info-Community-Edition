@@ -10,10 +10,18 @@
 // read, the query string follows the shell: `?view=<name>&record=<n>` while a form is
 // open, without `record` for a new record or before the first one opens, and the bare
 // path `/` on the forms list.
+//
+// The URL's request ends only when it is settled: the form opens, the forms list proves no
+// form has that name, or the user chooses "Show forms list". A lookup that fails (a 503, a
+// lost response, an OK answer that is not a forms list, or any other error) leaves the form
+// unknown, so the request and its URL are kept and Retry repeats the open; `GET /api/forms`
+// is safe to send again.
 import { useCallback, useEffect, useRef, useState, type FocusEvent, type ReactNode } from 'react';
 
-import { apiClient, type ApiClient } from './api/client';
+import { apiClient, type ApiClient, type ApiResult } from './api/client';
+import { describeError, networkError, parseProblem, type ApiError } from './api/errors';
 import type { FormSummary } from './api/types';
+import { ConnectionError } from './components/ConnectionError';
 import { FormView } from './components/FormView';
 import { FormsList } from './components/FormsList';
 
@@ -38,6 +46,8 @@ interface UrlSwitches {
 const TITLE = 'Epi Info Data Entry';
 const FORM_NOT_FOUND_NOTICE = 'This form no longer exists.';
 const LIST_PATH = '/';
+const RETRY = 'Retry';
+const SHOW_FORMS_LIST = 'Show forms list';
 
 const POSITION_PATTERN = /^[1-9]\d*$/;
 // The API reads a position as a 32-bit integer and answers 400 above it. A larger `record`
@@ -56,6 +66,27 @@ function readUrlSwitches(search: string): UrlSwitches | null {
   const position =
     record !== null && POSITION_PATTERN.test(record) ? Math.min(Number(record), MAX_POSITION) : undefined;
   return { view, record: position };
+}
+
+/**
+ * Whether an OK body holds what the lookup reads: a list whose every entry has an integer
+ * `viewId` and a string `name`. The client accepts any JSON as a success, so the body is
+ * checked as `unknown` before findForm reads it.
+ */
+function isFormList(value: unknown): value is readonly Pick<FormSummary, 'viewId' | 'name'>[] {
+  if (!Array.isArray(value)) {
+    return false;
+  }
+  const items: readonly unknown[] = value;
+  return items.every(
+    (item) =>
+      typeof item === 'object' &&
+      item !== null &&
+      'viewId' in item &&
+      Number.isInteger(item.viewId) &&
+      'name' in item &&
+      typeof item.name === 'string',
+  );
 }
 
 /** The form whose name is `view`: the exact spelling first, then ignoring case. */
@@ -125,10 +156,65 @@ function useFocusReturn(): { onBlur: (event: FocusEvent<HTMLElement>) => void; o
   return { onBlur, onFocus: cancel };
 }
 
+interface LookupFailureProps {
+  /** The form name the URL asked for. */
+  readonly view: string;
+  readonly error: ApiError;
+  /** Repeats the lookup of `view`. */
+  readonly onRetry: () => void;
+  /** Gives up the URL's request and shows the forms list. */
+  readonly onShowList: () => void;
+}
+
+/** The URL's form could not be looked up: the request is kept, so Retry repeats the open. */
+function LookupFailure({ view, error, onRetry, onShowList }: LookupFailureProps) {
+  let banner: ReactNode;
+  if (error.kind === 'unavailable' || error.kind === 'network') {
+    banner = <ConnectionError error={error} method="GET" onRetry={onRetry} />;
+  } else {
+    const message = describeError(error);
+    // describeError already ends a 500's text with the trace id, so it is not repeated.
+    const traceId = error.traceId;
+    const traceLine = traceId !== null && !message.includes(traceId) ? `Trace id: ${traceId}` : null;
+    banner = (
+      <div className="banner banner--error" role="alert">
+        <p>{message}</p>
+        {traceLine !== null && (
+          <p>
+            <small>{traceLine}</small>
+          </p>
+        )}
+        <button type="button" onClick={() => onRetry()}>
+          {RETRY}
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <>
+      {/* `view` is user input from the URL; React renders it as text, never as markup. */}
+      <p>{`Form '${view}' could not be opened.`}</p>
+      {banner}
+      {/* Wrapped, so the shell's column does not stretch the button to its full width. */}
+      <div>
+        <button type="button" onClick={() => onShowList()}>
+          {SHOW_FORMS_LIST}
+        </button>
+      </div>
+    </>
+  );
+}
+
 /** The application shell: a title, a one-shot notice, then the forms list or the open form. */
 export default function App({ client = apiClient }: AppProps) {
-  // Read once, on the first render; every later URL is the shell's own.
+  // Read once, on the first render; every later URL is the shell's own. Non-null until the
+  // request is settled, which a failed lookup does not do.
   const [switches, setSwitches] = useState<UrlSwitches | null>(() => readUrlSwitches(window.location.search));
+  // Why the last lookup of `switches` failed; null while one runs or before any has failed.
+  const [lookupFailure, setLookupFailure] = useState<ApiError | null>(null);
+  // Counts Retry presses, so the lookup effect runs again for the same request.
+  const [lookupAttempt, setLookupAttempt] = useState(0);
   const [selected, setSelected] = useState<SelectedForm | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
@@ -152,36 +238,50 @@ export default function App({ client = apiClient }: AppProps) {
       return;
     }
     const { view, record } = switches;
-    const finish = (form: SelectedForm | null, nextNotice: string | null): void => {
-      setSwitches(null);
-      show(form, nextNotice);
-    };
-    // Unmounting, or StrictMode's repeated effect, aborts this lookup; only the last one applies.
+    // Unmounting, a Retry, or StrictMode's repeated effect aborts this lookup; only the last
+    // one applies.
     const controller = new AbortController();
     void (async () => {
+      let result: ApiResult<FormSummary[]>;
       try {
-        const result = await client.listForms(controller.signal);
-        if (controller.signal.aborted) {
-          return;
-        }
-        const form = result.ok ? findForm(result.data, view) : undefined;
-        if (form !== undefined) {
-          finish({ viewId: form.viewId, name: form.name, initialPosition: record }, null);
-        } else {
-          // `view` is user input from the URL; React renders it as text, never as markup.
-          finish(null, result.ok ? `Form '${view}' was not found.` : `Form '${view}' could not be opened.`);
-        }
+        result = await client.listForms(controller.signal);
       } catch {
-        // The client rejects only when the call is aborted; anything else received no answer.
+        // The client rejects only when the call is aborted; any other rejection received no
+        // answer, so it is shown as a lost response with Retry, never left loading.
         if (!controller.signal.aborted) {
-          finish(null, `Form '${view}' could not be opened.`);
+          setLookupFailure(networkError());
         }
+        return;
+      }
+      if (controller.signal.aborted) {
+        return;
+      }
+      if (!result.ok) {
+        // Whether the form exists is still unknown: the request and its URL stay for Retry.
+        setLookupFailure(result.error);
+        return;
+      }
+      if (!isFormList(result.data)) {
+        // An OK answer that is not a forms list proves nothing either. The shared parser
+        // makes it the unexpected failure it makes of an OK answer without a body, and the
+        // request and its URL stay for Retry.
+        setLookupFailure(parseProblem(result.status, undefined));
+        return;
+      }
+      setSwitches(null);
+      const form = findForm(result.data, view);
+      if (form !== undefined) {
+        show({ viewId: form.viewId, name: form.name, initialPosition: record }, null);
+      } else {
+        // `view` is user input from the URL; React renders it as text, never as markup.
+        show(null, `Form '${view}' was not found.`);
       }
     })();
     return () => {
       controller.abort();
     };
-  }, [client, switches, show]);
+    // `lookupAttempt` is not read: a change of it is the Retry that repeats this lookup.
+  }, [client, switches, lookupAttempt, show]);
 
   useEffect(() => {
     if (focusTitleRef.current) {
@@ -215,8 +315,27 @@ export default function App({ client = apiClient }: AppProps) {
     }
   }, []);
 
+  // Both remove the button just pressed, and the title stays on every screen, so focus goes
+  // there first rather than falling to the page body.
+  const retryLookup = useCallback(() => {
+    headingRef.current?.focus();
+    setLookupFailure(null);
+    setLookupAttempt((attempt) => attempt + 1);
+  }, []);
+
+  const abandonLookup = useCallback(() => {
+    headingRef.current?.focus();
+    setLookupFailure(null);
+    setSwitches(null);
+    show(null, null);
+  }, [show]);
+
   let content: ReactNode;
-  if (switches !== null) {
+  if (switches !== null && lookupFailure !== null) {
+    content = (
+      <LookupFailure view={switches.view} error={lookupFailure} onRetry={retryLookup} onShowList={abandonLookup} />
+    );
+  } else if (switches !== null) {
     content = <p role="status">{`Opening form ${switches.view}…`}</p>;
   } else if (selected === null) {
     content = <FormsList client={client} onOpen={openFromList} />;

@@ -1,14 +1,16 @@
 // Composition root of the EpiInfo web API. It builds the ASP.NET Core host, refuses every listen setting that does
 // not bind 127.0.0.1 exactly and answers every request whose Host is not 127.0.0.1 or localhost with a 400
 // (LoopbackBindingGuard), loads the Kestrel endpoints with configuration reload off and applies the configured
-// request body limit, logs through the JSON console provider only, and warns at startup when the database connection
-// string is not configured. It registers the wire JSON settings (JsonSetup), the OpenAPI document v1 with its schema
-// transformers, the SQL Server data store (DataStoreRegistration), the check-code engine, the save stamp, the form,
-// record and field-event services, and the database health check. Its pipeline answers every failure through the
-// API's error contract (ApiExceptionHandler and its exception boundary), turns every empty error response into the
-// API's fixed ProblemDetails (ApiProblems), enforces the body limit and the JSON media type on the body endpoints
-// after routing, maps /openapi/v1.json, the /api form, record and field-event routes and /health, and serves the
-// built web client with its index.html fallback (ClientAppHosting) last.
+// request body limit, logs through the JSON console provider only, with UTC timestamps and without scopes, under
+// minimum levels for the protected framework categories that no logging configuration can lower (ProtectedLogLevels),
+// and warns at startup when the database connection string is not configured. It registers the wire JSON settings
+// (JsonSetup), the OpenAPI document v1 with its schema transformers, the SQL Server data store
+// (DataStoreRegistration), the check-code engine, the save stamp, the form, record and field-event services, and the
+// database health check. Its pipeline answers every failure through the API's error contract (ApiExceptionHandler and
+// its exception boundary), turns every empty error response into the API's fixed ProblemDetails (ApiProblems),
+// enforces the body limit and the JSON media type on the body endpoints after routing, maps /openapi/v1.json, the /api
+// form, record and field-event routes and /health, and serves the built web client with its index.html fallback
+// (ClientAppHosting) last.
 using EpiInfo.Api.Endpoints;
 using EpiInfo.Api.Errors;
 using EpiInfo.Api.Health;
@@ -37,7 +39,25 @@ builder.WebHost.ConfigureKestrel((context, options) =>
 });
 
 builder.Logging.ClearProviders();
-builder.Logging.AddJsonConsole();
+
+// This configure delegate is registered after the console provider's binding of Logging:Console:FormatterOptions, so it
+// runs after that binding on every build and reload of the formatter options: scopes, which carry the request path and
+// connection id, stay off whatever configuration says, every line carries a UTC timestamp, and the JSON writer stays
+// unindented, so each event is one line while the other writer settings configuration supplies still apply. "O" is the
+// culture-invariant ISO 8601 round-trip format; a custom pattern would take its separators and calendar from the
+// process culture.
+builder.Logging.AddJsonConsole(options =>
+{
+    options.IncludeScopes = false;
+    options.TimestampFormat = "O";
+    options.UseUtcTimestamp = true;
+    options.JsonWriterOptions = options.JsonWriterOptions with { Indented = false };
+});
+
+// A post-configuration runs after the configuration-bound Logging rules on every rebuild of the filter options, a
+// reload of appsettings*.json included, so no level configured for any provider or category lowers a protected
+// framework floor (ProtectedLogLevels); a configured level above a floor still applies.
+builder.Services.PostConfigure<LoggerFilterOptions>(ProtectedLogLevels.Apply);
 
 // Bodies framework writers produce through the ProblemDetails service, such as the Development exception page, keep
 // only the API's fixed texts and traceId.
@@ -119,3 +139,98 @@ app.Run();
 
 /// <summary>The API entry point, public so <c>WebApplicationFactory&lt;Program&gt;</c> can host it in tests.</summary>
 public partial class Program;
+
+/// <summary>
+/// Minimum levels for the framework log categories whose lower-level events carry request or configuration values,
+/// enforced beneath every configured logging rule, so no <c>Logging</c> setting can lower them.
+/// </summary>
+/// <remarks>
+/// <para>
+/// <see cref="Apply"/> runs as a post-configuration of <see cref="LoggerFilterOptions"/>, after the rules bound from
+/// <c>Logging:LogLevel</c> and <c>Logging:{Provider}:LogLevel</c>. For each provider and category the logger factory
+/// chooses one rule, preferring a provider-specific rule and then the longest matching category, and lets an event
+/// through only when it passes that rule's level and filter. Every rule therefore gets the floors added to its filter,
+/// and a rule carrying only the floors stands first for the categories no configured rule matches, so the floors hold
+/// whichever rule is chosen.
+/// </para>
+/// <para>
+/// A floor is a minimum: a configured level above it still applies, and every category outside the floors keeps its
+/// configured level. A category falls under a floor when it starts with the floor's prefix, ignoring case, as a
+/// configured category rule matches.
+/// </para>
+/// </remarks>
+internal static class ProtectedLogLevels
+{
+    // Each category prefix with the lowest level it lets through.
+    private static readonly (string CategoryPrefix, LogLevel MinimumLevel)[] Floors =
+    [
+        // The hosting request lines carry the path and query string; the routing, parameter-binding and Kestrel debug
+        // lines carry route values and connection details.
+        ("Microsoft.AspNetCore", LogLevel.Warning),
+
+        // The startup lines carry the listen address, the environment name and the content root. The warning about a
+        // missing connection string is the API's own category and is not affected.
+        ("Microsoft.Hosting.Lifetime", LogLevel.Warning),
+
+        // Its per-check result line repeats, at Error, the one failure line SqlServerHealthCheck writes for the same
+        // Unhealthy result, and its debug lines would write a result's data. Its error line for a check that throws
+        // never occurs: the one registered check catches every failure and rethrows only the caller's cancellation,
+        // which this service does not log.
+        ("Microsoft.Extensions.Diagnostics.HealthChecks.DefaultHealthCheckService", LogLevel.None),
+    ];
+
+    /// <summary>
+    /// Adds the floors to the filter of every rule in <paramref name="options"/> and puts a rule carrying only the
+    /// floors first.
+    /// </summary>
+    /// <param name="options">The filter options, after every configuration source has been applied.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="options"/> is <see langword="null"/>.</exception>
+    public static void Apply(LoggerFilterOptions options)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+
+        for (int index = 0; index < options.Rules.Count; index++)
+        {
+            LoggerFilterRule rule = options.Rules[index];
+            Func<string?, string?, LogLevel, bool>? filter = rule.Filter;
+            options.Rules[index] = new LoggerFilterRule(
+                rule.ProviderName,
+                rule.CategoryName,
+                rule.LogLevel,
+                filter is null
+                    ? (_, category, level) => IsAllowed(category, level)
+                    : (provider, category, level) => IsAllowed(category, level) && filter(provider, category, level));
+        }
+
+        // Any configured rule that matches is chosen over this one; where none matches, it applies the global minimum
+        // level the factory would otherwise use, with the floors.
+        options.Rules.Insert(
+            0,
+            new LoggerFilterRule(null, null, options.MinLevel, (_, category, level) => IsAllowed(category, level)));
+    }
+
+    /// <summary>Whether an event of <paramref name="level"/> in <paramref name="category"/> clears its floor.</summary>
+    /// <param name="category">The logger category; a <see langword="null"/> category falls under no floor.</param>
+    /// <param name="level">The level of the event.</param>
+    /// <returns>
+    /// <see langword="false"/> when the category starts with a floor's prefix and the level is below that floor;
+    /// otherwise <see langword="true"/>.
+    /// </returns>
+    public static bool IsAllowed(string? category, LogLevel level)
+    {
+        if (category is null)
+        {
+            return true;
+        }
+
+        foreach ((string prefix, LogLevel minimum) in Floors)
+        {
+            if (level < minimum && category.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+}

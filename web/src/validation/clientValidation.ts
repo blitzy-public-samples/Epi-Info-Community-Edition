@@ -6,8 +6,17 @@
 // left to the server's 400 `errors` map. No message ever contains a submitted value, only metadata.
 import type { FieldDefinition, FieldType, FieldValue, FormDefinition, PageDefinition, Values } from '../api/types';
 
-/** Messages keyed by canonical field name; only fields with at least one message appear. */
+/**
+ * Messages keyed by canonical field name; only fields with at least one message appear. The maps
+ * this module returns have no prototype, so every field name, `__proto__` included, is an own entry.
+ */
 export type FieldErrors = Record<string, string[]>;
+
+// Null prototype: a field named like an Object member, such as `__proto__` or `constructor`,
+// becomes an own entry, never a prototype change or an inherited member.
+function emptyFieldErrors(): FieldErrors {
+  return Object.create(null) as FieldErrors;
+}
 
 /**
  * The legacy `FIELD_IS_REQUIRED_LONG` text (Epi.Core/SharedStrings.resx), byte for byte, trailing
@@ -22,15 +31,13 @@ export const FIELD_IS_REQUIRED_LONG =
 const REQUIRED_PLACEHOLDERS = /\{([01])\}/g;
 
 /**
- * Formats {@link FIELD_IS_REQUIRED_LONG} for one missing field. A blank prompt (null, empty or
- * whitespace only) is replaced by the field name, as the server's `FormatFieldIsRequired` does.
+ * Formats {@link FIELD_IS_REQUIRED_LONG} for one missing field with its prompt and page name, as
+ * legacy and the server's `FormatFieldIsRequired` do. The prompt is inserted exactly as given, an
+ * empty or whitespace-only prompt included; a missing prompt (`null` or `undefined`) is inserted as
+ * empty text.
  */
-export function formatRequiredMessage(
-  prompt: string | null | undefined,
-  fieldName: string,
-  pageName: string,
-): string {
-  const subject = typeof prompt === 'string' && prompt.trim().length > 0 ? prompt : fieldName;
+export function formatRequiredMessage(prompt: string | null | undefined, pageName: string): string {
+  const subject = prompt ?? '';
   return FIELD_IS_REQUIRED_LONG.replace(REQUIRED_PLACEHOLDERS, (_placeholder: string, index: string) =>
     index === '0' ? subject : pageName,
   );
@@ -277,18 +284,31 @@ const NO_PATTERN_CHECK: PatternRule = { kind: 'none' };
 // One or more '#', optionally a point and one or more '#', over the whole pattern.
 const NUMBER_MASK = /^(#+)(?:\.(#+))?$/;
 
-// A letter or decimal digit in the sense of .NET char.IsLetterOrDigit (Unicode L* and Nd).
-const LETTER_OR_DIGIT = /[\p{L}\p{Nd}]/u;
+// A letter in the sense of .NET char.IsLetter (Unicode L*).
+const LETTER = /\p{L}/u;
+
+// Tested per UTF-16 code unit, as .NET tests each char: a surrogate half of an astral letter is no
+// letter there, so it is none here either.
+function hasLetter(pattern: string): boolean {
+  for (let i = 0; i < pattern.length; i++) {
+    if (LETTER.test(pattern.charAt(i))) {
+      return true;
+    }
+  }
+
+  return false;
+}
 
 function interpretPattern(pattern: string | null | undefined, fieldType: FieldType): PatternRule {
   if (typeof pattern !== 'string' || pattern.trim().length === 0) {
     return NO_PATTERN_CHECK;
   }
 
-  // The server checks a text mask only when every position is '#' or a literal that is not a letter
-  // or digit; a pattern such as `A##` is unchecked there, so it must be unchecked here too.
+  // The server checks a text mask only when it holds a '#' and no letter, every other position, a
+  // digit such as the `2` of `##-2` included, being a literal; a pattern such as `A##` is unchecked
+  // there, so it must be unchecked here too.
   if (isTextFamily(fieldType)) {
-    return pattern.includes('#') && !LETTER_OR_DIGIT.test(pattern)
+    return pattern.includes('#') && !hasLetter(pattern)
       ? { kind: 'textDigitMask', mask: pattern }
       : NO_PATTERN_CHECK;
   }
@@ -453,7 +473,7 @@ function createDataFieldLookup(pages: readonly PageDefinition[]): (name: string)
 export function validateValues(definition: FormDefinition, values: Values): FieldErrors {
   const findField = createDataFieldLookup(definition.pages);
   const seen = new Set<string>();
-  const errors: FieldErrors = {};
+  const errors = emptyFieldErrors();
 
   for (const [name, raw] of Object.entries(values)) {
     const field = findField(name);
@@ -479,6 +499,8 @@ export function validateValues(definition: FormDefinition, values: Values): Fiel
 // The legacy gate checks only fields with a separate prompt; checkbox and option fields have none
 // (CheckBoxField and OptionField derive from InputFieldWithoutSeparatePrompt), so the client never
 // requires them and cannot block a save over them. An explicit false is a value in any case.
+// A required read-only field is left to the server, whose gate reports it when its value is
+// missing: the client can never fill it, so skipping it here is the weaker form of that check.
 function isRequiredGated(field: FieldDefinition): boolean {
   if (!field.validation.required || !isWritableDataField(field)) {
     return false;
@@ -500,11 +522,12 @@ function isRequiredGated(field: FieldDefinition): boolean {
  * The required gate over the effective record (the draft laid over the loaded record; the draft
  * alone for a new record). Every missing required field is listed, in page then tab order, with the
  * legacy `FIELD_IS_REQUIRED_LONG` wording. A field is missing when its value is absent, `null` or
- * empty text, as on the server; whitespace is a value. Read-only fields are never required, since
- * the client can never fill them.
+ * empty text, as on the server; whitespace is a value. Only writable fields are checked here: the
+ * client can never fill a read-only field, so a required read-only one is reported by the server's
+ * gate instead.
  */
 export function checkRequired(definition: FormDefinition, effective: Values): FieldErrors {
-  const errors: FieldErrors = {};
+  const errors = emptyFieldErrors();
 
   for (const page of definition.pages) {
     for (const field of page.fields) {
@@ -515,7 +538,7 @@ export function checkRequired(definition: FormDefinition, effective: Values): Fi
       const raw = Object.hasOwn(effective, field.name) ? effective[field.name] : undefined;
       const value = normalizeValue(field, raw);
       if (value === null || value === '') {
-        errors[field.name] = [formatRequiredMessage(field.prompt, field.name, page.name)];
+        errors[field.name] = [formatRequiredMessage(field.prompt, page.name)];
       }
     }
   }
@@ -525,7 +548,7 @@ export function checkRequired(definition: FormDefinition, effective: Values): Fi
 
 /** Combines error sets per field, keeping first-seen field order and dropping repeated messages. */
 export function mergeFieldErrors(...sets: FieldErrors[]): FieldErrors {
-  const merged: FieldErrors = {};
+  const merged = emptyFieldErrors();
 
   for (const set of sets) {
     for (const [name, messages] of Object.entries(set)) {

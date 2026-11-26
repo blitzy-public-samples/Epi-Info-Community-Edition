@@ -348,19 +348,21 @@ public sealed class RecordValidator
     /// </summary>
     /// <remarks>
     /// <para>
-    /// The gate takes, in data-field order, every field whose metadata marks it required and not read-only, and
-    /// reports it missing when its effective value is absent, <see cref="FieldValue.Null"/> or empty text, as in
-    /// legacy data entry, which tests the value string for null or empty. Submitted empty text was already normalised
-    /// to null by <see cref="ValidateInput"/>; stored text is not normalised, so a stored empty string that the
-    /// request leaves untouched is missing too. Whitespace counts as present and nothing is trimmed, and no other
-    /// input check is applied to stored values. Every missing field is listed, where legacy stopped at the first, each
-    /// with the legacy <c>FIELD_IS_REQUIRED_LONG</c> wording formatted with the field's prompt (its name when the
-    /// prompt is blank) and its page name.
+    /// The gate takes, in data-field order, every data field whose metadata marks it required, read-only ones
+    /// included, and reports it missing when its effective value is absent, <see cref="FieldValue.Null"/> or empty
+    /// text, as in legacy data entry, which tests the value string for null or empty. Submitted empty text was
+    /// already normalised to null by <see cref="ValidateInput"/>; stored text is not normalised, so a stored empty
+    /// string that the request leaves untouched is missing too. Whitespace counts as present and nothing is trimmed,
+    /// and no other input check is applied to stored values. Every missing field is listed, where legacy stopped at
+    /// the first, each with the legacy <c>FIELD_IS_REQUIRED_LONG</c> wording formatted with the field's prompt,
+    /// exactly as stored, and its page name.
     /// </para>
     /// <para>
-    /// A read-only field is never treated as required. Read-only fields are rejected whenever they are submitted and
-    /// the client never sends them, so a required read-only field that is empty could never be filled and would block
-    /// every save of the form; skipping it is the reconciliation that follows from that read-only rule.
+    /// A read-only field can never be submitted, because <see cref="ValidateInput"/> rejects it whenever it is
+    /// present. Its stored value therefore decides the gate on a <c>PUT</c>: a stored non-empty value passes, and a
+    /// stored null or empty string is listed as missing. On a <c>POST</c> it can never be supplied, so once a create
+    /// passes the empty-record rule, <see cref="CheckNewRecord"/> always lists a required read-only field as missing;
+    /// an all-null create is the request-level <see cref="ValidationMessages.RecordHasNoValues"/> error instead.
     /// </para>
     /// <para>
     /// The empty-record rule of <see cref="CheckNewRecord"/> does not apply here: a <c>PUT</c> may clear fields. The
@@ -747,10 +749,11 @@ public sealed class RecordValidator
             // ever letting a protected field be written.
             IsReadOnly = validation.ReadOnly || dataField.Field.IsReadOnly;
 
-            // A required read-only field is left out of the gate: it could never be supplied (see CheckRequired).
-            if (validation.Required && !IsReadOnly)
+            // Every required data field is gated, read-only ones included, because legacy's required check exempts no
+            // read-only field; the read-only rule only stops a request from supplying the value (see CheckRequired).
+            if (validation.Required)
             {
-                RequiredMessage = ValidationMessages.FormatFieldIsRequired(definition.Prompt, Name, dataField.Page.Name);
+                RequiredMessage = ValidationMessages.FormatFieldIsRequired(definition.Prompt, dataField.Page.Name);
             }
 
             if (Column is { Family: ColumnFamily.Character, MaxCharacters: { } maxCharacters } && maxCharacters > 0)

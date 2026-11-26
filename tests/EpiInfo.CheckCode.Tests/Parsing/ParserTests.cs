@@ -1,5 +1,6 @@
 using System.Collections.Frozen;
 using System.Collections.Immutable;
+using EpiInfo.CheckCode.Evaluation;
 using EpiInfo.CheckCode.Lexing;
 using EpiInfo.CheckCode.Parsing;
 using EpiInfo.CheckCode.Syntax;
@@ -2195,6 +2196,254 @@ public sealed class ParserTests
 
         Assert.Equal(commands, program.Diagnostics.Select(diagnostic => diagnostic.Command));
         Assert.All(program.Diagnostics, diagnostic => Assert.Equal(1, diagnostic.Line));
+    }
+
+    // Fixed spellings of each kind, written out, and every Parser.Commands constant, read by reflection so that a
+    // constant added later is covered too.
+    public static TheoryData<string> VocabularySpellings
+    {
+        get
+        {
+            var data = new TheoryData<string>
+            {
+                Goto, Hide, Always, SystemDate, EndBefore, EndClick, "FORMAT", "SET-REQUIRED", "END-VIEW",
+                FunctionNames.Years, FunctionNames.EpiWeek,
+            };
+            foreach (System.Reflection.FieldInfo constant in typeof(Parser.Commands).GetFields())
+            {
+                if (constant.IsLiteral && constant.GetRawConstantValue() is string spelling)
+                {
+                    data.Add(spelling);
+                }
+            }
+
+            return data;
+        }
+    }
+
+    [Theory]
+    [MemberData(nameof(VocabularySpellings))]
+    public void IsVocabularyCommandAcceptsTheFixedSpellings(string command) =>
+        Assert.True(Parser.IsVocabularyCommand(command), $"'{command}' is not vocabulary.");
+
+    // Only the exact upper-case spellings the parser reports count; anything else is text the caller must not repeat.
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData(Days)]
+    [InlineData("goto")]
+    [InlineData(" GOTO")]
+    [InlineData("SECRET PII\r\n TOKEN")]
+    public void IsVocabularyCommandRejectsOtherText(string? command) =>
+        Assert.False(Parser.IsVocabularyCommand(command));
+
+    // An unsupported function is reported under its name as written, upper-cased: an unregistered name, a field's
+    // name, or a bracketed name that keeps its inner whitespace and line breaks. None of those is vocabulary, which
+    // is how the API tells that name, program text, from a command it may log.
+    [Theory]
+    [InlineData("ASSIGN Y = DAYS(A, B)", Days)]
+    [InlineData("ASSIGN Y = LastName(A)", "LASTNAME")]
+    [InlineData("ASSIGN Y = [Secret Pii\r\n Token](1)", "SECRET PII\r\n TOKEN")]
+    public void UnsupportedFunctionIsReportedUnderItsWrittenNameOutsideTheVocabulary(string statement, string name)
+    {
+        Diagnostic diagnostic = Assert.Single(Parse(InAfterBlock(statement)).Diagnostics);
+
+        Assert.Equal((DiagnosticSeverity.Warning, name, 3), (diagnostic.Severity, diagnostic.Command, diagnostic.Line));
+        Assert.False(Parser.IsVocabularyCommand(diagnostic.Command));
+    }
+
+    // Every unsupported function's diagnostic is recognised whatever its name's spelling: a bracketed name spelled
+    // like a statement keyword or holding a line break, a lexer keyword the parser does not reserve, an unregistered
+    // name, and a built-in value written without parentheses (line 254). The first, third and last are spelled like
+    // vocabulary, which is why the spelling alone cannot tell them from a statement's keyword.
+    [Theory]
+    [InlineData("ASSIGN Y = [GOTO](1)", Goto)]
+    [InlineData("ASSIGN Y = [Secret\r\n Name](1)", "SECRET\r\n NAME")]
+    [InlineData("ASSIGN Y = FORMAT(A)", "FORMAT")]
+    [InlineData("ASSIGN Y = DAYS(A, B)", Days)]
+    [InlineData("ASSIGN Y = SYSTEMDATE", SystemDate)]
+    public void ReportsUnsupportedFunctionRecognisesEveryUnsupportedFunction(string statement, string command)
+    {
+        Diagnostic diagnostic = Assert.Single(Parse(InAfterBlock(statement)).Diagnostics);
+
+        Assert.Equal(Warning(command, 3), (diagnostic.Severity, diagnostic.Command, diagnostic.Line));
+        Assert.True(Parser.ReportsUnsupportedFunction(diagnostic));
+    }
+
+    // A construct other than an unsupported function is not such a report, though it carries the same or a function's
+    // spelling: a GOTO statement, a malformed call of a supported function, an unsupported operator, unrecognised
+    // text and a GEOCODE.
+    [Theory]
+    [InlineData("GOTO Z", DiagnosticSeverity.Warning, Goto)]
+    [InlineData("ASSIGN Y = YEARS(A, B", DiagnosticSeverity.Warning, FunctionNames.Years)]
+    [InlineData("ASSIGN Y = 1 + 2", DiagnosticSeverity.Warning, Parser.Commands.Plus)]
+    [InlineData("junk", DiagnosticSeverity.Warning, Parser.Commands.Syntax)]
+    [InlineData("GEOCODE A, B, C", DiagnosticSeverity.Info, Parser.Commands.Geocode)]
+    public void ReportsUnsupportedFunctionRejectsOtherStaticDiagnostics(
+        string statement,
+        DiagnosticSeverity severity,
+        string command)
+    {
+        Diagnostic diagnostic = Assert.Single(Parse(InAfterBlock(statement)).Diagnostics);
+
+        Assert.Equal((severity, command, 3), (diagnostic.Severity, diagnostic.Command, diagnostic.Line));
+        Assert.False(Parser.ReportsUnsupportedFunction(diagnostic));
+    }
+
+    // Runtime errors carry the failing statement's command: the engine's unknown-field error, and the evaluator's own
+    // guard against an unregistered function in a hand-built tree, which names the function under ASSIGN.
+    [Fact]
+    public void ReportsUnsupportedFunctionRejectsRuntimeErrors()
+    {
+        FormMetadata form = TextForm("X", "A", "Y");
+        FieldEventResponse engineResponse = new CheckCodeEngine().Run(
+            InAfterBlock("ASSIGN Unknown = \"1\""),
+            form,
+            FieldEventKind.FieldAfter,
+            "X",
+            TextValues());
+        var block = new EventBlockNode(
+            FieldEventKind.FieldAfter,
+            2,
+            [new AssignStatementNode("Y", new FunctionCallNode(Days, [], 3), 3)],
+            []);
+        FieldEventResponse evaluatorResponse = Evaluator.Run(form, [block], TextValues());
+
+        Diagnostic[] errors = [.. engineResponse.Diagnostics, .. evaluatorResponse.Diagnostics];
+        Assert.Equal(2, errors.Length);
+        Assert.All(errors, diagnostic =>
+        {
+            Assert.Equal(
+                (DiagnosticSeverity.Error, Parser.Commands.Assign, 3),
+                (diagnostic.Severity, diagnostic.Command, diagnostic.Line));
+            Assert.False(Parser.ReportsUnsupportedFunction(diagnostic));
+        });
+    }
+
+    [Fact]
+    public void ReportsUnsupportedFunctionRejectsNull() =>
+        Assert.Throws<ArgumentNullException>("diagnostic", () => Parser.ReportsUnsupportedFunction(null!));
+
+    // Every construct the parser reports, other than an unsupported function, with none whose name is program text:
+    // top-level and field-level junk, misplaced and unterminated blocks, unsupported commands, statements, operators,
+    // literals, references and keyword-named functions, malformed supported statements and calls, and GEOCODE.
+    private const string VocabularyProgram = """
+        junk
+        Field X
+        	HIDE A
+        	Before
+        		GOTO Z
+        		HIDE A B
+        		ALWAYS
+        			ASSIGN Y = "1"
+        		END
+        		SET-REQUIRED A
+        		A = 1
+        		ASSIGN Y = SYSTEMDATE
+        		ASSIGN Y = FORMAT(A)
+        		ASSIGN Y = 1 + 2
+        		ASSIGN Y = -A
+        		ASSIGN Y = A & B
+        		ASSIGN Y = A * B
+        		ASSIGN Y = A / B
+        		ASSIGN Y = A ^ B
+        		ASSIGN Y = A % B
+        		ASSIGN Y = A MOD B
+        		ASSIGN Y = A!B
+        		ASSIGN Y = 12L
+        		ASSIGN Y = #1a
+        		ASSIGN Y = 'x'
+        		ASSIGN Y = 01/15/2011
+        		ASSIGN Y = 10:30
+        		ASSIGN Y = (A, B)
+        		ASSIGN Y = Other.Name
+        		ASSIGN Y = Grid[1, 2]
+        		ASSIGN Y = YEARS(A, B
+        		ASSIGN Y =
+        		ENABLE * EXCEPT A
+        		DISABLE * EXCEPT A
+        		CLEAR
+        		DIALOG B
+        		DIALOG "m" B YN
+        		GEOCODE A, B, C
+        		GEOCODE
+        		IF A <> "1" THEN ASSIGN Y = "1" END-IF
+        		IF A < 1 THEN ASSIGN Y = "1" END-IF
+        		IF A > 1 THEN ASSIGN Y = "1" END-IF
+        		IF A <= 1 THEN ASSIGN Y = "1" END-IF
+        		IF A >= 1 THEN ASSIGN Y = "1" END-IF
+        		IF A = "1" OR B = "2" THEN ASSIGN Y = "1" END-IF
+        		IF A = "1" XOR B = "2" THEN ASSIGN Y = "1" END-IF
+        		IF A LIKE "x" THEN ASSIGN Y = "1" END-IF
+        		IF A = (+) THEN ASSIGN Y = "1" END-IF
+        		IF A = "1" THEN ASSIGN Y = "1" ELSE-IF B = "2" THEN ASSIGN Y = "2" END-IF
+        		IF A = "1" THEN ASSIGN Y = "1" ELSE ASSIGN Y = "2" ELSE ASSIGN Y = "3" END-IF
+        		IF THEN ASSIGN Y = "1" END-IF
+        		END-IF
+        	End-Before
+        	After
+        	End-After
+        	Before
+        	End-Before
+        	End-Click
+        End-Field
+        View
+        End-View
+        Field
+        End-Field
+        Field Y
+        	After
+        		IF A = "1" THEN
+        			ASSIGN Y = "1"
+        End-Field
+        """;
+
+    // Every command reported for the program, for every truncation of its tokens, which leaves each construct open at
+    // each point, and for the nesting ceiling and an unterminated comment, is vocabulary; so is every runtime error's.
+    [Fact]
+    public void EveryCommandReportedWithoutAnUnsupportedFunctionIsVocabulary()
+    {
+        IReadOnlyList<Token> tokens = Lexer.Tokenize(VocabularyProgram);
+        var reported = new SortedSet<string>(StringComparer.Ordinal);
+        for (int length = 0; length <= tokens.Count; length++)
+        {
+            Token[] truncated = [.. tokens.Take(length)];
+            reported.UnionWith(Parser.Parse(truncated, "F").Diagnostics.Select(diagnostic => diagnostic.Command));
+        }
+
+        string nested = new string('(', Parser.MaxNestingDepth + 1) + "1" + new string(')', Parser.MaxNestingDepth + 1);
+        foreach (string program in new[] { InAfterBlock("ASSIGN Y = " + nested), InAfterBlock("/* open") })
+        {
+            reported.UnionWith(Parse(program).Diagnostics.Select(diagnostic => diagnostic.Command));
+        }
+
+        ICheckCodeEngine engine = new CheckCodeEngine();
+        FieldEventResponse response = engine.Run(
+            InAfterBlock("ASSIGN Unknown = \"1\"", "ENABLE Unknown", "IF Unknown = \"1\" THEN", "END-IF"),
+            TextForm("X", "A", "B", "Y", "Z"),
+            FieldEventKind.FieldAfter,
+            "X",
+            TextValues(("A", "1")));
+        Assert.Contains(response.Diagnostics, diagnostic => diagnostic.Severity == DiagnosticSeverity.Error);
+        reported.UnionWith(response.Diagnostics.Select(diagnostic => diagnostic.Command));
+
+        Assert.All(reported, command => Assert.True(Parser.IsVocabularyCommand(command), $"'{command}' is reported."));
+        Assert.Superset(
+            new SortedSet<string>(StringComparer.Ordinal)
+            {
+                Goto, Hide, Always, SystemDate, "FORMAT", "SET-REQUIRED", "BEFORE", "END-CLICK", "END-AFTER",
+                "VIEW", Parser.Commands.Syntax, Parser.Commands.Nesting, Parser.Commands.ImplicitAssign,
+                Parser.Commands.Plus, Parser.Commands.Minus, Parser.Commands.Concatenate, Parser.Commands.LibraryCall,
+                Parser.Commands.NumberLiteral, Parser.Commands.CharLiteral, Parser.Commands.DateLiteral,
+                Parser.Commands.TimeLiteral, Parser.Commands.CheckedLiteral, Parser.Commands.ExpressionList,
+                Parser.Commands.QualifiedName, Parser.Commands.GridField, Parser.Commands.EnableExcept,
+                Parser.Commands.DisableExcept, Parser.Commands.NotEqual, Parser.Commands.Or, Parser.Commands.Xor,
+                Parser.Commands.Like, Parser.Commands.ElseIf, Parser.Commands.Else, Parser.Commands.EndIf,
+                Parser.Commands.Field, Parser.Commands.EndField, Parser.Commands.If, Parser.Commands.Assign,
+                Parser.Commands.Enable, Parser.Commands.Clear, Parser.Commands.Dialog, Parser.Commands.Geocode,
+                FunctionNames.Years,
+            },
+            reported);
     }
 
     [Fact]

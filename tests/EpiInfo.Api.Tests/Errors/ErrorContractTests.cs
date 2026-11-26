@@ -33,6 +33,8 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Logging.Console;
+using Microsoft.Extensions.Options;
 
 namespace EpiInfo.Api.Tests.Errors;
 
@@ -193,6 +195,8 @@ public sealed class ErrorContractTests
     private const string RequestAbortedEvent = "RequestAborted";
 
     private const string ResponseAbortedEvent = "ResponseAborted";
+
+    private const string ErrorBodyWriteFailedEvent = "ErrorBodyWriteFailed";
 
     // The longest a hosted case waits for its endpoint to start, for the server to finish its request, or for a raw
     // HTTP/1.1 exchange to end.
@@ -905,6 +909,165 @@ public sealed class ErrorContractTests
         Assert.Empty(logs.Entries);
     }
 
+    // AAP 0.3.4.2 and 0.9.3: a log sink that throws for the handler's line changes nothing the client receives. The
+    // failure keeps its exact redacted ProblemDetails, its one line still reaches the working sinks, and neither the
+    // exception-handler middleware nor the server logs the original exception, whose text holds the sentinel.
+    [Theory]
+    [MemberData(nameof(ReadFailures))]
+    public async Task ThrowingLogSinkLeavesTheRedactedErrorResponseUnchanged(
+        string environment,
+        string endpoint,
+        string kind)
+    {
+        string sentinel = NewSentinel();
+        string sqlText = FakeDataStore.SqlTextException(sentinel).Message;
+        FakeDataStore store = FakeDataStore.WithStandardForms();
+        bool unavailable = kind == UnavailableFailure;
+
+        // Both failures carry the SQL text, the unavailable one as the driver exception a store attaches as its inner
+        // exception, so a framework line about the original exception would hold it.
+        Exception failure = unavailable
+            ? new DataStoreUnavailableException(
+                ReadStoreMethod(endpoint),
+                WriteOutcome.NotWritten,
+                sqlErrorNumber: -2,
+                innerException: FakeDataStore.SqlTextException(sentinel))
+            : FakeDataStore.SqlTextException(sentinel);
+        store.ThrowOn(ReadStoreMethod(endpoint), failure);
+        using var throwing = new ThrowingLoggerProvider(typeof(ApiExceptionHandler));
+        await using ApiFactory factory = CreateFactory(environment, store);
+        using HttpClient client = factory
+            .WithWebHostBuilder(builder => builder.ConfigureTestServices(
+                services => services.AddSingleton<ILoggerProvider>(throwing)))
+            .CreateClient();
+
+        using HttpResponseMessage response = await SendReadAsync(client, endpoint);
+        string body = await response.Content.ReadAsStringAsync();
+
+        HttpStatusCode status = unavailable ? HttpStatusCode.ServiceUnavailable : HttpStatusCode.InternalServerError;
+        JsonElement problem = AssertProblemDetails(response, body, status);
+        Assert.True(
+            ProblemMembers.SequenceEqual(
+                problem.EnumerateObject().Select(member => member.Name).Order(StringComparer.Ordinal),
+                StringComparer.Ordinal),
+            "The error body does not hold exactly type, title, status, detail and traceId.");
+        string? detail = StringMember(problem, "detail");
+        if (unavailable)
+        {
+            Assert.Equal(ApiProblems.UnavailableDetail, detail);
+        }
+        else
+        {
+            AssertUnexpectedDetail(detail, StringMember(problem, ApiProblems.TraceIdKey));
+        }
+
+        Assert.Equal(1, throwing.Throws);
+        CapturedLogEntry line = AssertOneHandlerLine(factory, status);
+        Assert.Equal(RequestFailedEvent, line.EventId.Name);
+        Assert.Equal(StringMember(problem, ApiProblems.TraceIdKey), StateValue(line, "TraceId"));
+        Assert.Empty(factory.Logs.Find(IsFrameworkExceptionLine));
+        AssertRedacted(factory, body, sentinel, sqlText);
+    }
+
+    /// <summary>The cases of <see cref="ThrowingLogSinkNeverStopsTheHandlersAnswer"/>.</summary>
+    public static TheoryData<bool, int, string[]> HandlerAnswersUnderAThrowingLogSink => new()
+    {
+        // A client abort: no body, and the status the exception-handler middleware gives an aborted request.
+        { true, StatusCodes.Status499ClientClosedRequest, [RequestAbortedEvent] },
+
+        // A failure whose error body cannot be written: the handler still answers it, with both of its lines.
+        { false, StatusCodes.Status500InternalServerError, [RequestFailedEvent, ErrorBodyWriteFailedEvent] },
+    };
+
+    // The handler alone, with a log sink that throws for its category: it still answers, never throws, and each of its
+    // lines still reaches the working sink.
+    [Theory]
+    [MemberData(nameof(HandlerAnswersUnderAThrowingLogSink))]
+    public async Task ThrowingLogSinkNeverStopsTheHandlersAnswer(bool clientAbort, int status, string[] events)
+    {
+        using var logs = new CapturingLoggerProvider();
+        using var throwing = new ThrowingLoggerProvider(typeof(ApiExceptionHandler));
+        using var loggerFactory = LoggerFactory.Create(logging => logging.AddProvider(logs).AddProvider(throwing));
+        using var services = new ServiceCollection().AddLogging().BuildServiceProvider();
+        using var aborted = new CancellationTokenSource();
+        var context = new DefaultHttpContext { RequestServices = services };
+        Exception failure;
+        if (clientAbort)
+        {
+            await aborted.CancelAsync();
+            context.RequestAborted = aborted.Token;
+            context.Response.Body = new MemoryStream();
+            failure = new OperationCanceledException(NewSentinel());
+        }
+        else
+        {
+            context.Response.Body = new FailingWriteStream();
+            failure = new InvalidOperationException(NewSentinel());
+        }
+
+        var handler = new ApiExceptionHandler(loggerFactory.CreateLogger<ApiExceptionHandler>());
+
+        Assert.True(await handler.TryHandleAsync(context, failure, CancellationToken.None));
+
+        Assert.Equal(status, context.Response.StatusCode);
+        if (context.Response.Body is MemoryStream written)
+        {
+            Assert.Equal(0, written.Length);
+        }
+
+        Assert.Equal(events.Length, throwing.Throws);
+        Assert.Equal(events, logs.Find(entry => entry.Category == HandlerCategory).Select(entry => entry.EventId.Name));
+        Assert.All(logs.Entries, entry => Assert.Null(entry.ExceptionType));
+        Assert.False(logs.ContainsText(failure.Message));
+    }
+
+    // The boundary alone, with a log sink that throws for its category: a client abort still ends as a body-less 499,
+    // and a failure after the response started still aborts the connection with the sent status unchanged. The
+    // boundary never throws, and its one line still reaches the working sink.
+    [Theory]
+    [InlineData(false, StatusCodes.Status499ClientClosedRequest, RequestAbortedEvent)]
+    [InlineData(true, StatusCodes.Status200OK, ResponseAbortedEvent)]
+    public async Task ThrowingLogSinkNeverStopsTheBoundarysAnswer(bool responseStarted, int status, string eventName)
+    {
+        var sentinel = NewSentinel();
+        using var logs = new CapturingLoggerProvider();
+        using var throwing = new ThrowingLoggerProvider(typeof(ApiExceptionHandler));
+        using var loggerFactory = LoggerFactory.Create(logging => logging.AddProvider(logs).AddProvider(throwing));
+        using var aborted = new CancellationTokenSource();
+        using var body = new MemoryStream();
+        var lifetime = new RecordingLifetimeFeature();
+        var context = new DefaultHttpContext();
+        context.Features.Set<IHttpRequestLifetimeFeature>(lifetime);
+        Exception failure;
+        if (responseStarted)
+        {
+            context.Features.Set<IHttpResponseFeature>(new StartedResponseFeature());
+            failure = new InvalidOperationException(sentinel);
+        }
+        else
+        {
+            await aborted.CancelAsync();
+            failure = new OperationCanceledException(sentinel);
+        }
+
+        lifetime.RequestAborted = aborted.Token;
+        context.Response.Body = body;
+        var boundary = new ApiExceptionBoundaryMiddleware(
+            _ => Task.FromException(failure),
+            loggerFactory.CreateLogger<ApiExceptionHandler>());
+
+        await boundary.InvokeAsync(context);
+
+        Assert.Equal(status, context.Response.StatusCode);
+        Assert.Equal(responseStarted, lifetime.Aborted);
+        Assert.Equal(0, body.Length);
+        Assert.Equal(1, throwing.Throws);
+        CapturedLogEntry line = Assert.Single(logs.Find(entry => entry.Category == HandlerCategory));
+        Assert.Equal(eventName, line.EventId.Name);
+        Assert.Null(line.ExceptionType);
+        Assert.False(logs.ContainsText(sentinel));
+    }
+
     // AAP 0.9.3: a failure after the response started cannot change the status the client already holds. The boundary
     // aborts the response, so it stays visibly incomplete (no last chunk), and logs one redacted Error line; neither
     // the exception-handler middleware nor Kestrel logs the exception, its message or its SQL text. The endpoint fails
@@ -1144,6 +1307,31 @@ public sealed class ErrorContractTests
 
     private const string FailingInsertPlacement = "valid value of a failing create";
 
+    // The logging configurations the floor cases run under: the committed appsettings*.json alone, and with
+    // LoweredLoggingSettings on top.
+    private const string CommittedLogging = "committed Logging configuration";
+
+    private const string LoweredLogging = "Logging settings lowering every level and enabling scopes";
+
+    // The category of the hosting request lines, which carry the request path and query string.
+    private const string HostingDiagnosticsCategory = "Microsoft.AspNetCore.Hosting.Diagnostics";
+
+    // The category of the startup lines, which carry the listen address, the environment name and the content root.
+    private const string HostingLifetimeCategory = "Microsoft.Hosting.Lifetime";
+
+    // The category of the framework's health-check service, whose per-check line repeats the check's own.
+    private const string HealthCheckServiceCategory =
+        "Microsoft.Extensions.Diagnostics.HealthChecks.DefaultHealthCheckService";
+
+    // The floors the API keeps framework categories at, written out here rather than read from the product: each
+    // category prefix, a category under it to probe, and the lowest level it may log at, where None means nothing.
+    private static readonly (string CategoryPrefix, string ProbeCategory, LogLevel Floor)[] ProtectedFloors =
+    [
+        ("Microsoft.AspNetCore", HostingDiagnosticsCategory, LogLevel.Warning),
+        (HostingLifetimeCategory, HostingLifetimeCategory, LogLevel.Warning),
+        (HealthCheckServiceCategory, HealthCheckServiceCategory, LogLevel.None),
+    ];
+
     // The cross-origin request of the CORS cases.
     private const string ForeignOrigin = "http://example.test";
 
@@ -1248,6 +1436,10 @@ public sealed class ErrorContractTests
     /// <summary>Each environment with each placement of a sentinel in the values of a create that fails.</summary>
     public static TheoryData<string, string> EnvironmentsAndValuePlacements =>
         EnvironmentsWith(NumberTypeErrorPlacement, OverLongTextPlacement, FailingInsertPlacement);
+
+    /// <summary>Each environment with the committed and with the lowered logging configuration.</summary>
+    public static TheoryData<string, string> EnvironmentsAndLoggingConfigurations =>
+        EnvironmentsWith(CommittedLogging, LoweredLogging);
 
     // AAP 0.3.4.2: a form that does not exist, a viewId its int route constraint cannot match, and a method the record
     // route does not map are each the fixed ProblemDetails of their status in every environment. The PATCH carries an
@@ -1762,6 +1954,86 @@ public sealed class ErrorContractTests
         AssertRedacted(factory, body, password, connectionString, PasswordKeyword);
     }
 
+    // AAP 0.9.3 and 0.3.4.7: whatever the Logging configuration sets, for every provider or for the console alone, no
+    // framework category whose low-level lines carry request or configuration values logs below its floor, and a
+    // query-string value reaches no captured line. Under the committed configuration the startup lines would otherwise
+    // carry the content root and environment name; under the lowered one the hosting request line would also carry the
+    // URL and its query string, and the health-check service would write its per-check lines. Every other category
+    // keeps its configured level, so the lowered configuration lets an application category log at Trace.
+    [Theory]
+    [MemberData(nameof(EnvironmentsAndLoggingConfigurations))]
+    public async Task ProtectedFrameworkCategoriesStayAtTheirFloorsUnderEveryLoggingConfiguration(
+        string environment,
+        string configuration)
+    {
+        string querySentinel = NewSentinel();
+        bool lowered = configuration == LoweredLogging;
+        await using ApiFactory factory = CreateLoggingFactory(environment, lowered);
+        using HttpClient client = factory.CreateClient();
+
+        using HttpResponseMessage list = await client.GetAsync(
+            $"{TwoPageRecordsPath}?{RequestParameters.Query}={Uri.EscapeDataString(querySentinel)}");
+        using HttpResponseMessage health = await client.GetAsync("/health");
+
+        Assert.Equal(HttpStatusCode.OK, list.StatusCode);
+        Assert.Equal(HttpStatusCode.OK, health.StatusCode);
+        ILogger application = factory.Services
+            .GetRequiredService<ILoggerFactory>()
+            .CreateLogger(typeof(RecordService).FullName!);
+        Assert.Equal(lowered, application.IsEnabled(LogLevel.Trace));
+        AssertNoLineBelowTheFloors(factory.Logs);
+        Assert.False(factory.Logs.ContainsText(querySentinel), "A captured log line holds the query-string value.");
+    }
+
+    // AAP 0.9.3: the floors hold in every rebuild of the filter options, which a configuration reload makes, and
+    // against a console-only rule, which the logger factory prefers to every generic rule. Each rule's filter rejects
+    // every protected category below its floor, so whichever rule the factory chooses drops those lines. Before and
+    // after a reload no provider's logger for a protected category is enabled below its floor, while an application
+    // category keeps the Trace level the configuration gives it.
+    [Theory]
+    [MemberData(nameof(Environments))]
+    public async Task LoggingFloorsHoldInEveryRebuildOfTheFilterOptions(string environment)
+    {
+        await using ApiFactory factory = CreateLoggingFactory(environment, lowered: true);
+        IServiceProvider services = factory.Services;
+
+        LoggerFilterOptions rebuilt = services
+            .GetRequiredService<IOptionsFactory<LoggerFilterOptions>>()
+            .Create(Microsoft.Extensions.Options.Options.DefaultName);
+        Assert.Contains(
+            rebuilt.Rules,
+            rule => string.Equals(rule.ProviderName, "Console", StringComparison.OrdinalIgnoreCase)
+                && rule.CategoryName == HostingDiagnosticsCategory
+                && rule.LogLevel == LogLevel.Trace);
+        AssertEveryRuleKeepsTheFloors(rebuilt);
+        AssertLoggerLevels(services);
+
+        ReloadConfiguration(services);
+
+        AssertEveryRuleKeepsTheFloors(
+            services.GetRequiredService<IOptionsMonitor<LoggerFilterOptions>>().CurrentValue);
+        AssertLoggerLevels(services);
+    }
+
+    // AAP 0.3.4.2 and 0.9.3: the JSON console the API logs through writes no scopes, which carry the request path and
+    // connection id, stamps every line with an ISO 8601 UTC timestamp, and writes each event as one unindented line,
+    // whatever Logging:Console sets, before and after a configuration reload. The line is written by the host's own
+    // formatter with a request-path scope active, under a culture whose date and time separators are not ISO 8601's.
+    [Theory]
+    [MemberData(nameof(Environments))]
+    public async Task JsonConsoleWritesNoScopesAndAUtcTimestampWhateverItsConfiguration(string environment)
+    {
+        string pathSentinel = NewSentinel();
+        await using ApiFactory factory = CreateLoggingFactory(environment, lowered: true);
+        IServiceProvider services = factory.Services;
+
+        AssertConsoleLine(services, pathSentinel);
+
+        ReloadConfiguration(services);
+
+        AssertConsoleLine(services, pathSentinel);
+    }
+
 
     // Every case names its client folder, so none falls back to the committed default (the repository's web/dist),
     // whose presence depends on whether the client was built.
@@ -1804,6 +2076,176 @@ public sealed class ErrorContractTests
 
     private static Dictionary<string, string?> ClientPathSetting(string clientFolder) =>
         new(StringComparer.OrdinalIgnoreCase) { [ApiOptions.ClientPathKey] = clientFolder };
+
+    // A host over the standard fake forms with the committed logging configuration, or with LoweredLoggingSettings on
+    // top of it; the client is absent.
+    private static ApiFactory CreateLoggingFactory(string environment, bool lowered)
+    {
+        Dictionary<string, string?> settings = ClientPathSetting(AbsentClientFolder());
+        if (lowered)
+        {
+            foreach ((string key, string? value) in LoweredLoggingSettings())
+            {
+                settings[key] = value;
+            }
+        }
+
+        return new ApiFactory(new ApiFactoryOptions
+        {
+            EnvironmentName = environment,
+            DataStore = FakeDataStore.WithStandardForms(),
+            ConnectionMode = ApiConnectionMode.None,
+            ExtraSettings = settings,
+        });
+    }
+
+    // Settings that, without the API's own floors, would lower every protected framework category to Trace for every
+    // provider, through the generic rules and through the console-only rules the logger factory prefers to them, and
+    // would turn the console's scopes on, its timestamp to local time in another pattern, its JSON writer to indented
+    // output spread over several lines, and its formatter away from JSON.
+    private static Dictionary<string, string?> LoweredLoggingSettings() => new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["Logging:LogLevel:Default"] = "Trace",
+        ["Logging:LogLevel:Microsoft.AspNetCore"] = "Trace",
+        ["Logging:LogLevel:" + HostingDiagnosticsCategory] = "Trace",
+        ["Logging:LogLevel:" + HostingLifetimeCategory] = "Trace",
+        ["Logging:LogLevel:Microsoft.Extensions.Diagnostics.HealthChecks"] = "Trace",
+        ["Logging:Console:LogLevel:Default"] = "Trace",
+        ["Logging:Console:LogLevel:" + HostingDiagnosticsCategory] = "Trace",
+        ["Logging:Console:LogLevel:" + HostingLifetimeCategory] = "Trace",
+        ["Logging:Console:LogLevel:" + HealthCheckServiceCategory] = "Trace",
+        ["Logging:Console:FormatterName"] = ConsoleFormatterNames.Simple,
+        ["Logging:Console:FormatterOptions:IncludeScopes"] = "true",
+        ["Logging:Console:FormatterOptions:TimestampFormat"] = "HH:mm:ss ",
+        ["Logging:Console:FormatterOptions:UseUtcTimestamp"] = "false",
+        ["Logging:Console:FormatterOptions:JsonWriterOptions:Indented"] = "true",
+    };
+
+    // Reloads every configuration source of the host and raises its change token, as a changed appsettings.json does,
+    // so every options instance bound to configuration is rebuilt.
+    private static void ReloadConfiguration(IServiceProvider services) =>
+        ((IConfigurationRoot)services.GetRequiredService<IConfiguration>()).Reload();
+
+    // AAP 0.9.3: no captured line from a protected framework category below its floor.
+    private static void AssertNoLineBelowTheFloors(CapturingLoggerProvider logs)
+    {
+        string[] belowFloors = logs.Entries
+            .Where(entry => ProtectedFloors.Any(floor =>
+                entry.Category.StartsWith(floor.CategoryPrefix, StringComparison.OrdinalIgnoreCase)
+                && entry.Level < floor.Floor))
+            .Select(entry => $"{entry.Category} at {entry.Level}")
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+        Assert.True(
+            belowFloors.Length == 0,
+            "Captured lines below a protected floor: " + string.Join(", ", belowFloors));
+    }
+
+    // Whichever rule the logger factory chooses for the console, its filter drops every protected category's lines
+    // below its floor.
+    private static void AssertEveryRuleKeepsTheFloors(LoggerFilterOptions options)
+    {
+        Assert.NotEmpty(options.Rules);
+        Assert.All(options.Rules, rule =>
+        {
+            Assert.NotNull(rule.Filter);
+            foreach ((_, string category, LogLevel floor) in ProtectedFloors)
+            {
+                Assert.False(
+                    rule.Filter(typeof(ConsoleLoggerProvider).FullName, category, floor - 1),
+                    $"A filter rule lets a {category} line below its floor through.");
+            }
+        });
+    }
+
+    // Through the host's logger factory, which asks every provider's chosen rule: below its floor every protected
+    // category is off for every provider, at its floor it is on unless the floor is None, and an application category
+    // keeps its configured Trace level.
+    private static void AssertLoggerLevels(IServiceProvider services)
+    {
+        ILoggerFactory loggers = services.GetRequiredService<ILoggerFactory>();
+        foreach ((_, string category, LogLevel floor) in ProtectedFloors)
+        {
+            ILogger logger = loggers.CreateLogger(category);
+            Assert.False(logger.IsEnabled(floor - 1), $"A provider logs {category} below its floor.");
+            if (floor != LogLevel.None)
+            {
+                Assert.True(logger.IsEnabled(floor), $"No provider logs {category} at its floor.");
+            }
+        }
+
+        Assert.True(
+            loggers.CreateLogger(typeof(RecordService).FullName!).IsEnabled(LogLevel.Trace),
+            "The configured Trace level of an application category does not apply.");
+    }
+
+    // One line written by the host's JSON console formatter, with a request-path scope holding pathSentinel active and,
+    // as the current culture, one whose date and time separators differ from ISO 8601's: the console is the JSON
+    // formatter, the event is a single line holding one JSON object without scopes or the sentinel, and its Timestamp
+    // is ISO 8601 in UTC.
+    private static void AssertConsoleLine(IServiceProvider services, string pathSentinel)
+    {
+        Assert.Equal(
+            ConsoleFormatterNames.Json,
+            services.GetRequiredService<IOptionsMonitor<ConsoleLoggerOptions>>().CurrentValue.FormatterName);
+        JsonConsoleFormatterOptions options =
+            services.GetRequiredService<IOptionsMonitor<JsonConsoleFormatterOptions>>().CurrentValue;
+        Assert.False(options.IncludeScopes, "The JSON console includes scopes.");
+        Assert.NotNull(options.TimestampFormat);
+        Assert.True(options.UseUtcTimestamp, "The JSON console writes local time.");
+        Assert.False(options.JsonWriterOptions.Indented, "The JSON console indents its output.");
+
+        ConsoleFormatter formatter = Assert.Single(
+            services.GetServices<ConsoleFormatter>(),
+            candidate => candidate.Name == ConsoleFormatterNames.Json);
+        var scopes = new LoggerExternalScopeProvider();
+        var culture = (CultureInfo)CultureInfo.InvariantCulture.Clone();
+        culture.DateTimeFormat.DateSeparator = ".";
+        culture.DateTimeFormat.TimeSeparator = ".";
+        CultureInfo previous = CultureInfo.CurrentCulture;
+        using var writer = new StringWriter(CultureInfo.InvariantCulture);
+        try
+        {
+            CultureInfo.CurrentCulture = culture;
+            using (scopes.Push(new[] { new KeyValuePair<string, object?>("RequestPath", "/api/" + pathSentinel) }))
+            {
+                formatter.Write(
+                    new LogEntry<string>(
+                        LogLevel.Warning,
+                        typeof(RecordService).FullName!,
+                        new EventId(1, "Fixed"),
+                        "A fixed line.",
+                        exception: null,
+                        (state, _) => state),
+                    scopes,
+                    writer);
+            }
+        }
+        finally
+        {
+            CultureInfo.CurrentCulture = previous;
+        }
+
+        string text = writer.ToString();
+        Assert.False(text.Contains(pathSentinel, StringComparison.Ordinal), "The console line holds the scope's path.");
+
+        // The formatter ends each event with one new line, so the event is a single line only when nothing before
+        // that terminator breaks it.
+        Assert.EndsWith(Environment.NewLine, text, StringComparison.Ordinal);
+        string body = text[..^Environment.NewLine.Length];
+        Assert.False(body.AsSpan().ContainsAny('\r', '\n'), "The console event spans more than one line.");
+        using JsonDocument line = JsonDocument.Parse(text);
+        Assert.False(line.RootElement.TryGetProperty("Scopes", out _), "The console line carries scopes.");
+        Assert.True(
+            line.RootElement.TryGetProperty("Timestamp", out JsonElement timestamp)
+                && timestamp.ValueKind == JsonValueKind.String,
+            "The console line carries no Timestamp string.");
+        string written = timestamp.GetString()!;
+        Assert.Matches(@"\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|\+00:00)\z", written);
+        Assert.Equal(
+            TimeSpan.Zero,
+            DateTimeOffset.Parse(written, CultureInfo.InvariantCulture, DateTimeStyles.None).Offset);
+    }
 
     // Each environment with each case.
     private static TheoryData<string, string> EnvironmentsWith(params string[] cases)
@@ -2301,12 +2743,14 @@ public sealed class ErrorContractTests
         return texts;
     }
 
-    // AAP 0.3.4.2: one handler line per failure, carrying the status it answered. A redaction case asserts it first,
-    // so its search runs over a line that exists.
+    // AAP 0.3.4.2: one handler line per failure, carrying the status it answered, at Information for a 4xx and at
+    // Error for a 5xx, the 503 of an unavailable store included. A redaction case asserts it first, so its search runs
+    // over a line that exists.
     private static CapturedLogEntry AssertOneHandlerLine(ApiFactoryBase factory, HttpStatusCode status)
     {
         CapturedLogEntry line = Assert.Single(factory.Logs.Find(entry => entry.Category == HandlerCategory));
         Assert.Equal((int)status, StateValue(line, "StatusCode"));
+        Assert.Equal((int)status >= 500 ? LogLevel.Error : LogLevel.Information, line.Level);
         return line;
     }
 
@@ -2463,6 +2907,65 @@ public sealed class ErrorContractTests
             length = 0;
             return false;
         }
+    }
+
+    /// <summary>
+    /// A response body whose every write and flush fails with an exception that is not a client abort, as a failing
+    /// server stream would.
+    /// </summary>
+    private sealed class FailingWriteStream : Stream
+    {
+        public override bool CanRead => false;
+
+        public override bool CanSeek => false;
+
+        public override bool CanWrite => true;
+
+        public override long Length => throw new NotSupportedException();
+
+        public override long Position
+        {
+            get => throw new NotSupportedException();
+            set => throw new NotSupportedException();
+        }
+
+        public override void Flush() => throw Failure();
+
+        public override Task FlushAsync(CancellationToken cancellationToken) => Task.FromException(Failure());
+
+        public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+
+        public override void SetLength(long value) => throw new NotSupportedException();
+
+        public override void Write(byte[] buffer, int offset, int count) => throw Failure();
+
+        public override Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken) =>
+            Task.FromException(Failure());
+
+        public override ValueTask WriteAsync(
+            ReadOnlyMemory<byte> buffer,
+            CancellationToken cancellationToken = default) =>
+            ValueTask.FromException(Failure());
+
+        private static InvalidOperationException Failure() => new("Response body failure injected by the test.");
+    }
+
+    /// <summary>A response the server has started sending, so its status and headers can no longer change.</summary>
+    private sealed class StartedResponseFeature : HttpResponseFeature
+    {
+        public override bool HasStarted => true;
+    }
+
+    /// <summary>The request lifetime of a test context, recording whether the connection was aborted.</summary>
+    private sealed class RecordingLifetimeFeature : IHttpRequestLifetimeFeature
+    {
+        public CancellationToken RequestAborted { get; set; }
+
+        public bool Aborted { get; private set; }
+
+        public void Abort() => Aborted = true;
     }
 
     /// <summary>
@@ -3395,9 +3898,10 @@ internal sealed record ErrorPipelineHostOptions
 /// <remarks>
 /// <para>
 /// The content root is <c>src/EpiInfo.Api</c>, so <c>appsettings.json</c> and <c>appsettings.{Environment}.json</c>
-/// supply the <c>Logging:LogLevel</c> filters, the body limit and the listen endpoint. Those committed filters govern
-/// the JSON console and the capture provider alike; the host changes no level, filter or console option, and the
-/// provider has no filter of its own, so it captures exactly what production emits.
+/// supply the <c>Logging:LogLevel</c> filters, the body limit and the listen endpoint. Those committed filters, held to
+/// the protected framework floors of <see cref="ProtectedLogLevels"/> as <c>Program.cs</c> holds them, govern the JSON
+/// console and the capture provider alike; the host changes no level, filter or console option beyond what
+/// <c>Program.cs</c> sets, and the provider has no filter of its own, so it captures exactly what production emits.
 /// </para>
 /// <para>
 /// The listener is held to the binding rule as <c>Program.cs</c> holds the API's. The committed endpoint is
@@ -3483,12 +3987,21 @@ internal sealed class ErrorPipelineHost : IAsyncDisposable
                 builder.WebHost.UseTestServer();
             }
 
-            // As Program.cs does, with the capture provider added beside the JSON console rather than in its place.
+            // As Program.cs does, with the capture provider added beside the JSON console rather than in its place: the
+            // console's scopes, UTC timestamp and unindented writer are fixed, and the protected framework floors hold
+            // over every configured rule, so the capture provider sees the levels production applies.
             builder.Logging.ClearProviders();
-            builder.Logging.AddJsonConsole();
+            builder.Logging.AddJsonConsole(console =>
+            {
+                console.IncludeScopes = false;
+                console.TimestampFormat = "O";
+                console.UseUtcTimestamp = true;
+                console.JsonWriterOptions = console.JsonWriterOptions with { Indented = false };
+            });
             builder.Logging.AddProvider(logs);
 
             var services = builder.Services;
+            services.PostConfigure<LoggerFilterOptions>(ProtectedLogLevels.Apply);
             services.AddSingleton(
                 provider => ApiOptions.FromConfiguration(provider.GetRequiredService<IConfiguration>()));
             services.AddProblemDetails(problem => problem.CustomizeProblemDetails = ApiProblems.Customize);

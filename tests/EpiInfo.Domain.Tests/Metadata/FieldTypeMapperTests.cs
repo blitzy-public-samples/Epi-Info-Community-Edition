@@ -329,79 +329,26 @@ public sealed class FieldTypeMapperTests
         AssertUnsupported(typeName, FieldTypeMapper.Map(FieldOn(typeName, sqlType)));
     }
 
-    // Synthetic, because no seeded field is an Option. An option is stored as its 0-based index, so the item count
-    // minus 1 must fit the column: 255 is the largest tinyint and 32767 the largest smallint.
+    // Synthetic, because no seeded field is an Option. The column alone decides admission, so an Option keeps every
+    // item at its 0-based index on either side of the column's largest index, 255 for tinyint and 32767 for
+    // smallint. A submitted index the column cannot store is the record validator's storage-range error.
     [Theory]
-    [InlineData("tinyint", 256, FieldType.Option, null)]
-    [InlineData("tinyint", 257, FieldType.Unsupported, "Option")]
-    [InlineData("smallint", 32768, FieldType.Option, null)]
-    [InlineData("smallint", 32769, FieldType.Unsupported, "Option")]
-    public void Map_OptionOnAdmittedColumn_IsSupportedOnlyWhileItsLastIndexFits(
-        string sqlType,
-        int itemCount,
-        FieldType expectedType,
-        string? expectedUnsupportedType)
+    [InlineData("tinyint", 256)]
+    [InlineData("tinyint", 257)]
+    [InlineData("smallint", 32768)]
+    [InlineData("smallint", 32769)]
+    public void Map_OptionOnAdmittedColumn_StaysOptionWithEveryItemWhateverItsCount(string sqlType, int itemCount)
     {
-        string list = string.Join(
-            ',',
-            Enumerable.Range(0, itemCount).Select(index => "Item" + index.ToString(CultureInfo.InvariantCulture)));
-        FieldMetadata field = FieldOn("Option", sqlType) with { List = list };
+        string[] labels = Enumerable.Range(0, itemCount)
+            .Select(index => "Item" + index.ToString(CultureInfo.InvariantCulture))
+            .ToArray();
+        string list = string.Join(',', labels);
+        FieldOption[] expectedOptions = labels
+            .Select((label, index) => new FieldOption(FieldValue.FromIndex(index), label))
+            .ToArray();
 
-        Assert.Equal(
-            (expectedType, expectedUnsupportedType is not null, expectedUnsupportedType),
-            FieldTypeMapper.Map(field));
-    }
-
-    // Map counts the items in place rather than parsing them, so it must count exactly the items ParseOptionItems
-    // gives: a comma after "||" starts no item, however many follow, while an empty item still takes an index.
-    [Theory]
-    [InlineData("tinyint", 256, "Item", 100_000, FieldType.Option, null)]
-    [InlineData("tinyint", 257, "Item", 100_000, FieldType.Unsupported, "Option")]
-    [InlineData("tinyint", 0, "Item", 100_000, FieldType.Option, null)]
-    [InlineData("tinyint", 256, "", 0, FieldType.Option, null)]
-    [InlineData("tinyint", 257, "", 0, FieldType.Unsupported, "Option")]
-    public void Map_OptionListWithSeparatorOrEmptyItems_CountsOnlyTheItemsParseOptionItemsGives(
-        string sqlType,
-        int itemCount,
-        string itemLabel,
-        int commasAfterSeparator,
-        FieldType expectedType,
-        string? expectedUnsupportedType)
-    {
-        string items = string.Join(',', Enumerable.Repeat(itemLabel, itemCount));
-        string list = commasAfterSeparator > 0 ? items + "||" + new string(',', commasAfterSeparator) : items;
-        FieldMetadata field = FieldOn("Option", sqlType) with { List = list };
-
-        Assert.Equal(itemCount, FieldTypeMapper.ParseOptionItems(list).Count);
-        Assert.Equal(
-            (expectedType, expectedUnsupportedType is not null, expectedUnsupportedType),
-            FieldTypeMapper.Map(field));
-    }
-
-    // Map counts an Option's items in place, so what it allocates does not grow with the stored list: a list of
-    // 131,072 items, 524,286 bytes of metaFields.List, costs Map exactly what three items cost, where parsing the
-    // items would allocate megabytes. Both fields are mapped once first, so the measurement holds no first-call work.
-    [Theory]
-    [InlineData("tinyint")]
-    [InlineData("int")]
-    public void Map_OptionWithLongList_AllocatesExactlyWhatAShortListDoes(string sqlType)
-    {
-        FieldMetadata shortList = FieldOn("Option", sqlType) with { List = "Yes,No,Unknown" };
-        FieldMetadata longList = FieldOn("Option", sqlType) with
-        {
-            List = string.Join(',', Enumerable.Repeat("a", 131_072)),
-        };
-        _ = FieldTypeMapper.Map(shortList);
-        _ = FieldTypeMapper.Map(longList);
-
-        long start = GC.GetAllocatedBytesForCurrentThread();
-        _ = FieldTypeMapper.Map(shortList);
-        long shortListBytes = GC.GetAllocatedBytesForCurrentThread() - start;
-        start = GC.GetAllocatedBytesForCurrentThread();
-        _ = FieldTypeMapper.Map(longList);
-        long longListBytes = GC.GetAllocatedBytesForCurrentThread() - start;
-
-        Assert.Equal(shortListBytes, longListBytes);
+        AssertSupported(FieldType.Option, FieldTypeMapper.Map(FieldOn("Option", sqlType) with { List = list }));
+        Assert.Equal(expectedOptions, FieldTypeMapper.ParseOptionItems(list));
     }
 
     // A data type with no page-table column has nowhere to write its value.
@@ -551,9 +498,11 @@ public sealed class FieldTypeMapperTests
         Assert.Equal(expected, FieldTypeMapper.ParseOptionItems(list));
     }
 
+    // No item text offers no option, whether the list is missing, empty or starts with "||".
     [Theory]
     [InlineData(null)]
     [InlineData("")]
+    [InlineData("||1,2,3")]
     public void ParseOptionItems_NoList_GivesNoOptions(string? list)
     {
         Assert.Empty(FieldTypeMapper.ParseOptionItems(list));

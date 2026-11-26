@@ -44,7 +44,9 @@ namespace EpiInfo.Api.Tests.Validation;
 /// <para>
 /// Each request runs under the exclusive <see cref="DatabaseWriteLock"/> between two <see cref="SqlSnapshot"/>
 /// captures: a rejection must leave the five data tables unchanged, and an acceptance must add exactly the new
-/// record's base and page rows. Each body carries a fresh <see cref="TestDatabase.NewMarker"/> in
+/// record's base and page rows. A rejection must also send no write command and run no command inside a
+/// transaction, as <see cref="SqlCommandRecorder"/> records them, because a write rolled back leaves the snapshots
+/// equal. Each body carries a fresh <see cref="TestDatabase.NewMarker"/> in
 /// <see cref="TestDatabase.MarkerField"/>, so the tested field alone decides the outcome and a record a defect
 /// accepted can be found; the one exception is the body of unchecked checkboxes only, identified by the id its
 /// response returns. Created records stay in the database, and no count or view id is hard-coded.
@@ -86,14 +88,17 @@ public sealed class ValidationTests : IAsyncLifetime
 
     /// <summary>
     /// Field-level rejections of a <c>POST</c> as (form, submitted name, raw JSON value, the one expected
-    /// <c>errors</c> key, a message that key must hold). The body also carries a marker in <c>LastName</c>.
+    /// <c>errors</c> key, the exact messages that key holds, in any order). The body also carries a marker in
+    /// <c>LastName</c>.
     /// </summary>
-    public static TheoryData<string, string, string, string, string> FieldLevelPostCases
+    public static TheoryData<string, string, string, string, string[]> FieldLevelPostCases
     {
         get
         {
             string ageRange = ValidationMessages.FormatRangeBetween(0L, 120L);
+            string agePattern = ValidationMessages.FormatPatternMismatch("###");
             string feverRange = ValidationMessages.FormatRangeBetween(80L, 110L);
+            string feverPattern = ValidationMessages.FormatPatternMismatch("###.#");
             string interviewRange = ValidationMessages.FormatRangeBetween(
                 new DateOnly(2011, 1, 15),
                 new DateOnly(2012, 12, 31));
@@ -103,62 +108,64 @@ public sealed class ValidationTests : IAsyncLifetime
             string phoneMask = ValidationMessages.FormatPatternMismatch("###-###-####");
             string zipLength = ValidationMessages.FormatMaxLengthExceeded(5);
 
-            return new TheoryData<string, string, string, string, string>
+            return new TheoryData<string, string, string, string, string[]>
             {
                 // MaxLength 5, also under a lower-case key, which the error names by its canonical spelling.
-                { CaseReport, "Zip", "\"123456\"", "Zip", zipLength },
-                { CaseReport, "zip", "\"123456\"", "Zip", zipLength },
+                { CaseReport, "Zip", "\"123456\"", "Zip", [zipLength] },
+                { CaseReport, "zip", "\"123456\"", "Zip", [zipLength] },
 
-                // Inclusive range 0 to 120; 1000 is outside it and also has more integer digits than ###.
-                { CaseReport, "Age", "121", "Age", ageRange },
-                { CaseReport, "Age", "1000", "Age", ValidationMessages.FormatPatternMismatch("###") },
+                // Inclusive range 0 to 120; 1000 is outside it and also has more integer digits than ###, so both
+                // messages are required.
+                { CaseReport, "Age", "121", "Age", [ageRange] },
+                { CaseReport, "Age", "1000", "Age", [ageRange, agePattern] },
 
                 // The phone mask; the last is the shape seeded rows hold, still rejected when it is submitted.
-                { CaseReport, "PhoneNumber", "\"5550148636\"", "PhoneNumber", phoneMask },
-                { CaseReport, "PhoneNumber", "\"555-014-863\"", "PhoneNumber", phoneMask },
-                { CaseReport, "PhoneNumber", "\"(555) 0148-6367\"", "PhoneNumber", phoneMask },
+                { CaseReport, "PhoneNumber", "\"5550148636\"", "PhoneNumber", [phoneMask] },
+                { CaseReport, "PhoneNumber", "\"555-014-863\"", "PhoneNumber", [phoneMask] },
+                { CaseReport, "PhoneNumber", "\"(555) 0148-6367\"", "PhoneNumber", [phoneMask] },
 
                 // A read-only field is rejected by its presence, whatever its value (C-3).
-                { CaseReport, "StateIDNumber", "\"X\"", "StateIDNumber", ValidationMessages.ReadOnlyField },
-                { CaseReport, "StateIDNumber", "null", "StateIDNumber", ValidationMessages.ReadOnlyField },
-                { FoodHistory, "OnsetWeek", "5", "OnsetWeek", ValidationMessages.ReadOnlyField },
+                { CaseReport, "StateIDNumber", "\"X\"", "StateIDNumber", [ValidationMessages.ReadOnlyField] },
+                { CaseReport, "StateIDNumber", "null", "StateIDNumber", [ValidationMessages.ReadOnlyField] },
+                { FoodHistory, "OnsetWeek", "5", "OnsetWeek", [ValidationMessages.ReadOnlyField] },
 
                 // Inclusive range 80 to 110 (112 is EC-VAL-02). 37.25 is below it and has two decimals, so both
-                // messages are given; the pattern's is pinned here and the range's by 79.
-                { FoodHistory, "FeverTemp", "112", "FeverTemp", feverRange },
-                { FoodHistory, "FeverTemp", "79", "FeverTemp", feverRange },
-                { FoodHistory, "FeverTemp", "37.25", "FeverTemp", ValidationMessages.FormatPatternMismatch("###.#") },
+                // messages are required.
+                { FoodHistory, "FeverTemp", "112", "FeverTemp", [feverRange] },
+                { FoodHistory, "FeverTemp", "79", "FeverTemp", [feverRange] },
+                { FoodHistory, "FeverTemp", "37.25", "FeverTemp", [feverRange, feverPattern] },
 
                 // In range with two decimals: the ###.# pattern alone rejects it.
-                { FoodHistory, "FeverTemp", "101.25", "FeverTemp", ValidationMessages.FormatPatternMismatch("###.#") },
+                { FoodHistory, "FeverTemp", "101.25", "FeverTemp", [feverPattern] },
 
-                // 37.5 fits the bare ###.# rule, which MaskPatternTests pins as accepted, but the seeded FeverTemp
-                // range 80 to 110 is inclusive, so the range rejects it here.
-                { FoodHistory, "FeverTemp", "37.5", "FeverTemp", feverRange },
+                // 37.5 is below the inclusive seeded range 80 to 110, and the range is its only error: the ###.# mask
+                // accepts it, as MaskPatternTests pins on the bare rule.
+                { FoodHistory, "FeverTemp", "37.5", "FeverTemp", [feverRange] },
 
                 // Inclusive range 2011-01-15 to 2012-12-31 (2011-01-01 is EC-VAL-01), and a month that does not exist.
-                { FoodHistory, "DateofInterview", "\"2011-01-01\"", "DateofInterview", interviewRange },
-                { FoodHistory, "DateofInterview", "\"2013-01-01\"", "DateofInterview", interviewRange },
+                { FoodHistory, "DateofInterview", "\"2011-01-01\"", "DateofInterview", [interviewRange] },
+                { FoodHistory, "DateofInterview", "\"2013-01-01\"", "DateofInterview", [interviewRange] },
                 {
-                    FoodHistory, "DateofInterview", "\"2011-13-01\"", "DateofInterview", ValidationMessages.DateExpected
+                    FoodHistory, "DateofInterview", "\"2011-13-01\"", "DateofInterview",
+                    [ValidationMessages.DateExpected]
                 },
 
                 // Not one of the code table's values (EC-VAL-03).
-                { FoodHistory, "Sex", "\"X-Other\"", "Sex", ValidationMessages.NotALegalValue },
+                { FoodHistory, "Sex", "\"X-Other\"", "Sex", [ValidationMessages.NotALegalValue] },
 
                 // Wire types: a string for a number, and a string or a number for a checkbox.
-                { CaseReport, "Age", "\"120\"", "Age", ValidationMessages.NumberExpected },
-                { FoodHistory, "White", "\"yes\"", "White", ValidationMessages.BooleanExpected },
-                { FoodHistory, "White", "1", "White", ValidationMessages.BooleanExpected },
+                { CaseReport, "Age", "\"120\"", "Age", [ValidationMessages.NumberExpected] },
+                { FoodHistory, "White", "\"yes\"", "White", [ValidationMessages.BooleanExpected] },
+                { FoodHistory, "White", "1", "White", [ValidationMessages.BooleanExpected] },
 
                 // A name with no metaFields row is reported under the fixed values key, so the submitted name never
                 // reaches the body; a system column or an unsupported field is a row that holds no value, reported
                 // under its canonical name.
-                { CaseReport, "NoSuchField", "\"unknown-value\"", valuesKey, notAField },
-                { CaseReport, "RecStatus", "1", "RecStatus", notADataField },
-                { CaseReport, "GlobalRecordId", "\"unknown-value\"", "GlobalRecordId", notADataField },
-                { CaseReport, "UniqueKey", "1", "UniqueKey", notADataField },
-                { FoodHistory, "ILL", "1", "ILL", notADataField },
+                { CaseReport, "NoSuchField", "\"unknown-value\"", valuesKey, [notAField] },
+                { CaseReport, "RecStatus", "1", "RecStatus", [notADataField] },
+                { CaseReport, "GlobalRecordId", "\"unknown-value\"", "GlobalRecordId", [notADataField] },
+                { CaseReport, "UniqueKey", "1", "UniqueKey", [notADataField] },
+                { FoodHistory, "ILL", "1", "ILL", [notADataField] },
             };
         }
     }
@@ -209,6 +216,10 @@ public sealed class ValidationTests : IAsyncLifetime
     private HttpClient Client =>
         _client ?? throw new InvalidOperationException("The API client is created in InitializeAsync.");
 
+    // Every SQL command the host's data store sends, the proof that a rejection reached no write.
+    private SqlCommandRecorder Recorder =>
+        _factory?.Recorder ?? throw new InvalidOperationException("The API host is created in InitializeAsync.");
+
     /// <summary>
     /// Starts the API host on the rehearsal database and resolves both form ids by name. A database that is not
     /// configured or not reachable fails every test with the <see cref="TestDatabase"/> message; nothing is skipped.
@@ -245,7 +256,7 @@ public sealed class ValidationTests : IAsyncLifetime
         string submittedName,
         string rawValue,
         string expectedKey,
-        string expectedMessage)
+        string[] expectedMessages)
     {
         using var timeout = new CancellationTokenSource(TestTimeout);
         string marker = TestDatabase.NewMarker();
@@ -253,7 +264,7 @@ public sealed class ValidationTests : IAsyncLifetime
 
         var (problem, text) = await AssertRejectedWithoutWriteAsync(form, Post(form, JsonBody(body)), timeout.Token);
 
-        AssertFieldLevel(problem, expectedKey, expectedMessage, SubmittedText(rawValue));
+        AssertFieldLevel(problem, expectedKey, expectedMessages, SubmittedText(rawValue));
         Assert.DoesNotContain(marker, text, StringComparison.Ordinal);
         if (!string.Equals(submittedName, expectedKey, StringComparison.Ordinal))
         {
@@ -281,7 +292,7 @@ public sealed class ValidationTests : IAsyncLifetime
         AssertFieldLevel(
             problem,
             MarkerField,
-            ValidationMessages.FormatTextTooLongForColumn(LastNameColumnLength),
+            [ValidationMessages.FormatTextTooLongForColumn(LastNameColumnLength)],
             value);
         Assert.DoesNotContain(marker, text, StringComparison.Ordinal);
     }
@@ -301,7 +312,7 @@ public sealed class ValidationTests : IAsyncLifetime
             Post(CaseReport, JsonBody(body)),
             timeout.Token);
 
-        AssertFieldLevel(problem, MarkerField, ValidationMessages.DuplicateField, marker);
+        AssertFieldLevel(problem, MarkerField, [ValidationMessages.DuplicateField], marker);
         Assert.DoesNotContain(marker, text, StringComparison.Ordinal);
     }
 
@@ -327,13 +338,13 @@ public sealed class ValidationTests : IAsyncLifetime
             CaseReport,
             Put(CaseReport, created.GlobalRecordId, JsonBody("""{"values":{"Age":121}}""")),
             ct);
-        AssertFieldLevel(outOfRange, "Age", ValidationMessages.FormatRangeBetween(0L, 120L), "121");
+        AssertFieldLevel(outOfRange, "Age", [ValidationMessages.FormatRangeBetween(0L, 120L)], "121");
 
         var (readOnly, _) = await SendRejectedWithoutWriteAsync(
             CaseReport,
             Put(CaseReport, created.GlobalRecordId, JsonBody("""{"values":{"StateIDNumber":"X"}}""")),
             ct);
-        AssertFieldLevel(readOnly, "StateIDNumber", ValidationMessages.ReadOnlyField, "X");
+        AssertFieldLevel(readOnly, "StateIDNumber", [ValidationMessages.ReadOnlyField], "X");
 
         var (notAnObject, _) = await SendRejectedWithoutWriteAsync(
             CaseReport,
@@ -559,14 +570,16 @@ public sealed class ValidationTests : IAsyncLifetime
     // The form's page-one table, which holds every field these cases read back.
     private static string PageOneTable(string form) => FormTables[form][1];
 
-    // Asserts a field-level 400: the fixed detail, an errors object whose only key is expectedKey (ordinal), at least
-    // one message under it and none blank, expectedMessage among them, and no message echoing the submitted text.
+    // Asserts a field-level 400: the fixed detail, an errors object whose only key is expectedKey (ordinal), exactly
+    // expectedMessages under it in any order, so no further message passes unseen, and no message echoing the
+    // submitted text.
     private static void AssertFieldLevel(
         JsonElement problem,
         string expectedKey,
-        string expectedMessage,
+        string[] expectedMessages,
         string? submittedText)
     {
+        Assert.NotEmpty(expectedMessages);
         Assert.Equal(ApiProblems.ValidationFailedDetail, problem.GetProperty("detail").GetString());
         Assert.True(
             problem.TryGetProperty("errors", out JsonElement errors) && errors.ValueKind == JsonValueKind.Object,
@@ -575,9 +588,9 @@ public sealed class ValidationTests : IAsyncLifetime
 
         string?[] messages =
             [.. errors.GetProperty(expectedKey).EnumerateArray().Select(message => message.GetString())];
-        Assert.NotEmpty(messages);
-        Assert.All(messages, message => Assert.False(string.IsNullOrWhiteSpace(message), "An error message is blank."));
-        Assert.Contains(expectedMessage, messages);
+        Assert.Equal<string?>(
+            expectedMessages.Order(StringComparer.Ordinal),
+            messages.Order(StringComparer.Ordinal));
         if (!string.IsNullOrEmpty(submittedText))
         {
             Assert.All(messages, message => Assert.DoesNotContain(submittedText, message!, StringComparison.Ordinal));
@@ -661,7 +674,8 @@ public sealed class ValidationTests : IAsyncLifetime
     private HttpRequestMessage Put(string form, string globalRecordId, HttpContent content) =>
         new(HttpMethod.Put, RecordsPath(form) + "/" + Uri.EscapeDataString(globalRecordId)) { Content = content };
 
-    // Takes the exclusive lock and sends one rejected request between two snapshots, as SendRejectedWithoutWriteAsync.
+    // Takes the exclusive lock and sends one rejected request between two snapshots, with the SQL recorder cleared
+    // just before it, as SendRejectedWithoutWriteAsync.
     private async Task<(JsonElement Problem, string Text)> AssertRejectedWithoutWriteAsync(
         string form,
         HttpRequestMessage request,
@@ -672,9 +686,12 @@ public sealed class ValidationTests : IAsyncLifetime
         return await SendRejectedWithoutWriteAsync(form, owned, ct);
     }
 
-    // Under the caller's exclusive lock: captures a snapshot, sends the request, captures again, and requires a 400
-    // problem body (application/problem+json, status 400, title, traceId), an empty snapshot diff and an unchanged
-    // row count of the form's base table. Returns the parsed body and its text. Disposes the request.
+    // Under the caller's exclusive lock: captures a snapshot, clears the host's SQL recorder, sends the request and
+    // captures again. Requires a 400 problem body (application/problem+json, status 400, title, traceId), no recorded
+    // INSERT, UPDATE, DELETE or MERGE and no recorded command inside a transaction, an empty snapshot diff and an
+    // unchanged row count of the form's base table. A write that ran and was rolled back leaves the snapshot unchanged,
+    // so the recorder is what shows the rejection came before the store's write transaction. Returns the parsed body
+    // and its text. Disposes the request.
     private async Task<(JsonElement Problem, string Text)> SendRejectedWithoutWriteAsync(
         string form,
         HttpRequestMessage request,
@@ -683,6 +700,7 @@ public sealed class ValidationTests : IAsyncLifetime
         using HttpRequestMessage sent = request;
         SqlSnapshot before = await SqlSnapshot.CaptureAsync(ct);
 
+        Recorder.Clear();
         using HttpResponseMessage response = await Client.SendAsync(sent, ct);
         string text = await response.Content.ReadAsStringAsync(ct);
 
@@ -690,6 +708,17 @@ public sealed class ValidationTests : IAsyncLifetime
 
         Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
         Assert.Equal(ApiProblems.ProblemContentType, response.Content.Headers.ContentType?.MediaType);
+
+        // ToString lists each command without its parameter values, so no submitted value reaches the test output.
+        IReadOnlyList<RecordedCommand> writes = Recorder.Writes();
+        Assert.True(
+            writes.Count == 0,
+            $"The rejected request sent {writes.Count} write command(s): {string.Join("; ", writes)}");
+        IReadOnlyList<RecordedCommand> inTransaction = [.. Recorder.Commands.Where(command => command.InTransaction)];
+        Assert.True(
+            inTransaction.Count == 0,
+            $"The rejected request ran {inTransaction.Count} command(s) inside a transaction: " +
+            string.Join("; ", inTransaction));
 
         SnapshotDiff diff = SqlSnapshot.Compare(before, after);
         Assert.True(diff.IsEmpty, diff.ToString());
