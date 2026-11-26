@@ -10,6 +10,8 @@ using EpiInfo.Domain.Forms;
 using EpiInfo.Domain.Metadata;
 using EpiInfo.Domain.Records;
 using EpiInfo.Domain.Search;
+using EpiInfo.Domain.Storage;
+using EpiInfo.Domain.Validation;
 using EpiInfo.Domain.Values;
 using EpiInfo.Tests.Shared;
 using Microsoft.Data.SqlClient;
@@ -36,14 +38,36 @@ namespace EpiInfo.Data.Tests.Records;
 /// Stored reads: every stored data value of the seeded forms, with the runtime type SqlClient returns for its column,
 /// converts through <see cref="ColumnValueConverter.FromDbValue"/> to the value stored.
 /// </description></item>
+/// <item><description>
+/// The repository's own operations (AAP 0.3.4.4 and 0.3.4.6), on records the tests create: the insert writes the base
+/// row, then one row on every page in page order, in one transaction; an update writes only the submitted columns and
+/// the last-save stamp, and repairs a missing page row as legacy does
+/// (<c>Epi.Core/Data/Services/CollectedDataProvider.cs:1360-1380</c>); a soft delete changes only the base row's
+/// status and stamp; an update of a deleted or unknown record writes nothing; and every read sends only
+/// <c>SELECT</c>.
+/// </description></item>
 /// </list>
 /// </summary>
 /// <remarks>
-/// The tests only read. The reader's commands are all <c>SELECT</c>, the page-row write statements are only built,
-/// never sent, and the stored-read case sends only <c>SELECT</c>. The identity lookups run their locked read in a
-/// transaction that is rolled back, and the record they look up is the seeded row with the lowest <c>UniqueKey</c>,
-/// chosen by SQL rather than hard-coded; the Find exclusion uses the lowest such active row with a row on every page.
-/// Their failure messages are fixed text, so no id reaches the output except through an equality assertion.
+/// <para>
+/// The builder, identity and stored-read cases only read. The reader's commands are all <c>SELECT</c>, the page-row
+/// write statements are only built, never sent, and the stored-read case sends only <c>SELECT</c>. The identity
+/// lookups run their locked read in a transaction that is rolled back, and the record they look up is the seeded row
+/// with the lowest <c>UniqueKey</c>, chosen by SQL rather than hard-coded; the Find exclusion uses the lowest such
+/// active row with a row on every page. Their failure messages are fixed text, so no id reaches the output except
+/// through an equality assertion.
+/// </para>
+/// <para>
+/// The repository cases write. This assembly reaches the data layer and not the API, so they create their records
+/// through <see cref="SqlRecordRepository"/>, the write path the API's store forwards to unchanged, each carrying a
+/// test marker in <see cref="TestDatabase.MarkerField"/>; the missing-page repair can be pinned only on such a record.
+/// Their one direct write is the removal of the page-two row of a record the test itself created, the missing-page
+/// fixture AAP 0.3.7 allows. They never touch a seeded, metadata or schema row, and the records they create stay in
+/// the database, so a rerun needs no reset. Each holds the exclusive <see cref="DatabaseWriteLock"/> for its whole
+/// body, so its snapshot comparisons hold exactly its own changes, and every expected count and position comes from
+/// SQL inside the test. Their failure messages describe commands with <see cref="RecordedCommand.Describe"/> without
+/// parameter values.
+/// </para>
 /// </remarks>
 [Collection(DatabaseCollections.Database)]
 [Trait("Category", "Integration")]
@@ -62,10 +86,30 @@ public sealed class SqlRecordRepositoryTests : IAsyncLifetime
     // Trailing spaces that take the padded id beyond the seeded nvarchar(255) column.
     private const int OverWidthPadding = 300;
 
+    // FoodHistory's page-two Text field (FoodHistory3.Lab, nvarchar(4000), no pattern, MaxLength 0) and the page-one
+    // Text field both seeded forms share beside the marker field (testdata/sql/03_forms.sql, 05_data_tables.sql).
+    private const string PageTwoTextField = "Lab";
+    private const string FirstNameField = "FirstName";
+
+    // The seeded form with two pages, on which every repository case but the insert theory runs.
+    private const string TwoPageForm = "FoodHistory";
+
+    // The base-table column the record path never names for a form without a foreign-key field.
+    private const string ForeignKeyColumn = "FKEY";
+
+    private static readonly TimeSpan RepositoryTestTimeout = TimeSpan.FromMinutes(5);
+
     private static readonly IReadOnlyDictionary<string, FieldValue> NoValues = new Dictionary<string, FieldValue>();
 
     /// <summary>The seeded forms.</summary>
     public static TheoryData<string> Forms => new() { "CaseReport", "FoodHistory" };
+
+    /// <summary>Each seeded form with its page tables in <c>metaPages.Position</c> order.</summary>
+    public static TheoryData<string, string[]> FormsWithPageTables => new()
+    {
+        { "CaseReport", new[] { "CaseReport1" } },
+        { "FoodHistory", new[] { "FoodHistory2", "FoodHistory3" } },
+    };
 
     /// <summary>Each seeded form with each padding: within and beyond the width of its id column.</summary>
     public static TheoryData<string, int> PaddedIds => new()
@@ -734,6 +778,781 @@ public sealed class SqlRecordRepositoryTests : IAsyncLifetime
         Assert.True(recorder.Writes().Count == 0, "A record lookup sent a write statement.");
     }
 
+    // AAP 0.3.4.6, insert: the base row first, returning its key through OUTPUT INSERTED.UniqueKey with one stamp for
+    // both pairs and FKEY never named, then one row on every page in metaPages.Position order, a page with no
+    // submitted value included, all in one transaction on one connection and nothing else in the five tables.
+    [Theory]
+    [MemberData(nameof(FormsWithPageTables))]
+    public async Task InsertWritesBaseThenEveryPageInPositionOrderInOneTransaction(string formName, string[] pageTables)
+    {
+        await TestDatabase.EnsureReachableAsync();
+        using var timeout = new CancellationTokenSource(RepositoryTestTimeout);
+        CancellationToken cancellationToken = timeout.Token;
+        await using var writeLock = await DatabaseWriteLock.AcquireExclusiveAsync(cancellationToken);
+
+        RepositoryHarness harness = RepositoryHarness.Create();
+        ReaderForm form = await ReaderForm.ReadAsync(formName);
+        IReadOnlyList<PageTableSchema> pages = PagesInPositionOrder(form);
+        Assert.Equal(pageTables, pages.Select(page => RequireTable(page).Name));
+        ColumnSchema foreignKey = Assert.IsType<ColumnSchema>(form.Schema.BaseTable.FindColumn(ForeignKeyColumn));
+        string marker = TestDatabase.NewMarker();
+        SaveStamp stamp = harness.Stamp(0);
+
+        SqlSnapshot before = await SqlSnapshot.CaptureAsync(cancellationToken);
+        harness.Recorder.Clear();
+        RecordDto record = await harness.Repository.InsertAsync(
+            form.Metadata,
+            Values(ignoreCase: false, (TestDatabase.MarkerField, FieldValue.FromText(marker))),
+            stamp,
+            cancellationToken);
+        IReadOnlyList<RecordedCommand> commands = harness.Recorder.Commands;
+        IReadOnlyList<RecordedCommand> writes = harness.Recorder.Writes();
+        SqlSnapshot after = await SqlSnapshot.CaptureAsync(cancellationToken);
+
+        AssertOneTransaction(commands);
+        Assert.True(
+            writes.Count == 1 + pages.Count,
+            Describe("The insert did not send exactly one base and one page write per page.", writes));
+        RecordedCommand baseInsert = writes[0];
+        Assert.True(
+            Verb(baseInsert) == "INSERT" && TargetTable(form, baseInsert) == form.Schema.BaseTable.Name,
+            Describe("The first write of the insert is not the base-table INSERT.", writes));
+        Assert.Contains("OUTPUT INSERTED.", baseInsert.CommandText, StringComparison.Ordinal);
+        IReadOnlyList<string> baseIdentifiers = SqlCommandRecorder.BracketedIdentifiers(baseInsert.CommandText);
+        Assert.Contains(RecordSqlBuilder.Require(form.Schema.UniqueKey).Name, baseIdentifiers);
+        Assert.DoesNotContain(foreignKey.Name, baseIdentifiers);
+
+        // One stamp fills both pairs, so no write after the base INSERT is an UPDATE.
+        Assert.Equal(
+            pages.Select(page => ("INSERT", (string?)RequireTable(page).Name)),
+            writes.Skip(1).Select(write => (Verb(write), TargetTable(form, write))));
+
+        string id = record.GlobalRecordId;
+        Assert.True(Guid.TryParse(id, out _), "The new GlobalRecordId is not a GUID.");
+        Assert.Equal(RecordQueryRules.ActiveRecStatus, record.RecStatus);
+        Assert.Equal(form.DataColumns.Select(column => column.Field.Name), record.Values.Keys);
+        Assert.Equal(marker, record.Values[TestDatabase.MarkerField].AsText());
+        Assert.All(
+            record.Values.Where(entry => entry.Key != TestDatabase.MarkerField),
+            entry => Assert.True(entry.Value.IsNull, "A field the insert did not submit was returned with a value."));
+
+        IReadOnlyDictionary<string, object> baseRow = Assert.Single(await ReadRowsAsync(
+            form.Schema.BaseTable,
+            RecordSqlBuilder.Require(form.Schema.GlobalRecordId),
+            id,
+            cancellationToken));
+        object Stored(ColumnSchema? column) => baseRow[RecordSqlBuilder.Require(column).Name];
+        Assert.Equal(id, Stored(form.Schema.GlobalRecordId));
+        Assert.Equal(record.UniqueKey, Assert.IsType<int>(Stored(form.Schema.UniqueKey)));
+        Assert.Equal(
+            RecordQueryRules.ActiveRecStatus,
+            Convert.ToInt32(Stored(form.Schema.RecStatus), CultureInfo.InvariantCulture));
+        Assert.Equal(Environment.UserName, Stored(form.Schema.FirstSaveLogonName));
+        Assert.Equal(Environment.UserName, Stored(form.Schema.LastSaveLogonName));
+        Assert.Equal(stamp.Time, Assert.IsType<DateTime>(Stored(form.Schema.FirstSaveTime)));
+        Assert.Equal(stamp.Time, Assert.IsType<DateTime>(Stored(form.Schema.LastSaveTime)));
+        Assert.Same(DBNull.Value, baseRow[foreignKey.Name]);
+
+        // Every column of each page row but its key is NULL, the marker column alone excepted: read-only and
+        // unsupported columns are never named, and the other writable columns are written NULL.
+        ProjectedColumn markerColumn = form.Column(TestDatabase.MarkerField);
+        foreach (PageTableSchema page in pages)
+        {
+            TableSchema table = RequireTable(page);
+            ColumnSchema key = RecordSqlBuilder.RequirePageKey(table);
+            bool holdsMarker = page.Page.PageId == markerColumn.Field.Page.PageId;
+            IReadOnlyDictionary<string, object> pageRow =
+                Assert.Single(await ReadRowsAsync(table, key, id, cancellationToken));
+            foreach ((string column, object value) in pageRow)
+            {
+                if (column == key.Name)
+                {
+                    Assert.Equal(id, value);
+                }
+                else if (holdsMarker && column == markerColumn.Column.Name)
+                {
+                    Assert.Equal(marker, value);
+                }
+                else
+                {
+                    Assert.True(value is DBNull, "A page column the insert did not submit holds a value.");
+                }
+            }
+        }
+
+        SnapshotDiff diff = SqlSnapshot.Compare(before, after);
+        Assert.True(
+            diff.RemovedRows.Count == 0 && diff.ChangedCells.Count == 0 && diff.SchemaChanges.Count == 0,
+            diff.ToString());
+        Assert.Equal(
+            pages.Select(page => RequireTable(page).Name)
+                .Prepend(form.Schema.BaseTable.Name)
+                .Order(StringComparer.Ordinal),
+            diff.AddedRows.Select(row => row.Table).Order(StringComparer.Ordinal));
+        Assert.True(diff.AddedRows.All(row => row.GlobalRecordId == id), diff.ToString());
+    }
+
+    // AAP 0.3.4.4 and 0.3.4.6, the missing page row: a record whose page-two row is gone still reads through the LEFT
+    // JOIN, with every page-two value null, and is still placed from the base table. An update of a page-two field then
+    // finds no row, inserts the page row holding only its key and repeats the update, as legacy repairs it
+    // (Epi.Core/Data/Services/CollectedDataProvider.cs:1360-1380), after the base stamp and without touching page one.
+    [Fact]
+    public async Task UpdateInsertsMissingPageRowAndRepeatsUpdate()
+    {
+        await TestDatabase.EnsureReachableAsync();
+        using var timeout = new CancellationTokenSource(RepositoryTestTimeout);
+        CancellationToken cancellationToken = timeout.Token;
+        await using var writeLock = await DatabaseWriteLock.AcquireExclusiveAsync(cancellationToken);
+
+        RepositoryHarness harness = RepositoryHarness.Create();
+        ReaderForm form = await ReaderForm.ReadAsync(TwoPageForm);
+        IReadOnlyList<PageTableSchema> pages = PagesInPositionOrder(form);
+        Assert.True(pages.Count == 2, "The two-page seeded form does not have two page tables.");
+        ProjectedColumn lab = form.Column(PageTwoTextField);
+        PageTableSchema missingPage = pages[1];
+        Assert.Equal(missingPage.Page.PageId, lab.Field.Page.PageId);
+        TableSchema missingTable = RequireTable(missingPage);
+        ColumnSchema missingKey = RecordSqlBuilder.RequirePageKey(missingTable);
+        string marker = TestDatabase.NewMarker();
+        RecordDto inserted = await harness.Repository.InsertAsync(
+            form.Metadata,
+            Values(ignoreCase: false, (TestDatabase.MarkerField, FieldValue.FromText(marker))),
+            harness.Stamp(0),
+            cancellationToken);
+        string id = inserted.GlobalRecordId;
+
+        // The one direct write the tests may make (AAP 0.3.7): the page-two row of the record this test created.
+        Assert.Equal(1, await DeleteRowAsync(missingTable, missingKey, id, cancellationToken));
+
+        RecordDto? read = await harness.Repository.GetByIdAsync(form.Metadata, id, cancellationToken);
+        Assert.NotNull(read);
+        Assert.Equal(marker, read.Values[TestDatabase.MarkerField].AsText());
+        Assert.All(
+            form.DataColumns.Where(column => column.Field.Page.PageId == missingPage.Page.PageId),
+            column => Assert.True(
+                read.Values[column.Field.Name].IsNull,
+                "A field of the missing page row was read with a value."));
+
+        foreach (bool includeDeleted in new[] { false, true })
+        {
+            NavigationPosition? placed =
+                await harness.Repository.GetSetPositionAsync(form.Metadata, id, includeDeleted, cancellationToken);
+            Assert.NotNull(placed);
+            Assert.Equal(
+                await CountBaseRowsAsync(form, inserted.UniqueKey, activeOnly: !includeDeleted, cancellationToken),
+                placed.Position);
+            Assert.Equal(
+                await CountBaseRowsAsync(form, atMostUniqueKey: null, activeOnly: !includeDeleted, cancellationToken),
+                placed.Count);
+        }
+
+        string labValue = "L-" + marker;
+        var gate = new CountingGate();
+        SqlSnapshot before = await SqlSnapshot.CaptureAsync(cancellationToken);
+        harness.Recorder.Clear();
+        RecordWriteResult result = await harness.Repository.UpdateAsync(
+            form.Metadata,
+            id,
+            Values(ignoreCase: false, (PageTwoTextField, FieldValue.FromText(labValue))),
+            harness.Stamp(1),
+            gate.Check,
+            permissions: null,
+            cancellationToken);
+        IReadOnlyList<RecordedCommand> commands = harness.Recorder.Commands;
+        IReadOnlyList<RecordedCommand> writes = harness.Recorder.Writes();
+        SqlSnapshot after = await SqlSnapshot.CaptureAsync(cancellationToken);
+
+        Assert.Equal(RecordWriteStatus.Success, result.Status);
+        Assert.Equal(1, gate.Calls);
+        AssertOneTransaction(commands);
+        string baseName = form.Schema.BaseTable.Name;
+        Assert.True(
+            writes.Count == 4 && Verb(writes[0]) == "UPDATE" && TargetTable(form, writes[0]) == baseName,
+            Describe("The update did not send the base stamp first and three page writes.", writes));
+        Assert.Equal(StampColumns(form), AssignedColumns(form, writes[0]));
+        Assert.Equal(
+            new[] { "UPDATE", "INSERT", "UPDATE" },
+            writes.Where(write => TargetTable(form, write) == missingTable.Name).Select(Verb));
+        Assert.Equal(new[] { missingKey.Name }, IdentifiersExcept(writes[2], missingTable.Name));
+        Assert.All(
+            new[] { writes[1], writes[3] },
+            update => Assert.Equal(new[] { lab.Column.Name }, AssignedColumns(form, update)));
+        Assert.True(
+            !writes.Any(write => TargetTable(form, write) == RequireTable(pages[0]).Name),
+            Describe("The update wrote the page it submitted no field for.", writes));
+
+        SnapshotDiff diff = SqlSnapshot.Compare(before, after);
+        Assert.True(diff.RemovedRows.Count == 0 && diff.SchemaChanges.Count == 0, diff.ToString());
+        SnapshotRowChange added = Assert.Single(diff.AddedRows);
+        Assert.Equal((missingTable.Name, id), (added.Table, added.GlobalRecordId));
+        foreach ((string column, object? value) in added.Row.Values)
+        {
+            object? expected = column == missingKey.Name ? id : column == lab.Column.Name ? labValue : null;
+            Assert.True(Equals(expected, value), "The repaired page row does not hold only its key and the update.");
+        }
+
+        Assert.Equal(
+            new[]
+            {
+                new SnapshotCellChange(baseName, id, LastSaveTime(form), harness.Stamp(0).Time, harness.Stamp(1).Time),
+            },
+            diff.ChangedCells);
+
+        Assert.True(result.IsSuccess);
+        Assert.Equal(labValue, result.Record.Values[PageTwoTextField].AsText());
+        Assert.Equal(marker, result.Record.Values[TestDatabase.MarkerField].AsText());
+    }
+
+    // AAP 0.3.4.4 and DATA-01: every read of the repository sends only SELECT statements and changes nothing stored.
+    [Fact]
+    public async Task ReadsIssueOnlySelect()
+    {
+        await TestDatabase.EnsureReachableAsync();
+        using var timeout = new CancellationTokenSource(RepositoryTestTimeout);
+        CancellationToken cancellationToken = timeout.Token;
+        await using var writeLock = await DatabaseWriteLock.AcquireExclusiveAsync(cancellationToken);
+
+        RepositoryHarness harness = RepositoryHarness.Create();
+        ReaderForm form = await ReaderForm.ReadAsync(TwoPageForm);
+        string marker = TestDatabase.NewMarker();
+        RecordDto inserted = await harness.Repository.InsertAsync(
+            form.Metadata,
+            Values(ignoreCase: false, (TestDatabase.MarkerField, FieldValue.FromText(marker))),
+            harness.Stamp(0),
+            cancellationToken);
+        string id = inserted.GlobalRecordId;
+        SearchParseResult criteria = SearchCriteriaParser.Parse(
+            FormDefinitionFactory.GetDataFields(form.Metadata),
+            [new SearchCriterion(TestDatabase.MarkerField, FieldValue.FromText(marker))]);
+        Assert.True(criteria.IsSuccess, "The marker criterion did not parse.");
+
+        SqlSnapshot before = await SqlSnapshot.CaptureAsync(cancellationToken);
+        harness.Recorder.Clear();
+        SqlRecordRepository repository = harness.Repository;
+        int activeCount = await repository.CountAsync(form.Metadata, includeDeleted: false, cancellationToken);
+        int allCount = await repository.CountAsync(form.Metadata, includeDeleted: true, cancellationToken);
+        RecordDto? first =
+            await repository.GetAtPositionAsync(form.Metadata, 1, includeDeleted: false, cancellationToken);
+        RecordDto? byId = await repository.GetByIdAsync(form.Metadata, id, cancellationToken);
+        NavigationPosition? activePosition =
+            await repository.GetSetPositionAsync(form.Metadata, id, includeDeleted: false, cancellationToken);
+        NavigationPosition? allPosition =
+            await repository.GetSetPositionAsync(form.Metadata, id, includeDeleted: true, cancellationToken);
+        RecordPage firstPage = await repository.ListAsync(form.Metadata, RecordListQuery.Default, cancellationToken);
+        RecordPage filtered =
+            await repository.ListAsync(form.Metadata, RecordListQuery.Default with { Q = marker }, cancellationToken);
+        SearchResponse found = await repository.SearchAsync(
+            form.Metadata,
+            criteria.Conditions,
+            includeDeleted: false,
+            excludeGlobalRecordId: null,
+            cancellationToken);
+        IReadOnlyList<RecordedCommand> commands = harness.Recorder.Commands;
+        SqlSnapshot after = await SqlSnapshot.CaptureAsync(cancellationToken);
+
+        Assert.True(harness.Recorder.Writes().Count == 0, Describe("A read sent a write statement.", commands));
+        Assert.NotEmpty(commands);
+        Assert.All(commands, command =>
+        {
+            Assert.True(command.Completed && command.Succeeded, Describe("A read did not succeed.", [command]));
+            Assert.True(IsReadStatement(command), Describe("A read sent a statement other than a query.", [command]));
+        });
+        SnapshotDiff diff = SqlSnapshot.Compare(before, after);
+        Assert.True(diff.IsEmpty, diff.ToString());
+
+        Assert.True(activeCount > 0 && allCount >= activeCount, "The counts do not describe the seeded form.");
+        Assert.NotNull(first);
+        Assert.NotEmpty(firstPage.Items);
+        Assert.NotNull(byId);
+        Assert.Equal(id, byId.GlobalRecordId);
+        Assert.NotNull(activePosition);
+        Assert.NotNull(allPosition);
+        Assert.NotNull(activePosition.Position);
+        Assert.Equal(id, Assert.Single(filtered.Items).GlobalRecordId);
+        Assert.Equal(1, filtered.Total);
+        SearchResult hit = Assert.Single(found.Items);
+        Assert.Equal(id, hit.GlobalRecordId);
+        Assert.Equal(activePosition.Position, hit.Position);
+    }
+
+    // AAP 0.3.4.6, update scope: a PUT is a delta, so the page holding the submitted field gets an UPDATE of that one
+    // column, the base row only its last-save stamp, and every other column and page stays as it was.
+    [Fact]
+    public async Task UpdateWritesOnlySubmittedColumns()
+    {
+        await TestDatabase.EnsureReachableAsync();
+        using var timeout = new CancellationTokenSource(RepositoryTestTimeout);
+        CancellationToken cancellationToken = timeout.Token;
+        await using var writeLock = await DatabaseWriteLock.AcquireExclusiveAsync(cancellationToken);
+
+        RepositoryHarness harness = RepositoryHarness.Create();
+        ReaderForm form = await ReaderForm.ReadAsync(TwoPageForm);
+        ProjectedColumn firstName = form.Column(FirstNameField);
+        PageTableSchema firstNamePage = form.PageOf(firstName.Field);
+        TableSchema firstNameTable = RequireTable(firstNamePage);
+        RecordDto inserted = await harness.Repository.InsertAsync(
+            form.Metadata,
+            Values(
+                ignoreCase: false,
+                (TestDatabase.MarkerField, FieldValue.FromText(TestDatabase.NewMarker())),
+                (FirstNameField, FieldValue.FromText("F"))),
+            harness.Stamp(0),
+            cancellationToken);
+        string id = inserted.GlobalRecordId;
+
+        var gate = new CountingGate();
+        SqlSnapshot before = await SqlSnapshot.CaptureAsync(cancellationToken);
+        harness.Recorder.Clear();
+        RecordWriteResult result = await harness.Repository.UpdateAsync(
+            form.Metadata,
+            id,
+            Values(ignoreCase: false, (FirstNameField, FieldValue.FromText("G"))),
+            harness.Stamp(1),
+            gate.Check,
+            permissions: null,
+            cancellationToken);
+        IReadOnlyList<RecordedCommand> commands = harness.Recorder.Commands;
+        IReadOnlyList<RecordedCommand> writes = harness.Recorder.Writes();
+        SqlSnapshot after = await SqlSnapshot.CaptureAsync(cancellationToken);
+
+        Assert.Equal(RecordWriteStatus.Success, result.Status);
+        Assert.Equal(1, gate.Calls);
+        AssertOneTransaction(commands);
+        Assert.True(
+            writes.Count == 2,
+            Describe("The update did not send exactly the base stamp and one page write.", writes));
+        Assert.Equal(("UPDATE", (string?)form.Schema.BaseTable.Name), (Verb(writes[0]), TargetTable(form, writes[0])));
+        Assert.Equal(StampColumns(form), AssignedColumns(form, writes[0]));
+        Assert.Equal(("UPDATE", (string?)firstNameTable.Name), (Verb(writes[1]), TargetTable(form, writes[1])));
+        Assert.Equal(new[] { firstName.Column.Name }, AssignedColumns(form, writes[1]));
+        Assert.All(
+            PagesInPositionOrder(form).Where(page => page.Page.PageId != firstNamePage.Page.PageId),
+            page => Assert.True(
+                !writes.Any(write => TargetTable(form, write) == RequireTable(page).Name),
+                Describe("The update wrote a page it submitted no field for.", writes)));
+
+        SnapshotDiff diff = SqlSnapshot.Compare(before, after);
+        Assert.True(
+            diff.AddedRows.Count == 0 && diff.RemovedRows.Count == 0 && diff.SchemaChanges.Count == 0,
+            diff.ToString());
+        Assert.Equal(
+            new[]
+            {
+                new SnapshotCellChange(
+                    form.Schema.BaseTable.Name,
+                    id,
+                    LastSaveTime(form),
+                    harness.Stamp(0).Time,
+                    harness.Stamp(1).Time),
+                new SnapshotCellChange(firstNameTable.Name, id, firstName.Column.Name, "F", "G"),
+            }.OrderBy(cell => cell.Table, StringComparer.Ordinal),
+            diff.ChangedCells.OrderBy(cell => cell.Table, StringComparer.Ordinal));
+
+        // The logon name is the same identity on both saves, so the diff cannot show it; it is read directly.
+        IReadOnlyDictionary<string, object> baseRow = Assert.Single(await ReadRowsAsync(
+            form.Schema.BaseTable,
+            RecordSqlBuilder.Require(form.Schema.GlobalRecordId),
+            id,
+            cancellationToken));
+        Assert.Equal(Environment.UserName, baseRow[RecordSqlBuilder.Require(form.Schema.LastSaveLogonName).Name]);
+    }
+
+    // AAP 0.3.4.6 and C-6, soft delete: the locked base read, then one base UPDATE of RecStatus and the last-save
+    // stamp; no page row is touched and nothing cascades. A repeated delete, or one of an unknown id, writes nothing.
+    [Fact]
+    public async Task SoftDeleteChangesOnlyBaseStatusAndStamps()
+    {
+        await TestDatabase.EnsureReachableAsync();
+        using var timeout = new CancellationTokenSource(RepositoryTestTimeout);
+        CancellationToken cancellationToken = timeout.Token;
+        await using var writeLock = await DatabaseWriteLock.AcquireExclusiveAsync(cancellationToken);
+
+        RepositoryHarness harness = RepositoryHarness.Create();
+        ReaderForm form = await ReaderForm.ReadAsync(TwoPageForm);
+        string marker = TestDatabase.NewMarker();
+        RecordDto inserted = await harness.Repository.InsertAsync(
+            form.Metadata,
+            Values(
+                ignoreCase: false,
+                (TestDatabase.MarkerField, FieldValue.FromText(marker)),
+                (PageTwoTextField, FieldValue.FromText("L-" + marker))),
+            harness.Stamp(0),
+            cancellationToken);
+        string id = inserted.GlobalRecordId;
+        string baseName = form.Schema.BaseTable.Name;
+        string recStatus = RecordSqlBuilder.Require(form.Schema.RecStatus).Name;
+
+        SqlSnapshot before = await SqlSnapshot.CaptureAsync(cancellationToken);
+        harness.Recorder.Clear();
+        SoftDeleteResult deleted =
+            await harness.Repository.SoftDeleteAsync(form.Metadata, id, harness.Stamp(1), cancellationToken);
+        IReadOnlyList<RecordedCommand> commands = harness.Recorder.Commands;
+        IReadOnlyList<RecordedCommand> writes = harness.Recorder.Writes();
+        SqlSnapshot afterDelete = await SqlSnapshot.CaptureAsync(cancellationToken);
+
+        Assert.Equal(SoftDeleteResult.Deleted, deleted);
+        AssertOneTransaction(commands);
+        RecordedCommand update = Assert.Single(writes);
+        Assert.Equal(("UPDATE", (string?)baseName), (Verb(update), TargetTable(form, update)));
+        Assert.Equal(
+            new[] { recStatus }.Concat(StampColumns(form)).Order(StringComparer.Ordinal),
+            AssignedColumns(form, update));
+        Assert.True(
+            commands.Any(command =>
+                command.Sequence < update.Sequence
+                && Verb(command) == "SELECT"
+                && TargetTable(form, command) == baseName
+                && command.CommandText.Contains("UPDLOCK", StringComparison.Ordinal)),
+            Describe("The soft delete did not lock the base row before its update.", commands));
+
+        // Two cells of the base row change; the page rows, both holding data, are left byte for byte as they were.
+        SnapshotDiff diff = SqlSnapshot.Compare(before, afterDelete);
+        Assert.True(
+            diff.AddedRows.Count == 0 && diff.RemovedRows.Count == 0 && diff.SchemaChanges.Count == 0,
+            diff.ToString());
+        Assert.True(
+            diff.ChangedCells.Count == 2
+            && diff.ChangedCells.All(cell => cell.Table == baseName && cell.GlobalRecordId == id),
+            diff.ToString());
+        SnapshotCellChange status = Assert.Single(diff.ChangedCells, cell => cell.Column == recStatus);
+        Assert.Equal(RecordQueryRules.ActiveRecStatus, Convert.ToInt32(status.OldValue, CultureInfo.InvariantCulture));
+        Assert.Equal(RecordQueryRules.DeletedRecStatus, Convert.ToInt32(status.NewValue, CultureInfo.InvariantCulture));
+        SnapshotCellChange stamped = Assert.Single(diff.ChangedCells, cell => cell.Column == LastSaveTime(form));
+        Assert.Equal(harness.Stamp(0).Time, stamped.OldValue);
+        Assert.Equal(harness.Stamp(1).Time, stamped.NewValue);
+
+        // A second delete finds RecStatus 0 and writes nothing, stamps included.
+        harness.Recorder.Clear();
+        SoftDeleteResult again =
+            await harness.Repository.SoftDeleteAsync(form.Metadata, id, harness.Stamp(2), cancellationToken);
+        Assert.Equal(SoftDeleteResult.AlreadyDeleted, again);
+        Assert.True(
+            harness.Recorder.Writes().Count == 0,
+            Describe("A repeated delete sent a write.", harness.Recorder.Commands));
+        SqlSnapshot afterRepeat = await SqlSnapshot.CaptureAsync(cancellationToken);
+        SnapshotDiff repeatDiff = SqlSnapshot.Compare(afterDelete, afterRepeat);
+        Assert.True(repeatDiff.IsEmpty, repeatDiff.ToString());
+        SnapshotRow? stored = afterRepeat.Row(baseName, id);
+        Assert.NotNull(stored);
+        Assert.Equal(harness.Stamp(1).Time, stored[LastSaveTime(form)]);
+
+        // An id the base table does not hold is not found, and nothing is written.
+        harness.Recorder.Clear();
+        SoftDeleteResult unknown = await harness.Repository.SoftDeleteAsync(
+            form.Metadata,
+            Guid.NewGuid().ToString(),
+            harness.Stamp(3),
+            cancellationToken);
+        Assert.Equal(SoftDeleteResult.NotFound, unknown);
+        Assert.True(
+            harness.Recorder.Writes().Count == 0,
+            Describe("A delete of an unknown id sent a write.", harness.Recorder.Commands));
+    }
+
+    // AAP 0.3.4.6: the locked read stops an update at RecStatus 0 (Deleted) or at a missing base row (NotFound), before
+    // the required gate runs and before any write.
+    [Fact]
+    public async Task UpdateOnDeletedRecordReturnsDeletedAndWritesNothing()
+    {
+        await TestDatabase.EnsureReachableAsync();
+        using var timeout = new CancellationTokenSource(RepositoryTestTimeout);
+        CancellationToken cancellationToken = timeout.Token;
+        await using var writeLock = await DatabaseWriteLock.AcquireExclusiveAsync(cancellationToken);
+
+        RepositoryHarness harness = RepositoryHarness.Create();
+        ReaderForm form = await ReaderForm.ReadAsync(TwoPageForm);
+        RecordDto inserted = await harness.Repository.InsertAsync(
+            form.Metadata,
+            Values(ignoreCase: false, (TestDatabase.MarkerField, FieldValue.FromText(TestDatabase.NewMarker()))),
+            harness.Stamp(0),
+            cancellationToken);
+        string id = inserted.GlobalRecordId;
+        Assert.Equal(
+            SoftDeleteResult.Deleted,
+            await harness.Repository.SoftDeleteAsync(form.Metadata, id, harness.Stamp(1), cancellationToken));
+        IReadOnlyDictionary<string, FieldValue> submitted =
+            Values(ignoreCase: false, (FirstNameField, FieldValue.FromText("X")));
+
+        var gate = new CountingGate();
+        SqlSnapshot before = await SqlSnapshot.CaptureAsync(cancellationToken);
+        harness.Recorder.Clear();
+        RecordWriteResult onDeleted = await harness.Repository.UpdateAsync(
+            form.Metadata,
+            id,
+            submitted,
+            harness.Stamp(2),
+            gate.Check,
+            permissions: null,
+            cancellationToken);
+        Assert.Equal(RecordWriteStatus.Deleted, onDeleted.Status);
+        Assert.Null(onDeleted.Record);
+        Assert.True(
+            harness.Recorder.Writes().Count == 0,
+            Describe("An update of a deleted record sent a write.", harness.Recorder.Commands));
+
+        harness.Recorder.Clear();
+        RecordWriteResult onUnknown = await harness.Repository.UpdateAsync(
+            form.Metadata,
+            Guid.NewGuid().ToString(),
+            submitted,
+            harness.Stamp(3),
+            gate.Check,
+            permissions: null,
+            cancellationToken);
+        Assert.Equal(RecordWriteStatus.NotFound, onUnknown.Status);
+        Assert.True(
+            harness.Recorder.Writes().Count == 0,
+            Describe("An update of an unknown id sent a write.", harness.Recorder.Commands));
+
+        Assert.Equal(0, gate.Calls);
+        SnapshotDiff diff = SqlSnapshot.Compare(before, await SqlSnapshot.CaptureAsync(cancellationToken));
+        Assert.True(diff.IsEmpty, diff.ToString());
+    }
+
+    // The form's pages in metaPages.Position order, then PageId, taken from the metadata rather than from the order the
+    // schema lists them in; every seeded page has its table.
+    private static IReadOnlyList<PageTableSchema> PagesInPositionOrder(ReaderForm form)
+    {
+        var pages = new List<PageTableSchema>();
+        foreach (PageMetadata page in form.Metadata.Pages.OrderBy(page => page.Position).ThenBy(page => page.PageId))
+        {
+            PageTableSchema? schema = form.Schema.FindPage(page.PageId);
+            Assert.NotNull(schema);
+            _ = RequireTable(schema);
+            pages.Add(schema);
+        }
+
+        return pages.AsReadOnly();
+    }
+
+    private static TableSchema RequireTable(PageTableSchema page) => Assert.IsType<TableSchema>(page.Table);
+
+    // Every command of one write ran on its one connection, inside its transaction, and succeeded.
+    private static void AssertOneTransaction(IReadOnlyList<RecordedCommand> commands)
+    {
+        Assert.True(commands.Count > 0, "The write sent no command.");
+        Guid connection = commands[0].ClientConnectionId;
+        Assert.True(
+            commands.All(command =>
+                command.ClientConnectionId == connection
+                && command.InTransaction
+                && command.Completed
+                && command.Succeeded),
+            Describe(
+                "A command of the write ran on another connection or outside its transaction, or failed.",
+                commands));
+    }
+
+    // An assertion message that lists commands without their parameter values.
+    private static string Describe(string message, IReadOnlyList<RecordedCommand> commands) =>
+        commands.Count == 0
+            ? message + " No command was recorded."
+            : message + Environment.NewLine + string.Join(
+                Environment.NewLine,
+                commands.Select(command => command.Describe(includeParameterValues: false)));
+
+    // The leading keyword of a command's text, upper-cased: INSERT, UPDATE, SELECT, WITH or IF.
+    private static string Verb(RecordedCommand command)
+    {
+        ReadOnlySpan<char> text = command.CommandText.AsSpan().TrimStart();
+        int length = 0;
+        while (length < text.Length && char.IsAsciiLetter(text[length]))
+        {
+            length++;
+        }
+
+        return text[..length].ToString().ToUpperInvariant();
+    }
+
+    // A record read starts with SELECT, or with WITH for Find's common table expression. The metadata reader's
+    // catalogue query (MetadataQueries.Columns) starts with IF, choosing one of two SELECT forms by the database
+    // compatibility level, so a metadata read may start with IF too; the write scan covers both of its branches.
+    private static bool IsReadStatement(RecordedCommand command)
+    {
+        string verb = Verb(command);
+        return !command.IsWrite
+            && (verb is "SELECT" or "WITH"
+                || (verb == "IF" && command.Operation.StartsWith("metadata.", StringComparison.Ordinal)));
+    }
+
+    // The first bracketed identifier of a command that names a table of the form, its base table or a page table;
+    // null for a command that names none, such as a metadata read.
+    private static string? TargetTable(ReaderForm form, RecordedCommand command)
+    {
+        var tables = new HashSet<string>(StringComparer.Ordinal) { form.Schema.BaseTable.Name };
+        foreach (PageTableSchema page in form.Schema.Pages)
+        {
+            if (page.Table is { } table)
+            {
+                tables.Add(table.Name);
+            }
+        }
+
+        return SqlCommandRecorder.BracketedIdentifiers(command.CommandText).FirstOrDefault(tables.Contains);
+    }
+
+    // The distinct bracketed identifiers of a command other than the excluded names, in ordinal order.
+    private static string[] IdentifiersExcept(RecordedCommand command, params string[] excluded) =>
+        SqlCommandRecorder.BracketedIdentifiers(command.CommandText)
+            .Where(name => !excluded.Contains(name, StringComparer.Ordinal))
+            .Distinct(StringComparer.Ordinal)
+            .Order(StringComparer.Ordinal)
+            .ToArray();
+
+    // The columns a base or page write assigns: its identifiers other than the form's tables and their key columns.
+    private static string[] AssignedColumns(ReaderForm form, RecordedCommand command)
+    {
+        var excluded = new List<string>
+        {
+            form.Schema.BaseTable.Name,
+            RecordSqlBuilder.Require(form.Schema.GlobalRecordId).Name,
+            RecordSqlBuilder.Require(form.Schema.UniqueKey).Name,
+        };
+        foreach (PageTableSchema page in form.Schema.Pages)
+        {
+            if (page.Table is { } table)
+            {
+                excluded.Add(table.Name);
+                excluded.Add(RecordSqlBuilder.RequirePageKey(table).Name);
+            }
+        }
+
+        return IdentifiersExcept(command, [.. excluded]);
+    }
+
+    // The base-table last-save stamp columns an update writes, in ordinal order.
+    private static string[] StampColumns(ReaderForm form) =>
+        new[]
+        {
+            RecordSqlBuilder.Require(form.Schema.LastSaveLogonName).Name,
+            LastSaveTime(form),
+        }.Order(StringComparer.Ordinal).ToArray();
+
+    private static string LastSaveTime(ReaderForm form) => RecordSqlBuilder.Require(form.Schema.LastSaveTime).Name;
+
+    // Every column of the rows of a table whose key column holds the id, raw as SqlClient returns them (DBNull for
+    // NULL), by a SELECT that names only reader-built identifiers and binds the id as a parameter.
+    private static async Task<IReadOnlyList<IReadOnlyDictionary<string, object>>> ReadRowsAsync(
+        TableSchema table,
+        ColumnSchema key,
+        string id,
+        CancellationToken cancellationToken)
+    {
+        string sql = "SELECT " + string.Join(", ", table.Columns.Select(column => SqlIdentifier.Quote(column))) +
+            " FROM " + SqlIdentifier.Quote(table) + " WHERE " + SqlIdentifier.Quote(key) + " = @id";
+        await using SqlConnection connection = await TestDatabase.OpenConnectionAsync(cancellationToken);
+        await using var command = new SqlCommand(sql, connection);
+        command.Parameters.Add(IdParameter(id));
+        await using SqlDataReader reader = await command.ExecuteReaderAsync(cancellationToken);
+        var rows = new List<IReadOnlyDictionary<string, object>>();
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            var row = new Dictionary<string, object>(reader.FieldCount, StringComparer.Ordinal);
+            for (int ordinal = 0; ordinal < reader.FieldCount; ordinal++)
+            {
+                row.Add(reader.GetName(ordinal), reader.GetValue(ordinal));
+            }
+
+            rows.Add(row);
+        }
+
+        return rows.AsReadOnly();
+    }
+
+    // Deletes the rows of a table whose key column holds the id, by reader-built identifiers and a parameter, and
+    // returns how many it removed. Used only for the page-two row of a record the test created.
+    private static async Task<int> DeleteRowAsync(
+        TableSchema table,
+        ColumnSchema key,
+        string id,
+        CancellationToken cancellationToken)
+    {
+        await using SqlConnection connection = await TestDatabase.OpenConnectionAsync(cancellationToken);
+        await using var command = new SqlCommand(
+            "DELETE FROM " + SqlIdentifier.Quote(table) + " WHERE " + SqlIdentifier.Quote(key) + " = @id",
+            connection);
+        command.Parameters.Add(IdParameter(id));
+        return await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    // The number of base rows of the active set, or of every row, whose UniqueKey is at most the given key, or all of
+    // them when no key is given: the expected navigation coordinates, computed by SQL in the test.
+    private static async Task<int> CountBaseRowsAsync(
+        ReaderForm form,
+        int? atMostUniqueKey,
+        bool activeOnly,
+        CancellationToken cancellationToken)
+    {
+        await using SqlConnection connection = await TestDatabase.OpenConnectionAsync(cancellationToken);
+        await using var command = new SqlCommand { Connection = connection };
+        var conditions = new List<string>();
+        if (activeOnly)
+        {
+            conditions.Add(SqlIdentifier.Quote(RecordSqlBuilder.Require(form.Schema.RecStatus)) + " = @recStatus");
+            command.Parameters.Add("@recStatus", SqlDbType.Int).Value = RecordQueryRules.ActiveRecStatus;
+        }
+
+        if (atMostUniqueKey is int uniqueKey)
+        {
+            conditions.Add(SqlIdentifier.Quote(RecordSqlBuilder.Require(form.Schema.UniqueKey)) + " <= @uniqueKey");
+            command.Parameters.Add("@uniqueKey", SqlDbType.Int).Value = uniqueKey;
+        }
+
+        var sql = new StringBuilder("SELECT COUNT_BIG(*) FROM ").Append(SqlIdentifier.Quote(form.Schema.BaseTable));
+        if (conditions.Count > 0)
+        {
+            sql.Append(" WHERE ").AppendJoin(" AND ", conditions);
+        }
+
+        command.CommandText = sql.ToString();
+        object? count = await command.ExecuteScalarAsync(cancellationToken);
+        return checked((int)Assert.IsType<long>(count));
+    }
+
+    private static SqlParameter IdParameter(string id) => new("@id", SqlDbType.NVarChar, -1) { Value = id };
+
+    // An update's required gate that always passes and counts its calls, so a test can tell whether the locked read
+    // stopped the update before the gate ran.
+    private sealed class CountingGate
+    {
+        public int Calls { get; private set; }
+
+        public RecordValidationResult Check(StoredRecord stored)
+        {
+            Calls++;
+            return RecordValidationResult.Success(stored.Values);
+        }
+    }
+
+    // The repository as the store builds it, over one recorder that hears every command the repository and its
+    // metadata reader send, with the save stamps of one test: whole seconds, the precision legacy stores, one minute
+    // apart, so each write's LastSaveTime differs from every earlier stamp of the test and a change is asserted as one.
+    private sealed class RepositoryHarness
+    {
+        private readonly DateTime _start = SaveStamp.TruncateToSeconds(DateTime.Now);
+
+        private RepositoryHarness(SqlCommandRecorder recorder, SqlRecordRepository repository)
+        {
+            Recorder = recorder;
+            Repository = repository;
+        }
+
+        public SqlCommandRecorder Recorder { get; }
+
+        public SqlRecordRepository Repository { get; }
+
+        public static RepositoryHarness Create()
+        {
+            var options = new DatabaseOptions(TestDatabase.ConnectionString);
+            var recorder = new SqlCommandRecorder();
+            var factory = new SqlConnectionFactory(options);
+            var reader = new SqlMetadataReader(factory, options, recorder);
+            return new RepositoryHarness(recorder, new SqlRecordRepository(factory, reader, options, recorder));
+        }
+
+        public SaveStamp Stamp(int minute) => new(Environment.UserName, _start.AddMinutes(minute));
+    }
+
     // A base row's stored id and key, as a by-id statement returned them.
     private readonly record struct IdRow(string GlobalRecordId, int UniqueKey);
 
@@ -1087,10 +1906,12 @@ internal static class PageInsert
 /// <para>
 /// The class is read-only and seed-backed: it creates no record and sends only <c>SELECT</c> statements, the
 /// builder's through <see cref="SqlExecution"/> and the command recorder, and the direct queries. Tests may write only
-/// records created through the API and the few fixtures AAP 0.3.7 ("Data reach of tests") lists, and this assembly
-/// reaches the data layer, not the API. Cases that need a stored literal pattern character therefore belong to
-/// <c>ListAndSearchTests</c>. Each test holds the shared <see cref="DatabaseWriteLock"/> for its whole body, so the
-/// seeded rows its expected values come from cannot move, and ends by asserting that the recorder saw no write.
+/// records created through the API, or through the repository the API's store forwards to as the write cases of
+/// <see cref="SqlRecordRepositoryTests"/> do to pin that path, and the few fixtures AAP 0.3.7 ("Data reach of tests")
+/// lists. This class pins the list and Find SQL against the seeded rows alone, so cases that need a stored literal
+/// pattern character belong to <c>ListAndSearchTests</c>. Each test holds the shared <see cref="DatabaseWriteLock"/>
+/// for its whole body, so the seeded rows its expected values come from cannot move, and ends by asserting that the
+/// recorder saw no write.
 /// </para>
 /// </remarks>
 [Trait("Category", "Integration")]
