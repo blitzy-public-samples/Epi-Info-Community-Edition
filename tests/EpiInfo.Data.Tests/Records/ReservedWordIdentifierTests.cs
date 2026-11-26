@@ -16,8 +16,9 @@ using Microsoft.Data.SqlClient;
 namespace EpiInfo.Data.Tests.Records;
 
 /// <summary>
-/// Integration tests on session temporary tables, for the identifiers and column types the seeded forms do not have.
-/// Each test creates its <c>#</c> tables on one dedicated connection, reads their schema through
+/// Integration tests on session temporary tables, for the identifiers and column types the seeded forms do not have,
+/// and for stored values the seeded rows lack, such as text with trailing blanks. Each test creates its <c>#</c>
+/// tables on one dedicated connection, reads their schema through
 /// <see cref="SqlMetadataReader.ReadTempTableSchemaAsync"/>, builds an in-memory form over them (no <c>meta*</c> row
 /// is written), writes and reads through <see cref="RecordSqlBuilder"/>, <see cref="SearchSqlBuilder"/> and
 /// <see cref="SqlExecution"/>, and verifies with plain parameterised <see cref="SqlCommand"/> reads on the same
@@ -42,8 +43,12 @@ public sealed class ReservedWordIdentifierTests
     // metaFieldTypes ids and names, as testdata/sql/02_reference_data.sql seeds them.
     private const int TextTypeId = 1;
     private const string TextTypeName = "Text";
+    private const int MultilineTypeId = 4;
+    private const string MultilineTypeName = "Multiline";
     private const int NumberTypeId = 5;
     private const string NumberTypeName = "Number";
+    private const int PhoneNumberTypeId = 6;
+    private const string PhoneNumberTypeName = "Phone Number";
     private const int OptionTypeId = 12;
     private const string OptionTypeName = "Option";
 
@@ -58,6 +63,9 @@ public sealed class ReservedWordIdentifierTests
     private const string SmallChoice = "SmallChoice";
     private const string IntChoice = "IntChoice";
     private const string Score = "Score";
+    private const string Surname = "Surname";
+    private const string Remarks = "Remarks";
+    private const string Phone = "Phone";
 
     // Dapper's literal token for parameter p1. Dapper's own DynamicParameters would replace it in the command text with
     // the value of @p1, even inside a bracketed identifier.
@@ -70,6 +78,8 @@ public sealed class ReservedWordIdentifierTests
     private const string SearchPage = "#SearchPage";
     private const string MarkerBase = "#MarkerBase";
     private const string MarkerPage = "#MarkerPage";
+    private const string PaddingBase = "#PaddingBase";
+    private const string PaddingPage = "#PaddingPage";
 
     private static readonly TimeSpan TestTimeout = TimeSpan.FromSeconds(120);
 
@@ -322,6 +332,181 @@ public sealed class ReservedWordIdentifierTests
         finally
         {
             await DropTablesAsync(connection, SearchPage, SearchBase);
+        }
+    }
+
+    /// <summary>
+    /// Criteria on the text <c>Surname</c>, the multiline <c>Remarks</c> and the Phone Number <c>Phone</c>, each with
+    /// the operator the parser gives it and the labels of the rows Find must return, in <c>UniqueKey</c> order, over
+    /// the stored rows of <see cref="StoredValues_FindPadsTrailingBlanksButLikeDoesNot"/>.
+    /// </summary>
+    /// <remarks>
+    /// <c>FakeDataStoreTrailingBlankFindTests</c> in <c>EpiInfo.Api.Tests</c> pins the same rows and cases on the
+    /// in-memory store; the two tables must stay identical.
+    /// </remarks>
+    public static TheoryData<string, string, SearchOperator, string> TrailingBlankCases => new()
+    {
+        // Equality pads the shorter text, so the stored "Smith ", "Smith   " and "Smith" are all found.
+        { Surname, "Smith", SearchOperator.Equal, "ABC" },
+
+        // LIKE keeps trailing blanks significant: %Smith_ matches only the one-blank "Smith ", and %mith only "Smith".
+        // The parser takes LIKE only for a value holding *, % or ?, so * leads each pattern.
+        { Surname, "*Smith_", SearchOperator.Like, "B" },
+        { Surname, "*mith", SearchOperator.Like, "A" },
+
+        // The multiline prefix equality pads too: "Notes" finds the stored "Notes   ", and a 300-character criterion
+        // whose 255-character prefix ends in five blanks finds a stored prefix ending in the same blanks, and the
+        // stored 250 letters alone, but not 251 letters.
+        { Remarks, "Notes", SearchOperator.PrefixEqual255, "AB" },
+        {
+            Remarks,
+            new string('a', 250) + new string(' ', 5) + new string('c', 45),
+            SearchOperator.PrefixEqual255,
+            "CD"
+        },
+        { Remarks, "*Notes", SearchOperator.Like, "A" },
+
+        // Phone Number keeps its prefix as the operator, and the stored "555-0148 " orders as "555-0148" does. A NULL
+        // phone satisfies no comparison.
+        { Phone, ">555-0148", SearchOperator.Greater, "C" },
+        { Phone, ">=555-0148", SearchOperator.GreaterOrEqual, "ABC" },
+        { Phone, "<>555-0148", SearchOperator.NotEqual, "CE" },
+        { Phone, "555-0148", SearchOperator.Equal, "AB" },
+        { Phone, "<=555-0148", SearchOperator.LessOrEqual, "ABE" },
+        { Phone, "<555-0148", SearchOperator.Less, "E" },
+    };
+
+    /// <summary>
+    /// Find over stored values with trailing blanks, which no seeded row holds, returns exactly the rows SQL Server's
+    /// comparison rules select: text and Phone Number comparisons and the multiline 255-character prefix equality pad
+    /// the shorter operand with spaces, while <c>LIKE</c> keeps trailing blanks significant, on both the scalar and the
+    /// packed statement. Each criterion goes through <see cref="SearchCriteriaParser"/> on the fixture's Text,
+    /// Multiline and Phone Number metadata, over the column types their seeded fields use: <c>nvarchar(4000)</c>,
+    /// <c>ntext</c> and <c>nvarchar(20)</c>.
+    /// </summary>
+    /// <param name="field">The searched field.</param>
+    /// <param name="criterion">The criterion text, as the API receives it.</param>
+    /// <param name="expectedOperator">The operator the parser must give the criterion's one alternative.</param>
+    /// <param name="expectedRows">The labels of the rows it must return, in <c>UniqueKey</c> order.</param>
+    [Theory]
+    [MemberData(nameof(TrailingBlankCases))]
+    public async Task StoredValues_FindPadsTrailingBlanksButLikeDoesNot(
+        string field,
+        string criterion,
+        SearchOperator expectedOperator,
+        string expectedRows)
+    {
+        await TestDatabase.EnsureReachableAsync();
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        var cancellationToken = timeout.Token;
+        await using var writeLock = await DatabaseWriteLock.AcquireExclusiveAsync(cancellationToken);
+        await using var connection = await TestDatabase.OpenConnectionAsync(cancellationToken);
+        try
+        {
+            var fixture = await CreateFixtureAsync(
+                connection,
+                PaddingBase,
+                PaddingPage,
+                $"[{Surname}] nvarchar(4000), [{Remarks}] ntext, [{Phone}] nvarchar(20)",
+                [
+                    new FixtureField(Surname, TextTypeId, TextTypeName),
+                    new FixtureField(Remarks, MultilineTypeId, MultilineTypeName),
+                    new FixtureField(Phone, PhoneNumberTypeId, PhoneNumberTypeName),
+                ],
+                cancellationToken);
+
+            // Every row is active and has its page row. B holds A's three texts with trailing blanks; C and D hold
+            // multiline values whose 255-character prefixes equal the long criterion's once padded, and E one whose
+            // prefix differs before the blanks; a field a row omits is NULL.
+            var rows = new (string Label, (string Name, FieldValue Value)[] Values)[]
+            {
+                ("A", [
+                    (Surname, FieldValue.FromText("Smith")),
+                    (Remarks, FieldValue.FromText("Notes")),
+                    (Phone, FieldValue.FromText("555-0148")),
+                ]),
+                ("B", [
+                    (Surname, FieldValue.FromText("Smith ")),
+                    (Remarks, FieldValue.FromText("Notes   ")),
+                    (Phone, FieldValue.FromText("555-0148 ")),
+                ]),
+                ("C", [
+                    (Surname, FieldValue.FromText("Smith   ")),
+                    (Remarks, FieldValue.FromText(new string('a', 250) + new string(' ', 5) + new string('b', 45))),
+                    (Phone, FieldValue.FromText("555-0149")),
+                ]),
+                ("D", [
+                    (Surname, FieldValue.FromText("Smyth")),
+                    (Remarks, FieldValue.FromText(new string('a', 250))),
+                ]),
+                ("E", [
+                    (Remarks, FieldValue.FromText(new string('a', 251) + new string('b', 49))),
+                    (Phone, FieldValue.FromText("555-0147")),
+                ]),
+            };
+
+            var labels = new Dictionary<string, string>(StringComparer.Ordinal);
+            foreach (var (label, values) in rows)
+            {
+                var globalRecordId = await InsertBaseAsync(fixture, connection, cancellationToken);
+                var insert = RecordSqlBuilder.InsertPage(
+                    fixture.Page, globalRecordId, fixture.PageColumns, Values(values));
+                Assert.Equal(1, await ExecuteAsync(fixture, connection, insert, cancellationToken));
+                labels.Add(globalRecordId, label);
+            }
+
+            var parsed = SearchCriteriaParser.Parse(
+                fixture.DataFields, [new SearchCriterion(field, FieldValue.FromText(criterion))]);
+            Assert.True(parsed.IsSuccess, "The criterion must parse.");
+            Assert.Equal(expectedOperator, Assert.Single(Assert.Single(parsed.Conditions).Alternatives).Operator);
+
+            Task<List<string>> FindAsync(SqlStatement statement) => SqlExecution.ReadAsync(
+                connection,
+                transaction: null,
+                FixtureOperation,
+                statement,
+                fixture.CommandTimeoutSeconds,
+                fixture.Recorder,
+                cancellationToken,
+                static async (reader, token) =>
+                {
+                    var ids = new List<string>();
+                    while (await reader.ReadAsync(token))
+                    {
+                        ids.Add(reader.GetString(SearchSqlBuilder.IdOrdinal));
+                    }
+
+                    return ids;
+                });
+
+            var search = SearchSqlBuilder.Search(
+                fixture.Schema,
+                fixture.DataFields,
+                RecordQueryRules.GetGridColumns(fixture.DataFields),
+                parsed.Conditions,
+                includeDeleted: false,
+                excludeGlobalRecordId: null);
+            var found = await FindAsync(search.Statement);
+            Assert.Equal(expectedRows, string.Concat(found.Select(id => labels[id])));
+
+            // Packed, as a search beyond the scalar parameter budget binds it, the criterion travels in the packed
+            // carrier rather than as its own parameter, and the padding rules select exactly the same rows.
+            var packed = SearchSqlBuilder.Search(
+                fixture.Schema,
+                fixture.DataFields,
+                RecordQueryRules.GetGridColumns(fixture.DataFields),
+                parsed.Conditions,
+                includeDeleted: false,
+                excludeGlobalRecordId: null,
+                scalarParameterBudget: 0);
+            Assert.NotEqual(search.Statement.Text, packed.Statement.Text);
+
+            var packedFound = await FindAsync(packed.Statement);
+            Assert.Equal(expectedRows, string.Concat(packedFound.Select(id => labels[id])));
+        }
+        finally
+        {
+            await DropTablesAsync(connection, PaddingPage, PaddingBase);
         }
     }
 

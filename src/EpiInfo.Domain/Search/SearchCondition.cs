@@ -144,7 +144,7 @@ public sealed record SearchAlternative(SearchOperator Operator, FieldValue? Valu
 /// compare alternatives element-wise.
 /// </para>
 /// </remarks>
-/// <param name="FieldName">The canonical column name; see <see cref="FieldName"/>.</param>
+/// <param name="FieldName">The canonical name; see <see cref="FieldName"/>.</param>
 /// <param name="Target">The column kind; see <see cref="Target"/>.</param>
 /// <param name="FieldType">The data field's kind; see <see cref="FieldType"/>.</param>
 /// <param name="Alternatives">The alternatives; see <see cref="Alternatives"/>.</param>

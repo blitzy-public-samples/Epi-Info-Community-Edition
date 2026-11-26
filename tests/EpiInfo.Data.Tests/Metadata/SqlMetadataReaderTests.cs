@@ -4,6 +4,7 @@ using EpiInfo.Data.Metadata;
 using EpiInfo.Data.Sql;
 using EpiInfo.Domain.Forms;
 using EpiInfo.Domain.Metadata;
+using EpiInfo.Domain.Validation;
 using EpiInfo.Domain.Values;
 using EpiInfo.Tests.Shared;
 using Microsoft.Data.SqlClient;
@@ -193,6 +194,85 @@ public sealed class SqlMetadataReaderTests : IAsyncLifetime
         Assert.True(recorder.AnyCommandTextContains("[" + SexTable + "]"));
         Assert.True(recorder.AnyCommandTextContains("[" + StateTable + "]"));
         Assert.Empty(recorder.Writes());
+    }
+
+    /// <summary>
+    /// Two Legal Values rows spelled exactly <c>Choice</c>: the page-1 row, with the higher <c>FieldId</c>, names the
+    /// administrative-sex table, and the page-2 row, with the lower <c>FieldId</c> and listed first, names the state
+    /// table. The data field is the first in storage order, the page-1 row, so its code table alone is read and holds
+    /// the one <c>Choice</c> entry; the definition lists the page-2 row as unsupported, and the validator accepts the
+    /// data field's options and rejects the state table's.
+    /// </summary>
+    [Fact]
+    public async Task GetOptionsAsync_ExactRepeatOfALegalValuesName_ReadsOnlyTheDataFieldsCodeTable()
+    {
+        using var cancellation = new CancellationTokenSource(TestTimeout);
+        CancellationToken token = cancellation.Token;
+        var recorder = new SqlCommandRecorder();
+        SqlMetadataReader reader = CreateReader(recorder);
+        await using SqlConnection verification = await TestDatabase.OpenConnectionAsync(token);
+
+        var form = new FormMetadata(
+            ViewId: 9102,
+            Name: "LegalValuesRepeat",
+            BaseTableName: "LegalValuesRepeat",
+            Pages:
+            [
+                new PageMetadata(1, "Page 1", 0, "LegalValuesRepeat1"),
+                new PageMetadata(2, "Page 2", 1, "LegalValuesRepeat2"),
+            ],
+            Fields:
+            [
+                CaseVariantLegalValuesField(1, "Choice", pageId: 2, StateTable, StateColumn),
+                CaseVariantLegalValuesField(2, "Choice", pageId: 1, SexTable, SexColumn),
+            ]);
+        IReadOnlyList<string?> sexRows = await ReadColumnAsync(verification, SexTable, SexColumn, token);
+        IReadOnlyList<string?> stateRows = await ReadColumnAsync(verification, StateTable, StateColumn, token);
+
+        // Preconditions on the seed, as in the case-variant test: both tables hold distinct non-blank rows and no text
+        // is in both, so the list read and the validator's verdicts each tell the two tables apart.
+        Assert.All(new[] { sexRows, stateRows }, rows =>
+        {
+            Assert.NotEmpty(rows);
+            Assert.All(rows, text => Assert.False(string.IsNullOrWhiteSpace(text)));
+            Assert.Equal(rows.Count, rows.Distinct(StringComparer.OrdinalIgnoreCase).Count());
+        });
+        Assert.Empty(sexRows.Intersect(stateRows, StringComparer.OrdinalIgnoreCase));
+
+        IReadOnlyDictionary<string, IReadOnlyList<FieldOption>> options = await reader.GetOptionsAsync(form, token);
+
+        Assert.Equal(["Choice"], options.Keys);
+        AssertOptionsAre(sexRows, options["Choice"]);
+        Assert.True(recorder.AnyCommandTextContains("[" + SexTable + "]"));
+
+        // Neither the catalogue read, which binds the code-table names as one parameter, nor the code-table batch
+        // names the repeating row's table.
+        Assert.DoesNotContain(recorder.Commands, command =>
+            command.CommandText.Contains(StateTable, StringComparison.Ordinal)
+            || command.Parameters.Any(parameter =>
+                parameter.Value is string bound && bound.Contains(StateTable, StringComparison.Ordinal)));
+        Assert.Empty(recorder.Writes());
+
+        FormDefinition definition = FormDefinitionFactory.Create(form, options, []);
+        FieldDefinition dataField = Assert.Single(Assert.Single(definition.Pages, page => page.PageId == 1).Fields);
+        FieldDefinition repeat = Assert.Single(Assert.Single(definition.Pages, page => page.PageId == 2).Fields);
+        Assert.Equal(FieldType.LegalValues, dataField.FieldType);
+        Assert.NotNull(dataField.Options);
+        AssertOptionsAre(sexRows, dataField.Options);
+        Assert.True(repeat.Unsupported);
+        Assert.Equal(FieldType.Unsupported, repeat.FieldType);
+        Assert.Null(repeat.Options);
+
+        var validator = new RecordValidator(form, definition);
+        RecordValidationResult accepted = validator.ValidateInput(
+            [new KeyValuePair<string, FieldValue>("Choice", FieldValue.FromText(sexRows[0]!))]);
+        RecordValidationResult rejected = validator.ValidateInput(
+            [new KeyValuePair<string, FieldValue>("Choice", FieldValue.FromText(stateRows[0]!))]);
+
+        Assert.True(accepted.IsValid, "An option of the data field's own code table was rejected.");
+        Assert.False(rejected.IsValid, "A text of the repeating row's code table was accepted.");
+        Assert.Equal(["Choice"], rejected.FieldErrors.Keys);
+        Assert.Equal([ValidationMessages.NotALegalValue], rejected.FieldErrors["Choice"]);
     }
 
 

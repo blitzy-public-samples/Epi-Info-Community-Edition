@@ -320,6 +320,23 @@ public sealed class RecordValidatorTests
             Row(3, "AGE", TextType, pageId: 2, Nvarchar(20)),
         ]);
 
+    /// <summary>
+    /// Fixture J: two required number rows spelled exactly <c>Age</c>, which no seeded form has. The row on page 1 is
+    /// first in storage order, so it is the data field; the row on page 2, first in metadata order and with the lower
+    /// <c>FieldId</c>, repeats its name and is listed unsupported. Plus an optional text field.
+    /// </summary>
+    private static readonly FormMetadata RepeatedNameForm = new(
+        ViewId: 8,
+        Name: "RepeatedName",
+        BaseTableName: "RepeatedName",
+        Pages: [new PageMetadata(1, "Page 1", 0, "RepeatedName1"), new PageMetadata(2, "Page 2", 1, "RepeatedName2")],
+        Fields:
+        [
+            Row(1, "Age", NumberType, pageId: 2, FloatColumn) with { Prompt = AgeGroupPrompt, IsRequired = true },
+            Row(2, "Age", NumberType, pageId: 1, FloatColumn) with { Prompt = AgePrompt, IsRequired = true },
+            Row(3, "Notes", TextType, pageId: 1, Nvarchar(4000)),
+        ]);
+
     // Column catalogue facts as sys.columns.max_length reports them, in bytes: nvarchar(n) is 2·n.
     private static (string SqlType, int MaxLengthBytes) FloatColumn => ("float", 8);
 
@@ -369,6 +386,7 @@ public sealed class RecordValidatorTests
         },
         { "CaseVariant", ["Age", "Notes", "AGE"] },
         { "CaseVariantLabel", ["Age", "AGE"] },
+        { "RepeatedName", ["Age", "Notes"] },
     };
 
     /// <summary>
@@ -2085,6 +2103,31 @@ public sealed class RecordValidatorTests
     }
 
     /// <summary>
+    /// A row repeating a data field's name exactly is no data field, so its own <c>IsRequired</c> never gates a save:
+    /// <c>Age</c> binds the page-1 field alone, and a create without it lists that field once, with its own prompt and
+    /// page.
+    /// </summary>
+    [Theory]
+    [InlineData("Age", 30d, false)]
+    [InlineData("Notes", "x", true)]
+    public void CheckNewRecord_RowRepeatingAName_GatesOnlyTheDataField(string supplied, object raw, bool ageMissing)
+    {
+        var validator = Validator(RepeatedNameForm);
+        var input = AssertValid(Validate(validator, (supplied, Wire(raw))));
+
+        var result = validator.CheckNewRecord(input);
+
+        if (ageMissing)
+        {
+            AssertOnlyFieldError(result, "Age", RequiredMessage(AgePrompt, "Page 1"));
+        }
+        else
+        {
+            Assert.Equal(new[] { "Age" }, AssertValid(result).Keys);
+        }
+    }
+
+    /// <summary>
     /// Every canonical values map rejects two keys that differ only by letter case, which no valid input can hold,
     /// with a fixed message that carries no key.
     /// </summary>
@@ -2118,6 +2161,7 @@ public sealed class RecordValidatorTests
         "BigBound" => BigBoundForm,
         "CaseVariant" => CaseVariantForm,
         "CaseVariantLabel" => CaseVariantLabelForm,
+        "RepeatedName" => RepeatedNameForm,
         _ => throw new ArgumentOutOfRangeException(nameof(name), name, "No fixture form has that name."),
     };
 

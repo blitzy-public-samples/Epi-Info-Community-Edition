@@ -427,8 +427,8 @@ public static class RecordQueryRules
             }
 
             // Keys compare ordinally, so two columns whose names differ only by case keep an entry and a value each.
-            // Only an exact repeat of a name shares one entry; the first in column order keeps it, as DataFieldSet
-            // resolves an exactly repeated name to the first in storage order.
+            // Columns from GetGridColumns never repeat a name, since the data-field set holds one field per exact
+            // name; for any other caller's list that repeats one, the first in column order keeps the entry.
             projected.TryAdd(column.Name, values.TryGetValue(column.Name, out var value) ? value : FieldValue.Null);
         }
 

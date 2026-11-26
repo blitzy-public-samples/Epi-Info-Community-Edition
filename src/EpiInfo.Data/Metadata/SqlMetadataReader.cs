@@ -124,8 +124,8 @@ internal sealed class SqlMetadataReader(
     }
 
     /// <summary>
-    /// Reads the options of every Legal Values field of <paramref name="form"/>: one entry per field that
-    /// <see cref="FieldTypeMapper.Map"/> maps to a supported <see cref="FieldType.LegalValues"/>.
+    /// Reads the options of every Legal Values data field of <paramref name="form"/>: one entry per field of
+    /// <see cref="FormDefinitionFactory.GetDataFields"/> whose type is <see cref="FieldType.LegalValues"/>.
     /// </summary>
     /// <remarks>
     /// At most two commands are sent, whatever the number of fields: one catalogue read resolves every code table
@@ -136,10 +136,12 @@ internal sealed class SqlMetadataReader(
     /// <param name="cancellationToken">The request's abort token.</param>
     /// <returns>
     /// The options keyed by canonical field name, compared ordinally, so two fields whose names differ only by letter
-    /// case each have an entry holding their own code table's rows. Each list is in the order SQL Server returned the
-    /// rows, or sorted by text when the field's <see cref="FieldMetadata.Sort"/> is set. A field without a usable code
-    /// table has an empty list. No connection is opened when no Legal Values field names both a code table and a
-    /// column.
+    /// case each have an entry holding their own code table's rows. The entries are the Legal Values data fields of
+    /// <see cref="FormDefinitionFactory.GetDataFields"/>, so a row repeating a data field's name exactly, which the
+    /// form definition lists as unsupported, neither supplies the entry of that name nor has its code table read. Each
+    /// list is in the order SQL Server returned the rows, or sorted by text when the field's
+    /// <see cref="FieldMetadata.Sort"/> is set. A field without a usable code table has an empty list. No connection
+    /// is opened when no Legal Values data field names both a code table and a column.
     /// </returns>
     /// <exception cref="ArgumentNullException"><paramref name="form"/> is null.</exception>
     /// <exception cref="InvalidOperationException">The code-table batch returned fewer result sets than it holds.</exception>
@@ -151,15 +153,16 @@ internal sealed class SqlMetadataReader(
 
         var optionsByField = new Dictionary<string, IReadOnlyList<FieldOption>>(StringComparer.Ordinal);
         var legalValuesFields = new List<FieldMetadata>();
-        foreach (FieldMetadata field in form.Fields)
+        foreach (DataFieldMetadata dataField in FormDefinitionFactory.GetDataFields(form))
         {
-            if (FieldTypeMapper.Map(field) is (FieldType.LegalValues, false, _)
-                && optionsByField.TryAdd(field.Name, NoOptions))
+            // The data-field set is the one field-identity rule the definition, the validator and the record SQL
+            // follow: it holds one field per exact canonical name, the first in storage order, so the row whose code
+            // table is read is the row those consumers use. Fields whose names differ only by letter case are
+            // distinct data fields, each reading its own code table, and never share a list.
+            if (dataField.FieldType == FieldType.LegalValues)
             {
-                // Each exact canonical name is its own field and reads its own code table, so fields whose names
-                // differ only by letter case never share a list. Only an exact repeat of a name is skipped: the
-                // first row so spelled keeps the entry.
-                legalValuesFields.Add(field);
+                optionsByField.Add(dataField.Name, NoOptions);
+                legalValuesFields.Add(dataField.Field);
             }
         }
 

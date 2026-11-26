@@ -20,8 +20,10 @@ public sealed record FieldMetadata
     public required int FieldId { get; init; }
 
     /// <summary>
-    /// The canonical <c>metaFields.Name</c>, for example <c>LastName</c>. Responses use this
-    /// spelling verbatim, and the page-table column of a data field has the same name.
+    /// The canonical <c>metaFields.Name</c>, for example <c>LastName</c>. Responses and the
+    /// field's <c>values</c> key use this spelling verbatim. The page-table column that stores a
+    /// data field's value is <see cref="Column"/>, whose catalogue spelling
+    /// (<see cref="ColumnMetadata.Name"/>) can differ from this name in letter case.
     /// </summary>
     public required string Name { get; init; }
 
@@ -131,7 +133,10 @@ public sealed record FieldMetadata
     public bool Sort { get; init; }
 
     /// <summary>
-    /// The column of the page table of <see cref="PageId"/> whose name equals <see cref="Name"/>;
+    /// The column of the page table of <see cref="PageId"/> that the metadata reader attaches to the
+    /// field: the column spelled exactly as <see cref="Name"/>, otherwise the first in
+    /// <c>column_id</c> order equal to it ignoring case, so its catalogue spelling
+    /// (<see cref="ColumnMetadata.Name"/>) can differ from <see cref="Name"/> in letter case;
     /// <see langword="null"/> when that table has no such column, as for labels, groups, command
     /// buttons and the system rows.
     /// </summary>

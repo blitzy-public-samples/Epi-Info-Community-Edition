@@ -1,3 +1,4 @@
+using System.Data;
 using System.Globalization;
 using System.Net;
 using System.Text.Json;
@@ -15,6 +16,7 @@ using EpiInfo.Domain.Search;
 using EpiInfo.Domain.Storage;
 using EpiInfo.Domain.Validation;
 using EpiInfo.Domain.Values;
+using EpiInfo.Tests.Shared;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Http.HttpResults;
@@ -23,6 +25,7 @@ using Microsoft.AspNetCore.Mvc.ApiExplorer;
 using Microsoft.AspNetCore.Mvc.ModelBinding;
 using Microsoft.AspNetCore.Routing;
 using Microsoft.AspNetCore.TestHost;
+using Microsoft.Data.SqlClient;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -293,8 +296,9 @@ public sealed class ListAndSearchBoundsTests
 /// <summary>
 /// Pins the Find and list semantics of the in-memory <see cref="FakeDataStore"/> against the
 /// <see cref="IDataStore"/> Find and list contract that AAP 0.3.4.3 and 0.3.4.4 set out: exact comparison on integer
-/// columns and binary64 comparison on float columns, SQL <c>LIKE</c> over the whole text, and one scan that numbers,
-/// filters, counts and pages records as the SQL statements do.
+/// columns and binary64 comparison on float columns, text comparison padded with spaces as SQL Server pads it, SQL
+/// <c>LIKE</c> over the whole text, and one scan that numbers, filters, counts and pages records as the SQL statements
+/// do.
 /// </summary>
 /// <remarks>
 /// The class calls the store's <see cref="IDataStore"/> members directly and needs no database: it carries no
@@ -373,6 +377,59 @@ public sealed class FakeDataStoreFindTests
         { "ab", "a[^]", true },
         { "a]", "[^]]", true },
         { "]", "[^]]", false },
+    };
+
+    /// <summary>
+    /// A stored text, a Find operator and its criterion, with whether SQL Server finds the stored value, as
+    /// <see cref="FindPaddingSqlTests"/> confirms on <c>nvarchar</c> parameters: the comparisons and the 255-character
+    /// prefix equality pad the shorter text with spaces, and <c>LIKE</c> keeps trailing blanks significant. The texts
+    /// hold only letters and spaces, so each outcome turns on the padding, never on how a collation orders other
+    /// characters.
+    /// </summary>
+    public static TheoryData<string, SearchOperator, string, bool> PaddingCases => new()
+    {
+        // Equality ignores trailing blanks on either side, never leading ones.
+        { "Smith ", SearchOperator.Equal, "Smith", true },
+        { "Smith", SearchOperator.Equal, "Smith  ", true },
+        { " Smith", SearchOperator.Equal, "Smith", false },
+        { "Smith ", SearchOperator.Equal, "Smit", false },
+        { "Smith ", SearchOperator.NotEqual, "Smith", false },
+        { "Smith ", SearchOperator.NotEqual, "Smyth", true },
+
+        // Ordering compares the padded texts, so trailing blanks order as the padding does.
+        { "Smith ", SearchOperator.Greater, "Smith", false },
+        { "Smith ", SearchOperator.LessOrEqual, "Smith", true },
+        { "Smith", SearchOperator.Less, "Smith ", false },
+        { "Smith", SearchOperator.GreaterOrEqual, "Smith  ", true },
+        { "Smith a", SearchOperator.Greater, "Smith  ", true },
+
+        // 300-character texts whose 255-character prefix ends in blanks, followed by letters or by more blanks, equal
+        // the shorter criterion; a prefix that differs before its blanks does not.
+        {
+            new string('a', 250) + new string(' ', 5) + new string('b', 45),
+            SearchOperator.PrefixEqual255,
+            new string('a', 250),
+            true
+        },
+        { new string('a', 254) + new string(' ', 46), SearchOperator.PrefixEqual255, new string('a', 254), true },
+        {
+            new string('a', 250),
+            SearchOperator.PrefixEqual255,
+            new string('a', 250) + new string(' ', 10) + new string('b', 40),
+            true
+        },
+        {
+            new string('a', 250) + new string(' ', 5) + new string('b', 45),
+            SearchOperator.PrefixEqual255,
+            new string('a', 251),
+            false
+        },
+
+        // LIKE pads neither side on Unicode text, so a trailing blank must be matched.
+        { "Smith ", SearchOperator.Like, "Smith", false },
+        { "Smith", SearchOperator.Like, "Smith ", false },
+        { "Smith ", SearchOperator.Like, "Smith_", true },
+        { "Smith ", SearchOperator.Like, "Smith%", true },
     };
 
     // The parser keeps 9007199254740993 exact, and the three counts from 2^53 share two nearest doubles, so only an
@@ -456,6 +513,45 @@ public sealed class FakeDataStoreFindTests
         Assert.Equal(matches ? 1 : 0, response.Total);
     }
 
+    // Stored values and criteria with trailing blanks, compared as SQL Server compares them. The conditions are built
+    // directly: the parser trims every criterion and takes the prefix equality only for a multiline field.
+    [Theory]
+    [MemberData(nameof(PaddingCases))]
+    public async Task TextComparisonsPadTrailingBlanksButLikeDoesNot(
+        string stored,
+        SearchOperator comparison,
+        string criterion,
+        bool matches)
+    {
+        Assert.Equal(matches, await FindsAsync(stored, comparison, criterion));
+    }
+
+    // A GlobalRecordId criterion compares padded too, as the SQL store's plain comparison on the nvarchar id column
+    // does: trailing blanks still find the record, a leading blank does not.
+    [Theory]
+    [InlineData(SearchOperator.Equal, "", "  ", true)]
+    [InlineData(SearchOperator.Equal, " ", "", false)]
+    [InlineData(SearchOperator.Less, "", " ", false)]
+    [InlineData(SearchOperator.GreaterOrEqual, "", " ", true)]
+    public async Task GlobalRecordIdCriterionPadsTrailingBlanks(
+        SearchOperator comparison,
+        string leading,
+        string trailing,
+        bool matches)
+    {
+        var store = CreateStore();
+        var id = Seed(store, NameField, FieldValue.FromText("match"));
+        SearchCondition[] conditions =
+        [
+            new("GlobalRecordId", SearchTarget.BaseGlobalRecordId, null,
+                [new SearchAlternative(comparison, FieldValue.FromText(leading + id + trailing))]),
+        ];
+
+        var response = await SearchAsync(store, conditions);
+
+        Assert.Equal(matches ? 1 : 0, response.Total);
+    }
+
     // Records r1, r2, the deleted rd, r3, r4 and r5, in UniqueKey order.
     [Theory]
     [InlineData(null, false, 1, 2, new[] { "r1", "r2" }, 5)]
@@ -489,6 +585,40 @@ public sealed class FakeDataStoreFindTests
         Assert.Equal(expectedTotal, result.Total);
         Assert.Equal(expectedNames, result.Items.Select(item => item.Values[NameField].AsText()));
         Assert.All(result.Items, item => Assert.Equal(GridColumnNames, item.Values.Keys));
+    }
+
+    // The grid filter searches a float as SQL Server's style-0 text, which keeps at most six significant digits, so q
+    // matches only that text. Records: 0 weighs 1234567.891 (1.23457e+006), 1 weighs 0.00001 (1e-005), 2 weighs
+    // 12345.65 (12345.7, from its 17 significant digits, though its double lies below the tie), 3 weighs 2^53 + 1,
+    // which a float column stores as 2^53 (9.0072e+015), and 4 weighs 37.5. Round-trip texts match nothing.
+    [Theory]
+    [InlineData("1.23457e+006", new[] { 0 })]
+    [InlineData("E+006", new[] { 0 })]
+    [InlineData("1234567", new int[0])]
+    [InlineData("e-005", new[] { 1 })]
+    [InlineData("1E-05", new int[0])]
+    [InlineData("12345.7", new[] { 2 })]
+    [InlineData("12345.65", new int[0])]
+    [InlineData("9.0072e+015", new[] { 3 })]
+    [InlineData("9007199254740993", new int[0])]
+    [InlineData("e+0", new[] { 0, 3 })]
+    [InlineData("37.5", new[] { 4 })]
+    public async Task ListMatchesAFloatAsSqlServerConvertsItToText(string q, int[] expectedRecords)
+    {
+        var store = CreateStore();
+        string[] ids =
+        [
+            Seed(store, WeightField, FieldValue.FromNumber(1234567.891)),
+            Seed(store, WeightField, FieldValue.FromNumber(0.00001)),
+            Seed(store, WeightField, FieldValue.FromNumber(12345.65)),
+            Seed(store, WeightField, FieldValue.FromInteger(TwoToThe53 + 1)),
+            Seed(store, WeightField, FieldValue.FromNumber(37.5)),
+        ];
+
+        var result = await store.ListAsync(Form, RecordListQuery.Default with { Q = q }, CancellationToken.None);
+
+        Assert.Equal(expectedRecords.Select(record => ids[record]), result.Items.Select(item => item.GlobalRecordId));
+        Assert.Equal(expectedRecords.Length, result.Total);
     }
 
     // Records: 0 match, 1 other, 2 match deleted, 3 match missing page 2, 4 match, 5 match. The excluded id is passed
@@ -626,6 +756,61 @@ public sealed class FakeDataStoreFindTests
         Assert.Equal(records[1..], await SearchIdsAsync(store, criteria));
     }
 
+    // A write refuses a read-only field's key, even with a null value, as the SQL builders do: before the locked read
+    // or any write is logged, and before anything changes, though the writable LastName beside it is valid. A seed
+    // admits it, since a seeded record stands for a stored row, and the stored value reads back unchanged. This
+    // class's own form has no read-only field, so the case uses the read-only number OnsetWeek of FakeForms.
+    [Theory]
+    [InlineData(nameof(IDataStore.InsertAsync), "values", false)]
+    [InlineData(nameof(IDataStore.InsertAsync), "values", true)]
+    [InlineData(nameof(IDataStore.UpdateAsync), "submitted", false)]
+    [InlineData(nameof(IDataStore.UpdateAsync), "submitted", true)]
+    public async Task WritesRefuseAReadOnlyFieldThatASeedAdmits(string method, string paramName, bool explicitNull)
+    {
+        const string readOnlyField = "OnsetWeek";
+        const string writableField = "LastName";
+        var form = FakeForms.WithCheckCode(string.Empty);
+        var store = new FakeDataStore(form);
+        var storedWeek = FieldValue.FromInteger(7);
+        var id = store.SeedRecord(
+            FakeForms.CheckCodeViewId,
+            new Dictionary<string, FieldValue>
+            {
+                [writableField] = FieldValue.FromText("seeded"),
+                [readOnlyField] = storedWeek,
+            });
+        var read = await store.GetByIdAsync(form.Metadata, id, CancellationToken.None);
+        Assert.Equal(storedWeek, Assert.IsType<RecordDto>(read).Values[readOnlyField]);
+        store.ClearCalls();
+
+        var values = new Dictionary<string, FieldValue>
+        {
+            [writableField] = FieldValue.FromText("changed"),
+            [readOnlyField] = explicitNull ? FieldValue.Null : FieldValue.FromInteger(8),
+        };
+        var stamp = new SaveStamp("tester", new DateTime(2024, 1, 2, 3, 4, 5, DateTimeKind.Utc));
+        var failure = await Record.ExceptionAsync(() => method == nameof(IDataStore.UpdateAsync)
+            ? store.UpdateAsync(
+                form.Metadata,
+                id,
+                values,
+                stamp,
+                _ => RecordValidationResult.Success(new Dictionary<string, FieldValue>()),
+                permissions: null,
+                CancellationToken.None)
+            : store.InsertAsync(form.Metadata, values, stamp, CancellationToken.None));
+
+        var argument = Assert.IsType<ArgumentException>(failure);
+        Assert.Equal(paramName, argument.ParamName);
+        Assert.StartsWith("A read-only field is never written.", argument.Message, StringComparison.Ordinal);
+        var record = Assert.Single(store.GetRecords(FakeForms.CheckCodeViewId));
+        Assert.Equal(id, record.GlobalRecordId);
+        Assert.Equal("seeded", record.Values[writableField].AsText());
+        Assert.Equal(storedWeek, record.Values[readOnlyField]);
+        Assert.Null(record.LastSave);
+        Assert.Empty(store.Calls);
+    }
+
     private static FakeDataStore CreateStore() =>
         new(new FakeForm(Form, new Dictionary<string, IReadOnlyList<FieldOption>>(StringComparer.OrdinalIgnoreCase), null));
 
@@ -651,6 +836,27 @@ public sealed class FakeDataStoreFindTests
 
     private static async Task<string[]> SearchIdsAsync(FakeDataStore store, IReadOnlyList<SearchCondition> conditions) =>
         [.. (await SearchAsync(store, conditions)).Items.Select(item => item.GlobalRecordId)];
+
+    /// <summary>
+    /// Whether the store's Find returns the one record seeded with <paramref name="stored"/> in the text
+    /// <c>Name</c>, searched by a condition built directly with one <paramref name="comparison"/> alternative on
+    /// <paramref name="criterion"/>, so the criterion keeps the blanks the parser would trim.
+    /// </summary>
+    internal static async Task<bool> FindsAsync(string stored, SearchOperator comparison, string criterion)
+    {
+        var store = CreateStore();
+        Seed(store, NameField, FieldValue.FromText(stored));
+        SearchCondition[] conditions =
+        [
+            new(NameField, SearchTarget.PageField, FieldType.Text,
+                [new SearchAlternative(comparison, FieldValue.FromText(criterion))]),
+        ];
+
+        var response = await SearchAsync(store, conditions);
+
+        Assert.InRange(response.Total, 0, 1);
+        return response.Total == 1;
+    }
 
     // Seeds the counts long.MinValue, 2, 3, 2^53, 2^53 + 1, 2^53 + 2 and long.MaxValue, in UniqueKey order, and
     // asserts that the conditions find exactly the expected counts, in that order.
@@ -724,6 +930,345 @@ public sealed class FakeDataStoreFindTests
             PageId = pageId,
             Column = FieldTypeMapper.DescribeColumn(name, sqlTypeName, maxLengthBytes),
         };
+}
+
+/// <summary>
+/// Holds the <see cref="FakeDataStore"/> Find to SQL Server's trailing-blank rules through genuine Text, Multiline and
+/// Phone Number metadata: each criterion goes through <see cref="SearchCriteriaParser"/>, which chooses its operator,
+/// and the store must return exactly the rows, and the total, that SQL Server returns for the same stored values.
+/// </summary>
+/// <remarks>
+/// <c>ReservedWordIdentifierTests.StoredValues_FindPadsTrailingBlanksButLikeDoesNot</c> in <c>EpiInfo.Data.Tests</c>
+/// pins the same rows and cases on SQL Server, over session temporary tables; the two tables must stay identical. This
+/// class needs no database: it carries no <c>Integration</c> trait, joins no database collection and takes no lock.
+/// Its form is synthetic: view 9110 on the unseeded base table <c>FakeTrailingBlankFind</c>, with the Text
+/// <c>Surname</c> on <c>nvarchar(4000)</c>, the Multiline <c>Remarks</c> on <c>ntext</c> and the Phone Number
+/// <c>Phone</c> on <c>nvarchar(20)</c>, the column types their seeded fields use, on one page.
+/// </remarks>
+public sealed class FakeDataStoreTrailingBlankFindTests
+{
+    private const int ViewId = 9110;
+    private const int PageId = 911001;
+    private const string BaseTable = "FakeTrailingBlankFind";
+    private const string Surname = "Surname";
+    private const string Remarks = "Remarks";
+    private const string Phone = "Phone";
+
+    private static readonly FormMetadata Form = CreateForm();
+
+    /// <summary>
+    /// Criteria on the text <c>Surname</c>, the multiline <c>Remarks</c> and the Phone Number <c>Phone</c>, each with
+    /// the operator the parser gives it and the labels of the rows Find must return, in <c>UniqueKey</c> order, over
+    /// the stored rows of <see cref="StoredValues_FindPadsTrailingBlanksButLikeDoesNot"/>.
+    /// </summary>
+    public static TheoryData<string, string, SearchOperator, string> TrailingBlankCases => new()
+    {
+        // Equality pads the shorter text, so the stored "Smith ", "Smith   " and "Smith" are all found.
+        { Surname, "Smith", SearchOperator.Equal, "ABC" },
+
+        // LIKE keeps trailing blanks significant: %Smith_ matches only the one-blank "Smith ", and %mith only "Smith".
+        // The parser takes LIKE only for a value holding *, % or ?, so * leads each pattern.
+        { Surname, "*Smith_", SearchOperator.Like, "B" },
+        { Surname, "*mith", SearchOperator.Like, "A" },
+
+        // The multiline prefix equality pads too: "Notes" finds the stored "Notes   ", and a 300-character criterion
+        // whose 255-character prefix ends in five blanks finds a stored prefix ending in the same blanks, and the
+        // stored 250 letters alone, but not 251 letters.
+        { Remarks, "Notes", SearchOperator.PrefixEqual255, "AB" },
+        {
+            Remarks,
+            new string('a', 250) + new string(' ', 5) + new string('c', 45),
+            SearchOperator.PrefixEqual255,
+            "CD"
+        },
+        { Remarks, "*Notes", SearchOperator.Like, "A" },
+
+        // Phone Number keeps its prefix as the operator, and the stored "555-0148 " orders as "555-0148" does. A NULL
+        // phone satisfies no comparison.
+        { Phone, ">555-0148", SearchOperator.Greater, "C" },
+        { Phone, ">=555-0148", SearchOperator.GreaterOrEqual, "ABC" },
+        { Phone, "<>555-0148", SearchOperator.NotEqual, "CE" },
+        { Phone, "555-0148", SearchOperator.Equal, "AB" },
+        { Phone, "<=555-0148", SearchOperator.LessOrEqual, "ABE" },
+        { Phone, "<555-0148", SearchOperator.Less, "E" },
+    };
+
+    /// <summary>
+    /// The store's Find over stored values with trailing blanks returns the rows and the total SQL Server returns:
+    /// text and Phone Number comparisons and the multiline 255-character prefix equality pad the shorter operand with
+    /// spaces, while <c>LIKE</c> keeps trailing blanks significant.
+    /// </summary>
+    /// <param name="field">The searched field.</param>
+    /// <param name="criterion">The criterion text, as the API receives it.</param>
+    /// <param name="expectedOperator">The operator the parser must give the criterion's one alternative.</param>
+    /// <param name="expectedRows">The labels of the rows it must return, in <c>UniqueKey</c> order.</param>
+    [Theory]
+    [MemberData(nameof(TrailingBlankCases))]
+    public async Task StoredValues_FindPadsTrailingBlanksButLikeDoesNot(
+        string field,
+        string criterion,
+        SearchOperator expectedOperator,
+        string expectedRows)
+    {
+        var store = new FakeDataStore(new FakeForm(
+            Form, new Dictionary<string, IReadOnlyList<FieldOption>>(StringComparer.OrdinalIgnoreCase), null));
+
+        // Every row is active and has its page row. B holds A's three texts with trailing blanks; C and D hold
+        // multiline values whose 255-character prefixes equal the long criterion's once padded, and E one whose
+        // prefix differs before the blanks; a field a row omits is NULL.
+        var rows = new (string Label, (string Name, FieldValue Value)[] Values)[]
+        {
+            ("A", [
+                (Surname, FieldValue.FromText("Smith")),
+                (Remarks, FieldValue.FromText("Notes")),
+                (Phone, FieldValue.FromText("555-0148")),
+            ]),
+            ("B", [
+                (Surname, FieldValue.FromText("Smith ")),
+                (Remarks, FieldValue.FromText("Notes   ")),
+                (Phone, FieldValue.FromText("555-0148 ")),
+            ]),
+            ("C", [
+                (Surname, FieldValue.FromText("Smith   ")),
+                (Remarks, FieldValue.FromText(new string('a', 250) + new string(' ', 5) + new string('b', 45))),
+                (Phone, FieldValue.FromText("555-0149")),
+            ]),
+            ("D", [
+                (Surname, FieldValue.FromText("Smyth")),
+                (Remarks, FieldValue.FromText(new string('a', 250))),
+            ]),
+            ("E", [
+                (Remarks, FieldValue.FromText(new string('a', 251) + new string('b', 49))),
+                (Phone, FieldValue.FromText("555-0147")),
+            ]),
+        };
+
+        var labels = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var (label, values) in rows)
+        {
+            var globalRecordId = store.SeedRecord(
+                ViewId, values.ToDictionary(entry => entry.Name, entry => entry.Value, StringComparer.Ordinal));
+            labels.Add(globalRecordId, label);
+        }
+
+        var parsed = SearchCriteriaParser.Parse(
+            FormDefinitionFactory.GetDataFields(Form), [new SearchCriterion(field, FieldValue.FromText(criterion))]);
+        Assert.True(parsed.IsSuccess, "The criterion must parse.");
+        Assert.Equal(expectedOperator, Assert.Single(Assert.Single(parsed.Conditions).Alternatives).Operator);
+
+        var response = await store.SearchAsync(
+            Form, parsed.Conditions, includeDeleted: false, excludeGlobalRecordId: null, CancellationToken.None);
+
+        Assert.Equal(expectedRows, string.Concat(response.Items.Select(item => labels[item.GlobalRecordId])));
+        Assert.Equal(expectedRows.Length, response.Total);
+        Assert.False(response.Truncated);
+    }
+
+    // The system rows and field-type ids are the seeded metaFields and metaFieldTypes rows, as FakeForms builds them;
+    // each data field's column has the type and catalogue size of its seeded counterparts.
+    private static FormMetadata CreateForm()
+    {
+        PageMetadata[] pages = [new(PageId, "Page 1", 0, BaseTable + PageId.ToString(CultureInfo.InvariantCulture))];
+        FieldMetadata[] fields =
+        [
+            SystemRow(1, "UniqueKey", 23),
+            SystemRow(2, "RecStatus", 22),
+            SystemRow(3, "GlobalRecordId", 26),
+            PageField(4, 1m, Surname, 1, "Text", "nvarchar", 8000),
+            PageField(5, 2m, Remarks, 4, "Multiline", "ntext", 16),
+            PageField(6, 3m, Phone, 6, "Phone Number", "nvarchar", 40),
+        ];
+        return new FormMetadata(ViewId, BaseTable, BaseTable, Array.AsReadOnly(pages), Array.AsReadOnly(fields));
+    }
+
+    private static FieldMetadata SystemRow(int ordinal, string name, int fieldTypeId) => new()
+    {
+        FieldId = (ViewId * 1000) + ordinal,
+        Name = name,
+        FieldTypeId = fieldTypeId,
+        FieldTypeName = name,
+        TabIndex = 0m,
+    };
+
+    private static FieldMetadata PageField(
+        int ordinal,
+        decimal tabIndex,
+        string name,
+        int fieldTypeId,
+        string fieldTypeName,
+        string sqlTypeName,
+        int maxLengthBytes) => new()
+        {
+            FieldId = (ViewId * 1000) + ordinal,
+            Name = name,
+            FieldTypeId = fieldTypeId,
+            FieldTypeName = fieldTypeName,
+            Prompt = name,
+            TabIndex = tabIndex,
+            PageId = PageId,
+            Column = FieldTypeMapper.DescribeColumn(name, sqlTypeName, maxLengthBytes),
+        };
+}
+
+/// <summary>
+/// Holds <see cref="FakeDataStore.GridFilterText"/>, the text the double's grid filter searches, to SQL Server: each
+/// value is bound as the type of the column that stores it and converted as the list's <c>q</c> predicate converts a
+/// grid column (AAP 0.3.4.4), <c>CONVERT(nvarchar(max), @v)</c> with style 23 for <c>datetime</c>, and SQL Server's
+/// text must equal the double's exactly.
+/// </summary>
+/// <remarks>
+/// Each parameter takes the SQL Server type of its column, a number on a <c>float</c> column its double as
+/// <see cref="DbType.Double"/>, as the SQL store binds it, and an <c>nchar(n)</c> value its fixed length, as the
+/// column holds it. The statement reads no table and writes nothing, so the class takes no <c>DatabaseWriteLock</c>
+/// (AAP 0.7.5); it still joins the database collection and probes the database first, as every integration test
+/// class does.
+/// </remarks>
+[Trait("Category", "Integration")]
+[Collection(DatabaseCollections.Database)]
+public sealed class GridFilterTextSqlTests : IAsyncLifetime
+{
+    // Numbers as a request or a criterion carries them, each stored in a float column.
+    private static readonly string[] FloatNumbers =
+    [
+        // Integers below, at and above six digits, and values that round up to seven.
+        "123456", "999999", "1234567", "9999995", "999999.5",
+
+        // Exactly representable ties at the seventh significant digit round half up, never to even.
+        "1234565", "1234575", "1234585", "100000.5", "100001.5", "100002.5", "123456.5", "1.828125", "0.01953125",
+
+        // Values just below a tie, which their 17 significant digits decide.
+        "12345.65", "99999.95", "9.999995",
+
+        // Zero, negative zero, which a number value holds as zero, and negatives.
+        "0", "-0", "-1234567.891", "-0.00001",
+
+        // Either side of the exponents where fixed notation stops.
+        "0.0001", "0.00001", "0.000123456", "100000", "1000000",
+
+        // Large and small magnitudes: the largest double, the smallest normal one and the smallest subnormal one last.
+        "1e15", "1e100", "1e-300", "1.7976931348623157e308", "2.2250738585072014e-308", "4.9406564584124654e-324",
+
+        // 2^53 + 1, which a float column stores as 2^53, and short decimals.
+        "9007199254740993", "0.1", "0.125", "37.5", "10001.0", "1234567.891",
+    ];
+
+    /// <summary>
+    /// The column's <c>sys.types</c> name and <c>max_length</c>, the value's kind and its invariant text: every
+    /// family a grid column can be stored in, and the <c>bit</c> family besides.
+    /// </summary>
+    public static TheoryData<string, int, FieldValueKind, string> Cases
+    {
+        get
+        {
+            var cases = new TheoryData<string, int, FieldValueKind, string>();
+            foreach (var number in FloatNumbers)
+            {
+                cases.Add("float", 8, FieldValueKind.Number, number);
+            }
+
+            cases.Add("tinyint", 1, FieldValueKind.Number, "255");
+            cases.Add("smallint", 2, FieldValueKind.Number, "-32768");
+            cases.Add("smallint", 2, FieldValueKind.Index, "2");
+            cases.Add("int", 4, FieldValueKind.Number, "-2147483648");
+            cases.Add("bigint", 8, FieldValueKind.Number, "9223372036854775807");
+            cases.Add("bigint", 8, FieldValueKind.Number, "-9223372036854775808");
+            cases.Add("datetime", 8, FieldValueKind.Date, "2011-01-15");
+            cases.Add("datetime", 8, FieldValueKind.Date, "1753-01-01");
+            cases.Add("datetime", 8, FieldValueKind.Date, "9999-12-31");
+            cases.Add("bit", 1, FieldValueKind.Boolean, "true");
+            cases.Add("bit", 1, FieldValueKind.Boolean, "false");
+            cases.Add("nvarchar", 8000, FieldValueKind.Text, "Smith ");
+            cases.Add("nvarchar", -1, FieldValueKind.Text, "O'Brien");
+            cases.Add("nchar", 10, FieldValueKind.Text, "abc");
+            cases.Add("ntext", 16, FieldValueKind.Text, "Notes ");
+            return cases;
+        }
+    }
+
+    public Task InitializeAsync() => TestDatabase.EnsureReachableAsync();
+
+    public Task DisposeAsync() => Task.CompletedTask;
+
+    [Theory]
+    [MemberData(nameof(Cases))]
+    public async Task GridFilterTextIsSqlServersText(
+        string sqlTypeName,
+        int maxLengthBytes,
+        FieldValueKind kind,
+        string text)
+    {
+        var column = FieldTypeMapper.DescribeColumn("Value", sqlTypeName, maxLengthBytes);
+        var value = Value(kind, text);
+
+        string sqlText;
+        await using (var connection = await TestDatabase.OpenConnectionAsync())
+        await using (var command = connection.CreateCommand())
+        {
+            command.CommandText = column.Family == ColumnFamily.DateTime
+                ? "SELECT CONVERT(nvarchar(max), @v, 23);"
+                : "SELECT CONVERT(nvarchar(max), @v);";
+            command.Parameters.Add(Parameter(column, value));
+            sqlText = Assert.IsType<string>(await command.ExecuteScalarAsync());
+        }
+
+        Assert.Equal(sqlText, FakeDataStore.GridFilterText(column, value));
+    }
+
+    // The value a case's text stands for; a number parses as a request's number does, so 9007199254740993 stays exact.
+    private static FieldValue Value(FieldValueKind kind, string text)
+    {
+        switch (kind)
+        {
+            case FieldValueKind.Number:
+                Assert.True(FieldValueCoercion.TryParseNumber(text, out var number));
+                return number;
+            case FieldValueKind.Index:
+                return FieldValue.FromIndex(int.Parse(text, CultureInfo.InvariantCulture));
+            case FieldValueKind.Date:
+                return FieldValue.FromDate(
+                    DateOnly.ParseExact(text, FieldValue.IsoDateFormat, CultureInfo.InvariantCulture));
+            case FieldValueKind.Boolean:
+                return FieldValue.FromBoolean(bool.Parse(text));
+            case FieldValueKind.Text:
+                return FieldValue.FromText(text);
+            default:
+                throw new ArgumentOutOfRangeException(nameof(kind), kind, "No case uses this kind.");
+        }
+    }
+
+    // The parameter holding the value as its column stores it.
+    private static SqlParameter Parameter(ColumnMetadata column, FieldValue value) => column.SqlTypeName switch
+    {
+        "float" => new SqlParameter { ParameterName = "@v", DbType = DbType.Double, Value = value.AsNumber() },
+        "tinyint" => new SqlParameter("@v", SqlDbType.TinyInt) { Value = checked((byte)Whole(value)) },
+        "smallint" => new SqlParameter("@v", SqlDbType.SmallInt) { Value = checked((short)Whole(value)) },
+        "int" => new SqlParameter("@v", SqlDbType.Int) { Value = checked((int)Whole(value)) },
+        "bigint" => new SqlParameter("@v", SqlDbType.BigInt) { Value = Whole(value) },
+        "datetime" => new SqlParameter("@v", SqlDbType.DateTime)
+        {
+            Value = value.AsDate().ToDateTime(TimeOnly.MinValue),
+        },
+        "bit" => new SqlParameter("@v", SqlDbType.Bit) { Value = value.AsBoolean() },
+        "nvarchar" => new SqlParameter("@v", SqlDbType.NVarChar, column.MaxCharacters ?? -1) { Value = value.AsText() },
+        "nchar" => new SqlParameter("@v", SqlDbType.NChar, Assert.NotNull(column.MaxCharacters))
+        {
+            Value = value.AsText(),
+        },
+        "ntext" => new SqlParameter("@v", SqlDbType.NText) { Value = value.AsText() },
+        _ => throw new ArgumentOutOfRangeException(nameof(column), column.SqlTypeName, "No case uses this type."),
+    };
+
+    // An integer column's value: an option index or an exact integer.
+    private static long Whole(FieldValue value)
+    {
+        if (value.TryGetIndex(out var index))
+        {
+            return index;
+        }
+
+        Assert.True(value.TryGetInteger(out var integer));
+        return integer;
+    }
 }
 
 /// <summary>
@@ -1477,4 +2022,70 @@ public sealed class RequestParameterCoercionTests : IAsyncLifetime
         Assert.NotEmpty(store.Calls);
         return await ApiTestClient.ReadJsonElementAsync(response);
     }
+}
+
+/// <summary>
+/// Holds <see cref="FakeDataStoreFindTests.PaddingCases"/> to SQL Server: each case's predicate, in the form the SQL
+/// store's Find renders it, is evaluated on <c>nvarchar</c> parameters, a comparison as <c>@stored op @criterion</c>,
+/// the multiline prefix equality as <c>SUBSTRING(@stored, 1, 255) = SUBSTRING(@criterion, 1, 255)</c> and a pattern
+/// as <c>@stored LIKE @criterion</c>. SQL Server's answer must be the case's expected one, and the
+/// <see cref="FakeDataStore"/> Find must give the same answer, so the double's trailing-blank padding is pinned to
+/// the database rather than to its own reading.
+/// </summary>
+/// <remarks>
+/// Both parameters take the database's default collation, as a page column and a Find parameter do; the stored value
+/// is bound as <c>nvarchar(4000)</c>, the type of the seeded <c>LastName</c> columns, and the criterion as
+/// <c>nvarchar(max)</c>, as the SQL store binds it. The statement reads no table and writes nothing, so the class
+/// takes no <c>DatabaseWriteLock</c>; it still joins the database collection and probes the database first, as every
+/// integration test class does.
+/// </remarks>
+[Trait("Category", "Integration")]
+[Collection(DatabaseCollections.Database)]
+public sealed class FindPaddingSqlTests : IAsyncLifetime
+{
+    // The seeded LastName columns are nvarchar(4000); -1 is nvarchar(max), the SQL store's text criterion type.
+    private const int StoredSize = 4000;
+    private const int CriterionSize = -1;
+
+    public Task InitializeAsync() => TestDatabase.EnsureReachableAsync();
+
+    public Task DisposeAsync() => Task.CompletedTask;
+
+    [Theory]
+    [MemberData(nameof(FakeDataStoreFindTests.PaddingCases), MemberType = typeof(FakeDataStoreFindTests))]
+    public async Task SqlServerAndTheFakeAgreeOnTrailingBlanks(
+        string stored,
+        SearchOperator comparison,
+        string criterion,
+        bool matches)
+    {
+        bool sqlMatches;
+        await using (var connection = await TestDatabase.OpenConnectionAsync())
+        await using (var command = connection.CreateCommand())
+        {
+            command.CommandText = "SELECT CASE WHEN " + Predicate(comparison) + " THEN 1 ELSE 0 END;";
+            command.Parameters.Add(new SqlParameter("@stored", SqlDbType.NVarChar, StoredSize) { Value = stored });
+            command.Parameters.Add(
+                new SqlParameter("@criterion", SqlDbType.NVarChar, CriterionSize) { Value = criterion });
+            sqlMatches = Assert.IsType<int>(await command.ExecuteScalarAsync()) == 1;
+        }
+
+        Assert.Equal(matches, sqlMatches);
+        Assert.Equal(sqlMatches, await FakeDataStoreFindTests.FindsAsync(stored, comparison, criterion));
+    }
+
+    // The predicate the SQL store's Find renders for each operator of the cases, on the two parameters.
+    private static string Predicate(SearchOperator comparison) => comparison switch
+    {
+        SearchOperator.Equal => "@stored = @criterion",
+        SearchOperator.NotEqual => "@stored <> @criterion",
+        SearchOperator.Less => "@stored < @criterion",
+        SearchOperator.LessOrEqual => "@stored <= @criterion",
+        SearchOperator.Greater => "@stored > @criterion",
+        SearchOperator.GreaterOrEqual => "@stored >= @criterion",
+        SearchOperator.PrefixEqual255 => "SUBSTRING(@stored, 1, 255) = SUBSTRING(@criterion, 1, 255)",
+        SearchOperator.Like => "@stored LIKE @criterion",
+        _ => throw new ArgumentOutOfRangeException(
+            nameof(comparison), comparison, "No padding case uses this operator."),
+    };
 }

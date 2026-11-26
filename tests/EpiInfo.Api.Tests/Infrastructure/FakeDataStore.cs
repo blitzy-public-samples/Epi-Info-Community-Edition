@@ -379,7 +379,23 @@ public static class FakeForms
 /// conditions with a <c>LIKE</c> pattern over <see cref="RecordQueryRules.MaxLikePatternLength"/>, and a grid filter
 /// that fails <see cref="RecordQueryRules.IsRepresentableFilter"/>. Search takes any number of alternatives, as the SQL
 /// builder does by packing them. Text comparisons, record ids and the grid filter ignore case ordinally, the common
-/// case-insensitive collation; the fake claims no collation parity beyond that.
+/// case-insensitive collation; the fake claims no collation parity beyond that. Find's comparisons, its 255-character
+/// prefix equality included, pad the shorter text with spaces, as SQL Server compares character values, so adding or
+/// removing trailing blanks changes none of them, while <c>LIKE</c> keeps them significant, as SQL Server does on
+/// Unicode text.
+/// </para>
+/// <para>
+/// The grid filter searches the text the list builder's <c>q</c> predicate converts each grid column to, as
+/// <see cref="GridFilterText"/> renders it: text as its column stores it, an integer exactly, a <c>float</c> as SQL
+/// Server's style-0 text with at most six significant digits (<c>1234567.891</c> is <c>1.23457e+006</c>), and a
+/// <c>datetime</c> as <c>yyyy-mm-dd</c>. Its case rule is the ordinal one above, so no collation parity is claimed for
+/// it.
+/// </para>
+/// <para>
+/// A read-only field's <c>values</c> key, even with a <see cref="FieldValue.Null"/> value, is refused by
+/// <see cref="InsertAsync"/> and <see cref="UpdateAsync"/> with an <see cref="ArgumentException"/> before any call is
+/// logged or anything changes, as the SQL builders refuse it, and admitted by <see cref="SeedRecord"/>: a seeded
+/// record stands for a stored row, which may hold a historical read-only value that the reads return unchanged.
 /// </para>
 /// <para>
 /// One lock guards all state, and every write runs entirely under it, so concurrent updates serialise and the last
@@ -548,7 +564,8 @@ public sealed class FakeDataStore : IDataStore
     /// <param name="viewId">The form's view id.</param>
     /// <param name="values">
     /// Values of data fields keyed by name, in any letter case; every other data field is <see cref="FieldValue.Null"/>.
-    /// A value for a field of a missing page is discarded, so it reads as <see cref="FieldValue.Null"/>.
+    /// A value for a field of a missing page is discarded, so it reads as <see cref="FieldValue.Null"/>. A read-only
+    /// field's value is admitted, as a stored row may hold one, though the writes refuse it.
     /// </param>
     /// <param name="recStatus">The record's <c>RecStatus</c>; 0 seeds a deleted record.</param>
     /// <param name="missingPageIds">The pages whose page row the record lacks.</param>
@@ -568,7 +585,11 @@ public sealed class FakeDataStore : IDataStore
         lock (_gate)
         {
             var state = Resolve(viewId);
-            var normalised = NormaliseValues(state, values ?? new Dictionary<string, FieldValue>(), nameof(values));
+            var normalised = NormaliseValues(
+                state,
+                values ?? new Dictionary<string, FieldValue>(),
+                nameof(values),
+                admitReadOnly: true);
 
             var present = new HashSet<int>(state.Form.Metadata.Pages.Select(page => page.PageId));
             foreach (var pageId in missingPageIds ?? Enumerable.Empty<int>())
@@ -1007,7 +1028,8 @@ public sealed class FakeDataStore : IDataStore
             foreach (var row in rows)
             {
                 if (!RecordQueryRules.IsInSelectedSet(row.RecStatus, query.IncludeDeleted)
-                    || (filter is not null && !columns.Any(column => Contains(ReadField(row, column.Field), filter))))
+                    || (filter is not null
+                        && !columns.Any(column => Contains(column.Field.Column, ReadField(row, column.Field), filter))))
                 {
                     continue;
                 }
@@ -1128,7 +1150,7 @@ public sealed class FakeDataStore : IDataStore
             {
                 ThrowIfEveryMemberFails();
                 var state = Resolve(form);
-                var normalised = NormaliseValues(state, values, nameof(values));
+                var normalised = NormaliseValues(state, values, nameof(values), admitReadOnly: false);
 
                 // The first data statement: the base-row insert.
                 ThrowInjected(nameof(InsertAsync), FakeFailureStage.BeforeWrite);
@@ -1177,7 +1199,7 @@ public sealed class FakeDataStore : IDataStore
             {
                 ThrowIfEveryMemberFails();
                 var state = Resolve(form);
-                var normalised = NormaliseValues(state, submitted, nameof(submitted));
+                var normalised = NormaliseValues(state, submitted, nameof(submitted), admitReadOnly: false);
 
                 // The locked read of the base row and every page row.
                 _calls.Add(new FakeStoreCall(nameof(UpdateAsync), IsWrite: false));
@@ -1418,11 +1440,14 @@ public sealed class FakeDataStore : IDataStore
 
     // Resolves values to canonical data-field names, rejecting what the SQL builders reject before any statement. The
     // map compares canonical names ordinally, so fields whose names differ only by case keep a value each; the repeat
-    // check ignores case, as the validator's does, so two such keys are still rejected.
+    // check ignores case, as the validator's does, so two such keys are still rejected. A write refuses a read-only
+    // field's key, even with a null value, as the builders do before converting its value; a seed admits it, because
+    // a seeded record stands for a stored row, which may hold a historical read-only value.
     private static Dictionary<string, FieldValue> NormaliseValues(
         FormState state,
         IReadOnlyDictionary<string, FieldValue> values,
-        string paramName)
+        string paramName,
+        bool admitReadOnly)
     {
         var normalised = new Dictionary<string, FieldValue>(values.Count, StringComparer.Ordinal);
         var seen = new HashSet<string>(values.Count, StringComparer.OrdinalIgnoreCase);
@@ -1431,6 +1456,11 @@ public sealed class FakeDataStore : IDataStore
             if (name is null || !state.DataFields.TryGet(name, out var field))
             {
                 throw new ArgumentException("A value names no data field of the form.", paramName);
+            }
+
+            if (!admitReadOnly && field.Field.IsReadOnly)
+            {
+                throw new ArgumentException("A read-only field is never written.", paramName);
             }
 
             // The kind is checked before the column, in the SQL builders' order: an integer column admits a number
@@ -1456,8 +1486,120 @@ public sealed class FakeDataStore : IDataStore
         return normalised;
     }
 
-    private static bool Contains(FieldValue value, string filter) =>
-        value.ToInvariantString() is { } text && text.Contains(filter, StringComparison.OrdinalIgnoreCase);
+    // The grid filter over one grid column: a contains on the text the list builder's LIKE searches, ignoring case
+    // ordinally. A null value has no text, so no filter matches it, as LIKE on NULL matches nothing.
+    private static bool Contains(ColumnMetadata column, FieldValue value, string filter) =>
+        GridFilterText(column, value) is { } text && text.Contains(filter, StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// The text the grid filter searches for a value stored in <paramref name="column"/>: the text SQL Server's
+    /// <c>CONVERT(nvarchar(max), column)</c> gives for it, with style 23 for a <c>datetime</c> column, as the list
+    /// builder's <c>q</c> predicate converts each grid column before its <c>LIKE</c>.
+    /// </summary>
+    /// <remarks>
+    /// By the column's family: text as stored, padded with spaces to the column's length for <c>nchar(n)</c>, which
+    /// SQL Server stores at a fixed length; an integer column's number or option index as its exact integer, such as
+    /// <c>-32768</c>; a <c>float</c> as SQL Server's style-0 text, which keeps at most six significant digits, such as
+    /// <c>1.23457e+006</c> for <c>1234567.891</c>; a <c>datetime</c> as <c>yyyy-mm-dd</c>; and a <c>bit</c> as
+    /// <c>1</c> or <c>0</c>. Every text is culture-invariant.
+    /// </remarks>
+    /// <param name="column">The column the value is stored in.</param>
+    /// <param name="value">
+    /// A value the column can store, as <see cref="FieldTypeMapper.IsRepresentable"/> admits it, or the null value.
+    /// </param>
+    /// <returns>The text, or <see langword="null"/> for the null value.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="column"/> is null.</exception>
+    /// <exception cref="ArgumentException">
+    /// <paramref name="value"/> is not a value <paramref name="column"/> can store, so no stored row could hold it.
+    /// </exception>
+    internal static string? GridFilterText(ColumnMetadata column, FieldValue value)
+    {
+        ArgumentNullException.ThrowIfNull(column);
+
+        if (!FieldTypeMapper.IsRepresentable(column, value))
+        {
+            throw new ArgumentException("A value does not fit its column.", nameof(value));
+        }
+
+        if (value.IsNull)
+        {
+            return null;
+        }
+
+        // IsRepresentable has admitted exactly the kinds each arm reads, and no value for any other family.
+        return column.Family switch
+        {
+            ColumnFamily.Character when column.MaxCharacters is { } length
+                && string.Equals(column.SqlTypeName.Trim(), "nchar", StringComparison.OrdinalIgnoreCase) =>
+                value.AsText().PadRight(length),
+            ColumnFamily.Character => value.AsText(),
+            ColumnFamily.Integer => value.TryGetIndex(out var index)
+                ? index.ToString(CultureInfo.InvariantCulture)
+                : value.TryGetInteger(out var integer)
+                    ? integer.ToString(CultureInfo.InvariantCulture)
+                    : throw new ArgumentException("A value does not fit its column.", nameof(value)),
+            ColumnFamily.Float => FormatFloat(value.AsNumber()),
+            ColumnFamily.DateTime => FieldValue.FormatIsoDate(value.AsDate()),
+            ColumnFamily.Bit => value.AsBoolean() ? "1" : "0",
+            _ => throw new ArgumentException("A value does not fit its column.", nameof(value)),
+        };
+    }
+
+    // SQL Server's style-0 text of a float, which CONVERT(nvarchar(max), float) gives, as observed on SQL Server 2022
+    // for every double tried, subnormals and the extremes included: the double's 17 significant digits, correctly
+    // rounded, are rounded half up to six; trailing zeros are dropped; and the digits are written in fixed notation
+    // when the rounded value's decimal exponent X lies in -4 <= X < 6, otherwise as d[.ddddd]e+XXX or d[.ddddd]e-XXX,
+    // the exponent of at least three digits. Rounding the 17 digits rather than the exact binary value decides values
+    // just below a tie: 12345.65, whose double lies below 12345.65, becomes 12345.7. Zero is 0, and negative zero -0.
+    private static string FormatFloat(double number)
+    {
+        var sign = double.IsNegative(number) ? "-" : string.Empty;
+        if (number == 0d)
+        {
+            return sign + "0";
+        }
+
+        // "E16" writes the 17 digits as d.dddddddddddddddde+ddd: the first digit, the point, then sixteen more.
+        var scientific = Math.Abs(number).ToString("E16", CultureInfo.InvariantCulture);
+        var exponent = int.Parse(
+            scientific.AsSpan(scientific.IndexOf('E', StringComparison.Ordinal) + 1),
+            NumberStyles.AllowLeadingSign,
+            CultureInfo.InvariantCulture);
+
+        // The first six digits, rounded half up by the seventh; a carry to seven digits moves the exponent up one.
+        var leading = ((scientific[0] - '0') * 100_000)
+            + int.Parse(scientific.AsSpan(2, 5), CultureInfo.InvariantCulture);
+        if (scientific[7] >= '5')
+        {
+            leading++;
+        }
+
+        if (leading == 1_000_000)
+        {
+            leading = 100_000;
+            exponent++;
+        }
+
+        var digits = leading.ToString(CultureInfo.InvariantCulture).TrimEnd('0');
+        if (exponent < -4 || exponent >= 6)
+        {
+            var mantissa = digits.Length == 1 ? digits : string.Concat(digits.AsSpan(0, 1), ".", digits.AsSpan(1));
+            return string.Concat(
+                sign,
+                mantissa,
+                exponent < 0 ? "e-" : "e+",
+                Math.Abs(exponent).ToString("000", CultureInfo.InvariantCulture));
+        }
+
+        if (exponent < 0)
+        {
+            return string.Concat(sign, "0.", new string('0', -exponent - 1), digits);
+        }
+
+        return digits.Length <= exponent + 1
+            ? sign + digits.PadRight(exponent + 1, '0')
+            : string.Concat(sign, digits.AsSpan(0, exponent + 1), ".", digits.AsSpan(exponent + 1));
+    }
 
     private static IReadOnlyList<ResolvedCondition> ResolveConditions(
         FormState state,
@@ -1513,7 +1655,7 @@ public sealed class FakeDataStore : IDataStore
                         condition, row => FieldValue.FromText(row.GlobalRecordId), NumericComparison.Exact));
                     break;
 
-                // RecStatus is an int column, so it compares exactly.
+                // RecStatus is a smallint column, so it compares exactly, as every integer column does.
                 case SearchTarget.BaseRecStatus:
                     resolved.Add(new ResolvedCondition(
                         condition, row => FieldValue.FromInteger(row.RecStatus), NumericComparison.Exact));
@@ -1528,7 +1670,8 @@ public sealed class FakeDataStore : IDataStore
     }
 
     // A null stored value satisfies only IS NULL, as SQL's three-valued comparison gives. A LIKE alternative matches
-    // through its prepared pattern.
+    // through its prepared pattern, where trailing blanks stay significant, as SQL Server's LIKE keeps them on Unicode
+    // text. The 255-character prefix equality compares the two prefixes padded, as SQL's = on the two SUBSTRINGs does.
     private static bool Satisfies(
         SearchAlternative alternative,
         LikePattern? pattern,
@@ -1550,7 +1693,7 @@ public sealed class FakeDataStore : IDataStore
             SearchOperator.Like => stored.TryGetText(out var text) && pattern is not null && pattern.IsMatch(text),
             SearchOperator.PrefixEqual255 => stored.TryGetText(out var text)
                 && criterion.TryGetText(out var other)
-                && string.Equals(Prefix255(text), Prefix255(other), StringComparison.OrdinalIgnoreCase),
+                && ComparePadded(Prefix255(text), Prefix255(other)) == 0,
             SearchOperator.Equal => Compare(stored, criterion, numbers) is 0,
             SearchOperator.NotEqual => Compare(stored, criterion, numbers) is { } order && order != 0,
             SearchOperator.Less => Compare(stored, criterion, numbers) is < 0,
@@ -1564,13 +1707,25 @@ public sealed class FakeDataStore : IDataStore
     private static string Prefix255(string text) =>
         text.Length <= PrefixCompareLength ? text : text[..PrefixCompareLength];
 
+    // The order SQL Server gives two character operands of =, <>, <, <=, > and >=: the shorter is padded with spaces
+    // (U+0020) to the longer's length first, so adding or removing trailing blanks changes no result. Padding is not
+    // trimming: a value orders against the spaces that pad the other, so "a" against "a\t" compares a space with a
+    // tab. The padded texts then compare ignoring case ordinally, the fake's stand-in for the database collation.
+    private static int ComparePadded(string left, string right)
+    {
+        var length = Math.Max(left.Length, right.Length);
+        return string.Compare(left.PadRight(length), right.PadRight(length), StringComparison.OrdinalIgnoreCase);
+    }
+
     // The order of two values of one comparable kind, or null when the kinds differ, so that no operator matches.
-    // Numbers compare as their column's family stores them, and option indexes, held in integer columns, as integers.
+    // Text, a GlobalRecordId criterion included, compares padded, as the SQL store's plain comparison on its nvarchar
+    // column does. Numbers compare as their column's family stores them, and option indexes, held in integer columns,
+    // as integers.
     private static int? Compare(FieldValue stored, FieldValue criterion, NumericComparison numbers)
     {
         if (stored.TryGetText(out var left) && criterion.TryGetText(out var right))
         {
-            return string.Compare(left, right, StringComparison.OrdinalIgnoreCase);
+            return ComparePadded(left, right);
         }
 
         if (stored.TryGetNumber(out var leftNumber) && criterion.TryGetNumber(out var rightNumber))

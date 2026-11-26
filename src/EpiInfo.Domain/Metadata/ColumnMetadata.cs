@@ -11,8 +11,14 @@ namespace EpiInfo.Domain.Metadata;
 /// column-family rules have one owner.
 /// </remarks>
 /// <param name="Name">
-/// The column name exactly as <c>sys.columns.name</c> returns it. It equals the canonical
-/// <c>metaFields.Name</c> of the field that owns the column, for example <c>LastName</c>.
+/// The column name exactly as <c>sys.columns.name</c> returns it: the catalogue spelling, for
+/// example <c>LastName</c>. The metadata reader attaches a column to a field through
+/// <c>TableSchema.FindColumn</c>, which takes the column spelled exactly as the field's
+/// <c>metaFields.Name</c>, otherwise the first column in <c>column_id</c> order equal to it ignoring
+/// case. This name can therefore differ from <see cref="FieldMetadata.Name"/> in letter case, as
+/// for a field <c>Age</c> stored in a column spelled <c>AGE</c>. It is not the <c>values</c> key:
+/// responses and <c>values</c> use <see cref="FieldMetadata.Name"/>. Record SQL names the column
+/// only through the reader-built <c>ColumnSchema</c>, quoted by <c>SqlIdentifier</c>.
 /// </param>
 /// <param name="SqlTypeName">
 /// The lower-case <c>sys.types.name</c>, for example <c>nvarchar</c>, <c>ntext</c>, <c>tinyint</c>,

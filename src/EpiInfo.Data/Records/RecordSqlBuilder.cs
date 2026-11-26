@@ -715,7 +715,9 @@ internal static class RecordSqlBuilder
     /// (@p0, @p1, ...)</c>, naming the key and every writable data-field column given.
     /// </summary>
     /// <remarks>
-    /// The caller passes every data-field column of the page. A writable column without a submitted value is written
+    /// The caller passes every data-field column of the page. The columns come from the form's data-field set
+    /// (<see cref="FormDefinitionFactory.GetDataFields"/>), which holds one field per exact canonical name, so a
+    /// submitted value binds exactly one column of the record. A writable column without a submitted value is written
     /// <c>NULL</c>. A read-only data field (<c>metaFields.IsReadOnly</c>, such as the seeded <c>StateIDNumber</c>,
     /// <c>CDCIDNumber</c>, <c>ReportedToCDCDate</c> and <c>OnsetWeek</c>) is never written from the client, so its
     /// column is left out of the statement, as are page-table columns that are not data-field columns, such as the

@@ -4,6 +4,7 @@ using System.Text.Json.Serialization;
 using EpiInfo.Domain.Diagnostics;
 using EpiInfo.Domain.Forms;
 using EpiInfo.Domain.Metadata;
+using EpiInfo.Domain.Records;
 using EpiInfo.Domain.Values;
 
 namespace EpiInfo.Domain.Tests.Metadata;
@@ -572,10 +573,9 @@ public sealed class FormDefinitionFactoryTests
     }
 
     /// <summary>
-    /// A name equal ignoring case to one distinct canonical spelling only is not ambiguous, however many fields repeat
-    /// that spelling exactly: <c>lastname</c> resolves to the seeded <c>LastName</c>, and every case of <c>age</c> to
-    /// the first in storage order of two fields both spelled <c>Age</c>. Null, empty and unknown names are not
-    /// ambiguous either.
+    /// A name equal ignoring case to one canonical name only is not ambiguous: <c>lastname</c> resolves to the seeded
+    /// <c>LastName</c>, and every case of <c>age</c> to the first in storage order of two rows both spelled
+    /// <c>Age</c>, the only one of them the set holds. Null, empty and unknown names are not ambiguous either.
     /// </summary>
     [Fact]
     public void DataFieldSet_NameWithOneDistinctSpelling_ResolvesAndIsNotAmbiguous()
@@ -595,7 +595,7 @@ public sealed class FormDefinitionFactoryTests
                 Field(11, "Age", "Number", tabIndex: 1, sqlType: "float"),
             ]));
 
-        Assert.Equal([11, 21], repeated.Select(field => field.Field.FieldId));
+        Assert.Equal([11], repeated.Select(field => field.Field.FieldId));
         foreach (string name in new[] { "Age", "age", "AGE" })
         {
             Assert.True(repeated.TryGet(name, out DataFieldMetadata? field));
@@ -606,6 +606,95 @@ public sealed class FormDefinitionFactoryTests
         Assert.False(repeated.IsAmbiguous(null!));
         Assert.False(repeated.IsAmbiguous(string.Empty));
         Assert.False(repeated.IsAmbiguous("NoSuchField"));
+    }
+
+    /// <summary>
+    /// Two number rows spelled exactly <c>Age</c>, one on each page, which no seeded form has. The page-1 row is first
+    /// in storage order, although the page-2 row has the lower <c>FieldId</c> and, in one case, comes first in the
+    /// metadata, so storage order alone decides: the page-1 row is the one data field <c>Age</c>, and the page-2 row
+    /// is listed on its page as unsupported, with no validation and no options. The group's <c>Age</c> entry, the
+    /// grid and every name lookup take the data field, so one <c>values</c> entry belongs to one column.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void Create_RowRepeatingADataFieldNameExactly_IsListedUnsupportedAndOnlyTheFirstHoldsTheName(
+        bool repeatListedFirst)
+    {
+        FieldMetadata repeat = Field(
+            5,
+            "Age",
+            "Number",
+            pageId: 2,
+            tabIndex: 1,
+            sqlType: "float",
+            prompt: "Age again",
+            lower: "0",
+            upper: "120",
+            pattern: "###",
+            isRequired: true);
+        FieldMetadata age = Field(
+            9,
+            "Age",
+            "Number",
+            tabIndex: 2,
+            sqlType: "float",
+            prompt: "Age",
+            lower: "0",
+            upper: "120",
+            pattern: "###",
+            isRequired: true);
+        FieldMetadata[] rows =
+        [
+            Field(8, "Name", "Text", tabIndex: 1, sqlType: "nvarchar(255)"),
+            Field(7, "Details", "Group", pageId: 2, tabIndex: 2, list: "Age,Name"),
+            .. SystemRows(firstFieldId: 1, withBaseTableColumns: false),
+        ];
+        FormMetadata form = new(
+            12,
+            "RepeatedName",
+            "RepeatedName",
+            [new PageMetadata(PageId, "Page 1", 0, "RepeatedName1"), new PageMetadata(2, "Page 2", 1, "RepeatedName2")],
+            repeatListedFirst ? [repeat, .. rows, age] : [age, .. rows, repeat]);
+
+        DataFieldSet dataFields = FormDefinitionFactory.GetDataFields(form);
+        Assert.Equal(["Name", "Age"], dataFields.Select(field => field.Name));
+        Assert.True(dataFields.TryGet("Age", out DataFieldMetadata? dataField));
+        Assert.Same(age, dataField.Field);
+        Assert.Equal(PageId, dataField.Page.PageId);
+        Assert.Same(dataField, dataFields.Find("age"));
+
+        FormDefinition definition = Create(form);
+        Assert.Equal(
+            [(PageId, "Name"), (PageId, "Age"), (2, "Age"), (2, "Details")],
+            definition.Pages.SelectMany(page => page.Fields).Select(field => (field.PageId, field.Name)));
+
+        FieldDefinition listedAge = FieldNamed(definition.Pages[0].Fields, "Age");
+        Assert.Equal(FieldType.Number, listedAge.FieldType);
+        Assert.False(listedAge.Unsupported);
+        Assert.Null(listedAge.UnsupportedType);
+        Assert.Equal(
+            new FieldValidation(true, false, null, FieldValue.FromNumber(0), FieldValue.FromNumber(120), "###"),
+            listedAge.Validation);
+
+        FieldDefinition listedRepeat = FieldNamed(definition.Pages[1].Fields, "Age");
+        Assert.Equal(FieldType.Unsupported, listedRepeat.FieldType);
+        Assert.True(listedRepeat.Unsupported);
+        Assert.Equal("Number", listedRepeat.UnsupportedType);
+        Assert.Equal("Age again", listedRepeat.Prompt);
+        Assert.Equal(FieldValidation.None, listedRepeat.Validation);
+        Assert.Null(listedRepeat.Options);
+        Assert.Null(listedRepeat.Members);
+
+        FieldMetadata group = Assert.Single(form.Fields, field => field.Name == "Details");
+        Assert.Equal(["Age", "Name"], FieldNamed(definition, "Details").Members);
+        IReadOnlyList<FieldMetadata> members = FormDefinitionFactory.GetGroupMembers(form, group);
+        Assert.Equal([9, 8], members.Select(member => member.FieldId));
+        Assert.Same(age, members[0]);
+
+        IReadOnlyList<DataFieldMetadata> grid = RecordQueryRules.GetGridColumns(form);
+        Assert.Equal(["Name", "Age"], grid.Select(column => column.Name));
+        Assert.Same(age, grid[1].Field);
     }
 
     /// <summary>

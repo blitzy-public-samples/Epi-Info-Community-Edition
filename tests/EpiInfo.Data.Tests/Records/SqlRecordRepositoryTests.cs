@@ -178,6 +178,73 @@ public sealed class SqlRecordRepositoryTests : IAsyncLifetime
         AssertBound(PageInsert.Columns(foodHistoryRow), "[Age]", expectedFoodHistoryAge);
     }
 
+    // The same two pages, with both seeded Age rows kept as they are beside FoodHistory's Occupation: one exact name on
+    // two pages, which metaFields allows and no seeded form has. Both pages hold Position 0 and CaseReport's PageId is
+    // the lower, so storage order makes the CaseReport row the form's one data field Age, though the FoodHistory row
+    // is listed first. The FoodHistory row is no data field, so the submitted Age binds CaseReport1.[Age] alone and
+    // the FoodHistory2 row, built from that page's data-field columns, never names [Age], whatever the map's comparer.
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task InsertPage_ExactNameOnTwoPages_BindsOnlyTheFirstInStorageOrder(bool mapIgnoresCase)
+    {
+        ReaderForm caseReport = await ReaderForm.ReadAsync("CaseReport");
+        ReaderForm foodHistory = await ReaderForm.ReadAsync("FoodHistory");
+        DataFieldMetadata caseReportAge = caseReport.Column("Age").Field;
+        DataFieldMetadata foodHistoryAge = foodHistory.Column("Age").Field;
+        ProjectedColumn occupation = foodHistory.Column("Occupation");
+        Assert.Equal(caseReportAge.Page.Position, foodHistoryAge.Page.Position);
+        Assert.True(caseReportAge.Page.PageId < foodHistoryAge.Page.PageId);
+        Assert.Equal(foodHistoryAge.Page.PageId, occupation.Field.Page.PageId);
+        FormMetadata repeatedNameForm = caseReport.Metadata with
+        {
+            Pages = [foodHistoryAge.Page, caseReportAge.Page],
+            Fields = [foodHistoryAge.Field, occupation.Field.Field, caseReportAge.Field],
+        };
+
+        // Each field resolves against its own form's reader-built schema, the only one that holds its page.
+        ProjectedColumn[] columns = FormDefinitionFactory.GetDataFields(repeatedNameForm)
+            .Select((field, ordinal) => RecordSqlBuilder.ResolveDataColumn(
+                field.Page.PageId == caseReportAge.Page.PageId ? caseReport.Schema : foodHistory.Schema,
+                field,
+                ordinal))
+            .ToArray();
+        Assert.Equal(new[] { "Age", "Occupation" }, columns.Select(column => column.Field.Name));
+        ProjectedColumn age = Assert.Single(
+            columns,
+            column => string.Equals(column.Field.Name, "Age", StringComparison.Ordinal));
+        Assert.Same(caseReportAge.Field, age.Field.Field);
+        Assert.Same(caseReport.Column("Age").Column, age.Column);
+
+        IReadOnlyDictionary<string, FieldValue> values = Values(
+            mapIgnoresCase,
+            ("Age", FieldValue.FromNumber(5)),
+            ("Occupation", FieldValue.FromText("Cook")));
+
+        SqlStatement caseReportRow = RecordSqlBuilder.InsertPage(
+            caseReport.PageOf(age.Field),
+            GlobalRecordId,
+            columns.Where(column => column.Field.Page.PageId == caseReportAge.Page.PageId).ToArray(),
+            values);
+        SqlStatement foodHistoryRow = RecordSqlBuilder.InsertPage(
+            foodHistory.PageOf(occupation.Field),
+            GlobalRecordId,
+            columns.Where(column => column.Field.Page.PageId == foodHistoryAge.Page.PageId).ToArray(),
+            values);
+
+        Assert.StartsWith("INSERT INTO [CaseReport1] (", caseReportRow.Text, StringComparison.Ordinal);
+        Assert.StartsWith("INSERT INTO [FoodHistory2] (", foodHistoryRow.Text, StringComparison.Ordinal);
+        AssertBound(PageInsert.Columns(caseReportRow), "[Age]", 5d);
+
+        IReadOnlyList<(string Column, SqlParameterValue Parameter)> foodHistoryColumns =
+            PageInsert.Columns(foodHistoryRow);
+        Assert.Equal(
+            new[] { "[GlobalRecordId]", SqlIdentifier.Quote(occupation.Column) },
+            foodHistoryColumns.Select(entry => entry.Column));
+        Assert.Equal("Cook", foodHistoryColumns[1].Parameter.Value);
+        Assert.DoesNotContain("[Age]", foodHistoryRow.Text, StringComparison.Ordinal);
+    }
+
     // A read-only field present in values is refused whether its value is of its type or null: presence is the rule.
     // Seeded StateIDNumber (CaseReport1) is text and OnsetWeek (FoodHistory2) a number; Age shares each page.
     [Theory]

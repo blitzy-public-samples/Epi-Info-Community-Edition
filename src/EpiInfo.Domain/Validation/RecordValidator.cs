@@ -135,15 +135,6 @@ public sealed class RecordValidator
             var kind = FieldTypeMapper.ValueKind(dataField.FieldType)
                 ?? throw new InvalidOperationException("A data field's type must hold a value kind.");
 
-            // Name lookups resolve an exact spelling to its own field, so a field whose name differs from another
-            // only by letter case keeps its own rule and values key. Only a field whose name repeats an earlier one
-            // exactly is shadowed: its name resolves to the earlier field, so it can never be submitted or carry a
-            // value of its own. It gets no rule, so it can neither be written nor block a save as a required field.
-            if (!_dataFields.TryGet(dataField.Name, out var resolved) || !ReferenceEquals(resolved, dataField))
-            {
-                continue;
-            }
-
             var rule = new FieldRule(dataField, fieldDefinition, kind);
             rules.Add(rule);
             _rulesByField.Add(dataField, rule);
