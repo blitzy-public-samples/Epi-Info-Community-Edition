@@ -552,6 +552,8 @@ describe('useRecordNavigation', () => {
       'New from the $name (position $from) shows "New record" with no request, and previous from it opens at/{N}',
       async ({ from }) => {
         const { api, result, beforeLeave } = await mount(activeRows(5), { initialPosition: from });
+        // The mount's own read of at/{from} precedes the mark, so the at/5 below is a new request.
+        expect(api.requests()).toEqual([countRequest(), atRequest(from)]);
         // The record New leaves is the one at this position.
         expect(result.current.n).toBe(from);
         expect(result.current.record?.globalRecordId).toBe(idOf(from));
