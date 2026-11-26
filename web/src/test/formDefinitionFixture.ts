@@ -17,6 +17,7 @@ import type {
   FormDefinition,
   FormSummary,
   RecordDto,
+  RecordSummary,
   Values,
 } from '../api/types';
 
@@ -359,6 +360,45 @@ export function recordFixture(overrides: RecordFixtureOverrides = {}): RecordDto
     position: overrides.position ?? 1,
     count: overrides.count ?? 3,
     values: { ...emptyValues(), ...values },
+  };
+}
+
+const gridFieldTypes: ReadonlySet<FieldType> = new Set<FieldType>(['text', 'number', 'date', 'legalValues']);
+
+const GRID_COLUMN_LIMIT = 6;
+
+/**
+ * A definition's grid columns by the contract's rule: the first six data fields whose
+ * `fieldType` is `text`, `number`, `date` or `legalValues`, pages by `position` and then
+ * `tabIndex`. Computed here, independently of the client, so a test can compare against
+ * it. For {@link formDefinitionFixture}: `CaseID, FirstName, LastName, Sex, DOB, Age`.
+ */
+export function gridColumnNames(definition: FormDefinition = formDefinitionFixture): string[] {
+  return allFields(definition)
+    .filter((candidate) => isDataField(candidate) && gridFieldTypes.has(candidate.fieldType))
+    .slice(0, GRID_COLUMN_LIMIT)
+    .map((candidate) => candidate.name);
+}
+
+/**
+ * The records-list row of `record`, as `GET /api/forms/{viewId}/records` returns it:
+ * the record's ids and status, and `values` with the {@link gridColumnNames} of
+ * `definition` only, `null` where the record holds none. Computed independently of the
+ * client, so a fake API can serve it and a test can compare against it.
+ */
+export function recordSummaryFixture(
+  record: RecordDto,
+  definition: FormDefinition = formDefinitionFixture,
+): RecordSummary {
+  const values: Values = {};
+  for (const name of gridColumnNames(definition)) {
+    values[name] = record.values[name] ?? null;
+  }
+  return {
+    globalRecordId: record.globalRecordId,
+    uniqueKey: record.uniqueKey,
+    recStatus: record.recStatus,
+    values,
   };
 }
 

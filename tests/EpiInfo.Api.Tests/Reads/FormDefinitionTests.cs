@@ -4,16 +4,12 @@ using System.Globalization;
 using System.Net;
 using System.Text.Json;
 using EpiInfo.Api.Endpoints;
-using EpiInfo.Api.Json;
 using EpiInfo.Api.Services;
 using EpiInfo.Api.Tests.Infrastructure;
 using EpiInfo.CheckCode;
 using EpiInfo.Domain.Storage;
 using EpiInfo.Tests.Shared;
-using Microsoft.AspNetCore.Builder;
-using Microsoft.AspNetCore.TestHost;
 using Microsoft.Data.SqlClient;
-using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Xunit.Abstractions;
 using Xunit.Sdk;
@@ -32,7 +28,8 @@ namespace EpiInfo.Api.Tests.Reads;
 /// on the <c>CaseReport</c> page and 55 and 33 on the two <c>FoodHistory</c> pages; 43 and 67 data fields; 43 and 74
 /// page-table data columns, the difference being the seven <c>Yes/No</c> fields, which sit on <c>tinyint</c> columns
 /// and are therefore unsupported and never written. The seeded lengths and bounds the validation rules name are
-/// checked by value as well.
+/// checked by value as well, and so is the number of <c>GEOCODE</c> statements in each form's program, none in
+/// <c>CaseReport</c> and one in <c>FoodHistory</c>; their lines are read from the <c>metaViews.CheckCode</c> text.
 /// </para>
 /// <para>
 /// The class reads only metadata, code tables and catalogue views, which no test writes, so its expected values cannot
@@ -74,6 +71,9 @@ public sealed class FormDefinitionTests : IClassFixture<FormDefinitionFixture>
 
     // The metaFields rows with a null PageId, in ordinal order.
     private static readonly string[] SystemFieldNames = ["GlobalRecordId", "RecStatus", "UniqueKey"];
+
+    // The line breaks of check-code text, \r\n first so that it ends one line rather than two.
+    private static readonly string[] CheckCodeLineBreaks = ["\r\n", "\n", "\r"];
 
     // The fieldType of every seeded metaFieldTypes.Name. Phone Number and Comment Legal are outside the supported
     // names and sit on character columns, so they are text; Yes/No sits on tinyint and Command Button is never
@@ -544,12 +544,27 @@ public sealed class FormDefinitionTests : IClassFixture<FormDefinitionFixture>
     {
         FormDefinitionFixture.SeededForm form = await _fixture.GetFormAsync(formName);
         JsonElement[] diagnostics = GetArray(form.Definition, "unsupportedCheckCode", formName);
+        int[] geocodeLines = GeocodeStatementLines(form.CheckCode);
         _output.WriteLine(
-            string.Create(CultureInfo.InvariantCulture, $"{formName} unsupportedCheckCode: {diagnostics.Length} entries"));
+            string.Create(
+                CultureInfo.InvariantCulture,
+                $"{formName} unsupportedCheckCode: {diagnostics.Length} entries; GEOCODE statements of " +
+                $"metaViews.CheckCode at lines [{DescribeLines(geocodeLines)}]"));
 
-        // Both seeded programs use only the supported subset. The one construct the definition may report is the
-        // FoodHistory GEOCODE statement, which is skipped with an info notice; the facade without the interpreter
-        // reports nothing, which holds here as well.
+        // Both seeded programs use only the supported subset, so the one construct the definition may report is a
+        // GEOCODE statement of the requested form's own program, skipped with an info notice and reported once at its
+        // line. The facade without the interpreter reports nothing, which holds here as well; an entry on another
+        // form, at a line holding no GEOCODE, or repeating a line fails.
+        if (diagnostics.Length > geocodeLines.Length)
+        {
+            throw new XunitException(
+                string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"{formName} unsupportedCheckCode: {diagnostics.Length} entries, but the program holds " +
+                    $"{geocodeLines.Length} GEOCODE statements."));
+        }
+
+        var reportedLines = new HashSet<int>();
         for (int index = 0; index < diagnostics.Length; index++)
         {
             string context = string.Create(CultureInfo.InvariantCulture, $"{formName} unsupportedCheckCode[{index}]");
@@ -559,9 +574,87 @@ public sealed class FormDefinitionTests : IClassFixture<FormDefinitionFixture>
                 $"{context}: severity is {severity}, but the seeded programs use only the supported subset.");
             Expect("info", severity, context + " severity");
             Expect(GeocodeCommand, GetString(diagnostics[index], "command", context), context + " command");
-            Expect(FoodHistory, GetString(diagnostics[index], "form", context), context + " form");
+            Expect(formName, GetString(diagnostics[index], "form", context), context + " form");
+
+            int line = GetInt32(diagnostics[index], "line", context);
+            if (!geocodeLines.Contains(line))
+            {
+                throw new XunitException(
+                    string.Create(
+                        CultureInfo.InvariantCulture,
+                        $"{context}: line {line} holds no GEOCODE statement of the {formName} program, whose " +
+                        $"GEOCODE lines are [{DescribeLines(geocodeLines)}]."));
+            }
+
+            if (!reportedLines.Add(line))
+            {
+                throw new XunitException(
+                    string.Create(CultureInfo.InvariantCulture, $"{context}: line {line} is reported a second time."));
+            }
         }
     }
+
+    // P1, committed with the delivered interpreter, whose Analyze reports each GEOCODE statement it skips. The check
+    // above is the permanent P0 one and stays valid for the facade, which reports nothing.
+    [Theory]
+    [InlineData(CaseReport, 0)]
+    [InlineData(FoodHistory, 1)]
+    public async Task UnsupportedCheckCodeReportsEachSeededGeocodeOnItsOwnForm(string formName, int seededGeocodes)
+    {
+        FormDefinitionFixture.SeededForm form = await _fixture.GetFormAsync(formName);
+        int[] geocodeLines = GeocodeStatementLines(form.CheckCode);
+        Expect(seededGeocodes, geocodeLines.Length, $"{formName}: GEOCODE statements of metaViews.CheckCode");
+
+        // Exactly those statements in source order, each an info notice on the requested form at its own line.
+        JsonElement[] diagnostics = GetArray(form.Definition, "unsupportedCheckCode", formName);
+        Expect(
+            geocodeLines.Length,
+            diagnostics.Length,
+            $"{formName} unsupportedCheckCode entries against the GEOCODE statements");
+        for (int index = 0; index < diagnostics.Length; index++)
+        {
+            string context = string.Create(CultureInfo.InvariantCulture, $"{formName} unsupportedCheckCode[{index}]");
+            Expect("info", GetString(diagnostics[index], "severity", context), context + " severity");
+            Expect(formName, GetString(diagnostics[index], "form", context), context + " form");
+            Expect(GeocodeCommand, GetString(diagnostics[index], "command", context), context + " command");
+            Expect(geocodeLines[index], GetInt32(diagnostics[index], "line", context), context + " line");
+            Assert.False(
+                string.IsNullOrWhiteSpace(GetString(diagnostics[index], "message", context)),
+                $"{context}: the message is blank.");
+        }
+
+        _output.WriteLine(
+            string.Create(
+                CultureInfo.InvariantCulture,
+                $"{formName}: {diagnostics.Length} GEOCODE notices at lines [{DescribeLines(geocodeLines)}]"));
+    }
+
+    // The 1-based lines of the program's GEOCODE statements: each line whose first token after its indentation is the
+    // keyword, compared ignoring case as the grammar's keywords are. Lines end at \r\n, \n or \r. The scan reads the
+    // text alone and lexes no comment or string; the seeded programs hold no GEOCODE inside either, and the seed
+    // counts UnsupportedCheckCodeReportsEachSeededGeocodeOnItsOwnForm pins fail on a program that does.
+    private static int[] GeocodeStatementLines(string? program)
+    {
+        if (string.IsNullOrEmpty(program))
+        {
+            return [];
+        }
+
+        string[] lines = program.Split(CheckCodeLineBreaks, StringSplitOptions.None);
+        return Enumerable.Range(0, lines.Length)
+            .Where(index => StartsWithGeocodeToken(lines[index].TrimStart()))
+            .Select(index => index + 1)
+            .ToArray();
+    }
+
+    // The keyword is a whole token when no identifier character, a letter, digit or underscore, follows it.
+    private static bool StartsWithGeocodeToken(string text) =>
+        text.StartsWith(GeocodeCommand, StringComparison.OrdinalIgnoreCase)
+        && (text.Length == GeocodeCommand.Length
+            || !(char.IsLetterOrDigit(text[GeocodeCommand.Length]) || text[GeocodeCommand.Length] == '_'));
+
+    private static string DescribeLines(IEnumerable<int> lines) =>
+        string.Join(", ", lines.Select(line => line.ToString(CultureInfo.InvariantCulture)));
 
     // The expected fieldType of a metaFields row: unsupported when encrypted, otherwise by its seeded type name.
     private static string ExpectedFieldType(FormDefinitionFixture.SeededField row, string context)
@@ -818,14 +911,27 @@ public sealed class FormDefinitionTests : IClassFixture<FormDefinitionFixture>
 /// <see cref="InitializeAsync"/> proves the database reachable before any test runs, so a database that is not
 /// configured or not reachable fails every test with the <see cref="TestDatabase"/> message; nothing is skipped. Each
 /// form is loaded on first use and the result, a failure included, is shared by the later tests. Every value in the
-/// SQL is a parameter; the code-table and column identifiers come from <c>metaFields</c> and are bracket-quoted.
+/// SQL is a parameter, and page and code tables are resolved in <c>dbo</c>, never in the login's default schema. The
+/// code-table and column identifiers come from the fixture's fixed map of the seeded Legal Values fields, and are
+/// bracket-quoted. Each field's <c>metaFields</c> pointer must equal its map entry ordinally, and is then resolved
+/// in the <c>dbo</c> catalogue under an explicit case-insensitive collation, so alike on a case-sensitive and a
+/// case-insensitive database: the table first, then the column within it, each by the name spelled exactly as the
+/// pointer spells it or else by the only case-insensitive match. The resolved table and column must equal the
+/// entry's physical names ordinally.
 /// </remarks>
 public sealed class FormDefinitionFixture : IAsyncLifetime
 {
     private const string GlobalRecordIdColumn = "GlobalRecordId";
     private const string LegalValuesTypeName = "Legal Values";
 
+    // The schema testdata/sql creates the page and code tables in. It is bound or quoted explicitly, never left to
+    // the login's default schema.
+    private const string SeedSchema = "dbo";
+
     private const string ViewIdSql = "SELECT [ViewId] FROM [metaViews] WHERE [Name] = @name;";
+
+    // The form's check-code program as stored, an ntext value.
+    private const string CheckCodeSql = "SELECT [CheckCode] FROM [metaViews] WHERE [Name] = @name;";
 
     private const string PagesSql = """
         SELECT [PageId], [Name], [Position]
@@ -844,17 +950,64 @@ public sealed class FormDefinitionFixture : IAsyncLifetime
         ORDER BY f.[FieldId];
         """;
 
-    // The page table of the default schema, as the legacy page-table name rule gives it.
+    // The page table in the bound schema, dbo, as the legacy page-table name rule gives it.
     private const string ColumnsSql = """
         SELECT c.[name] AS ColumnName, ty.[name] AS TypeName
         FROM sys.columns AS c
         JOIN sys.tables AS tb ON tb.[object_id] = c.[object_id]
+        JOIN sys.schemas AS s ON s.[schema_id] = tb.[schema_id]
         JOIN sys.types AS ty ON ty.[user_type_id] = c.[user_type_id]
-        WHERE tb.[name] = @table AND tb.[schema_id] = SCHEMA_ID()
+        WHERE s.[name] = @schema AND tb.[name] = @table
         ORDER BY c.[column_id];
         """;
 
+    // Every table of the bound schema whose name matches a code-table pointer, each with every column whose name
+    // matches the pointer's text column, or with a NULL column when none does. Both sides of each name comparison are
+    // collated case-insensitively, so the candidates are the same under a case-sensitive and a case-insensitive
+    // database collation; the caller picks the exact spelling among them, else the only one.
+    private const string CodeTableCandidatesSql = """
+        SELECT tb.[name] AS TableName, c.[name] AS ColumnName
+        FROM sys.tables AS tb
+        JOIN sys.schemas AS s ON s.[schema_id] = tb.[schema_id]
+        LEFT JOIN sys.columns AS c
+            ON c.[object_id] = tb.[object_id]
+            AND c.[name] COLLATE Latin1_General_100_CI_AS = @column COLLATE Latin1_General_100_CI_AS
+        WHERE s.[name] = @schema
+            AND tb.[name] COLLATE Latin1_General_100_CI_AS = @table COLLATE Latin1_General_100_CI_AS;
+        """;
+
     private static readonly TimeSpan LoadTimeout = TimeSpan.FromMinutes(2);
+
+    // Every page-bound Legal Values field the seed defines (testdata/sql/03_forms.sql, 04_code_tables.sql); CaseReport
+    // has none, its code-table pointers belonging to Comment Legal fields, which offer no options. Each entry holds
+    // the pointer as metaFields spells it and the dbo table and column it resolves to, as the catalogue spells them.
+    // Sex and EthnicityGroup resolve exactly; the metaFields row of LooseStoolsPerDay names the text column
+    // LooseStoolsPerDay, which 04_code_tables.sql creates as loosestoolsperday, so that column resolves by its only
+    // case-insensitive match. Code-table SQL is built only from these physical names, never from metadata text.
+    private static readonly LegalValuesCodeTable[] SeededLegalValuesCodeTables =
+    [
+        new(
+            Form: "FoodHistory",
+            Field: "Sex",
+            SourceTableName: "codephvs_administrativesex_hl7_2x",
+            TextColumnName: "phvs_administrativesex_hl7_2x",
+            Table: "codephvs_administrativesex_hl7_2x",
+            Column: "phvs_administrativesex_hl7_2x"),
+        new(
+            Form: "FoodHistory",
+            Field: "EthnicityGroup",
+            SourceTableName: "codephvs_ethnicitygroup_cdc",
+            TextColumnName: "phvs_ethnicitygroup_cdc",
+            Table: "codephvs_ethnicitygroup_cdc",
+            Column: "phvs_ethnicitygroup_cdc"),
+        new(
+            Form: "FoodHistory",
+            Field: "LooseStoolsPerDay",
+            SourceTableName: "codeloosestoolsperday",
+            TextColumnName: "LooseStoolsPerDay",
+            Table: "codeloosestoolsperday",
+            Column: "loosestoolsperday"),
+    ];
 
     private readonly ConcurrentDictionary<string, Lazy<Task<SeededForm>>> _forms = new(StringComparer.Ordinal);
 
@@ -904,6 +1057,7 @@ public sealed class FormDefinitionFixture : IAsyncLifetime
         CancellationToken ct = timeout.Token;
 
         int viewId;
+        string? checkCode;
         IReadOnlyList<SeededPage> pages;
         IReadOnlyList<SeededField> fields;
         var columns = new Dictionary<int, IReadOnlyList<SeededColumn>>();
@@ -912,6 +1066,7 @@ public sealed class FormDefinitionFixture : IAsyncLifetime
         await using (SqlConnection connection = await TestDatabase.OpenConnectionAsync(ct))
         {
             viewId = await ReadViewIdAsync(connection, formName, ct);
+            checkCode = await ReadCheckCodeAsync(connection, formName, ct);
             pages = await ReadPagesAsync(connection, viewId, ct);
             fields = await ReadFieldsAsync(connection, viewId, ct);
 
@@ -922,24 +1077,49 @@ public sealed class FormDefinitionFixture : IAsyncLifetime
                 if (tableColumns.Count == 0)
                 {
                     throw new XunitException(
-                        $"{formName} page {page.PageId}: the page table [{table}] has no data column or does not exist.");
+                        $"{formName} page {page.PageId}: the page table [{SeedSchema}].[{table}] has no data column " +
+                        "or does not exist.");
                 }
 
                 columns.Add(page.PageId, tableColumns);
             }
 
+            Dictionary<string, LegalValuesCodeTable> mapped = SeededLegalValuesCodeTables
+                .Where(entry => string.Equals(entry.Form, formName, StringComparison.Ordinal))
+                .ToDictionary(entry => entry.Field, StringComparer.Ordinal);
             foreach (SeededField field in fields)
             {
                 if (field.PageId is not null
                     && string.Equals(field.FieldTypeName, LegalValuesTypeName, StringComparison.Ordinal))
                 {
-                    codeTables.Add(field.Name, await ReadCodeTableAsync(connection, formName, field, ct));
+                    if (!mapped.TryGetValue(field.Name, out LegalValuesCodeTable? entry))
+                    {
+                        throw new XunitException(
+                            string.Create(
+                                CultureInfo.InvariantCulture,
+                                $"{formName} page {field.PageId} field {field.Name}: the Legal Values field is not " +
+                                $"in the fixture's map of seeded code tables."));
+                    }
+
+                    codeTables.Add(field.Name, await ReadCodeTableAsync(connection, formName, field, entry, ct));
                 }
+            }
+
+            // The map equals the seeded set, so an entry no page-bound Legal Values row matched fails as well.
+            string[] unmatched = mapped.Keys
+                .Where(name => !codeTables.ContainsKey(name))
+                .Order(StringComparer.Ordinal)
+                .ToArray();
+            if (unmatched.Length > 0)
+            {
+                throw new XunitException(
+                    $"{formName}: the fixture's map of seeded code tables names {string.Join(", ", unmatched)}, " +
+                    "which metaFields does not hold as page-bound Legal Values fields.");
             }
         }
 
         JsonElement definition = await ReadDefinitionAsync(formName, viewId, ct);
-        return new SeededForm(formName, viewId, pages, fields, columns, codeTables, definition);
+        return new SeededForm(formName, viewId, checkCode, pages, fields, columns, codeTables, definition);
     }
 
     private async Task<JsonElement> ReadDefinitionAsync(string formName, int viewId, CancellationToken ct)
@@ -977,6 +1157,32 @@ public sealed class FormDefinitionFixture : IAsyncLifetime
                 string.Create(
                     CultureInfo.InvariantCulture,
                     $"metaViews holds {viewIds.Count} rows named {formName}, expected 1."));
+    }
+
+    // The metaViews.CheckCode text of the form, unchanged; null for a SQL NULL.
+    private static async Task<string?> ReadCheckCodeAsync(
+        SqlConnection connection,
+        string formName,
+        CancellationToken ct)
+    {
+        await using var command = new SqlCommand(CheckCodeSql, connection);
+        command.Parameters.Add("@name", SqlDbType.NVarChar, 128).Value = formName;
+
+        var programs = new List<string?>();
+        await using (SqlDataReader reader = await command.ExecuteReaderAsync(ct))
+        {
+            while (await reader.ReadAsync(ct))
+            {
+                programs.Add(reader.IsDBNull(0) ? null : reader.GetString(0));
+            }
+        }
+
+        return programs.Count == 1
+            ? programs[0]
+            : throw new XunitException(
+                string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"metaViews holds {programs.Count} rows named {formName}, expected 1."));
     }
 
     private static async Task<IReadOnlyList<SeededPage>> ReadPagesAsync(
@@ -1043,6 +1249,7 @@ public sealed class FormDefinitionFixture : IAsyncLifetime
         CancellationToken ct)
     {
         await using var command = new SqlCommand(ColumnsSql, connection);
+        command.Parameters.Add("@schema", SqlDbType.NVarChar, 128).Value = SeedSchema;
         command.Parameters.Add("@table", SqlDbType.NVarChar, 128).Value = table;
 
         var columns = new List<SeededColumn>();
@@ -1059,23 +1266,44 @@ public sealed class FormDefinitionFixture : IAsyncLifetime
         return columns.AsReadOnly();
     }
 
-    // Every row of the code table's text column, read without ORDER BY as legacy reads a code table. The table and
-    // column are the metaFields names as stored; SQL Server resolves them under the database collation.
+    // Every row of the code table's text column, read without ORDER BY as legacy reads a code table. The field's
+    // metaFields pointer must equal its map entry ordinally; the pointer is then resolved in the dbo catalogue, and
+    // the resolved table and column must equal the entry's physical names ordinally. The SELECT is built only from
+    // those physical names, never from metadata text.
     private static async Task<SeededCodeTable> ReadCodeTableAsync(
         SqlConnection connection,
         string formName,
         SeededField field,
+        LegalValuesCodeTable entry,
         CancellationToken ct)
     {
-        if (string.IsNullOrWhiteSpace(field.SourceTableName) || string.IsNullOrWhiteSpace(field.TextColumnName))
+        string context = string.Create(
+            CultureInfo.InvariantCulture,
+            $"{formName} page {field.PageId} field {field.Name}");
+        if (field.SourceTableName is not { } sourceTable
+            || field.TextColumnName is not { } textColumn
+            || !string.Equals(sourceTable, entry.SourceTableName, StringComparison.Ordinal)
+            || !string.Equals(textColumn, entry.TextColumnName, StringComparison.Ordinal))
         {
             throw new XunitException(
-                $"{formName} page {field.PageId} field {field.Name}: the Legal Values field names no code table " +
-                "and text column.");
+                $"{context}: metaFields names the code table {Show(field.SourceTableName)} and text column " +
+                $"{Show(field.TextColumnName)}, but the fixture's map of seeded code tables expects " +
+                $"{Show(entry.SourceTableName)} and {Show(entry.TextColumnName)}, compared ordinally.");
         }
 
-        string sql = "SELECT " + QuoteIdentifier(field.TextColumnName) + " FROM " +
-            QuoteIdentifier(field.SourceTableName) + ";";
+        (string resolvedTable, string resolvedColumn) =
+            await ResolveCodeTableColumnAsync(connection, context, sourceTable, textColumn, ct);
+        if (!string.Equals(resolvedTable, entry.Table, StringComparison.Ordinal)
+            || !string.Equals(resolvedColumn, entry.Column, StringComparison.Ordinal))
+        {
+            throw new XunitException(
+                $"{context}: the {SeedSchema} catalogue resolves the metaFields pointer {Show(sourceTable)}." +
+                $"{Show(textColumn)} to [{SeedSchema}].[{resolvedTable}].[{resolvedColumn}], but the fixture's map " +
+                $"of seeded code tables names [{SeedSchema}].[{entry.Table}].[{entry.Column}], compared ordinally.");
+        }
+
+        string sql = "SELECT " + QuoteIdentifier(entry.Column) + " FROM " + QuoteIdentifier(SeedSchema) + "." +
+            QuoteIdentifier(entry.Table) + ";";
         await using var command = new SqlCommand(sql, connection);
 
         var texts = new List<string?>();
@@ -1085,13 +1313,95 @@ public sealed class FormDefinitionFixture : IAsyncLifetime
             texts.Add(reader.IsDBNull(0) ? null : reader.GetString(0));
         }
 
-        return new SeededCodeTable(field.SourceTableName, field.TextColumnName, texts.AsReadOnly());
+        return new SeededCodeTable(entry.Table, entry.Column, texts.AsReadOnly());
+    }
+
+    // The dbo table and text column a metaFields code-table pointer names, spelled as the catalogue holds them. One
+    // catalogue read returns every table matching the pointer's table ignoring case, with its columns matching the
+    // pointer's column ignoring case. The table is resolved first among those tables, then the column among the
+    // resolved table's columns, each by ResolveCatalogueName.
+    private static async Task<(string Table, string Column)> ResolveCodeTableColumnAsync(
+        SqlConnection connection,
+        string context,
+        string pointerTable,
+        string pointerColumn,
+        CancellationToken ct)
+    {
+        await using var command = new SqlCommand(CodeTableCandidatesSql, connection);
+        command.Parameters.Add("@schema", SqlDbType.NVarChar, 128).Value = SeedSchema;
+        command.Parameters.Add("@table", SqlDbType.NVarChar, 128).Value = pointerTable;
+        command.Parameters.Add("@column", SqlDbType.NVarChar, 128).Value = pointerColumn;
+
+        var candidates = new List<(string Table, string? Column)>();
+        await using (SqlDataReader reader = await command.ExecuteReaderAsync(ct))
+        {
+            while (await reader.ReadAsync(ct))
+            {
+                candidates.Add((reader.GetString(0), reader.IsDBNull(1) ? null : reader.GetString(1)));
+            }
+        }
+
+        string[] tables = candidates
+            .Select(candidate => candidate.Table)
+            .Distinct(StringComparer.Ordinal)
+            .Order(StringComparer.Ordinal)
+            .ToArray();
+        string table = ResolveCatalogueName(context, "code table", pointerTable, tables);
+
+        string[] columns = candidates
+            .Where(candidate => string.Equals(candidate.Table, table, StringComparison.Ordinal))
+            .Select(candidate => candidate.Column)
+            .OfType<string>()
+            .Distinct(StringComparer.Ordinal)
+            .Order(StringComparer.Ordinal)
+            .ToArray();
+        string column = ResolveCatalogueName(
+            context,
+            $"text column of [{SeedSchema}].[{table}]",
+            pointerColumn,
+            columns);
+
+        return (table, column);
+    }
+
+    // The catalogue name a pointer resolves to among the names matching it ignoring case: the one spelled ordinally as
+    // the pointer spells it, else the only match. No match, or several with none spelled exactly, fails and names the
+    // pointer and every match.
+    private static string ResolveCatalogueName(string context, string what, string pointer, string[] matches)
+    {
+        string? exact = Array.Find(matches, name => string.Equals(name, pointer, StringComparison.Ordinal));
+        if (exact is not null)
+        {
+            return exact;
+        }
+
+        if (matches.Length == 1)
+        {
+            return matches[0];
+        }
+
+        if (matches.Length == 0)
+        {
+            throw new XunitException(
+                $"{context}: the {SeedSchema} catalogue holds no {what} matching the metaFields pointer " +
+                $"{Show(pointer)}, compared ignoring case.");
+        }
+
+        throw new XunitException(
+            string.Create(
+                CultureInfo.InvariantCulture,
+                $"{context}: the {SeedSchema} catalogue holds {matches.Length} matches ignoring case for the {what} " +
+                $"the metaFields pointer {Show(pointer)} names, none spelled exactly as the pointer: " +
+                $"{string.Join(", ", matches.Select(name => Show(name)))}; the pointer is ambiguous."));
     }
 
     private static string PageTableName(string formName, int pageId) =>
         formName + pageId.ToString(CultureInfo.InvariantCulture);
 
     private static string QuoteIdentifier(string name) => "[" + name.Replace("]", "]]", StringComparison.Ordinal) + "]";
+
+    // A metadata name as a failure message quotes it.
+    private static string Show(string? name) => name is null ? "null" : "'" + name + "'";
 
     private static string? NullableString(SqlDataReader reader, string column) =>
         reader[column] is string text ? text : null;
@@ -1106,6 +1416,9 @@ public sealed class FormDefinitionFixture : IAsyncLifetime
     /// <summary>One seeded form: its SQL rows and its served definition.</summary>
     /// <param name="Name">The <c>metaViews.Name</c>.</param>
     /// <param name="ViewId">The <c>metaViews.ViewId</c>.</param>
+    /// <param name="CheckCode">
+    /// The <c>metaViews.CheckCode</c> program as stored; <see langword="null"/> for a SQL <c>NULL</c>.
+    /// </param>
     /// <param name="Pages">The <c>metaPages</c> rows in <c>Position</c> order, then <c>PageId</c>.</param>
     /// <param name="Fields">Every <c>metaFields</c> row of the view, system rows included, in <c>FieldId</c> order.</param>
     /// <param name="Columns">Each page table's columns other than <c>GlobalRecordId</c>, by page id.</param>
@@ -1114,6 +1427,7 @@ public sealed class FormDefinitionFixture : IAsyncLifetime
     public sealed record SeededForm(
         string Name,
         int ViewId,
+        string? CheckCode,
         IReadOnlyList<SeededPage> Pages,
         IReadOnlyList<SeededField> Fields,
         IReadOnlyDictionary<int, IReadOnlyList<SeededColumn>> Columns,
@@ -1186,10 +1500,20 @@ public sealed class FormDefinitionFixture : IAsyncLifetime
     public sealed record SeededColumn(string Name, string TypeName);
 
     /// <summary>The rows of a code table's text column, in the order SQL Server returned them.</summary>
-    /// <param name="Table">The <c>SourceTableName</c> as stored.</param>
-    /// <param name="Column">The <c>TextColumnName</c> as stored.</param>
+    /// <param name="Table">The <c>dbo</c> code table read, spelled as the catalogue holds it.</param>
+    /// <param name="Column">The text column read, spelled as the catalogue holds it.</param>
     /// <param name="Texts">Each row's text; <see langword="null"/> for a SQL <c>NULL</c>.</param>
     public sealed record SeededCodeTable(string Table, string Column, IReadOnlyList<string?> Texts);
+
+    // A seeded Legal Values field of the fixture's map: its form and field name, the code-table pointer its metaFields
+    // row holds, and the dbo table and column that pointer resolves to, as the catalogue spells them.
+    private sealed record LegalValuesCodeTable(
+        string Form,
+        string Field,
+        string SourceTableName,
+        string TextColumnName,
+        string Table,
+        string Column);
 }
 
 /// <summary>
@@ -1207,14 +1531,15 @@ public sealed class FormDefinitionFixture : IAsyncLifetime
 /// definition cases and selected by <c>--filter "Category!=Integration"</c>.
 /// </para>
 /// <para>
-/// The request goes through the real <see cref="FormEndpoints"/> route, on an in-memory TestServer host the test
-/// composes from the API's own pieces: the committed <c>appsettings.json</c> and <c>appsettings.{environment}.json</c>
-/// of the API project as its configuration; the API's JSON settings (<see cref="JsonSetup.AddApiJson"/>);
-/// <see cref="FormService"/> over the fake store; the real interpreter behind <see cref="CountingCheckCodeEngine"/>;
-/// and the JSON console, with <see cref="CapturingLoggerProvider"/> added as one more provider under the committed
-/// <c>Logging</c> filters. The response is therefore the product of routing, parameter binding, the service and the
-/// API's JSON writer, and the captured entries are exactly what that logging pipeline writes. Each environment whose
-/// logging configuration is committed is checked.
+/// The request goes to the API as <c>src/EpiInfo.Api/Program.cs</c> composes it, hosted on TestServer by
+/// <see cref="ApiFactory"/>: the committed <c>appsettings.json</c> and <c>appsettings.{environment}.json</c> of the API
+/// project, its JSON settings, its service registrations, its pipeline and routes, and its JSON console logging. The
+/// factory replaces only what the test observes: <see cref="IDataStore"/> by the fake, and
+/// <see cref="ICheckCodeEngine"/> by its <see cref="ApiFactoryBase.Engine"/>, a <see cref="CountingCheckCodeEngine"/>
+/// over the real <see cref="CheckCodeEngine"/>; and it adds its <see cref="ApiFactoryBase.Logs"/>, a
+/// <see cref="CapturingLoggerProvider"/>, as one more provider under the committed <c>Logging</c> filters. A
+/// registration, route or logging setting that <c>Program.cs</c> lacks therefore fails the test, and the captured
+/// entries are exactly what production writes. Each environment whose logging configuration is committed is checked.
 /// </para>
 /// </remarks>
 public sealed class FormDefinitionCheckCodeTests
@@ -1239,14 +1564,17 @@ public sealed class FormDefinitionCheckCodeTests
         int geocodeLine = SingleLineNumber(program, GeocodeCommand + " ");
 
         var store = new FakeDataStore(FakeForms.WithCheckCode(program));
-        var engine = new CountingCheckCodeEngine(new CheckCodeEngine());
-        using var logs = new CapturingLoggerProvider();
-        await using WebApplication app = await StartHostAsync(environment, store, engine, logs);
-        using HttpClient client = app.GetTestClient();
+        await using var factory = new ApiFactory(ApiFactoryOptions.ForFake(store, environment));
+        CountingCheckCodeEngine engine = factory.Engine;
+        CapturingLoggerProvider logs = factory.Logs;
 
-        // Starting the host is not part of the read, so only the request below is counted.
+        // Creating the client builds and starts the host through Program.cs.
+        using HttpClient client = factory.CreateClient();
+
+        // Starting the host is not part of the read, so only the request below is counted and captured.
         engine.Reset();
         store.ClearCalls();
+        logs.Clear();
 
         using HttpResponseMessage response = await client.GetAsync(
             string.Create(CultureInfo.InvariantCulture, $"/api/forms/{FakeForms.CheckCodeViewId}"));
@@ -1296,48 +1624,6 @@ public sealed class FormDefinitionCheckCodeTests
         // Neither the program's values nor the diagnostic's message reach any captured line, whatever its category.
         Assert.False(logs.ContainsText(sentinel), "A captured log entry holds the program sentinel.");
         Assert.False(logs.ContainsText(message), "A captured log entry holds the diagnostic's message.");
-    }
-
-    // The API's pieces the route needs, on TestServer: the committed configuration of the environment, the API's JSON
-    // settings, the form routes and service, and the JSON console with the capturing provider beside it.
-    private static async Task<WebApplication> StartHostAsync(
-        string environment,
-        FakeDataStore store,
-        CountingCheckCodeEngine engine,
-        CapturingLoggerProvider logs)
-    {
-        WebApplicationBuilder builder = WebApplication.CreateBuilder(new WebApplicationOptions
-        {
-            ContentRootPath = RepositoryPaths.ApiProjectDirectory,
-            EnvironmentName = environment,
-            ApplicationName = typeof(FormService).Assembly.GetName().Name,
-        });
-        builder.WebHost.UseTestServer();
-
-        builder.Logging.ClearProviders();
-        builder.Logging.AddJsonConsole();
-        builder.Logging.AddProvider(logs);
-
-        builder.Services.AddApiJson();
-        builder.Services.AddSingleton<IDataStore>(store);
-        builder.Services.AddSingleton<ICheckCodeEngine>(engine);
-        builder.Services.AddScoped<FormService>();
-
-        WebApplication app = builder.Build();
-        app.MapFormEndpoints();
-
-        try
-        {
-            await app.StartAsync();
-        }
-        catch
-        {
-            // A host that failed to start is still disposed, so its file watchers and services are released.
-            await app.DisposeAsync();
-            throw;
-        }
-
-        return app;
     }
 
     // Three Field blocks over the fake form's fields. The DOB and Asian blocks hold runnable statements of the

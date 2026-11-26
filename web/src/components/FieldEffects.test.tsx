@@ -23,7 +23,12 @@ import type {
   RecordPage,
   Values,
 } from '../api/types';
-import { createFormDefinitionFixture, fieldByName, recordFixture } from '../test/formDefinitionFixture';
+import {
+  createFormDefinitionFixture,
+  fieldByName,
+  recordFixture,
+  recordSummaryFixture,
+} from '../test/formDefinitionFixture';
 import { FormView } from './FormView';
 
 const definition = createFormDefinitionFixture();
@@ -34,8 +39,13 @@ const FIRST_RECORD_PATH = `${FORM_PATH}/records/at/1`;
 const LIST_PATH = `${FORM_PATH}/records`;
 const FIELD_EVENT_PATH = `${FORM_PATH}/checkcode/field-event`;
 
-/** The one stored record: values a test can watch being cleared or overwritten, and EC-AGE-03's interview date. */
+/**
+ * The one stored record, the only record of the set and so intrinsically 1 of 1: values
+ * a test can watch being cleared or overwritten, and EC-AGE-03's interview date.
+ */
 const RECORD: RecordDto = recordFixture({
+  position: 1,
+  count: 1,
   values: { LastName: 'Smith', DateofInterview: '2011-02-28', Black: true, Asian: false },
 });
 
@@ -143,9 +153,9 @@ function createFakeApi(responses: ConfiguredResponses): FakeApi {
   const events: SentEvent[] = [];
   const faults: string[] = [];
 
-  const { globalRecordId, uniqueKey, recStatus, values } = RECORD;
+  // The list row carries the grid columns only, as the API returns it.
   const page: RecordPage = {
-    items: [{ globalRecordId, uniqueKey, recStatus, values }],
+    items: [recordSummaryFixture(RECORD, definition)],
     total: 1,
     page: 1,
     pageSize: 50,

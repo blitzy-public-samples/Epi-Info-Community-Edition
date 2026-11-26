@@ -5,10 +5,20 @@
 // every page is one tab, and every field renders exactly once.
 //
 // FormView runs against the real client, hooks and field components. The client's fetch
-// seam is an in-memory API that answers the read routes of one form with one record; any
-// other request is answered 500 and recorded, and fails the test, so loading the form is
-// also shown to send GETs only and raise no field event (DATA-01).
-import { fireEvent, render, screen, within } from '@testing-library/react';
+// seam is an in-memory API that answers the read routes of one form and its stored active
+// records: one record by default, two or none where a case asks. A PUT of a stored record
+// or a POST of a new one is answered only with a reply the case queued, at once or held
+// until the case releases it, and a saved reply updates the stored records. Any other
+// request, and a write no reply was queued for, is answered 500 and recorded, and fails
+// the test, so loading the form is also shown to send GETs only and raise no field event
+// (DATA-01).
+//
+// The write cases drive the editor through FormView: a dirty draft is saved before a grid
+// open or Back to forms continues, and a failed save keeps the draft and cancels the move;
+// the first Save of a new record follows canInsert and Save of a stored record canUpdate,
+// and a 403 keeps the draft; the validation summary lists each errored field's prompt
+// with its message, from client validation or a field-level 400.
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vitest';
 
 import { createApiClient } from '../api/client';
@@ -16,13 +26,15 @@ import type {
   FieldDefinition,
   FieldType,
   FormDefinition,
+  HttpValidationProblemDetails,
   NavigationPosition,
   PageDefinition,
   ProblemDetails,
   RecordCountResponse,
   RecordDto,
   RecordPage,
-  RecordSummary,
+  Values,
+  WriteProblemDetails,
 } from '../api/types';
 import {
   allFields,
@@ -31,7 +43,9 @@ import {
   fieldByName,
   readOnlyFieldNames,
   recordFixture,
+  recordSummaryFixture,
   withField,
+  writableCheckboxNames,
 } from '../test/formDefinitionFixture';
 import { FormView } from './FormView';
 import { fieldControlId } from './fields/fieldComponents';
@@ -47,15 +61,24 @@ interface Call {
 
 const calls: Call[] = [];
 const unrouted: string[] = [];
+/** Answers to the next PUT or POST requests, in arrival order; see replyToWrite and holdWrite. */
+const writeAnswers: Promise<WriteReply>[] = [];
 
 beforeEach(() => {
   calls.length = 0;
   unrouted.length = 0;
+  writeAnswers.length = 0;
 });
 
 afterEach(() => {
-  // A request outside the read routes is a write or a field event, which no case here causes.
+  // Unmounted first: a failing check below skips the setup file's cleanup, and a form left
+  // mounted would fail the next case too.
+  cleanup();
+  // A request no route answers fails the case: a field event, which no case here raises,
+  // or a write the case queued no reply for.
   expect(unrouted).toEqual([]);
+  // A reply left over answers a write the case expected and FormView never sent.
+  expect(writeAnswers, 'write replies queued but never requested').toHaveLength(0);
 });
 
 function requestLine(call: Call): string {
@@ -81,20 +104,43 @@ const RECORD: RecordDto = recordFixture({
   },
 });
 
-const GRID_FIELD_TYPES: ReadonlySet<FieldType> = new Set<FieldType>(['text', 'number', 'date', 'legalValues']);
+/** A of the two-record set A, B: the stored record's values at position 1 of 2. */
+const RECORD_A: RecordDto = recordFixture({
+  globalRecordId: RECORD.globalRecordId,
+  uniqueKey: 1,
+  position: 1,
+  count: 2,
+  values: RECORD.values,
+});
 
-/** The record's grid row: the server's six grid columns, by page position and then `tabIndex`. */
-function summaryOf(definition: FormDefinition, record: RecordDto): RecordSummary {
-  const columns = allFields(definition)
-    .filter((field) => GRID_FIELD_TYPES.has(field.fieldType))
-    .slice(0, 6);
-  return {
-    globalRecordId: record.globalRecordId,
-    uniqueKey: record.uniqueKey,
-    recStatus: record.recStatus,
-    values: Object.fromEntries(columns.map((field) => [field.name, record.values[field.name] ?? null])),
-  };
+const B_LAST_NAME = 'Hopper';
+
+/** The edit a case makes to a stored record's LastName before it saves or leaves. */
+const EDITED_LAST_NAME = 'Byron';
+
+/** B of the two-record set A, B: active, at position 2 of 2. */
+const RECORD_B: RecordDto = recordFixture({
+  globalRecordId: '3f2b8c1e-5d4a-4c1b-9e7f-000000000002',
+  uniqueKey: 2,
+  position: 2,
+  count: 2,
+  values: {
+    CaseID: 2087,
+    FirstName: 'Grace',
+    LastName: B_LAST_NAME,
+    Sex: 'F-Female',
+    DOB: '1906-12-09',
+    Age: 85,
+  },
+});
+
+/** `record` as the server returns it after storing `changes`. */
+function savedWith(record: RecordDto, changes: Values): RecordDto {
+  return { ...record, values: { ...record.values, ...changes } };
 }
+
+/** The form's path, for every case that renders the fixture form. */
+const FORM_PATH = `/api/forms/${createFormDefinitionFixture().viewId}`;
 
 const UNROUTED_PROBLEM: ProblemDetails = {
   type: 'https://tools.ietf.org/html/rfc9110#section-15.6.1',
@@ -104,42 +150,163 @@ const UNROUTED_PROBLEM: ProblemDetails = {
   traceId: '00-test-unrouted-00',
 };
 
+/** A 403 of the permission check. Its text never speaks of permission, so only the client's own banner can. */
+const FORBIDDEN_PROBLEM: ProblemDetails = {
+  type: 'https://tools.ietf.org/html/rfc9110#section-15.5.4',
+  title: 'Forbidden',
+  status: 403,
+  detail: 'The test server refused this write.',
+  traceId: '00-test-forbidden-00',
+};
+
+/** A 500 of a write that rolled back, so nothing was written. */
+const NOT_WRITTEN_PROBLEM: WriteProblemDetails = {
+  type: 'https://tools.ietf.org/html/rfc9110#section-15.6.1',
+  title: 'An error occurred while processing your request.',
+  status: 500,
+  detail: 'The test server failed this write.',
+  traceId: '00-test-not-written-00',
+  writeOutcome: 'notWritten',
+};
+
+/** A field-level 400 carrying `errors`, keyed by canonical field name. */
+function fieldLevelProblem(errors: Record<string, string[]>): HttpValidationProblemDetails {
+  return {
+    type: 'https://tools.ietf.org/html/rfc9110#section-15.5.1',
+    title: 'One or more validation errors occurred.',
+    status: 400,
+    detail: 'The test server rejected these values.',
+    errors,
+    traceId: '00-test-validation-00',
+  };
+}
+
 function jsonResponse(status: number, body: unknown): Response {
   return new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
 }
 
-/** The body of a read route of `definition`'s form, or `null` when the request matches none. */
-function readRouteBody(method: string, path: string, definition: FormDefinition): unknown {
+function problemResponse(problem: ProblemDetails): Response {
+  return new Response(JSON.stringify(problem), {
+    status: problem.status,
+    headers: { 'Content-Type': 'application/problem+json' },
+  });
+}
+
+/**
+ * The body of a read route of `definition`'s form over `records`, its active records in
+ * position order, or `null` when the request matches none.
+ */
+function readRouteBody(
+  method: string,
+  path: string,
+  definition: FormDefinition,
+  records: readonly RecordDto[],
+): unknown {
   if (method !== 'GET') {
     return null;
   }
   const form = `/api/forms/${definition.viewId}`;
-  const record = `${form}/records/${RECORD.globalRecordId}`;
   switch (path) {
     case form:
       return definition;
     case `${form}/records`: {
-      const page: RecordPage = { items: [summaryOf(definition, RECORD)], total: 1, page: 1, pageSize: 50 };
+      // Each row carries the six grid columns only, as the API returns it.
+      const page: RecordPage = {
+        items: records.map((record) => recordSummaryFixture(record, definition)),
+        total: records.length,
+        page: 1,
+        pageSize: 50,
+      };
       return page;
     }
     case `${form}/records/count`: {
-      const count: RecordCountResponse = { count: 1 };
+      const count: RecordCountResponse = { count: records.length };
       return count;
     }
-    case `${form}/records/at/1`:
-    case record:
-      return RECORD;
-    case `${record}/position`: {
-      const position: NavigationPosition = { position: 1, count: 1 };
+    default:
+      break;
+  }
+  for (const [index, record] of records.entries()) {
+    const byId = `${form}/records/${record.globalRecordId}`;
+    if (path === byId || path === `${form}/records/at/${index + 1}`) {
+      return record;
+    }
+    if (path === `${byId}/position`) {
+      const position: NavigationPosition = { position: index + 1, count: records.length };
       return position;
     }
-    default:
-      return null;
+  }
+  return null;
+}
+
+/** A write's answer: the record the server stored, or the problem it refused the write with. */
+type WriteReply =
+  | { readonly kind: 'saved'; readonly record: RecordDto }
+  | { readonly kind: 'problem'; readonly problem: ProblemDetails | HttpValidationProblemDetails | WriteProblemDetails };
+
+/** Queues the answer to the next PUT or POST, given as soon as it arrives. */
+function replyToWrite(reply: WriteReply): void {
+  writeAnswers.push(Promise.resolve(reply));
+}
+
+/** A write the fake holds open until the case releases it. */
+interface HeldWrite {
+  /** Answers the held write; before the write arrives, it is answered on arrival. */
+  readonly release: (reply: WriteReply) => void;
+}
+
+/** Queues a held answer to the next PUT or POST. */
+function holdWrite(): HeldWrite {
+  let settle: ((reply: WriteReply) => void) | null = null;
+  writeAnswers.push(
+    new Promise<WriteReply>((resolve) => {
+      settle = resolve;
+    }),
+  );
+  return {
+    release: (reply) => {
+      if (settle === null) {
+        throw new Error('the held write has no resolver');
+      }
+      settle(reply);
+    },
+  };
+}
+
+/**
+ * What a write route addresses: `create` for `POST .../records`, the stored record for
+ * `PUT .../records/{id}`, or `null` when the request is no write of `definition`'s form.
+ */
+function writeTargetOf(
+  method: string,
+  path: string,
+  definition: FormDefinition,
+  records: readonly RecordDto[],
+): 'create' | RecordDto | null {
+  const list = `/api/forms/${definition.viewId}/records`;
+  if (method === 'POST' && path === list) {
+    return 'create';
+  }
+  if (method === 'PUT') {
+    return records.find((record) => path === `${list}/${record.globalRecordId}`) ?? null;
+  }
+  return null;
+}
+
+/** Stores a saved write: a created record joins the set, an updated one replaces the record it addressed. */
+function storeSaved(records: RecordDto[], target: 'create' | RecordDto, saved: RecordDto): void {
+  if (target === 'create') {
+    records.push(saved);
+  } else {
+    records[records.indexOf(target)] = saved;
   }
 }
 
-/** A fetch that serves `definition`'s form and records every request it receives. */
-function fakeApi(definition: FormDefinition): typeof fetch {
+/**
+ * A fetch that serves `definition`'s form and `records`, answers each write with the next
+ * queued reply, and records every request it receives.
+ */
+function fakeApi(definition: FormDefinition, records: RecordDto[]): typeof fetch {
   return async (input, init) => {
     const request = input instanceof Request ? input : new Request(input, init);
     const url = new URL(request.url);
@@ -147,12 +314,22 @@ function fakeApi(definition: FormDefinition): typeof fetch {
     const call: Call = { method: request.method, url, body: text === '' ? null : text };
     calls.push(call);
 
-    const body = readRouteBody(call.method, url.pathname, definition);
-    if (body === null) {
+    const body = readRouteBody(call.method, url.pathname, definition, records);
+    if (body !== null) {
+      return jsonResponse(200, body);
+    }
+    const target = writeTargetOf(call.method, url.pathname, definition, records);
+    const answer = target === null ? undefined : writeAnswers.shift();
+    if (target === null || answer === undefined) {
       unrouted.push(requestLine(call));
       return jsonResponse(500, UNROUTED_PROBLEM);
     }
-    return jsonResponse(200, body);
+    const reply = await answer;
+    if (reply.kind === 'problem') {
+      return problemResponse(reply.problem);
+    }
+    storeSaved(records, target, reply.record);
+    return jsonResponse(target === 'create' ? 201 : 200, reply.record);
   };
 }
 
@@ -165,19 +342,37 @@ interface RenderedForm {
   readonly onFormNotFound: Mock<() => void>;
 }
 
-/** Renders the form view and waits until the definition, the record and the grid have loaded. */
-async function renderForm(definition: FormDefinition = createFormDefinitionFixture()): Promise<RenderedForm> {
+interface RenderOptions {
+  /** The form's stored active records in position order; by default the one RECORD. */
+  readonly records?: readonly RecordDto[];
+}
+
+/**
+ * Renders the form view and waits until the definition, the first record (New on an
+ * empty form) and the grid have loaded.
+ */
+async function renderForm(
+  definition: FormDefinition = createFormDefinitionFixture(),
+  options: RenderOptions = {},
+): Promise<RenderedForm> {
+  // A copy, so the writes of one case never change the records another case stores.
+  const records = [...(options.records ?? [RECORD])];
   const onExit = vi.fn<() => void>();
   const onFormNotFound = vi.fn<() => void>();
   // Absolute: openapi-fetch builds a Request, and Node's Request rejects a relative URL.
-  const client = createApiClient({ baseUrl: 'http://localhost', fetch: fakeApi(definition) });
+  const client = createApiClient({ baseUrl: 'http://localhost', fetch: fakeApi(definition, records) });
   const { container } = render(
     <FormView viewId={definition.viewId} client={client} onExit={onExit} onFormNotFound={onFormNotFound} />,
   );
 
+  const count = records.length;
   await screen.findByRole('heading', { name: definition.name });
-  await within(screen.getByRole('toolbar', { name: 'Record navigation' })).findByText('1 of 1');
-  await within(screen.getByRole('region', { name: 'Records' })).findByText('1 record');
+  await within(screen.getByRole('toolbar', { name: 'Record navigation' })).findByText(
+    count === 0 ? 'New record' : `1 of ${count}`,
+  );
+  await within(screen.getByRole('region', { name: 'Records' })).findByText(
+    count === 1 ? '1 record' : `${count} records`,
+  );
   return { container, definition, onExit, onFormNotFound };
 }
 
@@ -260,6 +455,88 @@ function controlValue(element: HTMLElement): string {
   throw new Error(`${element.tagName} is not a native control`);
 }
 
+// Write-flow helpers
+
+/** Lets every pending promise callback and zero-delay timer run. */
+async function flush(): Promise<void> {
+  await act(async () => {
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 0);
+    });
+  });
+}
+
+/** Every request other than a GET, in arrival order. */
+function writeCalls(): Call[] {
+  return calls.filter((call) => call.method !== 'GET');
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/** The `values` a PUT or POST sent; throws unless its body is `{ values: { … } }`. */
+function writtenValues(call: Call): Record<string, unknown> {
+  const parsed: unknown = JSON.parse(present(call.body, `body of ${requestLine(call)}`));
+  if (!isPlainObject(parsed) || !isPlainObject(parsed.values)) {
+    throw new Error(`${requestLine(call)} sent no values object`);
+  }
+  return parsed.values;
+}
+
+/** The control of a fixture field, found by its prompt as a user finds it. */
+function controlOf(definition: FormDefinition, name: string): HTMLElement {
+  return screen.getByLabelText(promptOf(fieldByName(name, definition)));
+}
+
+/** A control's accessible description: the text of the elements its `aria-describedby` names. */
+function descriptionOf(control: HTMLElement): string {
+  const ids = (control.getAttribute('aria-describedby') ?? '').split(/\s+/).filter((id) => id !== '');
+  return ids.map((id) => document.getElementById(id)?.textContent ?? '').join(' ');
+}
+
+/** Changes a field's value as typing does; no focus moves, so no field event is raised. */
+function edit(definition: FormDefinition, name: string, value: string): void {
+  fireEvent.change(controlOf(definition, name), { target: { value } });
+}
+
+function formActionButton(name: string): HTMLElement {
+  return within(screen.getByRole('toolbar', { name: 'Form actions' })).getByRole('button', { name });
+}
+
+function navigatorButton(name: string): HTMLElement {
+  return within(screen.getByRole('toolbar', { name: 'Record navigation' })).getByRole('button', { name });
+}
+
+/** The navigator's position text: "[n] of N", or "New record". */
+function navigatorStatus(): string {
+  return within(screen.getByRole('toolbar', { name: 'Record navigation' })).getByRole('status').textContent ?? '';
+}
+
+/** Waits for an alert whose text contains `text`, ignoring case. */
+function findAlertContaining(text: string): Promise<HTMLElement> {
+  const wanted = text.toLowerCase();
+  return waitFor(() =>
+    present(
+      screen.queryAllByRole('alert').find((alert) => (alert.textContent ?? '').toLowerCase().includes(wanted)),
+      `an alert containing "${text}"`,
+    ),
+  );
+}
+
+/** Waits for the validation summary: the alert headed "Please correct the following". */
+async function findValidationSummary(): Promise<HTMLElement> {
+  const heading = await screen.findByRole('heading', { name: 'Please correct the following' });
+  return present(heading.closest<HTMLElement>('[role="alert"]'), 'the alert holding the validation summary');
+}
+
+/** The summary's items listed under `prompt`: each starts with the prompt and goes on with a message. */
+function summaryItemsFor(summary: HTMLElement, prompt: string): HTMLElement[] {
+  return within(summary)
+    .getAllByRole('listitem')
+    .filter((item) => (item.textContent ?? '').startsWith(prompt));
+}
+
 /** Field types rendered as one native control; an option field is a radio group instead. */
 type SingleControlFieldType = Exclude<FieldType, 'label' | 'group' | 'unsupported' | 'option'>;
 
@@ -273,9 +550,32 @@ const expectedControls: Readonly<Record<SingleControlFieldType, { readonly tagNa
 };
 
 describe('FormView accessible structure (SC-8)', () => {
+  /** The control labelled by `field`'s prompt, as a user finds it, narrowed to the element `kind`. */
+  function controlLabelledBy<T extends HTMLElement>(field: FieldDefinition, kind: new () => T): T {
+    const control = screen.getByLabelText(promptOf(field));
+    if (!(control instanceof kind)) {
+      throw new Error(`the control of ${field.name} is a ${control.tagName}`);
+    }
+    return control;
+  }
+
+  /**
+   * A fixture copy listing its pages, and each page's fields, in reverse, with every
+   * `position` and `tabIndex` unchanged. The fixture is already in `position` and `tabIndex`
+   * order, so only this copy shows that the order rendered is the renderer's own.
+   */
+  function reversedDefinition(): FormDefinition {
+    const definition = createFormDefinitionFixture();
+    return {
+      ...definition,
+      pages: [...definition.pages].reverse().map((page) => ({ ...page, fields: [...page.fields].reverse() })),
+    };
+  }
+
   it('renders one tab per page in position order, and the selected tab shows its panel', async () => {
-    const { definition } = await renderForm();
+    const { definition } = await renderForm(reversedDefinition());
     const pages = [...definition.pages].sort((a, b) => a.position - b.position);
+    expect(definition.pages.map((page) => page.name), 'pages as listed').not.toEqual(pages.map((page) => page.name));
     const [firstPage, secondPage] = pages;
     const tabs = screen.getAllByRole('tab');
 
@@ -303,12 +603,17 @@ describe('FormView accessible structure (SC-8)', () => {
   });
 
   it("renders each page's fields inside its own panel in tabIndex order", async () => {
-    const { definition } = await renderForm();
+    const { definition } = await renderForm(reversedDefinition());
 
     for (const page of definition.pages) {
+      const expectedOrder = [...page.fields].sort(byTabIndex).map((field) => field.name);
+      expect(
+        page.fields.map((field) => field.name),
+        `fields of ${page.name} as listed`,
+      ).not.toEqual(expectedOrder);
       // The fixture's group members directly follow the group in tabIndex, so the group's
       // nesting keeps document order equal to tabIndex order; Black's tabIndex is fractional.
-      expect(renderedFieldNames(panelOf(page))).toEqual([...page.fields].sort(byTabIndex).map((field) => field.name));
+      expect(renderedFieldNames(panelOf(page)), page.name).toEqual(expectedOrder);
     }
   });
 
@@ -363,6 +668,39 @@ describe('FormView accessible structure (SC-8)', () => {
     // Two visible fields, found by their prompts as a user finds them, showing the stored values.
     expect(controlValue(screen.getByLabelText('Last Name'))).toBe('Lovelace');
     expect(controlValue(screen.getByLabelText('Sex'))).toBe('F-Female');
+
+    // A text field's metadata maxLength is the input's native length limit.
+    const zip = fieldByName('Zip', definition);
+    expect(controlLabelledBy(zip, HTMLInputElement).maxLength, `maxLength of ${zip.name}`).toBe(
+      present(zip.validation.maxLength, `metadata maxLength of ${zip.name}`),
+    );
+
+    // A pattern is a format hint that describes the input. The record has no errors, so the
+    // description is the hint alone.
+    const phone = fieldByName('PhoneNumber', definition);
+    const describedBy = present(
+      controlLabelledBy(phone, HTMLInputElement).getAttribute('aria-describedby'),
+      `aria-describedby of ${phone.name}`,
+    );
+    expect(
+      describedBy
+        .split(/\s+/)
+        .filter((id) => id !== '')
+        .map((id) => present(document.getElementById(id), `description ${id} of ${phone.name}`).textContent),
+      `description of ${phone.name}`,
+    ).toEqual([`Format: ${present(phone.validation.pattern, `pattern of ${phone.name}`)}`]);
+
+    // Legal values follow one empty choice in the order the server sends them. The fixture's
+    // order is not alphabetical, so a renderer that sorted them fails here; the stored F-Female
+    // is listed, so no extra option for an unlisted stored value appears.
+    const sex = fieldByName('Sex', definition);
+    const sexOptions = present(sex.options, `options of ${sex.name}`);
+    const sexLabels = sexOptions.map((option) => option.label);
+    expect(sexLabels, `fixture options of ${sex.name}`).not.toEqual([...sexLabels].sort());
+    expect(
+      Array.from(controlLabelledBy(sex, HTMLSelectElement).options, (option) => [option.value, option.text]),
+      `options of ${sex.name}`,
+    ).toEqual([['', ''], ...sexOptions.map((option) => [String(option.value), option.label])]);
   });
 
   it('labels a control by the field name when the prompt is null', async () => {
@@ -502,14 +840,6 @@ describe('FormView accessible structure (SC-8)', () => {
     expect(within(navigator).getByRole('textbox', { name: 'Go to record' })).toBeTruthy();
     expect(within(records).getByRole('searchbox', { name: 'Search records' })).toBeTruthy();
     expect(within(records).getByRole('checkbox', { name: 'Show deleted' })).toBeTruthy();
-
-    // The browser test matches button names by substring, so no other button may contain these words.
-    for (const word of ['Save', 'Delete', 'Find', 'First', 'Previous', 'Next', 'Last', 'New']) {
-      expect(
-        screen.getAllByRole('button', { name: (accessibleName) => accessibleName.includes(word) }),
-        word,
-      ).toHaveLength(1);
-    }
   });
 });
 
@@ -549,5 +879,339 @@ describe('FormView permission flags', () => {
     expect(isDisabled(within(formActions).getByRole('button', { name: 'Save' }))).toBe(!save);
     expect(isDisabled(within(formActions).getByRole('button', { name: 'Delete' }))).toBe(!remove);
     expect(isDisabled(within(navigator).getByRole('button', { name: 'New' }))).toBe(!create);
+  });
+
+  // On an empty form the navigator opens New, whose first Save is a create: the flags
+  // below oppose each other, so Save follows canInsert there and never canUpdate.
+  it.each<{ label: string; flags: Flags; save: boolean; create: boolean }>([
+    {
+      label: 'canInsert true, canUpdate false',
+      flags: { canInsert: true, canUpdate: false, canDelete: null },
+      save: true,
+      create: true,
+    },
+    {
+      label: 'canInsert false, canUpdate true',
+      flags: { canInsert: false, canUpdate: true, canDelete: null },
+      save: false,
+      create: false,
+    },
+  ])('enables the first Save of a new record and New by canInsert alone: $label', async ({ flags, save, create }) => {
+    await renderForm({ ...createFormDefinitionFixture(), ...flags }, { records: [] });
+
+    expect(navigatorStatus()).toBe('New record');
+    expect(isDisabled(formActionButton('Save'))).toBe(!save);
+    expect(isDisabled(navigatorButton('New'))).toBe(!create);
+  });
+
+  it('POSTs the first Save of a new record under canInsert, then holds the stored record to canUpdate', async () => {
+    const { definition } = await renderForm(
+      { ...createFormDefinitionFixture(), canInsert: true, canUpdate: false, canDelete: null },
+      { records: [] },
+    );
+    edit(definition, 'LastName', B_LAST_NAME);
+    // A create sends every entered value and false for each unchecked writable checkbox.
+    const sent: Values = {
+      LastName: B_LAST_NAME,
+      ...Object.fromEntries(writableCheckboxNames.map((name) => [name, false])),
+    };
+    replyToWrite({
+      kind: 'saved',
+      record: recordFixture({
+        globalRecordId: '3f2b8c1e-5d4a-4c1b-9e7f-000000000003',
+        uniqueKey: 3,
+        position: 1,
+        count: 1,
+        values: sent,
+      }),
+    });
+
+    fireEvent.click(formActionButton('Save'));
+
+    await waitFor(() => {
+      expect(navigatorStatus()).toBe('1 of 1');
+    });
+    await within(screen.getByRole('region', { name: 'Records' })).findByText('1 record');
+    const writes = writeCalls();
+    expect(writes.map(requestLine)).toEqual([`POST ${FORM_PATH}/records`]);
+    expect(writtenValues(writes[0])).toEqual(sent);
+    expect(controlValue(controlOf(definition, 'LastName'))).toBe(B_LAST_NAME);
+    // The record is stored now, so its next Save is an update, which canUpdate denies.
+    expect(isDisabled(formActionButton('Save'))).toBe(true);
+    expect(isDisabled(navigatorButton('New'))).toBe(false);
+  });
+
+  // With nothing reported nothing is disabled, so the server's 403 is the only refusal.
+  it.each<{ label: string; records: readonly RecordDto[]; value: string; write: string; status: string }>([
+    {
+      label: 'PUT of a stored record',
+      records: [RECORD],
+      value: EDITED_LAST_NAME,
+      write: `PUT ${FORM_PATH}/records/${RECORD.globalRecordId}`,
+      status: '1 of 1',
+    },
+    {
+      label: 'POST of a new record',
+      records: [],
+      value: B_LAST_NAME,
+      write: `POST ${FORM_PATH}/records`,
+      status: 'New record',
+    },
+  ])(
+    'keeps the draft and shows a permission banner when the server answers the $label with 403',
+    async ({ records, value, write, status }) => {
+      const { definition } = await renderForm(createFormDefinitionFixture(), { records });
+      expect(isDisabled(formActionButton('Save'))).toBe(false);
+      edit(definition, 'LastName', value);
+      replyToWrite({ kind: 'problem', problem: FORBIDDEN_PROBLEM });
+
+      fireEvent.click(formActionButton('Save'));
+
+      await findAlertContaining('permission');
+      await flush();
+      const writes = writeCalls();
+      expect(writes.map(requestLine)).toEqual([write]);
+      // Nothing follows the refused write: no refresh and no move.
+      expect(calls.slice(calls.indexOf(writes[0]) + 1).map(requestLine)).toEqual([]);
+      expect(controlValue(controlOf(definition, 'LastName'))).toBe(value);
+      expect(navigatorStatus()).toBe(status);
+    },
+  );
+});
+
+describe('FormView leaving a dirty record', () => {
+  // Opening a grid row and Back to forms each save a dirty draft first, wait for that
+  // save, and continue only once it succeeds; a failed save keeps the draft on screen
+  // and cancels the transition.
+  const REJECTED_NAME = 'The test server rejects this name.';
+
+  interface Rejection {
+    readonly label: string;
+    readonly problem: ProblemDetails;
+    /** Text, ignoring case, of the alert that shows the failure. */
+    readonly shown: string;
+  }
+
+  // Each failure shows text only the test chose (its trace id or message), or for the
+  // 403, the meaning of the client's permission banner.
+  const REJECTIONS: readonly Rejection[] = [
+    { label: '500 notWritten', problem: NOT_WRITTEN_PROBLEM, shown: NOT_WRITTEN_PROBLEM.traceId },
+    { label: 'field-level 400', problem: fieldLevelProblem({ LastName: [REJECTED_NAME] }), shown: REJECTED_NAME },
+    { label: '403', problem: FORBIDDEN_PROBLEM, shown: 'permission' },
+  ];
+
+  /** Every request that reads B: by id, its position, or at its place in the set. */
+  function readsOfB(): string[] {
+    const byId = `${FORM_PATH}/records/${RECORD_B.globalRecordId}`;
+    // Every record of the set A, B is active, so B's place in it is B's own position.
+    const atPlace = `${FORM_PATH}/records/at/${RECORD_B.position}`;
+    return calls
+      .filter(
+        (call) =>
+          call.url.pathname === byId || call.url.pathname.startsWith(`${byId}/`) || call.url.pathname === atPlace,
+      )
+      .map(requestLine);
+  }
+
+  /** B's grid row, found by the last name it shows. */
+  function rowOfB(): HTMLElement {
+    const records = screen.getByRole('region', { name: 'Records' });
+    return within(records).getByRole('row', { name: new RegExp(B_LAST_NAME) });
+  }
+
+  it('saves the dirty draft before a grid open, and opens the row only once the held save succeeds', async () => {
+    const { definition } = await renderForm(createFormDefinitionFixture(), { records: [RECORD_A, RECORD_B] });
+    edit(definition, 'LastName', EDITED_LAST_NAME);
+    const held = holdWrite();
+
+    // The grid is disabled while a save runs, so the click comes first and triggers the save.
+    fireEvent.click(rowOfB());
+
+    await waitFor(() => {
+      expect(writeCalls()).toHaveLength(1);
+    });
+    await flush();
+    const [put] = writeCalls();
+    expect(requestLine(put)).toBe(`PUT ${FORM_PATH}/records/${RECORD_A.globalRecordId}`);
+    expect(writtenValues(put)).toEqual({ LastName: EDITED_LAST_NAME });
+    // While the save is held, B is not read and A's draft stays on screen.
+    expect(readsOfB()).toEqual([]);
+    expect(controlValue(controlOf(definition, 'LastName'))).toBe(EDITED_LAST_NAME);
+    expect(navigatorStatus()).toBe('1 of 2');
+
+    held.release({ kind: 'saved', record: savedWith(RECORD_A, { LastName: EDITED_LAST_NAME }) });
+
+    await waitFor(() => {
+      expect(navigatorStatus()).toBe('2 of 2');
+      expect(controlValue(controlOf(definition, 'LastName'))).toBe(B_LAST_NAME);
+    });
+    await flush();
+    expect(writeCalls()).toEqual([put]);
+    const readOfB = calls.findIndex(
+      (call) => call.method === 'GET' && call.url.pathname === `${FORM_PATH}/records/${RECORD_B.globalRecordId}`,
+    );
+    expect(readOfB).toBeGreaterThan(calls.indexOf(put));
+  });
+
+  it.each(REJECTIONS)(
+    'keeps the draft and the open record when the save before a grid open fails: $label',
+    async ({ problem, shown }) => {
+      const { definition } = await renderForm(createFormDefinitionFixture(), { records: [RECORD_A, RECORD_B] });
+      edit(definition, 'LastName', EDITED_LAST_NAME);
+      replyToWrite({ kind: 'problem', problem });
+
+      fireEvent.click(rowOfB());
+
+      await findAlertContaining(shown);
+      await flush();
+      expect(writeCalls().map(requestLine)).toEqual([`PUT ${FORM_PATH}/records/${RECORD_A.globalRecordId}`]);
+      expect(readsOfB()).toEqual([]);
+      expect(controlValue(controlOf(definition, 'LastName'))).toBe(EDITED_LAST_NAME);
+      expect(screen.queryByDisplayValue(B_LAST_NAME)).toBeNull();
+      expect(navigatorStatus()).toBe('1 of 2');
+    },
+  );
+
+  it('saves the dirty draft before Back to forms, and exits only once the held save succeeds', async () => {
+    const { definition, onExit } = await renderForm();
+    edit(definition, 'LastName', EDITED_LAST_NAME);
+    const held = holdWrite();
+
+    fireEvent.click(formActionButton('Back to forms'));
+
+    await waitFor(() => {
+      expect(writeCalls()).toHaveLength(1);
+    });
+    await flush();
+    const [put] = writeCalls();
+    expect(requestLine(put)).toBe(`PUT ${FORM_PATH}/records/${RECORD.globalRecordId}`);
+    expect(writtenValues(put)).toEqual({ LastName: EDITED_LAST_NAME });
+    expect(onExit).not.toHaveBeenCalled();
+    expect(controlValue(controlOf(definition, 'LastName'))).toBe(EDITED_LAST_NAME);
+
+    held.release({ kind: 'saved', record: savedWith(RECORD, { LastName: EDITED_LAST_NAME }) });
+
+    await waitFor(() => {
+      expect(onExit).toHaveBeenCalledTimes(1);
+    });
+    await flush();
+    expect(onExit).toHaveBeenCalledTimes(1);
+    expect(writeCalls()).toEqual([put]);
+  });
+
+  it.each(REJECTIONS)(
+    'keeps the draft and does not exit when the save before Back to forms fails: $label',
+    async ({ problem, shown }) => {
+      const { definition, onExit } = await renderForm();
+      edit(definition, 'LastName', EDITED_LAST_NAME);
+      replyToWrite({ kind: 'problem', problem });
+
+      fireEvent.click(formActionButton('Back to forms'));
+
+      await findAlertContaining(shown);
+      await flush();
+      expect(writeCalls().map(requestLine)).toEqual([`PUT ${FORM_PATH}/records/${RECORD.globalRecordId}`]);
+      expect(onExit).not.toHaveBeenCalled();
+      expect(controlValue(controlOf(definition, 'LastName'))).toBe(EDITED_LAST_NAME);
+      expect(navigatorStatus()).toBe('1 of 1');
+    },
+  );
+});
+
+describe('FormView validation summary', () => {
+  it('lists each field of a field-level 400 under its prompt with the server message; the draft stays', async () => {
+    const { definition } = await renderForm();
+    // Values the client accepts, so only the server rejects them. Each prompt differs from
+    // its field name, and each message is the test's own and names neither prompt, so an
+    // item is matched to its field by the prompt alone.
+    const rejected = [
+      {
+        name: 'LastName',
+        entered: EDITED_LAST_NAME,
+        sent: EDITED_LAST_NAME,
+        message: 'The test server rejects this surname.',
+      },
+      { name: 'FeverTemp', entered: '101.5', sent: 101.5, message: 'The test server rejects this reading.' },
+    ];
+    for (const { name, entered } of rejected) {
+      edit(definition, name, entered);
+    }
+    replyToWrite({
+      kind: 'problem',
+      problem: fieldLevelProblem(Object.fromEntries(rejected.map(({ name, message }) => [name, [message]]))),
+    });
+
+    fireEvent.click(formActionButton('Save'));
+
+    const summary = await findValidationSummary();
+    await flush();
+    const writes = writeCalls();
+    expect(writes.map(requestLine)).toEqual([`PUT ${FORM_PATH}/records/${RECORD.globalRecordId}`]);
+    expect(writtenValues(writes[0])).toEqual(Object.fromEntries(rejected.map(({ name, sent }) => [name, sent])));
+    for (const { name, message } of rejected) {
+      const items = summaryItemsFor(summary, promptOf(fieldByName(name, definition)));
+      expect(
+        items.map((item) => item.textContent?.includes(message)),
+        name,
+      ).toEqual([true]);
+    }
+    expect(within(summary).getAllByRole('listitem')).toHaveLength(rejected.length);
+    // Each message is also shown beside its field, as the control's description.
+    for (const { name, message } of rejected) {
+      expect(descriptionOf(controlOf(definition, name)), name).toContain(message);
+    }
+    // The draft stays, and nothing follows the rejected write.
+    for (const { name, entered } of rejected) {
+      expect(controlValue(controlOf(definition, name)), name).toBe(entered);
+    }
+    expect(calls.slice(calls.indexOf(writes[0]) + 1).map(requestLine)).toEqual([]);
+    expect(navigatorStatus()).toBe('1 of 1');
+  });
+
+  it('lists every field client validation rejects under its prompt with a message, and sends no write', async () => {
+    const { definition } = await renderForm();
+    const zip = fieldByName('Zip', definition);
+    // Its prompt differs from its name, so the summary must show the prompt itself.
+    const feverTemp = fieldByName('FeverTemp', definition);
+    const maxLength = present(zip.validation.maxLength, 'maxLength of Zip');
+    const upper = feverTemp.validation.upper;
+    if (typeof upper !== 'number') {
+      throw new Error('FeverTemp has no numeric upper bound');
+    }
+    // Past the limits the fixture sets. The input's maxLength stops typing in a browser;
+    // fireEvent.change sets the value directly, standing for any entry that gets past it.
+    const entries = [
+      { field: zip, entered: '9'.repeat(maxLength + 1) },
+      { field: feverTemp, entered: String(upper + 1) },
+    ];
+    for (const { field, entered } of entries) {
+      edit(definition, field.name, entered);
+    }
+
+    fireEvent.click(formActionButton('Save'));
+
+    const summary = await findValidationSummary();
+    await flush();
+    expect(writeCalls().map(requestLine)).toEqual([]);
+    const prompts = entries.map(({ field }) => promptOf(field));
+    for (const prompt of prompts) {
+      const items = summaryItemsFor(summary, prompt);
+      expect(items, prompt).not.toHaveLength(0);
+      for (const item of items) {
+        // A message follows the prompt.
+        expect((item.textContent ?? '').slice(prompt.length).replace(/[\s:]/g, ''), prompt).not.toBe('');
+      }
+    }
+    // Every item is one of the two fields.
+    for (const item of within(summary).getAllByRole('listitem')) {
+      expect(
+        prompts.some((prompt) => (item.textContent ?? '').startsWith(prompt)),
+        item.textContent ?? '',
+      ).toBe(true);
+    }
+    for (const { field, entered } of entries) {
+      expect(controlValue(controlOf(definition, field.name)), field.name).toBe(entered);
+    }
+    expect(navigatorStatus()).toBe('1 of 1');
   });
 });
