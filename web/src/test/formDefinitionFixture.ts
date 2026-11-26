@@ -13,7 +13,7 @@ import type {
   FieldDefinition,
   FieldOption,
   FieldType,
-  FieldValue,
+  FieldValidation,
   FormDefinition,
   FormSummary,
   RecordDto,
@@ -32,8 +32,8 @@ type FieldInit = {
     required?: boolean;
     readOnly?: boolean;
     maxLength?: number | null;
-    lower?: FieldValue;
-    upper?: FieldValue;
+    lower?: FieldValidation['lower'];
+    upper?: FieldValidation['upper'];
     pattern?: string | null;
   };
   options?: FieldOption[] | null;

@@ -4,6 +4,7 @@ using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
 using System.Text.Json.Serialization.Metadata;
 using EpiInfo.Api.Contracts;
+using EpiInfo.Api.Endpoints;
 using EpiInfo.Api.Errors;
 using EpiInfo.Api.Hosting;
 using EpiInfo.Domain.Diagnostics;
@@ -31,18 +32,35 @@ namespace EpiInfo.Api.OpenApi;
 /// <list type="bullet">
 /// <item><description>
 /// <c>FieldValue</c>, one component holding the scalar union <c>string | number | boolean | null</c>. Every record
-/// <c>values</c> map, <c>assigned</c>, a criterion <c>value</c>, an option <c>value</c> and the
-/// <c>lower</c>/<c>upper</c> bounds reference it, and no member of the tagged <see cref="FieldValue"/> struct
-/// (<see cref="FieldValueKind"/>, <c>kind</c>, <c>isNull</c>) appears.
+/// <c>values</c> map, <c>assigned</c> and a criterion <c>value</c> reference it, and no member of the tagged
+/// <see cref="FieldValue"/> struct (<see cref="FieldValueKind"/>, <c>kind</c>, <c>isNull</c>) appears.
+/// </description></item>
+/// <item><description>
+/// The form definition's two narrower <see cref="FieldValue"/> members, inline and without the union. A validation
+/// <c>lower</c>/<c>upper</c> bound is <c>oneOf</c> <c>null</c>, a number and a <c>date</c>-format string, because it is
+/// <c>null</c> when unset, a number on a number field and <c>YYYY-MM-DD</c> on a date field, and never a boolean. An
+/// option <c>value</c> is <c>oneOf</c> an <c>int32</c> of at least 0 and a string, because an Option item's value is
+/// its 0-based index and a Legal Values item's its stored text, and neither is ever <c>null</c>. The branches of each
+/// are disjoint by type, so a value matches exactly one, as <c>oneOf</c> requires.
 /// </description></item>
 /// <item><description>
 /// The request bodies whose members bind as raw <see cref="JsonElement"/>: <c>values</c> is an object of
 /// <c>FieldValue</c>, <c>event</c> the string enum <c>FieldBefore</c>, <c>FieldAfter</c>, <c>FieldClick</c>, and
 /// <c>fieldName</c> a string, each required, so no <see cref="JsonElement"/> component exists. The search body's
-/// <c>criteria</c> is a required, non-null array; its <c>includeDeleted</c> and <c>excludeGlobalRecordId</c> stay
-/// optional. The four operations carrying <see cref="JsonBodyMetadata"/> publish their body as required and as a plain
-/// <c>$ref</c> to its component, without the <c>null</c> branch of their nullable binding, because a missing or
-/// <c>null</c> body is a 400.
+/// <c>criteria</c> is a required, non-null array of 1 to <see cref="RecordQueryRules.MaxSearchFields"/> criteria,
+/// because an empty list, a seventh field and a field named twice are each a 400; its <c>includeDeleted</c> and
+/// <c>excludeGlobalRecordId</c> stay optional. The four operations carrying <see cref="JsonBodyMetadata"/> publish
+/// their body as required and as a plain <c>$ref</c> to its component, without the <c>null</c> branch of their
+/// nullable binding, because a missing or <c>null</c> body is a 400.
+/// </description></item>
+/// <item><description>
+/// The search response's <c>items</c> as an array of at most <see cref="RecordQueryRules.SearchCap"/> results, the
+/// cap after which <c>total</c> goes on counting and <c>truncated</c> is set.
+/// </description></item>
+/// <item><description>
+/// <c>HealthResponse</c> with <c>status</c> the required string enum <c>healthy</c>, <c>unhealthy</c>. The handler
+/// writes one fixed body per status, so the 200 and the 503 of <c>GET /health</c> each publish <c>allOf</c> the
+/// component and that status's own literal, <c>healthy</c> and <c>unhealthy</c>.
 /// </description></item>
 /// <item><description>
 /// The camelCase string enums <c>FieldType</c> and <c>DiagnosticSeverity</c>, and the <c>writeOutcome</c> enum
@@ -90,6 +108,9 @@ public sealed class ScalarSchemaTransformer :
     private const string ProblemDetailsSchemaId = nameof(ProblemDetails);
     private const string ValidationProblemDetailsSchemaId = nameof(HttpValidationProblemDetails);
 
+    // The component id the framework gives the /health body: its type name.
+    private const string HealthResponseSchemaId = nameof(HealthResponse);
+
     // Metadata keys of Microsoft.AspNetCore.OpenApi: a node holding the first becomes the component of that id, and a
     // property node holding the second is wrapped as oneOf [null, $ref] when it is resolved.
     private const string SchemaIdMetadataKey = "x-schema-id";
@@ -100,7 +121,14 @@ public sealed class ScalarSchemaTransformer :
     private const string FieldValueKindSchemaId = nameof(FieldValueKind);
 
     private const string Int32Format = "int32";
+    private const string DateFormat = "date";
     private const string UriReferenceFormat = "uri-reference";
+
+    // The first Option index: an option's value is its 0-based position in metaFields.List.
+    private const int MinOptionIndex = 0;
+
+    // The fewest criteria a search may carry; RecordService answers an empty list with a 400.
+    private const int MinSearchCriteria = 1;
 
     private const string CreatedLocationDescription =
         "The relative URI of the created record, /api/forms/{viewId}/records/{globalRecordId}, with the id "
@@ -120,8 +148,13 @@ public sealed class ScalarSchemaTransformer :
     private static readonly string EventProperty = CamelCase(nameof(FieldEventRequest.Event));
     private static readonly string FieldNameProperty = CamelCase(nameof(FieldEventRequest.FieldName));
     private static readonly string CriteriaProperty = CamelCase(nameof(SearchRequest.Criteria));
+    private static readonly string SearchItemsProperty = CamelCase(nameof(SearchResponse.Items));
     private static readonly string PositionProperty = CamelCase(nameof(NavigationPosition.Position));
     private static readonly string CountProperty = CamelCase(nameof(NavigationPosition.Count));
+    private static readonly string LowerProperty = CamelCase(nameof(FieldValidation.Lower));
+    private static readonly string UpperProperty = CamelCase(nameof(FieldValidation.Upper));
+    private static readonly string OptionValueProperty = CamelCase(nameof(FieldOption.Value));
+    private static readonly string HealthStatusProperty = CamelCase(nameof(HealthResponse.Status));
 
     private static readonly string[] FieldTypeWireNames = CamelCaseNames<FieldType>();
     private static readonly string[] DiagnosticSeverityWireNames = CamelCaseNames<DiagnosticSeverity>();
@@ -140,6 +173,12 @@ public sealed class ScalarSchemaTransformer :
         WriteOutcomeExtensions.WireWritten,
     ];
 
+    private static readonly string[] HealthStatusWireNames =
+    [
+        HealthResponse.HealthyStatus,
+        HealthResponse.UnhealthyStatus,
+    ];
+
     // The JSON names ProblemDetails declares for the members ApiProblems always writes, in declaration order.
     private static readonly string[] ProblemNonNullProperties = ["type", "title", "status", "detail"];
 
@@ -155,9 +194,9 @@ public sealed class ScalarSchemaTransformer :
     /// </summary>
     /// <remarks>
     /// The schema role does the essential work; the operation role corrects the JSON request bodies and their 400, adds
-    /// the create's <c>Location</c> header and repoints the write 500 and 503 responses, and the document role drops
-    /// helper components. Each role is correct on its own, so none depends on the order in which
-    /// the framework runs them.
+    /// the create's <c>Location</c> header, repoints the write 500 and 503 responses and narrows each <c>/health</c>
+    /// response to its status literal, and the document role drops helper components. Each role is correct on its own,
+    /// so none depends on the order in which the framework runs them.
     /// </remarks>
     /// <param name="options">The options of the default <c>v1</c> document.</param>
     /// <returns><paramref name="options"/>, for chaining.</returns>
@@ -179,7 +218,9 @@ public sealed class ScalarSchemaTransformer :
     /// <remarks>
     /// Rules keyed by type run on every node of that type, because a nested occurrence becomes the component just as
     /// a root one does, and every occurrence must produce the same component. Rules keyed by a member run only on that
-    /// member's node. Query and route parameter schemas are left to <c>ParameterSchemaTransformer</c>.
+    /// member's node; on a <see cref="FieldValue"/> member they run instead of the type rule, which would otherwise
+    /// make the member a reference to the union. Query and route parameter schemas are left to
+    /// <c>ParameterSchemaTransformer</c>.
     /// </remarks>
     /// <param name="schema">The node to rewrite in place.</param>
     /// <param name="context">The JSON contract of the node and the document being built.</param>
@@ -206,7 +247,13 @@ public sealed class ScalarSchemaTransformer :
 
         if (type == typeof(FieldValue))
         {
-            ApplyFieldValue(schema);
+            // A member whose values are narrower than the union is published in its own inline shape before the type
+            // rule could make it a reference to the union; every other occurrence is the one FieldValue component.
+            if (context.JsonPropertyInfo is not { } valueMember || !ApplyFieldValueMemberRules(schema, valueMember))
+            {
+                ApplyFieldValue(schema);
+            }
+
             return Task.CompletedTask;
         }
 
@@ -230,6 +277,61 @@ public sealed class ScalarSchemaTransformer :
         // Every occurrence, FieldValue? included, carries the one id, so all of them resolve to the single component.
         schema.Metadata ??= new Dictionary<string, object>(StringComparer.Ordinal);
         schema.Metadata[SchemaIdMetadataKey] = FieldValueSchemaId;
+    }
+
+    // The form definition carries some values as FieldValue in the Domain although the factory only ever writes a
+    // narrower set into them. Returns whether a rule matched the member.
+    private static bool ApplyFieldValueMemberRules(OpenApiSchema schema, JsonPropertyInfo property)
+    {
+        var name = property.Name;
+
+        if (property.DeclaringType == typeof(FieldValidation)
+            && (string.Equals(name, LowerProperty, StringComparison.Ordinal)
+                || string.Equals(name, UpperProperty, StringComparison.Ordinal)))
+        {
+            // An unset bound is null, a number field's bound a number and a date field's a YYYY-MM-DD string, never a
+            // boolean. The branches are disjoint by type, so every bound matches exactly one, as oneOf requires; a null
+            // branch beside the union, which admits null itself, made an unset bound match two.
+            PublishOneOf(
+                schema,
+                [
+                    new OpenApiSchema { Type = JsonSchemaType.Null },
+                    new OpenApiSchema { Type = JsonSchemaType.Number },
+                    new OpenApiSchema { Type = JsonSchemaType.String, Format = DateFormat },
+                ]);
+            return true;
+        }
+
+        if (property.DeclaringType == typeof(FieldOption)
+            && string.Equals(name, OptionValueProperty, StringComparison.Ordinal))
+        {
+            // An Option item's value is its 0-based index and a Legal Values item's the stored text; neither is ever
+            // null, a boolean or a fraction.
+            PublishOneOf(
+                schema,
+                [
+                    new OpenApiSchema
+                    {
+                        Type = JsonSchemaType.Integer,
+                        Format = Int32Format,
+                        Minimum = MinOptionIndex.ToString(CultureInfo.InvariantCulture),
+                    },
+                    new OpenApiSchema { Type = JsonSchemaType.String },
+                ]);
+            return true;
+        }
+
+        return false;
+    }
+
+    // Publishes the member as an inline oneOf of the branches, with no type of its own and no component behind it.
+    private static void PublishOneOf(OpenApiSchema schema, IList<IOpenApiSchema> branches)
+    {
+        Inline(schema);
+        schema.Type = null;
+        schema.AdditionalProperties = null;
+        schema.Required = null;
+        schema.OneOf = branches;
     }
 
     private static void ApplyTypeRules(OpenApiSchema schema, Type type, JsonTypeInfo typeInfo)
@@ -283,6 +385,15 @@ public sealed class ScalarSchemaTransformer :
                 [CountProperty] = new OpenApiSchema { Type = JsonSchemaType.Integer, Format = Int32Format },
             };
             AddRequired(schema, [PositionProperty, CountProperty]);
+        }
+        else if (type == typeof(HealthResponse))
+        {
+            // The handler writes one of two fixed bodies; the operation role narrows each response to its own status.
+            schema.Properties = new Dictionary<string, IOpenApiSchema>(StringComparer.Ordinal)
+            {
+                [HealthStatusProperty] = CreateStatusSchema(HealthStatusWireNames),
+            };
+            AddRequired(schema, [HealthStatusProperty]);
         }
 
         if (IsAlwaysSerialisedDomainObject(type, typeInfo))
@@ -369,6 +480,17 @@ public sealed class ScalarSchemaTransformer :
             {
                 schema.Type = criteriaType & ~JsonSchemaType.Null;
             }
+
+            // An empty list is a request-level 400, and a seventh criterion names either a seventh field or one field
+            // twice, which are 400s as well.
+            schema.MinItems = MinSearchCriteria;
+            schema.MaxItems = RecordQueryRules.MaxSearchFields;
+        }
+        else if (declaringType == typeof(SearchResponse)
+            && string.Equals(name, SearchItemsProperty, StringComparison.Ordinal))
+        {
+            // total counts every match, while the items stop at the cap.
+            schema.MaxItems = RecordQueryRules.SearchCap;
         }
         else if (typeof(WriteProblemDetails).IsAssignableFrom(declaringType)
             && string.Equals(name, WriteOutcomeProperty, StringComparison.Ordinal))
@@ -386,8 +508,10 @@ public sealed class ScalarSchemaTransformer :
     /// <see cref="JsonBodyMetadata"/> gets a required, non-null request body and a 400 that is <c>anyOf</c>
     /// <c>ProblemDetails</c> and <c>HttpValidationProblemDetails</c>. An operation carrying
     /// <see cref="WriteEndpointMetadata"/> gets its 500 and 503 pointed at <c>WriteProblemDetails</c>, and the create,
-    /// <see cref="WriteEndpointMetadata.Insert"/>, the required <c>Location</c> header on its 201. Every problem body is
-    /// <c>application/problem+json</c>, and every other response keeps the schema its endpoint declares.
+    /// <see cref="WriteEndpointMetadata.Insert"/>, the required <c>Location</c> header on its 201. A 200 or 503
+    /// declared with <c>HealthResponse</c> gets the component narrowed to the status literal of its status. Every
+    /// problem body is <c>application/problem+json</c>, and every other response keeps the schema its endpoint
+    /// declares.
     /// </summary>
     /// <param name="operation">The operation to rewrite in place.</param>
     /// <param name="context">The endpoint description and the document being built.</param>
@@ -403,6 +527,8 @@ public sealed class ScalarSchemaTransformer :
     {
         ArgumentNullException.ThrowIfNull(operation);
         ArgumentNullException.ThrowIfNull(context);
+
+        await NarrowHealthResponsesAsync(operation, context, cancellationToken).ConfigureAwait(false);
 
         var endpointMetadata = context.Description.ActionDescriptor.EndpointMetadata;
         if (HasMetadata<JsonBodyMetadata>(endpointMetadata))
@@ -527,6 +653,73 @@ public sealed class ScalarSchemaTransformer :
             Schema = new OpenApiSchema { Type = JsonSchemaType.String, Format = UriReferenceFormat },
         };
     }
+
+    // GET /health writes one fixed body per status, so each response declared with HealthResponse publishes the
+    // component narrowed to the literal of its status, and a swapped or unknown status fails validation. A response
+    // the endpoint does not declare, or a status with no fixed body, keeps its schema.
+    private static async Task NarrowHealthResponsesAsync(
+        OpenApiOperation operation,
+        OpenApiOperationTransformerContext context,
+        CancellationToken cancellationToken)
+    {
+        if (operation.Responses is not { } responses)
+        {
+            return;
+        }
+
+        IOpenApiSchema? component = null;
+        foreach (var responseType in context.Description.SupportedResponseTypes)
+        {
+            if (responseType.Type != typeof(HealthResponse)
+                || HealthStatusOf(responseType.StatusCode) is not { } status
+                || !responses.TryGetValue(
+                    responseType.StatusCode.ToString(CultureInfo.InvariantCulture),
+                    out var existing)
+                || existing is not OpenApiResponse { Content: { } content })
+            {
+                continue;
+            }
+
+            component ??= await ComponentReferenceAsync(
+                    typeof(HealthResponse),
+                    HealthResponseSchemaId,
+                    context,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            foreach (var mediaType in content.Values)
+            {
+                mediaType.Schema = new OpenApiSchema
+                {
+                    AllOf =
+                    [
+                        component,
+                        new OpenApiSchema
+                        {
+                            Type = JsonSchemaType.Object,
+                            Properties = new Dictionary<string, IOpenApiSchema>(StringComparer.Ordinal)
+                            {
+                                [HealthStatusProperty] = CreateStatusSchema([status]),
+                            },
+                            Required = new SortedSet<string>([HealthStatusProperty], StringComparer.Ordinal),
+                        },
+                    ],
+                };
+            }
+        }
+    }
+
+    private static string? HealthStatusOf(int statusCode) => statusCode switch
+    {
+        StatusCodes.Status200OK => HealthResponse.HealthyStatus,
+        StatusCodes.Status503ServiceUnavailable => HealthResponse.UnhealthyStatus,
+        _ => null,
+    };
+
+    private static OpenApiSchema CreateStatusSchema(string[] statuses) => new()
+    {
+        Type = JsonSchemaType.String,
+        Enum = CreateEnum(statuses),
+    };
 
     // The four JSON-body endpoints bind a nullable body, so that a JSON null reaches the service's request-level 400,
     // and the generator publishes that binding: an optional body whose schema is oneOf [null, $ref]. On the wire the

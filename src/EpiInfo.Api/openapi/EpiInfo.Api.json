@@ -126,7 +126,25 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HealthResponse"
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/HealthResponse"
+                    },
+                    {
+                      "required": [
+                        "status"
+                      ],
+                      "type": "object",
+                      "properties": {
+                        "status": {
+                          "enum": [
+                            "healthy"
+                          ],
+                          "type": "string"
+                        }
+                      }
+                    }
+                  ]
                 }
               }
             }
@@ -136,7 +154,25 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HealthResponse"
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/HealthResponse"
+                    },
+                    {
+                      "required": [
+                        "status"
+                      ],
+                      "type": "object",
+                      "properties": {
+                        "status": {
+                          "enum": [
+                            "unhealthy"
+                          ],
+                          "type": "string"
+                        }
+                      }
+                    }
+                  ]
                 }
               }
             }
@@ -1336,7 +1372,16 @@
         "type": "object",
         "properties": {
           "value": {
-            "$ref": "#/components/schemas/FieldValue"
+            "oneOf": [
+              {
+                "minimum": 0,
+                "type": "integer",
+                "format": "int32"
+              },
+              {
+                "type": "string"
+              }
+            ]
           },
           "label": {
             "type": "string"
@@ -1388,7 +1433,11 @@
                 "type": "null"
               },
               {
-                "$ref": "#/components/schemas/FieldValue"
+                "type": "number"
+              },
+              {
+                "type": "string",
+                "format": "date"
               }
             ]
           },
@@ -1398,7 +1447,11 @@
                 "type": "null"
               },
               {
-                "$ref": "#/components/schemas/FieldValue"
+                "type": "number"
+              },
+              {
+                "type": "string",
+                "format": "date"
               }
             ]
           },
@@ -1497,6 +1550,10 @@
         "type": "object",
         "properties": {
           "status": {
+            "enum": [
+              "healthy",
+              "unhealthy"
+            ],
             "type": "string"
           }
         }
@@ -1775,6 +1832,8 @@
         "type": "object",
         "properties": {
           "criteria": {
+            "maxItems": 6,
+            "minItems": 1,
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/SearchCriterion"
@@ -1803,6 +1862,7 @@
         "type": "object",
         "properties": {
           "items": {
+            "maxItems": 200,
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/SearchResult"

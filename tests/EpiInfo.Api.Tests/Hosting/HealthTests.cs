@@ -1,4 +1,7 @@
+using System.Globalization;
 using System.Net;
+using System.Text.Json;
+using EpiInfo.Api.Endpoints;
 using EpiInfo.Api.Health;
 using EpiInfo.Api.Hosting;
 using EpiInfo.Api.Tests.Infrastructure;
@@ -13,7 +16,8 @@ namespace EpiInfo.Api.Tests.Hosting;
 /// The <c>GET /health</c> contract of <see cref="EpiInfo.Api.Endpoints.HealthEndpoints"/> (AAP 0.3.4.7) without a
 /// database: 503 <c>{"status":"unhealthy"}</c>, plain JSON and not ProblemDetails, for an unreachable server and for a
 /// missing connection string; 200
-/// <c>{"status":"healthy"}</c> when the store's ping answers. Beneath it, the check-level contract of
+/// <c>{"status":"healthy"}</c> when the store's ping answers; and the OpenAPI document publishing each status with its
+/// own <c>status</c> literal. Beneath it, the check-level contract of
 /// <see cref="SqlServerHealthCheck"/>: Healthy only when the store's ping answers <see langword="true"/>; Unhealthy
 /// with the fixed description, no exception and no data for a <see langword="false"/> answer and for every store
 /// failure, whatever the registration's failure status; and only the caller's own cancellation propagated. Its log
@@ -21,7 +25,8 @@ namespace EpiInfo.Api.Tests.Hosting;
 /// </summary>
 /// <remarks>
 /// The class needs no SQL Server: the endpoint cases run the API on TestServer against a port where nothing listens,
-/// without a connection string, or over <see cref="FakeDataStore"/>, and the check cases run the check directly over
+/// without a connection string, or over <see cref="FakeDataStore"/>, the document cases read <c>/openapi/v1.json</c>
+/// from a host without a connection string, and the check cases run the check directly over
 /// that store. It carries no <c>Integration</c> trait and joins no database collection, so
 /// <c>--filter "Category!=Integration"</c> selects it. <see cref="HealthIntegrationTests"/> holds the case that needs
 /// the rehearsal database.
@@ -115,6 +120,43 @@ public sealed class HealthTests
         await HealthResponses.AssertAsync(response, HttpStatusCode.OK, HealthResponses.Healthy);
         Assert.Equal(new FakeStoreCall(PingOperation, IsWrite: false), Assert.Single(store.Calls));
         Assert.DoesNotContain(factory.Logs.Entries, entry => entry.Category == HealthCheckCategory);
+    }
+
+    // The published contract pins each status to its one body: the response is the HealthResponse component narrowed to
+    // a required status whose only value is that status's literal, so a swapped or other status fails validation.
+    [Theory]
+    [InlineData(HttpStatusCode.OK, HealthResponse.HealthyStatus)]
+    [InlineData(HttpStatusCode.ServiceUnavailable, HealthResponse.UnhealthyStatus)]
+    public async Task PublishedResponseAdmitsOnlyItsStatusLiteral(HttpStatusCode status, string literal)
+    {
+        JsonElement document = await PublishedDocumentAsync();
+
+        JsonElement schema = document.GetProperty("paths").GetProperty(HealthResponses.RequestPath).GetProperty("get")
+            .GetProperty("responses").GetProperty(((int)status).ToString(CultureInfo.InvariantCulture))
+            .GetProperty("content").GetProperty(ApiTestClient.JsonMediaType).GetProperty("schema");
+        Assert.Equal(new[] { "allOf" }, schema.EnumerateObject().Select(keyword => keyword.Name));
+        JsonElement[] parts = [.. schema.GetProperty("allOf").EnumerateArray()];
+        Assert.Equal(2, parts.Length);
+        Assert.Equal("#/components/schemas/HealthResponse", parts[0].GetProperty("$ref").GetString());
+        Assert.Equal(new[] { "status" }, parts[1].GetProperty("required").EnumerateArray().Select(Text));
+        Assert.Equal(
+            new[] { literal },
+            parts[1].GetProperty("properties").GetProperty("status").GetProperty("enum").EnumerateArray().Select(Text));
+    }
+
+    // The component alone admits exactly the two bodies the handler writes.
+    [Fact]
+    public async Task PublishedComponentAdmitsOnlyTheTwoStatuses()
+    {
+        JsonElement component = (await PublishedDocumentAsync())
+            .GetProperty("components").GetProperty("schemas").GetProperty("HealthResponse");
+
+        Assert.Equal(new[] { "status" }, component.GetProperty("required").EnumerateArray().Select(Text));
+        JsonElement statusSchema = component.GetProperty("properties").GetProperty("status");
+        Assert.Equal("string", statusSchema.GetProperty("type").GetString());
+        Assert.Equal(
+            new[] { HealthResponse.HealthyStatus, HealthResponse.UnhealthyStatus },
+            statusSchema.GetProperty("enum").EnumerateArray().Select(Text));
     }
 
     [Fact]
@@ -305,6 +347,21 @@ public sealed class HealthTests
 
     private static object? StateValue(CapturedLogEntry entry, string key) =>
         Assert.Single(entry.State, pair => pair.Key == key).Value;
+
+    // The document the API serves at /openapi/v1.json. Describing the endpoints reads no data, so the host has no
+    // connection string.
+    private static async Task<JsonElement> PublishedDocumentAsync()
+    {
+        await using var factory = new ApiFactory(new ApiFactoryOptions { ConnectionMode = ApiConnectionMode.None });
+        using HttpClient client = factory.CreateClient();
+
+        using HttpResponseMessage response = await client.GetAsync("/openapi/v1.json");
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        return await ApiTestClient.ReadJsonElementAsync(response);
+    }
+
+    private static string? Text(JsonElement value) => value.GetString();
 
     /// <summary>The check over a fresh store, logging only to a capturing provider that accepts every level.</summary>
     private sealed class CheckHarness : IDisposable

@@ -227,7 +227,7 @@ export interface components {
             diagnostics: components["schemas"]["Diagnostic"][];
         };
         FieldOption: {
-            value: components["schemas"]["FieldValue"];
+            value: number | string;
             label: string;
         };
         /** @enum {string} */
@@ -237,8 +237,8 @@ export interface components {
             readOnly: boolean;
             /** Format: int32 */
             maxLength: null | number;
-            lower: null | components["schemas"]["FieldValue"];
-            upper: null | components["schemas"]["FieldValue"];
+            lower: null | number | string;
+            upper: null | number | string;
             pattern: null | string;
         };
         FieldValue: null | boolean | number | string;
@@ -260,7 +260,8 @@ export interface components {
             pageCount: number;
         };
         HealthResponse: {
-            status: string;
+            /** @enum {string} */
+            status: "healthy" | "unhealthy";
         };
         HttpValidationProblemDetails: {
             type: string;
@@ -481,7 +482,10 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["HealthResponse"];
+                    "application/json": components["schemas"]["HealthResponse"] & {
+                        /** @enum {string} */
+                        status: "healthy";
+                    };
                 };
             };
             /** @description Service Unavailable */
@@ -490,7 +494,10 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["HealthResponse"];
+                    "application/json": components["schemas"]["HealthResponse"] & {
+                        /** @enum {string} */
+                        status: "unhealthy";
+                    };
                 };
             };
         };

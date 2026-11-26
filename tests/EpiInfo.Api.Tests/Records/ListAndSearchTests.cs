@@ -120,7 +120,8 @@ public sealed class SearchRequestBindingTests
 /// <remarks>
 /// The class needs no database: it carries no <c>Integration</c> trait and joins no database collection, so
 /// <c>--filter "Category!=Integration"</c> selects it. It calls <see cref="RequestParameters"/> and
-/// <see cref="RecordService"/> directly, the service over <see cref="FakeDataStore"/>.
+/// <see cref="RecordService"/> directly, the service over <see cref="FakeDataStore"/>, and reads the published Find
+/// array bounds from the OpenAPI document of an <see cref="ApiFactory"/> host with no connection string.
 /// </remarks>
 public sealed class ListAndSearchBoundsTests
 {
@@ -244,6 +245,30 @@ public sealed class ListAndSearchBoundsTests
         Assert.Empty(page.Items);
     }
 
+    // The published contract carries the same bounds: 1 to 6 criteria, since an empty list, a seventh field and a field
+    // named twice are each a 400, and at most 200 result items, however many match.
+    [Theory]
+    [InlineData("SearchRequest", "criteria", 1, RecordQueryRules.MaxSearchFields)]
+    [InlineData("SearchResponse", "items", null, RecordQueryRules.SearchCap)]
+    public async Task SearchArrays_PublishTheirBounds(string component, string member, int? minItems, int maxItems)
+    {
+        JsonElement array = (await PublishedSchemasAsync())
+            .GetProperty(component)
+            .GetProperty("properties")
+            .GetProperty(member);
+
+        Assert.Equal("array", array.GetProperty("type").GetString());
+        Assert.Equal(maxItems, array.GetProperty("maxItems").GetInt32());
+        if (minItems is null)
+        {
+            Assert.False(array.TryGetProperty("minItems", out _), $"{component}.{member} publishes a minItems.");
+        }
+        else
+        {
+            Assert.Equal(minItems, array.GetProperty("minItems").GetInt32());
+        }
+    }
+
     private static RecordService CreateService(FakeDataStore store) => new(
         store,
         new FormService(store, new CheckCodeEngine(), NullLogger<FormService>.Instance),
@@ -291,6 +316,19 @@ public sealed class ListAndSearchBoundsTests
         var problem = Assert.IsType<ApiProblems.ProblemResult>(result);
         Assert.Equal(StatusCodes.Status400BadRequest, problem.StatusCode);
         return Assert.IsType<HttpValidationProblemDetails>(problem.Value).Errors;
+    }
+
+    // The component schemas of the document the API serves at /openapi/v1.json, from a host with no connection string.
+    private static async Task<JsonElement> PublishedSchemasAsync()
+    {
+        await using var factory = new ApiFactory(new ApiFactoryOptions { ConnectionMode = ApiConnectionMode.None });
+        using HttpClient client = factory.CreateClient();
+
+        using HttpResponseMessage response = await client.GetAsync("/openapi/v1.json");
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        JsonElement document = await ApiTestClient.ReadJsonElementAsync(response);
+        return document.GetProperty("components").GetProperty("schemas");
     }
 }
 

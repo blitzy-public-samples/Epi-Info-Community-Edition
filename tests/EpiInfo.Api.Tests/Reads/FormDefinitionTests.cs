@@ -1381,3 +1381,81 @@ public sealed class FormDefinitionCheckCodeTests
     private static object? StateValue(CapturedLogEntry entry, string key) =>
         Assert.Single(entry.State, pair => pair.Key == key).Value;
 }
+
+/// <summary>
+/// The published wire schema of the form definition's narrowed values (AAP 0.3.4.3): a validation bound is
+/// <c>null</c> when unset, a number on a number field and a <c>YYYY-MM-DD</c> string on a date field, never a boolean;
+/// an option value is an Option item's 0-based index or a Legal Values item's text, never <c>null</c>. Each is a oneOf
+/// of type-disjoint branches with no reference to the <c>FieldValue</c> union.
+/// </summary>
+/// <remarks>
+/// The document is the one the API serves at <c>/openapi/v1.json</c>, built by the same transformers as the committed
+/// document. Describing the endpoints reads no data, so the host has no connection string and the class needs no
+/// SQL Server: it carries no <c>Integration</c> trait and joins no database collection, which keeps it selected by
+/// <c>--filter "Category!=Integration"</c>.
+/// </remarks>
+public sealed class FormDefinitionWireSchemaTests
+{
+    [Theory]
+    [InlineData("lower")]
+    [InlineData("upper")]
+    public async Task BoundIsNullNumberOrDateStringAndNeverTheUnion(string bound)
+    {
+        JsonElement validation = (await PublishedSchemasAsync()).GetProperty("FieldValidation");
+
+        JsonElement member = validation.GetProperty("properties").GetProperty(bound);
+        Assert.Equal(new[] { "oneOf" }, member.EnumerateObject().Select(keyword => keyword.Name));
+        Assert.Equal(
+            new[] { "null", "number", "string:date" },
+            member.GetProperty("oneOf").EnumerateArray().Select(Describe));
+        Assert.Contains(bound, validation.GetProperty("required").EnumerateArray().Select(name => name.GetString()));
+    }
+
+    // An Option item's value is its 0-based index and a Legal Values item's its text: never null, a boolean or a
+    // fraction.
+    [Fact]
+    public async Task OptionValueIsANonNegativeIndexOrText()
+    {
+        JsonElement option = (await PublishedSchemasAsync()).GetProperty("FieldOption");
+
+        JsonElement member = option.GetProperty("properties").GetProperty("value");
+        Assert.Equal(new[] { "oneOf" }, member.EnumerateObject().Select(keyword => keyword.Name));
+        Assert.Equal(
+            new[] { "integer:int32>=0", "string" },
+            member.GetProperty("oneOf").EnumerateArray().Select(Describe));
+        Assert.Contains("value", option.GetProperty("required").EnumerateArray().Select(name => name.GetString()));
+    }
+
+    // The document's component schemas, from a host with no connection string.
+    private static async Task<JsonElement> PublishedSchemasAsync()
+    {
+        await using var factory = new ApiFactory(new ApiFactoryOptions { ConnectionMode = ApiConnectionMode.None });
+        using HttpClient client = factory.CreateClient();
+
+        using HttpResponseMessage response = await client.GetAsync("/openapi/v1.json");
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        JsonElement document = await ApiTestClient.ReadJsonElementAsync(response);
+        return document.GetProperty("components").GetProperty("schemas");
+    }
+
+    // A branch as type, then :format and >=minimum when present. Any other keyword, a $ref included, fails the test.
+    private static string Describe(JsonElement branch)
+    {
+        string[] keywords = ["format", "minimum", "type"];
+        Assert.All(branch.EnumerateObject(), keyword => Assert.Contains(keyword.Name, keywords));
+
+        string text = branch.GetProperty("type").GetString() ?? string.Empty;
+        if (branch.TryGetProperty("format", out JsonElement format))
+        {
+            text += ":" + format.GetString();
+        }
+
+        if (branch.TryGetProperty("minimum", out JsonElement minimum))
+        {
+            text += ">=" + minimum.GetRawText();
+        }
+
+        return text;
+    }
+}
