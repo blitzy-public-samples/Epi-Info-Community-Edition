@@ -24,7 +24,7 @@
 //   handlers and the field-event queue; loading or replacing a record raises none.
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 
-import type { ApiClient, ApiResult } from '../api/client';
+import { sameFieldValue, type ApiClient, type ApiResult } from '../api/client';
 import {
   describeError,
   errorMessages,
@@ -608,7 +608,8 @@ function createController(host: ControllerHost): Controller {
         return;
       }
       for (const field of index().dataFields) {
-        const valueChanged = !Object.is(ownValue(next.values, field.name), ownValue(current.values, field.name));
+        // sameFieldValue: a bigint compares by value and an exact decimal by its literal.
+        const valueChanged = !sameFieldValue(ownValue(next.values, field.name), ownValue(current.values, field.name));
         if (!isWritableDataField(field)) {
           if (valueChanged) {
             readOnlyAssigned.add(field.name);

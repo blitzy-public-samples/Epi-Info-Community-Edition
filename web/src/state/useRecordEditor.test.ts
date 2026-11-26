@@ -12,16 +12,23 @@
 // - A write is acknowledged only by its contracted status (201 for POST, 200 for PUT)
 //   with its complete Record DTO; any other 2xx offers Save again only, as no response does.
 // - C-6: Delete asks first; Cancel sends nothing, Confirm sends exactly one DELETE.
+// - Exact numbers: the client reads a field value that is an integer beyond
+//   ±Number.MAX_SAFE_INTEGER, which a `bigint` column admits, as its bigint and saves it
+//   digit for digit, and reads every other number, such as a `tabIndex`, `uniqueKey` or
+//   `count`, and every other JSON body, as JSON.parse does. Client feedback compares a
+//   number with its bounds only where the server compares alike on every column, and
+//   leaves the rest to its 400.
 //
 // The hook runs against the real client and error parsing; createApiClient's fetch seam
 // is a fake that records every request and answers from a per-test reply queue.
 import { act, renderHook } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi, type Mock } from 'vitest';
 
-import { createApiClient, type ApiClient } from '../api/client';
+import { createApiClient, numberFromText, type ApiClient, type ApiResult } from '../api/client';
 import type {
   FieldDefinition,
   FieldEventResponse,
+  FieldValidation,
   FieldValue,
   FormDefinition,
   RecordDto,
@@ -39,6 +46,7 @@ import {
   withField,
   writableCheckboxNames,
 } from '../test/formDefinitionFixture';
+import { clientMessages, validateField } from '../validation/clientValidation';
 import { useRecordEditor, type EditorBanner, type RecordEditor, type UseRecordEditorOptions } from './useRecordEditor';
 
 const VIEW_ID = formDefinitionFixture.viewId;
@@ -85,7 +93,21 @@ function requireNames(what: string, names: readonly string[], count: number): re
   return names;
 }
 
+/** Writable number fields with no required, range or pattern rule. */
+const PLAIN_NUMBER_FIELDS: readonly string[] = allFields()
+  .filter(
+    (field) =>
+      field.fieldType === 'number' &&
+      isWritableDataField(field) &&
+      !field.validation.required &&
+      field.validation.lower === null &&
+      field.validation.upper === null &&
+      field.validation.pattern === null,
+  )
+  .map((field) => field.name);
+
 const [TEXT, OTHER_TEXT] = requireNames('plain writable text fields', PLAIN_TEXT_FIELDS, 2);
+const [NUMBER] = requireNames('plain writable number fields', PLAIN_NUMBER_FIELDS, 1);
 const [CHECKBOX] = requireNames('writable checkboxes', writableCheckboxNames, 1);
 requireNames('read-only data fields', readOnlyFieldNames, 1);
 requireNames('unsupported fields', UNSUPPORTED_FIELD_NAMES, 1);
@@ -147,6 +169,8 @@ interface RecordedCall {
   readonly path: string;
   /** The parsed JSON body; `undefined` when the request carried none. */
   readonly body: unknown;
+  /** The body text as sent; `null` when the request carried none. */
+  readonly text: string | null;
 }
 
 /** The answer to one request: a response, or a function that settles it later or rejects. */
@@ -214,7 +238,12 @@ function createFakeApi(): FakeApi {
     const request = input instanceof Request ? input : new Request(input, init);
     const text = await request.clone().text();
     const body: unknown = text === '' ? undefined : JSON.parse(text);
-    const call: RecordedCall = { method: request.method, path: new URL(request.url).pathname, body };
+    const call: RecordedCall = {
+      method: request.method,
+      path: new URL(request.url).pathname,
+      body,
+      text: text === '' ? null : text,
+    };
     calls.push(call);
     const next = replies.shift();
     if (next === undefined) {
@@ -247,8 +276,20 @@ function createFakeApi(): FakeApi {
   return api;
 }
 
+// Marks a bigint inside JSON.stringify's output so it can be written as a bare integer; no
+// fixture string holds the mark.
+const BIGINT_MARK = '\u0000bigint:';
+const MARKED_BIGINT = /"\\u0000bigint:(-?\d+)"/g;
+
+/** A record as the API writes it: a bigint is the JSON integer it holds, digit for digit. */
 function jsonResponse(status: number, body: RecordDto): Response {
-  return new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
+  const marked = JSON.stringify(body, (_key: string, value: unknown) =>
+    typeof value === 'bigint' ? BIGINT_MARK + value.toString() : value,
+  );
+  return new Response(marked.replace(MARKED_BIGINT, '$1'), {
+    status,
+    headers: { 'content-type': 'application/json' },
+  });
 }
 
 type ProblemStatus = 400 | 404 | 409 | 413 | 500 | 503;
@@ -1709,5 +1750,315 @@ describe('protected state', () => {
     expect(result.current.fieldErrors).toEqual({});
     expect(result.current.banner).toBeNull();
     expect(api.lines()).toHaveLength(2);
+  });
+});
+
+describe('exact numbers', () => {
+  /** A client whose every request is answered 200 with the JSON body text `text`. */
+  function clientAnswering(text: string): ApiClient {
+    return createApiClient({
+      baseUrl: 'http://localhost',
+      fetch: () => Promise.resolve(new Response(text, { status: 200, headers: { 'content-type': 'application/json' } })),
+    });
+  }
+
+  it.each<[bigint, bigint]>([
+    [9007199254740993n, 9007199254740994n],
+    [-9007199254740993n, -9007199254740994n],
+    [9223372036854775806n, 9223372036854775807n],
+  ])('reads the stored %s and saves the adjacent %s digit for digit', async (stored, edited) => {
+    const record = recordFixture({ values: { [NUMBER]: stored } });
+    const read = await createApiClient({
+      baseUrl: 'http://localhost',
+      fetch: () => Promise.resolve(jsonResponse(200, record)),
+    }).getRecord(VIEW_ID, record.globalRecordId);
+    if (!read.ok) {
+      throw new Error('the stored record was not read');
+    }
+    expect(read.data.values[NUMBER]).toBe(stored);
+
+    const { api, result, onSaved } = mountExisting(read.data);
+    expect(result.current.values[NUMBER]).toBe(stored);
+    edit(result, NUMBER, edited);
+    api.reply(jsonResponse(200, savedCopy(read.data, { [NUMBER]: edited })));
+
+    expect(await perform(() => result.current.save())).toBe(true);
+
+    expect(api.lines()).toEqual([`PUT ${recordPath(record)}`]);
+    expect(api.calls[0].text).toBe(`{"values":{${JSON.stringify(NUMBER)}:${edited.toString()}}}`);
+    expect(onSaved).toHaveBeenCalledTimes(1);
+    expect(onSaved.mock.calls[0][0].values[NUMBER]).toBe(edited);
+    expect(result.current.isDirty).toBe(false);
+  });
+
+  // The server compares a number with its bounds by what the column stores: exact integer limits
+  // read from the metadata text on an integer column, nearest doubles on a `float` column. The
+  // client sees neither and reads every bound as its nearest double, so its feedback checks a number
+  // against number bounds only and leaves a bigint or exact decimal value, and a whole bound beyond
+  // the safe range, to the server's 400.
+
+  type Bound = FieldValidation['lower'];
+
+  /** The plain number field of the fixture with the bounds given. */
+  function boundedNumber(lower: Bound, upper: Bound): FieldDefinition {
+    const field = fieldByName(NUMBER);
+    return { ...field, validation: { ...field.validation, lower, upper } };
+  }
+
+  /** The value typed text stands for, as the number control enters it. */
+  function typed(text: string): FieldValue {
+    const value = numberFromText(text);
+    if (value === null) {
+      throw new Error(`${text} is not a number`);
+    }
+    return value;
+  }
+
+  const AGE = fieldByName('Age');
+
+  // The metadata bound 9007199254740993 as the client reads it: its nearest double, 2^53.
+  const BEYOND_SAFE = 2 ** 53;
+
+  // RecordValidatorTests reject ±9007199254740994 against the bounds ±9007199254740993 on `bigint`;
+  // the client, which cannot see the column or the exact bound, leaves such comparisons to the server.
+  const UNSAFE_BOUNDED = boundedNumber(-BEYOND_SAFE, BEYOND_SAFE);
+
+  it.each<[string, FieldDefinition, FieldValue, string[]]>([
+    ['a bigint above an upper bound beyond the safe range', UNSAFE_BOUNDED, 9007199254740994n, []],
+    ['a bigint below a lower bound beyond the safe range', UNSAFE_BOUNDED, -9007199254740994n, []],
+    ['a number below a lower bound beyond the safe range', boundedNumber(BEYOND_SAFE, null), 5, []],
+    // The number mask still counts a bigint's digits, which a `float` column's double never has fewer of.
+    ['a bigint beyond a number range', AGE, 9007199254740993n, [clientMessages.patternMismatch('###')]],
+    ['an exact decimal beyond a number range and a number mask', AGE, typed('9007199254740992.5'), []],
+    [
+      'a number below a number lower bound beside an upper bound beyond the safe range',
+      boundedNumber(10, BEYOND_SAFE),
+      5,
+      [clientMessages.rangeAtLeast('10')],
+    ],
+  ])('gives feedback on %s only where the server compares alike on every column', (_case, field, value, messages) => {
+    expect(validateField(field, value)).toEqual(messages);
+  });
+
+  it.each<[string, Bound, Bound, number | bigint, string[] | null]>([
+    // A `float` column compares 2^53 with the double of 9007199254740993, which is 2^53, and accepts it.
+    ['a bigint below a float lower bound beyond the safe range', BEYOND_SAFE, null, 9007199254740992n, null],
+    // A `bigint` column's upper limit is 18014398509481985, the floor of the metadata bound
+    // 18014398509481985.25, whose nearest double, 18014398509481984, is the bound the client reads.
+    [
+      'a bigint above the nearest double of a fractional upper bound',
+      null,
+      2 ** 54,
+      18014398509481985n,
+      null,
+    ],
+    ['a number above an upper bound of 120', 0, 120, 121, [clientMessages.rangeBetween('0', '120')]],
+  ])('saves or stops %s as the server would', async (_case, lower, upper, value, errors) => {
+    const definition = withField(NUMBER, (field) => ({ ...field, validation: { ...field.validation, lower, upper } }));
+    const { api, result, record } = mountExisting(storedRecord(), definition);
+    edit(result, NUMBER, value);
+    if (errors === null) {
+      api.reply(jsonResponse(200, savedCopy(record, { [NUMBER]: value })));
+    }
+
+    expect(await perform(() => result.current.save())).toBe(errors === null);
+
+    expect(api.calls.map((call) => call.text)).toEqual(
+      errors === null ? [`{"values":{${JSON.stringify(NUMBER)}:${String(value)}}}`] : [],
+    );
+    expect(result.current.fieldErrors).toEqual(errors === null ? {} : { [NUMBER]: errors });
+  });
+
+  it('reads every integer beyond the safe range that a bigint column holds as its bigint, whatever its form, and every other number as a double', async () => {
+    // A whole record, so the body passes the client's check of the record's contract shape.
+    const text =
+      '{"globalRecordId":"g","uniqueKey":1,"recStatus":1,"position":1,"count":1,' +
+      '"values":{"a":9007199254740992,"b":9007199254740993,"c":-9223372036854775808,' +
+      '"d":9223372036854775807,"e":1E+16,"f":9.007199254740993e15,"g":9223372036854775808,' +
+      '"h":-9223372036854775809,"i":9007199254740991,"j":-9007199254740991,"k":1.5,"l":-0}}';
+    const read = await clientAnswering(text).getRecord(VIEW_ID, 'any');
+
+    expect(read.ok && read.data.values).toEqual({
+      a: 9007199254740992n,
+      b: 9007199254740993n,
+      c: -9223372036854775808n,
+      d: 9223372036854775807n,
+      e: 10000000000000000n,
+      f: 9007199254740993n,
+      // Beyond the 64-bit range no integer column holds the value, so its double serves.
+      g: 2 ** 63,
+      h: -(2 ** 63),
+      i: 9007199254740991,
+      j: -9007199254740991,
+      k: 1.5,
+      l: -0,
+    });
+  });
+
+  // ±9007199254740993 at every number of each response body: a field value, wherever its
+  // map entry's name, is its bigint; every other number, such as a `tabIndex`, `uniqueKey`,
+  // `count`, bound or option value, is the double JSON.parse reads, ±2^53, so arithmetic on it
+  // never meets a bigint.
+  const UNSAFE = '9007199254740993';
+  const EXACT = 9007199254740993n;
+  const DOUBLE = 2 ** 53;
+
+  it.each<[string, (client: ApiClient) => Promise<ApiResult<unknown>>, string, unknown]>([
+    [
+      'a record',
+      (client) => client.getRecord(VIEW_ID, 'g'),
+      `{"globalRecordId":"g","uniqueKey":${UNSAFE},"recStatus":1,"position":${UNSAFE},"count":${UNSAFE},` +
+        `"values":{"a":${UNSAFE},"count":-${UNSAFE},"tabIndex":${UNSAFE}}}`,
+      {
+        globalRecordId: 'g',
+        uniqueKey: DOUBLE,
+        recStatus: 1,
+        position: DOUBLE,
+        count: DOUBLE,
+        values: { a: EXACT, count: -EXACT, tabIndex: EXACT },
+      },
+    ],
+    [
+      'a form definition',
+      (client) => client.getForm(VIEW_ID),
+      `{"viewId":${UNSAFE},"name":"F","pages":[{"pageId":${UNSAFE},"name":"P","position":${UNSAFE},"fields":[` +
+        `{"name":"n","fieldType":"number","prompt":null,"tabIndex":${UNSAFE},"pageId":${UNSAFE},"unsupported":false,` +
+        `"unsupportedType":null,"validation":{"required":false,"readOnly":false,"maxLength":${UNSAFE},` +
+        `"lower":-${UNSAFE},"upper":${UNSAFE},"pattern":null},"options":null,"members":null},` +
+        `{"name":"o","fieldType":"option","prompt":null,"tabIndex":-${UNSAFE},"pageId":${UNSAFE},"unsupported":false,` +
+        `"unsupportedType":null,"validation":{"required":false,"readOnly":false,"maxLength":null,"lower":null,` +
+        `"upper":null,"pattern":null},"options":[{"value":${UNSAFE},"label":"l"}],"members":null}]}],` +
+        `"unsupportedCheckCode":[{"severity":"warning","form":"F","line":${UNSAFE},"command":"c","message":"m"}],` +
+        `"canInsert":null,"canUpdate":null,"canDelete":null}`,
+      {
+        viewId: DOUBLE,
+        name: 'F',
+        pages: [
+          {
+            pageId: DOUBLE,
+            name: 'P',
+            position: DOUBLE,
+            fields: [
+              {
+                name: 'n',
+                fieldType: 'number',
+                prompt: null,
+                tabIndex: DOUBLE,
+                pageId: DOUBLE,
+                unsupported: false,
+                unsupportedType: null,
+                validation: { required: false, readOnly: false, maxLength: DOUBLE, lower: -DOUBLE, upper: DOUBLE, pattern: null },
+                options: null,
+                members: null,
+              },
+              {
+                name: 'o',
+                fieldType: 'option',
+                prompt: null,
+                tabIndex: -DOUBLE,
+                pageId: DOUBLE,
+                unsupported: false,
+                unsupportedType: null,
+                validation: { required: false, readOnly: false, maxLength: null, lower: null, upper: null, pattern: null },
+                options: [{ value: DOUBLE, label: 'l' }],
+                members: null,
+              },
+            ],
+          },
+        ],
+        unsupportedCheckCode: [{ severity: 'warning', form: 'F', line: DOUBLE, command: 'c', message: 'm' }],
+        canInsert: null,
+        canUpdate: null,
+        canDelete: null,
+      },
+    ],
+    [
+      'a records page',
+      (client) => client.listRecords(VIEW_ID),
+      `{"items":[{"globalRecordId":"g","uniqueKey":${UNSAFE},"recStatus":1,"values":{"a":${UNSAFE}}}],` +
+        `"total":${UNSAFE},"page":${UNSAFE},"pageSize":${UNSAFE}}`,
+      {
+        items: [{ globalRecordId: 'g', uniqueKey: DOUBLE, recStatus: 1, values: { a: EXACT } }],
+        total: DOUBLE,
+        page: DOUBLE,
+        pageSize: DOUBLE,
+      },
+    ],
+    [
+      'a search response',
+      (client) => client.searchRecords(VIEW_ID, { criteria: [] }),
+      `{"items":[{"globalRecordId":"g","uniqueKey":${UNSAFE},"recStatus":1,"position":${UNSAFE},` +
+        `"values":{"a":${UNSAFE}}}],"total":${UNSAFE},"truncated":true}`,
+      {
+        items: [{ globalRecordId: 'g', uniqueKey: DOUBLE, recStatus: 1, position: DOUBLE, values: { a: EXACT } }],
+        total: DOUBLE,
+        truncated: true,
+      },
+    ],
+    [
+      'a field-event response',
+      (client) => client.raiseFieldEvent(VIEW_ID, { event: 'FieldAfter', fieldName: 'a', values: {} }),
+      `{"enabled":[],"disabled":[],"cleared":[],"assigned":{"a":${UNSAFE},"uniqueKey":-${UNSAFE}},"dialogs":[],` +
+        `"diagnostics":[{"severity":"error","form":"F","line":${UNSAFE},"command":"c","message":"m"}]}`,
+      {
+        enabled: [],
+        disabled: [],
+        cleared: [],
+        assigned: { a: EXACT, uniqueKey: -EXACT },
+        dialogs: [],
+        diagnostics: [{ severity: 'error', form: 'F', line: DOUBLE, command: 'c', message: 'm' }],
+      },
+    ],
+    ['a record count', (client) => client.countRecords(VIEW_ID), `{"count":${UNSAFE}}`, { count: DOUBLE }],
+    [
+      'a navigation position',
+      (client) => client.getRecordPosition(VIEW_ID, 'g'),
+      `{"position":${UNSAFE},"count":${UNSAFE}}`,
+      { position: DOUBLE, count: DOUBLE },
+    ],
+    [
+      'the forms list',
+      (client) => client.listForms(),
+      `[{"viewId":${UNSAFE},"name":"F","pageCount":${UNSAFE}}]`,
+      [{ viewId: DOUBLE, name: 'F', pageCount: DOUBLE }],
+    ],
+  ])('reads %s with its field values exact and every other number as JSON.parse does', async (_case, read, text, expected) => {
+    const result = await read(clientAnswering(text));
+
+    expect(result.ok && result.data).toEqual(expected);
+  });
+
+  it.each<[string, string]>([
+    ['escapes, unicode and a repeated key', '{"values":{"a":"q\\"b\\\\s\\/\\u00e9\\ud83d\\ude00\\n\\t","b":"x","a":"last"}}'],
+    ['members named __proto__ and constructor', '{"values":{"__proto__":"own","constructor":{"__proto__":[1]}}}'],
+    ['whitespace, nesting and every literal', ' \n{ "values" : { "a" : [ 1 , -0 , 1.5e-7 , 1E+20 , -2.5E-3 , true , false , null , { } , [ ] ] } }\r\n\t'],
+    ['the numbers a double holds exactly', '{"values":{"a":9007199254740991,"b":-9007199254740991,"c":0,"d":1e308,"e":5e-324}}'],
+  ])('reads a body with %s as JSON.parse does', async (_case, text) => {
+    // A field-event answer is passed on as parsed, unchecked, so any JSON body shows the reader;
+    // its `values` entries sit where a record's field values do.
+    const read = await clientAnswering(text).raiseFieldEvent(VIEW_ID, { event: 'FieldAfter', fieldName: 'a', values: {} });
+    const expected: unknown = JSON.parse(text);
+
+    expect(read.ok && read.data).toEqual(expected);
+  });
+
+  it.each<string>([
+    '{"values":{"a":01}}',
+    '{"values":}',
+    '{"values":[1,]}',
+    '{"values":{"a":1,}}',
+    '{"values":{"a" 1}}',
+    '{"values":{"a":"\\x"}}',
+    '{"values":{"a":"\t"}}',
+    '{"values":{"a":"unterminated}}',
+    '{"values":{}} trailing',
+    '{"values":{"a":tru}}',
+  ])('reports the malformed OK body %j as a failed exchange, as JSON.parse rejects it', async (text) => {
+    expect((): unknown => JSON.parse(text)).toThrow(SyntaxError);
+
+    const read = await clientAnswering(text).getRecord(VIEW_ID, 'any');
+
+    expect(read.ok).toBe(false);
+    expect(read.ok ? null : read.error.kind).toBe('network');
   });
 });

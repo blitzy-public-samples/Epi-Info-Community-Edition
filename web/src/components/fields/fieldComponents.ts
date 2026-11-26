@@ -5,6 +5,7 @@
 // `fieldType` (Phone Number and Comment Legal to `text`, Yes/No to `unsupported`),
 // so nothing here matches type names.
 import type { ComponentType, ReactNode } from 'react';
+import { isExactDecimal } from '../../api/client';
 import type { FieldDefinition, FieldType, FieldValue } from '../../api/types';
 import { CheckboxInput } from './CheckboxInput';
 import { DateInput } from './DateInput';
@@ -125,7 +126,11 @@ export function fieldTextValue(value: FieldValue): string {
   if (value === null || value === undefined) {
     return '';
   }
-  return typeof value === 'string' ? value : String(value);
+  if (typeof value === 'string') {
+    return value;
+  }
+  // An exact decimal is the number typed, shown as its JSON literal.
+  return isExactDecimal(value) ? value.literal : String(value);
 }
 
 // Import cycle: the components import helpers from here, so every helper and component stays a hoisted `function` declaration and nothing reads this map at module evaluation.

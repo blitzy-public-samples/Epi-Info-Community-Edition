@@ -2,9 +2,15 @@
 // required gate of src/EpiInfo.Domain/Validation/RecordValidator.cs, with the pattern rule of
 // MaskPattern.cs. The server stays authoritative. Every check here is one the server makes, or a
 // weaker form of it, so the client never blocks a save the server would accept; what the client
-// cannot decide (column lengths, integer-column storage, unknown, repeated or ambiguous names) is
-// left to the server's 400 `errors` map. No message ever contains a submitted value, only metadata.
+// cannot decide (column lengths, integer-column storage, the range of a bigint or exact decimal
+// value or against a whole bound beyond the safe range, the number mask of an exact decimal,
+// unknown, repeated or ambiguous names) is left to the server's 400 `errors` map. No message ever contains a submitted
+// value, only metadata.
+import { isExactDecimal } from '../api/client';
 import type { FieldDefinition, FieldType, FieldValue, FormDefinition, PageDefinition, Values } from '../api/types';
+
+// A submitted value that is not empty.
+type PresentValue = NonNullable<FieldValue>;
 
 /**
  * Messages keyed by canonical field name; only fields with at least one message appear. The maps
@@ -130,8 +136,13 @@ function isIsoDateBound(bound: FieldValue | undefined): bound is string {
   return typeof bound === 'string' && ISO_DATE.test(bound);
 }
 
+// A number bound the client checks: a finite number that is not a whole number beyond the safe range.
+// Such a bound may be the nearest double of a different metadata bound, which a message would then
+// misstate; see checkRange.
 function isNumberBound(bound: FieldValue | undefined): bound is number {
-  return typeof bound === 'number' && Number.isFinite(bound);
+  return (
+    typeof bound === 'number' && Number.isFinite(bound) && (!Number.isInteger(bound) || Number.isSafeInteger(bound))
+  );
 }
 
 /**
@@ -182,15 +193,21 @@ export function validateField(field: FieldDefinition, value: FieldValue | undefi
   return messages;
 }
 
-// The wire type of each field type, then the datetime storage range for dates.
-function checkType(field: FieldDefinition, value: string | number | boolean): string | null {
+// The wire type of each field type, then the datetime storage range for dates. A bigint is a
+// number: an exact integer beyond the safe range; so is an exact decimal, a typed fraction that
+// is written as the JSON number typed.
+function checkType(field: FieldDefinition, value: PresentValue): string | null {
   switch (field.fieldType) {
     case 'text':
     case 'multiline':
     case 'legalValues':
       return typeof value === 'string' ? null : clientMessages.textExpected;
     case 'number':
-      return typeof value === 'number' && Number.isFinite(value) ? null : clientMessages.numberExpected;
+      return typeof value === 'bigint' ||
+        isExactDecimal(value) ||
+        (typeof value === 'number' && Number.isFinite(value))
+        ? null
+        : clientMessages.numberExpected;
     case 'date':
       if (typeof value !== 'string' || !isCalendarDate(value)) {
         return clientMessages.dateExpected;
@@ -206,8 +223,9 @@ function checkType(field: FieldDefinition, value: string | number | boolean): st
 }
 
 // In the server's order: a value that is not a whole number is the wrong type whatever the options;
-// only then does an empty option list, and then the index bounds, decide.
-function checkOptionIndex(field: FieldDefinition, value: string | number | boolean): string | null {
+// only then does an empty option list, and then the index bounds, decide. A bigint lies beyond
+// every index, and an exact decimal is not a whole number.
+function checkOptionIndex(field: FieldDefinition, value: PresentValue): string | null {
   if (typeof value !== 'number' || !Number.isInteger(value)) {
     return clientMessages.optionExpected;
   }
@@ -222,7 +240,15 @@ function checkOptionIndex(field: FieldDefinition, value: string | number | boole
 
 // Inclusive bounds of the field's own kind: numbers on a number field, ISO dates (compared as text,
 // which orders them by date) on a date field. A bound of any other kind is ignored, as on the server.
-function checkRange(field: FieldDefinition, value: string | number | boolean): string | null {
+//
+// The server compares a number by what its column stores: with exact integer limits read from the
+// metadata text on an integer column, and as nearest doubles on a `float` column. The client knows
+// neither the column nor that text; a bound arrives as its nearest double, so 18014398509481985.25
+// arrives as 18014398509481984. So only a number value is checked, and only against number bounds:
+// rounding to a double is monotonic, so there the client never rejects a value the server accepts on
+// either column. A bigint or exact decimal value, and a whole bound beyond the safe range, are left to
+// the server's 400, and a message names only the bounds checked here.
+function checkRange(field: FieldDefinition, value: PresentValue): string | null {
   const { lower, upper } = field.validation;
 
   if (field.fieldType === 'number' && typeof value === 'number') {
@@ -336,7 +362,7 @@ function interpretPattern(pattern: string | null | undefined, fieldType: FieldTy
  * - a text-family `#` mask such as `###-###-####` needs exactly the mask's length, an ASCII digit at
  *   each `#` and the identical character everywhere else;
  * - a number mask such as `###` or `###.#` bounds the integer and decimal digits of the number's
- *   plain positional form, after one leading sign;
+ *   plain positional form, after one leading sign; an exact decimal is left to the server;
  * - a blank pattern, a date pattern and any other pattern check nothing.
  * A `null` value, or one not of the kind the mask checks, passes: type errors are reported apart.
  */
@@ -350,7 +376,14 @@ export function matchesPattern(field: FieldDefinition, value: FieldValue | undef
     case 'textDigitMask':
       return typeof value !== 'string' || matchesTextMask(rule.mask, value);
     case 'numberMask':
-      if (typeof value !== 'number') {
+      // A bigint's decimal digits are already its plain positional form. A `float` column's double
+      // of it has at least as many integer digits, so this is never stricter than the server.
+      if (typeof value === 'bigint') {
+        return fitsDigitBudget(value.toString(), rule.maxIntegerDigits, rule.maxDecimalDigits);
+      }
+      // An exact decimal is left to the server: an integer column rejects it as not whole, and a
+      // `float` column counts the digits of its nearest double, which the typed digits do not give.
+      if (isExactDecimal(value) || typeof value !== 'number') {
         return true;
       }
       return (

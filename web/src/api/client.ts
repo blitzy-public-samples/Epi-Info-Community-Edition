@@ -13,13 +13,22 @@
 // The client is stateless: no retries, caching or timers. Retry decisions belong to
 // isSafeToResend and the hooks, and values are sent exactly as the caller gives them,
 // because the editor alone decides which fields a save carries.
+//
+// Field values are exact in both directions: a field value that is a JSON integer beyond
+// ±Number.MAX_SAFE_INTEGER that a `bigint` column can hold, such as 9007199254740993, is
+// read as a bigint rather than rounded to the nearest double, and a bigint is written as
+// that JSON integer, digit for digit. Every other number, such as a `tabIndex` or a
+// `count`, is read as JSON.parse reads it. A number typed as a fraction whose nearest
+// double is whole, such as 9007199254740992.5, is an ExactDecimal and is written as the
+// literal typed, never as that whole double. The wire keeps plain JSON numbers.
 import createClient from 'openapi-fetch';
 
 import { isAbortError, networkError, parseProblem, type ApiError } from './errors';
-import type { paths } from './schema';
+import type { components, paths } from './schema';
 import type {
   Diagnostic,
   DiagnosticSeverity,
+  ExactDecimal,
   FieldDefinition,
   FieldEventRequest,
   FieldEventResponse,
@@ -35,6 +44,7 @@ import type {
   RecordDto,
   RecordPage,
   RecordSummary,
+  RecordWriteRequest,
   SearchRequest,
   SearchResponse,
   SearchResult,
@@ -280,8 +290,11 @@ function isArrayOf<T>(value: unknown, isItem: (item: unknown) => item is T): val
   return items.every(isItem);
 }
 
+// A field value as parseJson reads one: a bigint is a whole number beyond the safe range
+// that it kept exact (FIELD_VALUE_PATHS). No response carries an ExactDecimal, so an
+// object is never a field value here.
 function isFieldValue(value: unknown): value is FieldValue {
-  return value === null || isString(value) || isBoolean(value) || isFiniteNumber(value);
+  return value === null || isString(value) || isBoolean(value) || isFiniteNumber(value) || typeof value === 'bigint';
 }
 
 /** A `values` map: an object whose own entries are all scalar field values. */
@@ -454,6 +467,486 @@ function pageOrigin(): string {
   return window.location.origin;
 }
 
+// Exact numbers
+
+// A decimal literal as Number() reads one, such as 9.007199254740993e15: an optional sign,
+// digits with an optional point, and an optional exponent. `Infinity` and the 0x, 0o and 0b
+// forms do not match.
+const DECIMAL_LITERAL = /^([+-]?)(\d*)(?:\.(\d*))?(?:[eE]([+-]?\d+))?$/;
+
+// The 0x, 0o and 0b integers, which Number() reads unsigned and BigInt() reads alike.
+const NON_DECIMAL_INTEGER = /^0[xXoObB]/;
+
+// The signed 64-bit range, a `bigint` column's. Beyond it a number is outside every integer
+// column's range and a `float` column stores its nearest double, so that double serves as
+// well as the exact value would.
+const MIN_INT64 = -(2n ** 63n);
+const MAX_INT64 = 2n ** 63n - 1n;
+
+// The exact integer a numeric literal stands for, or `null` when it stands for a fraction.
+// It is only asked about a literal whose nearest double is a whole number beyond the safe
+// range and below 2^64, so the digits it builds stay short.
+function exactInteger(literal: string): bigint | null {
+  if (NON_DECIMAL_INTEGER.test(literal)) {
+    return BigInt(literal);
+  }
+
+  const match = DECIMAL_LITERAL.exec(literal);
+  if (match === null) {
+    return null;
+  }
+
+  // The literal is sign × digits × 10^shift; BigInt() ignores leading zeros.
+  const [, sign = '', whole = '', fraction = '', exponent = '0'] = match;
+  const digits = whole + fraction;
+  const shift = Number(exponent) - fraction.length;
+  if (shift >= 0) {
+    return BigInt(sign + digits + '0'.repeat(shift));
+  }
+
+  const point = digits.length + shift;
+  return point > 0 && /^0*$/.test(digits.slice(point)) ? BigInt(sign + digits.slice(0, point)) : null;
+}
+
+// A number as a field value holds it: the nearest double, except that a whole number beyond
+// ±Number.MAX_SAFE_INTEGER within the signed 64-bit range is the exact bigint the literal
+// stands for, so 9007199254740993 never becomes 9007199254740992. A fraction keeps its
+// nearest double.
+function exactNumber(literal: string): number | bigint {
+  const nearest = Number(literal);
+  // A double of 2^64 or more lies beyond the 64-bit range whatever value it was rounded from.
+  if (!Number.isInteger(nearest) || Number.isSafeInteger(nearest) || Math.abs(nearest) >= 2 ** 64) {
+    return nearest;
+  }
+
+  const exact = exactInteger(literal);
+  return exact !== null && exact >= MIN_INT64 && exact <= MAX_INT64 ? exact : nearest;
+}
+
+// Typed fractions
+
+// The number grammar of RFC 8259 over a whole text: the form an ExactDecimal's literal takes.
+const JSON_NUMBER_TOKEN = /^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$/;
+
+// Whether whole.fraction × 10^exponent is a whole number, decided from the digits alone so
+// that no exponent, however large, builds a string: it is when every digit after the point
+// the exponent moves is zero, as it is for zero itself. A huge exponent is ±Infinity here.
+function isWholeDecimal(whole: string, fraction: string, exponent: number): boolean {
+  const digits = whole + fraction;
+  const point = whole.length + exponent;
+  if (point >= digits.length) {
+    return true;
+  }
+  return /^0*$/.test(digits.slice(Math.max(point, 0)));
+}
+
+// The JSON number token of a decimal literal that is not a whole number, else `null`: the
+// sign without `+`, the integer part without leading zeros (`0` when it has no digits), the
+// fraction digits as typed after a point only when there are any, and the exponent as typed.
+function fractionLiteral(literal: string): string | null {
+  const match = DECIMAL_LITERAL.exec(literal);
+  if (match === null) {
+    return null;
+  }
+
+  const [, sign = '', whole = '', fraction = '', exponent] = match;
+  if ((whole === '' && fraction === '') || isWholeDecimal(whole, fraction, Number(exponent ?? '0'))) {
+    return null;
+  }
+
+  const integerPart = whole.replace(/^0+/, '');
+  return (
+    (sign === '-' ? '-' : '') +
+    (integerPart === '' ? '0' : integerPart) +
+    (fraction === '' ? '' : `.${fraction}`) +
+    (exponent === undefined ? '' : `e${exponent}`)
+  );
+}
+
+/**
+ * The number that typed text stands for, as a number field holds it: `null` when the
+ * trimmed text is blank or is not a finite number (`abc`, `1e400`); otherwise the nearest
+ * double, except that:
+ * - an integer beyond ±`Number.MAX_SAFE_INTEGER` within the signed 64-bit range is the
+ *   exact bigint (`9007199254740993`, `9.007199254740993e15`), as the client reads it
+ *   from JSON;
+ * - a number that is not whole but whose nearest double is (`9007199254740992.5`,
+ *   `2.0000000000000001`, `1e-400`) is the frozen {@link ExactDecimal} of its literal,
+ *   which the client writes bare, so it never reaches the server as that whole double.
+ *
+ * Every other fraction, such as `34.5` or `0.1`, and every other whole number, such as
+ * `1e20`, is its nearest double. The text is read as Number() reads it: surrounding
+ * whitespace, a sign, a point, an exponent, and the 0x, 0o and 0b forms.
+ */
+export function numberFromText(text: string): number | bigint | ExactDecimal | null {
+  const trimmed = text.trim();
+  if (trimmed === '' || !Number.isFinite(Number(trimmed))) {
+    return null;
+  }
+
+  const value = exactNumber(trimmed);
+  const literal = typeof value === 'number' && Number.isInteger(value) ? fractionLiteral(trimmed) : null;
+  if (literal === null) {
+    return value;
+  }
+  const decimal: ExactDecimal = Object.freeze({ kind: 'decimal', literal });
+  return decimal;
+}
+
+/**
+ * Whether `value` is an {@link ExactDecimal}: an object of kind `decimal` whose `literal` is
+ * a JSON number token, so writing it bare can only ever write a number.
+ */
+export function isExactDecimal(value: unknown): value is ExactDecimal {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    'kind' in value &&
+    value.kind === 'decimal' &&
+    'literal' in value &&
+    typeof value.literal === 'string' &&
+    JSON_NUMBER_TOKEN.test(value.literal)
+  );
+}
+
+/**
+ * Whether two field values are the same value: `Object.is`, so a bigint compares by value
+ * and -0 differs from 0, except that two {@link ExactDecimal}s are the same when their
+ * literals are equal, whichever objects hold them.
+ */
+export function sameFieldValue(a: FieldValue, b: FieldValue): boolean {
+  return isExactDecimal(a) && isExactDecimal(b) ? a.literal === b.literal : Object.is(a, b);
+}
+
+// Exact JSON
+//
+// JSON.parse rounds every number to a double, and JSON.stringify throws on a bigint, so
+// response bodies are read and request bodies written here. Both match the built-ins for
+// every other value. A response is read exactly only at its field values; every other
+// number, such as a `tabIndex`, a `uniqueKey` or a `count`, is the double JSON.parse reads,
+// as its type says, so arithmetic on it never meets a bigint.
+
+// The body an OK response of each ApiClient call carries.
+type ResponseBody = {
+  [K in keyof ApiClient]: Extract<Awaited<ReturnType<ApiClient[K]>>, { ok: true }>['data'];
+}[keyof ApiClient];
+
+type MemberPath<Path extends string, Key extends string> = Path extends '' ? Key : `${Path}.${Key}`;
+
+// The paths of T's members, as FIELD_VALUE_PATHS writes them: for `Kind` 'fieldValue' its
+// field values, the members whose client type admits a bigint; for `Kind` 'number' its
+// other numbers.
+type PathsOf<T, Kind extends 'fieldValue' | 'number', Path extends string = ''> = [bigint] extends [T]
+  ? Kind extends 'fieldValue'
+    ? Path
+    : never
+  : T extends readonly (infer Item)[]
+    ? PathsOf<Item, Kind, `${Path}[]`>
+    : T extends number
+      ? Kind extends 'number'
+        ? Path
+        : never
+      : T extends object
+        ? {
+            [K in keyof T & string]-?: PathsOf<T[K], Kind, MemberPath<Path, string extends K ? '*' : K>>;
+          }[keyof T & string]
+        : never;
+
+// A path as the reader matches it: `*` matches every key.
+type PathPattern<Path extends string> = Path extends `${infer Head}*${infer Tail}`
+  ? `${Head}${string}${PathPattern<Tail>}`
+  : Path;
+
+// `FieldValues`, unless a field-value path matches one of `Numbers` or one of them matches
+// it, which the reader would then read exactly: the result then names that path instead,
+// so the path list below fails tsc.
+type Unambiguous<FieldValues extends string, Numbers extends string> = [
+  Extract<Numbers, PathPattern<FieldValues>>,
+] extends [never]
+  ? [Extract<FieldValues, PathPattern<Numbers>>] extends [never]
+    ? FieldValues
+    : `${Extract<FieldValues, PathPattern<Numbers>>} is both a field value and another number`
+  : `${Extract<Numbers, PathPattern<FieldValues>>} is both a field value and another number`;
+
+type FieldValuePath = Unambiguous<PathsOf<ResponseBody, 'fieldValue'>, PathsOf<ResponseBody, 'number'>>;
+
+// Where a response body holds field values: members by name joined by `.`, an array's items
+// as `[]` after it, and the entries of a map keyed by field name as `*`. Typed by the
+// response types, so tsc fails when an entry is missing, extra, or matches another number.
+const FIELD_VALUE_PATHS: Readonly<Record<FieldValuePath, true>> = {
+  // RecordDto
+  'values.*': true,
+  // RecordPage and SearchResponse items
+  'items[].values.*': true,
+  // FieldEventResponse
+  'assigned.*': true,
+};
+
+// One position of FIELD_VALUE_PATHS: where its named members, its entries and its items
+// lead, and whether a number there is a field value.
+interface JsonPath {
+  readonly members: Map<string, JsonPath>;
+  entries: JsonPath | undefined;
+  items: JsonPath | undefined;
+  fieldValue: boolean;
+}
+
+function jsonPath(): JsonPath {
+  return { members: new Map(), entries: undefined, items: undefined, fieldValue: false };
+}
+
+// The positions of `paths`, from the body itself down.
+function jsonPaths(paths: readonly string[]): JsonPath {
+  const body = jsonPath();
+  for (const path of paths) {
+    let at = body;
+    // 'items[].values.*' -> items, [], values, *
+    for (const segment of path.split(/\.|(?=\[\])/)) {
+      if (segment === '[]') {
+        at = at.items ??= jsonPath();
+      } else if (segment === '*') {
+        at = at.entries ??= jsonPath();
+      } else {
+        const member = at.members.get(segment) ?? jsonPath();
+        at.members.set(segment, member);
+        at = member;
+      }
+    }
+    at.fieldValue = true;
+  }
+  return body;
+}
+
+const RESPONSE_BODY: JsonPath = jsonPaths(Object.keys(FIELD_VALUE_PATHS));
+
+interface JsonCursor {
+  readonly text: string;
+  at: number;
+}
+
+// The number grammar of RFC 8259, matched at the cursor.
+const JSON_NUMBER = /-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?/y;
+
+const JSON_WHITESPACE = ' \t\n\r';
+
+function jsonSyntaxError(cursor: JsonCursor): SyntaxError {
+  return new SyntaxError(`Unexpected JSON at position ${String(cursor.at)}`);
+}
+
+function skipJsonWhitespace(cursor: JsonCursor): void {
+  while (cursor.at < cursor.text.length && JSON_WHITESPACE.includes(cursor.text[cursor.at])) {
+    cursor.at++;
+  }
+}
+
+// `path` is the value's position in FIELD_VALUE_PATHS, `undefined` outside every path.
+function readJsonValue(cursor: JsonCursor, path: JsonPath | undefined): unknown {
+  skipJsonWhitespace(cursor);
+  switch (cursor.text[cursor.at]) {
+    case '{':
+      return readJsonObject(cursor, path);
+    case '[':
+      return readJsonArray(cursor, path?.items);
+    case '"':
+      return readJsonString(cursor);
+    case 't':
+      return readJsonLiteral(cursor, 'true', true);
+    case 'f':
+      return readJsonLiteral(cursor, 'false', false);
+    case 'n':
+      return readJsonLiteral(cursor, 'null', null);
+    default:
+      return readJsonNumber(cursor, path?.fieldValue === true);
+  }
+}
+
+function readJsonLiteral<T>(cursor: JsonCursor, word: string, value: T): T {
+  if (!cursor.text.startsWith(word, cursor.at)) {
+    throw jsonSyntaxError(cursor);
+  }
+  cursor.at += word.length;
+  return value;
+}
+
+// A field value as exactNumber reads it; any other number as JSON.parse does, the nearest
+// double, which Number() gives for every token of the grammar.
+function readJsonNumber(cursor: JsonCursor, fieldValue: boolean): number | bigint {
+  JSON_NUMBER.lastIndex = cursor.at;
+  const match = JSON_NUMBER.exec(cursor.text);
+  if (match === null) {
+    throw jsonSyntaxError(cursor);
+  }
+  cursor.at = JSON_NUMBER.lastIndex;
+  return fieldValue ? exactNumber(match[0]) : Number(match[0]);
+}
+
+function readJsonString(cursor: JsonCursor): string {
+  const { text } = cursor;
+  const start = cursor.at;
+  let at = start + 1;
+  while (at < text.length && text[at] !== '"') {
+    if (text.charCodeAt(at) < 0x20) {
+      cursor.at = at;
+      throw jsonSyntaxError(cursor);
+    }
+    // A backslash escapes the next character; JSON.parse checks the escape below.
+    at += text[at] === '\\' ? 2 : 1;
+  }
+  cursor.at = at;
+  if (at >= text.length) {
+    throw jsonSyntaxError(cursor);
+  }
+  cursor.at = at + 1;
+
+  // JSON.parse decodes the escapes of the token, and rejects a malformed one, as it would in place.
+  const decoded: unknown = JSON.parse(text.slice(start, cursor.at));
+  if (typeof decoded !== 'string') {
+    throw jsonSyntaxError(cursor);
+  }
+  return decoded;
+}
+
+// `itemPath` is the position of every item in FIELD_VALUE_PATHS.
+function readJsonArray(cursor: JsonCursor, itemPath: JsonPath | undefined): unknown[] {
+  const items: unknown[] = [];
+  cursor.at++;
+  skipJsonWhitespace(cursor);
+  if (cursor.text[cursor.at] === ']') {
+    cursor.at++;
+    return items;
+  }
+
+  for (;;) {
+    items.push(readJsonValue(cursor, itemPath));
+    skipJsonWhitespace(cursor);
+    const next = cursor.text[cursor.at];
+    if (next === ']') {
+      cursor.at++;
+      return items;
+    }
+    if (next !== ',') {
+      throw jsonSyntaxError(cursor);
+    }
+    cursor.at++;
+  }
+}
+
+function readJsonObject(cursor: JsonCursor, path: JsonPath | undefined): Record<string, unknown> {
+  const object: Record<string, unknown> = {};
+  cursor.at++;
+  skipJsonWhitespace(cursor);
+  if (cursor.text[cursor.at] === '}') {
+    cursor.at++;
+    return object;
+  }
+
+  for (;;) {
+    skipJsonWhitespace(cursor);
+    if (cursor.text[cursor.at] !== '"') {
+      throw jsonSyntaxError(cursor);
+    }
+    const key = readJsonString(cursor);
+    skipJsonWhitespace(cursor);
+    if (cursor.text[cursor.at] !== ':') {
+      throw jsonSyntaxError(cursor);
+    }
+    cursor.at++;
+    // A named member before a map entry; a Map, so `__proto__` and `constructor` name no path.
+    const memberPath = path === undefined ? undefined : (path.members.get(key) ?? path.entries);
+    // As JSON.parse defines members: an own data property even for `__proto__`, and a
+    // repeated key keeps its first place and takes its last value.
+    Object.defineProperty(object, key, {
+      value: readJsonValue(cursor, memberPath),
+      writable: true,
+      enumerable: true,
+      configurable: true,
+    });
+    skipJsonWhitespace(cursor);
+    const next = cursor.text[cursor.at];
+    if (next === '}') {
+      cursor.at++;
+      return object;
+    }
+    if (next !== ',') {
+      throw jsonSyntaxError(cursor);
+    }
+    cursor.at++;
+  }
+}
+
+// JSON.parse of a response body with exact field values: the same value for the same text,
+// except that a field value (FIELD_VALUE_PATHS) that is a whole number beyond the safe
+// range and within the 64-bit range is the bigint it stands for. Throws a SyntaxError for
+// text that is not JSON. Nesting is recursive, which the API's shallow bodies never strain.
+function parseJson(text: string): unknown {
+  const cursor: JsonCursor = { text, at: 0 };
+  const value = readJsonValue(cursor, RESPONSE_BODY);
+  skipJsonWhitespace(cursor);
+  if (cursor.at < text.length) {
+    throw jsonSyntaxError(cursor);
+  }
+  return value;
+}
+
+// JSON.stringify of plain data (objects, arrays, strings, numbers, booleans, null), except
+// that a bigint is written as the JSON integer it holds, where JSON.stringify throws, and an
+// ExactDecimal as its literal, the JSON number typed, where JSON.stringify writes an object.
+// As JSON.stringify does, an `undefined`, function or symbol member is left out, and such an
+// array element is written as `null`.
+function serializeJson(value: unknown): string | undefined {
+  if (typeof value === 'bigint') {
+    return value.toString();
+  }
+  if (isExactDecimal(value)) {
+    return value.literal;
+  }
+  if (value === undefined || typeof value === 'function' || typeof value === 'symbol') {
+    return undefined;
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map((item: unknown) => serializeJson(item) ?? 'null').join(',')}]`;
+  }
+  if (typeof value === 'object' && value !== null) {
+    const members: string[] = [];
+    for (const [key, member] of Object.entries(value as Record<string, unknown>)) {
+      const written = serializeJson(member);
+      if (written !== undefined) {
+        members.push(`${JSON.stringify(key)}:${written}`);
+      }
+    }
+    return `{${members.join(',')}}`;
+  }
+  // A string, number (NaN and ±Infinity as null), boolean or null.
+  return JSON.stringify(value);
+}
+
+// openapi-fetch reads an OK body with Response.json() when the response carries a
+// Content-Length, and with text() and the global JSON.parse when it does not. The copy
+// therefore always carries one, and its json() is parseJson, so the field values of every
+// OK body are read exactly. Error bodies hold no field values and keep openapi-fetch's own
+// parsing.
+async function readingJsonExactly(response: Response): Promise<Response> {
+  if (!response.ok || response.status === 204 || response.status === 205) {
+    return response;
+  }
+
+  const text = await response.text();
+  // The copy holds the decoded text whole, so it is neither encoded nor chunked.
+  const headers = new Headers(response.headers);
+  headers.delete('Content-Encoding');
+  headers.delete('Transfer-Encoding');
+  headers.set('Content-Length', String(new TextEncoder().encode(text).byteLength));
+  const copy = new Response(text, { status: response.status, statusText: response.statusText, headers });
+  Object.defineProperty(copy, 'json', { value: () => Promise.resolve(text).then(parseJson) });
+  return copy;
+}
+
+// openapi-fetch types each body by the wire schema, whose numbers are never bigints or
+// ExactDecimals; serializeJson writes either as the JSON number that schema calls a
+// number. Each body is first checked against its client type, which the schema generates,
+// so contract drift still fails tsc.
+type WireSchemas = components['schemas'];
+
 /**
  * Builds a client for the API at `baseUrl`, by default the page's own origin: the API
  * serves the built client, and the development server proxies `/api` and `/health`, so
@@ -461,11 +954,13 @@ function pageOrigin(): string {
  * @throws Error when no `baseUrl` is given outside a browser.
  */
 export function createApiClient(options: ApiClientOptions = {}): ApiClient {
+  // openapi-fetch captures globalThis.fetch when the client is built; resolving it per
+  // call lets a fetch installed later, such as a test stub, reach the default client.
+  const send = options.fetch ?? ((request: Request) => globalThis.fetch(request));
   const http = createClient<paths>({
     baseUrl: options.baseUrl ?? pageOrigin(),
-    // openapi-fetch captures globalThis.fetch when the client is built; resolving it per
-    // call lets a fetch installed later, such as a test stub, reach the default client.
-    fetch: options.fetch ?? ((request: Request) => globalThis.fetch(request)),
+    fetch: async (request: Request) => readingJsonExactly(await send(request)),
+    bodySerializer: serializeJson,
   });
 
   return {
@@ -543,7 +1038,7 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
         () =>
           http.POST('/api/forms/{viewId}/records', {
             params: { path: { viewId } },
-            body: { values },
+            body: ({ values } satisfies RecordWriteRequest) as WireSchemas['RecordWriteRequest'],
             headers: jsonHeaders,
             ...abortable(signal),
           }),
@@ -557,7 +1052,7 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
         () =>
           http.PUT('/api/forms/{viewId}/records/{globalRecordId}', {
             params: { path: { viewId, globalRecordId } },
-            body: { values },
+            body: ({ values } satisfies RecordWriteRequest) as WireSchemas['RecordWriteRequest'],
             headers: jsonHeaders,
             ...abortable(signal),
           }),
@@ -579,7 +1074,7 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
         () =>
           http.POST('/api/forms/{viewId}/records/search', {
             params: { path: { viewId } },
-            body: request,
+            body: request as WireSchemas['SearchRequest'],
             headers: jsonHeaders,
             ...abortable(signal),
           }),
@@ -594,7 +1089,7 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
         () =>
           http.POST('/api/forms/{viewId}/checkcode/field-event', {
             params: { path: { viewId } },
-            body: request,
+            body: request as WireSchemas['FieldEventRequest'],
             headers: jsonHeaders,
             ...abortable(signal),
           }),

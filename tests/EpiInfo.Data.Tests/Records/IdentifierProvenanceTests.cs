@@ -230,11 +230,11 @@ public sealed class IdentifierProvenanceTests
             Record + nameof(RecordSqlBuilder.AppendSelectedSetPredicate),
             Record + nameof(RecordSqlBuilder.AppendGlobalRecordIdExclusion),
             Record + nameof(RecordSqlBuilder.Count),
-            Record + nameof(RecordSqlBuilder.Position),
             Record + nameof(RecordSqlBuilder.SetPositionLookup),
             Record + nameof(RecordSqlBuilder.RecordAt),
             Record + nameof(RecordSqlBuilder.RecordById),
             Record + nameof(RecordSqlBuilder.RecordByUniqueKey),
+            Record + nameof(RecordSqlBuilder.RecordSnapshot),
             Record + nameof(RecordSqlBuilder.InsertBase),
             Record + nameof(RecordSqlBuilder.InsertPage),
             Record + nameof(RecordSqlBuilder.LockBase),
@@ -244,7 +244,6 @@ public sealed class IdentifierProvenanceTests
             Record + nameof(RecordSqlBuilder.SoftDelete),
             Search + nameof(SearchSqlBuilder.Search),
             Search + nameof(SearchSqlBuilder.ListPage),
-            Search + nameof(SearchSqlBuilder.ListCount),
         };
         Assert.Subset(builders.Select(Describe).ToHashSet(StringComparer.Ordinal), expected);
 

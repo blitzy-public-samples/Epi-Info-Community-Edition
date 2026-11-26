@@ -468,7 +468,7 @@ public sealed class SqlRecordRepositoryTests : IAsyncLifetime
 
         IReadOnlyList<IdRow> positioned = await form.ReadBaseRowsAsync(
             transaction: null,
-            RecordSqlBuilder.SetPositionLookup(form.Schema, form.GlobalRecordId));
+            RecordSqlBuilder.SetPositionLookup(form.Schema, form.GlobalRecordId, includeDeleted: false));
         AssertSingleStoredRow(positioned, form, "The position lookup did not return exactly the seeded row.");
 
         IReadOnlyList<IdRow> loaded = await form.ReadRecordRowsAsync(
@@ -521,7 +521,7 @@ public sealed class SqlRecordRepositoryTests : IAsyncLifetime
 
         IReadOnlyList<IdRow> positioned = await form.ReadBaseRowsAsync(
             transaction: null,
-            RecordSqlBuilder.SetPositionLookup(form.Schema, paddedId));
+            RecordSqlBuilder.SetPositionLookup(form.Schema, paddedId, includeDeleted: false));
         Assert.True(positioned.Count == 0, "The position lookup matched a padded id to a stored row.");
 
         IReadOnlyList<IdRow> loaded = await form.ReadRecordRowsAsync(
@@ -598,7 +598,7 @@ public sealed class SqlRecordRepositoryTests : IAsyncLifetime
 
         IReadOnlyList<IdRow> positioned = await form.ReadBaseRowsAsync(
             transaction: null,
-            RecordSqlBuilder.SetPositionLookup(form.Schema, paddedId));
+            RecordSqlBuilder.SetPositionLookup(form.Schema, paddedId, includeDeleted: false));
         Assert.True(positioned.Count == 0, "The position lookup matched a padded id to a stored row.");
 
         IReadOnlyList<FoundRow> padded = await form.FindByIdAsync(record.GlobalRecordId, paddedId);
@@ -1312,6 +1312,11 @@ public sealed class ListAndFindSqlTests
     private const string IsoDateStyle = "23";
     private const string GridFilterEscapeClause = @" ESCAPE '\'";
 
+    // The table hint every held read carries, and the plan hints only the list ends with, which make the base table the
+    // outer input of each nested-loops page join.
+    private const string HoldLockHint = " WITH (HOLDLOCK)";
+    private const string ListPlanHints = " OPTION (FORCE ORDER, LOOP JOIN)";
+
     // The seeded CaseReport text field the Find pattern cases search, and the shortest seeded value they are built
     // from, long enough for every case's slices.
     private const string PatternField = "LastName";
@@ -1322,7 +1327,6 @@ public sealed class ListAndFindSqlTests
 
     // Fixed operation names reported to the command observer.
     private const string ListPageOperation = "test.listPage";
-    private const string ListCountOperation = "test.listCount";
     private const string FindOperation = "test.find";
 
     // The selected-set case searches a window of complete records: this many before the first deleted one, and this
@@ -1377,24 +1381,34 @@ public sealed class ListAndFindSqlTests
             patternReading.Total > expected.Total,
             $"The pattern reading of {q} matches {patternReading.Total} active records, no more than its literal match.");
 
+        // One statement returns both the page and the total of the filtered set.
         var list = form.BuildList(q);
         var listed = await form.ListAsync(list, cancellationToken);
         Assert.Equal(expected.Ids, listed.Ids);
         Assert.Equal(expected.Total, listed.Total);
 
-        foreach (var statement in new[] { list.Page, list.Count })
-        {
-            var pattern = Assert.Single(statement.Parameters, parameter => parameter.DbType == DbType.String);
-            Assert.Equal(escapedPattern, Assert.IsType<string>(pattern.Value));
+        var pattern = Assert.Single(list.Parameters, parameter => parameter.DbType == DbType.String);
+        Assert.Equal(escapedPattern, Assert.IsType<string>(pattern.Value));
 
-            // Every grid column's term compares with that pattern under the fixed collation and declares ESCAPE '\'.
-            var term = $" LIKE {pattern.Name} COLLATE {GridFilterCollation}{GridFilterEscapeClause}";
-            Assert.Equal(form.Grid.Count, CountOccurrences(statement.Text, term));
-        }
+        // Every grid column's term compares with that pattern under the fixed collation and declares ESCAPE '\'.
+        var term = $" LIKE {pattern.Name} COLLATE {GridFilterCollation}{GridFilterEscapeClause}";
+        Assert.Equal(form.Grid.Count, CountOccurrences(list.Text, term));
 
-        // The builder's statements are reads: the recorder saw them and no write.
-        Assert.NotEmpty(form.Recorder.ForOperation(ListPageOperation));
-        Assert.NotEmpty(form.Recorder.ForOperation(ListCountOperation));
+        // The count and the page read the filtered set twice in one statement, so every table it reads is held: the
+        // base table and each page joined for a grid column. The plan hints that read the base table first, before
+        // each of its page rows, end the statement.
+        var heldJoins = form.HeldListJoins();
+        Assert.NotEmpty(heldJoins);
+        Assert.Equal(heldJoins.Count + 1, CountOccurrences(list.Text, HoldLockHint));
+        Assert.Contains(
+            $"{SqlIdentifier.Quote(form.Schema.BaseTable)} {RecordSqlBuilder.BaseAlias}{HoldLockHint}",
+            list.Text,
+            StringComparison.Ordinal);
+        Assert.All(heldJoins, join => Assert.Contains(join, list.Text, StringComparison.Ordinal));
+        Assert.EndsWith(ListPlanHints, list.Text, StringComparison.Ordinal);
+
+        // The builder's statement is a read: the recorder saw it once and no write.
+        Assert.Single(form.Recorder.ForOperation(ListPageOperation));
         Assert.Empty(form.Recorder.Writes());
     }
 
@@ -1707,6 +1721,10 @@ public sealed class ListAndFindSqlTests
             find.Statement.Text,
             StringComparison.Ordinal);
 
+        // Find reads each row once, so unlike the list its page joins carry no hint and it forces no join order.
+        Assert.DoesNotContain("FORCE ORDER", find.Statement.Text, StringComparison.Ordinal);
+        Assert.DoesNotContain("LOOP JOIN", find.Statement.Text, StringComparison.Ordinal);
+
         Assert.Equal(expected, await form.FindPlacedAsync(find, cancellationToken));
 
         // The builder's statement is a read: the recorder saw it and no write.
@@ -1727,9 +1745,6 @@ public sealed class ListAndFindSqlTests
 
         return count;
     }
-
-    /// <summary>The two list statements the builder renders for one query: a page, and the count of the filtered set.</summary>
-    private sealed record ListStatements(SqlStatement Page, SqlStatement Count);
 
     /// <summary>The ids of one list page, in the order returned, and the list's total.</summary>
     private sealed record ListRows(IReadOnlyList<string> Ids, long Total);
@@ -1811,38 +1826,63 @@ public sealed class ListAndFindSqlTests
         }
 
         /// <summary>
-        /// Builds the first list page of the active set, at the largest page size, filtered by <paramref name="q"/>,
-        /// and the count of the same filtered set.
+        /// Builds the one statement of the first list page of the active set, at the largest page size, filtered by
+        /// <paramref name="q"/>, which also returns the total of the same filtered set.
         /// </summary>
-        public ListStatements BuildList(string q)
+        public SqlStatement BuildList(string q)
         {
             var query = new RecordListQuery(q, IncludeDeleted: false, RecordQueryRules.DefaultPage, RecordQueryRules.MaxPageSize);
-            return new ListStatements(
-                SearchSqlBuilder.ListPage(Schema, Grid, query).Statement,
-                SearchSqlBuilder.ListCount(Schema, Grid, query));
+            return SearchSqlBuilder.ListPage(Schema, Grid, query).Statement;
         }
 
-        /// <summary>Runs a list page and its count, and reads the ids the page returns and the total.</summary>
-        public async Task<ListRows> ListAsync(ListStatements list, CancellationToken cancellationToken)
+        /// <summary>
+        /// The held join the list writes for each page table it joins, the pages with a table that hold a grid column,
+        /// in page order: <c>LEFT JOIN [page] p{i} WITH (HOLDLOCK) ON </c>.
+        /// </summary>
+        public IReadOnlyList<string> HeldListJoins() =>
+        [
+            .. Grid
+                .Select(field => RecordSqlBuilder.PageIndexOf(Schema, field.Page.PageId))
+                .Distinct()
+                .Order()
+                .Where(index => Schema.Pages[index].Table is not null)
+                .Select(index =>
+                    $"LEFT JOIN {SqlIdentifier.Quote(Schema.Pages[index].Table!)} " +
+                    $"{RecordSqlBuilder.PageAlias(index)}{HoldLockHint} ON "),
+        ];
+
+        /// <summary>
+        /// Runs a list statement and reads the ids of the rows it flags as on the page, in the order returned, and the
+        /// total every row carries.
+        /// </summary>
+        public async Task<ListRows> ListAsync(SqlStatement list, CancellationToken cancellationToken)
         {
             await using var connection = await TestDatabase.OpenConnectionAsync(cancellationToken);
-            var ids = await SqlExecution.ReadAsync(
+            return await SqlExecution.ReadAsync(
                 connection,
                 transaction: null,
                 ListPageOperation,
-                list.Page,
+                list,
                 Options.CommandTimeoutSeconds,
                 Recorder,
                 cancellationToken,
-                ReadIdsAsync);
-            var total = await SqlExecution.ExecuteScalarAsync<long>(
-                connection,
-                transaction: null,
-                ListCountOperation,
-                list.Count,
-                Options.CommandTimeoutSeconds,
-                Recorder,
-                cancellationToken);
+                ReadListRowsAsync);
+        }
+
+        // The ids of the rows a list statement flags as on the page, in the order returned, and the total every row
+        // carries; an empty page arrives as one row flagged 0, which carries the total alone.
+        private static async Task<ListRows> ReadListRowsAsync(DbDataReader reader, CancellationToken cancellationToken)
+        {
+            var ids = new List<string>();
+            long total = 0;
+            while (await reader.ReadAsync(cancellationToken))
+            {
+                total = reader.GetInt64(SearchSqlBuilder.TotalOrdinal);
+                if (reader.GetInt32(SearchSqlBuilder.InPageOrdinal) == 1)
+                {
+                    ids.Add(reader.GetString(SearchSqlBuilder.IdOrdinal));
+                }
+            }
 
             return new ListRows(ids, total);
         }
@@ -2305,17 +2345,6 @@ public sealed class ListAndFindSqlTests
             }
 
             return rows;
-        }
-
-        private static async Task<IReadOnlyList<string>> ReadIdsAsync(DbDataReader reader, CancellationToken cancellationToken)
-        {
-            var ids = new List<string>();
-            while (await reader.ReadAsync(cancellationToken))
-            {
-                ids.Add(reader.GetString(SearchSqlBuilder.IdOrdinal));
-            }
-
-            return ids;
         }
     }
 }

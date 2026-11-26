@@ -22,9 +22,21 @@ namespace EpiInfo.Data;
 /// <b>Composition.</b> The constructor builds one <see cref="SqlConnectionFactory"/>, <see cref="SqlMetadataReader"/>,
 /// <see cref="SqlRecordRepository"/> and <see cref="SqlPermissionReader"/>, each given the same
 /// <see cref="DatabaseOptions"/> and <see cref="ISqlCommandObserver"/>, so every command any of them sends is observed
-/// and runs with the configured timeout. Each call opens its own pooled connection through the factory and disposes it
-/// before it returns. Nothing is cached: metadata, catalogue schemas, counts, records and permissions are read again on
-/// every call, and every identifier in record SQL comes from the reader's catalogue read for that call.
+/// and runs with the configured timeout. A member that sends a command opens its own pooled connection through the
+/// factory and disposes it before it returns.
+/// </para>
+/// <para>
+/// <b>Reads.</b> Each member reads only the inputs it needs, and nothing is kept for a later request.
+/// <see cref="PingAsync"/> sends only <c>SELECT 1</c>. <see cref="ListFormsAsync"/> sends one query of the forms with
+/// their page counts, and <see cref="GetCheckCodeAsync"/> one of the form's program. <see cref="GetFormMetadataAsync"/>
+/// reads the form's <c>meta*</c> rows and its tables' catalogue columns on every call. <see cref="GetOptionsAsync"/>
+/// resolves and reads only the code tables the form's Legal Values data fields name, and opens no connection when none
+/// names both a code table and a column. <see cref="GetPermissionsAsync"/> resolves the form's tables in the catalogue
+/// and checks their permissions. A record read given the instance <see cref="GetFormMetadataAsync"/> returned in the
+/// same request uses the catalogue schema that read built, and reads the metadata and schema again only for an instance
+/// the reader did not return. A write reads them again inside its transaction, and an update given permissions also
+/// reads, inside that transaction, the permissions of the tables it resolved. Every identifier in record SQL comes
+/// from a schema the reader built from the catalogue.
 /// </para>
 /// <para>
 /// <b>Failures.</b> Every member runs inside the same boundary, which lets exactly three kinds of failure through
@@ -55,7 +67,7 @@ namespace EpiInfo.Data;
 /// string or a database message.
 /// </para>
 /// <para>
-/// <b>Threading.</b> The instance holds only immutable collaborators, so one instance serves every request.
+/// <b>Threading.</b> The instance holds only thread-safe collaborators, so one instance serves every request.
 /// </para>
 /// </remarks>
 public sealed class SqlServerDataStore : IDataStore

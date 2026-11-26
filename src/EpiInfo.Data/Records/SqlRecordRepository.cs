@@ -56,9 +56,13 @@ internal static class RecordOperations
 /// </summary>
 /// <remarks>
 /// <para>
-/// <b>Metadata.</b> Every public method opens one connection and reads the form's metadata and catalogue schema again
-/// on it through <see cref="SqlMetadataReader.ReadFormAsync"/>, by <see cref="FormMetadata.ViewId"/>, inside the
-/// transaction for a write. Nothing is cached, so every identifier a statement names comes from that read.
+/// <b>Metadata.</b> Every public method that sends a statement opens one connection. A read takes the form's metadata
+/// and catalogue schema from <see cref="SqlMetadataReader.ReuseOrReadFormAsync"/>: for the instance
+/// <see cref="SqlMetadataReader.GetFormMetadataAsync"/> returned earlier in the same request, the schema that read
+/// built, with no metadata command; for any other instance, a fresh read on the connection by
+/// <see cref="FormMetadata.ViewId"/>. A write always reads both again through
+/// <see cref="SqlMetadataReader.ReadFormAsync"/> inside its transaction. Nothing is kept across requests, and every
+/// identifier a statement names comes from a schema the reader built from the catalogue.
 /// </para>
 /// <para>
 /// <b>Reads</b> send only <c>SELECT</c> statements, in no transaction. Their failures propagate unchanged for
@@ -78,7 +82,7 @@ internal static class RecordOperations
 /// statement is sent, after the transaction is rolled back, and never wrapped.
 /// </para>
 /// <para>
-/// The instance holds only immutable collaborators and is safe to share across threads. It logs nothing, and every
+/// The instance holds only thread-safe collaborators and is safe to share across threads. It logs nothing, and every
 /// exception message it builds is fixed text naming no table, column, value or id.
 /// </para>
 /// </remarks>
@@ -134,7 +138,7 @@ internal sealed class SqlRecordRepository(
             .ConfigureAwait(false);
         await using (connection.ConfigureAwait(false))
         {
-            if (await metadata.ReadFormAsync(connection, transaction: null, form.ViewId, cancellationToken)
+            if (await metadata.ReuseOrReadFormAsync(connection, form, cancellationToken)
                     .ConfigureAwait(false) is not { } read)
             {
                 return 0;
@@ -181,7 +185,7 @@ internal sealed class SqlRecordRepository(
             .ConfigureAwait(false);
         await using (connection.ConfigureAwait(false))
         {
-            if (await metadata.ReadFormAsync(connection, transaction: null, form.ViewId, cancellationToken)
+            if (await metadata.ReuseOrReadFormAsync(connection, form, cancellationToken)
                     .ConfigureAwait(false) is not { } read)
             {
                 return null;
@@ -227,7 +231,7 @@ internal sealed class SqlRecordRepository(
             .ConfigureAwait(false);
         await using (connection.ConfigureAwait(false))
         {
-            if (await metadata.ReadFormAsync(connection, transaction: null, form.ViewId, cancellationToken)
+            if (await metadata.ReuseOrReadFormAsync(connection, form, cancellationToken)
                     .ConfigureAwait(false) is not { } read)
             {
                 return null;
@@ -241,7 +245,9 @@ internal sealed class SqlRecordRepository(
     /// <summary>
     /// Places a record in the caller's selected set, for the navigator's "[n] of N", as
     /// <see cref="IDataStore.GetSetPositionAsync"/>. Only the base table is read, so a record missing a page row is
-    /// still placed.
+    /// still placed. One statement returns the record's <c>RecStatus</c>, its selected-set position and the
+    /// selected-set count, so a concurrent write can never pair a position with a membership or a count of another
+    /// committed state.
     /// </summary>
     /// <param name="form">The form's metadata.</param>
     /// <param name="globalRecordId">The record's base-table <c>GlobalRecordId</c>, matched exactly.</param>
@@ -266,50 +272,44 @@ internal sealed class SqlRecordRepository(
             .ConfigureAwait(false);
         await using (connection.ConfigureAwait(false))
         {
-            if (await metadata.ReadFormAsync(connection, transaction: null, form.ViewId, cancellationToken)
+            if (await metadata.ReuseOrReadFormAsync(connection, form, cancellationToken)
                     .ConfigureAwait(false) is not { } read)
             {
                 return null;
             }
 
-            FormSchema schema = read.Schema;
-            if (await ReadBaseRowAsync(
+            // One statement reads the row's status, its position and the count, so they describe one committed state.
+            if (await SqlExecution.ReadAsync<SetPlacement?>(
                     connection,
                     transaction: null,
                     RecordOperations.SetPosition,
-                    RecordSqlBuilder.SetPositionLookup(schema, globalRecordId),
-                    cancellationToken)
-                .ConfigureAwait(false) is not { } baseRow)
+                    RecordSqlBuilder.SetPositionLookup(read.Schema, globalRecordId, includeDeleted),
+                    options.CommandTimeoutSeconds,
+                    observer,
+                    cancellationToken,
+                    async (reader, token) =>
+                        await reader.ReadAsync(token).ConfigureAwait(false)
+                            ? new SetPlacement(
+                                ReadInt32(reader, RecordSqlBuilder.BaseRowRecStatusOrdinal),
+                                ReadInt32(reader, RecordSqlBuilder.SetPositionOrdinal),
+                                ReadInt32(reader, RecordSqlBuilder.SetCountOrdinal))
+                            : null)
+                .ConfigureAwait(false) is not { } placement)
             {
                 return null;
             }
 
-            int count = await ReadCountAsync(
-                    connection,
-                    transaction: null,
-                    RecordOperations.SetPosition,
-                    RecordSqlBuilder.Count(schema, includeDeleted),
-                    cancellationToken)
-                .ConfigureAwait(false);
-            if (!RecordQueryRules.IsInSelectedSet(baseRow.RecStatus, includeDeleted))
-            {
-                return new NavigationPosition(null, count);
-            }
-
-            int position = await ReadCountAsync(
-                    connection,
-                    transaction: null,
-                    RecordOperations.SetPosition,
-                    RecordSqlBuilder.Position(schema, baseRow.UniqueKey, includeDeleted),
-                    cancellationToken)
-                .ConfigureAwait(false);
-            return new NavigationPosition(position, count);
+            return new NavigationPosition(
+                RecordQueryRules.IsInSelectedSet(placement.RecStatus, includeDeleted) ? placement.Position : null,
+                placement.Count);
         }
     }
 
     /// <summary>
     /// Reads one page of the records list, as <see cref="IDataStore.ListAsync"/>: the selected set, filtered by the
-    /// grid filter, ordered by <c>UniqueKey</c> and paged, holding the grid columns the form's data fields select.
+    /// grid filter, ordered by <c>UniqueKey</c> and paged, holding the grid columns the form's data fields select. One
+    /// statement returns the page and the total of the filtered set and holds every base and page row it reads until
+    /// it completes (<see cref="SearchSqlBuilder.ListPage"/>), so both describe one committed state.
     /// </summary>
     /// <param name="form">The form's metadata.</param>
     /// <param name="query">The coerced list parameters.</param>
@@ -332,7 +332,7 @@ internal sealed class SqlRecordRepository(
             .ConfigureAwait(false);
         await using (connection.ConfigureAwait(false))
         {
-            if (await metadata.ReadFormAsync(connection, transaction: null, form.ViewId, cancellationToken)
+            if (await metadata.ReuseOrReadFormAsync(connection, form, cancellationToken)
                     .ConfigureAwait(false) is not { } read)
             {
                 return new RecordPage(Array.Empty<RecordSummary>(), 0, query.Page, query.PageSize);
@@ -341,11 +341,12 @@ internal sealed class SqlRecordRepository(
             IReadOnlyList<DataFieldMetadata> gridColumns =
                 RecordQueryRules.GetGridColumns(FormDefinitionFactory.GetDataFields(read.Form));
 
-            // Both statements are built before either is sent, so a filter the builders refuse sends nothing.
+            // One statement returns the page and the total of the filtered set, holding every row it reads, so both
+            // describe one committed state. It is built before it is sent, so a filter the builder refuses sends
+            // nothing.
             ListSelect page = SearchSqlBuilder.ListPage(read.Schema, gridColumns, query);
-            SqlStatement total = SearchSqlBuilder.ListCount(read.Schema, gridColumns, query);
 
-            IReadOnlyList<RecordSummary> items = await SqlExecution.ReadAsync(
+            (IReadOnlyList<RecordSummary> items, int count) = await SqlExecution.ReadAsync(
                     connection,
                     transaction: null,
                     RecordOperations.List,
@@ -356,8 +357,17 @@ internal sealed class SqlRecordRepository(
                     async (reader, token) =>
                     {
                         var summaries = new List<RecordSummary>();
+                        int total = 0;
                         while (await reader.ReadAsync(token).ConfigureAwait(false))
                         {
+                            // Every row carries the same total. An empty page, past the end or of an empty set, still
+                            // returns one row, flagged as no item, so the total always arrives.
+                            total = ReadInt32(reader, SearchSqlBuilder.TotalOrdinal);
+                            if (ReadInt32(reader, SearchSqlBuilder.InPageOrdinal) == 0)
+                            {
+                                continue;
+                            }
+
                             summaries.Add(new RecordSummary(
                                 ReadText(reader, SearchSqlBuilder.IdOrdinal),
                                 ReadInt32(reader, SearchSqlBuilder.UniqueKeyOrdinal),
@@ -365,16 +375,8 @@ internal sealed class SqlRecordRepository(
                                 ReadValues(reader, page.Columns)));
                         }
 
-                        return (IReadOnlyList<RecordSummary>)summaries.AsReadOnly();
+                        return ((IReadOnlyList<RecordSummary>)summaries.AsReadOnly(), total);
                     })
-                .ConfigureAwait(false);
-
-            int count = await ReadCountAsync(
-                    connection,
-                    transaction: null,
-                    RecordOperations.List,
-                    total,
-                    cancellationToken)
                 .ConfigureAwait(false);
 
             return new RecordPage(items, count, query.Page, query.PageSize);
@@ -414,7 +416,7 @@ internal sealed class SqlRecordRepository(
             .ConfigureAwait(false);
         await using (connection.ConfigureAwait(false))
         {
-            if (await metadata.ReadFormAsync(connection, transaction: null, form.ViewId, cancellationToken)
+            if (await metadata.ReuseOrReadFormAsync(connection, form, cancellationToken)
                     .ConfigureAwait(false) is not { } read)
             {
                 return SearchResponse.Create(Array.Empty<SearchResult>(), 0);
@@ -1017,8 +1019,9 @@ internal sealed class SqlRecordRepository(
         return WriteDecision<SoftDeleteResult>.Committed(SoftDeleteResult.Deleted);
     }
 
-    // The response snapshot of a write, read inside its transaction: the base and page rows by the clustered key, then
-    // the record's intrinsic position and count over the set its RecStatus selects. The DTO is built here, before the
+    // The response snapshot of a write, read inside its transaction after every write and before the commit: one
+    // statement returns the base and page rows by the clustered key with the record's intrinsic position and count over
+    // the set its RecStatus selects, so all of them describe one committed state. The DTO is built here, before the
     // commit, so nothing after the commit computes from data.
     private async Task<RecordDto> ReadSnapshotAsync(
         WriteScope scope,
@@ -1033,29 +1036,12 @@ internal sealed class SqlRecordRepository(
                 scope.Connection,
                 scope.Transaction,
                 operation,
-                RecordSqlBuilder.RecordByUniqueKey(schema, dataFields, uniqueKey, globalRecordId),
+                RecordSqlBuilder.RecordSnapshot(schema, dataFields, uniqueKey, globalRecordId),
                 cancellationToken)
             .ConfigureAwait(false)
             ?? throw new InvalidOperationException(MissingRecordMessage);
 
-        StoredRecord record = row.Record;
-        bool intrinsicIncludesDeleted = RecordQueryRules.IntrinsicIncludesDeleted(record.RecStatus);
-        int position = await ReadCountAsync(
-                scope.Connection,
-                scope.Transaction,
-                operation,
-                RecordSqlBuilder.Position(schema, record.UniqueKey, intrinsicIncludesDeleted),
-                cancellationToken)
-            .ConfigureAwait(false);
-        int count = await ReadCountAsync(
-                scope.Connection,
-                scope.Transaction,
-                operation,
-                RecordSqlBuilder.Count(schema, intrinsicIncludesDeleted),
-                cancellationToken)
-            .ConfigureAwait(false);
-
-        return RecordDto.From(record, position, count);
+        return row.ToDto();
     }
 
     // One page's submitted columns, chunk by chunk. When the first chunk finds no page row, the row is inserted holding
@@ -1522,7 +1508,7 @@ internal sealed class SqlRecordRepository(
             async (reader, token) =>
                 await reader.ReadAsync(token).ConfigureAwait(false) ? ReadRecordRow(reader, select) : null);
 
-    // Reads the first row of a base-row lookup (SetPositionLookup or LockBase), or null when it returns none.
+    // Reads the first row of the locked base-row read (LockBase), or null when it returns none.
     private Task<BaseRow?> ReadBaseRowAsync(
         SqlConnection connection,
         SqlTransaction? transaction,
@@ -1753,6 +1739,10 @@ internal sealed class SqlRecordRepository(
 
     // A base row as a lookup by id returns it, its GlobalRecordId spelled as stored.
     private sealed record BaseRow(int UniqueKey, int RecStatus, string GlobalRecordId);
+
+    // A record's placement as SetPositionLookup returns it: its RecStatus, which decides membership of the selected
+    // set, the position it holds there when it is a member, and the selected-set count, all from one statement.
+    private sealed record SetPlacement(int RecStatus, int Position, int Count);
 
     // A write's values after the contract check: by canonical name, and with their columns in data-field order.
     private sealed record SubmittedValues(

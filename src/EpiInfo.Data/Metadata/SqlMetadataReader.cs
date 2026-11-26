@@ -1,5 +1,6 @@
 using System.Data;
 using System.Globalization;
+using System.Runtime.CompilerServices;
 using System.Text.Json;
 using EpiInfo.Data.Sql;
 using EpiInfo.Domain.Forms;
@@ -17,16 +18,21 @@ namespace EpiInfo.Data.Metadata;
 /// </summary>
 /// <remarks>
 /// <para>
-/// Nothing is cached: every call reads the metadata and the catalogue again, so a changed form or column type is seen
-/// by the next request. Every statement is a <c>SELECT</c>, runs through <see cref="SqlExecution"/> with the configured
-/// command timeout and the command observer, and binds every value as a typed parameter. The one command with
-/// dynamic text, the code-table read, holds one <c>SELECT</c> per distinct code-table column a request needs, and
-/// names only tables and columns this class built from the catalogue.
+/// Nothing is kept across requests: <see cref="GetFormMetadataAsync"/> and every other read method send the commands
+/// they need on every call, so a changed form or column type is seen by the next request. Within a request, the
+/// catalogue schema <see cref="GetFormMetadataAsync"/> built stays attached to the exact instance it returned and is
+/// released with it, so a record read given that instance takes the schema through
+/// <see cref="ReuseOrReadFormAsync"/> with no command; any other instance is read again. Every statement is a
+/// <c>SELECT</c>, runs through <see cref="SqlExecution"/> with the configured command timeout and the command
+/// observer, and binds every value as a typed parameter. The one command with dynamic text, the code-table read, holds
+/// one <c>SELECT</c> per distinct code-table column a request needs, and names only tables and columns this class built
+/// from the catalogue.
 /// </para>
 /// <para>
 /// Failures to open a connection or to run a command are not caught here: <see cref="SqlConnectionFactory"/> and the
 /// store that owns this reader classify them. The exceptions raised here carry fixed messages that name no table,
-/// column, value or SQL text. The instance holds only immutable collaborators and is safe to share across threads.
+/// column, value or SQL text. The instance holds immutable collaborators and a thread-safe weak table of immutable
+/// schemas, and is safe to share across threads.
 /// </para>
 /// </remarks>
 /// <param name="connectionFactory">Opens the connections of the port reads.</param>
@@ -69,6 +75,12 @@ internal sealed class SqlMetadataReader(
 
     private readonly ISqlCommandObserver observer = observer ?? throw new ArgumentNullException(nameof(observer));
 
+    // The catalogue schema GetFormMetadataAsync built with each form it returned, keyed by that exact instance. The
+    // table compares keys by reference, never by record equality, so a copy or another read of the same form finds
+    // nothing, and it holds each key weakly, so an entry lives only as long as its form instance, which in the API ends
+    // with the request that read it. Nothing is answered from it except to a caller holding that very instance.
+    private readonly ConditionalWeakTable<FormMetadata, FormSchema> schemasByForm = new();
+
     /// <summary>Lists every form in <c>metaViews</c> with its page count, ordered by <c>ViewId</c>.</summary>
     /// <param name="cancellationToken">The request's abort token.</param>
     /// <returns>One summary per form; seeded <c>(1, CaseReport, 1)</c> and <c>(2, FoodHistory, 2)</c>.</returns>
@@ -99,6 +111,12 @@ internal sealed class SqlMetadataReader(
     }
 
     /// <summary>Reads one form's metadata, with each field's page-table column as the catalogue reports it.</summary>
+    /// <remarks>
+    /// Every call opens a connection and sends the commands of <see cref="ReadFormAsync"/>; nothing is answered from
+    /// an earlier call. The catalogue schema built by the same read stays attached to the returned instance alone, so
+    /// a record read given that instance takes it through <see cref="ReuseOrReadFormAsync"/> without a command. The
+    /// attachment ends when the instance is no longer referenced, which for the API is the end of the request.
+    /// </remarks>
     /// <param name="viewId">The form's <c>metaViews.ViewId</c>.</param>
     /// <param name="cancellationToken">The request's abort token.</param>
     /// <returns>The form's metadata, or <see langword="null"/> when <paramref name="viewId"/> is not in <c>metaViews</c>.</returns>
@@ -112,14 +130,15 @@ internal sealed class SqlMetadataReader(
             .ConfigureAwait(false);
         await using (connection.ConfigureAwait(false))
         {
-            (FormMetadata Form, FormSchema Schema)? form = await ReadFormAsync(
-                    connection,
-                    transaction: null,
-                    viewId,
-                    cancellationToken)
-                .ConfigureAwait(false);
+            if (await ReadFormAsync(connection, transaction: null, viewId, cancellationToken)
+                    .ConfigureAwait(false) is not { } read)
+            {
+                return null;
+            }
 
-            return form?.Form;
+            // The instance was built by this read, so no entry can exist for it yet.
+            schemasByForm.Add(read.Form, read.Schema);
+            return read.Form;
         }
     }
 
@@ -219,8 +238,10 @@ internal sealed class SqlMetadataReader(
     }
 
     /// <summary>
-    /// Reads one form's metadata and its catalogue schema on a connection the caller owns. The record repository
-    /// calls it inside its write transaction, so every record operation sees the schema as it stands.
+    /// Reads one form's metadata and its catalogue schema on a connection the caller owns, sending every command on
+    /// each call; nothing is cached. The record repository calls it inside each write transaction, so a write sees the
+    /// schema as it stands, and through <see cref="ReuseOrReadFormAsync"/> for a read whose form instance this reader
+    /// did not return.
     /// </summary>
     /// <param name="connection">An open connection; this method neither opens nor closes it.</param>
     /// <param name="transaction">The transaction every command joins, or <see langword="null"/>.</param>
@@ -373,6 +394,42 @@ internal sealed class SqlMetadataReader(
             Array.AsReadOnly(fields));
         var schema = new FormSchema(viewId, baseTable, pageSchemas);
         return (form, schema);
+    }
+
+    /// <summary>
+    /// Supplies a form's metadata and catalogue schema to a record read outside any transaction. When
+    /// <paramref name="form"/> is the very instance <see cref="GetFormMetadataAsync"/> returned, the schema that read
+    /// built is returned with it and no command is sent; any other instance, a <see langword="with"/> copy or one
+    /// built in memory included, is read again with <see cref="ReadFormAsync"/> on <paramref name="connection"/> by
+    /// <see cref="FormMetadata.ViewId"/>. Either way the schema was built by this reader from the catalogue.
+    /// </summary>
+    /// <param name="connection">An open connection; this method neither opens nor closes it.</param>
+    /// <param name="form">The form's metadata, as the caller was given it for this request.</param>
+    /// <param name="cancellationToken">The request's abort token.</param>
+    /// <returns>
+    /// The metadata and schema, the metadata being <paramref name="form"/> itself when its schema is attached; or
+    /// <see langword="null"/> when a read finds the form's view id no longer in <c>metaViews</c>.
+    /// </returns>
+    /// <exception cref="ArgumentNullException"><paramref name="connection"/> or <paramref name="form"/> is null.</exception>
+    /// <exception cref="InvalidOperationException">
+    /// A read finds that the form's fields do not name exactly one non-blank data table, or that table is not in the
+    /// catalogue.
+    /// </exception>
+    internal async Task<(FormMetadata Form, FormSchema Schema)?> ReuseOrReadFormAsync(
+        SqlConnection connection,
+        FormMetadata form,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(connection);
+        ArgumentNullException.ThrowIfNull(form);
+
+        if (schemasByForm.TryGetValue(form, out FormSchema? schema))
+        {
+            return (form, schema);
+        }
+
+        return await ReadFormAsync(connection, transaction: null, form.ViewId, cancellationToken)
+            .ConfigureAwait(false);
     }
 
     /// <summary>

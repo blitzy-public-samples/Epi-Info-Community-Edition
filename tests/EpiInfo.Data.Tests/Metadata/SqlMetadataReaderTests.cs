@@ -1,9 +1,12 @@
 using System.Data;
 using System.Globalization;
 using EpiInfo.Data.Metadata;
+using EpiInfo.Data.Records;
 using EpiInfo.Data.Sql;
 using EpiInfo.Domain.Forms;
 using EpiInfo.Domain.Metadata;
+using EpiInfo.Domain.Records;
+using EpiInfo.Domain.Search;
 using EpiInfo.Domain.Validation;
 using EpiInfo.Domain.Values;
 using EpiInfo.Tests.Shared;
@@ -1248,6 +1251,139 @@ public sealed class SqlMetadataReaderTests : IAsyncLifetime
         Assert.False(read.HasValue);
         AssertSelectOnly(recorder);
     }
+
+    /// <summary>
+    /// Through the store, each record read given the very instance <c>GetFormMetadataAsync</c> returned uses the
+    /// catalogue schema that read built and sends no metadata command, so a request reads its form once. Given a
+    /// <see langword="with"/> copy, equal as a record but another instance, the same read first reads the form again
+    /// on its own connection, with as many metadata commands as <c>GetFormMetadataAsync</c> sent, then sends the same
+    /// record statements. Both instances return the same facts of the first row in <c>UniqueKey</c> order.
+    /// </summary>
+    [Theory]
+    [InlineData("CaseReport")]
+    [InlineData("FoodHistory")]
+    public async Task StoreRecordReads_ReuseTheSchemaOnlyForTheInstanceTheReaderReturned(string formName)
+    {
+        using var cancellation = new CancellationTokenSource(TestTimeout);
+        CancellationToken token = cancellation.Token;
+        var recorder = new SqlCommandRecorder();
+        var store = new SqlServerDataStore(new DatabaseOptions(TestDatabase.ConnectionString), recorder);
+        await using SqlConnection verification = await TestDatabase.OpenConnectionAsync(token);
+
+        int viewId = await ViewIdAsync(verification, formName, token);
+        string baseTable = Assert.Single(await QueryRowsAsync(
+            verification,
+            "SELECT DISTINCT [DataTableName] FROM [metaFields] "
+            + "WHERE [ViewId] = @viewId AND [DataTableName] IS NOT NULL;",
+            row => row.GetString(0),
+            token,
+            ViewIdParameter(viewId)));
+
+        // A seeded row, which no test edits or deletes, and every row a test adds gets a higher UniqueKey, so this row
+        // stays first in the set that includes deleted records while the test runs.
+        string firstId = Assert.Single(await QueryRowsAsync(
+            verification,
+            "SELECT TOP (1) [GlobalRecordId] FROM " + Bracket(baseTable) + " ORDER BY [UniqueKey];",
+            row => row.GetString(0),
+            token));
+
+        recorder.Clear();
+        FormMetadata? form = await store.GetFormMetadataAsync(viewId, token);
+        Assert.NotNull(form);
+        int formReadCommands = MetadataCommands(recorder.Commands).Count;
+        Assert.True(formReadCommands > 0, "GetFormMetadataAsync sent no metadata command.");
+
+        FormMetadata copy = form with { };
+        Assert.Equal(form, copy);
+        Assert.NotSame(form, copy);
+
+        var byId = new SearchCondition(
+            "GlobalRecordId",
+            SearchTarget.BaseGlobalRecordId,
+            FieldType: null,
+            [new SearchAlternative(SearchOperator.Equal, FieldValue.FromText(firstId))]);
+        (string Operation, string Expected, Func<FormMetadata, Task<string?>> Read)[] reads =
+        [
+            (RecordOperations.Count, bool.TrueString, async instance =>
+                (await store.CountAsync(instance, includeDeleted: true, token) > 0).ToString()),
+            (RecordOperations.At, firstId, async instance =>
+                (await store.GetAtPositionAsync(instance, 1, includeDeleted: true, token))?.GlobalRecordId),
+            (RecordOperations.Get, firstId, async instance =>
+                (await store.GetByIdAsync(instance, firstId, token))?.GlobalRecordId),
+            (RecordOperations.SetPosition, "1", async instance =>
+                (await store.GetSetPositionAsync(instance, firstId, includeDeleted: true, token))?.Position?.ToString(
+                    CultureInfo.InvariantCulture)),
+            (RecordOperations.List, firstId, async instance =>
+                Assert.Single((await store.ListAsync(
+                        instance,
+                        new RecordListQuery(Q: null, IncludeDeleted: true, Page: 1, PageSize: 1),
+                        token)).Items)
+                    .GlobalRecordId),
+            (RecordOperations.Search, firstId, async instance =>
+                Assert.Single((await store.SearchAsync(
+                        instance,
+                        [byId],
+                        includeDeleted: true,
+                        excludeGlobalRecordId: null,
+                        token)).Items)
+                    .GlobalRecordId),
+        ];
+
+        foreach ((string operation, string expected, Func<FormMetadata, Task<string?>> read) in reads)
+        {
+            recorder.Clear();
+            Assert.Equal(expected, await read(form));
+            IReadOnlyList<RecordedCommand> reused = recorder.Commands;
+            Assert.True(
+                MetadataCommands(reused).Count == 0,
+                DescribeCommands(operation + " read the metadata again for the instance the reader returned.", reused));
+            AssertOneConnectionOfSucceededReads(operation, reused);
+            Assert.True(
+                reused.All(command => string.Equals(command.Operation, operation, StringComparison.Ordinal)),
+                DescribeCommands(operation + " sent a command under another operation.", reused));
+
+            recorder.Clear();
+            Assert.Equal(expected, await read(copy));
+            IReadOnlyList<RecordedCommand> reread = recorder.Commands;
+            IReadOnlyList<RecordedCommand> metadataReads = MetadataCommands(reread);
+            Assert.True(
+                metadataReads.Count == formReadCommands,
+                DescribeCommands(operation + " did not read the form again for a copy.", reread));
+            AssertOneConnectionOfSucceededReads(operation, reread);
+            RecordedCommand[] recordStatements = [.. reread.Except(metadataReads)];
+            Assert.True(
+                metadataReads.Max(command => command.Sequence) < recordStatements.Min(command => command.Sequence),
+                DescribeCommands(operation + " sent a record statement before its metadata read.", reread));
+            Assert.Equal(
+                reused.Select(command => command.CommandText),
+                recordStatements.Select(command => command.CommandText));
+        }
+    }
+
+    // The commands the metadata reader sent, by its fixed operation-name prefix.
+    private static IReadOnlyList<RecordedCommand> MetadataCommands(IReadOnlyList<RecordedCommand> commands) =>
+        [.. commands.Where(command => command.Operation.StartsWith("metadata.", StringComparison.Ordinal))];
+
+    // One read's commands: at least one, each completed and succeeded and none a write, all on one connection.
+    private static void AssertOneConnectionOfSucceededReads(string operation, IReadOnlyList<RecordedCommand> commands)
+    {
+        Assert.True(commands.Count > 0, operation + " sent no command.");
+        Guid connection = commands[0].ClientConnectionId;
+        Assert.True(
+            commands.All(command =>
+                command.ClientConnectionId == connection
+                && command.Completed
+                && command.Succeeded
+                && !command.IsWrite),
+            DescribeCommands(
+                operation + " sent a command on another connection, a failed command or a write.",
+                commands));
+    }
+
+    private static string DescribeCommands(string message, IReadOnlyList<RecordedCommand> commands) =>
+        message
+        + Environment.NewLine
+        + string.Join(Environment.NewLine, commands.Select(command => command.ToString()));
 
     private static SqlMetadataReader CreateReader(SqlCommandRecorder recorder)
     {

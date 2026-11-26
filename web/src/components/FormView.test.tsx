@@ -20,6 +20,12 @@
 // with its message, from client validation or a field-level 400; and the toolbar
 // announces Saving… while a save is under way. The connection-banner cases answer their
 // own outage reads and failed writes, and check the banner each shows.
+//
+// A number field holds an integer beyond ±Number.MAX_SAFE_INTEGER, which a `bigint`
+// column admits, exactly: read from JSON, shown and entered digit for digit. A number typed
+// as a fraction whose nearest double is whole is sent as typed, in its field event and its
+// save. A tabIndex beyond the safe range, read from the form route's own body text, still
+// orders the page and Find.
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { Profiler } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vitest';
@@ -29,6 +35,7 @@ import type {
   FieldDefinition,
   FieldEventResponse,
   FieldType,
+  FieldValue,
   FormDefinition,
   HttpValidationProblemDetails,
   NavigationPosition,
@@ -56,6 +63,7 @@ import {
 import { formatRequiredMessage } from '../validation/clientValidation';
 import { FormView } from './FormView';
 import { fieldComponents, fieldControlId, fieldErrorId, type FieldComponentProps } from './fields/fieldComponents';
+import { NumberInput } from './fields/NumberInput';
 
 // The in-memory API
 
@@ -188,8 +196,20 @@ function fieldLevelProblem(errors: Record<string, string[]>): HttpValidationProb
   };
 }
 
+// Marks a bigint inside JSON.stringify's output so it can be written as a bare integer; no
+// fixture string holds the mark.
+const BIGINT_MARK = '\u0000bigint:';
+const MARKED_BIGINT = /"\\u0000bigint:(-?\d+)"/g;
+
+/** JSON as the API writes it: a bigint is the JSON integer it holds, digit for digit. */
 function jsonResponse(status: number, body: unknown): Response {
-  return new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
+  const marked = JSON.stringify(body, (_key: string, value: unknown) =>
+    typeof value === 'bigint' ? BIGINT_MARK + value.toString() : value,
+  );
+  return new Response(marked.replace(MARKED_BIGINT, '$1'), {
+    status,
+    headers: { 'Content-Type': 'application/json' },
+  });
 }
 
 function problemResponse(problem: ProblemDetails): Response {
@@ -322,9 +342,15 @@ const NO_EFFECTS: FieldEventResponse = {
 /**
  * A fetch that serves `definition`'s form and `records`, answers each write with the next
  * queued reply, answers field events with no effects when `answersFieldEvents` is set, and
- * records every request it receives.
+ * records every request it receives. `definitionText`, when given, is the form route's body
+ * text as sent, in place of `definition` as JSON.
  */
-function fakeApi(definition: FormDefinition, records: RecordDto[], answersFieldEvents = false): typeof fetch {
+function fakeApi(
+  definition: FormDefinition,
+  records: RecordDto[],
+  answersFieldEvents = false,
+  definitionText?: string,
+): typeof fetch {
   return async (input, init) => {
     const request = input instanceof Request ? input : new Request(input, init);
     const url = new URL(request.url);
@@ -333,6 +359,9 @@ function fakeApi(definition: FormDefinition, records: RecordDto[], answersFieldE
     calls.push(call);
 
     const body = readRouteBody(call.method, url.pathname, definition, records);
+    if (body === definition && definitionText !== undefined) {
+      return new Response(definitionText, { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }
     if (body !== null) {
       return jsonResponse(200, body);
     }
@@ -372,6 +401,8 @@ interface RenderOptions {
   readonly answerRead?: (path: string) => Response | undefined;
   /** Called at the end of each commit of the form view, in its layout phase, after the form view's layout effects. */
   readonly onCommit?: () => void;
+  /** The form route's body text, in place of the definition as JSON. */
+  readonly definitionText?: string;
 }
 
 /**
@@ -386,7 +417,7 @@ async function renderForm(
   const records = [...(options.records ?? [RECORD])];
   const onExit = vi.fn<() => void>();
   const onFormNotFound = vi.fn<() => void>();
-  const serve = fakeApi(definition, records, options.answersFieldEvents ?? false);
+  const serve = fakeApi(definition, records, options.answersFieldEvents ?? false, options.definitionText);
   const { answerRead, onCommit } = options;
   const fetch: typeof globalThis.fetch =
     answerRead === undefined
@@ -2833,5 +2864,178 @@ describe('FormView banner action focus', () => {
     expect(document.activeElement).toBe(heading);
     expect(readsOf(AT_2_PATH)).toHaveLength(2);
     expect(writeCalls()).toEqual([]);
+  });
+});
+
+describe('number fields hold integers beyond the safe range exactly', () => {
+  const CASE_ID = fieldByName('CaseID');
+
+  it.each<[bigint]>([[9007199254740993n], [-9007199254740993n], [9223372036854775807n]])(
+    'shows the stored %s digit for digit in its control and its grid cell',
+    async (stored) => {
+      const record: RecordDto = { ...RECORD, values: { ...RECORD.values, [CASE_ID.name]: stored } };
+      await renderForm(createFormDefinitionFixture(), { records: [record] });
+
+      const digits = stored.toString();
+      expect(screen.getByLabelText(CASE_ID.prompt ?? CASE_ID.name)).toHaveProperty('value', digits);
+      expect(within(screen.getByRole('region', { name: 'Records' })).getByText(digits)).toBeTruthy();
+    },
+  );
+
+  it.each<[string, FieldValue]>([
+    ['9007199254740993', 9007199254740993n],
+    ['-9007199254740993', -9007199254740993n],
+    ['9223372036854775807', 9223372036854775807n],
+    [' 9007199254740994 ', 9007199254740994n],
+    ['9.007199254740993e15', 9007199254740993n],
+    ['9007199254740993.000', 9007199254740993n],
+    ['0x20000000000001', 9007199254740993n],
+    ['9223372036854775808', 2 ** 63],
+    ['9007199254740991', 9007199254740991],
+    ['-9007199254740991', -9007199254740991],
+    ['37.5', 37.5],
+    // A fraction whose nearest double is whole keeps its literal, as a JSON number token.
+    ['9007199254740992.5', { kind: 'decimal', literal: '9007199254740992.5' }],
+    ['-9223372036854775808.5', { kind: 'decimal', literal: '-9223372036854775808.5' }],
+    ['2.0000000000000001', { kind: 'decimal', literal: '2.0000000000000001' }],
+    ['1e-400', { kind: 'decimal', literal: '1e-400' }],
+    [' +00.5e-400 ', { kind: 'decimal', literal: '0.5e-400' }],
+    ['34.5', 34.5],
+    ['0.1', 0.1],
+    ['1e20', 1e20],
+    ['1e400', '1e400'],
+    ['abc', 'abc'],
+  ])('enters the text %j as %s', (text, expected) => {
+    const onChange = vi.fn<(value: FieldValue) => void>();
+    render(
+      <NumberInput
+        field={CASE_ID}
+        value={null}
+        disabled={false}
+        isProtected={false}
+        errors={[]}
+        onChange={onChange}
+      />,
+    );
+
+    const input = screen.getByLabelText(CASE_ID.prompt ?? CASE_ID.name);
+    fireEvent.change(input, { target: { value: text } });
+
+    expect(onChange).toHaveBeenCalledTimes(1);
+    expect(onChange).toHaveBeenLastCalledWith(expected);
+    expect(input).toHaveProperty('value', text);
+  });
+});
+
+describe('a number typed as a fraction whose nearest double is whole is sent as typed', () => {
+  const CASE_ID = fieldByName('CaseID');
+  // The JSON text of CaseID's member in a request body, up to the next member or the end of its object.
+  const CASE_ID_MEMBER = new RegExp(`${JSON.stringify(CASE_ID.name)}:([^,}]*)`);
+
+  /** The JSON token a request body sends for CaseID. */
+  function sentToken(call: Call | undefined, what: string): string {
+    const match = CASE_ID_MEMBER.exec(present(present(call, what).body, `the body of ${what}`));
+    return present(match, `CaseID in ${what}`)[1];
+  }
+
+  // Integer columns reject these as not whole and a `float` column stores their nearest double,
+  // which the server decides only if it receives the number typed rather than that double.
+  it.each<[string, string]>([
+    ['9007199254740992.5', '9007199254740992.5'],
+    ['-9223372036854775808.5', '-9223372036854775808.5'],
+    ['2.0000000000000001', '2.0000000000000001'],
+    [' +00.5e-400 ', '0.5e-400'],
+    ['34.5', '34.5'],
+    ['0.1', '0.1'],
+  ])('sends the text %j as the JSON number %s in its FieldAfter event and its save', async (text, token) => {
+    await renderForm(createFormDefinitionFixture(), { answersFieldEvents: true });
+    // The server stores RECORD unchanged, as an integer column would reject or a `float` column round it.
+    replyToWrite({ kind: 'saved', record: RECORD });
+    // Installing the record moves focus without raising an event; the test's own focus comes after it.
+    await act(async () => {
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, 0);
+      });
+    });
+    const input = screen.getByLabelText(promptOf(CASE_ID));
+
+    act(() => {
+      input.focus();
+    });
+    fireEvent.change(input, { target: { value: text } });
+    act(() => {
+      input.blur();
+    });
+    // The draft keeps the text as typed, sign and spaces included.
+    expect(input).toHaveProperty('value', text);
+    const formActions = screen.getByRole('toolbar', { name: 'Form actions' });
+    fireEvent.click(within(formActions).getByRole('button', { name: 'Save' }));
+
+    const update = await waitFor(() => present(calls.find((call) => call.method === 'PUT'), 'the update'));
+    const fieldAfter = calls.find(
+      (call) => call.method === 'POST' && call.body?.includes('"event":"FieldAfter"') === true,
+    );
+    expect(sentToken(fieldAfter, 'the FieldAfter event')).toBe(token);
+    expect(update.body).toBe(`{"values":{${JSON.stringify(CASE_ID.name)}:${token}}}`);
+    // The saved record, RECORD with its CaseID 1042, replaces the draft once the update settles.
+    await waitFor(() => {
+      expect(input).toHaveProperty('value', '1042');
+    });
+  });
+});
+
+describe('a tabIndex beyond the safe range', () => {
+  // metaFields.TabIndex is decimal(18,0), so a field can sit past Number.MAX_SAFE_INTEGER.
+  // The client reads a tabIndex as JSON.parse does, its nearest double, so the page and Find
+  // order it among ordinary indexes as a number. Title's 9007199254740993 reads as 2^53.
+  const LARGE_TAB_INDEXES: ReadonlyMap<string, string> = new Map([
+    ['Title', '9007199254740993'],
+    ['CaseID', '9007199254741000'],
+  ]);
+
+  /** The fixture with those page-1 tabIndexes as the client holds them, and its body text as the API writes it. */
+  function withLargeTabIndexes(): { definition: FormDefinition; text: string } {
+    const definition = createFormDefinitionFixture();
+    for (const page of definition.pages) {
+      page.fields = page.fields.map((field) => {
+        const token = LARGE_TAB_INDEXES.get(field.name);
+        return token === undefined ? field : { ...field, tabIndex: Number(token) };
+      });
+    }
+    let text = JSON.stringify(definition);
+    for (const token of LARGE_TAB_INDEXES.values()) {
+      text = text.replace(`"tabIndex":${String(Number(token))}`, `"tabIndex":${token}`);
+      expect(text).toContain(`"tabIndex":${token}`);
+    }
+    return { definition, text };
+  }
+
+  it('renders the page in tabIndex order and lists the fields in Find in that order', async () => {
+    const { definition, text } = withLargeTabIndexes();
+    const [firstPage] = definition.pages;
+    await renderForm(definition, { definitionText: text });
+
+    const rendered = renderedFieldNames(panelOf(firstPage));
+    expect(rendered).toEqual([...firstPage.fields].sort(byTabIndex).map((field) => field.name));
+    expect(rendered.slice(-2)).toEqual(['Title', 'CaseID']);
+
+    fireEvent.click(within(screen.getByRole('toolbar', { name: 'Form actions' })).getByRole('button', { name: 'Find' }));
+
+    const picker = within(screen.getByRole('dialog', { name: 'Find record' })).getByRole('group', {
+      name: 'Fields to search',
+    });
+    const picked = within(picker)
+      .getAllByRole('checkbox')
+      .map((box) => {
+        const nameId = present(box.getAttribute('aria-labelledby'), 'aria-labelledby of a Find checkbox');
+        return present(document.getElementById(nameId), `element ${nameId}`).textContent;
+      });
+    expect(picked).toEqual([
+      ...allFields(definition)
+        .filter(isDataField)
+        .map((field) => field.name),
+      'GlobalRecordId',
+      'RecStatus',
+    ]);
   });
 });

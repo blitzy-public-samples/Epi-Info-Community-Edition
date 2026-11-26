@@ -1,11 +1,16 @@
 using System.Data;
+using System.Diagnostics;
 using System.Globalization;
 using System.Net;
 using System.Text.Json;
 using EpiInfo.Api.Tests.Infrastructure;
-using EpiInfo.Domain.Records;
+using EpiInfo.Data.Sql;
 using EpiInfo.Tests.Shared;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.TestHost;
 using Microsoft.Data.SqlClient;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using Xunit.Abstractions;
 using Xunit.Sdk;
 
@@ -29,12 +34,17 @@ namespace EpiInfo.Api.Tests.Navigation;
 /// <para>
 /// Expected values come from direct SQL on the base tables, never from literals, because other tests leave the
 /// records they create in the database. Read cases hold the shared <see cref="DatabaseWriteLock"/> for their whole
-/// run so those values cannot move. The one writing case holds it exclusively; its only writes are one record created
-/// through the API with a marker, and the removal of that record's own <c>FoodHistory3</c> row, the missing-page
-/// fixture AAP 0.3.7 allows. No seeded row, metadata row or schema object is touched.
+/// run so those values cannot move. The writing cases hold it exclusively. The missing-page case writes one record
+/// created through the API with a marker, and removes that record's own <c>FoodHistory3</c> row, the missing-page
+/// fixture AAP 0.3.7 allows. The two interleaving cases each create one record with a marker and soft-delete it, and
+/// the write-response case creates one record with a marker and updates it, all through the API. The held-page case
+/// creates its records through the API with one marker, and on a second connection takes an exclusive lock on one of
+/// their <c>CaseReport1</c> rows in a transaction it rolls back, a lock that changes no data. No seeded row, metadata
+/// row or schema object is touched.
 /// </para>
 /// <para>
 /// Table names in the SQL below come from a closed map of bracket-quoted literals, and every value is a parameter.
+/// The row states 0 and 1 are test-owned constants, in the SQL and in the assertions, never production values.
 /// An unconfigured or unreachable database fails every case through <see cref="ApiFactory.ForDatabaseAsync"/>; no
 /// case skips.
 /// </para>
@@ -59,11 +69,54 @@ public sealed class NavigationTests : IAsyncLifetime
 
     private const string FoodHistoryPageTwoName = "FoodHistory3";
 
-    // The selected-set predicate of C-16, with @all choosing every row, so one statement serves both sets.
-    private const string SetPredicate = "(@all = 1 OR [RecStatus] = 1)";
+    // The CaseReport page table, which holds the grid columns the held-page case filters on.
+    private const string CaseReportPageOneTable = "[dbo].[CaseReport1]";
+
+    // The sys.dm_tran_locks names the held-page case binds: a granted key lock, in the mode the gate takes and in the
+    // modes a held shared read takes on a key, S on a row it found and RangeS-S on a key range.
+    private const string KeyLockType = "KEY";
+
+    private const string GrantedLockStatus = "GRANT";
+
+    private const string ExclusiveMode = "X";
+
+    private const string SharedMode = "S";
+
+    private const string RangeSharedMode = "RangeS-S";
+
+    // The held-page case stops creating records at the first one whose GlobalRecordId is above the lowest created
+    // before it, so it reaches this bound only if all of its records arrive in strictly decreasing GlobalRecordId
+    // order: for random ids, a probability of 1/32!.
+    private const int MaxHeldPageRecords = 32;
+
+    // Test-owned row states, never read from production code, typed as the smallint RecStatus column: 1 is the active
+    // set (C-16) and 0 a soft-deleted record (DELETE sets RECSTATUS=0, AAP 0.3.4.1).
+    private const short ActiveRecStatus = 1;
+
+    private const short DeletedRecStatus = 0;
+
+    // The selected-set predicate of C-16, with @all choosing every row, so one statement serves both sets. Bound by
+    // AddSetParameter.
+    private const string SetPredicate = "(@all = 1 OR [RecStatus] = @active)";
+
+    // Test-owned copies of the fixed operation names the data store reports to its command observer for the
+    // position endpoint, the records list, a create and an update.
+    private const string SetPositionOperation = "records.setPosition";
+
+    private const string ListOperation = "records.list";
+
+    private const string InsertOperation = "records.insert";
+
+    private const string UpdateOperation = "records.update";
 
     // Longer than DatabaseWriteLock's 300-second wait, so a hung request fails the test instead of the whole run.
     private static readonly TimeSpan TestTimeout = TimeSpan.FromMinutes(10);
+
+    // How long the held-page case waits for the list to block on the gate's row, well inside the API's 30-second command
+    // timeout, and how often it looks.
+    private static readonly TimeSpan BlockedRequestWait = TimeSpan.FromSeconds(15);
+
+    private static readonly TimeSpan BlockedRequestPoll = TimeSpan.FromMilliseconds(25);
 
     private readonly ITestOutputHelper _output;
 
@@ -154,7 +207,7 @@ public sealed class NavigationTests : IAsyncLifetime
             Assert.Equal(expectedId, NavigationApi.GetString(record, "globalRecordId"));
 
             // The intrinsic coordinates: an active record is numbered within the active set, which is the set asked.
-            Assert.Equal(RecordQueryRules.ActiveRecStatus, NavigationApi.GetInt(record, "recStatus"));
+            Assert.Equal(ActiveRecStatus, NavigationApi.GetInt(record, "recStatus"));
             Assert.Equal(index, NavigationApi.GetInt(record, "position"));
             Assert.Equal(n, NavigationApi.GetInt(record, "count"));
             await AssertIntrinsicAsync(form, record, ct);
@@ -399,7 +452,7 @@ public sealed class NavigationTests : IAsyncLifetime
         await using var dbLock = await DatabaseWriteLock.AcquireSharedAsync(ct);
         Factory.Recorder.Clear();
 
-        int[] admitted = [RecordQueryRules.DeletedRecStatus, RecordQueryRules.ActiveRecStatus];
+        int[] admitted = [DeletedRecStatus, ActiveRecStatus];
         foreach (var form in new[] { CaseReport, FoodHistory })
         {
             var values = await DistinctRecStatusAsync(form, ct);
@@ -411,10 +464,10 @@ public sealed class NavigationTests : IAsyncLifetime
             }
 
             Assert.All(values, value => Assert.Contains(value, admitted));
-            Assert.Contains(RecordQueryRules.ActiveRecStatus, values);
+            Assert.Contains(ActiveRecStatus, values);
 
             // The seeded synthetic rows include soft-deleted records in both forms (testdata/sql/99_verify.sql).
-            Assert.Contains(RecordQueryRules.DeletedRecStatus, values);
+            Assert.Contains(DeletedRecStatus, values);
         }
 
         AssertNoWritesIssued();
@@ -482,7 +535,7 @@ public sealed class NavigationTests : IAsyncLifetime
         var baseRow = await BaseRowAsync(FoodHistory, id, ct);
         Assert.True(baseRow.HasValue, "The created record has no base row.");
         var (uniqueKey, recStatus) = baseRow.Value;
-        Assert.Equal(RecordQueryRules.ActiveRecStatus, recStatus);
+        Assert.Equal(ActiveRecStatus, recStatus);
 
         var active = await CountAsync(FoodHistory, includeDeleted: false, ct);
         var all = await CountAsync(FoodHistory, includeDeleted: true, ct);
@@ -518,6 +571,354 @@ public sealed class NavigationTests : IAsyncLifetime
         AssertNoWritesIssued();
     }
 
+    // AAP 0.3.4.4, C-16: the position endpoint takes the record's membership, its position and the count from one
+    // committed state. The host's observer commits a soft delete of the record through the API as soon as the
+    // endpoint's first set-position statement has completed, before the endpoint answers. The answer must still
+    // describe one state, the one before the delete: the position and the active count SQL read beforehand, never a
+    // position counted after the record left the set. The next request sees the delete: no position, one fewer row.
+    [Fact]
+    public async Task PositionEndpoint_DeleteCommittedDuringTheRequest_AnswersFromOneState()
+    {
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        var ct = timeout.Token;
+        await using var dbLock = await DatabaseWriteLock.AcquireExclusiveAsync(ct);
+
+        await using var host = await InterleavingFactory.ForDatabaseAsync();
+        using var client = host.CreateClient();
+        using var deleteClient = host.CreateClient();
+
+        var viewId = await ApiTestClient.GetViewIdAsync(client, CaseReport, ct);
+        var id = await CreateMarkedRecordAsync(client, viewId, TestDatabase.NewMarker(), ct);
+
+        // The expected answer, read by SQL before the delete: the active record's position and the active count.
+        var baseRow = await BaseRowAsync(CaseReport, id, ct);
+        Assert.True(baseRow.HasValue, "The created record has no base row.");
+        var (uniqueKey, recStatus) = baseRow.Value;
+        Assert.Equal(ActiveRecStatus, recStatus);
+        var active = await CountAsync(CaseReport, includeDeleted: false, ct);
+        var position = await PositionOfAsync(CaseReport, includeDeleted: false, uniqueKey, ct);
+
+        host.Interleaver.Arm(SetPositionOperation, deleteClient, NavigationApi.RecordsPath(viewId, ById(id)), ct);
+        var placed = await NavigationApi.GetOkAsync(client, NavigationApi.RecordsPath(viewId, PositionOf(id)), ct);
+        await AssertSoftDeletedDuringRequestAsync(host, id, ct);
+
+        NavigationApi.AssertNavigationPosition(placed, position, active);
+
+        var activeAfter = await CountAsync(CaseReport, includeDeleted: false, ct);
+        Assert.Equal(active - 1, activeAfter);
+        var after = await NavigationApi.GetOkAsync(client, NavigationApi.RecordsPath(viewId, PositionOf(id)), ct);
+        NavigationApi.AssertNavigationPosition(after, null, activeAfter);
+    }
+
+    // AAP 0.3.4.4 "Records list q": the list's items and its total count one filtered set. The q filter is the
+    // record's own marker, in LastName, a CaseReport grid column, so the active filtered set is that record alone. The
+    // host's observer commits a soft delete of the record through the API as soon as the list's first statement has
+    // completed, before the list answers. The page and the total must still describe one state, the one before the
+    // delete: the record, and a total of 1. The next request sees the delete: no item and a total of 0.
+    [Fact]
+    public async Task List_DeleteCommittedDuringTheRequest_PageAndTotalDescribeOneState()
+    {
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        var ct = timeout.Token;
+        await using var dbLock = await DatabaseWriteLock.AcquireExclusiveAsync(ct);
+
+        await using var host = await InterleavingFactory.ForDatabaseAsync();
+        using var client = host.CreateClient();
+        using var deleteClient = host.CreateClient();
+
+        var viewId = await ApiTestClient.GetViewIdAsync(client, CaseReport, ct);
+        var marker = TestDatabase.NewMarker();
+        var id = await CreateMarkedRecordAsync(client, viewId, marker, ct);
+        var filtered = NavigationApi.RecordsPath(viewId, "?q=" + Uri.EscapeDataString(marker));
+
+        host.Interleaver.Arm(ListOperation, deleteClient, NavigationApi.RecordsPath(viewId, ById(id)), ct);
+        var listed = await NavigationApi.GetOkAsync(client, filtered, ct);
+        await AssertSoftDeletedDuringRequestAsync(host, id, ct);
+
+        var item = Assert.Single(NavigationApi.GetArray(listed, "items"));
+        Assert.Equal(id, NavigationApi.GetString(item, "globalRecordId"));
+        Assert.Equal(1, NavigationApi.GetInt(listed, "total"));
+
+        var after = await NavigationApi.GetOkAsync(client, filtered, ct);
+        Assert.Empty(NavigationApi.GetArray(after, "items"));
+        Assert.Equal(0, NavigationApi.GetInt(after, "total"));
+    }
+
+    // The list's items and its total count one filtered set even when a page row changes between the count and the
+    // page, which the list's one statement reads in two evaluations: it holds every page row it reads, as well as the
+    // base rows, until it completes. The test creates CaseReport records through the API, all carrying one marker in
+    // LastName. The target is the record with the lowest GlobalRecordId created so far, and the gate is the first
+    // record created with a GlobalRecordId above the target's; a record created below it becomes the target instead.
+    // Created after the target, the gate also has the higher UniqueKey, so the list reads the target's page row before
+    // the gate's whichever table leads the join. A second connection takes an exclusive lock on the gate's CaseReport1
+    // row in a transaction it rolls back, a lock that changes no data, and the list filtered by the marker blocks on
+    // that row. While it waits it must still hold a shared lock on the target's page row: a list that had released it
+    // could see that row change before its second evaluation and answer items and a total from two states. Once the
+    // lock is rolled back, the list answers every created record, with their number as the total.
+    [Fact]
+    public async Task List_BlockedOnALaterPageRow_StillHoldsThePageRowsItRead()
+    {
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        var ct = timeout.Token;
+        await using var dbLock = await DatabaseWriteLock.AcquireExclusiveAsync(ct);
+
+        var viewId = await ApiTestClient.GetViewIdAsync(Client, CaseReport, ct);
+        var marker = TestDatabase.NewMarker();
+        var created = new List<string> { await CreateMarkedRecordAsync(Client, viewId, marker, ct) };
+        var target = created[0];
+        string? gate = null;
+        while (gate is null)
+        {
+            Assert.True(
+                created.Count < MaxHeldPageRecords,
+                string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"The {created.Count} records created arrived in strictly decreasing GlobalRecordId order."));
+            var candidate = await CreateMarkedRecordAsync(Client, viewId, marker, ct);
+            created.Add(candidate);
+            if (StringComparer.OrdinalIgnoreCase.Compare(candidate, target) > 0)
+            {
+                gate = candidate;
+            }
+            else
+            {
+                target = candidate;
+            }
+        }
+
+        var targetRow = await BaseRowAsync(CaseReport, target, ct);
+        var gateRow = await BaseRowAsync(CaseReport, gate, ct);
+        Assert.True(targetRow.HasValue && gateRow.HasValue, "A created record has no base row.");
+        Assert.True(
+            targetRow.Value.UniqueKey < gateRow.Value.UniqueKey,
+            "The gate record does not follow the target record in UniqueKey order.");
+
+        // The lock resources of the two page rows, read before any lock is taken.
+        var targetResource = await PageOneLockResourceAsync(target, ct);
+        var gateResource = await PageOneLockResourceAsync(gate, ct);
+        var filtered = NavigationApi.RecordsPath(viewId, "?q=" + Uri.EscapeDataString(marker));
+
+        Factory.Recorder.Clear();
+        Task<HttpResponseMessage>? listing = null;
+        string? rollbackFailure;
+        await using var monitor = await TestDatabase.OpenConnectionAsync(ct);
+        var gateConnection = await TestDatabase.OpenConnectionAsync(ct);
+        SqlTransaction? gateTransaction = null;
+        try
+        {
+            gateTransaction = gateConnection.BeginTransaction();
+            await LockPageOneRowAsync(gateConnection, gateTransaction, gate, ct);
+            var gateSession = gateConnection.ServerProcessId;
+            Assert.Contains(ExclusiveMode, await GrantedPageOneKeyModesAsync(monitor, gateSession, gateResource, ct));
+
+            listing = Client.GetAsync(filtered, ct);
+            var listSession = await WaitForRequestBlockedByAsync(monitor, gateSession, gateResource, listing, ct);
+            var held = await GrantedPageOneKeyModesAsync(monitor, listSession, targetResource, ct);
+            Assert.True(
+                held.Contains(SharedMode) || held.Contains(RangeSharedMode),
+                $"While blocked on the gate's page row, the list holds no granted {SharedMode} or {RangeSharedMode} " +
+                $"key lock on the target's page row it read first; it holds [{string.Join(", ", held)}].");
+        }
+        finally
+        {
+            rollbackFailure = await ReleaseGateAsync(gateConnection, gateTransaction);
+        }
+
+        Assert.True(
+            rollbackFailure is null,
+            $"Rolling back the transaction that held the gate's page-row lock failed with {rollbackFailure}.");
+        Assert.NotNull(listing);
+        using var response = await listing;
+        var listed = await NavigationApi.ReadOkAsync(response, "GET " + filtered, ct);
+        Assert.Equal(
+            created,
+            NavigationApi.GetArray(listed, "items").Select(item => NavigationApi.GetString(item, "globalRecordId")));
+        Assert.Equal(created.Count, NavigationApi.GetInt(listed, "total"));
+        AssertNoWritesIssued();
+    }
+
+    // AAP 0.3.4.6 "Transaction boundary", 0.3.4.3: the response of a create and of an update is read inside the write's
+    // transaction, after its writes, by one statement that returns the rows with their intrinsic position and count,
+    // so the coordinates and the row describe one committed state. Each response's coordinates equal SQL's.
+    [Fact]
+    public async Task WriteResponse_IsOneSnapshotReadAfterTheWritesInsideTheTransaction()
+    {
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        var ct = timeout.Token;
+        await using var dbLock = await DatabaseWriteLock.AcquireExclusiveAsync(ct);
+
+        var viewId = await ApiTestClient.GetViewIdAsync(Client, CaseReport, ct);
+        Factory.Recorder.Clear();
+        var created = await ApiTestClient.CreateRecordAsync(
+            Client,
+            viewId,
+            new Dictionary<string, object?> { [TestDatabase.MarkerField] = TestDatabase.NewMarker() },
+            ct);
+        AssertOneSnapshotReadAfterTheWrites(InsertOperation);
+        await AssertIntrinsicAsync(CaseReport, created.Record, ct);
+
+        Factory.Recorder.Clear();
+        using var response = await ApiTestClient.PutJsonAsync(
+            Client,
+            NavigationApi.RecordsPath(viewId, ById(created.GlobalRecordId)),
+            new { values = new Dictionary<string, object?> { [TestDatabase.MarkerField] = TestDatabase.NewMarker() } },
+            ct);
+        var updated = await NavigationApi.ReadOkAsync(response, "PUT record", ct);
+        AssertOneSnapshotReadAfterTheWrites(UpdateOperation);
+        await AssertIntrinsicAsync(CaseReport, updated, ct);
+    }
+
+    // Creates a CaseReport record whose LastName holds marker, through the API, and returns its id.
+    private static async Task<string> CreateMarkedRecordAsync(
+        HttpClient client,
+        int viewId,
+        string marker,
+        CancellationToken ct)
+    {
+        var created = await ApiTestClient.CreateRecordAsync(
+            client,
+            viewId,
+            new Dictionary<string, object?> { [TestDatabase.MarkerField] = marker },
+            ct);
+        return created.GlobalRecordId;
+    }
+
+    // The interleaved DELETE answered 204 inside the request, and SQL holds the record soft-deleted.
+    private static async Task AssertSoftDeletedDuringRequestAsync(
+        InterleavingFactory host,
+        string globalRecordId,
+        CancellationToken ct)
+    {
+        Assert.Equal(HttpStatusCode.NoContent, host.Interleaver.DeleteStatus());
+        var deletedRow = await BaseRowAsync(CaseReport, globalRecordId, ct);
+        Assert.True(deletedRow.HasValue, "The soft-deleted record has no base row.");
+        Assert.Equal(DeletedRecStatus, deletedRow.Value.RecStatus);
+    }
+
+    // The write's commands under its operation: every one succeeded inside one transaction, and after its first write
+    // exactly one statement reads, the snapshot, which is the last command the write sends.
+    private void AssertOneSnapshotReadAfterTheWrites(string operation)
+    {
+        var commands = Factory.Recorder.ForOperation(operation);
+        Assert.NotEmpty(commands);
+        Assert.All(commands, command => Assert.True(
+            command.Completed && command.Succeeded && command.InTransaction,
+            $"A {operation} command did not succeed inside the transaction: {command}"));
+        Assert.Single(commands.Select(command => command.ClientConnectionId).Distinct());
+
+        var firstWrite = commands.First(command => command.IsWrite);
+        var readsAfterWrites = commands
+            .Where(command => command.Sequence > firstWrite.Sequence && !command.IsWrite)
+            .ToList();
+        var snapshot = Assert.Single(readsAfterWrites);
+        Assert.Equal(commands[^1].Sequence, snapshot.Sequence);
+    }
+
+    // The rehearsal-database API host of the interleaving cases: ApiFactoryBase's host, with its command observer
+    // replaced by an Interleaver that forwards every command to the factory's Recorder.
+    private sealed class InterleavingFactory : ApiFactoryBase
+    {
+        private InterleavingFactory(DatabaseHost host)
+            : base(host)
+        {
+            Interleaver = new DeleteAfterCommand(Recorder);
+        }
+
+        // The observer every command of the host reaches.
+        public DeleteAfterCommand Interleaver { get; }
+
+        // Proves the database reachable first and throws otherwise, as ApiFactory.ForDatabaseAsync does.
+        public static async Task<InterleavingFactory> ForDatabaseAsync() =>
+            new(await DatabaseHost.PrepareAsync(options: null));
+
+        // Runs after the base class's own test services, so this registration replaces the Recorder's.
+        protected override void ConfigureHost(IWebHostBuilder builder) =>
+            builder.ConfigureTestServices(services =>
+            {
+                services.RemoveAll<ISqlCommandObserver>();
+                services.AddSingleton<ISqlCommandObserver>(Interleaver);
+            });
+    }
+
+    // Forwards every command to the inner observer. Once armed, it sends one DELETE through its client inside
+    // OnExecuted of the next command of the armed operation, and waits there for the response, so the delete is
+    // committed after that statement completed and before the request that sent it can send another or answer.
+    private sealed class DeleteAfterCommand(ISqlCommandObserver inner) : ISqlCommandObserver
+    {
+        private readonly Lock _gate = new();
+
+        private (string Operation, HttpClient Client, string Path, CancellationToken Token)? _armed;
+
+        private HttpStatusCode? _status;
+
+        private Exception? _failure;
+
+        // Arms one DELETE of path; the next command of operation sends it, and later commands are only forwarded.
+        public void Arm(string operation, HttpClient client, string path, CancellationToken token)
+        {
+            lock (_gate)
+            {
+                _armed = (operation, client, path, token);
+                _status = null;
+                _failure = null;
+            }
+        }
+
+        public void OnExecuting(SqlCommandInfo command) => inner.OnExecuting(command);
+
+        public void OnExecuted(SqlCommandInfo command, int? sqlErrorNumber, Exception? error)
+        {
+            inner.OnExecuted(command, sqlErrorNumber, error);
+
+            (string Operation, HttpClient Client, string Path, CancellationToken Token) armed;
+            lock (_gate)
+            {
+                if (_armed is not { } pending
+                    || !string.Equals(command.Operation, pending.Operation, StringComparison.Ordinal))
+                {
+                    return;
+                }
+
+                armed = pending;
+                _armed = null;
+            }
+
+            try
+            {
+                // Blocking on purpose: the observer is called synchronously, so the request that ran the statement
+                // continues only once the DELETE, a request of its own on another connection, has answered.
+                using var response = armed.Client.DeleteAsync(armed.Path, armed.Token).GetAwaiter().GetResult();
+                lock (_gate)
+                {
+                    _status = response.StatusCode;
+                }
+            }
+            catch (Exception failure)
+            {
+                // An observer must not throw; the failure is raised by DeleteStatus instead.
+                lock (_gate)
+                {
+                    _failure = failure;
+                }
+            }
+        }
+
+        // The status the interleaved DELETE answered with.
+        public HttpStatusCode DeleteStatus()
+        {
+            lock (_gate)
+            {
+                if (_failure is not null)
+                {
+                    throw new XunitException("The interleaved DELETE failed.", _failure);
+                }
+
+                return _status ?? throw new XunitException(
+                    "No command of the armed operation completed while the DELETE was armed, so it was never sent.");
+            }
+        }
+    }
+
     // The first, middle and last 1-based index of a set of count rows, each once.
     private static SortedSet<int> StartMiddleEnd(int count) => [1, (count + 1) / 2, count];
 
@@ -532,7 +933,7 @@ public sealed class NavigationTests : IAsyncLifetime
     private static void AssertDeletedRecord(JsonElement record, string globalRecordId, int position, int count)
     {
         Assert.Equal(globalRecordId, NavigationApi.GetString(record, "globalRecordId"));
-        Assert.Equal(RecordQueryRules.DeletedRecStatus, NavigationApi.GetInt(record, "recStatus"));
+        Assert.Equal(DeletedRecStatus, NavigationApi.GetInt(record, "recStatus"));
         Assert.Equal(position, NavigationApi.GetInt(record, "position"));
         Assert.Equal(count, NavigationApi.GetInt(record, "count"));
     }
@@ -541,7 +942,7 @@ public sealed class NavigationTests : IAsyncLifetime
     private static void AssertActiveRecord(JsonElement record, string globalRecordId, int position, int count)
     {
         Assert.Equal(globalRecordId, NavigationApi.GetString(record, "globalRecordId"));
-        Assert.Equal(RecordQueryRules.ActiveRecStatus, NavigationApi.GetInt(record, "recStatus"));
+        Assert.Equal(ActiveRecStatus, NavigationApi.GetInt(record, "recStatus"));
         Assert.Equal(position, NavigationApi.GetInt(record, "position"));
         Assert.Equal(count, NavigationApi.GetInt(record, "count"));
     }
@@ -550,7 +951,7 @@ public sealed class NavigationTests : IAsyncLifetime
     private static void AssertActiveNeighbour(JsonElement record, string deletedId, int deletedKey, bool before)
     {
         Assert.NotEqual(deletedId, NavigationApi.GetString(record, "globalRecordId"));
-        Assert.Equal(RecordQueryRules.ActiveRecStatus, NavigationApi.GetInt(record, "recStatus"));
+        Assert.Equal(ActiveRecStatus, NavigationApi.GetInt(record, "recStatus"));
         var uniqueKey = NavigationApi.GetInt(record, "uniqueKey");
         Assert.True(
             before ? uniqueKey < deletedKey : uniqueKey > deletedKey,
@@ -597,7 +998,8 @@ public sealed class NavigationTests : IAsyncLifetime
         Assert.Equal(baseRow.Value.UniqueKey, uniqueKey);
         Assert.Equal(baseRow.Value.RecStatus, recStatus);
 
-        var intrinsicIncludesDeleted = recStatus != RecordQueryRules.ActiveRecStatus;
+        // The set is chosen from the row state SQL read, so the oracle does not rest on the response under test.
+        var intrinsicIncludesDeleted = baseRow.Value.RecStatus != ActiveRecStatus;
         Assert.Equal(
             await PositionOfAsync(form, intrinsicIncludesDeleted, uniqueKey, ct),
             NavigationApi.GetInt(record, "position"));
@@ -693,7 +1095,7 @@ public sealed class NavigationTests : IAsyncLifetime
     private static Task<(string GlobalRecordId, int UniqueKey)> FirstDeletedAsync(string form, CancellationToken ct) =>
         ReadFirstRowAsync(
             form,
-            $"SELECT TOP (1) [GlobalRecordId], [UniqueKey] FROM {BaseTable(form)} WHERE [RecStatus] = 0 " +
+            $"SELECT TOP (1) [GlobalRecordId], [UniqueKey] FROM {BaseTable(form)} WHERE [RecStatus] = @deleted " +
             "ORDER BY [UniqueKey];",
             "a soft-deleted record",
             ct);
@@ -707,7 +1109,7 @@ public sealed class NavigationTests : IAsyncLifetime
             "SELECT TOP (1) x.[GlobalRecordId], x.[UniqueKey] FROM (" +
             "SELECT [GlobalRecordId], [UniqueKey], [RecStatus], " +
             $"LAG([RecStatus]) OVER (ORDER BY [UniqueKey]) AS [PrevStatus] FROM {BaseTable(form)}) x " +
-            "WHERE x.[RecStatus] = 1 AND x.[PrevStatus] = 0 ORDER BY x.[UniqueKey];",
+            "WHERE x.[RecStatus] = @active AND x.[PrevStatus] = @deleted ORDER BY x.[UniqueKey];",
             "an active record directly after a soft-deleted one",
             ct);
 
@@ -720,6 +1122,10 @@ public sealed class NavigationTests : IAsyncLifetime
         await using var connection = await TestDatabase.OpenConnectionAsync(ct);
         await using var command = connection.CreateCommand();
         command.CommandText = commandText;
+
+        // Both row states are bound, so each caller's query compares RecStatus only through @active and @deleted.
+        AddActiveParameter(command);
+        AddDeletedParameter(command);
         await using var reader = await command.ExecuteReaderAsync(ct);
         if (!await reader.ReadAsync(ct))
         {
@@ -737,7 +1143,8 @@ public sealed class NavigationTests : IAsyncLifetime
         await using var connection = await TestDatabase.OpenConnectionAsync(ct);
         await using var command = connection.CreateCommand();
         command.CommandText =
-            $"SELECT COUNT(*) FROM {BaseTable(form)} WHERE [RecStatus] <> 1 AND [UniqueKey] < @k;";
+            $"SELECT COUNT(*) FROM {BaseTable(form)} WHERE [RecStatus] <> @active AND [UniqueKey] < @k;";
+        AddActiveParameter(command);
         command.Parameters.Add(new SqlParameter("@k", SqlDbType.Int) { Value = uniqueKey });
         return Assert.IsType<int>(await command.ExecuteScalarAsync(ct));
     }
@@ -782,8 +1189,157 @@ public sealed class NavigationTests : IAsyncLifetime
         return Assert.IsType<int>(await command.ExecuteScalarAsync(ct));
     }
 
-    private static void AddSetParameter(SqlCommand command, bool includeDeleted) =>
+    // The lock resource of a record's CaseReport1 row, as sys.dm_tran_locks describes a key lock on it.
+    private static async Task<string> PageOneLockResourceAsync(string globalRecordId, CancellationToken ct)
+    {
+        await using var connection = await TestDatabase.OpenConnectionAsync(ct);
+        await using var command = connection.CreateCommand();
+        command.CommandText = $"SELECT %%lockres%% FROM {CaseReportPageOneTable} WHERE [GlobalRecordId] = @id;";
+        AddIdParameter(command, globalRecordId);
+        return await command.ExecuteScalarAsync(ct) as string
+            ?? throw new XunitException("The created record has no CaseReport1 row.");
+    }
+
+    // The held-page case's gate: an exclusive lock on the record's CaseReport1 row, held by the open transaction until
+    // it is rolled back. The read changes no data.
+    private static async Task LockPageOneRowAsync(
+        SqlConnection connection,
+        SqlTransaction transaction,
+        string globalRecordId,
+        CancellationToken ct)
+    {
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText =
+            $"SELECT [GlobalRecordId] FROM {CaseReportPageOneTable} WITH (XLOCK, ROWLOCK, HOLDLOCK) " +
+            "WHERE [GlobalRecordId] = @id;";
+        AddIdParameter(command, globalRecordId);
+        Assert.True(
+            await command.ExecuteScalarAsync(ct) is string,
+            "The gate record has no CaseReport1 row to lock; no request was sent.");
+    }
+
+    // The modes of the granted key locks a session holds on one CaseReport1 row in this database.
+    private static async Task<IReadOnlyList<string>> GrantedPageOneKeyModesAsync(
+        SqlConnection monitor,
+        int session,
+        string lockResource,
+        CancellationToken ct)
+    {
+        await using var command = monitor.CreateCommand();
+        command.CommandText =
+            "SELECT l.[request_mode] FROM sys.dm_tran_locks AS l " +
+            "WHERE l.[request_session_id] = @session AND l.[resource_database_id] = DB_ID() " +
+            "AND l.[resource_type] = @type AND l.[request_status] = @status " +
+            "AND RTRIM(l.[resource_description]) = @resource " +
+            "AND l.[resource_associated_entity_id] IN (SELECT p.[hobt_id] FROM sys.partitions AS p " +
+            $"WHERE p.[object_id] = OBJECT_ID(N'{CaseReportPageOneTable}'));";
+        command.Parameters.Add(new SqlParameter("@session", SqlDbType.Int) { Value = session });
+        command.Parameters.Add(new SqlParameter("@type", SqlDbType.NVarChar, 60) { Value = KeyLockType });
+        command.Parameters.Add(new SqlParameter("@status", SqlDbType.NVarChar, 60) { Value = GrantedLockStatus });
+        command.Parameters.Add(new SqlParameter("@resource", SqlDbType.NVarChar, 256) { Value = lockResource });
+        await using var reader = await command.ExecuteReaderAsync(ct);
+        var modes = new List<string>();
+        while (await reader.ReadAsync(ct))
+        {
+            modes.Add(reader.GetString(0));
+        }
+
+        return modes.AsReadOnly();
+    }
+
+    // Waits until a request in this database is blocked by the gate session on the gate's row, and returns its session.
+    // The list answering first, or no such wait within BlockedRequestWait, fails the test.
+    private static async Task<int> WaitForRequestBlockedByAsync(
+        SqlConnection monitor,
+        int gateSession,
+        string gateResource,
+        Task<HttpResponseMessage> listing,
+        CancellationToken ct)
+    {
+        var waited = Stopwatch.StartNew();
+        while (true)
+        {
+            await using (var command = monitor.CreateCommand())
+            {
+                command.CommandText =
+                    "SELECT TOP (1) r.[session_id], r.[wait_resource] FROM sys.dm_exec_requests AS r " +
+                    "WHERE r.[blocking_session_id] = @gate AND r.[database_id] = DB_ID();";
+                command.Parameters.Add(new SqlParameter("@gate", SqlDbType.Int) { Value = gateSession });
+                await using var reader = await command.ExecuteReaderAsync(ct);
+                if (await reader.ReadAsync(ct))
+                {
+                    var session = reader.GetInt16(0);
+                    var waitResource = reader.GetString(1);
+                    Assert.True(
+                        waitResource.Contains(gateResource, StringComparison.Ordinal),
+                        "The request the gate session blocks waits on another resource than the gate's page row.");
+                    return session;
+                }
+            }
+
+            if (listing.IsCompleted)
+            {
+                throw new XunitException(
+                    "The list answered before it waited on the gate's page row, so its held locks were not observed.");
+            }
+
+            if (waited.Elapsed > BlockedRequestWait)
+            {
+                throw new XunitException(
+                    string.Create(
+                        CultureInfo.InvariantCulture,
+                        $"No request waited on the gate's page row within {BlockedRequestWait.TotalSeconds} seconds."));
+            }
+
+            await Task.Delay(BlockedRequestPoll, ct);
+        }
+    }
+
+    // Rolls the gate's transaction back, then disposes it and its connection. A failed rollback is returned, not
+    // thrown, so it never replaces an assertion raised while the lock was held; closing the connection rolls back a
+    // pending transaction, so the lock is released either way.
+    private static async Task<string?> ReleaseGateAsync(SqlConnection connection, SqlTransaction? transaction)
+    {
+        string? failure = null;
+        try
+        {
+            if (transaction is not null)
+            {
+                try
+                {
+                    await transaction.RollbackAsync(CancellationToken.None);
+                }
+                catch (Exception exception) when (exception is SqlException or InvalidOperationException)
+                {
+                    failure = TestDatabase.DescribeFailure(exception);
+                }
+                finally
+                {
+                    await transaction.DisposeAsync();
+                }
+            }
+        }
+        finally
+        {
+            await connection.DisposeAsync();
+        }
+
+        return failure;
+    }
+
+    // The parameters of SetPredicate: the deleted toggle, and the active row state.
+    private static void AddSetParameter(SqlCommand command, bool includeDeleted)
+    {
         command.Parameters.Add(new SqlParameter("@all", SqlDbType.Bit) { Value = includeDeleted });
+        AddActiveParameter(command);
+    }
+
+    private static void AddActiveParameter(SqlCommand command) =>
+        command.Parameters.Add(new SqlParameter("@active", SqlDbType.SmallInt) { Value = ActiveRecStatus });
+
+    private static void AddDeletedParameter(SqlCommand command) =>
+        command.Parameters.Add(new SqlParameter("@deleted", SqlDbType.SmallInt) { Value = DeletedRecStatus });
 
     private static void AddIdParameter(SqlCommand command, string globalRecordId) =>
         command.Parameters.Add(new SqlParameter("@id", SqlDbType.NVarChar, 255) { Value = globalRecordId });
@@ -801,6 +1357,12 @@ public sealed class NavigationTests : IAsyncLifetime
 /// </remarks>
 public sealed class EmptyFormNavigationTests : IAsyncLifetime
 {
+    // Test-owned list defaults, never read from production code: a missing page is 1 and a missing pageSize is 50
+    // (AAP 0.3.4.1).
+    private const int DefaultPage = 1;
+
+    private const int DefaultPageSize = 50;
+
     private readonly FakeForm _form = FakeForms.Empty;
 
     private readonly FakeDataStore _store = new();
@@ -875,8 +1437,8 @@ public sealed class EmptyFormNavigationTests : IAsyncLifetime
                 NavigationApi.RecordsPath(_viewId, string.Empty, includeDeleted));
             Assert.Empty(NavigationApi.GetArray(page, "items"));
             Assert.Equal(0, NavigationApi.GetInt(page, "total"));
-            Assert.Equal(RecordQueryRules.DefaultPage, NavigationApi.GetInt(page, "page"));
-            Assert.Equal(RecordQueryRules.DefaultPageSize, NavigationApi.GetInt(page, "pageSize"));
+            Assert.Equal(DefaultPage, NavigationApi.GetInt(page, "page"));
+            Assert.Equal(DefaultPageSize, NavigationApi.GetInt(page, "pageSize"));
         }
 
         Assert.Empty(_store.WriteCalls);

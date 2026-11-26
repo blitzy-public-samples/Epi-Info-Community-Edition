@@ -20,12 +20,19 @@ namespace EpiInfo.Data.Records;
 internal sealed record SearchSelect(SqlStatement Statement, IReadOnlyList<ProjectedColumn> Columns);
 
 /// <summary>
-/// One page of the records list with the layout of its result: ordinals <see cref="SearchSqlBuilder.IdOrdinal"/>,
-/// <see cref="SearchSqlBuilder.UniqueKeyOrdinal"/> and <see cref="SearchSqlBuilder.RecStatusOrdinal"/> (0, 1, 2) are
-/// the base row's <c>GlobalRecordId</c>, <c>UniqueKey</c> and <c>RecStatus</c>; then one
-/// <see cref="ProjectedColumn"/> per grid column, from ordinal 3.
+/// One page of the records list and the total of its filtered set, with the layout of its result: ordinals
+/// <see cref="SearchSqlBuilder.IdOrdinal"/>, <see cref="SearchSqlBuilder.UniqueKeyOrdinal"/> and
+/// <see cref="SearchSqlBuilder.RecStatusOrdinal"/> (0, 1, 2) are the base row's <c>GlobalRecordId</c>,
+/// <c>UniqueKey</c> and <c>RecStatus</c>; <see cref="SearchSqlBuilder.InPageOrdinal"/> (3) is 1 for a row of the page
+/// and 0 otherwise, an <c>int</c>; <see cref="SearchSqlBuilder.TotalOrdinal"/> (4) is the number of rows in the
+/// filtered set, a <c>bigint</c>, the same on every row; then one <see cref="ProjectedColumn"/> per grid column, from
+/// ordinal 5.
 /// </summary>
-/// <param name="Statement">The statement to run; it returns no row for a page past the end.</param>
+/// <param name="Statement">
+/// The statement to run. It returns the page's rows, flagged 1; for an empty page, a page past the end or an empty
+/// filtered set included, it returns one row flagged 0 whose other columns are <c>NULL</c>, so the total always
+/// arrives.
+/// </param>
 /// <param name="Columns">The grid columns in the order they were passed to the builder.</param>
 internal sealed record ListSelect(SqlStatement Statement, IReadOnlyList<ProjectedColumn> Columns);
 
@@ -45,12 +52,14 @@ internal sealed record ListSelect(SqlStatement Statement, IReadOnlyList<Projecte
 /// <para>
 /// <b>Identifiers and values.</b> Every table and column name comes from the reader-built <see cref="FormSchema"/>
 /// and reaches the text only through <see cref="SqlIdentifier"/>, by way of the <see cref="RecordSqlBuilder"/>
-/// helpers. The CTE name <c>[n]</c>, its position column <c>[pos]</c>, the aliases <c>b</c>, <c>p{i}</c> and
-/// <c>[c{n}]</c>, the names a packed list is decoded under (the derived tables <c>[d]</c>, <c>[a]</c> and <c>[e]</c>,
-/// the digit tables <c>[r{k}]</c>, and their columns <c>[v]</c>, <c>[i]</c>, <c>[t]</c> and <c>[g]</c>), the
-/// collation name, the escape character, the decoding expressions of packed values and a packed statement's plan
-/// hints, <c>OPTION (USE HINT ('DISABLE_OPTIMIZER_ROWGOAL', 'FORCE_LEGACY_CARDINALITY_ESTIMATION'))</c>, are fixed
-/// literals. Every value (criteria, packed or not, the grid filter, the excluded id, the cap, the offset and the page
+/// helpers. The CTE name <c>[n]</c>, Find's position column <c>[pos]</c>, the list's derived tables <c>[ct]</c> and
+/// <c>[pg]</c> and its count column <c>[tot]</c>, the aliases <c>b</c>, <c>p{i}</c> and <c>[c{n}]</c>, the names a
+/// packed list is decoded under (the derived tables <c>[d]</c>, <c>[a]</c> and <c>[e]</c>, the digit tables
+/// <c>[r{k}]</c>, and their columns <c>[v]</c>, <c>[i]</c>, <c>[t]</c> and <c>[g]</c>), the collation name, the escape
+/// character, the decoding expressions of packed values, a packed statement's plan hints,
+/// <c>OPTION (USE HINT ('DISABLE_OPTIMIZER_ROWGOAL', 'FORCE_LEGACY_CARDINALITY_ESTIMATION'))</c>, and the list's,
+/// <c>OPTION (FORCE ORDER, LOOP JOIN)</c>, are fixed literals.
+/// Every value (criteria, packed or not, the grid filter, the excluded id, the cap, the offset and the page
 /// size) is a positional parameter, so text that looks like SQL stays inert data.
 /// </para>
 /// <para>
@@ -76,14 +85,27 @@ internal static class SearchSqlBuilder
     internal const int PositionOrdinal = 3;
 
     /// <summary>
-    /// The ordinal of the total number of matches in a <see cref="SearchSelect"/>, a <c>bigint</c> counted before the
-    /// cap, so every row carries the same total.
+    /// The ordinal of a list row's page flag in a <see cref="ListSelect"/>, an <c>int</c>: 1 for a row of the requested
+    /// page, 0 for the one row an empty page returns, which carries only the total.
+    /// </summary>
+    internal const int InPageOrdinal = 3;
+
+    /// <summary>
+    /// The ordinal of the total in a <see cref="SearchSelect"/> or a <see cref="ListSelect"/>, a <c>bigint</c> that
+    /// every row carries: the number of matches, counted before the cap, in a search; the number of rows in the
+    /// filtered set, whatever the page, in the list.
     /// </summary>
     internal const int TotalOrdinal = 4;
 
     // The first grid-column ordinal of each result layout.
     private const int SearchFirstColumnOrdinal = 5;
-    private const int ListFirstColumnOrdinal = 3;
+    private const int ListFirstColumnOrdinal = 5;
+
+    // The fixed names of the list's filtered set, of the derived tables that count it and page it, and of the count.
+    private const string ListSetName = "[n]";
+    private const string ListTotalName = "[ct]";
+    private const string ListPageName = "[pg]";
+    private const string ListTotalColumn = "[tot]";
 
     // SUBSTRING bounds of the multiline comparison, legacy's 255-character prefix.
     private const string PrefixLength = "255";
@@ -167,6 +189,10 @@ internal static class SearchSqlBuilder
     // and 110 is applied at every level, so each level plans the decoding as those do: once per list.
     private const string PackedPlanHints =
         " OPTION (USE HINT ('DISABLE_OPTIMIZER_ROWGOAL', 'FORCE_LEGACY_CARDINALITY_ESTIMATION'))";
+
+    // The plan hints the list statement ends with: the joins run in written order, each as nested loops, so the base
+    // table is the outer input of every page join and each page row is read only after its base row is held (ListPage).
+    private const string ListPlanHints = " OPTION (FORCE ORDER, LOOP JOIN)";
 
     // SQL Server's largest decimal precision, the precision a packed decimal element is read back with.
     private const int MaxDecimalPrecision = 38;
@@ -437,7 +463,7 @@ internal static class SearchSqlBuilder
         {
             if (schema.Pages[index].Table is { } table)
             {
-                AppendPageJoin(sql, schema, index, table, "INNER JOIN");
+                AppendPageJoin(sql, schema, index, table, "INNER JOIN", holdLock: false);
             }
         }
 
@@ -491,21 +517,71 @@ internal static class SearchSqlBuilder
     }
 
     /// <summary>
-    /// Builds one page of the records list: the selected set, filtered by the grid filter, ordered by
-    /// <c>UniqueKey</c> and paged with <c>OFFSET ... FETCH</c>.
+    /// Builds one page of the records list and the total of its filtered set in one statement: the selected set,
+    /// filtered by the grid filter, counted, and paged in <c>UniqueKey</c> order with <c>OFFSET ... FETCH</c>.
     /// </summary>
     /// <remarks>
     /// <para>The statement has this shape:</para>
     /// <code>
-    /// SELECT b.[GlobalRecordId] AS [c0], b.[UniqueKey] AS [c1], b.[RecStatus] AS [c2], p0.[col] AS [c3], ...
-    /// FROM [base] b LEFT JOIN [page] p0 ON p0.[GlobalRecordId] = b.[GlobalRecordId] ...
-    /// [WHERE b.[RecStatus] = @p0] [AND (filter)]
-    /// ORDER BY b.[UniqueKey] OFFSET @p2 ROWS FETCH NEXT @p3 ROWS ONLY
+    /// WITH [n] AS (SELECT b.[GlobalRecordId] AS [c0], b.[UniqueKey] AS [c1], b.[RecStatus] AS [c2],
+    ///                     p0.[col] AS [c5], ...
+    ///              FROM [base] b WITH (HOLDLOCK)
+    ///              LEFT JOIN [page] p0 WITH (HOLDLOCK) ON p0.[GlobalRecordId] = b.[GlobalRecordId] ...
+    ///              [WHERE b.[RecStatus] = @p0] [AND (filter)])
+    /// SELECT [pg].[c0], [pg].[c1], [pg].[c2], CASE WHEN [pg].[c1] IS NULL THEN 0 ELSE 1 END AS [c3],
+    ///        [ct].[tot] AS [c4], [pg].[c5], ...
+    /// FROM (SELECT COUNT_BIG(*) AS [tot] FROM [n]) AS [ct]
+    /// OUTER APPLY (SELECT [c0], [c1], [c2], [c5], ... FROM [n]
+    ///              ORDER BY [c1] OFFSET @p2 ROWS FETCH NEXT @p3 ROWS ONLY) AS [pg]
+    /// ORDER BY [pg].[c1]
+    /// OPTION (FORCE ORDER, LOOP JOIN)
     /// </code>
     /// <para>
-    /// Only the pages holding a grid column are joined, with <c>LEFT JOIN</c>, so a record missing a page row is
-    /// still listed with <c>NULL</c> grid values. The offset is a <c>bigint</c>, so the largest admitted page cannot
-    /// wrap, and a valid page past the end returns no row. The filter is the one <see cref="ListCount"/> applies.
+    /// <b>Page and total.</b> <c>[n]</c> is the filtered set. <c>[ct]</c> counts it, and <c>[pg]</c> is the page,
+    /// <c>OFFSET ... FETCH</c> in <c>UniqueKey</c> order, with a <c>bigint</c> offset and an <c>int</c> page size, so
+    /// the largest admitted page cannot wrap. The count is one row, and applying the page to it returns each page row
+    /// with the total, flagged 1 at <see cref="InPageOrdinal"/>, or, for an empty page, one row of <c>NULL</c> page
+    /// columns flagged 0 that carries the total alone: a valid page past the end has no item and the correct total, and
+    /// an empty filtered set a total of 0.
+    /// </para>
+    /// <para>
+    /// <b>One consistent read.</b> The count and the page each read the filtered set, so this one statement evaluates
+    /// <c>[n]</c> twice, and every table <c>[n]</c> reads, the base table and each joined page table, carries the hint
+    /// <c>WITH (HOLDLOCK)</c>. Under the database's locking <c>READ COMMITTED</c>, every shared and key-range lock
+    /// either evaluation takes is held until the statement completes, so no base or page row one of them read can
+    /// change, and no row can be inserted among the base rows, before the other has read it too: the page and the
+    /// total describe one committed state even under a concurrent soft delete, a change to a filtered field, or a
+    /// change to a page row alone, which a writer outside the application, or an application update of a base table
+    /// with neither last-save column, makes without updating the base row. This is the one read that holds its page
+    /// tables; the record reads and Find read each row once and hold only the base table, as
+    /// <see cref="RecordSqlBuilder"/>'s class remarks describe.
+    /// </para>
+    /// <para>
+    /// <b>Lock order.</b> A held page-row lock could deadlock with a write that holds that record's exclusive page-row
+    /// lock while it waits for a base row the list holds. The statement therefore ends with
+    /// <c>OPTION (FORCE ORDER, LOOP JOIN)</c>: the joins run in their written order, each as nested loops, so the base
+    /// table is the outer input of every page join, and each evaluation reads a page row only once it holds that
+    /// row's base row. Page tables key on <c>GlobalRecordId</c>, so each inner read is a seek that locks the base row's
+    /// own page row or, where it has none, the key range that row would sit in. Every application write locks a
+    /// record's base row before any of its page rows: an update takes its update lock on the base row, and updates
+    /// the base row's last-save columns where the table has them, before its page rows; a create inserts the base row
+    /// first; and a soft delete writes the base row alone. Its later reads of other rows take only shared locks. A
+    /// write that holds a page row the list waits for therefore waits on nothing the list holds, and a write that
+    /// waits for a base row the list holds holds none of the page rows the list still has to read, so no application
+    /// write forms a lock cycle with the list.
+    /// </para>
+    /// <para>
+    /// <b>Residual deadlocks.</b> Two waits can still end in a deadlock (1205): a writer outside the application that
+    /// changes a page row the list holds while it holds one the list waits for, and a create whose new page key falls
+    /// in the key range a page seek of the list locked for a record with no row on that page, while the list waits for
+    /// that create's base row. The list can also be chosen as the victim of a deadlock between writers whose base-row
+    /// locks it waits behind, a wait its held base-table read alone already allows. SQL Server ends one statement as
+    /// the victim, which the store reports as unavailable: the list answers 503, and an application create 503 with
+    /// nothing written. None of them returns a page and a total from two different states.
+    /// </para>
+    /// <para>
+    /// Only the pages holding a grid column are joined, with <c>LEFT JOIN</c>, so a record missing a page row is still
+    /// listed with <c>NULL</c> grid values and still counted.
     /// </para>
     /// </remarks>
     /// <param name="schema">The form's catalogue view.</param>
@@ -533,8 +609,10 @@ internal static class SearchSqlBuilder
         var uniqueKey = RecordSqlBuilder.Require(schema.UniqueKey);
         var columns = ResolveGridColumns(schema, gridColumns, ListFirstColumnOrdinal);
 
+        // The filtered set is the statement's one source of base and page rows, read by the count and by the page with
+        // every table under HOLDLOCK and, through the plan hints at the end, the base table first.
         var parameters = new PositionalParameters();
-        var sql = new StringBuilder("SELECT ");
+        var sql = new StringBuilder("WITH ").Append(ListSetName).Append(" AS (SELECT ");
         AppendBase(sql, RecordSqlBuilder.Require(schema.GlobalRecordId))
             .Append(" AS ").Append(RecordSqlBuilder.ColumnAlias(IdOrdinal)).Append(", ");
         AppendBase(sql, uniqueKey).Append(" AS ").Append(RecordSqlBuilder.ColumnAlias(UniqueKeyOrdinal)).Append(", ");
@@ -543,53 +621,43 @@ internal static class SearchSqlBuilder
         AppendProjections(sql, schema, columns);
         AppendListSource(sql, schema, columns, query, parameters);
 
-        sql.Append(" ORDER BY ");
-        AppendBase(sql, uniqueKey)
+        // The page's columns as the filtered set names them, and as the outer query reads them from the page.
+        var setColumns = new StringBuilder();
+        var pageColumns = new StringBuilder();
+        foreach (var ordinal in new[] { IdOrdinal, UniqueKeyOrdinal, RecStatusOrdinal }
+                     .Concat(columns.Select(column => column.Ordinal)))
+        {
+            var alias = RecordSqlBuilder.ColumnAlias(ordinal);
+            setColumns.Append(setColumns.Length == 0 ? string.Empty : ", ").Append(alias);
+            pageColumns.Append(", ").Append(ListPageName).Append('.').Append(alias);
+        }
+
+        var pageKey = string.Concat(ListPageName, ".", RecordSqlBuilder.ColumnAlias(UniqueKeyOrdinal));
+        sql.Append(") SELECT ")
+            .Append(ListPageName).Append('.').Append(RecordSqlBuilder.ColumnAlias(IdOrdinal)).Append(", ")
+            .Append(pageKey).Append(", ")
+            .Append(ListPageName).Append('.').Append(RecordSqlBuilder.ColumnAlias(RecStatusOrdinal))
+            .Append(", CASE WHEN ").Append(pageKey).Append(" IS NULL THEN 0 ELSE 1 END AS ")
+            .Append(RecordSqlBuilder.ColumnAlias(InPageOrdinal))
+            .Append(", ").Append(ListTotalName).Append('.').Append(ListTotalColumn)
+            .Append(" AS ").Append(RecordSqlBuilder.ColumnAlias(TotalOrdinal));
+        foreach (var column in columns)
+        {
+            sql.Append(", ").Append(ListPageName).Append('.').Append(RecordSqlBuilder.ColumnAlias(column.Ordinal));
+        }
+
+        // The offset is a bigint and the page size an int, bound after the filter's parameters.
+        sql.Append(" FROM (SELECT COUNT_BIG(*) AS ").Append(ListTotalColumn).Append(" FROM ").Append(ListSetName)
+            .Append(") AS ").Append(ListTotalName)
+            .Append(" OUTER APPLY (SELECT ").Append(setColumns).Append(" FROM ").Append(ListSetName)
+            .Append(" ORDER BY ").Append(RecordSqlBuilder.ColumnAlias(UniqueKeyOrdinal))
             .Append(" OFFSET ").Append(parameters.Add(n => ColumnValueConverter.Int64(n, offset)))
             .Append(" ROWS FETCH NEXT ").Append(parameters.Add(n => ColumnValueConverter.Int32(n, query.PageSize)))
-            .Append(" ROWS ONLY");
+            .Append(" ROWS ONLY) AS ").Append(ListPageName)
+            .Append(" ORDER BY ").Append(pageKey)
+            .Append(ListPlanHints);
 
         return new ListSelect(parameters.ToStatement(sql.ToString()), columns);
-    }
-
-    /// <summary>
-    /// Counts the records the list filters, for its <c>total</c>: <c>SELECT COUNT_BIG(*)</c> over the same joins and
-    /// the same predicate as <see cref="ListPage"/>, built by the same private code (<see cref="AppendListSource"/>),
-    /// so for one database state the total counts exactly the rows the pages are drawn from.
-    /// </summary>
-    /// <remarks>
-    /// The page and the count are two statements, so this builder alone gives them no common snapshot: a write
-    /// committed between them can make the total and a page disagree. A caller that needs them to agree runs both
-    /// under one consistent read, for example one snapshot transaction where the database allows snapshot isolation,
-    /// or one serializable transaction.
-    /// </remarks>
-    /// <param name="schema">The form's catalogue view.</param>
-    /// <param name="gridColumns">The grid columns the filter searches, the ones passed to <see cref="ListPage"/>.</param>
-    /// <param name="query">The coerced list query; its paging is not used.</param>
-    /// <returns>A statement returning one <c>bigint</c>.</returns>
-    /// <exception cref="ArgumentNullException">An argument is null.</exception>
-    /// <exception cref="ArgumentException">
-    /// <paramref name="gridColumns"/> holds a null entry or a field with no column in the form's page tables; or the
-    /// query's filter fails <see cref="RecordQueryRules.IsRepresentableFilter"/>, so its contains pattern would be
-    /// longer than <see cref="RecordQueryRules.MaxLikePatternLength"/>.
-    /// </exception>
-    /// <exception cref="InvalidOperationException">A table lacks a required system or key column.</exception>
-    internal static SqlStatement ListCount(
-        FormSchema schema,
-        IReadOnlyList<DataFieldMetadata> gridColumns,
-        RecordListQuery query)
-    {
-        ArgumentNullException.ThrowIfNull(schema);
-        ArgumentNullException.ThrowIfNull(gridColumns);
-        ArgumentNullException.ThrowIfNull(query);
-
-        // The ordinals match ListPage's so the resolved columns are the same; this statement projects none of them.
-        var columns = ResolveGridColumns(schema, gridColumns, ListFirstColumnOrdinal);
-        var parameters = new PositionalParameters();
-        var sql = new StringBuilder("SELECT COUNT_BIG(*)");
-        AppendListSource(sql, schema, columns, query, parameters);
-
-        return parameters.ToStatement(sql.ToString());
     }
 
     // Resolves every condition to the column text it compares, before any statement text is written. A page field
@@ -1019,11 +1087,12 @@ internal static class SearchSqlBuilder
         return columns.AsReadOnly();
     }
 
-    // The list's FROM clause and predicate, shared by ListPage and ListCount: the base table LEFT JOINed to each page
-    // holding a grid column, the selected set, and the grid filter. The filter is a case-insensitive "contains" over
-    // the grid columns that does not depend on the database collation: each column is converted to text (a datetime
-    // as yyyy-mm-dd), and both sides are compared under one case-insensitive collation, with the filter's pattern
-    // characters escaped by RecordQueryRules.ToContainsPattern. It has no legacy counterpart.
+    // The FROM clause and predicate of ListPage's filtered set: the base table LEFT JOINed to each page holding a grid
+    // column, every one of them under the HOLDLOCK hint ListPage describes, the selected set, and the grid filter. The
+    // filter is a case-insensitive "contains" over the grid columns that does not depend on the database collation:
+    // each column is converted to text (a datetime as yyyy-mm-dd), and both sides are compared under one
+    // case-insensitive collation, with the filter's pattern characters escaped by RecordQueryRules.ToContainsPattern.
+    // It has no legacy counterpart.
     private static void AppendListSource(
         StringBuilder sql,
         FormSchema schema,
@@ -1033,6 +1102,7 @@ internal static class SearchSqlBuilder
     {
         sql.Append(" FROM ");
         AppendBaseTable(sql, schema);
+        sql.Append(" WITH (HOLDLOCK)");
 
         var joined = new bool[schema.Pages.Count];
         foreach (var column in columns)
@@ -1044,7 +1114,7 @@ internal static class SearchSqlBuilder
         {
             if (joined[index] && schema.Pages[index].Table is { } table)
             {
-                AppendPageJoin(sql, schema, index, table, "LEFT JOIN");
+                AppendPageJoin(sql, schema, index, table, "LEFT JOIN", holdLock: true);
             }
         }
 
@@ -1101,12 +1171,24 @@ internal static class SearchSqlBuilder
         }
     }
 
-    // <join> [page] p{i} ON p{i}.[GlobalRecordId] = b.[GlobalRecordId]
-    private static void AppendPageJoin(StringBuilder sql, FormSchema schema, int pageIndex, TableSchema table, string join)
+    // <join> [page] p{i} [WITH (HOLDLOCK)] ON p{i}.[GlobalRecordId] = b.[GlobalRecordId]; only ListPage holds its page
+    // tables, for the reason it describes, so Find's joins carry no hint.
+    private static void AppendPageJoin(
+        StringBuilder sql,
+        FormSchema schema,
+        int pageIndex,
+        TableSchema table,
+        string join,
+        bool holdLock)
     {
         var alias = RecordSqlBuilder.PageAlias(pageIndex);
-        sql.Append(' ').Append(join).Append(' ').Append(SqlIdentifier.Quote(table)).Append(' ').Append(alias)
-            .Append(" ON ").Append(alias).Append('.').Append(SqlIdentifier.Quote(RecordSqlBuilder.RequirePageKey(table)))
+        sql.Append(' ').Append(join).Append(' ').Append(SqlIdentifier.Quote(table)).Append(' ').Append(alias);
+        if (holdLock)
+        {
+            sql.Append(" WITH (HOLDLOCK)");
+        }
+
+        sql.Append(" ON ").Append(alias).Append('.').Append(SqlIdentifier.Quote(RecordSqlBuilder.RequirePageKey(table)))
             .Append(" = ");
         AppendBase(sql, RecordSqlBuilder.Require(schema.GlobalRecordId));
     }

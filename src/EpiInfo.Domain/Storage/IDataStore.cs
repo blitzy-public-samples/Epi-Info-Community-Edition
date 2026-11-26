@@ -32,8 +32,8 @@ namespace EpiInfo.Domain.Storage;
 /// </para>
 /// <para>
 /// <b>Threading.</b> Implementations are stateless and thread-safe, so one instance serves every request. Each call
-/// uses its own connection, and nothing is cached between calls, metadata included: a form's metadata, code tables
-/// and column types are read again on every call that needs them.
+/// uses its own connection, and nothing is kept for a later request, metadata included: a form's metadata, code tables
+/// and column types are read again by every request that needs them.
 /// </para>
 /// <para>
 /// <b>Identifiers.</b> Field names are canonical <c>metaFields.Name</c> values, and results key them ordinally, so
@@ -41,8 +41,9 @@ namespace EpiInfo.Domain.Storage;
 /// <see cref="DataFieldSet.TryGet"/> resolves it to: the exact spelling, otherwise the one field equal to it ignoring
 /// case; an ambiguous name names none. Every table and column name a store uses comes from its own catalogue read,
 /// never from a caller's string; in <c>EpiInfo.Data</c> that is the reader-built <c>TableSchema</c>. The
-/// <see cref="FormMetadata"/> a record method receives identifies the form, and the store resolves its tables and
-/// columns again for that call.
+/// <see cref="FormMetadata"/> a record method receives identifies the form. A record read takes its tables and columns
+/// from the catalogue read that produced that very instance in the same request, or reads them again for any other
+/// instance; a write reads them again inside its transaction.
 /// </para>
 /// <para>
 /// <b>Cancellation.</b> Every method takes the request's abort token as its last, required parameter, so no caller
@@ -100,8 +101,8 @@ namespace EpiInfo.Domain.Storage;
 /// <item><description>
 /// <b>Inside the transaction</b> run the locked read and the gates, every write, and the read of the response
 /// snapshot (base and page rows with the intrinsic position and count, which follow the same intrinsic rule as the
-/// record reads) together with the construction of its <see cref="RecordDto"/> through <see cref="RecordDto.From"/>.
-/// A failure in any of them rolls the write back.
+/// record reads and come from one consistent read with the rows, as theirs do) together with the construction of its
+/// <see cref="RecordDto"/> through <see cref="RecordDto.From"/>. A failure in any of them rolls the write back.
 /// </description></item>
 /// <item><description>
 /// <b>Return value:</b> a normal return of <see cref="InsertAsync"/>, a <see cref="RecordWriteStatus.Success"/> from
@@ -253,6 +254,9 @@ public interface IDataStore
     /// <remarks>
     /// Only the base table is read, so a record missing a page row is still placed. These coordinates differ from the
     /// intrinsic ones a <see cref="RecordDto"/> carries whenever the toggle selects a set other than the record's own.
+    /// The record's <c>RecStatus</c>, which decides its membership, its position and the count come from one
+    /// consistent read, as the intrinsic coordinates do, so a concurrent soft delete can never yield a position for a
+    /// record outside the set.
     /// </remarks>
     /// <param name="form">The form's metadata.</param>
     /// <param name="globalRecordId">The record's base-table <c>GlobalRecordId</c>.</param>
@@ -295,6 +299,14 @@ public interface IDataStore
     /// <b>Precondition:</b> a <see cref="RecordListQuery.Filter"/> that is not <see langword="null"/> passes
     /// <see cref="RecordQueryRules.IsRepresentableFilter"/>, so its contains pattern fits SQL Server's <c>LIKE</c>
     /// pattern limit. The API rejects a longer <c>q</c> with a 400 before it calls the store.
+    /// </description></item>
+    /// <item><description>
+    /// <b>Consistency:</b> the items and the total come from one consistent read of the filtered set, so they always
+    /// describe the same set: in the SQL store, one statement that counts and pages the set and holds the shared locks
+    /// of its base-table and page-table reads until it completes (<c>HOLDLOCK</c>), reading each page row only after
+    /// its base row, so no row either read can change before the other has read it, even under a concurrent soft
+    /// delete or a change to a filtered field. A deadlock that chooses the read as its victim fails it as unavailable,
+    /// never with an inconsistent page.
     /// </description></item>
     /// </list>
     /// </remarks>

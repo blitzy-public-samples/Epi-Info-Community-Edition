@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useId, useMemo, useState, type KeyboardEvent, type ReactNode } from 'react';
 
-import type { ApiClient } from '../api/client';
+import { isExactDecimal, type ApiClient } from '../api/client';
 import { describeError, isAbortError, networkError, type ApiError } from '../api/errors';
 import type { FieldDefinition, FieldValue, FormDefinition, RecordPage, RecordSummary } from '../api/types';
 import { ConnectionError } from './ConnectionError';
@@ -55,11 +55,16 @@ function cellText(value: FieldValue | undefined): string {
   if (typeof value === 'boolean') {
     return value ? 'Yes' : 'No';
   }
-  if (typeof value === 'number') {
+  // A bigint is an exact integer beyond the safe range, shown digit for digit.
+  if (typeof value === 'number' || typeof value === 'bigint') {
     return String(value);
   }
   if (typeof value === 'string') {
     return value;
+  }
+  // An exact decimal is a typed number, shown as its JSON literal; no response carries one.
+  if (isExactDecimal(value)) {
+    return value.literal;
   }
   return '';
 }

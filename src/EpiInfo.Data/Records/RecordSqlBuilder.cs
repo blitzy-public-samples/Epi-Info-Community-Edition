@@ -87,8 +87,8 @@ internal sealed record PagePresence(PageTableSchema Page, int Ordinal);
 /// <param name="Pages">The joined pages, in <c>FormSchema.Pages</c> order.</param>
 /// <param name="HasIntrinsicCoordinates">
 /// Whether ordinals 3 and 4 hold the record's intrinsic position and count, computed by the same statement that reads
-/// the row: set for <see cref="RecordSqlBuilder.RecordAt"/> and <see cref="RecordSqlBuilder.RecordById"/>, clear for
-/// <see cref="RecordSqlBuilder.RecordByUniqueKey"/>.
+/// the row: set for <see cref="RecordSqlBuilder.RecordAt"/>, <see cref="RecordSqlBuilder.RecordById"/> and
+/// <see cref="RecordSqlBuilder.RecordSnapshot"/>, clear for <see cref="RecordSqlBuilder.RecordByUniqueKey"/>.
 /// </param>
 internal sealed record RecordSelect(
     SqlStatement Statement,
@@ -122,8 +122,9 @@ internal enum SelectedSetClause
 /// <b>Identifiers.</b> Every table and column name comes from a reader-built <see cref="FormSchema"/>,
 /// <see cref="PageTableSchema"/> or <see cref="ColumnSchema"/> and reaches the text only through
 /// <see cref="SqlIdentifier.Quote(TableSchema)"/> or <see cref="SqlIdentifier.Quote(ColumnSchema)"/>. The aliases
-/// (<c>b</c>, <c>i</c>, <c>p{i}</c>, <c>[c{n}]</c>, <c>[ip]</c>, <c>[ic]</c>) and SQL keywords are fixed literals.
-/// Result columns are aliased by ordinal, so two tables with a column of the same name never collide.
+/// (<c>b</c>, <c>i</c>, <c>p{i}</c>, <c>[c{n}]</c>, <c>[ip]</c>, <c>[ic]</c>, <c>[sp]</c>, <c>[sc]</c>) and SQL
+/// keywords are fixed literals. Result columns are aliased by ordinal, so two tables with a column of the same name
+/// never collide.
 /// </para>
 /// <para>
 /// <b>Values.</b> Every value is a positional parameter built by <see cref="ColumnValueConverter"/>, typed by the
@@ -134,22 +135,23 @@ internal enum SelectedSetClause
 /// <b>Record identity.</b> SQL Server compares strings as if the shorter were padded with trailing spaces. Every
 /// predicate this builder renders that matches a base row against a <c>GlobalRecordId</c> parameter, in
 /// <see cref="RecordById"/>, <see cref="SetPositionLookup"/>, <see cref="LockBase"/> and the base-row key of
-/// <see cref="RecordByUniqueKey"/>, <see cref="UpdateBaseStamp"/> and <see cref="SoftDelete"/>, compares under the
-/// column's collation and, because of that padding, also requires equal byte lengths (<c>DATALENGTH</c>): an id
-/// longer than the column, or one that differs from a stored id only by trailing spaces, finds no row instead of
-/// failing to bind or matching that stored id, while letter case still follows the collation. The Find exclusion
-/// (<see cref="AppendGlobalRecordIdExclusion"/>) negates that same match, so such an id excludes no row. The page
-/// statements (<see cref="UpdatePageColumns"/>, <see cref="InsertPageKey"/>) bind the stored id the locked read
-/// returned, and the page join of a record read compares two stored columns. Neither meets a request's spelling, so
-/// the page <c>UPDATE</c> and the join keep plain equality. The by-id reads return the id as the base row stores it,
-/// and every later statement binds that stored spelling, never the request's.
+/// <see cref="RecordByUniqueKey"/>, <see cref="RecordSnapshot"/>, <see cref="UpdateBaseStamp"/> and
+/// <see cref="SoftDelete"/>, compares under the column's collation and, because of that padding, also requires equal
+/// byte lengths (<c>DATALENGTH</c>): an id longer than the column, or one that differs from a stored id only by
+/// trailing spaces, finds no row instead of failing to bind or matching that stored id, while letter case still
+/// follows the collation. The Find exclusion (<see cref="AppendGlobalRecordIdExclusion"/>) negates that same match, so
+/// such an id excludes no row. The page statements (<see cref="UpdatePageColumns"/>, <see cref="InsertPageKey"/>)
+/// bind the stored id the locked read returned, and the page join of a record read compares two stored columns.
+/// Neither meets a request's spelling, so the page <c>UPDATE</c> and the join keep plain equality. The by-id reads
+/// return the id as the base row stores it, and every later statement binds that stored spelling, never the request's.
 /// </para>
 /// <para>
 /// <b>Aliases.</b> Reads alias the base table <c>b</c> and each page <c>p{i}</c>, where <c>i</c> is the page's index in
-/// <see cref="FormSchema.Pages"/>, so a column has the same reference in every statement. <see cref="RecordAt"/> and
-/// <see cref="RecordById"/> read the base table as <c>i</c> inside a derived table aliased <c>b</c>, which keeps the
-/// base system columns under their catalogue names and adds <c>[ip]</c> and <c>[ic]</c>, so their outer query
-/// references the base row exactly as the other reads do. Statements that write use no alias.
+/// <see cref="FormSchema.Pages"/>, so a column has the same reference in every statement. <see cref="RecordAt"/>,
+/// <see cref="RecordById"/> and <see cref="RecordSnapshot"/> read the base table as <c>i</c> inside a derived table
+/// aliased <c>b</c>, which keeps the base system columns under their catalogue names and adds <c>[ip]</c> and
+/// <c>[ic]</c>, so their outer query references the base row exactly as the other reads do;
+/// <see cref="SetPositionLookup"/> does the same with <c>[sp]</c> and <c>[sc]</c>. Statements that write use no alias.
 /// </para>
 /// <para>
 /// <b>Locking.</b> The locked read (<see cref="LockBase"/>) takes an update lock on the base row it matches and holds
@@ -165,21 +167,34 @@ internal enum SelectedSetClause
 /// depend on serialisation across a whole table, or assume its absence. Every later base statement addresses the row by
 /// <c>UniqueKey</c> and <c>GlobalRecordId</c> together, a clustered-key seek, and page tables key on
 /// <c>GlobalRecordId</c>, so page statements seek. A writer can still wait on another record's writer, in the locked
-/// scan or in the snapshot counts; a deadlock that ends such a wait (1205) is reported by the repository as not
-/// written.
+/// scan or in the snapshot read, which scans the base table for the intrinsic coordinates; a deadlock that ends such a
+/// wait (1205) is reported by the repository as not written.
 /// </para>
 /// <para>
 /// <b>Read hint.</b> The database runs locking <c>READ COMMITTED</c>, with neither read-committed snapshot nor
 /// snapshot isolation, and its settings are never changed. There a scan releases each shared lock as it moves on, so
-/// a concurrent write committed mid-statement could leave a record's <c>RecStatus</c> and the rows counted for its
-/// position from different states. <see cref="RecordAt"/> and <see cref="RecordById"/> therefore read the base table
-/// <c>WITH (HOLDLOCK)</c>: every shared and key-range lock that read takes is held until the statement completes, so
-/// no base row it read can change, and no row can be inserted among them, before it returns, and the row, its
-/// intrinsic position and its count describe one committed state. Those reads run outside any transaction, so the
-/// hint lasts one statement. Only the base table carries it: held page-row locks could deadlock with an update that
-/// holds exclusive page-row locks. Every application write updates the base row before any of its page rows (a base
-/// table with neither last-save column, which no seeded form has, takes only the update lock first), so a page row
-/// read while the record's base row is held cannot change either.
+/// a concurrent write committed mid-statement, or between two statements, could leave a record's <c>RecStatus</c>
+/// and the rows counted for its position or for a total from different states. Every read that pairs rows with
+/// coordinates or a total computed from the base table is therefore one statement that reads the base table
+/// <c>WITH (HOLDLOCK)</c>: <see cref="RecordAt"/>, <see cref="RecordById"/>, <see cref="RecordSnapshot"/> and
+/// <see cref="SetPositionLookup"/> here, and <c>SearchSqlBuilder.Search</c> and <c>SearchSqlBuilder.ListPage</c>.
+/// Every shared and key-range lock that read takes is held until the statement completes, so no base row it read can
+/// change, and no row can be inserted among them, before it returns, and the rows, their status, positions, counts
+/// and totals describe one committed state. The reads other than <see cref="RecordSnapshot"/> run outside any
+/// transaction, so the hint lasts one statement. <see cref="RecordSnapshot"/> runs inside a write transaction, where
+/// the locks last until the commit the repository sends immediately after it, so no later statement waits on them.
+/// In every read except <c>SearchSqlBuilder.ListPage</c> only the base table carries the hint: held page-row locks
+/// could deadlock with an update that holds exclusive page-row locks. Every application write updates the base row
+/// before any of its page rows (a base table with neither last-save column, which no seeded form has, takes only the
+/// update lock first), so on the seeded forms a page row these reads join to a held base row cannot change through
+/// the application, and each of them reads that row once. <c>SearchSqlBuilder.ListPage</c> is the exception: it
+/// reads its filtered set twice in one statement, once for the total and once for the page, so a page row changed
+/// between the two reads without its base row, by a writer outside the application or by an update of a base table
+/// with neither last-save column, would make them describe different sets. It therefore holds its page tables too,
+/// and its plan hints <c>OPTION (FORCE ORDER, LOOP JOIN)</c> make the base table the outer input of every page join,
+/// so it reads each page row only once it holds that row's base row, the order every application write locks them
+/// in, and no application write forms a lock cycle with it. Its remarks state the deadlocks that order leaves
+/// possible and how they are reported.
 /// </para>
 /// <para>
 /// Every exception message is fixed text naming no table, column, value or id, as the redaction policy requires.
@@ -215,8 +230,8 @@ internal static class RecordSqlBuilder
     /// <summary>
     /// The ordinal of <c>GlobalRecordId</c>, as stored, in the base-row reads <see cref="SetPositionLookup"/> and
     /// <see cref="LockBase"/>. The caller binds this spelling, never the request's, in every later statement of the
-    /// operation: <see cref="RecordByUniqueKey"/>, <see cref="UpdateBaseStamp"/>, <see cref="UpdatePageColumns"/>,
-    /// <see cref="InsertPageKey"/> and <see cref="SoftDelete"/>.
+    /// operation: <see cref="RecordByUniqueKey"/>, <see cref="RecordSnapshot"/>, <see cref="UpdateBaseStamp"/>,
+    /// <see cref="UpdatePageColumns"/>, <see cref="InsertPageKey"/> and <see cref="SoftDelete"/>.
     /// </summary>
     internal const int BaseRowGlobalRecordIdOrdinal = 2;
 
@@ -233,6 +248,15 @@ internal static class RecordSqlBuilder
     internal const int RecordIntrinsicCountOrdinal = 4;
 
     /// <summary>
+    /// The ordinal of the record's position in the selected set, a <c>bigint</c>, in <see cref="SetPositionLookup"/>.
+    /// It is a position only for a row inside that set.
+    /// </summary>
+    internal const int SetPositionOrdinal = 3;
+
+    /// <summary>The ordinal of the selected-set count, a <c>bigint</c>, in <see cref="SetPositionLookup"/>.</summary>
+    internal const int SetCountOrdinal = 4;
+
+    /// <summary>
     /// The most columns one page <c>UPDATE</c> sets, the chunk size legacy Epi Info uses
     /// (<c>Epi.Core/Data/Services/CollectedDataProvider.cs:1274-1340</c>).
     /// </summary>
@@ -241,11 +265,14 @@ internal static class RecordSqlBuilder
     // The number of base columns every record SELECT starts with: GlobalRecordId, UniqueKey, RecStatus.
     private const int RecordBaseColumnCount = 3;
 
-    // The alias of the base table inside the derived table of an intrinsic record read, and the fixed names that
-    // derived table gives the intrinsic position and count. None of them reaches SQL text from a caller.
+    // The alias of the base table inside the derived table of an intrinsic record read or a selected-set placement,
+    // and the fixed names those derived tables give the intrinsic position and count and the selected-set position and
+    // count. None of them reaches SQL text from a caller.
     private const string IntrinsicSourceAlias = "i";
     private const string IntrinsicPositionColumn = "[ip]";
     private const string IntrinsicCountColumn = "[ic]";
+    private const string SetPositionColumn = "[sp]";
+    private const string SetCountColumn = "[sc]";
 
     // Catalogue lookup key of a page table's key column, matched through TableSchema.FindColumn, which returns the
     // reader-built column. The literal never reaches SQL text.
@@ -494,57 +521,81 @@ internal static class RecordSqlBuilder
     }
 
     /// <summary>
-    /// The 1-based position of the record with key <paramref name="uniqueKey"/> in the selected set, the legacy
-    /// formula <c>Count(*) ... Where UniqueKey &lt;= k</c> (<c>Epi.Enter.CheckCodeEngine/RunTimeView.cs:673-694</c>):
-    /// <c>SELECT COUNT_BIG(*) FROM [base] b WHERE b.[UniqueKey] &lt;= @p0 [AND b.[RecStatus] = @p1]</c>. It places a
-    /// record in the caller's selected set for <c>IDataStore.GetSetPositionAsync</c>; <see cref="RecordAt"/> and
-    /// <see cref="RecordById"/> compute a record's intrinsic position in their own statement instead.
+    /// Places a record in the caller's selected set for <c>IDataStore.GetSetPositionAsync</c>, in one statement that
+    /// reads the base table only, so a base row that lacks a page row is still placed: the record's base row by id,
+    /// with its position in the selected set and the selected-set count computed by the same read. The caller takes the
+    /// first row.
     /// </summary>
-    /// <param name="schema">The form's catalogue view.</param>
-    /// <param name="uniqueKey">The record's <c>UniqueKey</c>.</param>
-    /// <param name="includeDeleted">Whether every row is counted rather than the active set.</param>
-    /// <returns>A statement returning one <c>bigint</c>.</returns>
-    /// <exception cref="ArgumentNullException"><paramref name="schema"/> is null.</exception>
-    /// <exception cref="InvalidOperationException">The base table lacks <c>UniqueKey</c> or <c>RecStatus</c>.</exception>
-    internal static SqlStatement Position(FormSchema schema, int uniqueKey, bool includeDeleted)
-    {
-        ArgumentNullException.ThrowIfNull(schema);
-
-        var uniqueKeyColumn = Require(schema.UniqueKey);
-        var parameters = new PositionalParameters();
-        var sql = new StringBuilder("SELECT COUNT_BIG(*) FROM ");
-        AppendBaseTable(sql, schema);
-        sql.Append(" WHERE ");
-        AppendBaseColumn(sql, uniqueKeyColumn);
-        sql.Append(" <= ")
-            .Append(parameters.Add(n => ColumnValueConverter.ToSystemParameter(n, uniqueKeyColumn, uniqueKey)));
-        AppendSelectedSetPredicate(sql, schema, includeDeleted, parameters, SelectedSetClause.And);
-
-        return parameters.ToStatement(sql.ToString());
-    }
-
-    /// <summary>
-    /// Finds a record's base row by id, reading the base table only, so a base row that lacks a page row is still
-    /// placed: <c>SELECT b.[UniqueKey] AS [c0], b.[RecStatus] AS [c1], b.[GlobalRecordId] AS [c2] FROM [base] b WHERE
-    /// b.[GlobalRecordId] = @p0 AND DATALENGTH(b.[GlobalRecordId]) = DATALENGTH(@p0) ORDER BY b.[UniqueKey]</c>. The
-    /// caller takes the first row, and binds its stored id, not the request's, in any later statement.
-    /// </summary>
+    /// <remarks>
+    /// <para>For the active set the statement has this shape:</para>
+    /// <code>
+    /// SELECT b.[UniqueKey] AS [c0], b.[RecStatus] AS [c1], b.[GlobalRecordId] AS [c2], b.[sp] AS [c3], b.[sc] AS [c4]
+    /// FROM (SELECT i.[GlobalRecordId], i.[UniqueKey], i.[RecStatus],
+    ///   SUM(CASE WHEN i.[RecStatus] = @p0 THEN CAST(1 AS bigint) ELSE CAST(0 AS bigint) END)
+    ///     OVER (ORDER BY i.[UniqueKey] ROWS UNBOUNDED PRECEDING) AS [sp],
+    ///   SUM(CASE WHEN i.[RecStatus] = @p0 THEN CAST(1 AS bigint) ELSE CAST(0 AS bigint) END) OVER () AS [sc]
+    ///   FROM [base] i WITH (HOLDLOCK)) b
+    /// WHERE b.[GlobalRecordId] = @p1 AND DATALENGTH(b.[GlobalRecordId]) = DATALENGTH(@p1)
+    /// ORDER BY b.[UniqueKey]
+    /// </code>
+    /// <para>
+    /// <c>@p0</c> is the status <see cref="RecordQueryRules.RequiredRecStatus"/> gives, bound with the <c>RecStatus</c>
+    /// column's own type. With every row selected no status is bound, the windows are
+    /// <c>ROW_NUMBER() OVER (ORDER BY i.[UniqueKey])</c> and <c>COUNT_BIG(*) OVER ()</c>, and the id is <c>@p0</c>.
+    /// Either way <c>[sp]</c> is the number of selected rows whose key is at most the row's own, the legacy formula
+    /// <c>Count(*) ... Where UniqueKey &lt;= k</c> (<c>Epi.Enter.CheckCodeEngine/RunTimeView.cs:673-694</c>), because
+    /// <c>UniqueKey</c> is unique, and <c>[sc]</c> is the selected-set count. The windows have no
+    /// <c>PARTITION BY</c>, so they are computed over the whole base table before the outer predicate selects the
+    /// record. For a row outside the selected set <c>[sp]</c> is no position: the caller tests the
+    /// <c>RecStatus</c> the same row returns with <see cref="RecordQueryRules.IsInSelectedSet"/> and reports none.
+    /// The read runs under the base-table hint described in the class remarks, so the status, the position and the
+    /// count describe one committed state even under a concurrent soft delete.
+    /// </para>
+    /// </remarks>
     /// <param name="schema">The form's catalogue view.</param>
     /// <param name="globalRecordId">The id from the request, bound at full length and matched exactly.</param>
+    /// <param name="includeDeleted">Whether the selected set holds every row rather than the active set.</param>
     /// <returns>
     /// A statement returning <c>UniqueKey</c> at <see cref="BaseRowUniqueKeyOrdinal"/>, <c>RecStatus</c> at
-    /// <see cref="BaseRowRecStatusOrdinal"/> and the stored <c>GlobalRecordId</c> at
-    /// <see cref="BaseRowGlobalRecordIdOrdinal"/>; no row for an unknown id, including one that differs from a stored
-    /// id only by trailing spaces or is longer than the column.
+    /// <see cref="BaseRowRecStatusOrdinal"/>, the stored <c>GlobalRecordId</c> at
+    /// <see cref="BaseRowGlobalRecordIdOrdinal"/>, and the selected-set position and count, both <c>bigint</c>, at
+    /// <see cref="SetPositionOrdinal"/> and <see cref="SetCountOrdinal"/>; no row for an unknown id, including one that
+    /// differs from a stored id only by trailing spaces or is longer than the column.
     /// </returns>
     /// <exception cref="ArgumentNullException">An argument is null.</exception>
     /// <exception cref="InvalidOperationException">The base table lacks a required system column.</exception>
-    internal static SqlStatement SetPositionLookup(FormSchema schema, string globalRecordId)
+    internal static SqlStatement SetPositionLookup(FormSchema schema, string globalRecordId, bool includeDeleted)
     {
         ArgumentNullException.ThrowIfNull(schema);
         ArgumentNullException.ThrowIfNull(globalRecordId);
 
-        return BaseRowById(schema, globalRecordId, tableHints: null);
+        var uniqueKeyColumn = Require(schema.UniqueKey);
+        var recStatusColumn = Require(schema.RecStatus);
+        var globalRecordIdColumn = Require(schema.GlobalRecordId);
+
+        var parameters = new PositionalParameters();
+        var sql = new StringBuilder("SELECT ");
+        AppendProjection(sql, BaseAlias, uniqueKeyColumn, BaseRowUniqueKeyOrdinal);
+        sql.Append(", ");
+        AppendProjection(sql, BaseAlias, recStatusColumn, BaseRowRecStatusOrdinal);
+        sql.Append(", ");
+        AppendProjection(sql, BaseAlias, globalRecordIdColumn, BaseRowGlobalRecordIdOrdinal);
+        sql.Append(", ").Append(BaseAlias).Append('.').Append(SetPositionColumn)
+            .Append(" AS ").Append(ColumnAlias(SetPositionOrdinal))
+            .Append(", ").Append(BaseAlias).Append('.').Append(SetCountColumn)
+            .Append(" AS ").Append(ColumnAlias(SetCountOrdinal));
+        sql.Append(" FROM ");
+        AppendSelectedSetBaseSource(sql, schema, includeDeleted, parameters);
+        sql.Append(" WHERE ");
+        AppendGlobalRecordIdMatch(
+            sql,
+            schema,
+            parameters,
+            BaseAlias,
+            (n, _) => ColumnValueConverter.Text(n, globalRecordId));
+        AppendOrderByUniqueKey(sql, schema);
+
+        return parameters.ToStatement(sql.ToString());
     }
 
     /// <summary>
@@ -656,8 +707,9 @@ internal static class RecordSqlBuilder
     /// <summary>
     /// Reads a record whose base row the caller has already located, by its clustered key and id together: the record
     /// <c>SELECT</c>, then <c>WHERE b.[UniqueKey] = @p0 AND b.[GlobalRecordId] = @p1 AND
-    /// DATALENGTH(b.[GlobalRecordId]) = DATALENGTH(@p1)</c>. Write transactions use it for the page-row read and the
-    /// response snapshot, so the base row is reached by a seek rather than a scan.
+    /// DATALENGTH(b.[GlobalRecordId]) = DATALENGTH(@p1)</c>. An update's transaction uses it for the page-row read, so
+    /// the base row is reached by a seek rather than a scan; the response snapshot, which needs the intrinsic
+    /// coordinates too, is <see cref="RecordSnapshot"/>.
     /// </summary>
     /// <param name="schema">The form's catalogue view.</param>
     /// <param name="dataFields">The data fields to project, in data-field order.</param>
@@ -687,6 +739,53 @@ internal static class RecordSqlBuilder
 
         var core = RecordSelectCore(schema, dataFields, intrinsicParameters: null);
         var parameters = new PositionalParameters();
+        core.Sql.Append(" WHERE ");
+        AppendBaseRowKey(core.Sql, schema, parameters, uniqueKey, globalRecordId, BaseAlias);
+
+        return core.Finish(parameters);
+    }
+
+    /// <summary>
+    /// Reads the response snapshot of a write inside its transaction, after every write statement and before the
+    /// commit: the record's base and page rows and its intrinsic position and count, all from one statement. It is the
+    /// record <c>SELECT</c> over the intrinsic base read of <see cref="RecordAt"/>, addressed as
+    /// <see cref="RecordByUniqueKey"/> addresses the row: <c>WHERE b.[UniqueKey] = @p1 AND b.[GlobalRecordId] = @p2 AND
+    /// DATALENGTH(b.[GlobalRecordId]) = DATALENGTH(@p2)</c>.
+    /// </summary>
+    /// <remarks>
+    /// The intrinsic windows are computed over the whole base table, under the base-table hint described in the class
+    /// remarks, so the row, its position and its count describe one committed state, including the transaction's own
+    /// writes. Inside the write transaction the hint's locks last until its commit, which the repository sends
+    /// immediately after this read; no later statement of the transaction waits on them.
+    /// </remarks>
+    /// <param name="schema">The form's catalogue view.</param>
+    /// <param name="dataFields">The data fields to project, in data-field order.</param>
+    /// <param name="uniqueKey">The written base row's <c>UniqueKey</c>.</param>
+    /// <param name="globalRecordId">
+    /// The written base row's <c>GlobalRecordId</c>, as stored: the id the insert wrote, or the value
+    /// <see cref="LockBase"/> returned at <see cref="BaseRowGlobalRecordIdOrdinal"/>. A spelling of another length,
+    /// such as one with trailing spaces, matches no row.
+    /// </param>
+    /// <returns>
+    /// The statement and its result layout, with <see cref="RecordSelect.HasIntrinsicCoordinates"/> set.
+    /// </returns>
+    /// <exception cref="ArgumentNullException">An argument is null.</exception>
+    /// <exception cref="ArgumentException">
+    /// A data field is not a column of the form, the list holds a null entry, or the id does not fit the column.
+    /// </exception>
+    /// <exception cref="InvalidOperationException">A table lacks a required system or key column.</exception>
+    internal static RecordSelect RecordSnapshot(
+        FormSchema schema,
+        IReadOnlyList<DataFieldMetadata> dataFields,
+        int uniqueKey,
+        string globalRecordId)
+    {
+        ArgumentNullException.ThrowIfNull(schema);
+        ArgumentNullException.ThrowIfNull(dataFields);
+        ArgumentNullException.ThrowIfNull(globalRecordId);
+
+        var parameters = new PositionalParameters();
+        var core = RecordSelectCore(schema, dataFields, intrinsicParameters: parameters);
         core.Sql.Append(" WHERE ");
         AppendBaseRowKey(core.Sql, schema, parameters, uniqueKey, globalRecordId, BaseAlias);
 
@@ -1139,7 +1238,8 @@ internal static class RecordSqlBuilder
         FormSchema schema,
         PositionalParameters parameters)
     {
-        var globalRecordIdColumn = Require(schema.GlobalRecordId);
+        // Every system column is required before the parameter is added, so a missing one adds none.
+        _ = Require(schema.GlobalRecordId);
         var uniqueKeyColumn = Require(schema.UniqueKey);
         var recStatusColumn = Require(schema.RecStatus);
         var active = parameters.Add(n =>
@@ -1152,15 +1252,71 @@ internal static class RecordSqlBuilder
         var activeRows = new StringBuilder("SUM(CASE WHEN ").Append(isActive)
             .Append(" THEN CAST(1 AS bigint) ELSE CAST(0 AS bigint) END)");
 
-        sql.Append("(SELECT ");
-        AppendQualified(sql, IntrinsicSourceAlias, globalRecordIdColumn).Append(", ");
-        AppendQualified(sql, IntrinsicSourceAlias, uniqueKeyColumn).Append(", ");
-        AppendQualified(sql, IntrinsicSourceAlias, recStatusColumn);
-        sql.Append(", CASE WHEN ").Append(isActive).Append(" THEN ").Append(activeRows)
+        var position = new StringBuilder("CASE WHEN ").Append(isActive).Append(" THEN ").Append(activeRows)
             .Append(" OVER (").Append(orderByKey).Append(" ROWS UNBOUNDED PRECEDING) ELSE ROW_NUMBER() OVER (")
-            .Append(orderByKey).Append(") END AS ").Append(IntrinsicPositionColumn);
-        sql.Append(", CASE WHEN ").Append(isActive).Append(" THEN ").Append(activeRows)
-            .Append(" OVER () ELSE COUNT_BIG(*) OVER () END AS ").Append(IntrinsicCountColumn);
+            .Append(orderByKey).Append(") END");
+        var count = new StringBuilder("CASE WHEN ").Append(isActive).Append(" THEN ").Append(activeRows)
+            .Append(" OVER () ELSE COUNT_BIG(*) OVER () END");
+        AppendHeldBaseSource(sql, schema, (position, IntrinsicPositionColumn), (count, IntrinsicCountColumn));
+    }
+
+    // (SELECT i.[GlobalRecordId], i.[UniqueKey], i.[RecStatus], <position> AS [sp], <count> AS [sc]
+    //  FROM [base] i WITH (HOLDLOCK)) b, the shape SetPositionLookup documents. For the active set, @status is the
+    // status RecordQueryRules.RequiredRecStatus gives, bound with the column's own type and used twice: the position is
+    // the running count of active rows in key order and the count their total. For every row, the position is the row
+    // number in key order and the count the row count, with no parameter. Only the base table carries HOLDLOCK (class
+    // remarks).
+    private static void AppendSelectedSetBaseSource(
+        StringBuilder sql,
+        FormSchema schema,
+        bool includeDeleted,
+        PositionalParameters parameters)
+    {
+        // Every system column is required before the parameter is added, so a missing one adds none.
+        _ = Require(schema.GlobalRecordId);
+        var uniqueKeyColumn = Require(schema.UniqueKey);
+        var recStatusColumn = Require(schema.RecStatus);
+
+        var orderByKey = new StringBuilder("ORDER BY ");
+        AppendQualified(orderByKey, IntrinsicSourceAlias, uniqueKeyColumn);
+        StringBuilder position;
+        StringBuilder count;
+        if (RecordQueryRules.RequiredRecStatus(includeDeleted) is { } recStatus)
+        {
+            var status = parameters.Add(n => ColumnValueConverter.ToSystemParameter(n, recStatusColumn, recStatus));
+            var selectedRows = new StringBuilder("SUM(CASE WHEN ");
+            AppendQualified(selectedRows, IntrinsicSourceAlias, recStatusColumn).Append(" = ").Append(status)
+                .Append(" THEN CAST(1 AS bigint) ELSE CAST(0 AS bigint) END)");
+            position = new StringBuilder().Append(selectedRows)
+                .Append(" OVER (").Append(orderByKey).Append(" ROWS UNBOUNDED PRECEDING)");
+            count = new StringBuilder().Append(selectedRows).Append(" OVER ()");
+        }
+        else
+        {
+            position = new StringBuilder("ROW_NUMBER() OVER (").Append(orderByKey).Append(')');
+            count = new StringBuilder("COUNT_BIG(*) OVER ()");
+        }
+
+        AppendHeldBaseSource(sql, schema, (position, SetPositionColumn), (count, SetCountColumn));
+    }
+
+    // (SELECT i.[GlobalRecordId], i.[UniqueKey], i.[RecStatus], <position> AS <name>, <count> AS <name>
+    //  FROM [base] i WITH (HOLDLOCK)) b: the one base-table reference of a read whose row and window coordinates must
+    // describe one committed state. It exposes the base system columns under their catalogue names, so the outer
+    // query's b.[...] references stay those of a direct base read. Only the base table carries HOLDLOCK (class
+    // remarks).
+    private static void AppendHeldBaseSource(
+        StringBuilder sql,
+        FormSchema schema,
+        (StringBuilder Expression, string Name) position,
+        (StringBuilder Expression, string Name) count)
+    {
+        sql.Append("(SELECT ");
+        AppendQualified(sql, IntrinsicSourceAlias, Require(schema.GlobalRecordId)).Append(", ");
+        AppendQualified(sql, IntrinsicSourceAlias, Require(schema.UniqueKey)).Append(", ");
+        AppendQualified(sql, IntrinsicSourceAlias, Require(schema.RecStatus));
+        sql.Append(", ").Append(position.Expression).Append(" AS ").Append(position.Name);
+        sql.Append(", ").Append(count.Expression).Append(" AS ").Append(count.Name);
         sql.Append(" FROM ").Append(SqlIdentifier.Quote(schema.BaseTable)).Append(' ').Append(IntrinsicSourceAlias)
             .Append(" WITH (HOLDLOCK)) ").Append(BaseAlias);
     }

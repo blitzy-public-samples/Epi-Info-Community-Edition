@@ -5,6 +5,7 @@
 // become onFocus/onBlur. Range, mask and required checks are not made here: they
 // arrive as `errors` from client validation and the server.
 import { useState } from 'react';
+import { isExactDecimal, numberFromText, sameFieldValue } from '../../api/client';
 import type { FieldValue } from '../../api/types';
 import type { FieldComponentProps } from './fieldComponents';
 import {
@@ -18,16 +19,19 @@ import {
 /**
  * The value typed text stands for: blank is `null`, a finite number is that number,
  * and anything else is the raw text, so client validation can report that it is not
- * a number. `Infinity` and `NaN` are never emitted.
+ * a number. `Infinity` and `NaN` are never emitted. An integer beyond
+ * ±`Number.MAX_SAFE_INTEGER` that a `bigint` column can hold is its exact bigint, so
+ * `9007199254740993` is saved as typed rather than as the double 9007199254740992, and a
+ * fraction whose nearest double is whole is its exact decimal, so `9007199254740992.5`
+ * is saved as typed rather than as the whole number 9007199254740992.
  */
 function interpret(text: string): FieldValue {
-  const trimmed = text.trim();
-  // Trim first: Number('  ') is 0, but blank input is empty.
-  if (trimmed === '') {
+  // Blank input is empty, never the raw text: Number('  ') is 0, and numberFromText
+  // gives null for blank text as for any other text that is not a number.
+  if (text.trim() === '') {
     return null;
   }
-  const parsed = Number(trimmed);
-  return Number.isFinite(parsed) ? parsed : text;
+  return numberFromText(text) ?? text;
 }
 
 /** Text the control shows for a value; an empty value is `''`. */
@@ -39,6 +43,10 @@ function display(value: FieldValue): string {
   }
   if (typeof value === 'string') {
     return value;
+  }
+  // An exact decimal shows the number typed, as its JSON literal.
+  if (isExactDecimal(value)) {
+    return value.literal;
   }
   return String(value);
 }
@@ -55,11 +63,13 @@ export function NumberInput(props: FieldComponentProps) {
   const [draft, setDraft] = useState(() => display(value));
 
   // Adjust state when a prop changes, during render rather than in an effect, so the
-  // replaced draft is never painted. Object.is keeps NaN stable and tells -0 from 0.
+  // replaced draft is never painted. sameFieldValue keeps NaN stable, tells -0 from 0,
+  // compares bigints by value and exact decimals by literal, so a typed fraction such as
+  // ` +9007199254740992.5` keeps its draft.
   const [lastValue, setLastValue] = useState<FieldValue>(value);
-  if (!Object.is(lastValue, value)) {
+  if (!sameFieldValue(lastValue, value)) {
     setLastValue(value);
-    if (!Object.is(interpret(draft), value)) {
+    if (!sameFieldValue(interpret(draft), value)) {
       setDraft(display(value));
     }
   }
