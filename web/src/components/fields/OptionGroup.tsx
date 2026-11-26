@@ -7,9 +7,11 @@ import { fieldControlId, fieldErrorId, fieldLabelText, fieldWrapperClass } from 
 
 /**
  * One radio per option, each followed by its own label, inside a fieldset whose
- * native `disabled` disables every radio. A change sets the chosen index, then
- * raises `FieldClick`. Focus and blur are raised once as focus enters and leaves
- * the group, never when it moves between the group's own radios.
+ * native `disabled` disables every radio; each radio also carries `disabled`, so
+ * its own `disabled` property agrees with its `:disabled` state. A change sets
+ * the chosen index, then raises `FieldClick`. Focus and blur are raised once as
+ * focus enters and leaves the group, never when it moves between the group's own
+ * radios, whether by keyboard, by a click on a radio or by a click on a label.
  */
 export function OptionGroup(props: FieldComponentProps) {
   const { field, value, disabled, errors, onChange, onFocus, onBlur, onClick } = props;
@@ -37,6 +39,16 @@ export function OptionGroup(props: FieldComponentProps) {
           }
           onBlur?.();
         }}
+        onMouseDown={(e) => {
+          // A mousedown on a label moves focus to the body before the label's click
+          // focuses its radio, so both focus events arrive with no related target and
+          // the group would raise a spurious FieldAfter/FieldBefore pair. While focus
+          // is already inside the group it stays there; the click still checks and
+          // focuses the label's radio.
+          if (e.target instanceof HTMLLabelElement && e.currentTarget.contains(document.activeElement)) {
+            e.preventDefault();
+          }
+        }}
       >
         <legend>{fieldLabelText(field)}</legend>
         {options.map((option, i) => {
@@ -52,7 +64,15 @@ export function OptionGroup(props: FieldComponentProps) {
                 name={groupId}
                 value={String(optionValue)}
                 checked={value === optionValue}
+                disabled={disabled}
                 onChange={() => {
+                  // Native `disabled` stops user input, but a scripted click event
+                  // still checks a disabled radio and fires change; a protected or
+                  // check-code-disabled field must emit neither a value nor FieldClick.
+                  if (disabled) {
+                    return;
+                  }
+                  // The new index first, then FieldClick, so check code sees the post-click value.
                   onChange(optionValue);
                   onClick?.();
                 }}

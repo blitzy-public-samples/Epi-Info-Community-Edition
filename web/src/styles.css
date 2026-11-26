@@ -480,8 +480,22 @@
     min-inline-size: 0;
   }
 
+  /* A flex item's automatic minimum width is its longest unbreakable word, so
+   * a prompt, heading, hint or message holding one would widen the field past
+   * a narrow screen. min-inline-size: 0 lets each row shrink to the field's
+   * width and overflow-wrap breaks the word inside it. Labels, hints and
+   * errors take anywhere, which unlike break-word also lowers the min-content
+   * width and so keeps a checkbox's long label beside its box. */
   .field > * {
     flex: 1 1 100%;
+    min-inline-size: 0;
+    overflow-wrap: break-word;
+  }
+
+  .field > label,
+  .field > small,
+  .field > .field-error {
+    overflow-wrap: anywhere;
   }
 
   .field > input[type="checkbox"] {
