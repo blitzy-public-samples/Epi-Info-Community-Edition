@@ -114,15 +114,36 @@ export function fieldTextValue(value: FieldValue): string {
 }
 
 // Import cycle: the components import helpers from here, so every helper and component stays a hoisted `function` declaration and nothing reads this map at module evaluation.
+// Each entry is a getter because Vitest's Vite 5 SSR transform defines a module's exports only after its imports have run: when a component module loads before this one, its export is still unbound while this module evaluates, and a plain `group: GroupSection` would store `undefined`.
 export const fieldComponents: Readonly<Record<FieldType, ComponentType<FieldComponentProps>>> = {
-  label: LabelHeading,
-  group: GroupSection,
-  text: TextInput,
-  multiline: MultilineInput,
-  number: NumberInput,
-  date: DateInput,
-  checkbox: CheckboxInput,
-  option: OptionGroup,
-  legalValues: LegalValuesSelect,
-  unsupported: UnsupportedPlaceholder,
+  get label() {
+    return LabelHeading;
+  },
+  get group() {
+    return GroupSection;
+  },
+  get text() {
+    return TextInput;
+  },
+  get multiline() {
+    return MultilineInput;
+  },
+  get number() {
+    return NumberInput;
+  },
+  get date() {
+    return DateInput;
+  },
+  get checkbox() {
+    return CheckboxInput;
+  },
+  get option() {
+    return OptionGroup;
+  },
+  get legalValues() {
+    return LegalValuesSelect;
+  },
+  get unsupported() {
+    return UnsupportedPlaceholder;
+  },
 };
