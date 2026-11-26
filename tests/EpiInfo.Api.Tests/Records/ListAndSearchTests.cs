@@ -30,6 +30,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
+using Xunit.Abstractions;
 
 namespace EpiInfo.Api.Tests.Records;
 
@@ -2089,3 +2090,949 @@ public sealed class FindPaddingSqlTests : IAsyncLifetime
             nameof(comparison), comparison, "No padding case uses this operator."),
     };
 }
+
+/// <summary>
+/// The records list and the Find search over HTTP against the seeded rehearsal database (AAP 0.3.4.4 and the SC-5
+/// "Listing and Find" cases of AAP 0.7.1): paging, the deleted toggle and the grid <c>q</c> of
+/// <c>GET /api/forms/{viewId}/records</c>, and the legacy-semantics criteria, set selection, exclusion, positions,
+/// order and cap of <c>POST /api/forms/{viewId}/records/search</c>.
+/// </summary>
+/// <remarks>
+/// <para>
+/// Every expected value is computed by a direct SQL query read under the test lock, never hard-coded, so each case
+/// holds on a freshly loaded database and after any number of earlier runs. A test that creates records holds the
+/// exclusive <see cref="DatabaseWriteLock"/> from before its first SQL read to its last assertion; a read-only case
+/// whose expectations are SQL counts or positions holds it shared; a coercion 400 takes none (AAP 0.7.5).
+/// </para>
+/// <para>
+/// Records are created only through <c>POST /api/forms/{viewId}/records</c>, each carrying a fresh
+/// <see cref="TestDatabase.NewMarker"/> in <see cref="TestDatabase.MarkerField"/>, and they stay in the database. The
+/// one direct write is the missing-page fixture, which deletes the <c>FoodHistory3</c> row of a record the test itself
+/// created (AAP 0.3.7, "Data reach of tests"). No seeded row, metadata row or schema object is changed.
+/// </para>
+/// </remarks>
+[Trait("Category", "Integration")]
+[Collection(DatabaseCollections.Database)]
+public sealed class ListAndSearchTests
+{
+    private const string CaseReport = "CaseReport";
+
+    private const string FoodHistory = "FoodHistory";
+
+    // Data fields of the seeded forms (testdata/sql/03_forms.sql): FirstName is nvarchar(4000) text on both forms,
+    // PhoneNumber is CaseReport's "Phone Number" field with the mask ###-###-####, and PatientAddress is FoodHistory's
+    // ntext Multiline field (testdata/sql/05_data_tables.sql).
+    private const string FirstNameField = "FirstName";
+
+    private const string PhoneNumberField = "PhoneNumber";
+
+    private const string PatientAddressField = "PatientAddress";
+
+    // A value that matches the seeded ###-###-#### mask, so the create passes validation.
+    private const string PhoneNumber = "555-014-8636";
+
+    // A FirstName holding letters only, so it can never read as a prefix, a wildcard or an alternative.
+    private const string FixedFirstName = "Avery";
+
+    // Legacy Find compares a multiline field on its first 255 characters (CollectedDataProvider.cs:2212-2222); the
+    // stored text and the criteria are longer, so the characters after the prefix are shown not to count.
+    private const int MultilinePrefixLength = 255;
+
+    private const int MultilineTextLength = 300;
+
+    // The inner run of a marker that the grid q case upper-cases: characters 5 to 16, all hexadecimal digits.
+    private const int InnerStart = 4;
+
+    private const int InnerLength = 12;
+
+    // The selected set on the base table b (AAP C-16): every row when @includeDeleted is 1, otherwise RecStatus = 1.
+    private const string SelectedSetFilter = "(@includeDeleted = 1 OR b.[RecStatus] = @active)";
+
+    // Longer than DatabaseWriteLock's 300-second wait, so a lock held by another process fails the lock call rather
+    // than this token; xUnit v2 gives a test no cancellation token of its own.
+    private static readonly TimeSpan TestTimeout = TimeSpan.FromMinutes(10);
+
+    private readonly ITestOutputHelper _output;
+
+    /// <summary>Creates the test class with the output the collation case writes to.</summary>
+    /// <param name="output">The test output.</param>
+    public ListAndSearchTests(ITestOutputHelper output)
+    {
+        _output = output ?? throw new ArgumentNullException(nameof(output));
+    }
+
+    /// <summary>
+    /// A paging parameter and a value it rejects: a <c>pageSize</c> below and above its range, a <c>page</c> below its
+    /// minimum, and a <c>page</c> that is not an integer.
+    /// </summary>
+    public static TheoryData<string, string> InvalidPagingCases => new()
+    {
+        { RequestParameters.PageSize, Text(RecordQueryRules.MinPageSize - 1) },
+        { RequestParameters.PageSize, Text(RecordQueryRules.MaxPageSize + 1) },
+        { RequestParameters.Page, Text(RecordQueryRules.MinPage - 1) },
+        { RequestParameters.Page, "abc" },
+    };
+
+    // AAP 0.3.4.1 and 0.3.4.4: the list is the active set (RecStatus = 1) in UniqueKey order, paged with OFFSET/FETCH
+    // on a 64-bit offset. No query string is page 1 of 50, page 2 is SQL's OFFSET 50, and the largest admitted page
+    // lies past the end, so it is a 200 with no items and the full total, never a 400 or a 500.
+    [Theory]
+    [InlineData(CaseReport, null)]
+    [InlineData(CaseReport, 2)]
+    [InlineData(CaseReport, int.MaxValue)]
+    [InlineData(FoodHistory, null)]
+    [InlineData(FoodHistory, 2)]
+    [InlineData(FoodHistory, int.MaxValue)]
+    public async Task ListPage_IsTheSqlPageOfTheActiveSetInUniqueKeyOrder(string form, int? page)
+    {
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        var ct = timeout.Token;
+        await using var factory = await ApiFactory.ForDatabaseAsync();
+        using var client = factory.CreateClient();
+        await using var dbLock = await DatabaseWriteLock.AcquireSharedAsync(ct);
+
+        var viewId = await ApiTestClient.GetViewIdAsync(client, form, ct);
+        var expectedPage = page ?? RecordQueryRules.DefaultPage;
+        var offset = RecordQueryRules.ComputeOffset(expectedPage, RecordQueryRules.DefaultPageSize);
+        var activeCount = await CountBaseRowsAsync(form, includeDeleted: false, ct);
+        var expected = await ReadActivePageAsync(form, offset, RecordQueryRules.DefaultPageSize, ct);
+
+        // The SQL page is full before the end and empty past it, so no case passes on two empty lists by accident.
+        var expectedItems = (int)Math.Clamp(activeCount - offset, 0L, RecordQueryRules.DefaultPageSize);
+        Assert.Equal(expectedItems, expected.Length);
+
+        var query = page is null ? string.Empty : "?" + RequestParameters.Page + "=" + Text(expectedPage);
+        var list = await GetListAsync(client, viewId, query, ct);
+
+        Assert.Equal(expectedPage, Property(list, "page").GetInt32());
+        Assert.Equal(RecordQueryRules.DefaultPageSize, Property(list, "pageSize").GetInt32());
+        Assert.Equal(activeCount, Property(list, "total").GetInt32());
+        var items = Items(list);
+        Assert.Equal(expected, items.Select(item => new BaseRow(Id(item), UniqueKey(item))).ToArray());
+        Assert.All(items, item => Assert.Equal(RecordQueryRules.ActiveRecStatus, RecStatus(item)));
+    }
+
+    // AAP 0.3.4.1 (RequestParameters): a pageSize outside 1 to 200, a page below 1 and a page that is not an integer
+    // are each a field-level 400 whose errors map holds exactly that parameter. Coercion runs before any store call,
+    // so the case takes no lock.
+    [Theory]
+    [MemberData(nameof(InvalidPagingCases))]
+    public async Task InvalidPaging_IsAFieldLevel400OnThatParameterOnly(string parameter, string value)
+    {
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        var ct = timeout.Token;
+        await using var factory = await ApiFactory.ForDatabaseAsync();
+        using var client = factory.CreateClient();
+
+        var viewId = await ApiTestClient.GetViewIdAsync(client, CaseReport, ct);
+        var path = RecordsPath(viewId, "?" + parameter + "=" + Uri.EscapeDataString(value));
+        using var response = await client.GetAsync(path, ct);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        var body = ApiTestClient.AssertProblemDetails(
+            await ApiTestClient.ReadJsonElementAsync(response, ct),
+            StatusCodes.Status400BadRequest);
+        var errors = Property(body, "errors");
+        Assert.Equal(JsonValueKind.Object, errors.ValueKind);
+        var entry = Assert.Single(errors.EnumerateObject());
+        Assert.Equal(parameter, entry.Name);
+        Assert.Equal(JsonValueKind.Array, entry.Value.ValueKind);
+        Assert.NotEmpty(entry.Value.EnumerateArray());
+    }
+
+    // AAP 0.3.4.4 (C-5, C-16): seeded deleted records (RecStatus = 0) are listed only with includeDeleted=true. Every
+    // page of both sets is walked at the largest page size, and the seeded deleted rows make the case non-vacuous.
+    [Theory]
+    [InlineData(CaseReport)]
+    [InlineData(FoodHistory)]
+    public async Task DeletedRecords_AreListedOnlyWithIncludeDeleted(string form)
+    {
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        var ct = timeout.Token;
+        await using var factory = await ApiFactory.ForDatabaseAsync();
+        using var client = factory.CreateClient();
+        await using var dbLock = await DatabaseWriteLock.AcquireSharedAsync(ct);
+
+        var viewId = await ApiTestClient.GetViewIdAsync(client, form, ct);
+        var activeCount = await CountBaseRowsAsync(form, includeDeleted: false, ct);
+        var allCount = await CountBaseRowsAsync(form, includeDeleted: true, ct);
+        var deletedIds = (await ReadDeletedIdsAsync(form, ct)).ToHashSet(StringComparer.Ordinal);
+        Assert.NotEmpty(deletedIds);
+
+        var (activeTotal, active) = await ListEveryPageAsync(client, viewId, includeDeleted: false, ct);
+        Assert.Equal(activeCount, activeTotal);
+        Assert.Equal(activeCount, active.Count);
+        Assert.All(active, record => Assert.Equal(RecordQueryRules.ActiveRecStatus, record.RecStatus));
+        var activeIds = active.Select(record => record.GlobalRecordId).ToHashSet(StringComparer.Ordinal);
+        Assert.Equal(activeCount, activeIds.Count);
+        Assert.False(activeIds.Overlaps(deletedIds), "The default list holds a record SQL shows as deleted.");
+
+        var (allTotal, all) = await ListEveryPageAsync(client, viewId, includeDeleted: true, ct);
+        Assert.Equal(allCount, allTotal);
+        Assert.Equal(allCount, all.Count);
+        var allIds = all.Select(record => record.GlobalRecordId).ToHashSet(StringComparer.Ordinal);
+        Assert.Equal(allCount, allIds.Count);
+        Assert.Subset(allIds, deletedIds);
+        Assert.All(
+            all.Where(record => deletedIds.Contains(record.GlobalRecordId)),
+            record => Assert.Equal(RecordQueryRules.DeletedRecStatus, record.RecStatus));
+
+        // Both walks keep UniqueKey order across page boundaries.
+        foreach (var listed in new[] { active, all })
+        {
+            var keys = listed.Select(record => record.UniqueKey).ToArray();
+            Assert.Equal(keys.Order().ToArray(), keys);
+        }
+    }
+
+    // AAP 0.3.4.4, grid q: a case-insensitive "contains" over the grid columns. The statement converts each column and
+    // the pattern to Latin1_General_100_CI_AS, so the match is collation-independent by design and holds under a _CI_
+    // and a _CS_ database collation alike. A whitespace-only q applies no filter.
+    [Fact]
+    public async Task GridQ_MatchesTheMarkerInAnyCaseAndAsAnInnerSubstring()
+    {
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        var ct = timeout.Token;
+        await using var factory = await ApiFactory.ForDatabaseAsync();
+        using var client = factory.CreateClient();
+        await using var dbLock = await DatabaseWriteLock.AcquireExclusiveAsync(ct);
+
+        var viewId = await ApiTestClient.GetViewIdAsync(client, CaseReport, ct);
+        var marker = NewMarkerWithHexLetter();
+        var created = await CreateAsync(client, viewId, new() { [TestDatabase.MarkerField] = marker }, ct);
+
+        string[] filters =
+        [
+            marker.ToUpperInvariant(),
+            marker.ToLowerInvariant(),
+            marker.Substring(InnerStart, InnerLength).ToUpperInvariant(),
+        ];
+        foreach (var q in filters)
+        {
+            // Each filter differs from the stored text in letter case, so only a case-insensitive contains finds it.
+            Assert.DoesNotContain(q, marker, StringComparison.Ordinal);
+            Assert.Contains(q, marker, StringComparison.OrdinalIgnoreCase);
+
+            var list = await GetListAsync(
+                client, viewId, "?" + RequestParameters.Query + "=" + Uri.EscapeDataString(q), ct);
+
+            Assert.Equal(1, Property(list, "total").GetInt32());
+            var item = Assert.Single(Items(list));
+            Assert.Equal(created.GlobalRecordId, Id(item));
+            Assert.Equal(marker, StringValue(Property(item, "values"), TestDatabase.MarkerField));
+        }
+
+        var activeCount = await CountBaseRowsAsync(CaseReport, includeDeleted: false, ct);
+        var blank = await GetListAsync(
+            client, viewId, "?" + RequestParameters.Query + "=" + Uri.EscapeDataString("   "), ct);
+        Assert.Equal(activeCount, Property(blank, "total").GetInt32());
+    }
+
+
+    // AAP 0.3.4.4, multiline: legacy Find compares a multiline field as
+    // SUBSTRING(col, 1, 255) = SUBSTRING(@p, 1, 255) (CollectedDataProvider.cs:2212-2222). A 300-character criterion
+    // that keeps the stored first 255 characters and changes the rest finds the record; one that differs within the
+    // first 255 does not. The texts hold only hexadecimal digits and 'z', so no space (and so no " or "), wildcard or
+    // comparison prefix can give them another meaning.
+    [Fact]
+    public async Task Multiline_IsComparedOnItsFirst255CharactersOnly()
+    {
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        var ct = timeout.Token;
+        await using var factory = await ApiFactory.ForDatabaseAsync();
+        using var client = factory.CreateClient();
+        await using var dbLock = await DatabaseWriteLock.AcquireExclusiveAsync(ct);
+
+        var viewId = await ApiTestClient.GetViewIdAsync(client, FoodHistory, ct);
+        var marker = TestDatabase.NewMarker();
+        var address = LettersAndDigits(MultilineTextLength);
+        var created = await CreateAsync(
+            client,
+            viewId,
+            new() { [TestDatabase.MarkerField] = marker, [PatientAddressField] = address },
+            ct);
+
+        var sameStart = address[..MultilinePrefixLength] +
+            new string('z', MultilineTextLength - MultilinePrefixLength);
+        var differentStart = address[..100] + "z" + address[101..];
+        Assert.Equal(MultilineTextLength, sameStart.Length);
+        Assert.Equal(MultilineTextLength, differentStart.Length);
+        Assert.NotEqual(address, sameStart);
+
+        var found = await SearchAsync(
+            client,
+            viewId,
+            [new(TestDatabase.MarkerField, marker), new(PatientAddressField, sameStart)],
+            ct: ct);
+        AssertFound(found, created.GlobalRecordId);
+
+        var missed = await SearchAsync(
+            client,
+            viewId,
+            [new(TestDatabase.MarkerField, marker), new(PatientAddressField, differentStart)],
+            ct: ct);
+        AssertFound(missed);
+    }
+
+    // AAP 0.3.4.4, Phone Number: the legacy PhoneNumber path compares the column as a string, uses the written prefix
+    // as the operator and has no wildcard path (CollectedDataProvider.cs:2118-2131), so "555-014-86*" is an equality
+    // on that literal text.
+    [Theory]
+    [InlineData(">555-014-8635", true)]
+    [InlineData("<555-014-8636", false)]
+    [InlineData("<>555-014-8636", false)]
+    [InlineData("555-014-86*", false)]
+    public async Task PhoneNumber_ComparesAsAStringWithThePrefixAsTheOperator(string criterion, bool finds)
+    {
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        var ct = timeout.Token;
+        await using var factory = await ApiFactory.ForDatabaseAsync();
+        using var client = factory.CreateClient();
+        await using var dbLock = await DatabaseWriteLock.AcquireExclusiveAsync(ct);
+
+        var viewId = await ApiTestClient.GetViewIdAsync(client, CaseReport, ct);
+        var marker = TestDatabase.NewMarker();
+        var created = await CreateAsync(
+            client,
+            viewId,
+            new() { [TestDatabase.MarkerField] = marker, [PhoneNumberField] = PhoneNumber },
+            ct);
+
+        var response = await SearchAsync(
+            client,
+            viewId,
+            [new(TestDatabase.MarkerField, marker), new(PhoneNumberField, criterion)],
+            ct: ct);
+
+        AssertFound(response, finds ? [created.GlobalRecordId] : []);
+    }
+
+    // AAP 0.3.4.4, text: a bare comparison prefix leaves no value, which legacy Find turns into IS NULL
+    // (CollectedDataProvider.cs:2186-2193), and a prefix before a text value is stripped and ignored
+    // (FindRecordDialog.cs:708-770), so ">" + marker and "<>" + marker are both equality on the marker.
+    [Fact]
+    public async Task TextPrefix_BareIsNullAndBeforeAValueIsIgnored()
+    {
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        var ct = timeout.Token;
+        await using var factory = await ApiFactory.ForDatabaseAsync();
+        using var client = factory.CreateClient();
+        await using var dbLock = await DatabaseWriteLock.AcquireExclusiveAsync(ct);
+
+        var viewId = await ApiTestClient.GetViewIdAsync(client, CaseReport, ct);
+        var marker = TestDatabase.NewMarker();
+        var withoutFirstName = await CreateAsync(client, viewId, new() { [TestDatabase.MarkerField] = marker }, ct);
+        var withFirstName = await CreateAsync(
+            client,
+            viewId,
+            new() { [TestDatabase.MarkerField] = marker, [FirstNameField] = FixedFirstName },
+            ct);
+        Assert.IsType<DBNull>(await ReadFirstNameAsync(withoutFirstName.GlobalRecordId, ct));
+        Assert.Equal(
+            FixedFirstName,
+            Assert.IsType<string>(await ReadFirstNameAsync(withFirstName.GlobalRecordId, ct)));
+
+        var bare = await SearchAsync(
+            client,
+            viewId,
+            [new(TestDatabase.MarkerField, marker), new(FirstNameField, ">")],
+            ct: ct);
+        AssertFound(bare, withoutFirstName.GlobalRecordId);
+
+        foreach (var prefix in new[] { ">", "<>" })
+        {
+            var prefixed = await SearchAsync(client, viewId, [new(TestDatabase.MarkerField, prefix + marker)], ct: ct);
+            AssertFound(prefixed, withoutFirstName.GlobalRecordId, withFirstName.GlobalRecordId);
+        }
+    }
+
+    // AAP 0.3.4.4: Find INNER JOINs the base table to every page table, which reproduces legacy hydration dropping a
+    // base row that lacks a page row (CollectedDataProvider.cs:2289-2298, 2357-2375). The position endpoint reads the
+    // base table only, so the same record is still placed in both sets.
+    [Fact]
+    public async Task MissingPageRow_HidesTheRecordFromFindButNotFromThePositionEndpoint()
+    {
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        var ct = timeout.Token;
+        await using var factory = await ApiFactory.ForDatabaseAsync();
+        using var client = factory.CreateClient();
+        await using var dbLock = await DatabaseWriteLock.AcquireExclusiveAsync(ct);
+
+        var viewId = await ApiTestClient.GetViewIdAsync(client, FoodHistory, ct);
+        var marker = TestDatabase.NewMarker();
+        var created = await CreateAsync(client, viewId, new() { [TestDatabase.MarkerField] = marker }, ct);
+        var id = created.GlobalRecordId;
+        AssertFound(await SearchAsync(client, viewId, [new(TestDatabase.MarkerField, marker)], ct: ct), id);
+
+        // The create wrote a FoodHistory3 row; removing it is the one direct write the tests make on a record of
+        // their own.
+        Assert.Equal(1, await CountPageTwoRowsAsync(id, ct));
+        Assert.Equal(1, await DeletePageTwoRowAsync(id, ct));
+        Assert.Equal(0, await CountPageTwoRowsAsync(id, ct));
+
+        AssertFound(await SearchAsync(client, viewId, [new(TestDatabase.MarkerField, marker)], ct: ct));
+
+        var uniqueKey = await ReadUniqueKeyAsync(FoodHistory, id, ct);
+        foreach (var includeDeleted in new[] { false, true })
+        {
+            var (position, count) = await GetPositionAsync(client, viewId, id, includeDeleted, ct);
+            Assert.Equal(await CountUpToAsync(FoodHistory, uniqueKey, includeDeleted, ct), position);
+            Assert.Equal(await CountBaseRowsAsync(FoodHistory, includeDeleted, ct), count);
+        }
+    }
+
+    // AAP 0.3.4.4 (C-19): excludeGlobalRecordId removes the open record on the server before total is counted. The
+    // alternatives of one field, split on " or " (FindRecordDialog.cs:708-770), combine with OR, and criteria on
+    // different fields combine with AND.
+    [Fact]
+    public async Task Exclusion_Alternatives_AndCriteria_SelectTheExpectedRecords()
+    {
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        var ct = timeout.Token;
+        await using var factory = await ApiFactory.ForDatabaseAsync();
+        using var client = factory.CreateClient();
+        await using var dbLock = await DatabaseWriteLock.AcquireExclusiveAsync(ct);
+
+        var viewId = await ApiTestClient.GetViewIdAsync(client, CaseReport, ct);
+        var markerA = TestDatabase.NewMarker();
+        var markerB = TestDatabase.NewMarker();
+        var shared = TestDatabase.NewMarker();
+        var a = (await CreateAsync(
+            client, viewId, new() { [TestDatabase.MarkerField] = markerA, [FirstNameField] = shared }, ct))
+            .GlobalRecordId;
+        var b = (await CreateAsync(
+            client, viewId, new() { [TestDatabase.MarkerField] = markerB, [FirstNameField] = shared }, ct))
+            .GlobalRecordId;
+
+        AssertFound(await SearchAsync(client, viewId, [new(FirstNameField, shared)], ct: ct), a, b);
+        AssertFound(await SearchAsync(client, viewId, [new(FirstNameField, shared)], exclude: a, ct: ct), b);
+
+        var either = markerA + " or " + markerB;
+        AssertFound(await SearchAsync(client, viewId, [new(TestDatabase.MarkerField, either)], ct: ct), a, b);
+        AssertFound(
+            await SearchAsync(
+                client, viewId, [new(TestDatabase.MarkerField, either), new(FirstNameField, shared)], ct: ct),
+            a,
+            b);
+        AssertFound(
+            await SearchAsync(
+                client, viewId, [new(TestDatabase.MarkerField, markerA), new(FirstNameField, shared)], ct: ct),
+            a);
+        AssertFound(
+            await SearchAsync(
+                client, viewId, [new(TestDatabase.MarkerField, markerA), new(FirstNameField, markerB)], ct: ct));
+    }
+
+
+    // AAP 0.3.4.4 (C-16, C-17): a result's position is its ROW_NUMBER over the selected set by UniqueKey, taken before
+    // the criteria apply, so it equals the position endpoint over the same set and the legacy record number, the
+    // count of rows with UniqueKey <= k (RunTimeView.cs:673-694). A RecStatus criterion stays inside the selected set.
+    [Fact]
+    public async Task SearchPositions_FollowTheSelectedSet()
+    {
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        var ct = timeout.Token;
+        await using var factory = await ApiFactory.ForDatabaseAsync();
+        using var client = factory.CreateClient();
+        await using var dbLock = await DatabaseWriteLock.AcquireExclusiveAsync(ct);
+
+        var viewId = await ApiTestClient.GetViewIdAsync(client, CaseReport, ct);
+        var marker = TestDatabase.NewMarker();
+        var created = await CreateAsync(client, viewId, new() { [TestDatabase.MarkerField] = marker }, ct);
+        var uniqueKey = await ReadUniqueKeyAsync(CaseReport, created.GlobalRecordId, ct);
+        var activePosition = await CountUpToAsync(CaseReport, uniqueKey, includeDeleted: false, ct);
+        var allPosition = await CountUpToAsync(CaseReport, uniqueKey, includeDeleted: true, ct);
+
+        // Seeded deleted rows precede every record a test creates, so the two sets number this record differently.
+        Assert.True(
+            allPosition > activePosition,
+            "SQL shows no deleted row before the created record, so the two sets cannot be told apart.");
+
+        foreach (var (includeDeleted, expected) in new[] { (false, activePosition), (true, allPosition) })
+        {
+            var response = await SearchAsync(
+                client, viewId, [new(TestDatabase.MarkerField, marker)], includeDeleted, ct: ct);
+            var item = Assert.Single(Items(response));
+            Assert.Equal(created.GlobalRecordId, Id(item));
+            Assert.Equal(expected, Position(item));
+            var (position, _) = await GetPositionAsync(client, viewId, created.GlobalRecordId, includeDeleted, ct);
+            Assert.Equal(expected, position);
+        }
+
+        // The seeded deleted records, searched in the set that holds them.
+        var deletedTotal = await CountSearchMatchesAsync(
+            CaseReport, includeDeleted: true, RecordQueryRules.DeletedRecStatus, ct);
+        var expectedDeleted = await ReadSearchMatchesAsync(
+            CaseReport, includeDeleted: true, RecordQueryRules.DeletedRecStatus, RecordQueryRules.SearchCap, ct);
+        Assert.NotEmpty(expectedDeleted);
+
+        var deletedCriterion = new CriterionBody(
+            SearchCriteriaParser.RecStatusFieldName, Text(RecordQueryRules.DeletedRecStatus));
+        var deleted = await SearchAsync(client, viewId, [deletedCriterion], includeDeleted: true, ct: ct);
+        Assert.Equal(deletedTotal, Property(deleted, "total").GetInt32());
+        var deletedItems = Items(deleted);
+        Assert.Equal(
+            expectedDeleted,
+            deletedItems.Select(item => new SearchMatch(Id(item), Position(item))).ToArray());
+        Assert.All(deletedItems, item => Assert.Equal(RecordQueryRules.DeletedRecStatus, RecStatus(item)));
+        await AssertEndpointPositionsAsync(client, viewId, deletedItems, includeDeleted: true, ct);
+
+        AssertFound(await SearchAsync(client, viewId, [deletedCriterion], ct: ct));
+    }
+
+    // AAP 0.3.4.4 "Order and cap" (C-19): results are ordered by UniqueKey and capped at 200, total counts every match
+    // and truncated is total > 200; the open record is excluded before total and the cap, so the 201st match moves up
+    // into the page. Read-only, so the case holds the lock shared.
+    [Fact]
+    public async Task Cap_OrdersByUniqueKey_CountsEveryMatch_AndExcludesBeforeCapping()
+    {
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        var ct = timeout.Token;
+        await using var factory = await ApiFactory.ForDatabaseAsync();
+        using var client = factory.CreateClient();
+        await using var dbLock = await DatabaseWriteLock.AcquireSharedAsync(ct);
+
+        var viewId = await ApiTestClient.GetViewIdAsync(client, CaseReport, ct);
+        var expectedTotal = await CountSearchMatchesAsync(
+            CaseReport, includeDeleted: false, RecordQueryRules.ActiveRecStatus, ct);
+        Assert.True(
+            expectedTotal > RecordQueryRules.SearchCap + 1,
+            "SQL shows too few active CaseReport records for the cap to apply after an exclusion.");
+        var expected = await ReadSearchMatchesAsync(
+            CaseReport, includeDeleted: false, RecordQueryRules.ActiveRecStatus, RecordQueryRules.SearchCap + 1, ct);
+        var criterion = new CriterionBody(
+            SearchCriteriaParser.RecStatusFieldName, Text(RecordQueryRules.ActiveRecStatus));
+
+        var capped = await SearchAsync(client, viewId, [criterion], ct: ct);
+        Assert.Equal(expectedTotal, Property(capped, "total").GetInt32());
+        Assert.True(Property(capped, "truncated").GetBoolean());
+        var cappedItems = Items(capped);
+        Assert.Equal(
+            expected.Take(RecordQueryRules.SearchCap).ToArray(),
+            cappedItems.Select(item => new SearchMatch(Id(item), Position(item))).ToArray());
+        await AssertEndpointPositionsAsync(client, viewId, cappedItems, includeDeleted: false, ct);
+
+        var excludedId = expected[0].GlobalRecordId;
+        var excluded = await SearchAsync(client, viewId, [criterion], exclude: excludedId, ct: ct);
+        Assert.Equal(expectedTotal - 1, Property(excluded, "total").GetInt32());
+        Assert.True(Property(excluded, "truncated").GetBoolean());
+        var excludedItems = Items(excluded);
+        Assert.Equal(
+            expected.Skip(1).ToArray(),
+            excludedItems.Select(item => new SearchMatch(Id(item), Position(item))).ToArray());
+        Assert.DoesNotContain(excludedItems, item => Id(item) == excludedId);
+        Assert.Equal(expected[RecordQueryRules.SearchCap].GlobalRecordId, Id(excludedItems[^1]));
+    }
+
+    // AAP 0.3.4.4 and SC-5: a criterion that matches nothing is a 200 with no items, a total of 0 and truncated false,
+    // never a 404. The marker is fresh, so no record holds it.
+    [Theory]
+    [InlineData(CaseReport)]
+    [InlineData(FoodHistory)]
+    public async Task NoMatch_IsAnEmpty200(string form)
+    {
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        var ct = timeout.Token;
+        await using var factory = await ApiFactory.ForDatabaseAsync();
+        using var client = factory.CreateClient();
+        await using var dbLock = await DatabaseWriteLock.AcquireSharedAsync(ct);
+
+        var viewId = await ApiTestClient.GetViewIdAsync(client, form, ct);
+        var response = await SearchAsync(
+            client, viewId, [new(TestDatabase.MarkerField, TestDatabase.NewMarker())], ct: ct);
+
+        AssertFound(response);
+    }
+
+    // AAP 0.3.4.4 "Collation": Find's equality compares under the database collation exactly as legacy did, and
+    // testdata/sql/00_create_database.sql pins none. The collation found is written to the test output for the
+    // "Search semantics" section of docs/parity-notes.md, and direct SQL on the same column must give the same answer.
+    [Fact]
+    public async Task FindEquality_FollowsTheDatabaseCollation()
+    {
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        var ct = timeout.Token;
+        await using var factory = await ApiFactory.ForDatabaseAsync();
+        using var client = factory.CreateClient();
+        await using var dbLock = await DatabaseWriteLock.AcquireExclusiveAsync(ct);
+
+        var collation = await ReadDatabaseCollationAsync(ct);
+        _output.WriteLine("Database collation: " + collation);
+        int expectedMatches;
+        if (collation.Contains("_CI", StringComparison.Ordinal))
+        {
+            expectedMatches = 1;
+        }
+        else if (collation.Contains("_CS", StringComparison.Ordinal))
+        {
+            expectedMatches = 0;
+        }
+        else
+        {
+            Assert.Fail(
+                $"The database collation '{collation}' is neither case-insensitive (_CI) nor case-sensitive (_CS).");
+            return;
+        }
+
+        var viewId = await ApiTestClient.GetViewIdAsync(client, CaseReport, ct);
+        var marker = NewMarkerWithHexLetter();
+        var created = await CreateAsync(client, viewId, new() { [TestDatabase.MarkerField] = marker }, ct);
+        var upper = marker.ToUpperInvariant();
+        Assert.NotEqual(marker, upper);
+        Assert.Equal(expectedMatches, await CountLastNameEqualsAsync(upper, ct));
+
+        var response = await SearchAsync(client, viewId, [new(TestDatabase.MarkerField, upper)], ct: ct);
+        AssertFound(response, expectedMatches == 1 ? [created.GlobalRecordId] : []);
+    }
+
+
+    // An integer as the query string and the criteria write it.
+    private static string Text(int value) => value.ToString(CultureInfo.InvariantCulture);
+
+    // A marker whose inner run, and so the whole marker, holds a hexadecimal letter, so each case variant differs from
+    // the lowercase text NewMarker stores.
+    private static string NewMarkerWithHexLetter()
+    {
+        string marker;
+        do
+        {
+            marker = TestDatabase.NewMarker();
+        }
+        while (!marker.AsSpan(InnerStart, InnerLength).ContainsAnyInRange('a', 'f'));
+
+        return marker;
+    }
+
+    // Fresh lowercase hexadecimal text of the given length: letters a to f and digits only.
+    private static string LettersAndDigits(int length) =>
+        string.Concat(Enumerable.Range(0, (length / 32) + 1).Select(_ => Guid.NewGuid().ToString("N")))[..length];
+
+    private static string RecordsPath(int viewId, string suffix) =>
+        string.Create(CultureInfo.InvariantCulture, $"/api/forms/{viewId}/records{suffix}");
+
+    // ApiTestClient.CreateRecordAsync with a concrete dictionary, so a case can write its values as new() { ... }.
+    private static Task<CreatedRecord> CreateAsync(
+        HttpClient client,
+        int viewId,
+        Dictionary<string, object?> values,
+        CancellationToken ct) =>
+        ApiTestClient.CreateRecordAsync(client, viewId, values, ct);
+
+    private static async Task<JsonElement> GetJsonAsync(HttpClient client, string path, CancellationToken ct)
+    {
+        using var response = await client.GetAsync(path, ct);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        return await ApiTestClient.ReadJsonElementAsync(response, ct);
+    }
+
+    private static Task<JsonElement> GetListAsync(HttpClient client, int viewId, string query, CancellationToken ct) =>
+        GetJsonAsync(client, RecordsPath(viewId, query), ct);
+
+    // Every page of one set at the largest page size, until the items reach the total or a page comes back empty.
+    private static async Task<(int Total, List<ListedRecord> Records)> ListEveryPageAsync(
+        HttpClient client,
+        int viewId,
+        bool includeDeleted,
+        CancellationToken ct)
+    {
+        var records = new List<ListedRecord>();
+        var set = includeDeleted ? "&" + RequestParameters.IncludeDeleted + "=true" : string.Empty;
+        for (var page = RecordQueryRules.DefaultPage; ; page++)
+        {
+            var query = "?" + RequestParameters.PageSize + "=" + Text(RecordQueryRules.MaxPageSize) +
+                "&" + RequestParameters.Page + "=" + Text(page) + set;
+            var list = await GetListAsync(client, viewId, query, ct);
+            Assert.Equal(page, Property(list, "page").GetInt32());
+            Assert.Equal(RecordQueryRules.MaxPageSize, Property(list, "pageSize").GetInt32());
+
+            var total = Property(list, "total").GetInt32();
+            var items = Items(list);
+            records.AddRange(items.Select(item => new ListedRecord(Id(item), UniqueKey(item), RecStatus(item))));
+            if (items.Count == 0 || records.Count >= total)
+            {
+                return (total, records);
+            }
+        }
+    }
+
+    // POST .../records/search with only the members a case sets, so an absent includeDeleted or excludeGlobalRecordId
+    // takes its default; the response must be a 200.
+    private static async Task<JsonElement> SearchAsync(
+        HttpClient client,
+        int viewId,
+        IReadOnlyList<CriterionBody> criteria,
+        bool? includeDeleted = null,
+        string? exclude = null,
+        CancellationToken ct = default)
+    {
+        var body = new Dictionary<string, object?> { ["criteria"] = criteria.ToArray() };
+        if (includeDeleted is { } flag)
+        {
+            body["includeDeleted"] = flag;
+        }
+
+        if (exclude is not null)
+        {
+            body["excludeGlobalRecordId"] = exclude;
+        }
+
+        using var response = await ApiTestClient.PostJsonAsync(client, RecordsPath(viewId, "/search"), body, ct);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        return await ApiTestClient.ReadJsonElementAsync(response, ct);
+    }
+
+    // GET .../records/{globalRecordId}/position over the chosen set.
+    private static async Task<(int? Position, int Count)> GetPositionAsync(
+        HttpClient client,
+        int viewId,
+        string globalRecordId,
+        bool includeDeleted,
+        CancellationToken ct)
+    {
+        var path = RecordsPath(
+            viewId,
+            "/" + Uri.EscapeDataString(globalRecordId) + "/position?" + RequestParameters.IncludeDeleted + "=" +
+            (includeDeleted ? "true" : "false"));
+        var body = await GetJsonAsync(client, path, ct);
+        var position = Property(body, "position");
+        int? placed = position.ValueKind == JsonValueKind.Null ? null : position.GetInt32();
+        return (placed, Property(body, "count").GetInt32());
+    }
+
+    // The first, middle and last results carry the position the position endpoint gives them in the same set.
+    private static async Task AssertEndpointPositionsAsync(
+        HttpClient client,
+        int viewId,
+        IReadOnlyList<JsonElement> items,
+        bool includeDeleted,
+        CancellationToken ct)
+    {
+        Assert.NotEmpty(items);
+        foreach (var index in new[] { 0, items.Count / 2, items.Count - 1 }.Distinct())
+        {
+            var item = items[index];
+            var (position, _) = await GetPositionAsync(client, viewId, Id(item), includeDeleted, ct);
+            Assert.Equal(Position(item), position);
+        }
+    }
+
+    // A search response that found exactly ids, in UniqueKey order, within the cap.
+    private static void AssertFound(JsonElement response, params string[] ids)
+    {
+        Assert.Equal(ids.Length, Property(response, "total").GetInt32());
+        Assert.False(Property(response, "truncated").GetBoolean());
+        Assert.Equal(ids, Items(response).Select(Id).ToArray());
+    }
+
+    private static JsonElement Property(JsonElement element, string name)
+    {
+        Assert.Equal(JsonValueKind.Object, element.ValueKind);
+        Assert.True(element.TryGetProperty(name, out var value), $"The response has no '{name}' member.");
+        return value;
+    }
+
+    private static IReadOnlyList<JsonElement> Items(JsonElement response)
+    {
+        var items = Property(response, "items");
+        Assert.Equal(JsonValueKind.Array, items.ValueKind);
+        return items.EnumerateArray().ToArray();
+    }
+
+    private static string StringValue(JsonElement element, string name)
+    {
+        var value = Property(element, name);
+        Assert.Equal(JsonValueKind.String, value.ValueKind);
+        return Assert.IsType<string>(value.GetString());
+    }
+
+    private static string Id(JsonElement item) => StringValue(item, "globalRecordId");
+
+    private static int UniqueKey(JsonElement item) => Property(item, "uniqueKey").GetInt32();
+
+    private static int RecStatus(JsonElement item) => Property(item, "recStatus").GetInt32();
+
+    private static int Position(JsonElement item) => Property(item, "position").GetInt32();
+
+
+    // The fixed, bracket-quoted tables of each seeded form (testdata/sql/05_data_tables.sql): its base table and its
+    // page tables in page order. No identifier in the statements below is built from input.
+    private static (string Base, string[] Pages) Tables(string form) => form switch
+    {
+        CaseReport => ("[dbo].[CaseReport]", new[] { "[dbo].[CaseReport1]" }),
+        FoodHistory => ("[dbo].[FoodHistory]", new[] { "[dbo].[FoodHistory2]", "[dbo].[FoodHistory3]" }),
+        _ => throw new ArgumentOutOfRangeException(nameof(form), form, "Not a seeded form."),
+    };
+
+    private static SqlParameter[] SelectedSetParameters(bool includeDeleted) =>
+    [
+        new("@includeDeleted", SqlDbType.Bit) { Value = includeDeleted },
+        new("@active", SqlDbType.SmallInt) { Value = (short)RecordQueryRules.ActiveRecStatus },
+    ];
+
+    private static SqlParameter IdParameter(string globalRecordId) =>
+        new("@id", SqlDbType.NVarChar, 255) { Value = globalRecordId };
+
+    // An INNER JOIN of every page table of the form to the row alias, as Find joins them.
+    private static string PageJoins(string form, string alias) => string.Concat(
+        Tables(form).Pages.Select((table, index) => string.Create(
+            CultureInfo.InvariantCulture,
+            $" INNER JOIN {table} AS p{index} ON p{index}.[GlobalRecordId] = {alias}.[GlobalRecordId]")));
+
+    private static Task<int> CountBaseRowsAsync(string form, bool includeDeleted, CancellationToken ct) =>
+        ScalarIntAsync(
+            $"SELECT COUNT(*) FROM {Tables(form).Base} AS b WHERE {SelectedSetFilter};",
+            ct,
+            SelectedSetParameters(includeDeleted));
+
+    // The legacy record number over the selected set: the count of its rows with UniqueKey <= k.
+    private static Task<int> CountUpToAsync(string form, int uniqueKey, bool includeDeleted, CancellationToken ct) =>
+        ScalarIntAsync(
+            $"SELECT COUNT(*) FROM {Tables(form).Base} AS b WHERE b.[UniqueKey] <= @uniqueKey AND {SelectedSetFilter};",
+            ct,
+            [
+                new SqlParameter("@uniqueKey", SqlDbType.Int) { Value = uniqueKey },
+                .. SelectedSetParameters(includeDeleted),
+            ]);
+
+    private static Task<int> ReadUniqueKeyAsync(string form, string globalRecordId, CancellationToken ct) =>
+        ScalarIntAsync(
+            $"SELECT b.[UniqueKey] FROM {Tables(form).Base} AS b WHERE b.[GlobalRecordId] = @id;",
+            ct,
+            IdParameter(globalRecordId));
+
+    private static Task<BaseRow[]> ReadActivePageAsync(string form, long offset, int pageSize, CancellationToken ct) =>
+        ReadRowsAsync(
+            $"SELECT b.[GlobalRecordId], b.[UniqueKey] FROM {Tables(form).Base} AS b WHERE b.[RecStatus] = @active " +
+            "ORDER BY b.[UniqueKey] OFFSET @offset ROWS FETCH NEXT @pageSize ROWS ONLY;",
+            reader => new BaseRow(reader.GetString(0), reader.GetInt32(1)),
+            ct,
+            new SqlParameter("@active", SqlDbType.SmallInt) { Value = (short)RecordQueryRules.ActiveRecStatus },
+            new SqlParameter("@offset", SqlDbType.BigInt) { Value = offset },
+            new SqlParameter("@pageSize", SqlDbType.Int) { Value = pageSize });
+
+    private static Task<string[]> ReadDeletedIdsAsync(string form, CancellationToken ct) =>
+        ReadRowsAsync(
+            $"SELECT b.[GlobalRecordId] FROM {Tables(form).Base} AS b WHERE b.[RecStatus] = @deleted " +
+            "ORDER BY b.[UniqueKey];",
+            reader => reader.GetString(0),
+            ct,
+            new SqlParameter("@deleted", SqlDbType.SmallInt) { Value = (short)RecordQueryRules.DeletedRecStatus });
+
+    // The number of Find matches of a RecStatus criterion: base rows of the selected set with that status and a row
+    // on every page.
+    private static Task<int> CountSearchMatchesAsync(
+        string form,
+        bool includeDeleted,
+        int recStatus,
+        CancellationToken ct) =>
+        ScalarIntAsync(
+            $"SELECT COUNT(*) FROM {Tables(form).Base} AS b{PageJoins(form, "b")} " +
+            $"WHERE b.[RecStatus] = @status AND {SelectedSetFilter};",
+            ct,
+            [
+                new SqlParameter("@status", SqlDbType.SmallInt) { Value = (short)recStatus },
+                .. SelectedSetParameters(includeDeleted),
+            ]);
+
+    // The first Find matches of a RecStatus criterion in UniqueKey order, each with its ROW_NUMBER over the selected
+    // set, numbered before the criterion and the page joins apply.
+    private static Task<SearchMatch[]> ReadSearchMatchesAsync(
+        string form,
+        bool includeDeleted,
+        int recStatus,
+        int take,
+        CancellationToken ct) =>
+        ReadRowsAsync(
+            "SELECT TOP (@take) n.[GlobalRecordId], n.[pos] FROM (" +
+            "SELECT b.[GlobalRecordId], b.[UniqueKey], b.[RecStatus], " +
+            "CAST(ROW_NUMBER() OVER (ORDER BY b.[UniqueKey]) AS int) AS [pos] " +
+            $"FROM {Tables(form).Base} AS b WHERE {SelectedSetFilter}) AS n{PageJoins(form, "n")} " +
+            "WHERE n.[RecStatus] = @status ORDER BY n.[UniqueKey];",
+            reader => new SearchMatch(reader.GetString(0), reader.GetInt32(1)),
+            ct,
+            [
+                new SqlParameter("@take", SqlDbType.Int) { Value = take },
+                new SqlParameter("@status", SqlDbType.SmallInt) { Value = (short)recStatus },
+                .. SelectedSetParameters(includeDeleted),
+            ]);
+
+    private static Task<int> CountPageTwoRowsAsync(string globalRecordId, CancellationToken ct) =>
+        ScalarIntAsync(
+            "SELECT COUNT(*) FROM [dbo].[FoodHistory3] WHERE [GlobalRecordId] = @id;",
+            ct,
+            IdParameter(globalRecordId));
+
+    // The missing-page fixture: the only direct write of these tests, on a FoodHistory record the test created.
+    private static async Task<int> DeletePageTwoRowAsync(string globalRecordId, CancellationToken ct)
+    {
+        await using var connection = await TestDatabase.OpenConnectionAsync(ct);
+        await using var command = connection.CreateCommand();
+        command.CommandText = "DELETE FROM [dbo].[FoodHistory3] WHERE [GlobalRecordId] = @id;";
+        command.Parameters.Add(IdParameter(globalRecordId));
+        return await command.ExecuteNonQueryAsync(ct);
+    }
+
+    // The stored FirstName of a CaseReport record: DBNull for NULL, null when the record has no page row.
+    private static Task<object?> ReadFirstNameAsync(string globalRecordId, CancellationToken ct) =>
+        ScalarAsync(
+            "SELECT [FirstName] FROM [dbo].[CaseReport1] WHERE [GlobalRecordId] = @id;",
+            ct,
+            IdParameter(globalRecordId));
+
+    // The CaseReport rows whose LastName equals the text under the column's collation, the database default.
+    private static Task<int> CountLastNameEqualsAsync(string lastName, CancellationToken ct) =>
+        ScalarIntAsync(
+            "SELECT COUNT(*) FROM [dbo].[CaseReport1] WHERE [LastName] = @lastName;",
+            ct,
+            new SqlParameter("@lastName", SqlDbType.NVarChar, 4000) { Value = lastName });
+
+    private static async Task<string> ReadDatabaseCollationAsync(CancellationToken ct) =>
+        Assert.IsType<string>(await ScalarAsync(
+            "SELECT CONVERT(nvarchar(128), DATABASEPROPERTYEX(DB_NAME(), 'Collation'));",
+            ct));
+
+    private static async Task<object?> ScalarAsync(string sql, CancellationToken ct, params SqlParameter[] parameters)
+    {
+        await using var connection = await TestDatabase.OpenConnectionAsync(ct);
+        await using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        command.Parameters.AddRange(parameters);
+        return await command.ExecuteScalarAsync(ct);
+    }
+
+    private static async Task<int> ScalarIntAsync(string sql, CancellationToken ct, params SqlParameter[] parameters) =>
+        Assert.IsType<int>(await ScalarAsync(sql, ct, parameters));
+
+    private static async Task<T[]> ReadRowsAsync<T>(
+        string sql,
+        Func<SqlDataReader, T> map,
+        CancellationToken ct,
+        params SqlParameter[] parameters)
+    {
+        await using var connection = await TestDatabase.OpenConnectionAsync(ct);
+        await using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        command.Parameters.AddRange(parameters);
+        await using var reader = await command.ExecuteReaderAsync(ct);
+        var rows = new List<T>();
+        while (await reader.ReadAsync(ct))
+        {
+            rows.Add(map(reader));
+        }
+
+        return rows.ToArray();
+    }
+
+    // One search criterion on the wire: {"field": ..., "value": ...}.
+    private sealed record CriterionBody(string Field, string Value);
+
+    // A base row's identity and order key, as the list items carry them.
+    private readonly record struct BaseRow(string GlobalRecordId, int UniqueKey);
+
+    // One listed record of a walk over every page.
+    private readonly record struct ListedRecord(string GlobalRecordId, int UniqueKey, int RecStatus);
+
+    // One Find result's identity and its position over the selected set.
+    private readonly record struct SearchMatch(string GlobalRecordId, int Position);
+}
+
