@@ -9,7 +9,6 @@ using EpiInfo.Api.Hosting;
 using EpiInfo.Api.Tests.Infrastructure;
 using EpiInfo.Domain.Values;
 using Microsoft.AspNetCore.Hosting.Server;
-using Microsoft.AspNetCore.Hosting.Server.Features;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Http.Features;
 using Microsoft.AspNetCore.Server.Kestrel.Core;
@@ -110,7 +109,10 @@ public sealed class BodyLimitHostFixture : IAsyncLifetime
 /// <para>
 /// On the body endpoints a body one byte over the limit, declared or chunked, is the fixed 413 ProblemDetails and
 /// reaches no handler; a valid JSON body padded with insignificant whitespace to exactly the limit gets the handler's
-/// exact success. Kestrel counts the framing of a chunked body against its own cap, so the guard raises that cap for a
+/// exact success. Both rules are proved through the API's own composition, <c>Program.cs</c> hosted by
+/// <see cref="ApiFactory"/> on TestServer and by <see cref="KestrelApiFactory"/> on real Kestrel, each case on its own
+/// host and store, and again on the shared <see cref="GuardPipelineHost"/> hosts, which run the same guards in either
+/// order. Kestrel counts the framing of a chunked body against its own cap, so the guard raises that cap for a
 /// chunked request by a framing budget of 5 × limit + 5 bytes, and within that budget the decoded bytes decide: the
 /// exact limit passes and one byte more fails whatever the chunk size. The budget's own edge is pinned with chunk
 /// extensions: framing up to exactly the budget is created, and framing past it, by one byte or by many, is Kestrel's
@@ -122,10 +124,13 @@ public sealed class BodyLimitHostFixture : IAsyncLifetime
 /// pass through untouched, and the counting stream's read bound.
 /// </para>
 /// <para>
-/// TestServer is reached through its in-process <see cref="HttpClient"/>. Kestrel is reached through a raw HTTP/1.1
-/// socket client that sends the exact framing given and reads the response while the body is still being sent:
-/// <see cref="HttpClient"/> waits for the whole body to be sent before it surfaces a response, so a server that answers
-/// early and closes the connection would turn the answer into a send failure.
+/// TestServer is reached through its in-process <see cref="HttpClient"/>, and the composition's Kestrel through
+/// <see cref="KestrelApiFactory.CreateKestrelClient"/>, whose bodies stay within one byte of the limit. The
+/// guard-pipeline Kestrel hosts, whose cases include exact chunk framing of several megabytes on the wire, are reached
+/// through a raw HTTP/1.1 socket client that sends the exact framing given and reads the response while the body is
+/// still being sent: <see cref="HttpClient"/> waits for the whole body to be sent before it surfaces a response, so a
+/// server that answers early and closes the connection would turn the answer into a send failure. No case resends a
+/// request.
 /// </para>
 /// <para>
 /// The class needs no database: it carries no <c>Integration</c> trait and joins no database collection.
@@ -138,10 +143,6 @@ public sealed class BodyLimitTests : IClassFixture<BodyLimitHostFixture>
     private const string JsonMediaType = "application/json";
 
     private const string LoopbackHost = "127.0.0.1";
-
-    private const string KestrelUrlKey = "Kestrel:Endpoints:Http:Url";
-
-    private const string EphemeralLoopbackUrl = "http://127.0.0.1:0";
 
     private const string SubmittedText = "x";
 
@@ -357,6 +358,30 @@ public sealed class BodyLimitTests : IClassFixture<BodyLimitHostFixture>
                         {
                             data.Add(server, order, endpoint, framing);
                         }
+                    }
+                }
+            }
+
+            return data;
+        }
+    }
+
+    /// <summary>
+    /// Each server the API's own composition runs on (<see cref="ApiFactory"/> on TestServer,
+    /// <see cref="KestrelApiFactory"/> on real Kestrel), body endpoint and framing.
+    /// </summary>
+    public static TheoryData<ServerKind, BodyEndpoint, BodyFraming> CompositionCases
+    {
+        get
+        {
+            var data = new TheoryData<ServerKind, BodyEndpoint, BodyFraming>();
+            foreach (ServerKind server in AllServers)
+            {
+                foreach (BodyEndpoint endpoint in AllEndpoints)
+                {
+                    foreach (BodyFraming framing in AllFramings)
+                    {
+                        data.Add(server, endpoint, framing);
                     }
                 }
             }
@@ -617,19 +642,13 @@ public sealed class BodyLimitTests : IClassFixture<BodyLimitHostFixture>
         Assert.Equal(Committed.ConfiguredLimit, Limit);
 
         var store = new FakeDataStore(FakeForms.TwoPage);
-        await using var factory = new ApiFactory(ApiFactoryOptions.ForFake(store) with
-        {
-            ExtraSettings = new Dictionary<string, string?> { [KestrelUrlKey] = EphemeralLoopbackUrl },
-        });
-        factory.UseKestrel();
-        factory.StartServer();
+        await using var factory = new KestrelApiFactory(ApiFactoryOptions.ForFake(store));
+        factory.Start();
 
-        IServer server = factory.Services.GetRequiredService<IServer>();
-        Assert.IsNotType<TestServer>(server);
-        IServerAddressesFeature? addresses = server.Features.Get<IServerAddressesFeature>();
-        Assert.NotNull(addresses);
-        Assert.NotEmpty(addresses.Addresses);
-        Assert.All(addresses.Addresses, address => Assert.Equal(LoopbackHost, new Uri(address).Host));
+        Assert.IsNotType<TestServer>(factory.Services.GetRequiredService<IServer>());
+        IReadOnlyList<string> addresses = factory.BoundAddresses;
+        Assert.NotEmpty(addresses);
+        Assert.All(addresses, address => Assert.Equal(LoopbackHost, new Uri(address).Host));
 
         KestrelServerOptions kestrel = factory.Services.GetRequiredService<IOptions<KestrelServerOptions>>().Value;
         Assert.Equal(Committed.ConfiguredLimit, kestrel.Limits.MaxRequestBodySize);
@@ -711,7 +730,7 @@ public sealed class BodyLimitTests : IClassFixture<BodyLimitHostFixture>
 
         ReceivedResponse response = await SendAsync(
             Host(server, order),
-            EndpointRequest(endpoint, Limit + 1, JsonMediaType, framing));
+            EndpointRequest(endpoint, _fixture.RecordId, Limit + 1, JsonMediaType, framing));
 
         AssertProblem(response, HttpStatusCode.RequestEntityTooLarge, ApiProblems.RequestTooLargeDetail);
         AssertEchoesNoRequestContent(response);
@@ -730,59 +749,53 @@ public sealed class BodyLimitTests : IClassFixture<BodyLimitHostFixture>
         BodyFraming framing)
     {
         int writesBefore = _fixture.Store.WriteCalls.Count;
-        BodyRequest request = EndpointRequest(endpoint, Limit, JsonMediaType, framing);
+        BodyRequest request = EndpointRequest(endpoint, _fixture.RecordId, Limit, JsonMediaType, framing);
         Assert.Equal(1_048_576, request.Body.Length);
 
         ReceivedResponse response = await SendAsync(Host(server, order), request);
 
         Assert.True(response.BodyFullySent ?? true, "The request body was not fully sent before the response.");
-        switch (endpoint)
-        {
-            case BodyEndpoint.Create:
-                AssertCreated(response, writesBefore);
-                break;
+        AssertHandlerSuccess(response, endpoint, _fixture.Store, _fixture.RecordId, writesBefore);
+    }
 
-            case BodyEndpoint.Update:
-                using (JsonDocument record = ParseSuccess(response, HttpStatusCode.OK))
-                {
-                    Assert.Equal(_fixture.RecordId, AssertRecordWithSubmittedText(record.RootElement));
-                }
+    // Through the API's own composition, Program.cs on ApiFactory's TestServer and on KestrelApiFactory's real
+    // Kestrel, one byte over the limit, declared or chunked, is the fixed 413 on every body endpoint: nothing of the
+    // request is echoed and the store is never called, so nothing is written. Each case has its own host and store.
+    [Theory]
+    [MemberData(nameof(CompositionCases))]
+    public async Task ApiCompositionAnswersOneByteOverTheLimitWithTheFixed413(
+        ServerKind server,
+        BodyEndpoint endpoint,
+        BodyFraming framing)
+    {
+        await using ComposedApiHost api = ComposedApiHost.Start(server);
+        BodyRequest request = EndpointRequest(endpoint, api.RecordId, Limit + 1, JsonMediaType, framing);
+        Assert.Equal(1_048_577, request.Body.Length);
 
-                Assert.Equal(writesBefore + 1, _fixture.Store.WriteCalls.Count);
-                break;
+        ReceivedResponse response = await api.SendAsync(request);
 
-            case BodyEndpoint.Search:
-                using (JsonDocument matches = ParseSuccess(response, HttpStatusCode.OK))
-                {
-                    JsonElement body = matches.RootElement;
-                    Assert.Equal(
-                        new[] { "items", "total", "truncated" },
-                        body.EnumerateObject().Select(member => member.Name));
-                    Assert.Equal(JsonValueKind.Array, body.GetProperty("items").ValueKind);
-                    Assert.Equal(JsonValueKind.Number, body.GetProperty("total").ValueKind);
-                    Assert.Contains(
-                        body.GetProperty("truncated").ValueKind,
-                        new[] { JsonValueKind.True, JsonValueKind.False });
-                }
+        AssertProblem(response, HttpStatusCode.RequestEntityTooLarge, ApiProblems.RequestTooLargeDetail);
+        AssertEchoesNoRequestContent(response);
+        Assert.Empty(api.Store.Calls);
+    }
 
-                Assert.Equal(writesBefore, _fixture.Store.WriteCalls.Count);
-                break;
+    // Through the API's own composition, a valid JSON body padded to exactly the limit, declared or chunked, reaches
+    // the handler on both servers and gets its exact success, so the cap rejects nothing at the limit.
+    [Theory]
+    [MemberData(nameof(CompositionCases))]
+    public async Task ApiCompositionGivesABodyOfExactlyTheLimitTheHandlersSuccess(
+        ServerKind server,
+        BodyEndpoint endpoint,
+        BodyFraming framing)
+    {
+        await using ComposedApiHost api = ComposedApiHost.Start(server);
+        BodyRequest request = EndpointRequest(endpoint, api.RecordId, Limit, JsonMediaType, framing);
+        Assert.Equal(1_048_576, request.Body.Length);
 
-            case BodyEndpoint.FieldEvent:
-                using (JsonDocument effects = ParseSuccess(response, HttpStatusCode.OK))
-                using (JsonDocument envelope = JsonDocument.Parse(EmptyFieldEventEnvelope))
-                {
-                    Assert.True(
-                        JsonElement.DeepEquals(envelope.RootElement, effects.RootElement),
-                        "Not the empty field-event envelope.");
-                }
+        ReceivedResponse response = await api.SendAsync(request);
 
-                Assert.Equal(writesBefore, _fixture.Store.WriteCalls.Count);
-                break;
-
-            default:
-                throw new ArgumentOutOfRangeException(nameof(endpoint), endpoint, "Not a body endpoint.");
-        }
+        Assert.True(response.BodyFullySent ?? true, "The request body was not fully sent before the response.");
+        AssertHandlerSuccess(response, endpoint, api.Store, api.RecordId, writesBefore: 0);
     }
 
     // Exact HTTP/1.1 chunk framing on Kestrel: every chunking of the exact limit carries more wire bytes than the
@@ -824,7 +837,7 @@ public sealed class BodyLimitTests : IClassFixture<BodyLimitHostFixture>
         if (expected == HttpStatusCode.Created)
         {
             Assert.True(response.BodyFullySent ?? true, "The request body was not fully sent before the response.");
-            AssertCreated(response, writesBefore);
+            AssertCreated(response, _fixture.Store, writesBefore);
             return;
         }
 
@@ -873,7 +886,7 @@ public sealed class BodyLimitTests : IClassFixture<BodyLimitHostFixture>
         if (expected == HttpStatusCode.Created)
         {
             Assert.True(response.BodyFullySent ?? true, "The request body was not fully sent before the response.");
-            AssertCreated(response, writesBefore);
+            AssertCreated(response, _fixture.Store, writesBefore);
             return;
         }
 
@@ -925,7 +938,7 @@ public sealed class BodyLimitTests : IClassFixture<BodyLimitHostFixture>
 
         ReceivedResponse response = await SendAsync(
             Host(server, order),
-            EndpointRequest(endpoint, Limit + 1, contentType, framing));
+            EndpointRequest(endpoint, _fixture.RecordId, Limit + 1, contentType, framing));
 
         AssertProblem(response, HttpStatusCode.UnsupportedMediaType, ApiProblems.UnsupportedMediaTypeDetail);
         AssertEchoesNoRequestContent(response);
@@ -952,7 +965,7 @@ public sealed class BodyLimitTests : IClassFixture<BodyLimitHostFixture>
                 ApiProblems.ResourceNotFoundDetail),
             OutsideRoute.RecordPatch => (
                 HttpMethod.Patch,
-                RecordPath(),
+                RecordPath(_fixture.RecordId),
                 HttpStatusCode.MethodNotAllowed,
                 ApiProblems.MethodNotAllowedDetail),
             _ => throw new ArgumentOutOfRangeException(nameof(route), route, "Not an outside route."),
@@ -973,7 +986,7 @@ public sealed class BodyLimitTests : IClassFixture<BodyLimitHostFixture>
     public async Task EmptyJsonBodyIsTheRequestLevel400(ServerKind server, GuardSequence order, BodyEndpoint endpoint)
     {
         int callsBefore = _fixture.Store.Calls.Count;
-        (HttpMethod method, string path, _) = EndpointTarget(endpoint);
+        (HttpMethod method, string path, _) = EndpointTarget(endpoint, _fixture.RecordId);
         var request = new BodyRequest(method, path, JsonMediaType, [], BodyFraming.ContentLength);
 
         ReceivedResponse response = await SendAsync(Host(server, order), request);
@@ -1579,23 +1592,30 @@ public sealed class BodyLimitTests : IClassFixture<BodyLimitHostFixture>
         return _fixture.Host(kind, guards);
     }
 
-    private string RecordPath() =>
+    private static string RecordPath(string recordId) =>
         string.Create(
             CultureInfo.InvariantCulture,
-            $"/api/forms/{FakeForms.TwoPageViewId}/records/{Uri.EscapeDataString(_fixture.RecordId)}");
+            $"/api/forms/{FakeForms.TwoPageViewId}/records/{Uri.EscapeDataString(recordId)}");
 
-    private BodyRequest EndpointRequest(BodyEndpoint endpoint, long size, string? contentType, BodyFraming framing)
+    private static BodyRequest EndpointRequest(
+        BodyEndpoint endpoint,
+        string recordId,
+        long size,
+        string? contentType,
+        BodyFraming framing)
     {
-        (HttpMethod method, string path, string json) = EndpointTarget(endpoint);
+        (HttpMethod method, string path, string json) = EndpointTarget(endpoint, recordId);
         return new BodyRequest(method, path, contentType, PaddedJson(json, size), framing);
     }
 
-    // The method, path and compact valid JSON body of each body endpoint, aimed at the seeded form and record.
-    private (HttpMethod Method, string Path, string Json) EndpointTarget(BodyEndpoint endpoint) =>
+    // The method, path and compact valid JSON body of each body endpoint, aimed at the form and the seeded record.
+    private static (HttpMethod Method, string Path, string Json) EndpointTarget(
+        BodyEndpoint endpoint,
+        string recordId) =>
         endpoint switch
         {
             BodyEndpoint.Create => (HttpMethod.Post, CreatePath(), CreateBody),
-            BodyEndpoint.Update => (HttpMethod.Put, RecordPath(), CreateBody),
+            BodyEndpoint.Update => (HttpMethod.Put, RecordPath(recordId), CreateBody),
             BodyEndpoint.Search => (HttpMethod.Post, $"{CreatePath()}/search", SearchBody),
             BodyEndpoint.FieldEvent => (
                 HttpMethod.Post,
@@ -1607,16 +1627,146 @@ public sealed class BodyLimitTests : IClassFixture<BodyLimitHostFixture>
         };
 
     // 201 with the new record, its Location, the submitted text stored and exactly one more write.
-    private void AssertCreated(ReceivedResponse response, int writesBefore)
+    private static void AssertCreated(ReceivedResponse response, FakeDataStore store, int writesBefore)
     {
         using JsonDocument document = ParseSuccess(response, HttpStatusCode.Created);
         string createdId = AssertRecordWithSubmittedText(document.RootElement);
         Assert.Equal($"{CreatePath()}/{createdId}", response.Location);
         Assert.Equal(
             FieldValue.FromText(SubmittedText),
-            Assert.IsType<FakeRecordState>(_fixture.Store.GetRecord(FakeForms.TwoPageViewId, createdId))
+            Assert.IsType<FakeRecordState>(store.GetRecord(FakeForms.TwoPageViewId, createdId))
                 .Values["LastName"]);
-        Assert.Equal(writesBefore + 1, _fixture.Store.WriteCalls.Count);
+        Assert.Equal(writesBefore + 1, store.WriteCalls.Count);
+    }
+
+    // The exact success each body endpoint gives a valid body of exactly the limit, so an unrelated failure cannot
+    // pass as "not rejected for size": the created record, the updated record, an empty search result shape, or the
+    // empty field-event envelope, with exactly the writes each one makes.
+    private static void AssertHandlerSuccess(
+        ReceivedResponse response,
+        BodyEndpoint endpoint,
+        FakeDataStore store,
+        string recordId,
+        int writesBefore)
+    {
+        switch (endpoint)
+        {
+            case BodyEndpoint.Create:
+                AssertCreated(response, store, writesBefore);
+                break;
+
+            case BodyEndpoint.Update:
+                using (JsonDocument record = ParseSuccess(response, HttpStatusCode.OK))
+                {
+                    Assert.Equal(recordId, AssertRecordWithSubmittedText(record.RootElement));
+                }
+
+                Assert.Equal(writesBefore + 1, store.WriteCalls.Count);
+                break;
+
+            case BodyEndpoint.Search:
+                using (JsonDocument matches = ParseSuccess(response, HttpStatusCode.OK))
+                {
+                    JsonElement body = matches.RootElement;
+                    Assert.Equal(
+                        new[] { "items", "total", "truncated" },
+                        body.EnumerateObject().Select(member => member.Name));
+                    Assert.Equal(JsonValueKind.Array, body.GetProperty("items").ValueKind);
+                    Assert.Equal(JsonValueKind.Number, body.GetProperty("total").ValueKind);
+                    Assert.Contains(
+                        body.GetProperty("truncated").ValueKind,
+                        new[] { JsonValueKind.True, JsonValueKind.False });
+                }
+
+                Assert.Equal(writesBefore, store.WriteCalls.Count);
+                break;
+
+            case BodyEndpoint.FieldEvent:
+                using (JsonDocument effects = ParseSuccess(response, HttpStatusCode.OK))
+                using (JsonDocument envelope = JsonDocument.Parse(EmptyFieldEventEnvelope))
+                {
+                    Assert.True(
+                        JsonElement.DeepEquals(envelope.RootElement, effects.RootElement),
+                        "Not the empty field-event envelope.");
+                }
+
+                Assert.Equal(writesBefore, store.WriteCalls.Count);
+                break;
+
+            default:
+                throw new ArgumentOutOfRangeException(nameof(endpoint), endpoint, "Not a body endpoint.");
+        }
+    }
+
+    /// <summary>
+    /// The API's own composition, <c>Program.cs</c>, hosted for one case: <see cref="ApiFactory"/> on TestServer or
+    /// <see cref="KestrelApiFactory"/> on real Kestrel, over a fresh <see cref="FakeDataStore"/> holding
+    /// <see cref="FakeForms.TwoPage"/> with one seeded record, so the store's call log holds that case's calls alone.
+    /// </summary>
+    /// <remarks>
+    /// Requests go through the factory's own client: in process on TestServer, over a loopback socket on Kestrel. A
+    /// body here is at most one byte over the limit, small enough for the socket client to surface Kestrel's early 413
+    /// reliably, so these cases need no raw-socket client; the larger framings of the guard-pipeline cases do.
+    /// </remarks>
+    private sealed class ComposedApiHost : IAsyncDisposable
+    {
+        private readonly ApiFactoryBase _factory;
+
+        private readonly HttpClient _client;
+
+        private ComposedApiHost(FakeDataStore store, string recordId, ApiFactoryBase factory, HttpClient client)
+        {
+            Store = store;
+            RecordId = recordId;
+            _factory = factory;
+            _client = client;
+        }
+
+        /// <summary>The store the host serves; seeded with one record and no call.</summary>
+        public FakeDataStore Store { get; }
+
+        /// <summary>The <c>GlobalRecordId</c> of the seeded record, the target of the <c>PUT</c>.</summary>
+        public string RecordId { get; }
+
+        /// <summary>Starts the composition on <paramref name="server"/>; the caller disposes the host.</summary>
+        /// <param name="server">The server to host it on.</param>
+        /// <returns>The started host.</returns>
+        public static ComposedApiHost Start(ServerKind server)
+        {
+            var store = new FakeDataStore(FakeForms.TwoPage);
+            string recordId = store.SeedRecord(FakeForms.TwoPageViewId);
+            ApiFactoryOptions options = ApiFactoryOptions.ForFake(store);
+
+            ApiFactoryBase factory = server switch
+            {
+                ServerKind.TestServer => new ApiFactory(options),
+                ServerKind.Kestrel => new KestrelApiFactory(options),
+                _ => throw new ArgumentOutOfRangeException(nameof(server), server, "Not a server kind."),
+            };
+
+            try
+            {
+                HttpClient client = factory is KestrelApiFactory kestrel
+                    ? kestrel.CreateKestrelClient()
+                    : factory.CreateClient();
+                return new ComposedApiHost(store, recordId, factory, client);
+            }
+            catch
+            {
+                factory.Dispose();
+                throw;
+            }
+        }
+
+        /// <summary>Sends <paramref name="request"/> to the host once; nothing is retried.</summary>
+        public Task<ReceivedResponse> SendAsync(BodyRequest request) => SendThroughClientAsync(_client, request);
+
+        /// <inheritdoc />
+        public async ValueTask DisposeAsync()
+        {
+            _client.Dispose();
+            await _factory.DisposeAsync();
+        }
     }
 
     /// <summary>A request a case sends.</summary>

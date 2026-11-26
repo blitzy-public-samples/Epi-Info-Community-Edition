@@ -10,6 +10,8 @@ using EpiInfo.Api.Json;
 using EpiInfo.Api.Services;
 using EpiInfo.Api.Tests.Infrastructure;
 using EpiInfo.CheckCode;
+using EpiInfo.Domain.Forms;
+using EpiInfo.Domain.Metadata;
 using EpiInfo.Domain.Storage;
 using EpiInfo.Domain.Values;
 using Microsoft.AspNetCore.Builder;
@@ -347,42 +349,110 @@ internal sealed class GuardPipelineHost : IAsyncDisposable
 }
 
 /// <summary>
-/// The shared real-Kestrel host of <see cref="MediaTypeTests"/>: a <see cref="GuardPipelineHost"/> over a
-/// <see cref="FakeDataStore"/> holding <see cref="FakeForms.TwoPage"/> with one seeded record.
+/// The shared real-Kestrel hosts of <see cref="MediaTypeTests"/>, each reached over a socket.
 /// </summary>
-public sealed class MediaTypeHostFixture : IAsyncLifetime
+/// <remarks>
+/// <para>
+/// The API itself is <c>src/EpiInfo.Api/Program.cs</c> hosted by <see cref="KestrelApiFactory"/> over
+/// <see cref="Store"/>, a <see cref="FakeDataStore"/> holding <see cref="FakeForms.TwoPage"/> with one seeded record,
+/// so the four body endpoints are proved through the composition root's own pipeline: dropping the media-type guard
+/// from <c>Program.cs</c> lets the <c>+json</c> types through and fails the 415 cases.
+/// </para>
+/// <para>
+/// <see cref="GuardHost"/> is a <see cref="GuardPipelineHost"/> over a store of its own, used only for the probe routes
+/// that differ in <see cref="JsonBodyMetadata"/> alone, which the API does not map.
+/// </para>
+/// <para>
+/// The form's view id, its writable text field and the seeded record id come from <see cref="FakeForms.TwoPage"/> and
+/// the store, never from literals. Accepted cases write to <see cref="Store"/>; each test reads its write count before
+/// sending, and xUnit runs the tests of one class one at a time.
+/// </para>
+/// </remarks>
+public sealed class MediaTypeFixture : IAsyncLifetime
 {
-    private GuardPipelineHost? _host;
+    private readonly KestrelApiFactory _factory;
 
-    /// <summary>Creates the store and seeds the record; the host starts in <see cref="InitializeAsync"/>.</summary>
-    public MediaTypeHostFixture()
+    private HttpClient? _client;
+
+    private GuardPipelineHost? _guardHost;
+
+    /// <summary>
+    /// Creates the store, seeds the record and creates the API factory; both hosts start in
+    /// <see cref="InitializeAsync"/>.
+    /// </summary>
+    /// <exception cref="InvalidOperationException">
+    /// <see cref="FakeForms.TwoPage"/> has no writable text field.
+    /// </exception>
+    public MediaTypeFixture()
     {
-        Store = new FakeDataStore(FakeForms.TwoPage);
-        RecordId = Store.SeedRecord(FakeForms.TwoPageViewId);
+        FakeForm form = FakeForms.TwoPage;
+        ViewId = form.Metadata.ViewId;
+        TextField = WritableTextField(form.Metadata);
+        Store = new FakeDataStore(form);
+        RecordId = Store.SeedRecord(ViewId);
+        _factory = new KestrelApiFactory(ApiFactoryOptions.ForFake(Store));
     }
 
-    /// <summary>The store the host serves.</summary>
+    /// <summary>The store the API serves.</summary>
     public FakeDataStore Store { get; }
+
+    /// <summary>The view id of <see cref="FakeForms.TwoPage"/>.</summary>
+    public int ViewId { get; }
 
     /// <summary>The <c>GlobalRecordId</c> of the seeded record, the target of every <c>PUT</c>.</summary>
     public string RecordId { get; }
 
-    /// <summary>The started host.</summary>
-    /// <exception cref="InvalidOperationException">The host has not been started.</exception>
-    internal GuardPipelineHost Host => _host ?? throw new InvalidOperationException("The host has not been started.");
+    /// <summary>
+    /// A writable, page-bound <c>text</c> data field of the form with no length limit or pattern, so the value
+    /// <c>"x"</c> passes validation.
+    /// </summary>
+    public string TextField { get; }
+
+    /// <summary>
+    /// The API's client, sending real HTTP over a socket to the <c>127.0.0.1</c> address Kestrel bound.
+    /// </summary>
+    /// <exception cref="InvalidOperationException">The API has not been started.</exception>
+    public HttpClient Client => _client ?? throw new InvalidOperationException("The API has not been started.");
+
+    /// <summary>The probe host.</summary>
+    /// <exception cref="InvalidOperationException">The probe host has not been started.</exception>
+    internal GuardPipelineHost GuardHost =>
+        _guardHost ?? throw new InvalidOperationException("The probe host has not been started.");
 
     /// <inheritdoc />
-    public async Task InitializeAsync() =>
-        _host = await GuardPipelineHost.StartAsync(GuardHostKind.Kestrel, Store);
+    public async Task InitializeAsync()
+    {
+        // Starts Kestrel; the loopback guard has checked every listen setting before any socket opened.
+        _client = _factory.CreateKestrelClient();
+        _guardHost = await GuardPipelineHost.StartAsync(GuardHostKind.Kestrel, new FakeDataStore(FakeForms.TwoPage));
+    }
 
     /// <inheritdoc />
     public async Task DisposeAsync()
     {
-        if (_host is not null)
+        try
         {
-            await _host.DisposeAsync();
+            if (_guardHost is not null)
+            {
+                await _guardHost.DisposeAsync();
+            }
+        }
+        finally
+        {
+            // Disposes the client with the host and frees the port.
+            await _factory.DisposeAsync();
         }
     }
+
+    private static string WritableTextField(FormMetadata metadata) =>
+        metadata.Fields.FirstOrDefault(field =>
+            field.PageId is not null
+            && !field.IsReadOnly
+            && field.MaxLength is not > 0
+            && string.IsNullOrEmpty(field.Pattern)
+            && FieldTypeMapper.Map(field) is (FieldType.Text, false, _))?.Name
+        ?? throw new InvalidOperationException(
+            "The form has no writable text field without a length limit or pattern.");
 }
 
 /// <summary>
@@ -399,23 +469,19 @@ public sealed class MediaTypeHostFixture : IAsyncLifetime
 /// stays 404 and a method mismatch 405.
 /// </para>
 /// <para>
-/// The class needs no database: it carries no <c>Integration</c> trait and joins no database collection. Each
-/// <c>Content-Type</c> is added without validation, so it reaches the server exactly as written.
+/// Every body-endpoint case runs on the API's own composition root through <see cref="KestrelApiFactory"/>, where the
+/// framework's binding alone would accept the <c>+json</c> types. The class needs no database: it carries no
+/// <c>Integration</c> trait and joins no database collection. Each <c>Content-Type</c> is added without validation, so
+/// it reaches the server exactly as written.
 /// </para>
 /// </remarks>
-public sealed class MediaTypeTests : IClassFixture<MediaTypeHostFixture>
+public sealed class MediaTypeTests : IClassFixture<MediaTypeFixture>
 {
     private const string ContentTypeHeader = "Content-Type";
 
     private const string JsonMediaType = "application/json";
 
     private const string QuotedUtf8JsonMediaType = "application/json; charset=\"utf-8\"";
-
-    private const string CreateBody = """{"values":{"LastName":"x"}}""";
-
-    private const string SearchBody = """{"criteria":[{"field":"LastName","value":"x"}]}""";
-
-    private const string FieldEventBody = """{"event":"FieldAfter","fieldName":"LastName","values":{"LastName":"x"}}""";
 
     private const string MalformedBody = """{"values":""";
 
@@ -429,11 +495,11 @@ public sealed class MediaTypeTests : IClassFixture<MediaTypeHostFixture>
     private static readonly BodyEndpoint[] AllEndpoints =
         [BodyEndpoint.Create, BodyEndpoint.Update, BodyEndpoint.Search, BodyEndpoint.FieldEvent];
 
-    private readonly MediaTypeHostFixture _fixture;
+    private readonly MediaTypeFixture _fixture;
 
-    /// <summary>Creates the test class over the shared host.</summary>
-    /// <param name="fixture">The shared real-Kestrel host.</param>
-    public MediaTypeTests(MediaTypeHostFixture fixture)
+    /// <summary>Creates the test class over the shared hosts.</summary>
+    /// <param name="fixture">The shared real-Kestrel hosts.</param>
+    public MediaTypeTests(MediaTypeFixture fixture)
     {
         _fixture = fixture;
     }
@@ -532,7 +598,7 @@ public sealed class MediaTypeTests : IClassFixture<MediaTypeHostFixture>
         }
     }
 
-    private HttpClient Client => _fixture.Host.Client;
+    private HttpClient Client => _fixture.Client;
 
     // AAP 0.7.6: text/plain, +json types and a missing Content-Type are a 415 with or without a body; the media type is
     // checked before the body, so an empty body still gets the 415, never the 400 (AAP 0.3.4.7).
@@ -593,11 +659,11 @@ public sealed class MediaTypeTests : IClassFixture<MediaTypeHostFixture>
         {
             case BodyEndpoint.Create:
                 string createdId = AssertRecordWithSubmittedText(body);
-                Assert.Equal($"{CreatePath()}/{createdId}", response.Headers.Location?.OriginalString);
+                Assert.Equal($"{RecordsPath()}/{createdId}", response.Headers.Location?.OriginalString);
                 Assert.Equal(
                     FieldValue.FromText(SubmittedText),
-                    Assert.IsType<FakeRecordState>(_fixture.Store.GetRecord(FakeForms.TwoPageViewId, createdId))
-                        .Values["LastName"]);
+                    Assert.IsType<FakeRecordState>(_fixture.Store.GetRecord(_fixture.ViewId, createdId))
+                        .Values[_fixture.TextField]);
                 Assert.Equal(writesBefore + 1, _fixture.Store.WriteCalls.Count);
                 break;
 
@@ -668,7 +734,7 @@ public sealed class MediaTypeTests : IClassFixture<MediaTypeHostFixture>
         string path = string.Format(
             CultureInfo.InvariantCulture,
             pathFormat,
-            FakeForms.TwoPageViewId,
+            _fixture.ViewId,
             Uri.EscapeDataString(_fixture.RecordId));
 
         using HttpRequestMessage request = CreateRequest(new HttpMethod(method), path, "hello"u8.ToArray(), "text/plain");
@@ -678,7 +744,8 @@ public sealed class MediaTypeTests : IClassFixture<MediaTypeHostFixture>
     }
 
     // AAP 0.3.4.7: the guard acts only on an endpoint that carries JsonBodyMetadata. The probes differ in that marker
-    // alone, and neither declares Accepts metadata, so routing never answers for them.
+    // alone, and neither declares Accepts metadata, so routing never answers for them. The API maps no such pair, so
+    // they run on the probe host, which composes the same guards in the same order.
     [Theory]
     [InlineData(GuardPipelineHost.GuardedProbePath, "text/plain", HttpStatusCode.UnsupportedMediaType)]
     [InlineData(GuardPipelineHost.GuardedProbePath, null, HttpStatusCode.UnsupportedMediaType)]
@@ -690,10 +757,11 @@ public sealed class MediaTypeTests : IClassFixture<MediaTypeHostFixture>
         string? contentType,
         HttpStatusCode expected)
     {
-        byte[] body = Encoding.UTF8.GetBytes(CreateBody);
+        GuardPipelineHost host = _fixture.GuardHost;
+        byte[] body = Encoding.UTF8.GetBytes(ValidBody(BodyEndpoint.Create));
 
         using HttpRequestMessage request = CreateRequest(HttpMethod.Post, path, body, contentType);
-        using HttpResponseMessage response = await Client.SendAsync(request);
+        using HttpResponseMessage response = await host.Client.SendAsync(request);
 
         if (expected == HttpStatusCode.UnsupportedMediaType)
         {
@@ -708,21 +776,21 @@ public sealed class MediaTypeTests : IClassFixture<MediaTypeHostFixture>
 
         // A body with Content-Length keeps Kestrel's configured limit on either probe.
         Assert.Equal(
-            _fixture.Host.Services.GetRequiredService<ApiOptions>().MaxRequestBodySize,
+            host.Services.GetRequiredService<ApiOptions>().MaxRequestBodySize,
             probe.GetProperty(GuardPipelineHost.ProbeMaxRequestBodySizeProperty).GetInt64());
     }
 
-    // The same composition on TestServer gives the same 415 and the same handler success, quoted charset included, so
-    // either host can carry the guard tests that need it.
+    // The probe host's composition on TestServer gives the same 415 and the same handler success, quoted charset
+    // included, so either of its servers can carry the guard tests that need it.
     [Fact]
     public async Task TestServerHostAppliesTheSameMediaTypeRule()
     {
         var store = new FakeDataStore(FakeForms.TwoPage);
         await using GuardPipelineHost host = await GuardPipelineHost.StartAsync(GuardHostKind.TestServer, store);
         Assert.Equal(GuardHostKind.TestServer, host.Kind);
-        byte[] body = Encoding.UTF8.GetBytes(CreateBody);
+        byte[] body = Encoding.UTF8.GetBytes(ValidBody(BodyEndpoint.Create));
 
-        using (HttpRequestMessage rejected = CreateRequest(HttpMethod.Post, CreatePath(), body, "text/plain"))
+        using (HttpRequestMessage rejected = CreateRequest(HttpMethod.Post, RecordsPath(), body, "text/plain"))
         using (HttpResponseMessage response = await host.Client.SendAsync(rejected))
         {
             await AssertProblemAsync(
@@ -733,7 +801,7 @@ public sealed class MediaTypeTests : IClassFixture<MediaTypeHostFixture>
 
         Assert.Empty(store.WriteCalls);
 
-        using (HttpRequestMessage accepted = CreateRequest(HttpMethod.Post, CreatePath(), body, JsonMediaType))
+        using (HttpRequestMessage accepted = CreateRequest(HttpMethod.Post, RecordsPath(), body, JsonMediaType))
         using (HttpResponseMessage response = await host.Client.SendAsync(accepted))
         {
             Assert.Equal(HttpStatusCode.Created, response.StatusCode);
@@ -742,7 +810,7 @@ public sealed class MediaTypeTests : IClassFixture<MediaTypeHostFixture>
 
         Assert.Single(store.WriteCalls);
 
-        using (HttpRequestMessage quoted = CreateRequest(HttpMethod.Post, CreatePath(), body, QuotedUtf8JsonMediaType))
+        using (HttpRequestMessage quoted = CreateRequest(HttpMethod.Post, RecordsPath(), body, QuotedUtf8JsonMediaType))
         using (HttpResponseMessage response = await host.Client.SendAsync(quoted))
         {
             Assert.Equal(HttpStatusCode.Created, response.StatusCode);
@@ -765,9 +833,6 @@ public sealed class MediaTypeTests : IClassFixture<MediaTypeHostFixture>
 
         return data;
     }
-
-    private static string CreatePath() =>
-        string.Create(CultureInfo.InvariantCulture, $"/api/forms/{FakeForms.TwoPageViewId}/records");
 
     // The raw header is added without validation, so parameter edge cases reach the server exactly as written; a null
     // content type sends no Content-Type at all.
@@ -799,31 +864,47 @@ public sealed class MediaTypeTests : IClassFixture<MediaTypeHostFixture>
         Assert.False(body.TryGetProperty("errors", out _), "A request-level problem carries no errors member.");
     }
 
-    // A Record DTO whose LastName is the submitted text; returns its globalRecordId.
-    private static string AssertRecordWithSubmittedText(JsonElement body)
+    // A Record DTO whose text field holds the submitted text; returns its globalRecordId.
+    private string AssertRecordWithSubmittedText(JsonElement body)
     {
         Assert.Equal(JsonValueKind.Object, body.ValueKind);
         string? id = body.GetProperty("globalRecordId").GetString();
         Assert.False(string.IsNullOrEmpty(id));
-        Assert.Equal(SubmittedText, body.GetProperty("values").GetProperty("LastName").GetString());
+        Assert.Equal(SubmittedText, body.GetProperty("values").GetProperty(_fixture.TextField).GetString());
         return id;
+    }
+
+    // The method, path and valid JSON body of each body endpoint, built from the fixture's form, record and text
+    // field. Update sends the create body to the seeded record.
+    private (HttpMethod Method, string Path, string ValidBody) Describe(BodyEndpoint endpoint) => endpoint switch
+    {
+        BodyEndpoint.Create => (HttpMethod.Post, RecordsPath(), ValidBody(endpoint)),
+        BodyEndpoint.Update => (HttpMethod.Put, RecordPath(), ValidBody(endpoint)),
+        BodyEndpoint.Search => (HttpMethod.Post, $"{RecordsPath()}/search", ValidBody(endpoint)),
+        BodyEndpoint.FieldEvent => (
+            HttpMethod.Post,
+            string.Create(CultureInfo.InvariantCulture, $"/api/forms/{_fixture.ViewId}/checkcode/field-event"),
+            ValidBody(endpoint)),
+        _ => throw new ArgumentOutOfRangeException(nameof(endpoint), endpoint, "Not a body endpoint."),
+    };
+
+    // The field name is JSON-encoded, so the bodies stay valid JSON whatever the form names its field.
+    private string ValidBody(BodyEndpoint endpoint)
+    {
+        string field = JsonEncodedText.Encode(_fixture.TextField).Value;
+        string values = $$"""{"{{field}}":"{{SubmittedText}}"}""";
+        return endpoint switch
+        {
+            BodyEndpoint.Create or BodyEndpoint.Update => $$"""{"values":{{values}}}""",
+            BodyEndpoint.Search => $$"""{"criteria":[{"field":"{{field}}","value":"{{SubmittedText}}"}]}""",
+            BodyEndpoint.FieldEvent => $$"""{"event":"FieldAfter","fieldName":"{{field}}","values":{{values}}}""",
+            _ => throw new ArgumentOutOfRangeException(nameof(endpoint), endpoint, "Not a body endpoint."),
+        };
     }
 
     private HttpRequestMessage CreateRequest(BodyEndpoint endpoint, BodyShape shape, string? contentType)
     {
-        (HttpMethod method, string path, string validBody) = endpoint switch
-        {
-            BodyEndpoint.Create => (HttpMethod.Post, CreatePath(), CreateBody),
-            BodyEndpoint.Update => (HttpMethod.Put, RecordPath(), CreateBody),
-            BodyEndpoint.Search => (HttpMethod.Post, $"{CreatePath()}/search", SearchBody),
-            BodyEndpoint.FieldEvent => (
-                HttpMethod.Post,
-                string.Create(
-                    CultureInfo.InvariantCulture,
-                    $"/api/forms/{FakeForms.TwoPageViewId}/checkcode/field-event"),
-                FieldEventBody),
-            _ => throw new ArgumentOutOfRangeException(nameof(endpoint), endpoint, "Not a body endpoint."),
-        };
+        (HttpMethod method, string path, string validBody) = Describe(endpoint);
 
         byte[] body = shape switch
         {
@@ -836,9 +917,12 @@ public sealed class MediaTypeTests : IClassFixture<MediaTypeHostFixture>
         return CreateRequest(method, path, body, contentType);
     }
 
+    private string RecordsPath() =>
+        string.Create(CultureInfo.InvariantCulture, $"/api/forms/{_fixture.ViewId}/records");
+
     private string RecordPath() => string.Format(
         CultureInfo.InvariantCulture,
         RecordPathFormat,
-        FakeForms.TwoPageViewId,
+        _fixture.ViewId,
         Uri.EscapeDataString(_fixture.RecordId));
 }
