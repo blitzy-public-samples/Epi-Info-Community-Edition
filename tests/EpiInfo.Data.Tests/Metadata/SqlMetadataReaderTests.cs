@@ -39,6 +39,129 @@ public sealed class SqlMetadataReaderTests : IAsyncLifetime
 
     private static readonly TimeSpan TestTimeout = TimeSpan.FromSeconds(60);
 
+    // The rows with a null PageId: system fields, never listed on a page (C-7).
+    private static readonly string[] SystemFieldNames = ["GlobalRecordId", "RecStatus", "UniqueKey"];
+
+    // The seeded forms as testdata/sql/03_forms.sql and 05_data_tables.sql define them. Each test also reads the same
+    // facts by direct SQL, so the literals, the database and the reader must all agree.
+    private static readonly IReadOnlyDictionary<int, SeededForm> SeededForms = new Dictionary<int, SeededForm>
+    {
+        [1] = new SeededForm(
+            ViewId: 1,
+            Name: "CaseReport",
+            Pages: [new PageMetadata(1, "Page 1", 0, "CaseReport1")],
+            FieldCount: 64,
+            FieldsPerPage: new Dictionary<int, int> { [1] = 61 },
+            DataColumnsPerTable: new Dictionary<string, int>(StringComparer.Ordinal) { ["CaseReport1"] = 43 },
+            DataFieldCount: 43,
+            FieldTypeCounts: new Dictionary<string, int>(StringComparer.Ordinal)
+            {
+                ["Text"] = 16,
+                ["Label/Title"] = 14,
+                ["Comment Legal"] = 18,
+                ["Group"] = 4,
+                ["Date"] = 4,
+                ["Phone Number"] = 3,
+                ["Number"] = 2,
+            },
+            YesNoFields: []),
+        [2] = new SeededForm(
+            ViewId: 2,
+            Name: "FoodHistory",
+            Pages: [new PageMetadata(2, "Page 1", 0, "FoodHistory2"), new PageMetadata(3, "Page 2", 1, "FoodHistory3")],
+            FieldCount: 91,
+            FieldsPerPage: new Dictionary<int, int> { [2] = 55, [3] = 33 },
+            DataColumnsPerTable: new Dictionary<string, int>(StringComparer.Ordinal)
+            {
+                ["FoodHistory2"] = 45,
+                ["FoodHistory3"] = 29,
+            },
+            DataFieldCount: 67,
+            FieldTypeCounts: new Dictionary<string, int>(StringComparer.Ordinal)
+            {
+                ["Checkbox"] = 40,
+                ["Label/Title"] = 9,
+                ["Text"] = 8,
+                ["Date"] = 7,
+                ["Yes/No"] = 7,
+                ["Number"] = 6,
+                ["Group"] = 4,
+                ["Legal Values"] = 3,
+                ["Multiline"] = 2,
+                ["Phone Number"] = 1,
+                ["Command Button"] = 1,
+            },
+            YesNoFields:
+            ["Antibiotics", "Died", "DoctorVisit", "Hospitalized", "ILL", "O157H7isolated", "StoolSubmitted"]),
+    };
+
+    // The fieldType each seeded metaFieldTypes name maps to. Phone Number and Comment Legal sit on character columns
+    // and are text; Yes/No sits on tinyint and is unsupported, so it is never written (C-2); Command Button is always
+    // unsupported.
+    private static readonly IReadOnlyDictionary<string, FieldType> SeededTypeMapping =
+        new Dictionary<string, FieldType>(StringComparer.Ordinal)
+        {
+            ["Text"] = FieldType.Text,
+            ["Label/Title"] = FieldType.Label,
+            ["Group"] = FieldType.Group,
+            ["Number"] = FieldType.Number,
+            ["Date"] = FieldType.Date,
+            ["Phone Number"] = FieldType.Text,
+            ["Comment Legal"] = FieldType.Text,
+            ["Multiline"] = FieldType.Multiline,
+            ["Checkbox"] = FieldType.Checkbox,
+            ["Legal Values"] = FieldType.LegalValues,
+            ["Yes/No"] = FieldType.Unsupported,
+            ["Command Button"] = FieldType.Unsupported,
+        };
+
+    // The metaFieldTypes rows neither seeded form uses (testdata/sql/02_reference_data.sql): Option, the types the
+    // AAP keeps unsupported, and ForeignKey, whose absence means the base insert never names FKEY (A7, A15).
+    private static readonly IReadOnlyDictionary<int, string> AbsentFieldTypes = new Dictionary<int, string>
+    {
+        [12] = "Option",
+        [14] = "Image",
+        [15] = "Mirror",
+        [16] = "Grid",
+        [20] = "Relate",
+        [24] = "ForeignKey",
+        [25] = "GUID",
+    };
+
+    // The sys.types names the seeded base and page tables may use: exactly the types the admitted families cover.
+    private static readonly string[] SeededColumnTypes =
+        ["bit", "datetime", "float", "int", "ntext", "nvarchar", "smallint", "tinyint"];
+
+    // Seeded character columns with their catalogue type, length in UTF-16 code units and raw max_length.
+    private static readonly CharacterColumn[] SeededCharacterColumns =
+    [
+        new(1, "LastName", "CaseReport1", "nvarchar", 4000, 8000),
+        new(2, "LastName", "FoodHistory2", "nvarchar", 4000, 8000),
+        new(1, "PhoneNumber", "CaseReport1", "nvarchar", 20, 40),
+        new(2, "HomePhone", "FoodHistory2", "nvarchar", 20, 40),
+        new(2, "PatientAddress", "FoodHistory2", "ntext", null, 16),
+        new(2, "BuyLastTenDays", "FoodHistory3", "ntext", null, 16),
+    ];
+
+    // FoodHistory's three Legal Values fields (testdata/sql/03_forms.sql) with their code tables as metaFields names
+    // them, the catalogue spelling of the text column, and the seeded texts (testdata/sql/04_code_tables.sql).
+    private static readonly SeededLegalValuesField[] SeededLegalValuesFields =
+    [
+        new("Sex", SexTable, SexColumn, SexColumn, ["F-Female", "M-Male", "U-Unknown"]),
+        new(
+            "EthnicityGroup",
+            "codephvs_ethnicitygroup_cdc",
+            "phvs_ethnicitygroup_cdc",
+            "phvs_ethnicitygroup_cdc",
+            ["2135:2-Hispanic or Latino", "2186:5-Not Hispanic or Latino"]),
+        new(
+            "LooseStoolsPerDay",
+            LooseStoolsTable,
+            LooseStoolsTextColumn,
+            "loosestoolsperday",
+            ["1-3 per day", "4-6 per day", "7-10 per day", "10+ per day"]),
+    ];
+
     private readonly ITestOutputHelper _output;
 
     public SqlMetadataReaderTests(ITestOutputHelper output)
@@ -424,6 +547,675 @@ public sealed class SqlMetadataReaderTests : IAsyncLifetime
         Assert.Empty(recorder.Commands);
     }
 
+    /// <summary>
+    /// The form list is <c>metaViews</c> with each view's <c>metaPages</c> count: exactly the seeded
+    /// <c>(1, CaseReport, 1)</c> and <c>(2, FoodHistory, 2)</c>, as a direct query also reads them.
+    /// </summary>
+    [Fact]
+    public async Task ListFormsAsync_ReturnsSeededFormsWithPageCounts()
+    {
+        using var cancellation = new CancellationTokenSource(TestTimeout);
+        CancellationToken token = cancellation.Token;
+        var recorder = new SqlCommandRecorder();
+        SqlMetadataReader reader = CreateReader(recorder);
+        await using SqlConnection verification = await TestDatabase.OpenConnectionAsync(token);
+
+        IReadOnlyList<FormSummary> stored = await QueryRowsAsync(
+            verification,
+            """
+            SELECT v.[ViewId], v.[Name], (SELECT COUNT(*) FROM [metaPages] AS p WHERE p.[ViewId] = v.[ViewId])
+            FROM [metaViews] AS v;
+            """,
+            row => new FormSummary(Int(row, 0), row.GetString(1), Int(row, 2)),
+            token);
+
+        IReadOnlyList<FormSummary> forms = await reader.ListFormsAsync(token);
+
+        FormSummary[] seeded = [new FormSummary(1, "CaseReport", 1), new FormSummary(2, "FoodHistory", 2)];
+        Assert.Equal(seeded, forms.OrderBy(form => form.ViewId));
+        Assert.Equal(stored.OrderBy(form => form.ViewId), forms.OrderBy(form => form.ViewId));
+        AssertSelectOnly(recorder);
+    }
+
+    /// <summary>
+    /// The base table is the view's one <c>metaFields.DataTableName</c>, read by legacy's own query, and each page
+    /// table is that name followed by the page id, as legacy <c>Page.TableName</c> builds it; every one of them is a
+    /// table of the catalogue under exactly that spelling (A16).
+    /// </summary>
+    [Theory]
+    [InlineData(1, "CaseReport")]
+    [InlineData(2, "FoodHistory")]
+    public async Task GetFormMetadataAsync_ReadsTableNamesFromMetadata(int viewId, string name)
+    {
+        using var cancellation = new CancellationTokenSource(TestTimeout);
+        CancellationToken token = cancellation.Token;
+        var recorder = new SqlCommandRecorder();
+        SqlMetadataReader reader = CreateReader(recorder);
+        await using SqlConnection verification = await TestDatabase.OpenConnectionAsync(token);
+
+        // Legacy MetadataDbProvider.GetDataTableName (Epi.Core/Data/Services/MetadataDbProvider.cs:2165-2192).
+        string legacyBaseTable = Assert.Single(await QueryRowsAsync(
+            verification,
+            "select distinct [DataTableName] from [metaFields] where [ViewId] = @viewId and [DataTableName] is not null;",
+            row => row.GetString(0),
+            token,
+            ViewIdParameter(viewId)));
+        IReadOnlyList<PageMetadata> storedPages = await QueryRowsAsync(
+            verification,
+            "SELECT [PageId], [Name], [Position] FROM [metaPages] WHERE [ViewId] = @viewId ORDER BY [Position], [PageId];",
+            row => new PageMetadata(
+                Int(row, 0),
+                row.GetString(1),
+                Int(row, 2),
+                legacyBaseTable + Int(row, 0).ToString(CultureInfo.InvariantCulture)),
+            token,
+            ViewIdParameter(viewId));
+
+        FormMetadata? form = await reader.GetFormMetadataAsync(viewId, token);
+
+        Assert.NotNull(form);
+        Assert.Equal(viewId, form.ViewId);
+        Assert.Equal(name, form.Name);
+        Assert.Equal(name, legacyBaseTable);
+        Assert.Equal(legacyBaseTable, form.BaseTableName);
+        Assert.True(
+            await TableExistsAsync(verification, form.BaseTableName, token),
+            $"Base table {form.BaseTableName} is not in sys.tables under that spelling.");
+
+        PageMetadata[] pages = [.. form.Pages.OrderBy(page => page.Position).ThenBy(page => page.PageId)];
+        Assert.Equal(SeededForms[viewId].Pages, pages);
+        Assert.Equal(storedPages, pages);
+        foreach (PageMetadata page in pages)
+        {
+            Assert.Equal(form.BaseTableName + page.PageId.ToString(CultureInfo.InvariantCulture), page.TableName);
+            Assert.True(
+                await TableExistsAsync(verification, page.TableName, token),
+                $"Page table {page.TableName} is not in sys.tables under that spelling.");
+        }
+
+        AssertSelectOnly(recorder);
+    }
+
+    /// <summary>
+    /// On a connection the caller owns, the reader builds the form's catalogue schema: the base table with its
+    /// <c>RecStatus</c>, <c>UniqueKey</c> and <c>GlobalRecordId</c> columns spelled and typed as the catalogue holds
+    /// them, and one table per page with the seeded number of data columns (A16).
+    /// </summary>
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    public async Task ReadFormAsync_BuildsSchemaFromCatalogue(int viewId)
+    {
+        using var cancellation = new CancellationTokenSource(TestTimeout);
+        CancellationToken token = cancellation.Token;
+        var recorder = new SqlCommandRecorder();
+        SqlMetadataReader reader = CreateReader(recorder);
+        await using SqlConnection connection = await TestDatabase.OpenConnectionAsync(token);
+        SeededForm seeded = SeededForms[viewId];
+
+        (FormMetadata Form, FormSchema Schema)? read =
+            await reader.ReadFormAsync(connection, transaction: null, viewId, token);
+        FormMetadata? viaPort = await reader.GetFormMetadataAsync(viewId, token);
+
+        Assert.True(read.HasValue, $"ReadFormAsync returned null for seeded view {viewId}.");
+        (FormMetadata form, FormSchema schema) = read.Value;
+        Assert.Equal(viewId, schema.ViewId);
+        Assert.Equal(form.BaseTableName, schema.BaseTable.Name);
+
+        IReadOnlyList<CatalogueColumn> baseColumns = await CatalogueColumnsAsync(connection, form.BaseTableName, token);
+        Assert.Equal("smallint", Assert.Single(baseColumns, column => column.Name == "RecStatus").TypeName);
+        Assert.Equal("int", Assert.Single(baseColumns, column => column.Name == "UniqueKey").TypeName);
+        Assert.NotNull(schema.RecStatus);
+        Assert.Equal("RecStatus", schema.RecStatus.Name);
+        Assert.Equal("smallint", schema.RecStatus.SqlTypeName, ignoreCase: true);
+        Assert.NotNull(schema.UniqueKey);
+        Assert.Equal("UniqueKey", schema.UniqueKey.Name);
+        Assert.Equal("int", schema.UniqueKey.SqlTypeName, ignoreCase: true);
+        Assert.NotNull(schema.GlobalRecordId);
+        Assert.Equal("GlobalRecordId", schema.GlobalRecordId.Name);
+
+        Assert.Equal(form.Pages.Select(page => page.PageId), schema.Pages.Select(page => page.Page.PageId));
+        foreach (PageTableSchema page in schema.Pages)
+        {
+            Assert.NotNull(page.Table);
+            Assert.Equal(page.Page.TableName, page.Table.Name);
+            IReadOnlyList<CatalogueColumn> catalogue = await CatalogueColumnsAsync(connection, page.Table.Name, token);
+            int dataColumns = page.Table.Columns.Count(column => !IsGlobalRecordId(column.Name));
+            Assert.Equal(seeded.DataColumnsPerTable[page.Table.Name], dataColumns);
+            Assert.Equal(catalogue.Count(column => !IsGlobalRecordId(column.Name)), dataColumns);
+        }
+
+        Assert.NotNull(viaPort);
+        Assert.Equal(form.ViewId, viaPort.ViewId);
+        Assert.Equal(form.BaseTableName, viaPort.BaseTableName);
+        Assert.Equal(form.Pages.Select(page => page.PageId), viaPort.Pages.Select(page => page.PageId));
+        Assert.Equal(form.Fields.Count, viaPort.Fields.Count);
+        AssertSelectOnly(recorder);
+    }
+
+    /// <summary>
+    /// The form's fields are every <c>metaFields</c> row of the view: 61 on <c>CaseReport</c>'s page, 55 and 33 on
+    /// <c>FoodHistory</c>'s, plus the three system rows with no page, 64 and 91 in all (A12, C-7).
+    /// </summary>
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    public async Task Fields_ListEveryMetaFieldsRowWithPageBinding(int viewId)
+    {
+        using var cancellation = new CancellationTokenSource(TestTimeout);
+        CancellationToken token = cancellation.Token;
+        var recorder = new SqlCommandRecorder();
+        SqlMetadataReader reader = CreateReader(recorder);
+        await using SqlConnection verification = await TestDatabase.OpenConnectionAsync(token);
+        SeededForm seeded = SeededForms[viewId];
+
+        IReadOnlyList<(int? PageId, int Count)> stored = await QueryRowsAsync(
+            verification,
+            "SELECT [PageId], COUNT(*) FROM [metaFields] WHERE [ViewId] = @viewId GROUP BY [PageId];",
+            row => (row.IsDBNull(0) ? (int?)null : Int(row, 0), Int(row, 1)),
+            token,
+            ViewIdParameter(viewId));
+
+        FormMetadata? form = await reader.GetFormMetadataAsync(viewId, token);
+
+        Assert.NotNull(form);
+        Assert.Equal(seeded.FieldCount, form.Fields.Count);
+        Assert.Equal(stored.Sum(row => row.Count), form.Fields.Count);
+
+        (int PageId, int Count)[] perPage =
+        [
+            .. form.Fields
+                .Where(field => field.PageId is not null)
+                .GroupBy(field => field.PageId.GetValueOrDefault())
+                .Select(group => (group.Key, group.Count()))
+                .OrderBy(entry => entry.Key),
+        ];
+        Assert.Equal(seeded.FieldsPerPage.OrderBy(entry => entry.Key).Select(entry => (entry.Key, entry.Value)), perPage);
+        Assert.Equal(
+            stored.Where(row => row.PageId is not null)
+                .Select(row => (row.PageId.GetValueOrDefault(), row.Count))
+                .OrderBy(entry => entry.Item1),
+            perPage);
+        Assert.All(form.Fields.Where(field => field.PageId is not null), field =>
+            Assert.NotNull(form.FindPage(field.PageId.GetValueOrDefault())));
+
+        string[] systemRows = [.. form.Fields.Where(field => field.PageId is null).Select(field => field.Name)];
+        Assert.Equal(SystemFieldNames, systemRows.Order(StringComparer.Ordinal));
+        Assert.Equal(SystemFieldNames.Length, Assert.Single(stored, row => row.PageId is null).Count);
+        AssertSelectOnly(recorder);
+    }
+
+    /// <summary>
+    /// The C-7 reconciliation: the page-bound fields that own a column are exactly the page tables' data columns,
+    /// 43 and 74, and the form definition's data fields are 43 and 67, because the seven Yes/No fields on
+    /// <c>tinyint</c> columns are unsupported (C-2).
+    /// </summary>
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    public async Task PageTableDataColumns_ReconcileWithDtoDataFields(int viewId)
+    {
+        using var cancellation = new CancellationTokenSource(TestTimeout);
+        CancellationToken token = cancellation.Token;
+        var recorder = new SqlCommandRecorder();
+        SqlMetadataReader reader = CreateReader(recorder);
+        await using SqlConnection verification = await TestDatabase.OpenConnectionAsync(token);
+        SeededForm seeded = SeededForms[viewId];
+
+        FormMetadata? form = await reader.GetFormMetadataAsync(viewId, token);
+        Assert.NotNull(form);
+
+        var catalogueKeys = new List<string>();
+        foreach (PageMetadata page in form.Pages)
+        {
+            IReadOnlyList<CatalogueColumn> columns = await CatalogueColumnsAsync(verification, page.TableName, token);
+            catalogueKeys.AddRange(
+                columns.Where(column => !IsGlobalRecordId(column.Name)).Select(column => page.TableName + "." + column.Name));
+        }
+
+        Assert.Equal(seeded.DataColumnsPerTable.Values.Sum(), catalogueKeys.Count);
+
+        var columnFieldKeys = new List<string>();
+        var columnFieldNames = new List<string>();
+        foreach (FieldMetadata field in form.Fields)
+        {
+            if (field.PageId is int pageId && field.Column is { } column)
+            {
+                PageMetadata? page = form.FindPage(pageId);
+                Assert.NotNull(page);
+                Assert.Equal(field.Name, column.Name, ignoreCase: true);
+                columnFieldKeys.Add(page.TableName + "." + column.Name);
+                columnFieldNames.Add(field.Name);
+            }
+        }
+
+        Assert.Equal(
+            catalogueKeys.Order(StringComparer.OrdinalIgnoreCase),
+            columnFieldKeys.Order(StringComparer.OrdinalIgnoreCase),
+            StringComparer.OrdinalIgnoreCase);
+
+        DataFieldSet dataFields = FormDefinitionFactory.GetDataFields(form);
+        Assert.Equal(seeded.DataFieldCount, dataFields.Count);
+
+        string[] dropped =
+        [
+            .. columnFieldNames
+                .Except(dataFields.Select(field => field.Name), StringComparer.Ordinal)
+                .Order(StringComparer.Ordinal),
+        ];
+        string[] yesNo =
+        [
+            .. form.Fields
+                .Where(field => field.FieldTypeName == "Yes/No")
+                .Select(field => field.Name)
+                .Order(StringComparer.Ordinal),
+        ];
+        Assert.Equal(seeded.YesNoFields, dropped);
+        Assert.Equal(yesNo, dropped);
+
+        int pageBound = form.Fields.Count(field => field.PageId is not null);
+        _output.WriteLine(
+            $"{form.Name}: metaFields {form.Fields.Count} ({pageBound} page-bound, {form.Fields.Count - pageBound} " +
+            $"system); page-table data columns {catalogueKeys.Count}; DTO data fields {dataFields.Count}" +
+            (dropped.Length == 0 ? string.Empty : $" ({dropped.Length} Yes/No unsupported: {string.Join(", ", dropped)})"));
+        AssertSelectOnly(recorder);
+    }
+
+    /// <summary>
+    /// The page-bound fields per <c>metaFieldTypes</c> name match the seed on both forms, and each maps to the
+    /// fieldType decided for its name: Phone Number and Comment Legal are text, Yes/No and Command Button are
+    /// unsupported under their stored names, and every other field's column is in its type's admitted set (A8).
+    /// </summary>
+    [Fact]
+    public async Task FieldTypes_PerFormMatchSeed()
+    {
+        using var cancellation = new CancellationTokenSource(TestTimeout);
+        CancellationToken token = cancellation.Token;
+        var recorder = new SqlCommandRecorder();
+        SqlMetadataReader reader = CreateReader(recorder);
+        await using SqlConnection verification = await TestDatabase.OpenConnectionAsync(token);
+
+        var totals = new Dictionary<string, int>(StringComparer.Ordinal);
+        foreach (SeededForm seeded in SeededForms.Values)
+        {
+            IReadOnlyList<KeyValuePair<string, int>> stored = await QueryRowsAsync(
+                verification,
+                """
+                SELECT t.[Name], COUNT(*)
+                FROM [metaFields] AS f
+                INNER JOIN [metaFieldTypes] AS t ON t.[FieldTypeId] = f.[FieldTypeId]
+                WHERE f.[ViewId] = @viewId AND f.[PageId] IS NOT NULL
+                GROUP BY t.[Name];
+                """,
+                row => KeyValuePair.Create(row.GetString(0), Int(row, 1)),
+                token,
+                ViewIdParameter(seeded.ViewId));
+
+            FormMetadata? form = await reader.GetFormMetadataAsync(seeded.ViewId, token);
+            Assert.NotNull(form);
+            FieldMetadata[] pageBound = [.. form.Fields.Where(field => field.PageId is not null)];
+
+            string[] counts = DescribeCounts(pageBound.CountBy(field => field.FieldTypeName));
+            Assert.Equal(DescribeCounts(seeded.FieldTypeCounts), counts);
+            Assert.Equal(DescribeCounts(stored), counts);
+
+            // One line per field, so a failure names the field whose mapping differs.
+            string[] expectedMappings =
+            [
+                .. pageBound.Select(field => DescribeMapping(
+                    field,
+                    SeededTypeMapping[field.FieldTypeName],
+                    SeededTypeMapping[field.FieldTypeName] == FieldType.Unsupported ? field.FieldTypeName : null)),
+            ];
+            string[] mappings =
+            [
+                .. pageBound.Select(field =>
+                {
+                    (FieldType fieldType, bool unsupported, string? unsupportedType) = FieldTypeMapper.Map(field);
+                    Assert.Equal(fieldType == FieldType.Unsupported, unsupported);
+                    return DescribeMapping(field, fieldType, unsupportedType);
+                }),
+            ];
+            Assert.Equal(expectedMappings, mappings);
+
+            foreach (IGrouping<string, FieldMetadata> type in pageBound.GroupBy(field => field.FieldTypeName))
+            {
+                totals[type.Key] = totals.GetValueOrDefault(type.Key) + type.Count();
+                (FieldType fieldType, bool unsupported, _) = FieldTypeMapper.Map(type.First());
+                string[] columnTypes =
+                [
+                    .. type.Select(field => field.Column)
+                        .OfType<ColumnMetadata>()
+                        .Select(DescribeColumnType)
+                        .Distinct(StringComparer.Ordinal)
+                        .Order(StringComparer.Ordinal),
+                ];
+                _output.WriteLine(
+                    $"{form.Name} | {type.Key} | {type.Count()} | {WireName(fieldType)}" +
+                    (unsupported ? $" ({type.Key})" : string.Empty) +
+                    $" | {(columnTypes.Length == 0 ? "no column" : string.Join(", ", columnTypes))}");
+            }
+        }
+
+        Assert.Equal(4, totals["Phone Number"]);
+        Assert.Equal(18, totals["Comment Legal"]);
+        Assert.Equal(7, totals["Yes/No"]);
+        Assert.Equal(1, totals["Command Button"]);
+        AssertSelectOnly(recorder);
+    }
+
+    /// <summary>
+    /// No row of either form, system rows included, is an Option, Image, Mirror, Grid, Relate, ForeignKey or GUID
+    /// field, and none is encrypted (A7). With no ForeignKey field the base insert never names <c>FKEY</c>, which
+    /// both base tables hold and leave <c>NULL</c> (A15).
+    /// </summary>
+    [Fact]
+    public async Task SeededForms_HaveNoRelateOptionGridImageMirrorGuidForeignKeyOrEncryptedFields()
+    {
+        using var cancellation = new CancellationTokenSource(TestTimeout);
+        CancellationToken token = cancellation.Token;
+        var recorder = new SqlCommandRecorder();
+        SqlMetadataReader reader = CreateReader(recorder);
+        await using SqlConnection verification = await TestDatabase.OpenConnectionAsync(token);
+
+        // The ids stand for the names the seed gives them.
+        IReadOnlyList<KeyValuePair<int, string>> fieldTypes = await QueryRowsAsync(
+            verification,
+            "SELECT [FieldTypeId], [Name] FROM [metaFieldTypes];",
+            row => KeyValuePair.Create(Int(row, 0), row.GetString(1)),
+            token);
+        Assert.All(AbsentFieldTypes, absent => Assert.Contains(absent, fieldTypes));
+
+        foreach (SeededForm seeded in SeededForms.Values)
+        {
+            IReadOnlyList<(int FieldTypeId, string FieldTypeName, bool IsEncrypted)> stored = await QueryRowsAsync(
+                verification,
+                """
+                SELECT f.[FieldTypeId], t.[Name], f.[IsEncrypted]
+                FROM [metaFields] AS f
+                INNER JOIN [metaFieldTypes] AS t ON t.[FieldTypeId] = f.[FieldTypeId]
+                WHERE f.[ViewId] = @viewId;
+                """,
+                row => (Int(row, 0), row.GetString(1), !row.IsDBNull(2) && row.GetBoolean(2)),
+                token,
+                ViewIdParameter(seeded.ViewId));
+            Assert.Equal(seeded.FieldCount, stored.Count);
+            Assert.DoesNotContain(stored, row => AbsentFieldTypes.ContainsKey(row.FieldTypeId));
+            Assert.DoesNotContain(
+                stored,
+                row => AbsentFieldTypes.Values.Contains(row.FieldTypeName, StringComparer.Ordinal));
+            Assert.DoesNotContain(stored, row => row.IsEncrypted);
+
+            FormMetadata? form = await reader.GetFormMetadataAsync(seeded.ViewId, token);
+            Assert.NotNull(form);
+            Assert.Equal(seeded.FieldCount, form.Fields.Count);
+            Assert.DoesNotContain(form.Fields, field => AbsentFieldTypes.ContainsKey(field.FieldTypeId));
+            Assert.DoesNotContain(
+                form.Fields,
+                field => AbsentFieldTypes.Values.Contains(field.FieldTypeName, StringComparer.Ordinal));
+            Assert.DoesNotContain(form.Fields, field => field.IsEncrypted);
+
+            IReadOnlyList<CatalogueColumn> baseColumns =
+                await CatalogueColumnsAsync(verification, form.BaseTableName, token);
+            CatalogueColumn foreignKey = Assert.Single(baseColumns, column => column.Name == "FKEY");
+
+            _output.WriteLine(
+                $"{form.Name}: no {string.Join(", ", AbsentFieldTypes.Values)} field and no encrypted field among " +
+                $"{form.Fields.Count} metaFields rows; no ForeignKey field, so the base insert never names FKEY; " +
+                $"{form.BaseTableName}.FKEY exists ({foreignKey.TypeName}, {foreignKey.MaxLengthBytes} bytes).");
+        }
+
+        AssertSelectOnly(recorder);
+    }
+
+    /// <summary>
+    /// The seeded base and page tables use only the types the admitted families cover, and every column the reader
+    /// returns, as a schema column or as a field's column, carries the catalogue's name, type and length with the
+    /// family <see cref="FieldTypeMapper.ClassifyColumn"/> gives that type (A17).
+    /// </summary>
+    [Fact]
+    public async Task ColumnFamilies_MatchCatalogue()
+    {
+        using var cancellation = new CancellationTokenSource(TestTimeout);
+        CancellationToken token = cancellation.Token;
+        var recorder = new SqlCommandRecorder();
+        SqlMetadataReader reader = CreateReader(recorder);
+        await using SqlConnection connection = await TestDatabase.OpenConnectionAsync(token);
+
+        var catalogueTypes = new HashSet<string>(StringComparer.Ordinal);
+        foreach (SeededForm seeded in SeededForms.Values)
+        {
+            (FormMetadata Form, FormSchema Schema)? read =
+                await reader.ReadFormAsync(connection, transaction: null, seeded.ViewId, token);
+            Assert.True(read.HasValue, $"ReadFormAsync returned null for seeded view {seeded.ViewId}.");
+            (FormMetadata form, FormSchema schema) = read.Value;
+
+            var catalogue = new Dictionary<string, IReadOnlyList<CatalogueColumn>>(StringComparer.Ordinal);
+            TableSchema[] tables =
+                [schema.BaseTable, .. schema.Pages.Select(page => page.Table).OfType<TableSchema>()];
+            Assert.Equal(seeded.Pages.Length + 1, tables.Length);
+            foreach (TableSchema table in tables)
+            {
+                IReadOnlyList<CatalogueColumn> columns = await CatalogueColumnsAsync(connection, table.Name, token);
+                catalogue.Add(table.Name, columns);
+                catalogueTypes.UnionWith(columns.Select(column => column.TypeName));
+
+                Assert.Equal(columns.Select(column => column.Name), table.Columns.Select(column => column.Name));
+                foreach ((CatalogueColumn expected, ColumnSchema column) in columns.Zip(table.Columns))
+                {
+                    Assert.Equal(expected.TypeName, column.SqlTypeName, ignoreCase: true);
+                    Assert.Equal(expected.MaxLengthBytes, column.MaxLengthBytes);
+                    AssertColumnMatches(expected, column.Metadata);
+                }
+
+                _output.WriteLine(
+                    $"{table.Name}: " + string.Join(
+                        ", ",
+                        table.Columns
+                            .GroupBy(column => (Type: DescribeColumnType(column.Metadata), column.Metadata.Family))
+                            .Select(group => $"{group.Key.Type} [{group.Key.Family}] {group.Count()}")));
+            }
+
+            foreach (FieldMetadata field in form.Fields)
+            {
+                if (field.Column is not { } column)
+                {
+                    continue;
+                }
+
+                PageMetadata? page = field.PageId is int pageId ? form.FindPage(pageId) : null;
+                Assert.NotNull(page);
+                AssertColumnMatches(Assert.Single(catalogue[page.TableName], entry => entry.Name == column.Name), column);
+            }
+
+            foreach (string name in seeded.YesNoFields)
+            {
+                FieldMetadata yesNo = Assert.Single(form.Fields, field => field.Name == name);
+                Assert.Equal("Yes/No", yesNo.FieldTypeName);
+                Assert.NotNull(yesNo.Column);
+                Assert.Equal("tinyint", yesNo.Column.SqlTypeName);
+                Assert.Equal(ColumnFamily.Integer, yesNo.Column.Family);
+            }
+
+            foreach (CharacterColumn expected in SeededCharacterColumns.Where(entry => entry.ViewId == seeded.ViewId))
+            {
+                FieldMetadata field = Assert.Single(form.Fields, candidate => candidate.Name == expected.Field);
+                Assert.NotNull(field.Column);
+                Assert.Equal(expected.TypeName, field.Column.SqlTypeName);
+                Assert.Equal(expected.MaxCharacters, field.Column.MaxCharacters);
+                Assert.Equal(ColumnFamily.Character, field.Column.Family);
+
+                TableSchema? table = tables.SingleOrDefault(candidate => candidate.Name == expected.Table);
+                Assert.NotNull(table);
+                ColumnSchema? stored = table.FindColumn(expected.Field);
+                Assert.NotNull(stored);
+                Assert.Equal(expected.MaxLengthBytes, stored.MaxLengthBytes);
+            }
+        }
+
+        Assert.Subset(new HashSet<string>(SeededColumnTypes, StringComparer.Ordinal), catalogueTypes);
+        _output.WriteLine("Column types in the seeded tables: " + string.Join(", ", catalogueTypes.Order(StringComparer.Ordinal)));
+        AssertSelectOnly(recorder);
+    }
+
+    /// <summary>
+    /// FoodHistory's three Legal Values fields name their code tables and text columns in <c>metaFields</c>, and the
+    /// single-field read gives each the rows of that column in the order SQL Server returns them to legacy's unsorted
+    /// query, each option's value and label the stored text (A9a). <c>CaseReport</c> has no Legal Values field; its
+    /// Comment Legal fields also name code tables but map to text, so they get no options.
+    /// </summary>
+    [Fact]
+    public async Task LegalValuesOptions_EqualCodeTableRows()
+    {
+        using var cancellation = new CancellationTokenSource(TestTimeout);
+        CancellationToken token = cancellation.Token;
+        var recorder = new SqlCommandRecorder();
+        SqlMetadataReader reader = CreateReader(recorder);
+        await using SqlConnection connection = await TestDatabase.OpenConnectionAsync(token);
+
+        FormMetadata? caseReport = await reader.GetFormMetadataAsync(1, token);
+        Assert.NotNull(caseReport);
+        Assert.DoesNotContain(caseReport.Fields, field => field.FieldTypeName == LegalValuesTypeName);
+
+        FormMetadata? foodHistory = await reader.GetFormMetadataAsync(2, token);
+        Assert.NotNull(foodHistory);
+        FieldMetadata[] legalValues =
+        [
+            .. foodHistory.Fields
+                .Where(field => field.FieldTypeName == LegalValuesTypeName)
+                .OrderBy(field => field.Name, StringComparer.Ordinal),
+        ];
+        IReadOnlyList<LegalValuesField> stored = await LegalValuesFieldsAsync(connection, foodHistory.ViewId, token);
+        Assert.Equal(
+            SeededLegalValuesFields.Select(field => field.Name).Order(StringComparer.Ordinal),
+            legalValues.Select(field => field.Name));
+        Assert.Equal(
+            stored.OrderBy(field => field.Name, StringComparer.Ordinal),
+            legalValues.Select(field => new LegalValuesField(
+                field.Name,
+                field.SourceTableName ?? string.Empty,
+                field.TextColumnName ?? string.Empty)));
+
+        foreach (FieldMetadata field in legalValues)
+        {
+            SeededLegalValuesField seeded = Assert.Single(SeededLegalValuesFields, entry => entry.Name == field.Name);
+            Assert.Equal(seeded.SourceTableName, field.SourceTableName);
+            Assert.Equal(seeded.TextColumnName, field.TextColumnName);
+            Assert.Equal(2, field.PageId);
+            Assert.False(field.Sort);
+
+            (string table, string column) = await ResolveCodeColumnAsync(
+                connection,
+                seeded.SourceTableName,
+                seeded.TextColumnName,
+                token);
+            Assert.Equal(seeded.CatalogueColumn, column);
+            IReadOnlyList<string?> rows = await ReadColumnAsync(connection, table, column, token);
+
+            IReadOnlyList<FieldOption> options =
+                await reader.ReadOptionsAsync(connection, transaction: null, field, token);
+
+            Assert.Equal(rows, options.Select(option => option.Label));
+            Assert.Equal(seeded.Texts.Order(StringComparer.Ordinal), options.Select(option => option.Label).Order(StringComparer.Ordinal));
+            Assert.All(options, option =>
+            {
+                Assert.Equal(FieldValueKind.Text, option.Value.Kind);
+                Assert.Equal(option.Label, option.Value.AsText());
+            });
+
+            _output.WriteLine(
+                $"{foodHistory.Name}.{field.Name} | {field.SourceTableName}.{field.TextColumnName} " +
+                $"(catalogue {table}.{column}) | Sort {field.Sort} | {options.Count} options: " +
+                string.Join("; ", options.Select(option => option.Label)));
+        }
+
+        AssertSelectOnly(recorder);
+    }
+
+    /// <summary>The check-code program is <c>metaViews.CheckCode</c> returned unchanged, for both seeded forms.</summary>
+    [Fact]
+    public async Task GetCheckCodeAsync_ReturnsStoredProgram()
+    {
+        using var cancellation = new CancellationTokenSource(TestTimeout);
+        CancellationToken token = cancellation.Token;
+        var recorder = new SqlCommandRecorder();
+        SqlMetadataReader reader = CreateReader(recorder);
+        await using SqlConnection verification = await TestDatabase.OpenConnectionAsync(token);
+
+        foreach (SeededForm seeded in SeededForms.Values)
+        {
+            string stored = Assert.Single(await QueryRowsAsync(
+                verification,
+                "SELECT [CheckCode] FROM [metaViews] WHERE [ViewId] = @viewId;",
+                row => row.IsDBNull(0) ? string.Empty : row.GetString(0),
+                token,
+                ViewIdParameter(seeded.ViewId)));
+            Assert.NotEmpty(stored);
+
+            string? program = await reader.GetCheckCodeAsync(seeded.ViewId, token);
+
+            Assert.Equal(stored, program);
+        }
+
+        string? caseReport = await reader.GetCheckCodeAsync(1, token);
+        Assert.NotNull(caseReport);
+        Assert.Contains("Field Sex", caseReport, StringComparison.Ordinal);
+        AssertSelectOnly(recorder);
+    }
+
+    /// <summary>
+    /// Each metadata read sends its own commands, so a second read of the same form sends them again, and every
+    /// command is a <c>SELECT</c> that succeeds.
+    /// </summary>
+    [Fact]
+    public async Task Reads_AreUncachedAndSelectOnly()
+    {
+        using var cancellation = new CancellationTokenSource(TestTimeout);
+        CancellationToken token = cancellation.Token;
+        var recorder = new SqlCommandRecorder();
+        SqlMetadataReader reader = CreateReader(recorder);
+
+        recorder.Clear();
+        Assert.NotNull(await reader.GetFormMetadataAsync(2, token));
+        int first = recorder.Commands.Count;
+        Assert.True(first > 0, "The first metadata read sent no command.");
+
+        Assert.NotNull(await reader.GetFormMetadataAsync(2, token));
+
+        Assert.True(
+            recorder.Commands.Count >= 2 * first,
+            $"The second read sent {recorder.Commands.Count - first} commands; the first sent {first}.");
+        Assert.Empty(recorder.Failed());
+        AssertSelectOnly(recorder);
+    }
+
+    /// <summary>A view id absent from <c>metaViews</c> reads as no form, through the port and on a caller's connection.</summary>
+    [Fact]
+    public async Task UnknownView_ReturnsNull()
+    {
+        const int unknownViewId = 999;
+        using var cancellation = new CancellationTokenSource(TestTimeout);
+        CancellationToken token = cancellation.Token;
+        var recorder = new SqlCommandRecorder();
+        SqlMetadataReader reader = CreateReader(recorder);
+        await using SqlConnection connection = await TestDatabase.OpenConnectionAsync(token);
+
+        Assert.Empty(await QueryRowsAsync(
+            connection,
+            "SELECT [ViewId] FROM [metaViews] WHERE [ViewId] = @viewId;",
+            row => Int(row, 0),
+            token,
+            ViewIdParameter(unknownViewId)));
+
+        FormMetadata? form = await reader.GetFormMetadataAsync(unknownViewId, token);
+        (FormMetadata Form, FormSchema Schema)? read =
+            await reader.ReadFormAsync(connection, transaction: null, unknownViewId, token);
+
+        Assert.Null(form);
+        Assert.False(read.HasValue);
+        AssertSelectOnly(recorder);
+    }
+
     private static SqlMetadataReader CreateReader(SqlCommandRecorder recorder)
     {
         var options = new DatabaseOptions(TestDatabase.ConnectionString);
@@ -574,7 +1366,144 @@ public sealed class SqlMetadataReaderTests : IAsyncLifetime
         return count;
     }
 
+    // Every command the reader sent was a SELECT, and it sent at least one.
+    private static void AssertSelectOnly(SqlCommandRecorder recorder)
+    {
+        Assert.Empty(recorder.Writes());
+        Assert.NotEmpty(recorder.Commands);
+        Assert.All(recorder.Commands, command => Assert.False(command.IsWrite));
+    }
+
+    // A direct verification query on the test's own connection, outside the reader and its observer. Every value is
+    // a parameter.
+    private static async Task<IReadOnlyList<T>> QueryRowsAsync<T>(
+        SqlConnection connection,
+        string text,
+        Func<SqlDataReader, T> map,
+        CancellationToken token,
+        params SqlParameter[] parameters)
+    {
+        await using var command = new SqlCommand(text, connection);
+        command.Parameters.AddRange(parameters);
+
+        var rows = new List<T>();
+        await using SqlDataReader reader = await command.ExecuteReaderAsync(token);
+        while (await reader.ReadAsync(token))
+        {
+            rows.Add(map(reader));
+        }
+
+        return rows;
+    }
+
+    private static SqlParameter ViewIdParameter(int viewId) => new("@viewId", SqlDbType.Int) { Value = viewId };
+
+    // Integer columns are read whatever their integer type (metaPages.Position is smallint, COUNT(*) is int).
+    private static int Int(SqlDataReader row, int ordinal) =>
+        Convert.ToInt32(row.GetValue(ordinal), CultureInfo.InvariantCulture);
+
+    // Whether dbo holds a user table spelled exactly so.
+    private static async Task<bool> TableExistsAsync(SqlConnection connection, string table, CancellationToken token)
+    {
+        IReadOnlyList<int> matches = await QueryRowsAsync(
+            connection,
+            """
+            SELECT t.[object_id]
+            FROM sys.tables AS t
+            WHERE t.[name] COLLATE Latin1_General_100_BIN2 = @name AND t.[schema_id] = SCHEMA_ID(N'dbo');
+            """,
+            row => row.GetInt32(0),
+            token,
+            new SqlParameter("@name", SqlDbType.NVarChar, 128) { Value = table });
+        return matches.Count == 1;
+    }
+
+    // The catalogue columns of the dbo table spelled exactly so, in column_id order, with their sys.types name joined
+    // on user_type_id and their raw max_length.
+    private static Task<IReadOnlyList<CatalogueColumn>> CatalogueColumnsAsync(
+        SqlConnection connection,
+        string table,
+        CancellationToken token) =>
+        QueryRowsAsync(
+            connection,
+            """
+            SELECT c.[name], ty.[name], c.[max_length]
+            FROM sys.tables AS t
+            INNER JOIN sys.columns AS c ON c.[object_id] = t.[object_id]
+            INNER JOIN sys.types AS ty ON ty.[user_type_id] = c.[user_type_id]
+            WHERE t.[name] COLLATE Latin1_General_100_BIN2 = @name AND t.[schema_id] = SCHEMA_ID(N'dbo')
+            ORDER BY c.[column_id];
+            """,
+            row => new CatalogueColumn(row.GetString(0), row.GetString(1), Int(row, 2)),
+            token,
+            new SqlParameter("@name", SqlDbType.NVarChar, 128) { Value = table });
+
+    private static bool IsGlobalRecordId(string column) =>
+        string.Equals(column, "GlobalRecordId", StringComparison.OrdinalIgnoreCase);
+
+    // A column the reader returned agrees with its catalogue row: the exact name, the type, the length in UTF-16 code
+    // units for nvarchar(n) and nchar(n) (max_length / 2, none for max and ntext), and the family of that type.
+    private static void AssertColumnMatches(CatalogueColumn expected, ColumnMetadata column)
+    {
+        Assert.Equal(expected.Name, column.Name);
+        Assert.Equal(expected.TypeName, column.SqlTypeName, ignoreCase: true);
+        int? maxCharacters = expected.TypeName is "nvarchar" or "nchar" && expected.MaxLengthBytes > 0
+            ? expected.MaxLengthBytes / 2
+            : null;
+        Assert.Equal(maxCharacters, column.MaxCharacters);
+        Assert.Equal(FieldTypeMapper.ClassifyColumn(column.SqlTypeName), column.Family);
+    }
+
+    private static string[] DescribeCounts(IEnumerable<KeyValuePair<string, int>> counts) =>
+        [.. counts.Select(entry => $"{entry.Key}: {entry.Value}").Order(StringComparer.Ordinal)];
+
+    private static string DescribeMapping(FieldMetadata field, FieldType fieldType, string? unsupportedType) =>
+        $"{field.Name} ({field.FieldTypeName}) -> {WireName(fieldType)} {unsupportedType ?? "-"}";
+
+    // The column type as the parity notes write it, for example nvarchar(255), nvarchar(max) or ntext.
+    private static string DescribeColumnType(ColumnMetadata column) => column switch
+    {
+        { MaxCharacters: int length } => $"{column.SqlTypeName}({length})",
+        { SqlTypeName: "nvarchar" or "nchar" } => $"{column.SqlTypeName}(max)",
+        _ => column.SqlTypeName,
+    };
+
+    // The camelCase spelling the API gives a field type.
+    private static string WireName(FieldType fieldType)
+    {
+        string name = fieldType.ToString();
+        return char.ToLowerInvariant(name[0]) + name[1..];
+    }
+
     private sealed record LegalValuesField(string Name, string SourceTableName, string TextColumnName);
+
+    private sealed record SeededForm(
+        int ViewId,
+        string Name,
+        PageMetadata[] Pages,
+        int FieldCount,
+        IReadOnlyDictionary<int, int> FieldsPerPage,
+        IReadOnlyDictionary<string, int> DataColumnsPerTable,
+        int DataFieldCount,
+        IReadOnlyDictionary<string, int> FieldTypeCounts,
+        string[] YesNoFields);
+
+    private sealed record CatalogueColumn(string Name, string TypeName, int MaxLengthBytes);
+
+    private sealed record CharacterColumn(
+        int ViewId,
+        string Field,
+        string Table,
+        string TypeName,
+        int? MaxCharacters,
+        int MaxLengthBytes);
+
+    private sealed record SeededLegalValuesField(
+        string Name,
+        string SourceTableName,
+        string TextColumnName,
+        string CatalogueColumn,
+        string[] Texts);
 }
 
 /// <summary>
