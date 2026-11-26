@@ -1,10 +1,10 @@
 using System.Collections.ObjectModel;
 using System.Globalization;
 using System.Net;
+using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
 using EpiInfo.Api.Contracts;
-using EpiInfo.Api.Endpoints;
 using EpiInfo.Api.Errors;
 using EpiInfo.Api.Json;
 using EpiInfo.Api.Services;
@@ -16,41 +16,60 @@ using EpiInfo.Domain.Metadata;
 using EpiInfo.Domain.Storage;
 using EpiInfo.Domain.Validation;
 using EpiInfo.Domain.Values;
-using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Http.HttpResults;
-using Microsoft.AspNetCore.TestHost;
-using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace EpiInfo.Api.Tests.CheckCode;
 
 /// <summary>
-/// The field-event route, <c>POST /api/forms/{viewId}/checkcode/field-event</c>: which <c>values</c> it rejects
-/// before evaluation and how each rejection is keyed, and that values breaking the write rules but carrying their
-/// wire type are evaluated as sent.
+/// The field-event route, <c>POST /api/forms/{viewId}/checkcode/field-event</c>, over HTTP: the 400, 404, 413 and 415
+/// answers issued before evaluation and how each 400 is keyed, the exact empty envelope of an event that selects no
+/// block, values breaking the write rules but carrying their wire type evaluated as sent, and the effects and
+/// diagnostics of a block that runs.
 /// </summary>
 /// <remarks>
 /// <para>
 /// A field event checks only what evaluation needs: the event spelling, a field name on a page, and that every
 /// <c>values</c> entry names a data field once and carries that field's wire type. Each request is sent as raw JSON
-/// text, so case variants, repeats, <c>1e400</c> and escaped lone surrogates reach the API exactly as written. Every
-/// rejection must be a 400 <c>application/problem+json</c> body keyed by the canonical <c>metaFields.Name</c>, by
-/// <see cref="RecordValidator.ValuesKey"/>, or by the <c>event</c> or <c>fieldName</c> member, carrying no submitted
-/// text, and issued before the program is read: the store is never asked for the check code, the engine never runs
-/// and nothing is written.
+/// text, so missing members, numbers, case variants, repeats, <c>1e400</c> and escaped lone surrogates reach the API
+/// exactly as written. Every rejection must be a ProblemDetails body carrying no submitted text, a 400 keyed by the
+/// canonical <c>metaFields.Name</c>, by <see cref="RecordValidator.ValuesKey"/>, or by the <c>event</c> or
+/// <c>fieldName</c> member, issued before the program is read: the store is never asked for the check code, the
+/// engine never runs and nothing is written. An accepted event runs the engine exactly once and writes nothing.
 /// </para>
 /// <para>
-/// The forms are <see cref="FakeForms"/> fixtures in a <see cref="FakeDataStore"/>, extended with synthetic fields
-/// where no fixture has the type or rule a case needs, so the class needs no database and carries no
-/// <c>Integration</c> trait.
+/// Every request crosses the API's own pipeline, <c>Program.cs</c> on TestServer through <see cref="ApiFactory"/>,
+/// body-limit and media-type guards included. The forms are <see cref="FakeForms"/> fixtures in a
+/// <see cref="FakeDataStore"/>, extended with synthetic fields where no fixture has the type or rule a case needs, so
+/// the class needs no database and carries no <c>Integration</c> trait.
 /// </para>
 /// </remarks>
 public sealed class FieldEventEndpointTests
 {
     private const string Sentinel = "SENTINEL-PII-4711";
+
+    // The committed Kestrel:Limits:MaxRequestBodySize, which RequestBodyLimitMiddleware applies on TestServer.
+    private const int RequestBodyLimit = 1_048_576;
+
+    // FieldEventResponse.Empty on the wire: every list empty, diagnostics included.
+    private const string EmptyEnvelope =
+        """{"enabled":[],"disabled":[],"cleared":[],"assigned":{},"dialogs":[],"diagnostics":[]}""";
+
+    // The one field of NoBlockProgram that has a block, and that block's only event is After.
+    private const string BlockFieldName = "Age";
+
+    // A valid program on the fields of FakeForms.WithCheckCode whose only block is After on Age: an event on another
+    // field, or Before or Click on Age, selects no block. It holds only supported constructs naming fields of the form,
+    // so it parses without a diagnostic and an event selecting no block gives the empty envelope, diagnostics included.
+    private const string NoBlockProgram = """
+        Field Age
+            After
+                CLEAR LastName
+            End-After
+        End-Field
+        """;
 
     private const string OptionFieldName = "Colour";
 
@@ -251,6 +270,176 @@ public sealed class FieldEventEndpointTests
     };
 
     /// <summary>
+    /// <c>event</c> members that name no event, as raw JSON, or <see langword="null"/> to leave the member out: other
+    /// spellings of <c>FieldAfter</c>, the empty string, a number, a boolean and the JSON literal <c>null</c>.
+    /// </summary>
+    public static TheoryData<string?> InvalidEventMembers => new()
+    {
+        "\"fieldAfter\"",
+        "\"After\"",
+        "\"FIELDAFTER\"",
+        "\"field-after\"",
+        "\"\"",
+        "1",
+        "true",
+        "null",
+        null,
+    };
+
+    /// <summary>
+    /// <c>fieldName</c> members that name no field on a page of the form, as raw JSON, or <see langword="null"/> to
+    /// leave the member out: a name the form has no row for, a system row, blank text, a number and the JSON literal
+    /// <c>null</c>.
+    /// </summary>
+    public static TheoryData<string?> InvalidFieldNameMembers => new()
+    {
+        "\"NoSuchField\"",
+        "\"UniqueKey\"",
+        "\"\"",
+        "\"   \"",
+        "5",
+        "null",
+        null,
+    };
+
+    /// <summary>
+    /// Paths of a form the store does not hold, with the <c>detail</c> of each 404: a view id outside the fixtures'
+    /// 9001 to 9004, and a non-integer view id, which the route's <c>int</c> constraint turns into a route miss.
+    /// </summary>
+    public static TheoryData<string, string> UnknownFormPaths => new()
+    {
+        { "/api/forms/424242/checkcode/field-event", ApiProblems.FormNotFoundDetail },
+        { "/api/forms/abc/checkcode/field-event", ApiProblems.ResourceNotFoundDetail },
+    };
+
+    /// <summary>
+    /// Events of <see cref="NoBlockProgram"/> that select no block, as (event, field name, <c>values</c> JSON): After
+    /// on a field without a block, with values of each wire type and with the read-only <c>OnsetWeek</c>, which a field
+    /// event accepts although a save refuses it; and Before and Click on <see cref="BlockFieldName"/>, whose only
+    /// block is After.
+    /// </summary>
+    public static TheoryData<string, string, string> NoMatchingBlockEvents => new()
+    {
+        { "FieldAfter", "LastName", """{"LastName":"Smith","DOB":"2011-01-15","Age":37,"Asian":true}""" },
+        { "FieldAfter", "DOB", """{"OnsetWeek":3,"DOB":null}""" },
+        { "FieldBefore", BlockFieldName, "{}" },
+        { "FieldClick", BlockFieldName, """{"Asian":false}""" },
+    };
+
+    /// <summary>
+    /// An <c>event</c> other than exactly <c>FieldBefore</c>, <c>FieldAfter</c> or <c>FieldClick</c>, or none, is a
+    /// field-level 400 under <c>errors["event"]</c> alone, and the event is not evaluated.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(InvalidEventMembers))]
+    public async Task EventOtherThanTheThreeExactSpellingsIsRejectedUnderEvent(string? eventMember)
+    {
+        await using var host = EndpointHost.ForProgram(NoBlockProgram);
+
+        var problem = await SendRejectedEventAsync(host, RequestJson(eventMember, "\"LastName\"", "{}"));
+
+        Assert.Equal(ApiProblems.ValidationFailedDetail, problem.GetProperty("detail").GetString());
+        AssertErrors(problem, [FieldEventService.EventKey], [FieldEventService.InvalidEventMessage]);
+    }
+
+    /// <summary>
+    /// A <c>fieldName</c> that names no field on a page of the form, or none, is a field-level 400 under
+    /// <c>errors["fieldName"]</c> alone, and the event is not evaluated.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(InvalidFieldNameMembers))]
+    public async Task FieldNameOfNoFieldOnAPageIsRejectedUnderFieldName(string? fieldNameMember)
+    {
+        await using var host = EndpointHost.ForProgram(NoBlockProgram);
+
+        var problem = await SendRejectedEventAsync(host, RequestJson("\"FieldAfter\"", fieldNameMember, "{}"));
+
+        Assert.Equal(ApiProblems.ValidationFailedDetail, problem.GetProperty("detail").GetString());
+        AssertErrors(problem, [FieldEventService.FieldNameKey], [FieldEventService.InvalidFieldNameMessage]);
+    }
+
+    /// <summary>
+    /// A valid event posted to a form the store does not hold is the 404 ProblemDetails, and nothing is evaluated.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(UnknownFormPaths))]
+    public async Task UnknownFormIsA404Problem(string path, string expectedDetail)
+    {
+        await using var host = EndpointHost.ForProgram(NoBlockProgram);
+        using var content = JsonBody(RequestJson("\"FieldAfter\"", "\"LastName\"", "{}"));
+
+        using var response = await host.Client.PostAsync(path, content, host.Timeout);
+
+        var problem = await ReadUnevaluatedProblemAsync(host, response, HttpStatusCode.NotFound);
+        Assert.Equal(expectedDetail, problem.GetProperty("detail").GetString());
+    }
+
+    /// <summary>
+    /// A valid JSON body one byte over the 1,048,576-byte limit, declared by <c>Content-Length</c>, is the 413
+    /// ProblemDetails, and nothing is evaluated.
+    /// </summary>
+    [Fact]
+    public async Task BodyOneByteOverTheLimitIsA413Problem()
+    {
+        await using var host = EndpointHost.ForProgram(NoBlockProgram);
+
+        // A valid event padded inside its LastName value, so only the size can reject it.
+        const string Prefix = "{\"event\":\"FieldAfter\",\"fieldName\":\"LastName\",\"values\":{\"LastName\":\"";
+        const string Suffix = "\"}}";
+        var padding = RequestBodyLimit + 1 - Encoding.UTF8.GetByteCount(Prefix + Suffix);
+        var body = Encoding.UTF8.GetBytes(Prefix + new string('x', padding) + Suffix);
+        Assert.Equal(RequestBodyLimit + 1, body.Length);
+        JsonDocument.Parse(body).Dispose();
+
+        using var content = new ByteArrayContent(body);
+        content.Headers.ContentType = new MediaTypeHeaderValue(ApiTestClient.JsonMediaType);
+        content.Headers.ContentLength = body.Length;
+        using var response = await host.Client.PostAsync(EventPath(FakeForms.CheckCodeViewId), content, host.Timeout);
+
+        var problem = await ReadUnevaluatedProblemAsync(host, response, HttpStatusCode.RequestEntityTooLarge);
+        Assert.Equal(ApiProblems.RequestTooLargeDetail, problem.GetProperty("detail").GetString());
+    }
+
+    /// <summary>
+    /// A valid JSON body sent as <c>text/plain</c> is the 415 ProblemDetails, and nothing is evaluated.
+    /// </summary>
+    [Fact]
+    public async Task TextPlainBodyIsA415Problem()
+    {
+        await using var host = EndpointHost.ForProgram(NoBlockProgram);
+        using var content = new StringContent(
+            RequestJson("\"FieldAfter\"", "\"LastName\"", "{}"),
+            Encoding.UTF8,
+            "text/plain");
+
+        using var response = await host.Client.PostAsync(EventPath(FakeForms.CheckCodeViewId), content, host.Timeout);
+
+        var problem = await ReadUnevaluatedProblemAsync(host, response, HttpStatusCode.UnsupportedMediaType);
+        Assert.Equal(ApiProblems.UnsupportedMediaTypeDetail, problem.GetProperty("detail").GetString());
+    }
+
+    /// <summary>
+    /// An event that selects no block is evaluated once and answers 200 with exactly the empty envelope, diagnostics
+    /// included, whatever wire-typed values it carries, a read-only field's included.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(NoMatchingBlockEvents))]
+    public async Task EventSelectingNoBlockGivesTheExactEmptyEnvelope(
+        string eventName,
+        string fieldName,
+        string valuesJson)
+    {
+        await using var host = EndpointHost.ForProgram(NoBlockProgram);
+
+        var body = await SendAcceptedEventAsync(
+            host,
+            FakeForms.CheckCodeViewId,
+            RequestJson(JsonSerializer.Serialize(eventName), JsonSerializer.Serialize(fieldName), valuesJson));
+
+        AssertJsonEqual(EmptyEnvelope, body);
+    }
+
+    /// <summary>
     /// A value without its field's wire type, a repeated field or a name that is not a data field is one error under
     /// the canonical name or the fixed values key, and the event is not evaluated.
     /// </summary>
@@ -261,7 +450,7 @@ public sealed class FieldEventEndpointTests
         string expectedKey,
         string expectedMessage)
     {
-        await using var host = await EndpointHost.StartAsync(new FakeDataStore(FormWithOptionField()));
+        await using var host = EndpointHost.Start(new FakeDataStore(FormWithOptionField()));
 
         var problem = await SendRejectedEventAsync(
             host,
@@ -284,7 +473,7 @@ public sealed class FieldEventEndpointTests
         string[] expectedKeys,
         string[] expectedMessages)
     {
-        await using var host = await EndpointHost.StartAsync(new FakeDataStore(FormWithOptionField()));
+        await using var host = EndpointHost.Start(new FakeDataStore(FormWithOptionField()));
 
         var problem = await SendRejectedEventAsync(
             host,
@@ -302,7 +491,7 @@ public sealed class FieldEventEndpointTests
     [MemberData(nameof(UndecodableValuesCases))]
     public async Task UndecodableNameOrStringIsRequestLevelMalformedJson(string valuesJson)
     {
-        await using var host = await EndpointHost.StartAsync(new FakeDataStore(FormWithOptionField()));
+        await using var host = EndpointHost.Start(new FakeDataStore(FormWithOptionField()));
 
         var problem = await SendRejectedEventAsync(
             host,
@@ -325,7 +514,7 @@ public sealed class FieldEventEndpointTests
         string[] expectedKeys,
         string[] expectedMessages)
     {
-        await using var host = await EndpointHost.StartAsync(new FakeDataStore(FormWithOptionField()));
+        await using var host = EndpointHost.Start(new FakeDataStore(FormWithOptionField()));
 
         var problem = await SendRejectedEventAsync(host, requestJson);
 
@@ -341,7 +530,7 @@ public sealed class FieldEventEndpointTests
     public async Task CaseVariantsWithTheirWireTypesAreEvaluatedUnderCanonicalNames()
     {
         var store = new FakeDataStore(FormWithOptionField());
-        await using var host = await EndpointHost.StartAsync(store);
+        await using var host = EndpointHost.Start(store);
 
         var body = await SendAcceptedEventAsync(
             host,
@@ -371,7 +560,7 @@ public sealed class FieldEventEndpointTests
     public async Task HistoricallyInvalidValuesWithTheirWireTypesReachEvaluation()
     {
         var store = new FakeDataStore(FormWithHistoricRules());
-        await using var host = await EndpointHost.StartAsync(store);
+        await using var host = EndpointHost.Start(store);
         var values = $$"""
             {"Age":150,"Sex":"X-Other","{{PhoneFieldName}}":"(555) 0148-6367","{{ReadOnlyFieldName}}":"RO-7",
             "{{ZipFieldName}}":"303330"}
@@ -420,6 +609,219 @@ public sealed class FieldEventEndpointTests
         Assert.Equal(1, host.Engine.RunCalls);
         Assert.Empty(store.WriteCalls);
     }
+
+    // P1 effect and diagnostic cases (AAP 0.3.5, 0.7.2)
+
+    // Each effect statement once, on the fields of FakeForms.WithCheckCode: ENABLE the date DOB, DISABLE the checkbox
+    // Asian, CLEAR the read-only number OnsetWeek, ASSIGN the text LastName, and a dialog with and without TITLETEXT.
+    private const string BasicEffectsProgram = """
+        Field Age
+            After
+                ENABLE DOB
+                DISABLE Asian
+                CLEAR OnsetWeek
+                ASSIGN LastName = "assigned-text"
+                DIALOG "Check the value" TITLETEXT = "Notice"
+                DIALOG "No title"
+            End-After
+        End-Field
+        """;
+
+    // LastName enters enabled before DOB, leaves it for disabled and comes back: the later statement decides that it
+    // is enabled, and its first entry decides that it is listed first.
+    private const string EnablementOrderProgram = """
+        Field Age
+            After
+                ENABLE LastName
+                ENABLE DOB
+                DISABLE LastName
+                ENABLE LastName
+            End-After
+        End-Field
+        """;
+
+    // Age is assigned before LastName, cleared and assigned again: the last ASSIGN gives the value and keeps it out of
+    // cleared, and its first assignment keeps it the first key of assigned.
+    private const string AssignmentOrderProgram = """
+        Field Age
+            After
+                ASSIGN Age = 1
+                ASSIGN LastName = "second"
+                CLEAR Age
+                ASSIGN Age = 3
+            End-After
+        End-Field
+        """;
+
+    // An unsupported command on line 3 followed by a supported statement.
+    private const string UnsupportedCommandProgram = """
+        Field Age
+            After
+                GOTO DOB
+                ASSIGN LastName = "after-goto"
+            End-After
+        End-Field
+        """;
+
+    // EPIWEEK of the date DOB, sent empty, fails at run time on line 4, after line 3 has enabled LastName.
+    private const string RuntimeErrorProgram = """
+        Field Age
+            After
+                ENABLE LastName
+                ASSIGN OnsetWeek = EPIWEEK(DOB)
+            End-After
+        End-Field
+        """;
+
+    /// <summary>
+    /// Programs whose After block on <c>Age</c> runs without a diagnostic, as (program, the expected response, the
+    /// expected key order of <c>assigned</c>).
+    /// </summary>
+    public static TheoryData<string, string, string[]> EffectCases => new()
+    {
+        {
+            BasicEffectsProgram,
+            """
+            {
+              "enabled": ["DOB"], "disabled": ["Asian"], "cleared": ["OnsetWeek"],
+              "assigned": {"LastName": "assigned-text"},
+              "dialogs": [{"message": "Check the value", "title": "Notice"}, {"message": "No title", "title": null}],
+              "diagnostics": []
+            }
+            """,
+            ["LastName"]
+        },
+        {
+            EnablementOrderProgram,
+            """
+            {
+              "enabled": ["LastName", "DOB"], "disabled": [], "cleared": [], "assigned": {}, "dialogs": [],
+              "diagnostics": []
+            }
+            """,
+            []
+        },
+        {
+            AssignmentOrderProgram,
+            """
+            {
+              "enabled": [], "disabled": [], "cleared": [], "assigned": {"Age": 3, "LastName": "second"}, "dialogs": [],
+              "diagnostics": []
+            }
+            """,
+            ["Age", "LastName"]
+        },
+    };
+
+    /// <summary>
+    /// The effects of the matching block come back as data in the response lists, in the engine's order: dialogs in
+    /// execution order, each list by the first time its field entered it, membership by the last statement, and the
+    /// keys of <c>assigned</c> by first assignment. Nothing is written.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(EffectCases))]
+    public async Task EffectsOfTheMatchingBlockAreReturnedAsData(
+        string program,
+        string expectedResponse,
+        string[] expectedAssignedKeys)
+    {
+        await using var host = EndpointHost.ForProgram(program);
+
+        var body = await SendAcceptedEventAsync(
+            host,
+            FakeForms.CheckCodeViewId,
+            """{"event":"FieldAfter","fieldName":"Age","values":{"Age":37,"LastName":"Smith","OnsetWeek":12}}""");
+
+        AssertJsonEqual(expectedResponse, body);
+        Assert.Equal(
+            expectedAssignedKeys,
+            body.GetProperty("assigned").EnumerateObject().Select(entry => entry.Name));
+    }
+
+    /// <summary>
+    /// An unsupported command is a <c>warning</c> diagnostic naming the form, its line and the command, it is logged
+    /// without any field value, and the statement after it still runs.
+    /// </summary>
+    [Fact]
+    public async Task UnsupportedCommandIsALoggedWarningAndTheNextStatementStillRuns()
+    {
+        var form = FakeForms.WithCheckCode(UnsupportedCommandProgram);
+        await using var host = EndpointHost.Start(new FakeDataStore(form));
+
+        var body = await SendAcceptedEventAsync(
+            host,
+            FakeForms.CheckCodeViewId,
+            """{"event":"FieldAfter","fieldName":"Age","values":{"Age":37,"LastName":"Smith"}}""");
+
+        AssertDiagnostic(
+            Assert.Single(body.GetProperty("diagnostics").EnumerateArray()),
+            "warning",
+            form.Metadata.Name,
+            line: 3,
+            command: "GOTO");
+        Assert.Equal("after-goto", body.GetProperty("assigned").GetProperty("LastName").GetString());
+        AssertDiagnosticLogged(host, LogLevel.Warning, form.Metadata.Name, line: 3, command: "GOTO");
+        Assert.False(host.Logs.ContainsText("after-goto"), "A log entry carries an assigned field value.");
+        Assert.False(host.Logs.ContainsText("Smith"), "A log entry carries a submitted field value.");
+    }
+
+    /// <summary>
+    /// A runtime error is an <c>error</c> diagnostic at the failing statement in a 200 response: the effects of the
+    /// statements before it are kept and the failed assignment is absent.
+    /// </summary>
+    [Fact]
+    public async Task RuntimeErrorIsAnErrorDiagnosticAndEarlierEffectsAreKept()
+    {
+        var form = FakeForms.WithCheckCode(RuntimeErrorProgram);
+        await using var host = EndpointHost.Start(new FakeDataStore(form));
+
+        var body = await SendAcceptedEventAsync(
+            host,
+            FakeForms.CheckCodeViewId,
+            """{"event":"FieldAfter","fieldName":"Age","values":{"Age":37,"DOB":null,"OnsetWeek":12}}""");
+
+        AssertDiagnostic(
+            Assert.Single(body.GetProperty("diagnostics").EnumerateArray()),
+            "error",
+            form.Metadata.Name,
+            line: 4,
+            command: "ASSIGN");
+        Assert.Equal(
+            new string?[] { "LastName" },
+            body.GetProperty("enabled").EnumerateArray().Select(name => name.GetString()));
+        Assert.Empty(body.GetProperty("assigned").EnumerateObject());
+        Assert.Empty(body.GetProperty("disabled").EnumerateArray());
+        Assert.Empty(body.GetProperty("cleared").EnumerateArray());
+        Assert.Empty(body.GetProperty("dialogs").EnumerateArray());
+        AssertDiagnosticLogged(host, LogLevel.Warning, form.Metadata.Name, line: 4, command: "ASSIGN");
+    }
+
+    // Asserts one diagnostic of the response: its severity, form, 1-based line and command, and a message.
+    private static void AssertDiagnostic(JsonElement diagnostic, string severity, string form, int line, string command)
+    {
+        Assert.Equal(severity, diagnostic.GetProperty("severity").GetString());
+        Assert.Equal(form, diagnostic.GetProperty("form").GetString());
+        Assert.Equal(line, diagnostic.GetProperty("line").GetInt32());
+        Assert.Equal(command, diagnostic.GetProperty("command").GetString());
+        Assert.False(
+            string.IsNullOrWhiteSpace(diagnostic.GetProperty("message").GetString()),
+            "A diagnostic carries a message.");
+    }
+
+    // Asserts that the field-event service logged the diagnostic exactly once, at level, by its form, line and command.
+    private static void AssertDiagnosticLogged(EndpointHost host, LogLevel level, string form, int line, string command)
+    {
+        var entry = Assert.Single(host.Logs.Find(
+            candidate => candidate.Category == typeof(FieldEventService).FullName
+                && HasStateValue(candidate, "Form", form)
+                && HasStateValue(candidate, "Line", line)
+                && HasStateValue(candidate, "Command", command)));
+        Assert.Equal(level, entry.Level);
+    }
+
+    private static bool HasStateValue(CapturedLogEntry entry, string key, object expected) =>
+        entry.State.Any(pair => string.Equals(pair.Key, key, StringComparison.Ordinal) && Equals(pair.Value, expected));
+
 
     // FakeForms.WithCheckCode carrying TypedValuesProgram, with the Option field Colour (items Red, Green, Blue on a
     // smallint column) added to its page, since no fixture has an Option field.
@@ -499,11 +901,22 @@ public sealed class FieldEventEndpointTests
     private static async Task<JsonElement> SendRejectedEventAsync(EndpointHost host, string requestJson)
     {
         using var response = await PostEventAsync(host, FakeForms.CheckCodeViewId, requestJson);
+        return await ReadUnevaluatedProblemAsync(host, response, HttpStatusCode.BadRequest);
+    }
+
+    // Asserts the contract every answer issued before evaluation shares: the expected status as an
+    // application/problem+json ProblemDetails with a traceId and no submitted text, the program never read, the engine
+    // never run and nothing written. Returns the body.
+    private static async Task<JsonElement> ReadUnevaluatedProblemAsync(
+        EndpointHost host,
+        HttpResponseMessage response,
+        HttpStatusCode expected)
+    {
         var text = await response.Content.ReadAsStringAsync(host.Timeout);
 
         Assert.True(
-            response.StatusCode == HttpStatusCode.BadRequest,
-            $"{requestJson} returned {(int)response.StatusCode}: {text}");
+            response.StatusCode == expected,
+            $"Expected {(int)expected}, got {(int)response.StatusCode}: {text}");
         Assert.Equal(ApiProblems.ProblemContentType, response.Content.Headers.ContentType?.MediaType);
         Assert.DoesNotContain(Sentinel, text, StringComparison.Ordinal);
 
@@ -512,11 +925,11 @@ public sealed class FieldEventEndpointTests
         Assert.Empty(host.Store.WriteCalls);
 
         using var document = JsonDocument.Parse(text);
-        return ApiTestClient.AssertProblemDetails(document.RootElement.Clone(), StatusCodes.Status400BadRequest);
+        return ApiTestClient.AssertProblemDetails(document.RootElement.Clone(), (int)expected);
     }
 
-    // Posts requestJson to the field-event route of viewId and asserts a 200 from exactly one evaluation of the
-    // program the store was asked for, with nothing written. Returns the field-event response body.
+    // Posts requestJson to the field-event route of viewId and asserts a 200 application/json response from exactly one
+    // evaluation of the program the store was asked for, with nothing written. Returns the field-event response body.
     private static async Task<JsonElement> SendAcceptedEventAsync(EndpointHost host, int viewId, string requestJson)
     {
         using var response = await PostEventAsync(host, viewId, requestJson);
@@ -525,6 +938,7 @@ public sealed class FieldEventEndpointTests
         Assert.True(
             response.StatusCode == HttpStatusCode.OK,
             $"{requestJson} returned {(int)response.StatusCode}: {text}");
+        Assert.Equal(ApiTestClient.JsonMediaType, response.Content.Headers.ContentType?.MediaType);
         Assert.Equal(1, host.Engine.RunCalls);
         Assert.Single(host.Store.Calls, call => call.Method == nameof(IDataStore.GetCheckCodeAsync));
         Assert.Empty(host.Store.WriteCalls);
@@ -535,8 +949,37 @@ public sealed class FieldEventEndpointTests
 
     private static async Task<HttpResponseMessage> PostEventAsync(EndpointHost host, int viewId, string requestJson)
     {
-        using var content = new StringContent(requestJson, Encoding.UTF8, ApiTestClient.JsonMediaType);
-        return await host.Client.PostAsync($"/api/forms/{viewId}/checkcode/field-event", content, host.Timeout);
+        using var content = JsonBody(requestJson);
+        return await host.Client.PostAsync(EventPath(viewId), content, host.Timeout);
+    }
+
+    private static string EventPath(int viewId) =>
+        string.Create(CultureInfo.InvariantCulture, $"/api/forms/{viewId}/checkcode/field-event");
+
+    // The raw JSON text as an application/json; charset=utf-8 body, sent exactly as written.
+    private static StringContent JsonBody(string rawJson) =>
+        new(rawJson, Encoding.UTF8, ApiTestClient.JsonMediaType);
+
+    // A field-event body from raw JSON member values; a null member is left out of the object altogether.
+    private static string RequestJson(string? eventMember, string? fieldNameMember, string? valuesMember)
+    {
+        var members = new List<string>(3);
+        if (eventMember is not null)
+        {
+            members.Add("\"event\":" + eventMember);
+        }
+
+        if (fieldNameMember is not null)
+        {
+            members.Add("\"fieldName\":" + fieldNameMember);
+        }
+
+        if (valuesMember is not null)
+        {
+            members.Add("\"values\":" + valuesMember);
+        }
+
+        return "{" + string.Join(",", members) + "}";
     }
 
     // Asserts that actual is the JSON value expected describes: the same members with equal values, arrays in order.
@@ -574,32 +1017,34 @@ public sealed class FieldEventEndpointTests
     }
 
     /// <summary>
-    /// An in-process TestServer host over the real field-event and record endpoints and the services behind them, with
-    /// the API's JSON settings, <see cref="FakeDataStore"/> as the store and the real check-code engine behind a
-    /// <see cref="CountingCheckCodeEngine"/>. The test server replaces Kestrel, so nothing binds a port, and logging
-    /// has no provider.
+    /// One test's API host: <c>Program.cs</c> on TestServer through <see cref="ApiFactory"/>, over a
+    /// <see cref="FakeDataStore"/>, with the factory's <see cref="CountingCheckCodeEngine"/> around the real check-code
+    /// engine and its <see cref="CapturingLoggerProvider"/>. Every request crosses the production pipeline, its guards
+    /// included; nothing binds a port and nothing connects to SQL Server.
     /// </summary>
     private sealed class EndpointHost : IAsyncDisposable
     {
         private static readonly TimeSpan RequestTimeout = TimeSpan.FromSeconds(30);
 
-        private readonly WebApplication _app;
+        private readonly ApiFactory _factory;
 
         private readonly CancellationTokenSource _timeout = new(RequestTimeout);
 
-        private EndpointHost(WebApplication app, FakeDataStore store, CountingCheckCodeEngine engine)
+        private EndpointHost(ApiFactory factory, FakeDataStore store)
         {
-            _app = app;
+            _factory = factory;
             Store = store;
-            Engine = engine;
-            Client = app.GetTestClient();
+            Client = factory.CreateClient();
         }
 
         /// <summary>The store the host reads and writes.</summary>
         public FakeDataStore Store { get; }
 
         /// <summary>The check-code engine the host uses, counting its calls.</summary>
-        public CountingCheckCodeEngine Engine { get; }
+        public CountingCheckCodeEngine Engine => _factory.Engine;
+
+        /// <summary>Every log entry the committed logging filters let through.</summary>
+        public CapturingLoggerProvider Logs => _factory.Logs;
 
         /// <summary>A client whose requests go straight to the test server.</summary>
         public HttpClient Client { get; }
@@ -607,40 +1052,35 @@ public sealed class FieldEventEndpointTests
         /// <summary>Cancels a request or read that has not finished within the host's time limit.</summary>
         public CancellationToken Timeout => _timeout.Token;
 
-        /// <summary>Builds and starts a host over <paramref name="store"/>.</summary>
+        /// <summary>Starts a host over <paramref name="store"/>.</summary>
         /// <param name="store">The in-memory store the endpoints use.</param>
         /// <returns>The started host; the caller disposes it.</returns>
-        public static async Task<EndpointHost> StartAsync(FakeDataStore store)
+        public static EndpointHost Start(FakeDataStore store)
         {
-            var builder = WebApplication.CreateSlimBuilder(
-                new WebApplicationOptions { EnvironmentName = Environments.Production });
-            builder.WebHost.UseTestServer();
-            builder.Logging.ClearProviders();
-
-            var engine = new CountingCheckCodeEngine(new CheckCodeEngine());
-            builder.Services.AddApiJson();
-            builder.Services.AddSingleton<IDataStore>(store);
-            builder.Services.AddSingleton<ICheckCodeEngine>(engine);
-            builder.Services.AddSingleton<TimeProvider>(new ControlledTimeProvider());
-            builder.Services.AddSingleton<SaveStampProvider>();
-            builder.Services.AddScoped<FormService>();
-            builder.Services.AddScoped<RecordService>();
-            builder.Services.AddScoped<FieldEventService>();
-
-            var app = builder.Build();
-            app.MapCheckCodeEndpoints();
-            app.MapRecordEndpoints();
-
-            using var startTimeout = new CancellationTokenSource(RequestTimeout);
-            await app.StartAsync(startTimeout.Token);
-            return new EndpointHost(app, store, engine);
+            var factory = new ApiFactory(ApiFactoryOptions.ForFake(store));
+            try
+            {
+                return new EndpointHost(factory, store);
+            }
+            catch
+            {
+                factory.Dispose();
+                throw;
+            }
         }
+
+        /// <summary>Starts a host whose store holds <see cref="FakeForms.WithCheckCode(string)"/> with
+        /// <paramref name="program"/>.</summary>
+        /// <param name="program">The form's check-code program.</param>
+        /// <returns>The started host; the caller disposes it.</returns>
+        public static EndpointHost ForProgram(string program) =>
+            Start(new FakeDataStore(FakeForms.WithCheckCode(program)));
 
         /// <inheritdoc />
         public async ValueTask DisposeAsync()
         {
             Client.Dispose();
-            await _app.DisposeAsync();
+            await _factory.DisposeAsync();
             _timeout.Dispose();
         }
     }
