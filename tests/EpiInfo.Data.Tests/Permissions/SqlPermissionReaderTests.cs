@@ -14,7 +14,8 @@ namespace EpiInfo.Data.Tests.Permissions;
 /// Integration tests of <see cref="SqlPermissionReader"/> against the rehearsal database, as the seeded login. They
 /// only read: no lock is taken and nothing is written. No denied principal is created, because a new login or user
 /// would change the database, which the unchanged-database rule excludes; denial is covered with <c>FakeDataStore</c>
-/// in <c>PermissionTests</c>, and here a table missing from the catalogue stands in for a denied one.
+/// in <c>PermissionTests</c>, and here a table missing from the catalogue stands in for a denied one. The untested real
+/// denial is recorded as a gap in <c>docs/parity-notes.md</c>.
 /// </summary>
 [Trait("Category", "Integration")]
 [Collection(DatabaseCollections.Database)]
@@ -33,11 +34,19 @@ public sealed class SqlPermissionReaderTests : IAsyncLifetime
         { 2, "FoodHistory", ["FoodHistory", "FoodHistory2", "FoodHistory3"] },
     };
 
+    // xUnit builds a new instance for every test case, so each test gets its own 60-second budget for every
+    // connection, command and read it makes.
+    private readonly CancellationTokenSource timeout = new(TimeSpan.FromSeconds(60));
+
     /// <inheritdoc />
     public Task InitializeAsync() => TestDatabase.EnsureReachableAsync();
 
     /// <inheritdoc />
-    public Task DisposeAsync() => Task.CompletedTask;
+    public Task DisposeAsync()
+    {
+        timeout.Dispose();
+        return Task.CompletedTask;
+    }
 
     [Theory]
     [MemberData(nameof(SeededForms))]
@@ -46,10 +55,10 @@ public sealed class SqlPermissionReaderTests : IAsyncLifetime
         string formName,
         string[] expectedTables)
     {
-        FormMetadata form = await LoadFormAsync(viewId, formName, expectedTables);
+        FormMetadata form = await LoadFormAsync(viewId, formName, expectedTables, timeout.Token);
 
         FormPermissions? permissions = await CreateReader(NullSqlCommandObserver.Instance)
-            .GetPermissionsAsync(form, CancellationToken.None);
+            .GetPermissionsAsync(form, timeout.Token);
 
         Assert.NotNull(permissions);
         Assert.Equal(expectedTables, permissions.Tables.Select(table => table.TableName));
@@ -57,14 +66,21 @@ public sealed class SqlPermissionReaderTests : IAsyncLifetime
             expectedTables.Select(table => (table, table)).OrderBy(pair => pair.Item1, StringComparer.Ordinal),
             Pairs(permissions.ResolvedTableNames));
 
-        await using SqlConnection connection = await TestDatabase.OpenConnectionAsync();
+        await using SqlConnection connection = await TestDatabase.OpenConnectionAsync(timeout.Token);
         foreach (TablePermission table in permissions.Tables)
         {
-            (bool canInsert, bool canUpdate) = await HasPermsByNameAsync(connection, table.TableName);
+            (bool canInsert, bool canUpdate) = await HasPermsByNameAsync(connection, table.TableName, timeout.Token);
             Assert.True(table.CanInsert, table.TableName);
             Assert.True(table.CanUpdate, table.TableName);
             Assert.Equal(canInsert, table.CanInsert);
             Assert.Equal(canUpdate, table.CanUpdate);
+        }
+
+        foreach (string expected in expectedTables)
+        {
+            TablePermission? found = permissions.Find(expected);
+            Assert.True(found is not null, $"view {viewId}: Find({expected}) returned no entry");
+            Assert.Equal(expected, found.TableName);
         }
 
         Assert.True(permissions.CanInsert(form));
@@ -82,10 +98,10 @@ public sealed class SqlPermissionReaderTests : IAsyncLifetime
         string formName,
         string[] expectedTables)
     {
-        FormMetadata form = await LoadFormAsync(viewId, formName, expectedTables);
+        FormMetadata form = await LoadFormAsync(viewId, formName, expectedTables, timeout.Token);
         var recorder = new SqlCommandRecorder();
 
-        await CreateReader(recorder).GetPermissionsAsync(form, CancellationToken.None);
+        await CreateReader(recorder).GetPermissionsAsync(form, timeout.Token);
 
         IReadOnlyList<RecordedCommand> commands = recorder.Commands;
         Assert.True(commands.Count == 2, DescribeCommands(commands));
@@ -110,6 +126,7 @@ public sealed class SqlPermissionReaderTests : IAsyncLifetime
             JsonSerializer.Deserialize<string[]>(Assert.IsType<string>(names.Value))!.Order(StringComparer.Ordinal));
 
         RecordedCommand permission = commands[1];
+        Assert.StartsWith("SELECT", permission.CommandText.TrimStart(), StringComparison.OrdinalIgnoreCase);
         Assert.Contains(PermissionFunction, permission.CommandText, StringComparison.Ordinal);
         Assert.Equal(
             expectedTables.Select(table => "[" + table + "]").Order(StringComparer.Ordinal),
@@ -135,15 +152,20 @@ public sealed class SqlPermissionReaderTests : IAsyncLifetime
         string formName,
         string[] expectedTables)
     {
-        FormMetadata form = await LoadFormAsync(viewId, formName, expectedTables);
+        FormMetadata form = await LoadFormAsync(viewId, formName, expectedTables, timeout.Token);
         var recorder = new SqlCommandRecorder();
         SqlPermissionReader reader = CreateReader(recorder);
 
-        await reader.GetPermissionsAsync(form, CancellationToken.None);
+        FormPermissions? firstResult = await reader.GetPermissionsAsync(form, timeout.Token);
         IReadOnlyList<RecordedCommand> first = recorder.Commands;
         recorder.Clear();
-        await reader.GetPermissionsAsync(form, CancellationToken.None);
+        FormPermissions? secondResult = await reader.GetPermissionsAsync(form, timeout.Token);
         IReadOnlyList<RecordedCommand> second = recorder.Commands;
+
+        Assert.NotNull(firstResult);
+        Assert.NotNull(secondResult);
+        Assert.Equal(firstResult.Tables, secondResult.Tables);
+        Assert.Equal(Pairs(firstResult.ResolvedTableNames), Pairs(secondResult.ResolvedTableNames));
 
         Assert.True(first.Count == 2, DescribeCommands(first));
         Assert.True(second.Count == 2, DescribeCommands(second));
@@ -157,6 +179,46 @@ public sealed class SqlPermissionReaderTests : IAsyncLifetime
         }
     }
 
+    // IDataStore.GetPermissionsAsync is the seam RecordService and FormService call, so the store must hand back the
+    // reader's result unchanged, through the reader's own two read-only commands.
+    [Theory]
+    [MemberData(nameof(SeededForms))]
+    public async Task DataStore_ReportsTheReadersPermissions(int viewId, string formName, string[] expectedTables)
+    {
+        FormMetadata form = await LoadFormAsync(viewId, formName, expectedTables, timeout.Token);
+        FormPermissions? fromReader = await CreateReader(NullSqlCommandObserver.Instance)
+            .GetPermissionsAsync(form, timeout.Token);
+        var recorder = new SqlCommandRecorder();
+        var store = new SqlServerDataStore(new DatabaseOptions(TestDatabase.ConnectionString), recorder);
+
+        FormPermissions? fromStore = await store.GetPermissionsAsync(form, timeout.Token);
+
+        Assert.NotNull(fromReader);
+        Assert.NotNull(fromStore);
+        Assert.Equal(fromReader.Tables, fromStore.Tables);
+        Assert.Equal(Pairs(fromReader.ResolvedTableNames), Pairs(fromStore.ResolvedTableNames));
+        Assert.True(fromStore.CanInsert(form), $"view {viewId}: CanInsert");
+        Assert.True(fromStore.CanUpdate(form), $"view {viewId}: CanUpdate");
+        Assert.True(fromStore.CanDelete(form), $"view {viewId}: CanDelete");
+
+        IReadOnlyList<RecordedCommand> commands = recorder.Commands;
+        Assert.True(commands.Count == 2, DescribeCommands(commands));
+        Assert.All(commands, command =>
+        {
+            Assert.True(command.Completed, command.ToString());
+            Assert.True(command.Succeeded, command.ToString());
+            Assert.False(command.IsWrite, command.ToString());
+        });
+        RecordedCommand permission = Assert.Single(
+            commands,
+            command => command.CommandText.Contains(PermissionFunction, StringComparison.Ordinal));
+        Assert.Equal(
+            expectedTables.Select(table => "[" + table + "]").Order(StringComparer.Ordinal),
+            permission.Parameters
+                .Select(parameter => Assert.IsType<string>(parameter.Value))
+                .Order(StringComparer.Ordinal));
+    }
+
     [Theory]
     [MemberData(nameof(SeededForms))]
     public async Task MissingPageTable_GetsNoEntry_AndDeniesInsertAndUpdate(
@@ -164,9 +226,9 @@ public sealed class SqlPermissionReaderTests : IAsyncLifetime
         string formName,
         string[] expectedTables)
     {
-        FormMetadata seeded = await LoadFormAsync(viewId, formName, expectedTables);
+        FormMetadata seeded = await LoadFormAsync(viewId, formName, expectedTables, timeout.Token);
         string missingTable = seeded.BaseTableName + "99";
-        await AssertNotInCatalogueAsync(missingTable);
+        await AssertNotInCatalogueAsync(missingTable, timeout.Token);
         int lastPosition = seeded.Pages.Max(page => page.Position);
         FormMetadata form = seeded with
         {
@@ -174,7 +236,7 @@ public sealed class SqlPermissionReaderTests : IAsyncLifetime
         };
         var recorder = new SqlCommandRecorder();
 
-        FormPermissions? permissions = await CreateReader(recorder).GetPermissionsAsync(form, CancellationToken.None);
+        FormPermissions? permissions = await CreateReader(recorder).GetPermissionsAsync(form, timeout.Token);
 
         Assert.NotNull(permissions);
         Assert.Equal(expectedTables, permissions.Tables.Select(table => table.TableName));
@@ -193,13 +255,17 @@ public sealed class SqlPermissionReaderTests : IAsyncLifetime
     [Fact]
     public async Task MissingBaseTable_GetsNoEntry_AndDeniesEveryFormAction()
     {
-        FormMetadata seeded = await LoadFormAsync(2, "FoodHistory", ["FoodHistory", "FoodHistory2", "FoodHistory3"]);
+        FormMetadata seeded = await LoadFormAsync(
+            2,
+            "FoodHistory",
+            ["FoodHistory", "FoodHistory2", "FoodHistory3"],
+            timeout.Token);
         const string missingTable = "FoodHistoryMissing";
-        await AssertNotInCatalogueAsync(missingTable);
+        await AssertNotInCatalogueAsync(missingTable, timeout.Token);
         FormMetadata form = seeded with { BaseTableName = missingTable };
 
         FormPermissions? permissions = await CreateReader(NullSqlCommandObserver.Instance)
-            .GetPermissionsAsync(form, CancellationToken.None);
+            .GetPermissionsAsync(form, timeout.Token);
 
         Assert.NotNull(permissions);
         Assert.Equal(["FoodHistory2", "FoodHistory3"], permissions.Tables.Select(table => table.TableName));
@@ -213,11 +279,11 @@ public sealed class SqlPermissionReaderTests : IAsyncLifetime
     [Fact]
     public async Task NoTableInTheCatalogue_SendsNoPermissionStatement_AndDeniesEverything()
     {
-        FormMetadata seeded = await LoadFormAsync(1, "CaseReport", ["CaseReport", "CaseReport1"]);
+        FormMetadata seeded = await LoadFormAsync(1, "CaseReport", ["CaseReport", "CaseReport1"], timeout.Token);
         const string missingBase = "CaseReportMissing";
         const string missingPage = "CaseReportMissing1";
-        await AssertNotInCatalogueAsync(missingBase);
-        await AssertNotInCatalogueAsync(missingPage);
+        await AssertNotInCatalogueAsync(missingBase, timeout.Token);
+        await AssertNotInCatalogueAsync(missingPage, timeout.Token);
         FormMetadata form = seeded with
         {
             BaseTableName = missingBase,
@@ -225,7 +291,7 @@ public sealed class SqlPermissionReaderTests : IAsyncLifetime
         };
         var recorder = new SqlCommandRecorder();
 
-        FormPermissions? permissions = await CreateReader(recorder).GetPermissionsAsync(form, CancellationToken.None);
+        FormPermissions? permissions = await CreateReader(recorder).GetPermissionsAsync(form, timeout.Token);
 
         Assert.NotNull(permissions);
         Assert.Empty(permissions.Tables);
@@ -247,7 +313,7 @@ public sealed class SqlPermissionReaderTests : IAsyncLifetime
         string formName,
         string[] expectedTables)
     {
-        FormMetadata seeded = await LoadFormAsync(viewId, formName, expectedTables);
+        FormMetadata seeded = await LoadFormAsync(viewId, formName, expectedTables, timeout.Token);
         FormMetadata form = seeded with
         {
             BaseTableName = seeded.BaseTableName.ToUpperInvariant(),
@@ -255,7 +321,7 @@ public sealed class SqlPermissionReaderTests : IAsyncLifetime
         };
 
         FormPermissions? permissions = await CreateReader(NullSqlCommandObserver.Instance)
-            .GetPermissionsAsync(form, CancellationToken.None);
+            .GetPermissionsAsync(form, timeout.Token);
 
         Assert.NotNull(permissions);
         Assert.Equal(expectedTables, permissions.Tables.Select(table => table.TableName));
@@ -303,15 +369,19 @@ public sealed class SqlPermissionReaderTests : IAsyncLifetime
 
     // Loads the form as the store would for a request, through a metadata reader whose commands nobody records, after
     // confirming by SQL that the view id names the form; the metadata must name the expected tables.
-    private static async Task<FormMetadata> LoadFormAsync(int viewId, string formName, string[] expectedTables)
+    private static async Task<FormMetadata> LoadFormAsync(
+        int viewId,
+        string formName,
+        string[] expectedTables,
+        CancellationToken cancellationToken)
     {
-        await using (SqlConnection connection = await TestDatabase.OpenConnectionAsync())
+        await using (SqlConnection connection = await TestDatabase.OpenConnectionAsync(cancellationToken))
         {
             await using var command = new SqlCommand(
                 "SELECT [Name] FROM [metaViews] WHERE [ViewId] = @viewId;",
                 connection);
             command.Parameters.Add(new SqlParameter("@viewId", SqlDbType.Int) { Value = viewId });
-            Assert.Equal(formName, await command.ExecuteScalarAsync() as string);
+            Assert.Equal(formName, await command.ExecuteScalarAsync(cancellationToken) as string);
         }
 
         var options = new DatabaseOptions(TestDatabase.ConnectionString);
@@ -319,7 +389,7 @@ public sealed class SqlPermissionReaderTests : IAsyncLifetime
             new SqlConnectionFactory(options),
             options,
             NullSqlCommandObserver.Instance);
-        FormMetadata? form = await metadataReader.GetFormMetadataAsync(viewId, CancellationToken.None);
+        FormMetadata? form = await metadataReader.GetFormMetadataAsync(viewId, cancellationToken);
 
         Assert.NotNull(form);
         Assert.Equal(
@@ -331,7 +401,8 @@ public sealed class SqlPermissionReaderTests : IAsyncLifetime
     // An independent read of the same permissions, quoting the one-part name itself rather than through SqlIdentifier.
     private static async Task<(bool CanInsert, bool CanUpdate)> HasPermsByNameAsync(
         SqlConnection connection,
-        string tableName)
+        string tableName,
+        CancellationToken cancellationToken)
     {
         await using var command = new SqlCommand(
             "SELECT HAS_PERMS_BY_NAME(@securable, N'OBJECT', N'INSERT'), " +
@@ -342,21 +413,21 @@ public sealed class SqlPermissionReaderTests : IAsyncLifetime
             Value = "[" + tableName.Replace("]", "]]", StringComparison.Ordinal) + "]",
         });
 
-        await using SqlDataReader reader = await command.ExecuteReaderAsync();
-        Assert.True(await reader.ReadAsync());
+        await using SqlDataReader reader = await command.ExecuteReaderAsync(cancellationToken);
+        Assert.True(await reader.ReadAsync(cancellationToken));
         return (Grants(reader, 0), Grants(reader, 1));
 
         static bool Grants(SqlDataReader row, int ordinal) => !row.IsDBNull(ordinal) && row.GetInt32(ordinal) == 1;
     }
 
-    private static async Task AssertNotInCatalogueAsync(string tableName)
+    private static async Task AssertNotInCatalogueAsync(string tableName, CancellationToken cancellationToken)
     {
-        await using SqlConnection connection = await TestDatabase.OpenConnectionAsync();
+        await using SqlConnection connection = await TestDatabase.OpenConnectionAsync(cancellationToken);
         await using var command = new SqlCommand(
             "SELECT COUNT(*) FROM sys.tables WHERE [name] = @name;",
             connection);
         command.Parameters.Add(new SqlParameter("@name", SqlDbType.NVarChar, 128) { Value = tableName });
-        Assert.Equal(0, (int)(await command.ExecuteScalarAsync())!);
+        Assert.Equal(0, (int)(await command.ExecuteScalarAsync(cancellationToken))!);
     }
 
     private static string DescribeCommands(IReadOnlyList<RecordedCommand> commands) =>
