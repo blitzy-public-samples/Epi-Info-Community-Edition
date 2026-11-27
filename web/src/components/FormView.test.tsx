@@ -15,8 +15,9 @@
 //
 // The write cases drive the editor through FormView: a dirty draft is saved before a grid
 // open or Back to forms continues, and a failed save keeps the draft and cancels the move;
-// the first Save of a new record follows canInsert and Save of a stored record canUpdate,
-// and a 403 keeps the draft; the validation summary lists each errored field's prompt
+// a save that finds the record deleted (409) keeps it read-only and reloads the grid, and
+// Next then re-reads N and opens the record that followed it; the first Save of a new
+// record follows canInsert and Save of a stored record canUpdate, and a 403 keeps the draft; the validation summary lists each errored field's prompt
 // with its message, from client validation or a field-level 400; and the toolbar
 // announces Saving… while a save is under way, a leave's from the start of its field-event
 // drain, then Changes saved. until the next edit. The connection-banner cases answer their
@@ -2399,6 +2400,82 @@ describe('FormView leaving a dirty record', () => {
   );
 });
 
+describe('FormView a save that finds the record deleted (409)', () => {
+  const CONFLICT_PROBLEM: ProblemDetails = {
+    type: 'https://tools.ietf.org/html/rfc9110#section-15.5.10',
+    title: 'Conflict',
+    status: 409,
+    detail: 'The test server found this record deleted.',
+    traceId: '00-test-conflict-00',
+  };
+
+  it('keeps the record read-only and reloads the grid, then Next re-reads N and opens the record that followed it', async () => {
+    const definition = createFormDefinitionFixture();
+    // B as the server returns it once A is deleted: the only record of the active set.
+    const bAlone: RecordDto = { ...RECORD_B, position: 1, count: 1 };
+    let aDeleted = false;
+    await renderForm(definition, {
+      records: [RECORD_A, RECORD_B],
+      answerRead: (path) => {
+        if (!aDeleted) {
+          return undefined;
+        }
+        switch (path) {
+          case `${FORM_PATH}/records`: {
+            const page: RecordPage = {
+              items: [recordSummaryFixture(bAlone, definition)],
+              total: 1,
+              page: 1,
+              pageSize: 50,
+            };
+            return jsonResponse(200, page);
+          }
+          case `${FORM_PATH}/records/count`:
+            return jsonResponse(200, { count: 1 });
+          case `${FORM_PATH}/records/at/1`:
+            return jsonResponse(200, bAlone);
+          default:
+            return undefined;
+        }
+      },
+    });
+    edit(definition, 'LastName', EDITED_LAST_NAME);
+    // A is deleted elsewhere before the save reaches the server.
+    aDeleted = true;
+    replyToWrite({ kind: 'problem', problem: CONFLICT_PROBLEM });
+
+    fireEvent.click(formActionButton('Save'));
+
+    // The save's conflict banner stands in for the deleted status while it is shown.
+    await screen.findByText('This record has been deleted and is read-only. Your unsaved changes were not saved.');
+    // The grid reloads and no longer lists A, while A stays open at the n and N shown before.
+    await within(screen.getByRole('region', { name: 'Records' })).findByText('1 record');
+    await flush();
+    const put = present(writeCalls()[0], 'the PUT of A');
+    expect(requestLine(put)).toBe(`PUT ${FORM_PATH}/records/${RECORD_A.globalRecordId}`);
+    expect(navigatorStatus()).toBe('1 of 2');
+    expect(isDisabled(navigatorButton('Next'))).toBe(false);
+
+    fireEvent.click(navigatorButton('Next'));
+
+    await waitFor(() => {
+      expect(navigatorStatus()).toBe('1 of 1');
+      expect(controlValue(controlOf(definition, 'LastName'))).toBe(B_LAST_NAME);
+    });
+    await flush();
+    const navigationReads = calls
+      .slice(calls.indexOf(put))
+      .filter((call) => /\/records\/(count|at\/\d+)$/.test(call.url.pathname))
+      .map(requestLine);
+    expect(navigationReads).toEqual([
+      `GET ${FORM_PATH}/records/count?includeDeleted=false`,
+      `GET ${FORM_PATH}/records/at/1?includeDeleted=false`,
+    ]);
+    expect(writeCalls()).toEqual([put]);
+    expect(isDisabled(navigatorButton('Next'))).toBe(true);
+  });
+});
+
 describe('FormView validation summary', () => {
   it('lists each field of a field-level 400 under its prompt with the server message; the draft stays', async () => {
     const { definition } = await renderForm();
@@ -2577,6 +2654,214 @@ describe('FormView with no pages', () => {
     expect(screen.getByRole('toolbar', { name: 'Record navigation' })).toBeTruthy();
     expect(screen.getByRole('region', { name: 'Records' })).toBeTruthy();
   });
+});
+
+describe('FormView sticky header and page tabs', () => {
+  // jsdom lays nothing out and loads no style sheet, so these cases give the header, the tab
+  // strip, the panels and a control their boxes through getBoundingClientRect, and the styles
+  // FormView reads through getComputedStyle, and observe what FormView does with them: the
+  // sizes it publishes for styles.css, the scroll a focused control needs and the scroll a
+  // tab's selection requests. That the header and the strip stick is a browser check.
+  const HEADER_HEIGHT = 140;
+  const TABS_HEIGHT = 44;
+  const TABS_BOTTOM = HEADER_HEIGHT + TABS_HEIGHT;
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  /**
+   * Gives the workspace header, `headerHeight()` tall, and the tab strip their boxes; other
+   * elements keep jsdom's empty box.
+   */
+  function layOutStickyParts(headerHeight: () => number): void {
+    vi.spyOn(Element.prototype, 'getBoundingClientRect').mockImplementation(function (this: Element) {
+      if (this.classList.contains('form-view__header')) {
+        return new DOMRect(0, 0, 1000, headerHeight());
+      }
+      return this.getAttribute('role') === 'tablist' ? new DOMRect(0, HEADER_HEIGHT, 1000, TABS_HEIGHT) : new DOMRect();
+    });
+  }
+
+  /** A stand-in ResizeObserver that records what it observes and runs its callback on demand. */
+  class RecordingResizeObserver {
+    static readonly instances: RecordingResizeObserver[] = [];
+    readonly observed: Element[] = [];
+    disconnected = false;
+
+    constructor(private readonly callback: ResizeObserverCallback) {
+      RecordingResizeObserver.instances.push(this);
+    }
+
+    observe(target: Element): void {
+      this.observed.push(target);
+    }
+
+    unobserve(target: Element): void {
+      this.observed.splice(this.observed.indexOf(target), 1);
+    }
+
+    disconnect(): void {
+      this.disconnected = true;
+    }
+
+    /** Reports a resize, as the browser does after layout. */
+    resize(): void {
+      this.callback([], this);
+    }
+  }
+
+  it('holds the form actions and the record navigator in one header, ahead of the page tabs', async () => {
+    await renderForm();
+    const formActions = screen.getByRole('toolbar', { name: 'Form actions' });
+    const navigator = screen.getByRole('toolbar', { name: 'Record navigation' });
+    const tablist = screen.getByRole('tablist', { name: 'Pages' });
+
+    const header = present(formActions.parentElement, 'the container of the form actions');
+    expect(header.classList.contains('form-view__header')).toBe(true);
+    // The two toolbars, in reading order; the navigator's live announcement sits beside it.
+    const toolbars = Array.from(header.children).filter((child) => child.getAttribute('role') === 'toolbar');
+    expect(toolbars).toHaveLength(2);
+    expect(toolbars[0]).toBe(formActions);
+    expect(toolbars[1]).toBe(navigator);
+    // Notices, the validation summary and the tabs scroll with the page, below the header.
+    expect(header.contains(tablist)).toBe(false);
+    expect(header.compareDocumentPosition(tablist) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+  });
+
+  it('publishes the header and tab strip block sizes on the form view, again on each resize, and stops observing on unmount', async () => {
+    RecordingResizeObserver.instances.length = 0;
+    vi.stubGlobal('ResizeObserver', RecordingResizeObserver);
+    let headerHeight = HEADER_HEIGHT;
+    layOutStickyParts(() => headerHeight);
+    await renderForm();
+    const header = present(
+      screen.getByRole('toolbar', { name: 'Form actions' }).parentElement,
+      'the container of the form actions',
+    );
+    const formView = present(header.parentElement, 'the form view');
+    const publishedSize = (name: string): string => formView.style.getPropertyValue(name);
+
+    expect(publishedSize('--form-view-header-block-size')).toBe(`${HEADER_HEIGHT}px`);
+    expect(publishedSize('--form-view-tabs-block-size')).toBe(`${TABS_HEIGHT}px`);
+    // The record grid observes its own box too, so the header's observer is found by what it observes.
+    const headerObservers = RecordingResizeObserver.instances.filter((instance) => instance.observed.includes(header));
+    expect(headerObservers).toHaveLength(1);
+    const [observer] = headerObservers;
+    expect(observer.observed).toHaveLength(2);
+    expect(observer.observed[0]).toBe(header);
+    expect(observer.observed[1]).toBe(screen.getByRole('tablist', { name: 'Pages' }));
+
+    // The navigator wraps onto a second row.
+    headerHeight = 192;
+    act(() => {
+      observer.resize();
+    });
+    expect(publishedSize('--form-view-header-block-size')).toBe('192px');
+
+    expect(observer.disconnected).toBe(false);
+    cleanup();
+    expect(observer.disconnected).toBe(true);
+  });
+
+  // styles.css gives the controls below the sticky parts a scroll margin; here Last Name gets
+  // `margin`. Focus that leaves the control starting inside it, as a date input's inner fields
+  // can, scrolls the control to just below it. A control clear of its margin, one with none
+  // (a header control) and one taller than the 800px viewport's room below it stay.
+  it.each<{ label: string; margin: string; top: number; height: number; scrolledBy: number | null }>([
+    { label: 'starting inside its margin', margin: '188px', top: 50, height: 44, scrolledBy: 50 - 188 },
+    { label: 'starting above the viewport', margin: '188px', top: -400, height: 44, scrolledBy: -400 - 188 },
+    { label: 'clear of its margin', margin: '188px', top: 188, height: 44, scrolledBy: null },
+    { label: 'with no margin', margin: '0px', top: -20, height: 44, scrolledBy: null },
+    { label: 'taller than the room below its margin', margin: '188px', top: 50, height: 700, scrolledBy: null },
+  ])('scrolls a focused control $label by $scrolledBy px (null: not at all)', async ({
+    margin,
+    top,
+    height,
+    scrolledBy,
+  }) => {
+    // Focus raises FieldBefore, which the fake API answers with no effects.
+    const { definition } = await renderForm(createFormDefinitionFixture(), { answersFieldEvents: true });
+    const control = controlOf(definition, 'LastName');
+    const realComputedStyle = window.getComputedStyle.bind(window);
+    vi.spyOn(window, 'getComputedStyle').mockImplementation((element, pseudoElement) => {
+      const style = realComputedStyle(element, pseudoElement);
+      if (element === control) {
+        Object.defineProperty(style, 'scrollMarginBlockStart', { value: margin });
+      }
+      return style;
+    });
+    vi.spyOn(Element.prototype, 'getBoundingClientRect').mockImplementation(function (this: Element) {
+      return this === control ? new DOMRect(0, top, 600, height) : new DOMRect();
+    });
+    vi.spyOn(Element.prototype, 'clientHeight', 'get').mockReturnValue(800);
+    const scrollBy = vi.spyOn(window, 'scrollBy').mockImplementation(() => undefined);
+
+    act(() => {
+      control.focus();
+    });
+
+    expect(document.activeElement).toBe(control);
+    expect(scrollBy.mock.calls).toEqual(scrolledBy === null ? [] : [[0, scrolledBy]]);
+    await flush();
+  });
+
+  // A sticky strip sticks 140px down, so its stuck bottom edge is at 184px. A panel starting
+  // above that edge is scrolled back to start right at it: under the stuck strip, or with the
+  // strip carried off-screen by a newly shown panel shorter than the old one, whose rect then
+  // says nothing about where the strip sticks. A panel starting at the edge, as at the top
+  // of the page, stays, and so does any panel where the strip is not sticky.
+  it.each<{
+    how: 'click' | 'ArrowRight';
+    position: 'sticky' | 'static';
+    tablistTop: number;
+    panelTop: number;
+    scrolledBy: number | null;
+  }>([
+    { how: 'click', position: 'sticky', tablistTop: HEADER_HEIGHT, panelTop: -300, scrolledBy: -300 - TABS_BOTTOM },
+    { how: 'ArrowRight', position: 'sticky', tablistTop: HEADER_HEIGHT, panelTop: -300, scrolledBy: -300 - TABS_BOTTOM },
+    { how: 'click', position: 'sticky', tablistTop: -1376, panelTop: -3146, scrolledBy: -3146 - TABS_BOTTOM },
+    { how: 'click', position: 'sticky', tablistTop: 282, panelTop: 326, scrolledBy: null },
+    { how: 'click', position: 'sticky', tablistTop: HEADER_HEIGHT, panelTop: TABS_BOTTOM, scrolledBy: null },
+    { how: 'click', position: 'static', tablistTop: -344, panelTop: -300, scrolledBy: null },
+  ])(
+    'selecting a page by $how with a $position strip at $tablistTop px and the panel at $panelTop px scrolls by $scrolledBy px',
+    async ({ how, position, tablistTop, panelTop, scrolledBy }) => {
+      vi.spyOn(Element.prototype, 'getBoundingClientRect').mockImplementation(function (this: Element) {
+        switch (this.getAttribute('role')) {
+          case 'tablist':
+            return new DOMRect(0, tablistTop, 1000, TABS_HEIGHT);
+          case 'tabpanel':
+            return new DOMRect(0, panelTop, 1000, 1800);
+          default:
+            return new DOMRect();
+        }
+      });
+      // styles.css, which jsdom does not load, sets the strip's sticky offset to the header's height.
+      const realComputedStyle = window.getComputedStyle.bind(window);
+      vi.spyOn(window, 'getComputedStyle').mockImplementation((element, pseudoElement) => {
+        const style = realComputedStyle(element, pseudoElement);
+        if (element.getAttribute('role') === 'tablist') {
+          Object.defineProperty(style, 'position', { value: position });
+          Object.defineProperty(style, 'top', { value: position === 'sticky' ? `${HEADER_HEIGHT}px` : 'auto' });
+        }
+        return style;
+      });
+      const scrollBy = vi.spyOn(window, 'scrollBy').mockImplementation(() => undefined);
+      const { definition } = await renderForm();
+      const [firstPage, secondPage] = [...definition.pages].sort((a, b) => a.position - b.position);
+      expect(scrollBy).not.toHaveBeenCalled();
+
+      if (how === 'click') {
+        showPage(secondPage);
+      } else {
+        fireEvent.keyDown(screen.getByRole('tab', { name: firstPage.name }), { key: 'ArrowRight' });
+      }
+
+      expect(screen.getByRole('tab', { name: secondPage.name }).getAttribute('aria-selected')).toBe('true');
+      expect(scrollBy.mock.calls).toEqual(scrolledBy === null ? [] : [[0, scrolledBy]]);
+    },
+  );
 });
 
 describe('FormView malformed form metadata', () => {
@@ -3897,15 +4182,17 @@ describe('RecordNavigator pending and busy states', () => {
   const LOADING = 'Loading…';
   const BUTTONS = ['First', 'Previous', 'Next', 'Last', 'Go', 'New'] as const;
 
-  // Three records, so record 1 has a Next, and Last can overtake a pending Next.
+  // Three records, so record 1 has a Next, and Last can overtake a pending Next. Each holds
+  // a different Sex, so the legal-values select changes its selection with the record.
   const LAST_NAMES = ['Lovelace', 'Hopper', 'Noether'];
+  const SEXES = ['M-Male', 'F-Female', 'U-Unknown'];
   const RECORDS: readonly RecordDto[] = LAST_NAMES.map((lastName, index) =>
     recordFixture({
       globalRecordId: `3f2b8c1e-5d4a-4c1b-9e7f-${String(101 + index).padStart(12, '0')}`,
       uniqueKey: index + 1,
       position: index + 1,
       count: LAST_NAMES.length,
-      values: { LastName: lastName },
+      values: { LastName: lastName, Sex: SEXES[index] },
     }),
   );
 
@@ -4091,8 +4378,9 @@ describe('RecordNavigator pending and busy states', () => {
     // The announcement follows the toolbar, outside every aria-busy subtree, since assistive
     // technology may hold back a busy subtree's updates until the load has ended.
     const announcement = expectAnnouncer(navigator, status, LOADING);
-    // Previous is the one disabled control: record 1 has no previous record.
-    expect(enabledControls(navigator)).toEqual({ ...allControls(true), Previous: false });
+    // Every control is enabled: Previous counts from the pending target, record 2, as a press
+    // of it does, although the status still shows record 1.
+    expect(enabledControls(navigator)).toEqual(allControls(true));
 
     await releaseAndSettle(api);
 
@@ -4106,33 +4394,40 @@ describe('RecordNavigator pending and busy states', () => {
     expect(enabledControls(navigator)).toEqual(allControls(true));
   });
 
-  it('lets a press during a pending load supersede it, and ignores the overtaken response', async () => {
-    const definition = createFormDefinitionFixture();
-    const api = holdingApi(definition);
-    const navigator = await renderThreeRecords(api, definition);
-    const status = within(navigator).getByRole('status');
+  // Previous counts from the pending record 2, so it goes back to record 1.
+  it.each([
+    { press: 'Last', status: '3 of 3', lastName: 'Noether' },
+    { press: 'Previous', status: '1 of 3', lastName: 'Lovelace' },
+  ])(
+    'lets $press pressed during a pending Next from record 1 supersede it, and ignores the overtaken response',
+    async ({ press, status: landed, lastName }) => {
+      const definition = createFormDefinitionFixture();
+      const api = holdingApi(definition);
+      const navigator = await renderThreeRecords(api, definition);
+      const status = within(navigator).getByRole('status');
 
-    api.holdAt(2);
-    fireEvent.click(within(navigator).getByRole('button', { name: 'Next' }));
-    await waitFor(() => {
-      expect(api.heldCount()).toBe(1);
-    });
-    fireEvent.click(within(navigator).getByRole('button', { name: 'Last' }));
+      api.holdAt(2);
+      fireEvent.click(within(navigator).getByRole('button', { name: 'Next' }));
+      await waitFor(() => {
+        expect(api.heldCount()).toBe(1);
+      });
+      fireEvent.click(within(navigator).getByRole('button', { name: press }));
 
-    await waitFor(() => {
-      expect(status.textContent).toBe('3 of 3');
-    });
-    expect(lastNameValue()).toBe('Noether');
-    expect(navigator.getAttribute('aria-busy')).toBeNull();
+      await waitFor(() => {
+        expect(status.textContent).toBe(landed);
+        expect(navigator.getAttribute('aria-busy')).toBeNull();
+      });
+      expect(lastNameValue()).toBe(lastName);
 
-    // The read of record 2 answers last and installs nothing.
-    await releaseAndSettle(api);
+      // The read of record 2 answers last and installs nothing.
+      await releaseAndSettle(api);
 
-    expect(status.textContent).toBe('3 of 3');
-    expect(lastNameValue()).toBe('Noether');
-    expect(navigator.getAttribute('aria-busy')).toBeNull();
-    expectAnnouncer(navigator, status, '');
-  });
+      expect(status.textContent).toBe(landed);
+      expect(lastNameValue()).toBe(lastName);
+      expect(navigator.getAttribute('aria-busy')).toBeNull();
+      expectAnnouncer(navigator, status, '');
+    },
+  );
 
   it('disables every data field while a pending load replaces the record, without marking any protected (0.3.6)', async () => {
     const definition = createFormDefinitionFixture();
@@ -4182,7 +4477,7 @@ describe('RecordNavigator pending and busy states', () => {
     });
 
     // The record being left is frozen: every control refuses input, yet nothing becomes
-    // protected, so no wrapper takes the protected padding and background meanwhile.
+    // protected, so no wrapper takes the protected band meanwhile.
     expect(lastNameValue()).toBe('Lovelace');
     for (const name of dataFieldNames) {
       expect(disabledStates(name), name).not.toContain(false);
@@ -4201,6 +4496,51 @@ describe('RecordNavigator pending and busy states', () => {
     }
     expect(protectedWrappers()).toEqual(protectedBefore);
     expect(body.querySelectorAll('.field--disabled')).toHaveLength(0);
+  });
+
+  it('replaces the options of a legal-values select a pending load disables and re-enables, keeping the select, its label and its selection, with no field event', async () => {
+    const definition = createFormDefinitionFixture();
+    const api = holdingApi(definition);
+    const navigator = await renderThreeRecords(api, definition);
+    const select = screen.getByRole<HTMLSelectElement>('combobox', { name: 'Sex' });
+    const optionsOf = (): HTMLOptionElement[] => Array.from(select.options);
+    const enabledOptions = optionsOf();
+    expect(controlValue(select)).toBe('M-Male');
+
+    api.holdAt(2);
+    fireEvent.click(within(navigator).getByRole('button', { name: 'Next' }));
+    await waitFor(() => {
+      expect(api.heldCount()).toBe(1);
+    });
+
+    // Frozen: the same select, disabled and still showing record 1, over new options.
+    expect(screen.getByRole('combobox', { name: 'Sex' })).toBe(select);
+    expect(isDisabled(select)).toBe(true);
+    expect(controlValue(select)).toBe('M-Male');
+    const frozenOptions = optionsOf();
+    for (const option of frozenOptions) {
+      expect(enabledOptions).not.toContain(option);
+    }
+
+    await releaseAndSettle(api);
+
+    // Re-enabled on record 2: the select stays and is still labelled by its prompt, and no
+    // option from before either change of its disabled state survives, so none can carry
+    // an accessibility state from then. The new options are enabled and the record's value
+    // is the one selected.
+    expect(lastNameValue()).toBe('Hopper');
+    expect(screen.getByRole('combobox', { name: 'Sex' })).toBe(select);
+    expect(isDisabled(select)).toBe(false);
+    const options = optionsOf();
+    expect(options.map((option) => option.textContent)).toEqual(['No selection', 'M-Male', 'F-Female', 'U-Unknown']);
+    for (const option of options) {
+      expect(enabledOptions).not.toContain(option);
+      expect(frozenOptions).not.toContain(option);
+      expect(isDisabled(option)).toBe(false);
+    }
+    expect(controlValue(select)).toBe('F-Female');
+    expect(within(select).getByRole('option', { selected: true })).toBe(options[2]);
+    expect(calls.filter((call) => call.url.pathname.endsWith('/checkcode/field-event')).map(requestLine)).toEqual([]);
   });
 
   it('disables every control while the editor saves, and marks the toolbar busy without announcing a load', () => {
@@ -4232,6 +4572,75 @@ describe('RecordNavigator pending and busy states', () => {
     expect(status.textContent).toBe('2 of 3');
     expectAnnouncer(navigator, status, '');
   });
+
+  it.each<{ label: string; text: string }>([
+    { label: 'a number outside 1..N, which useRecordNavigation rejects as goToError', text: '999999' },
+    { label: 'text that is no record number, which the navigator rejects itself', text: 'abc' },
+  ])('shows the go-to rejection of $label only while the box holds the text submitted', async ({ text }) => {
+    const definition = createFormDefinitionFixture();
+    const api = holdingApi(definition);
+    const navigator = await renderThreeRecords(api, definition);
+    const box = within(navigator).getByRole('textbox', { name: 'Go to record' });
+
+    /** Asserts the rejection and the box's invalid state are both shown, or both absent. */
+    function expectRejection(shown: boolean): void {
+      const alert = within(navigator).queryByRole('alert');
+      if (shown) {
+        expect(alert?.textContent).toBe('Enter a record number from 1 to 3.');
+        expect(box.getAttribute('aria-invalid')).toBe('true');
+        expect(box.getAttribute('aria-describedby')).toBe(alert?.id);
+      } else {
+        expect(alert).toBeNull();
+        expect(box.getAttribute('aria-invalid')).toBeNull();
+        expect(box.getAttribute('aria-describedby')).toBeNull();
+      }
+    }
+
+    fireEvent.change(box, { target: { value: text } });
+    expectRejection(false);
+    fireEvent.keyDown(box, { key: 'Enter' });
+    expectRejection(true);
+
+    // Any edit leaves a message that describes other text, so it goes.
+    fireEvent.change(box, { target: { value: `${text}1` } });
+    expectRejection(false);
+    fireEvent.keyDown(box, { key: 'Enter' });
+    expectRejection(true);
+    fireEvent.change(box, { target: { value: '' } });
+    expectRejection(false);
+
+    // Submitting the same text again shows its rejection again; the record never changed.
+    fireEvent.change(box, { target: { value: text } });
+    fireEvent.keyDown(box, { key: 'Enter' });
+    expectRejection(true);
+    expect(within(navigator).getByRole('status').textContent).toBe('1 of 3');
+  });
+
+  it('shows no go-to rejection for a valid number whose save before leaving client validation refuses', async () => {
+    const definition = createFormDefinitionFixture();
+    const api = holdingApi(definition);
+    const navigator = await renderThreeRecords(api, definition);
+    const box = within(navigator).getByRole('textbox', { name: 'Go to record' });
+    // Past the fixture's Age upper bound of 120, so the save before leaving stops at client validation.
+    edit(definition, 'Age', '121');
+
+    fireEvent.change(box, { target: { value: '999999' } });
+    fireEvent.keyDown(box, { key: 'Enter' });
+    expect(within(navigator).getByRole('alert').textContent).toBe('Enter a record number from 1 to 3.');
+
+    fireEvent.change(box, { target: { value: '2' } });
+    fireEvent.keyDown(box, { key: 'Enter' });
+    await findValidationSummary();
+    await flush();
+
+    // The refused leave is no rejection of 2, and the earlier one describes other text.
+    expect(within(navigator).queryByRole('alert')).toBeNull();
+    expect(box.getAttribute('aria-invalid')).toBeNull();
+    expect(controlValue(box)).toBe('2');
+    expect(writeCalls().map(requestLine)).toEqual([]);
+    expect(controlValue(controlOf(definition, 'Age'))).toBe('121');
+    expect(within(navigator).getByRole('status').textContent).toBe('1 of 3');
+  });
 });
 
 describe('FormView Find record', () => {
@@ -4242,10 +4651,15 @@ describe('FormView Find record', () => {
     return screen.getByRole('dialog', { name: 'Find record' });
   }
 
-  /** Picks `name` in the field picker and returns its criterion's value box. */
+  /**
+   * Picks `name` in the field picker and returns its criterion's value box, labelled by
+   * the field's prompt with `(name)` after it, or by the name alone when that is the prompt.
+   */
   function pick(dialog: HTMLElement, name: string): HTMLInputElement {
     fireEvent.click(within(dialog).getByRole('checkbox', { name }));
-    const box = within(dialog).getByRole('textbox', { name: `Value for ${name}` });
+    const box = within(dialog).getByRole('textbox', {
+      name: (label) => label === name || label.endsWith(` (${name})`),
+    });
     if (!(box instanceof HTMLInputElement)) {
       throw new Error(`the value box of ${name} is not an input`);
     }
@@ -4340,6 +4754,100 @@ describe('FormView Find record', () => {
     },
   );
 
+  // A criterion is labelled by the field's prompt on one line, without a closing colon,
+  // then the field name, or by the name alone when the prompt says only that; Remove
+  // still names the field.
+  it.each<{ name: string; definition?: () => FormDefinition; label: string }>([
+    { name: 'LastName', label: 'Last Name (LastName)' },
+    { name: 'Age', label: 'Age' },
+    { name: 'Lab', label: 'Lab' },
+    {
+      name: 'OnsetDate',
+      definition: () => withField('OnsetDate', (field) => ({ ...field, prompt: 'Date of onset of\r\nfirst  symptoms: ' })),
+      label: 'Date of onset of first symptoms (OnsetDate)',
+    },
+    {
+      name: 'PatientAddress',
+      definition: () => withField('PatientAddress', (field) => ({ ...field, prompt: null })),
+      label: 'PatientAddress',
+    },
+    { name: 'GlobalRecordId', label: 'Global record ID (GlobalRecordId)' },
+    { name: 'RecStatus', label: 'Record status (RecStatus)' },
+  ])('labels the criterion of $name $label', async ({ name, definition, label }) => {
+    await renderForm(definition?.());
+    const dialog = openFind();
+    fireEvent.click(within(dialog).getByRole('checkbox', { name }));
+
+    const box = within(dialog).getByRole('textbox', { name: label });
+    const row = present(box.parentElement, `criterion row of ${name}`);
+    expect(within(row).getByRole('button', { name: `Remove ${name}` })).toBeTruthy();
+  });
+
+  /** The words of a picker name or prompt: its text split at each <wbr> inside the element. */
+  function nameWords(nameElement: HTMLElement): string[] {
+    const words = [''];
+    for (const node of nameElement.childNodes) {
+      if (node instanceof HTMLElement && node.tagName === 'WBR') {
+        words.push('');
+      } else if (node.nodeType === Node.TEXT_NODE) {
+        words[words.length - 1] += node.textContent ?? '';
+      } else {
+        throw new Error(`unexpected ${node.nodeName} in ${nameElement.textContent ?? ''}`);
+      }
+    }
+    return words;
+  }
+
+  // A long name wraps between its words, not inside one. Chrome reads a <wbr> as a space
+  // in an accessible name, so the checkbox is named by the plain name and the copy shown,
+  // which carries the <wbr> elements, is hidden from assistive technology.
+  it.each<{ name: string; words: readonly string[] }>([
+    { name: 'EatenLastTenDays', words: ['Eaten', 'Last', 'Ten', 'Days'] },
+    { name: 'CDCIDNumber', words: ['CDCID', 'Number'] },
+    { name: 'O157H7isolated', words: ['O', '157', 'H', '7', 'isolated'] },
+    { name: 'first_name-2', words: ['first_', 'name-', '2'] },
+    { name: 'Radiculoneuropathy', words: ['Radiculoneuropathy'] },
+  ])('marks the word boundaries of the picker name $name', async ({ name, words }) => {
+    await renderForm(withField('FeverTemp', (field) => ({ ...field, name })));
+    const checkbox = within(openFind()).getByRole('checkbox', { name });
+
+    const nameId = present(checkbox.getAttribute('aria-labelledby'), 'aria-labelledby of the checkbox');
+    const nameElement = present(document.getElementById(nameId), `element #${nameId}`);
+    expect(nameWords(nameElement)).toEqual([name]);
+    const shown = present(
+      checkbox.closest('label')?.querySelector<HTMLElement>('[aria-hidden="true"]'),
+      `shown name of ${name}`,
+    );
+    expect(shown.textContent).toBe(name);
+    expect(nameWords(shown)).toEqual(words);
+  });
+
+  // A prompt wraps at its spaces and after a slash, backslash or underscore joining two
+  // words, never inside a word; numbers keep their slashes. Chrome reads a <wbr> as a
+  // space in an accessible description too, so the checkbox is described by the plain
+  // prompt and the copy shown, which carries the <wbr> elements, is hidden from it.
+  it.each<{ prompt: string; words: readonly string[] }>([
+    { prompt: 'Encephalitis/Encephalomyelitis', words: ['Encephalitis/', 'Encephalomyelitis'] },
+    { prompt: 'Native Hawaiian/Other Pacific Islander', words: ['Native Hawaiian/', 'Other Pacific Islander'] },
+    { prompt: 'Lab\\Clinic_Name', words: ['Lab\\', 'Clinic_', 'Name'] },
+    { prompt: 'Dose 1/2 on 01/15/2011, and/ or later', words: ['Dose 1/2 on 01/15/2011, and/ or later'] },
+    { prompt: 'Highest fever temp', words: ['Highest fever temp'] },
+  ])('marks the word breaks of the picker prompt $prompt', async ({ prompt, words }) => {
+    await renderForm(withField('FeverTemp', (field) => ({ ...field, prompt })));
+    const checkbox = within(openFind()).getByRole('checkbox', { name: 'FeverTemp', description: prompt });
+
+    const descriptionId = present(checkbox.getAttribute('aria-describedby'), 'aria-describedby of the checkbox');
+    const description = present(document.getElementById(descriptionId), `element #${descriptionId}`);
+    expect(description.hidden).toBe(true);
+    expect(nameWords(description)).toEqual([prompt]);
+    const shown = present(
+      checkbox.closest('label')?.querySelector<HTMLElement>('small[aria-hidden="true"]'),
+      `shown prompt of ${prompt}`,
+    );
+    expect(shown.textContent).toBe(prompt);
+    expect(nameWords(shown)).toEqual(words);
+  });
+
   /** Answers the searches in order, one answer each; a search past the last is left unrouted. */
   function searchRoute(...answers: readonly (() => Response | Promise<Response>)[]): Route {
     let next = 0;
@@ -4371,6 +4879,18 @@ describe('FormView Find record', () => {
     const body: unknown = JSON.parse(present(call.body, 'search body'));
     return typeof body === 'object' && body !== null && 'criteria' in body ? body.criteria : undefined;
   }
+
+  /** The search's `excludeGlobalRecordId`; `undefined` when the body carries none. */
+  function sentExclusion(call: Call): unknown {
+    const body: unknown = JSON.parse(present(call.body, 'search body'));
+    return typeof body === 'object' && body !== null && 'excludeGlobalRecordId' in body
+      ? body.excludeGlobalRecordId
+      : undefined;
+  }
+
+  // The status line's sentence for a search that left the open record out.
+  const ON_SCREEN_NOT_LISTED = 'The record on screen is not listed.';
+  const EARLIER_NOT_LISTED = 'The record that was on screen when you searched is not listed.';
 
   /** How the one result row offers itself: actionable rows carry no aria-disabled. */
   function resultState(dialog: HTMLElement) {
@@ -4419,7 +4939,9 @@ describe('FormView Find record', () => {
     const stale = '1 record matches. These results are for the previous criteria; Search updates them.';
     expect(resultState(dialog)).toEqual(OUT_OF_DATE);
     expect(within(dialog).getByText(stale)).toBeTruthy();
-    expect(descriptionsOf(within(dialog).getByRole('button', { name: 'Open record at position 1' }))).toEqual([stale]);
+    expect(descriptionsOf(within(dialog).getByRole('button', { name: 'Open record at position 1' }))).toEqual([
+      `${stale} ${ON_SCREEN_NOT_LISTED}`,
+    ]);
     tryToOpen(dialog);
     expect(screen.getByRole('dialog', { name: 'Find record' })).toBe(dialog);
 
@@ -4457,7 +4979,90 @@ describe('FormView Find record', () => {
     await within(screen.getByRole('toolbar', { name: 'Record navigation' })).findByText('1 of 1');
   });
 
-  it("keeps a field's message while its criterion holds the text sent, and drops it and the banner once edited", async () => {
+  /** A search result for a stored record of the two-record set, matched on its LastName. */
+  function matchOf(record: RecordDto): SearchResult {
+    const lastName = record.values.LastName;
+    return {
+      globalRecordId: record.globalRecordId,
+      uniqueKey: record.uniqueKey,
+      recStatus: record.recStatus,
+      position: record.position,
+      values: { LastName: typeof lastName === 'string' ? lastName : null },
+    };
+  }
+
+  // The server leaves the record sent as excludeGlobalRecordId out before it counts, so the
+  // status says so; a new record's search excludes nothing and the status adds nothing.
+  it.each<{
+    on: string;
+    startNew: boolean;
+    answer: readonly RecordDto[];
+    summary: string;
+    excluded: string | undefined;
+  }>([
+    { on: 'a stored record', startNew: false, answer: [], summary: 'No records match.', excluded: RECORD_A.globalRecordId },
+    {
+      on: 'a stored record',
+      startNew: false,
+      answer: [RECORD_B],
+      summary: '1 record matches.',
+      excluded: RECORD_A.globalRecordId,
+    },
+    { on: 'a new record', startNew: true, answer: [RECORD_A], summary: '1 record matches.', excluded: undefined },
+  ])(
+    'tells whether the record on screen was left out when Find on $on answers $summary',
+    async ({ startNew, answer, summary, excluded }) => {
+      await renderForm(undefined, {
+        records: [RECORD_A, RECORD_B],
+        route: searchRoute(() => matches(...answer.map(matchOf))),
+      });
+      if (startNew) {
+        const navigator = screen.getByRole('toolbar', { name: 'Record navigation' });
+        fireEvent.click(within(navigator).getByRole('button', { name: 'New' }));
+        await within(navigator).findByText('New record');
+      }
+      const dialog = openFind();
+      fireEvent.change(pick(dialog, 'LastName'), { target: { value: 'Lovelace or Hopper' } });
+      fireEvent.click(within(dialog).getByRole('button', { name: 'Search' }));
+
+      // The count keeps a text of its own, and the note follows it on the same status line.
+      const status = await within(dialog).findByText(summary);
+      expect(status.getAttribute('role')).toBe('status');
+      expect(status.textContent).toBe(excluded === undefined ? summary : `${summary} ${ON_SCREEN_NOT_LISTED}`);
+      expect(calls.filter(isSearch).map(sentExclusion)).toEqual([excluded]);
+    },
+  );
+
+  it('says the record that was on screen is not listed once another record opens behind the results', async () => {
+    const next = deferred();
+    const atTwo = `${FORM_PATH}/records/at/2`;
+    const answerSearch = searchRoute(() => matches(matchOf(RECORD_B)));
+    await renderForm(undefined, {
+      records: [RECORD_A, RECORD_B],
+      route: (call) => (call.method === 'GET' && call.url.pathname === atTwo ? next.response : answerSearch(call)),
+    });
+    // Next is still loading B when Find opens, so the search leaves A out.
+    const navigator = screen.getByRole('toolbar', { name: 'Record navigation' });
+    fireEvent.click(within(navigator).getByRole('button', { name: 'Next' }));
+    await vi.waitFor(() => {
+      expect(calls.some((call) => call.method === 'GET' && call.url.pathname === atTwo)).toBe(true);
+    });
+    const dialog = openFind();
+    fireEvent.change(pick(dialog, 'LastName'), { target: { value: B_LAST_NAME } });
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Search' }));
+    const status = await within(dialog).findByText('1 record matches.');
+    expect(status.textContent).toBe(`1 record matches. ${ON_SCREEN_NOT_LISTED}`);
+
+    // B, which the results list, is now on screen; A is the record they leave out.
+    next.release(jsonResponse(200, RECORD_B));
+    await within(navigator).findByText('2 of 2');
+    const stale = '1 record matches. These results are for the previous criteria; Search updates them.';
+    expect(within(dialog).getByText(stale).textContent).toBe(`${stale} ${EARLIER_NOT_LISTED}`);
+    expect(calls.filter(isSearch).map(sentExclusion)).toEqual([RECORD_A.globalRecordId]);
+  });
+
+
+  it("keeps a field's message while its criterion holds the text sent, and the banner's summary while such a message shows", async () => {
     const problem = {
       type: 'https://tools.ietf.org/html/rfc9110#section-15.5.1',
       title: 'One or more validation errors occurred.',
@@ -4492,17 +5097,39 @@ describe('FormView Find record', () => {
     };
     expect(shown()).toEqual(sentState);
 
-    // Editing CaseID drops its message and the banner; the untouched LastName keeps its own.
+    // Editing CaseID drops its message and the banner's line about the criteria as a whole;
+    // the untouched LastName keeps its own, and the summary that points at it stays.
+    const summary = 'Some values need attention. See the messages beside each field.';
     fireEvent.change(caseId, { target: { value: 'abcd' } });
-    expect(shown()).toEqual({
+    const caseIdEdited = {
       lastName: lastNameInvalid,
       caseId: { invalid: null, described: [caseIdHint] },
-      banner: null,
-    });
+      banner: summary,
+    };
+    expect(shown()).toEqual(caseIdEdited);
 
     // The text sent once more: the messages describe the criteria on screen again.
     fireEvent.change(caseId, { target: { value: 'abc' } });
     expect(shown()).toEqual(sentState);
+
+    // The summary stays while either criterion still shows its message, and goes once
+    // neither does.
+    fireEvent.change(lastName, { target: { value: 'Lovelace' } });
+    expect(shown()).toEqual({
+      lastName: { invalid: null, described: [lastNameHint] },
+      caseId: { invalid: 'true', described: [caseIdHint, 'CaseID must be a number.'] },
+      banner: summary,
+    });
+    fireEvent.change(caseId, { target: { value: 'abcd' } });
+    expect(shown()).toEqual({
+      lastName: { invalid: null, described: [lastNameHint] },
+      caseId: { invalid: null, described: [caseIdHint] },
+      banner: null,
+    });
+
+    // Restoring one criterion's text brings back its message and the summary with it.
+    fireEvent.change(lastName, { target: { value: '' } });
+    expect(shown()).toEqual(caseIdEdited);
   });
 
   it('titles each nonblank result cell with its full value', async () => {
@@ -4607,6 +5234,261 @@ describe('FormView Find record', () => {
     expect(within(dialog).getByRole('alert').textContent).toBe(
       target === null ? message : 'Some values need attention. See the messages beside each field.',
     );
+  });
+
+  /** A search 400 with `errors` keyed as the server keys them. */
+  function searchProblem(errors: Readonly<Record<string, readonly string[]>>): Response {
+    return jsonResponse(400, {
+      type: 'https://tools.ietf.org/html/rfc9110#section-15.5.1',
+      title: 'One or more validation errors occurred.',
+      status: 400,
+      traceId: '00-test-search-02',
+      errors,
+    });
+  }
+
+  /** The bar pinned to the dialog's top or bottom edge while its place is out of view, which holds Search. */
+  function footerOf(dialog: HTMLElement): HTMLElement {
+    const search = within(dialog).getByRole('button', { name: 'Search' });
+    return present(search.closest<HTMLElement>('.find-dialog__footer'), 'footer around Search');
+  }
+
+  /** Picks LastName, enters `Lovelace`, focuses Search and presses it, as a pointer or Space does. */
+  function searchFromButton(dialog: HTMLElement): HTMLElement {
+    fireEvent.change(pick(dialog, 'LastName'), { target: { value: 'Lovelace' } });
+    const search = within(dialog).getByRole('button', { name: 'Search' });
+    search.focus();
+    fireEvent.click(search);
+    return search;
+  }
+
+  it('keeps the status line, Search and Close in one footer between the criteria and the results', async () => {
+    await renderForm(undefined, { route: searchRoute(() => matches(MATCH)) });
+    const dialog = openFind();
+    const footer = footerOf(dialog);
+    const status = within(footer).getByRole('status');
+    expect(status.className).toBe('visually-hidden');
+
+    const search = searchFromButton(dialog);
+    await within(dialog).findByText('1 record matches.');
+    const close = within(dialog).getByRole('button', { name: 'Close' });
+    expect(footer.parentElement).toBe(dialog);
+    // The status line first, at the bar's start, then the buttons as one group; Search
+    // still submits the form.
+    const [first, actions, ...rest] = Array.from(footer.children);
+    expect(first).toBe(status);
+    expect(rest).toEqual([]);
+    expect(Array.from(actions.children)).toEqual([search, close]);
+    expect(status.className).toBe('');
+    expect(search.getAttribute('type')).toBe('submit');
+    expect(search.getAttribute('form')).toBe(present(dialog.querySelector('form'), 'Find form').id);
+
+    // Document and Tab order: picker, criteria, Search, Close, then the results.
+    const table = within(dialog).getByRole('table', { name: 'Matching records' });
+    const ordered = [
+      within(dialog).getByRole('group', { name: 'Fields to search' }),
+      within(dialog).getByRole('button', { name: 'Remove LastName' }),
+      search,
+      close,
+      within(table).getByRole('button', { name: 'Open record at position 1' }),
+    ];
+    for (const [index, element] of ordered.slice(1).entries()) {
+      expect(ordered[index].compareDocumentPosition(element) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+    }
+    expect(footer.contains(table)).toBe(false);
+  });
+
+  it('shows the limit note under the picker legend, outside the scrolling options', async () => {
+    await renderForm();
+    const dialog = openFind();
+    const picker = within(dialog).getByRole('group', { name: 'Fields to search' });
+    const options = present(picker.querySelector<HTMLElement>('.find-dialog__options'), 'picker options');
+    const boxes = within(options).getAllByRole('checkbox');
+    for (const box of boxes.slice(0, 6)) {
+      fireEvent.click(box);
+    }
+
+    const note = within(picker).getByText('At most six fields can be searched.');
+    expect(note.getAttribute('role')).toBe('status');
+    expect(note.className).toBe('');
+    expect(options.contains(note)).toBe(false);
+    expect(present(picker.querySelector('legend'), 'picker legend').nextElementSibling).toBe(note);
+    // Every option the limit disables still names the note as its reason.
+    const disabled = boxes.filter((box) => isDisabled(box));
+    expect(disabled).toHaveLength(boxes.length - 6);
+    for (const box of disabled) {
+      expect(descriptionsOf(box)).toContain('At most six fields can be searched.');
+    }
+  });
+
+  // The first field, one in the middle and the last, a system field.
+  it.each<{ name: string }>([{ name: 'CaseID' }, { name: 'PhoneNumber' }, { name: 'RecStatus' }])(
+    'moves focus from the checked $name checkbox to its new value box',
+    async ({ name }) => {
+      await renderForm();
+      const dialog = openFind();
+      within(dialog).getByRole('checkbox', { name }).focus();
+
+      const box = pick(dialog, name);
+      expect(document.activeElement).toBe(box);
+    },
+  );
+
+  it('keeps focus in the picker on open, on unchecking and after Remove, and says checking moves it', async () => {
+    await renderForm();
+    const dialog = openFind();
+    const picker = within(dialog).getByRole('group', { name: 'Fields to search' });
+    const guidance = 'Checking a field moves focus to its value box.';
+    expect(document.activeElement).toBe(within(picker).getAllByRole('checkbox')[0]);
+    expect(within(picker).getByText(guidance)).toBeTruthy();
+    expect(descriptionsOf(picker)).toEqual([guidance]);
+
+    pick(dialog, 'LastName');
+    pick(dialog, 'Age');
+    const age = within(dialog).getByRole('checkbox', { name: 'Age' });
+    age.focus();
+    fireEvent.click(age);
+    expect(within(dialog).queryByRole('button', { name: 'Remove Age' })).toBeNull();
+    expect(document.activeElement).toBe(age);
+
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Remove LastName' }));
+    expect(document.activeElement).toBe(within(dialog).getByRole('checkbox', { name: 'LastName' }));
+  });
+
+  // The value boxes after LastName, then CaseID, were picked: CaseID comes first in picker order.
+  it.each<{ marks: string; errors: Readonly<Record<string, readonly string[]>>; focused: string }>([
+    {
+      marks: 'two criteria',
+      errors: { LastName: ['LastName needs a value.'], CaseID: ['CaseID must be a number.'] },
+      focused: 'CaseID',
+    },
+    {
+      marks: 'one criterion',
+      errors: { LastName: ['LastName needs a value.'], criteria: ['A search names at most six fields.'] },
+      focused: 'LastName',
+    },
+    { marks: 'no criterion', errors: { criteria: ['A search names at most six fields.'] }, focused: 'Search' },
+  ])('after a 400 that marks $marks, scrolls the banner into view, then focuses $focused: the first marked value box in picker order, else Search', async ({
+    errors,
+    focused,
+  }) => {
+    // jsdom has no scrollIntoView; with one, the banner scrolls into view first, and the
+    // box is focused without a scroll of its own and then scrolled only as far as it
+    // needs, so the banner stays in view whenever both fit.
+    type Step =
+      | { readonly step: 'scroll'; readonly element: Element; readonly options: unknown }
+      | { readonly step: 'focus'; readonly element: EventTarget | null };
+    const steps: Step[] = [];
+    Object.defineProperty(Element.prototype, 'scrollIntoView', {
+      configurable: true,
+      writable: true,
+      value(this: Element, options?: boolean | ScrollIntoViewOptions) {
+        steps.push({ step: 'scroll', element: this, options });
+      },
+    });
+    const recordFocus = (event: FocusEvent) => {
+      steps.push({ step: 'focus', element: event.target });
+    };
+    try {
+      await renderForm(undefined, { route: searchRoute(() => searchProblem(errors)) });
+      const dialog = openFind();
+      const boxes = new Map(['LastName', 'CaseID'].map((name) => [name, pick(dialog, name)]));
+      const search = within(dialog).getByRole('button', { name: 'Search' });
+      search.focus();
+      document.addEventListener('focusin', recordFocus);
+      fireEvent.click(search);
+
+      const banner = await within(dialog).findByRole('alert');
+      const box = focused === 'Search' ? undefined : present(boxes.get(focused), `value box of ${focused}`);
+      expect(document.activeElement).toBe(box ?? search);
+      const nearest = { block: 'nearest', inline: 'nearest' };
+      expect(steps).toEqual([
+        { step: 'scroll', element: banner, options: nearest },
+        ...(box === undefined
+          ? []
+          : [
+              { step: 'focus', element: box },
+              { step: 'scroll', element: box, options: nearest },
+            ]),
+      ]);
+    } finally {
+      document.removeEventListener('focusin', recordFocus);
+      Reflect.deleteProperty(Element.prototype, 'scrollIntoView');
+    }
+  });
+
+  it('leaves focus where the user moved it while the search ran', async () => {
+    const answer = deferred();
+    await renderForm(undefined, { route: searchRoute(() => answer.response) });
+    const dialog = openFind();
+    searchFromButton(dialog);
+    const caseId = pick(dialog, 'CaseID');
+    caseId.focus();
+
+    answer.release(searchProblem({ LastName: ['LastName needs a value.'] }));
+    await within(dialog).findByText('LastName needs a value.');
+    expect(document.activeElement).toBe(caseId);
+  });
+
+  it.each<{
+    outcome: string;
+    answer: () => Response;
+    scrolled: (dialog: HTMLElement) => readonly Element[];
+  }>([
+    {
+      outcome: 'matches',
+      answer: () => matches(MATCH),
+      scrolled: (dialog) => [
+        present(within(dialog).getByRole('table', { name: 'Matching records' }).parentElement, 'results wrapper'),
+        footerOf(dialog),
+      ],
+    },
+    { outcome: 'no match', answer: () => matches(), scrolled: () => [] },
+    {
+      outcome: 'a request-level 400',
+      answer: () => searchProblem({ criteria: ['A search names at most six fields.'] }),
+      scrolled: (dialog) => [within(dialog).getByRole('alert')],
+    },
+    {
+      outcome: 'a 503',
+      answer: () =>
+        jsonResponse(503, {
+          type: 'https://tools.ietf.org/html/rfc9110#section-15.6.4',
+          title: 'Service Unavailable',
+          status: 503,
+          detail: 'The database is unavailable.',
+          traceId: '00-test-search-03',
+        }),
+      scrolled: (dialog) => [within(dialog).getByRole('alert')],
+    },
+  ])('after $outcome, scrolls into view what the footer does not show, keeping focus on Search', async ({
+    answer,
+    scrolled,
+  }) => {
+    // jsdom has no scrollIntoView; the dialog calls it only where the browser has it.
+    const requests: { readonly element: Element; readonly options: unknown }[] = [];
+    Object.defineProperty(Element.prototype, 'scrollIntoView', {
+      configurable: true,
+      writable: true,
+      value(this: Element, options?: boolean | ScrollIntoViewOptions) {
+        requests.push({ element: this, options });
+      },
+    });
+    try {
+      await renderForm(undefined, { route: searchRoute(answer) });
+      const dialog = openFind();
+      const search = searchFromButton(dialog);
+      await vi.waitFor(() => {
+        expect(isDisabled(search)).toBe(false);
+      });
+
+      expect(requests).toEqual(
+        scrolled(dialog).map((element) => ({ element, options: { block: 'nearest', inline: 'nearest' } })),
+      );
+      expect(document.activeElement).toBe(search);
+    } finally {
+      Reflect.deleteProperty(Element.prototype, 'scrollIntoView');
+    }
   });
 });
 
@@ -4925,6 +5807,215 @@ describe('FormView record grid', () => {
     expect(calls.filter((call) => call.url.pathname.startsWith(LIST_PATH) && call.method !== 'GET')).toEqual([]);
   });
 
+  /** `<event> <fieldName>` of a field-event request; `null` for any other request. */
+  function fieldEventTargetOf(call: Call): string | null {
+    const event = fieldEventOf(call);
+    if (event === null || call.body === null) {
+      return null;
+    }
+    const body: unknown = JSON.parse(call.body);
+    return typeof body === 'object' && body !== null && 'fieldName' in body && typeof body.fieldName === 'string'
+      ? `${event} ${body.fieldName}`
+      : null;
+  }
+
+  /** The paragraphs of each check-code notice banner shown; empty when there is none. */
+  function checkCodeNoticeBanners(): string[][] {
+    return screen
+      .queryAllByRole('status')
+      .filter((status) => (status.textContent ?? '').startsWith('Check code could not run'))
+      .map((status) => within(status).queryAllByRole('paragraph').map((paragraph) => paragraph.textContent ?? ''));
+  }
+
+  const DOB_EVENT_FAILED = `Check code could not run for DOB. An unexpected error occurred. Trace id: ${EVENT_FAILED.traceId}.`;
+  const FIRST_NAME_EVENT_FAILED = `Check code could not run for First Name. An unexpected error occurred. Trace id: ${EVENT_FAILED.traceId}.`;
+
+  /** `<event> <fieldName>` of every field-event request, in arrival order. */
+  function sentFieldEvents(): string[] {
+    return calls.map(fieldEventTargetOf).filter((target) => target !== null);
+  }
+
+  /**
+   * Waits until `count` field events were sent. The queue sends an event only once the one
+   * before it was processed, so every earlier answer has then reached the editor; act
+   * commits the render it caused.
+   */
+  async function processedBefore(count: number): Promise<void> {
+    await vi.waitFor(() => {
+      expect(sentFieldEvents()).toHaveLength(count);
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+  }
+
+  /** Presses `target` while `from` has focus: the press comes first, then focus moves. */
+  function pressMovingFocus(from: HTMLElement, target: HTMLElement): void {
+    fireEvent.pointerDown(target);
+    fireEvent.blur(from);
+    fireEvent.focus(target);
+  }
+
+  it('lists the notice of each field whose event failed in one status banner, a paragraph each in order of failure', async () => {
+    const { definition } = await renderForm(undefined, {
+      route: (call) => {
+        switch (fieldEventTargetOf(call)) {
+          case null:
+            return null;
+          case 'FieldAfter DOB':
+          case 'FieldAfter FirstName':
+            return jsonResponse(500, EVENT_FAILED);
+          default:
+            return fieldEventResponse({});
+        }
+      },
+    });
+    const dob = screen.getByLabelText(promptOf(fieldByName('DOB', definition)));
+    const firstName = screen.getByLabelText(promptOf(fieldByName('FirstName', definition)));
+
+    fireEvent.focus(dob);
+    fireEvent.blur(dob);
+    fireEvent.focus(firstName);
+    fireEvent.blur(firstName);
+
+    await vi.waitFor(() => {
+      expect(checkCodeNoticeBanners()).toEqual([[DOB_EVENT_FAILED, FIRST_NAME_EVENT_FAILED]]);
+    });
+    // The paragraphs sit in one block, the banner's only child that is not a button, so
+    // each takes its own line instead of sharing one with another as a flex item.
+    const banner = present(
+      screen.getAllByRole('status').find((status) => (status.textContent ?? '').startsWith('Check code could not run')),
+      'check-code notice banner',
+    );
+    const blocks = Array.from(banner.children).filter((child) => !(child instanceof HTMLButtonElement));
+    expect(blocks).toHaveLength(1);
+    const paragraphs = within(banner).getAllByRole('paragraph');
+    expect(paragraphs).toHaveLength(2);
+    for (const paragraph of paragraphs) {
+      expect(paragraph.parentElement).toBe(blocks[0]);
+    }
+  });
+
+  it.each<{ end: string; finish: (target: HTMLElement) => void }>([
+    { end: 'a pointerup', finish: (target) => fireEvent.pointerUp(target) },
+    { end: 'a pointercancel', finish: (target) => fireEvent.pointerCancel(target) },
+    { end: 'the window losing focus', finish: () => fireEvent.blur(window) },
+  ])('shows a notice that arrived during a press a task after $end ends the press', async ({ finish }) => {
+    const { definition } = await renderForm(undefined, {
+      route: (call) => {
+        switch (fieldEventTargetOf(call)) {
+          case null:
+            return null;
+          case 'FieldAfter DOB':
+            return jsonResponse(500, EVENT_FAILED);
+          default:
+            return fieldEventResponse({});
+        }
+      },
+    });
+    const dob = screen.getByLabelText(promptOf(fieldByName('DOB', definition)));
+    const firstName = screen.getByLabelText(promptOf(fieldByName('FirstName', definition)));
+
+    fireEvent.focus(dob);
+    pressMovingFocus(dob, firstName);
+    await processedBefore(3);
+    expect(checkCodeNoticeBanners()).toEqual([]);
+
+    finish(firstName);
+    // Applied a task later, so the press's click is dispatched over the same layout.
+    expect(checkCodeNoticeBanners()).toEqual([]);
+    await vi.waitFor(() => {
+      expect(checkCodeNoticeBanners()).toEqual([[DOB_EVENT_FAILED]]);
+    });
+  });
+
+  // QAFE-F03: a press moves focus, which raises events whose notices may appear, change or
+  // go; the banner holds still until the release, so the press and the release land on the
+  // same control.
+  it('holds the check-code notices still while a pointer is pressed and shows their change after the release', async () => {
+    const firstDobAfter = deferred();
+    const afters = { DOB: 0, FirstName: 0 };
+    const { definition } = await renderForm(undefined, {
+      route: (call) => {
+        switch (fieldEventTargetOf(call)) {
+          case null:
+            return null;
+          case 'FieldAfter DOB':
+            // The first is held and then fails; the second is applied, which resolves it.
+            afters.DOB += 1;
+            return afters.DOB === 1 ? firstDobAfter.response : fieldEventResponse({});
+          case 'FieldAfter FirstName':
+            afters.FirstName += 1;
+            return afters.FirstName === 1 ? jsonResponse(500, EVENT_FAILED) : fieldEventResponse({});
+          default:
+            return fieldEventResponse({});
+        }
+      },
+    });
+    const dob = screen.getByLabelText(promptOf(fieldByName('DOB', definition)));
+    const firstName = screen.getByLabelText(promptOf(fieldByName('FirstName', definition)));
+    const lastName = screen.getByLabelText(promptOf(fieldByName('LastName', definition)));
+    const release = (target: HTMLElement): void => {
+      fireEvent.pointerUp(target);
+      fireEvent.click(target);
+    };
+
+    fireEvent.focus(dob);
+
+    // Appearing: DOB's FieldAfter fails while the press on First Name is held.
+    pressMovingFocus(dob, firstName);
+    firstDobAfter.release(jsonResponse(500, EVENT_FAILED));
+    await processedBefore(3);
+    expect(checkCodeNoticeBanners()).toEqual([]);
+    release(firstName);
+    expect(checkCodeNoticeBanners()).toEqual([]);
+    await vi.waitFor(() => {
+      expect(checkCodeNoticeBanners()).toEqual([[DOB_EVENT_FAILED]]);
+    });
+
+    // Growing: First Name's FieldAfter fails; DOB's FieldBefore succeeds and resolves nothing.
+    pressMovingFocus(firstName, dob);
+    await processedBefore(5);
+    expect(checkCodeNoticeBanners()).toEqual([[DOB_EVENT_FAILED]]);
+    release(dob);
+    expect(checkCodeNoticeBanners()).toEqual([[DOB_EVENT_FAILED]]);
+    await vi.waitFor(() => {
+      expect(checkCodeNoticeBanners()).toEqual([[DOB_EVENT_FAILED, FIRST_NAME_EVENT_FAILED]]);
+    });
+
+    // Shrinking: DOB's own FieldAfter is applied.
+    pressMovingFocus(dob, firstName);
+    await processedBefore(7);
+    expect(checkCodeNoticeBanners()).toEqual([[DOB_EVENT_FAILED, FIRST_NAME_EVENT_FAILED]]);
+    release(firstName);
+    expect(checkCodeNoticeBanners()).toEqual([[DOB_EVENT_FAILED, FIRST_NAME_EVENT_FAILED]]);
+    await vi.waitFor(() => {
+      expect(checkCodeNoticeBanners()).toEqual([[FIRST_NAME_EVENT_FAILED]]);
+    });
+
+    // Going: First Name's own FieldAfter is applied.
+    pressMovingFocus(firstName, lastName);
+    await processedBefore(9);
+    expect(checkCodeNoticeBanners()).toEqual([[FIRST_NAME_EVENT_FAILED]]);
+    release(lastName);
+    expect(checkCodeNoticeBanners()).toEqual([[FIRST_NAME_EVENT_FAILED]]);
+    await vi.waitFor(() => {
+      expect(checkCodeNoticeBanners()).toEqual([]);
+    });
+
+    expect(sentFieldEvents()).toEqual([
+      'FieldBefore DOB',
+      'FieldAfter DOB',
+      'FieldBefore FirstName',
+      'FieldAfter FirstName',
+      'FieldBefore DOB',
+      'FieldAfter DOB',
+      'FieldBefore FirstName',
+      'FieldAfter FirstName',
+      'FieldBefore LastName',
+    ]);
+  });
+
   it('decides on a list 404 only after a fresh drain when a dirty draft turns clean with a FieldAfter held', async () => {
     const gate = deferred();
     const { definition, onFormNotFound } = await renderForm(undefined, {
@@ -4989,7 +6080,7 @@ describe('FormView record grid', () => {
     fireEvent.click(within(formActions).getByRole('button', { name: 'Find' }));
     const dialog = screen.getByRole('dialog', { name: 'Find record' });
     fireEvent.click(within(dialog).getByRole('checkbox', { name: 'LastName' }));
-    fireEvent.change(within(dialog).getByRole('textbox', { name: 'Value for LastName' }), {
+    fireEvent.change(within(dialog).getByRole('textbox', { name: 'Last Name (LastName)' }), {
       target: { value: 'Lovelace' },
     });
     const search = within(dialog).getByRole('button', { name: 'Search' });
@@ -5262,6 +6353,254 @@ describe('FormView record grid', () => {
     });
     await findInGrid('1 record');
     expect(state()).toEqual({ checked: true, busy: null, pendingStyle: false, rows: null });
+  });
+
+  it.each<{ list: string; answer: () => Response | Promise<Response>; status: string; retry: boolean; rows: boolean }>([
+    { list: 'a page of records', answer: () => listPage(1, 1), status: '1 record', retry: false, rows: true },
+    {
+      list: 'no match',
+      answer: () => jsonResponse(200, { items: [], total: 0, page: 1, pageSize: 50 } satisfies RecordPage),
+      status: 'No records found.',
+      retry: false,
+      rows: false,
+    },
+    {
+      list: 'a load aborted by something else',
+      answer: () => Promise.reject(abortError()),
+      status: 'The record list was not loaded.',
+      retry: true,
+      rows: false,
+    },
+  ])('reports $list in the one status, beside the search controls and before the table', async (example) => {
+    mountForm(undefined, { route: (call) => (isGet(call, LIST_PATH) ? example.answer() : null) });
+    await vi.waitFor(() => {
+      expect(gridStatus()).toBe(example.status);
+    });
+    const region = records();
+    const statuses = within(region).getAllByRole('status');
+    expect(statuses).toHaveLength(1);
+    const [status] = statuses;
+    // In the controls' row: directly after the toggle, then its Retry when one is offered.
+    const toggle = within(region).getByRole('checkbox', { name: 'Show deleted' });
+    expect(present(toggle.closest('label'), 'toggle label').nextElementSibling).toBe(status);
+    const retry = within(region).queryByRole('button', { name: 'Retry' });
+    expect(retry !== null).toBe(example.retry);
+    if (retry !== null) {
+      expect(status.nextElementSibling).toBe(retry);
+    }
+    // The count is stated once, by the status, and the rows and the paging follow it.
+    expect(within(region).getAllByText(example.status)).toEqual([status]);
+    const table = within(region).queryByRole('table');
+    expect(table !== null).toBe(example.rows);
+    if (table !== null) {
+      expect(status.compareDocumentPosition(table) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      // The footer holds the paging alone.
+      const paging = within(region).getByRole('navigation', { name: 'Record list pages' });
+      const footer = present(paging.parentElement, 'paging footer');
+      expect(footer.tagName).toBe('FOOTER');
+      expect(Array.from(footer.children)).toEqual([paging]);
+      expect(table.compareDocumentPosition(footer) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      // Earlier and Later share one group, so they wrap as a pair, in reading order.
+      const buttons = within(paging).getAllByRole('button');
+      expect(buttons.map((button) => button.textContent)).toEqual(['Earlier records', 'Later records']);
+      const group = present(buttons[0].parentElement, 'paging button group');
+      expect(group).not.toBe(paging);
+      expect(Array.from(group.children)).toEqual(buttons);
+    } else {
+      // No rows, no paging and no empty footer.
+      expect(within(region).queryByRole('navigation')).toBeNull();
+      expect(region.querySelector('footer')).toBeNull();
+    }
+  });
+
+  it.each<{
+    outcome: 'resets' | 'keeps';
+    change: string;
+    total: number;
+    trigger: (definition: FormDefinition) => void;
+  }>([
+    {
+      outcome: 'resets',
+      change: 'a new search',
+      total: 1,
+      trigger: () => fireEvent.change(searchBox(), { target: { value: 'Ada' } }),
+    },
+    {
+      outcome: 'resets',
+      change: 'another page',
+      total: 51,
+      trigger: () => fireEvent.click(within(records()).getByRole('button', { name: 'Later records' })),
+    },
+    {
+      outcome: 'resets',
+      change: 'a "Show deleted" change',
+      total: 1,
+      trigger: () => fireEvent.click(within(records()).getByRole('checkbox', { name: 'Show deleted' })),
+    },
+    {
+      outcome: 'keeps',
+      change: 'a reload of the same page after a save',
+      total: 1,
+      trigger: (definition) => {
+        replyToWrite({ kind: 'saved', record: savedWith(RECORD, { FirstName: 'Adah' }) });
+        fireEvent.change(screen.getByLabelText(promptOf(fieldByName('FirstName', definition))), {
+          target: { value: 'Adah' },
+        });
+        fireEvent.click(
+          within(screen.getByRole('toolbar', { name: 'Form actions' })).getByRole('button', { name: 'Save' }),
+        );
+      },
+    },
+  ])('$outcome the sideways scroll of the rows on $change', async (example) => {
+    // The first list request after the change is held, so the rows it replaces are seen pending.
+    const next = deferred();
+    let holding = false;
+    const { definition } = mountForm(undefined, {
+      route: (call) => {
+        if (!isGet(call, LIST_PATH)) {
+          return null;
+        }
+        const answer = listPage(example.total, Number(call.url.searchParams.get('page') ?? '1'));
+        if (!holding) {
+          return answer;
+        }
+        holding = false;
+        return next.response.then(() => answer);
+      },
+    });
+    const table = () => within(records()).getByRole('table', { name: `${definition.name} records` });
+    await recordOpened();
+    await vi.waitFor(() => {
+      expect(table().getAttribute('aria-busy')).toBe('false');
+    });
+    const box = present(table().parentElement, 'scroll box');
+    box.scrollLeft = 120;
+    const before = listCalls().length;
+
+    holding = true;
+    example.trigger(definition);
+    await vi.waitFor(() => {
+      expect(listCalls().length).toBeGreaterThan(before);
+    });
+    // The old rows stay, pending, in the same scroll box at the user's offset.
+    expect(table().getAttribute('aria-busy')).toBe('true');
+    expect(box.scrollLeft).toBe(120);
+
+    next.release(new Response(null));
+    await vi.waitFor(() => {
+      expect(table().getAttribute('aria-busy')).toBe('false');
+    });
+    // Another listing starts at the inline start; the same listing keeps the user's offset.
+    expect(table().parentElement).toBe(box);
+    expect(box.scrollLeft).toBe(example.outcome === 'keeps' ? 120 : 0);
+  });
+
+  it.each<{
+    outcome: 'restores' | 'leaves';
+    control: string;
+    focused: () => HTMLElement | null;
+    change: () => void;
+    /** The control's viewport top before the change. */
+    top: number;
+  }>([
+    {
+      outcome: 'restores',
+      control: 'the search box in view',
+      focused: () => searchBox(),
+      change: () => fireEvent.change(searchBox(), { target: { value: 'Ada' } }),
+      top: 80,
+    },
+    {
+      outcome: 'restores',
+      control: '"Show deleted" in view',
+      focused: () => within(records()).getByRole('checkbox', { name: 'Show deleted' }),
+      change: () => fireEvent.click(within(records()).getByRole('checkbox', { name: 'Show deleted' })),
+      top: 80,
+    },
+    {
+      outcome: 'leaves',
+      control: 'the search box scrolled out of view',
+      focused: () => searchBox(),
+      change: () => fireEvent.change(searchBox(), { target: { value: 'Ada' } }),
+      top: -100,
+    },
+    {
+      outcome: 'leaves',
+      control: 'no grid control',
+      focused: () => null,
+      change: () => fireEvent.change(searchBox(), { target: { value: 'Ada' } }),
+      top: 80,
+    },
+  ])('$outcome a window offset a shorter list clamps while $control has focus', async (example) => {
+    // jsdom lays nothing out and never scrolls: the window's offset is a value the case
+    // sets, scrollTo only records its calls, and the case gives the boxes it reads.
+    let offset = 0;
+    const ownScrollY = Object.getOwnPropertyDescriptor(window, 'scrollY');
+    Object.defineProperty(window, 'scrollY', { configurable: true, get: () => offset });
+    try {
+      const scrollTo = vi.spyOn(window, 'scrollTo').mockImplementation(() => undefined);
+      let hold: ReturnType<typeof deferred> | null = null;
+      await renderForm(undefined, {
+        route: (call) => {
+          if (hold === null || !isGet(call, LIST_PATH)) {
+            return null;
+          }
+          const { response } = hold;
+          hold = null;
+          return response.then(() => listPage(1, 1));
+        },
+      });
+      const region = records();
+      const busy = () => within(region).getByRole('table').getAttribute('aria-busy');
+      /** Runs `change` with the list request it makes held, then answers it once `offset` is `after`. */
+      const changeList = async (change: () => void, after: number) => {
+        const answer = deferred();
+        hold = answer;
+        change();
+        await vi.waitFor(() => {
+          expect(busy()).toBe('true');
+        });
+        offset = after;
+        answer.release(new Response(null));
+        await vi.waitFor(() => {
+          expect(busy()).toBe('false');
+        });
+      };
+
+      // The user has scrolled the page 600 px; the grid's controls sit at example.top.
+      offset = 600;
+      window.dispatchEvent(new Event('scroll'));
+      example.focused()?.focus();
+      // The shorter list's clamp takes 200 px off the offset and moves the controls down by as much.
+      const shortfall = 200;
+      for (const control of [searchBox(), within(region).getByRole('checkbox', { name: 'Show deleted' })]) {
+        vi.spyOn(control, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, example.top + shortfall, 240, 44));
+      }
+      vi.spyOn(region, 'getBoundingClientRect').mockReturnValue(new DOMRect(0, -400, 1000, 1000));
+
+      await changeList(example.change, offset - shortfall);
+      if (example.outcome === 'restores') {
+        // The section keeps the height the old offset needs, and the window returns to it.
+        expect(region.style.minBlockSize).toBe(`${1000 + shortfall}px`);
+        expect(scrollTo.mock.calls).toEqual([[{ left: 0, top: 600, behavior: 'instant' }]]);
+        offset = 600;
+      } else {
+        expect(region.style.minBlockSize).toBe('');
+        expect(scrollTo).not.toHaveBeenCalled();
+      }
+      window.dispatchEvent(new Event('scroll'));
+
+      // The next change of the list releases the hold; with no clamp, nothing scrolls.
+      await changeList(() => fireEvent.change(searchBox(), { target: { value: 'Adam' } }), offset);
+      expect(region.style.minBlockSize).toBe('');
+      expect(scrollTo).toHaveBeenCalledTimes(example.outcome === 'restores' ? 1 : 0);
+    } finally {
+      if (ownScrollY === undefined) {
+        Reflect.deleteProperty(window, 'scrollY');
+      } else {
+        Object.defineProperty(window, 'scrollY', ownScrollY);
+      }
+    }
   });
 
   it('re-renders no grid row and sends no list request while a field is edited', async () => {

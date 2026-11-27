@@ -77,9 +77,29 @@ internal static class RecordOperations
 /// transaction proves (<see cref="WriteStage"/>).
 /// </para>
 /// <para>
+/// <b>Concurrency.</b> The response snapshot reads the whole base table under <c>HOLDLOCK</c> while the write holds
+/// its own base row exclusively, so two writes in progress together could each wait there for the other's row. Before
+/// its first lock on a record table, after the values passed the contract check, an insert therefore takes the form's
+/// write lock exclusive and an update takes it shared (<see cref="RecordSqlBuilder.AcquireFormWriteLock"/>), both
+/// owned by the transaction. Creates of a form run one at a time and never beside an update of it, so neither forms
+/// a lock cycle with the other; updates still run together and serialise per record on the update lock of the
+/// locked read. A soft delete takes no form lock, because it sends nothing after its exclusive base-row lock. A wait
+/// for the form's lock is bounded by the command timeout, and one that SQL Server ends without the lock is reported
+/// as unavailable with nothing written.
+/// </para>
+/// <para>
 /// <b>Contract violations.</b> A <c>values</c> key that names no writable data field, a repeated field, or a value
 /// its field and column cannot hold is an <see cref="ArgumentException"/>, raised before any base- or page-table
 /// statement is sent, after the transaction is rolled back, and never wrapped.
+/// </para>
+/// <para>
+/// <b>Metadata changed since the caller read it.</b> The public <c>InsertAsync</c> and <c>UpdateAsync</c> check the
+/// values against the metadata their transaction reads, which can differ from the <see cref="FormMetadata"/> the
+/// caller validated them against. A refusal there is the caller's broken argument only when the caller's own metadata
+/// refuses the values too, by the same rules. When it accepts them, or when an insert's transaction no longer finds
+/// the form, the metadata changed after the caller's read: that is no contract violation, and the write rolls back
+/// before any base- or page-table statement and fails as a <see cref="DataStoreWriteException"/> with
+/// <see cref="WriteOutcome.NotWritten"/> and no SQL error number.
 /// </para>
 /// <para>
 /// The instance holds only thread-safe collaborators and is safe to share across threads. It logs nothing, and every
@@ -101,12 +121,15 @@ internal sealed class SqlRecordRepository(
     private const string UnknownFieldMessage = "A value names no data field of the form.";
     private const string ReadOnlyFieldMessage = "A read-only field is never written.";
     private const string RepeatedFieldMessage = "Two values name the same field ignoring case.";
+    private const string MetadataChangedMessage = "The form's metadata changed after the caller read it.";
     private const string MismatchedSchemaMessage = "The form schema does not describe the form.";
     private const string ConnectionNotOpenMessage = "The connection must be open.";
     private const string MissingRecordMessage = "The written record could not be read back inside its transaction.";
     private const string MissingCoordinatesMessage = "The record read carries no intrinsic position and count.";
     private const string RowNotWrittenMessage = "A write statement affected no row of the locked record.";
+    private const string UnexpectedRowCountMessage = "A write statement reported an unexpected number of changed rows.";
     private const string GateResultMessage = "The required gate returned no result.";
+    private const string FormWriteLockRefusedMessage = "SQL Server refused the form's write lock.";
     private const string StampResultMessage = "The save stamp source returned no stamp.";
 
     // The name a submitted value is bound under to test it against its column; that parameter is never sent.
@@ -486,9 +509,11 @@ internal sealed class SqlRecordRepository(
 
 
     /// <summary>
-    /// Inserts a new active record, as <see cref="IDataStore.InsertAsync"/>: the base row with one save stamp for both
-    /// stamp pairs, one row on every page in page order holding every writable data column (<c>NULL</c> when absent),
-    /// then the response snapshot, all in one transaction that then commits.
+    /// Inserts a new active record, as <see cref="IDataStore.InsertAsync"/>: the form's exclusive write lock, then the
+    /// base row with one save stamp for both stamp pairs, one row on every page in page order holding every writable
+    /// data column (<c>NULL</c> when absent), then the response snapshot, all in one transaction that then commits.
+    /// The exclusive lock runs creates of the form one at a time and never beside an update of it, so concurrent
+    /// creates all commit rather than deadlock in their snapshot reads (class remarks).
     /// </summary>
     /// <param name="form">The form's metadata, as the store's metadata read returned it.</param>
     /// <param name="values">The validated values of writable data fields, keyed by canonical name.</param>
@@ -496,13 +521,15 @@ internal sealed class SqlRecordRepository(
     /// <param name="cancellationToken">The request's abort token.</param>
     /// <returns>The new record as committed, with its intrinsic position and count.</returns>
     /// <exception cref="ArgumentException">
-    /// The form is no longer in the metadata, or <paramref name="values"/> breaks the contract (class remarks); raised
-    /// before any base- or page-table statement is sent.
+    /// <paramref name="values"/> breaks the contract against <paramref name="form"/> (class remarks); raised before
+    /// any base- or page-table statement is sent.
     /// </exception>
     /// <exception cref="DataStoreUnavailableException">The database was unavailable; the outcome says what is known.</exception>
     /// <exception cref="DataStoreWriteException">
     /// Any other failure; the outcome says what is known. A page whose table, or its record key column, the catalogue
-    /// does not hold is refused this way, with <see cref="WriteOutcome.NotWritten"/> and nothing written.
+    /// does not hold is refused this way, with <see cref="WriteOutcome.NotWritten"/> and nothing written, as are a form
+    /// the transaction's metadata read no longer finds and values that read refuses although <paramref name="form"/>
+    /// accepts them (class remarks).
     /// </exception>
     public async Task<RecordDto> InsertAsync(
         FormMetadata form,
@@ -523,14 +550,22 @@ internal sealed class SqlRecordRepository(
                 RecordOperations.Insert,
                 async scope =>
                 {
-                    // RecordService reads the metadata before it calls the store, so a form that has vanished since
-                    // is a broken precondition rather than a record that is not found.
+                    // The caller's form came from the store's own metadata read, so a form this transaction no longer
+                    // finds was removed after that read: the metadata changed, which is no broken argument, and the
+                    // failure, raised before any record statement, is reported as writing nothing.
                     (FormMetadata Form, FormSchema Schema) read = await metadata
                             .ReadFormAsync(scope.Connection, scope.Transaction, form.ViewId, cancellationToken)
                             .ConfigureAwait(false)
-                        ?? throw scope.Reject(new ArgumentException(UnknownFormMessage, nameof(form)));
+                        ?? throw new InvalidOperationException(UnknownFormMessage);
 
-                    return await InsertCoreAsync(scope, read.Form, read.Schema, values, stamp, cancellationToken)
+                    return await InsertCoreAsync(
+                            scope,
+                            read.Form,
+                            read.Schema,
+                            callerForm: form,
+                            values,
+                            stamp,
+                            cancellationToken)
                         .ConfigureAwait(false);
                 },
                 cancellationToken)
@@ -542,15 +577,16 @@ internal sealed class SqlRecordRepository(
     /// one transaction that first locks the base row and re-checks the required fields against the stored state.
     /// </summary>
     /// <remarks>
-    /// In order: the locked base read (<c>NotFound</c>, or <c>Deleted</c> for <c>RecStatus</c> 0); the page-row read;
-    /// the required gate; when <paramref name="permissions"/> is not <see langword="null"/>, one permission read inside
-    /// this transaction for the base table and every page table, which must grant UPDATE on each of them and INSERT on
-    /// the table of every page whose row is missing (<c>Forbidden</c>); the one call of
-    /// <paramref name="createStamp"/>; the base last-save stamp; for each page holding a submitted field, in page
-    /// order, the submitted columns, inserting the page row first when the update finds none, as legacy repairs it;
-    /// then the snapshot and the commit.
-    /// Concurrent saves of one record serialise on the base-row lock and the later commit wins for a field both
-    /// submitted, with no row-version check.
+    /// In order: the form's shared write lock; the locked base read (<c>NotFound</c>, or <c>Deleted</c> for
+    /// <c>RecStatus</c> 0); the page-row read; the required gate; when <paramref name="permissions"/> is not
+    /// <see langword="null"/>, one permission read inside this transaction for the base table and every page table,
+    /// which must grant UPDATE on each of them and INSERT on the table of every page whose row is missing
+    /// (<c>Forbidden</c>); the one call of <paramref name="createStamp"/>; the base last-save stamp; for each page
+    /// holding a submitted field, in page order, the submitted columns, inserting the page row first when the update
+    /// finds none, as legacy repairs it; then the snapshot and the commit.
+    /// Updates hold the shared lock together, and none runs beside a create of the form, which holds it exclusive
+    /// (class remarks). Concurrent saves of one record serialise on the base-row lock and the later commit wins for a
+    /// field both submitted, with no row-version check.
     /// </remarks>
     /// <param name="form">The form's metadata, as the store's metadata read returned it.</param>
     /// <param name="globalRecordId">The record's base-table <c>GlobalRecordId</c>, matched exactly.</param>
@@ -572,14 +608,15 @@ internal sealed class SqlRecordRepository(
     /// back with nothing written.
     /// </returns>
     /// <exception cref="ArgumentException">
-    /// <paramref name="submitted"/> breaks the contract (class remarks); raised before any base- or page-table
-    /// statement is sent.
+    /// <paramref name="submitted"/> breaks the contract against <paramref name="form"/> (class remarks); raised before
+    /// any base- or page-table statement is sent.
     /// </exception>
     /// <exception cref="DataStoreUnavailableException">The database was unavailable; the outcome says what is known.</exception>
     /// <exception cref="DataStoreWriteException">
     /// Any other failure, an exception or a <see langword="null"/> result of <paramref name="requiredGate"/> or
     /// <paramref name="createStamp"/> included, which reports <see cref="WriteOutcome.NotWritten"/> with no SQL error
-    /// number.
+    /// number, as do values the transaction's metadata read refuses although <paramref name="form"/> accepts them
+    /// (class remarks).
     /// </exception>
     public async Task<RecordWriteResult> UpdateAsync(
         FormMetadata form,
@@ -616,6 +653,7 @@ internal sealed class SqlRecordRepository(
                             scope,
                             read.Form,
                             read.Schema,
+                            callerForm: form,
                             globalRecordId,
                             submitted,
                             createStamp,
@@ -630,7 +668,9 @@ internal sealed class SqlRecordRepository(
 
     /// <summary>
     /// Soft-deletes a record on its base row only, as <see cref="IDataStore.SoftDeleteAsync"/>: <c>RecStatus</c> 0
-    /// with the last-save stamp, in one transaction. Page rows are never touched and nothing cascades.
+    /// with the last-save stamp, in one transaction. Page rows are never touched and nothing cascades. It takes no form
+    /// write lock: it sends nothing after its exclusive lock on the base row, so it closes no lock cycle with a create
+    /// or an update (class remarks).
     /// </summary>
     /// <param name="form">The form's metadata, as the store's metadata read returned it.</param>
     /// <param name="globalRecordId">
@@ -693,7 +733,8 @@ internal sealed class SqlRecordRepository(
     /// <remarks>
     /// It skips the connection open and the metadata read and runs the same transaction, statements, stage tracking
     /// and observer as <see cref="InsertAsync(FormMetadata, IReadOnlyDictionary{string, FieldValue}, SaveStamp, CancellationToken)"/>.
-    /// The connection is never disposed here.
+    /// With no metadata read of its own, a refused value is always the caller's broken argument, an unwrapped
+    /// <see cref="ArgumentException"/>. The connection is never disposed here.
     /// </remarks>
     /// <param name="connection">An open connection with no pending transaction.</param>
     /// <param name="form">The in-memory metadata of the fixture form.</param>
@@ -721,15 +762,16 @@ internal sealed class SqlRecordRepository(
                 connection,
                 ownsConnection: false,
                 RecordOperations.Insert,
-                scope => InsertCoreAsync(scope, form, schema, values, stamp, cancellationToken),
+                scope => InsertCoreAsync(scope, form, schema, callerForm: null, values, stamp, cancellationToken),
                 cancellationToken)
             .ConfigureAwait(false);
     }
 
     /// <summary>
     /// Updates a record on a connection the caller owns, with a form and schema the caller supplies, through the same
-    /// path as the public <c>UpdateAsync</c>; the reserved-word identifier fixture's entry. The connection is never
-    /// disposed here.
+    /// path as the public <c>UpdateAsync</c>; the reserved-word identifier fixture's entry. With no metadata read of
+    /// its own, a refused value is always the caller's broken argument, an unwrapped <see cref="ArgumentException"/>.
+    /// The connection is never disposed here.
     /// </summary>
     /// <param name="connection">An open connection with no pending transaction.</param>
     /// <param name="form">The in-memory metadata of the fixture form.</param>
@@ -772,6 +814,7 @@ internal sealed class SqlRecordRepository(
                     scope,
                     form,
                     schema,
+                    callerForm: null,
                     globalRecordId,
                     submitted,
                     createStamp,
@@ -833,17 +876,20 @@ internal sealed class SqlRecordRepository(
         return row?.ToDto();
     }
 
-    // The insert both InsertAsync overloads share, inside the transaction RunWriteAsync opened.
+    // The insert both InsertAsync overloads share, inside the transaction RunWriteAsync opened. callerForm is the
+    // metadata the caller validated the values against, when this transaction read form again itself; null when form
+    // is the caller's own (ResolveSubmitted).
     private async Task<WriteDecision<RecordDto>> InsertCoreAsync(
         WriteScope scope,
         FormMetadata form,
         FormSchema schema,
+        FormMetadata? callerForm,
         IReadOnlyDictionary<string, FieldValue> values,
         SaveStamp stamp,
         CancellationToken cancellationToken)
     {
         DataFieldSet dataFields = FormDefinitionFactory.GetDataFields(form);
-        SubmittedValues resolved = scope.Check(() => ResolveValues(schema, dataFields, values, nameof(values)));
+        SubmittedValues resolved = ResolveSubmitted(scope, schema, dataFields, callerForm, values, nameof(values));
 
         // Every statement is built before the first is sent, so a statement the builders refuse sends nothing.
         string globalRecordId = RecordSqlBuilder.NewGlobalRecordId();
@@ -861,6 +907,11 @@ internal sealed class SqlRecordRepository(
                 PageColumns(schema, dataFields, page),
                 resolved.ByName));
         }
+
+        // The form's exclusive write lock comes before the base INSERT, the transaction's first lock on a record table,
+        // and after every statement is built, so a refused insert sends nothing.
+        await AcquireFormWriteLockAsync(scope, RecordOperations.Insert, schema, exclusive: true, cancellationToken)
+            .ConfigureAwait(false);
 
         // OUTPUT INSERTED returns the new key uncoerced, so the converter checks it against its reader-built column.
         object? insertedKey = await SqlExecution.ExecuteScalarAsync<object>(
@@ -892,11 +943,13 @@ internal sealed class SqlRecordRepository(
         return WriteDecision<RecordDto>.Committed(snapshot);
     }
 
-    // The update both UpdateAsync overloads share, inside the transaction RunWriteAsync opened.
+    // The update both UpdateAsync overloads share, inside the transaction RunWriteAsync opened. callerForm is as for
+    // InsertCoreAsync.
     private async Task<WriteDecision<RecordWriteResult>> UpdateCoreAsync(
         WriteScope scope,
         FormMetadata form,
         FormSchema schema,
+        FormMetadata? callerForm,
         string globalRecordId,
         IReadOnlyDictionary<string, FieldValue> submitted,
         Func<SaveStamp> createStamp,
@@ -907,7 +960,13 @@ internal sealed class SqlRecordRepository(
         DataFieldSet dataFields = FormDefinitionFactory.GetDataFields(form);
 
         // Resolved before the locked read, the first base-table statement, so an unknown key reaches no record table.
-        SubmittedValues resolved = scope.Check(() => ResolveValues(schema, dataFields, submitted, nameof(submitted)));
+        SubmittedValues resolved =
+            ResolveSubmitted(scope, schema, dataFields, callerForm, submitted, nameof(submitted));
+
+        // The form's shared write lock comes before the locked read, the transaction's first lock on a record table:
+        // updates hold it together and serialise per record on the locked read, and none runs beside a create.
+        await AcquireFormWriteLockAsync(scope, RecordOperations.Update, schema, exclusive: false, cancellationToken)
+            .ConfigureAwait(false);
 
         if (await ReadBaseRowAsync(
                 scope.Connection,
@@ -1064,6 +1123,42 @@ internal sealed class SqlRecordRepository(
         return WriteDecision<SoftDeleteResult>.Committed(SoftDeleteResult.Deleted(locked.GlobalRecordId));
     }
 
+    // Takes the form's write lock inside the write's transaction (RecordSqlBuilder.AcquireFormWriteLock): exclusive
+    // for a create, shared for an update, released by the commit or the rollback. It is no INSERT or UPDATE, so it
+    // marks no DML and a failure here is classified before any DML. A wait that SQL Server ends without the lock, by
+    // its timeout or as a deadlock victim, is unavailability with nothing written, as a deadlock or a command timeout
+    // of any statement is; a command timeout while waiting reaches the caller as SqlClient's own timeout. Any other
+    // refusal is unexpected, and so is a result the converter refuses: none at all, or one not of the int the
+    // statement selects.
+    private async Task AcquireFormWriteLockAsync(
+        WriteScope scope,
+        string operation,
+        FormSchema schema,
+        bool exclusive,
+        CancellationToken cancellationToken)
+    {
+        object? returned = await SqlExecution.ExecuteScalarAsync<object>(
+                scope.Connection,
+                scope.Transaction,
+                operation,
+                RecordSqlBuilder.AcquireFormWriteLock(schema, exclusive),
+                options.CommandTimeoutSeconds,
+                observer,
+                cancellationToken)
+            .ConfigureAwait(false);
+        int result = ColumnValueConverter.FromComputedInteger(RecordSqlBuilder.FormWriteLockResultType, returned);
+
+        switch (result)
+        {
+            case >= 0:
+                return;
+            case RecordSqlBuilder.FormWriteLockTimedOut or RecordSqlBuilder.FormWriteLockDeadlockVictim:
+                throw new DataStoreUnavailableException(operation, WriteOutcome.NotWritten);
+            default:
+                throw new InvalidOperationException(FormWriteLockRefusedMessage);
+        }
+    }
+
     // The one call of an update's or soft delete's stamp source, inside its transaction once the write is decided and
     // before its first data statement. An exception of the source, or the null stamp that breaks its contract, is
     // raised before any DML, so the transaction rolls back and the write reports NotWritten.
@@ -1096,20 +1191,26 @@ internal sealed class SqlRecordRepository(
         return row.ToDto();
     }
 
-    // One page's submitted columns, chunk by chunk. When the first chunk finds no page row, the row is inserted holding
-    // only its key and the chunk is repeated, as legacy repairs a missing page row
-    // (Epi.Core/Data/Services/CollectedDataProvider.cs:1360-1380); later chunks then find the row.
+    // One page's submitted columns, chunk by chunk, each deciding on the row count it selects itself. The page table
+    // keys on GlobalRecordId, so the first chunk changes no row or one. When it finds no page row, the row is inserted
+    // holding only its key and the chunk is repeated, as legacy repairs a missing page row
+    // (Epi.Core/Data/Services/CollectedDataProvider.cs:1360-1380); the repeat and every later chunk must then change
+    // exactly that row. Any other count means the statement did not run as built, so the write is abandoned.
     private async Task RunPageUpdateAsync(WriteScope scope, PageUpdate pageUpdate, CancellationToken cancellationToken)
     {
         IReadOnlyList<SqlStatement> chunks = pageUpdate.Chunks;
-        int affected = await ExecuteAsync(scope, RecordOperations.Update, chunks[0], cancellationToken)
+        int changed = await ExecuteCountedAsync(scope, RecordOperations.Update, chunks[0], cancellationToken)
             .ConfigureAwait(false);
-        if (affected == 0)
+        if (changed == 0)
         {
             await ExecuteAsync(scope, RecordOperations.Update, pageUpdate.InsertKey, cancellationToken)
                 .ConfigureAwait(false);
             await ExecuteOnLockedRowAsync(scope, RecordOperations.Update, chunks[0], cancellationToken)
                 .ConfigureAwait(false);
+        }
+        else if (changed != 1)
+        {
+            throw new InvalidOperationException(UnexpectedRowCountMessage);
         }
 
         for (int index = 1; index < chunks.Count; index++)
@@ -1119,38 +1220,66 @@ internal sealed class SqlRecordRepository(
         }
     }
 
-    // A statement that must change exactly the locked record's row; a statement that finds no row means the record's
-    // rows changed under the lock, so the write is abandoned and rolled back.
+    // An UPDATE that must change exactly the locked record's row, as the row count it selects itself reports. No row
+    // means the record's rows changed under the lock; more than one means the statement did not run as built, as does
+    // no count, which ExecuteCountedAsync refuses. Either way the write is abandoned and rolled back.
     private async Task ExecuteOnLockedRowAsync(
         WriteScope scope,
         string operation,
         SqlStatement statement,
         CancellationToken cancellationToken)
     {
-        if (await ExecuteAsync(scope, operation, statement, cancellationToken).ConfigureAwait(false) == 0)
+        int changed = await ExecuteCountedAsync(scope, operation, statement, cancellationToken).ConfigureAwait(false);
+        if (changed != 1)
         {
-            throw new InvalidOperationException(RowNotWrittenMessage);
+            throw new InvalidOperationException(changed == 0 ? RowNotWrittenMessage : UnexpectedRowCountMessage);
         }
     }
 
-    // Sends one statement of the write. Every statement sent here is an INSERT or an UPDATE, so SqlExecution marks the
-    // scope's DML as sent once the statement has passed its local checks and immediately before it goes out; one those
-    // checks refuse, such as a statement on a closed connection, sends nothing and marks nothing. Reads go through
-    // SqlExecution directly and mark nothing.
-    private Task<int> ExecuteAsync(
+    // Sends one UPDATE of the write, built to end by selecting its own row count (RecordSqlBuilder.UpdateBaseStamp,
+    // SoftDelete and UpdatePageColumns), and returns that count, read through the converter as the int @@ROWCOUNT is
+    // (RecordSqlBuilder.RowCountType), so a statement that returned no count, or one of another type, fails rather than
+    // reading as 0. The count is read from the statement's result, never from the provider's affected-row count, which
+    // is -1 under NOCOUNT ON for a row changed and for none alike. The scope's DML is marked as ExecuteAsync marks it.
+    private async Task<int> ExecuteCountedAsync(
+        WriteScope scope,
+        string operation,
+        SqlStatement statement,
+        CancellationToken cancellationToken)
+    {
+        object? count = await SqlExecution.ExecuteScalarAsync<object>(
+                scope.Connection,
+                scope.Transaction,
+                operation,
+                statement,
+                options.CommandTimeoutSeconds,
+                observer,
+                cancellationToken,
+                onDispatch: scope.MarkDmlSent)
+            .ConfigureAwait(false);
+        return ColumnValueConverter.FromComputedInteger(RecordSqlBuilder.RowCountType, count);
+    }
+
+    // Sends one INSERT of the write. SqlExecution marks the scope's DML as sent once the statement has passed its local
+    // checks and immediately before it goes out; one those checks refuse, such as a statement on a closed connection,
+    // sends nothing and marks nothing. The provider's affected-row count is not returned: it is -1 under NOCOUNT ON,
+    // so no write decides on it, and an UPDATE goes through ExecuteCountedAsync. Reads go through SqlExecution
+    // directly and mark nothing.
+    private async Task ExecuteAsync(
         WriteScope scope,
         string operation,
         SqlStatement statement,
         CancellationToken cancellationToken) =>
-        SqlExecution.ExecuteAsync(
-            scope.Connection,
-            scope.Transaction,
-            operation,
-            statement,
-            options.CommandTimeoutSeconds,
-            observer,
-            cancellationToken,
-            onDispatch: scope.MarkDmlSent);
+        await SqlExecution.ExecuteAsync(
+                scope.Connection,
+                scope.Transaction,
+                operation,
+                statement,
+                options.CommandTimeoutSeconds,
+                observer,
+                cancellationToken,
+                onDispatch: scope.MarkDmlSent)
+            .ConfigureAwait(false);
 
 
     // Runs one write transaction on connection and, when it owns the connection, releases it. A release failure after
@@ -1450,10 +1579,46 @@ internal sealed class SqlRecordRepository(
     }
 
 
-    // The contract check of a write's values, run before any base- or page-table statement: each key resolves to a
-    // writable data field of the form (exact name, else the one canonical name equal to it ignoring case), no two keys
-    // name the same field ignoring case, as the validator refuses them, and each value binds to its column exactly as
-    // the write statement will bind it, so a value of the wrong kind or one the column cannot hold is refused here.
+    // The contract check of a write's values inside its transaction (ResolveValues), and whose error a refusal is.
+    // Without callerForm, the transaction writes with the caller's own metadata, so a refusal is the caller's broken
+    // argument (WriteScope.Check). With it, the transaction read the metadata again after the caller validated the
+    // values against callerForm, so a refusal is the caller's broken argument only when callerForm refuses the values
+    // too, by the same rules (ApplyValueRules, which sends nothing); that refusal is then raised. When callerForm
+    // accepts them, the metadata changed after the caller read it. That is no contract violation but a failure before
+    // any record statement, which RunTransactionAsync rolls back and reports as writing nothing, with the transaction's
+    // refusal as its inner exception.
+    private static SubmittedValues ResolveSubmitted(
+        WriteScope scope,
+        FormSchema schema,
+        DataFieldSet dataFields,
+        FormMetadata? callerForm,
+        IReadOnlyDictionary<string, FieldValue> values,
+        string paramName)
+    {
+        if (callerForm is null)
+        {
+            return scope.Check(() => ResolveValues(schema, dataFields, values, paramName));
+        }
+
+        try
+        {
+            return ResolveValues(schema, dataFields, values, paramName);
+        }
+        catch (ArgumentException refused)
+        {
+            DataFieldSet callerFields = FormDefinitionFactory.GetDataFields(callerForm);
+            _ = scope.Check(() => ApplyValueRules(
+                callerFields,
+                values,
+                paramName,
+                (callerField, _) => callerField.Column,
+                column => column));
+            throw new InvalidOperationException(MetadataChangedMessage, refused);
+        }
+    }
+
+    // The contract check of a write's values against the metadata and catalogue schema the transaction uses, run
+    // before any base- or page-table statement, by the rules of ApplyValueRules with each field's catalogue column.
     // The result holds the values under their canonical names and their columns in data-field order.
     private static SubmittedValues ResolveValues(
         FormSchema schema,
@@ -1464,6 +1629,47 @@ internal sealed class SqlRecordRepository(
         var byName = new Dictionary<string, (ProjectedColumn Column, FieldValue Value)>(
             values.Count,
             StringComparer.Ordinal);
+        foreach ((DataFieldMetadata field, ProjectedColumn column, FieldValue value) in ApplyValueRules(
+                     dataFields,
+                     values,
+                     paramName,
+                     (dataField, ordinal) => RecordSqlBuilder.ResolveDataColumn(schema, dataField, ordinal),
+                     projected => projected.Column.Metadata))
+        {
+            byName.Add(field.Name, (column, value));
+        }
+
+        var exact = new Dictionary<string, FieldValue>(byName.Count, StringComparer.Ordinal);
+        var columns = new List<(ProjectedColumn Column, FieldValue Value)>(byName.Count);
+        foreach (DataFieldMetadata field in dataFields)
+        {
+            if (byName.TryGetValue(field.Name, out (ProjectedColumn Column, FieldValue Value) entry))
+            {
+                exact.Add(field.Name, entry.Value);
+                columns.Add(entry);
+            }
+        }
+
+        return new SubmittedValues(new ReadOnlyDictionary<string, FieldValue>(exact), columns.AsReadOnly());
+    }
+
+    // The contract rules of a write's values, stated once for both checks that apply them: the transaction's
+    // (ResolveValues, with the catalogue column) and the caller's (ResolveSubmitted, with the column the caller's
+    // metadata names). Each key resolves to a writable data field of dataFields (exact name, else the one canonical
+    // name equal to it ignoring case); no two keys name the same field ignoring case, as the validator refuses them;
+    // and each value binds to the column resolveColumn gives its field, typed as columnType describes it, exactly as
+    // the write statement will bind it, so a value of the wrong kind or one the column cannot hold is refused. The
+    // first broken rule throws an ArgumentException for paramName with a fixed message. Otherwise the entries come
+    // back in values order, each with its field, its column, resolved with its 0-based place among them, and its
+    // value.
+    private static List<(DataFieldMetadata Field, TColumn Column, FieldValue Value)> ApplyValueRules<TColumn>(
+        DataFieldSet dataFields,
+        IReadOnlyDictionary<string, FieldValue> values,
+        string paramName,
+        Func<DataFieldMetadata, int, TColumn> resolveColumn,
+        Func<TColumn, ColumnMetadata> columnType)
+    {
+        var entries = new List<(DataFieldMetadata Field, TColumn Column, FieldValue Value)>(values.Count);
         var seen = new HashSet<string>(values.Count, StringComparer.OrdinalIgnoreCase);
         foreach ((string name, FieldValue value) in values)
         {
@@ -1482,23 +1688,12 @@ internal sealed class SqlRecordRepository(
                 throw new ArgumentException(RepeatedFieldMessage, paramName);
             }
 
-            ProjectedColumn column = RecordSqlBuilder.ResolveDataColumn(schema, field, byName.Count);
-            _ = ColumnValueConverter.ToParameter(ProbeParameterName, column.Column.Metadata, field.FieldType, value);
-            byName.Add(field.Name, (column, value));
+            TColumn column = resolveColumn(field, entries.Count);
+            _ = ColumnValueConverter.ToParameter(ProbeParameterName, columnType(column), field.FieldType, value);
+            entries.Add((field, column, value));
         }
 
-        var exact = new Dictionary<string, FieldValue>(byName.Count, StringComparer.Ordinal);
-        var columns = new List<(ProjectedColumn Column, FieldValue Value)>(byName.Count);
-        foreach (DataFieldMetadata field in dataFields)
-        {
-            if (byName.TryGetValue(field.Name, out (ProjectedColumn Column, FieldValue Value) entry))
-            {
-                exact.Add(field.Name, entry.Value);
-                columns.Add(entry);
-            }
-        }
-
-        return new SubmittedValues(new ReadOnlyDictionary<string, FieldValue>(exact), columns.AsReadOnly());
+        return entries;
     }
 
     // Every data-field column of one page, in data-field order: the columns a new record's page row names.
@@ -1744,13 +1939,6 @@ internal sealed class SqlRecordRepository(
                 ContractViolation = exception;
                 throw;
             }
-        }
-
-        // Marks exception as the caller's broken argument, for the caller to throw.
-        public ArgumentException Reject(ArgumentException exception)
-        {
-            ContractViolation = exception;
-            return exception;
         }
 
         // Called by SqlExecution immediately before each INSERT or UPDATE is sent, after its local checks.

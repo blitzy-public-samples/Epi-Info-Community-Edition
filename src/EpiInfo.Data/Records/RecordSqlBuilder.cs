@@ -168,8 +168,15 @@ internal enum SelectedSetClause
 /// depend on serialisation across a whole table, or assume its absence. Every later base statement addresses the row by
 /// <c>UniqueKey</c> and <c>GlobalRecordId</c> together, a clustered-key seek, and page tables key on
 /// <c>GlobalRecordId</c>, so page statements seek. A writer can still wait on another record's writer, in the locked
-/// scan or in the snapshot read, which scans the base table for the intrinsic coordinates; a deadlock that ends such a
-/// wait (1205) is reported by the repository as not written.
+/// scan or in the snapshot read, which scans the base table for the intrinsic coordinates under <c>HOLDLOCK</c> while
+/// the writer holds its own base row exclusively: the new key of a create, the stamped row of an update. Two writes
+/// waiting there for each other's row would deadlock, so a create and an update each take the form's write lock
+/// (<see cref="AcquireFormWriteLock"/>) first, exclusive for a create and shared for an update. No create then runs
+/// beside another create or an update of the same form, which removes every cycle a create can close, while updates
+/// still run together and serialise per record on the locked read. Two updates of different records can therefore
+/// still wait for each other's stamped row in their snapshot reads where the locked scan keeps only the matching row
+/// locked; a deadlock that ends such a wait (1205), or one with a writer outside the application, is reported by the
+/// repository as not written, and so is a wait for the form's write lock that ends without the lock.
 /// </para>
 /// <para>
 /// <b>Read hint.</b> The database runs locking <c>READ COMMITTED</c>, with neither read-committed snapshot nor
@@ -292,6 +299,30 @@ internal static class RecordSqlBuilder
     /// </summary>
     internal const int MaxColumnsPerUpdate = 100;
 
+    /// <summary>
+    /// The result of <see cref="AcquireFormWriteLock"/> when the lock was not granted before its wait ended: the
+    /// <c>sp_getapplock</c> return code for a timed-out request. Results of 0 and above mean the lock was granted.
+    /// </summary>
+    internal const int FormWriteLockTimedOut = -1;
+
+    /// <summary>
+    /// The result of <see cref="AcquireFormWriteLock"/> when SQL Server chose the request as a deadlock victim: the
+    /// <c>sp_getapplock</c> return code for that case.
+    /// </summary>
+    internal const int FormWriteLockDeadlockVictim = -3;
+
+    /// <summary>
+    /// The native type of the one value <see cref="AcquireFormWriteLock"/> returns: <c>int</c>, the type of the
+    /// <c>sp_getapplock</c> return code it selects.
+    /// </summary>
+    internal const DbType FormWriteLockResultType = DbType.Int32;
+
+    /// <summary>
+    /// The native type of the one value each counted <c>UPDATE</c> returns (<see cref="UpdatePageColumns"/>,
+    /// <see cref="UpdateBaseStamp"/>, <see cref="SoftDelete"/>): <c>int</c>, the type of <c>@@ROWCOUNT</c>.
+    /// </summary>
+    internal const DbType RowCountType = DbType.Int32;
+
     // The number of base columns every record SELECT starts with: GlobalRecordId, UniqueKey, RecStatus.
     private const int RecordBaseColumnCount = 3;
 
@@ -304,9 +335,25 @@ internal static class RecordSqlBuilder
     private const string SetPositionColumn = "[sp]";
     private const string SetCountColumn = "[sc]";
 
+    // The values AcquireFormWriteLock binds: the fixed prefix of every form's lock resource, which the base table's
+    // reader-built name completes; the two lock modes; the transaction as the lock's owner; and the lock timeout -1,
+    // which waits without a limit of its own, so the command timeout bounds the wait. Each is bound as a parameter, so
+    // none reaches SQL text.
+    private const string FormWriteLockResourcePrefix = "EpiInfo.Web.RecordWrites/";
+    private const string ExclusiveLockMode = "Exclusive";
+    private const string SharedLockMode = "Shared";
+    private const string TransactionLockOwner = "Transaction";
+    private const int LockWaitWithoutLimit = -1;
+
     // Catalogue lookup key of a page table's key column, matched through TableSchema.FindColumn, which returns the
     // reader-built column. The literal never reaches SQL text.
     private const string PageKeyColumnName = "GlobalRecordId";
+
+    // The tail of every UPDATE whose row count the repository decides on (UpdatePageColumns, UpdateBaseStamp and
+    // SoftDelete): the statement returns its own count as one row. @@ROWCOUNT holds the count of the UPDATE just run
+    // whatever the session's NOCOUNT setting, whereas the provider's affected-row count is -1 under NOCOUNT ON, which
+    // a server's 'user options' can make every session's default.
+    private const string RowCountSelect = "; SELECT @@ROWCOUNT";
 
     // Fixed messages: the redaction policy keeps identifiers, values and ids out of exception text.
     private const string MissingSystemColumnMessage = "The form's base table lacks a required system column.";
@@ -786,7 +833,9 @@ internal static class RecordSqlBuilder
     /// The intrinsic windows are computed over the whole base table, under the base-table hint described in the class
     /// remarks, so the row, its position and its count describe one committed state, including the transaction's own
     /// writes. Inside the write transaction the hint's locks last until its commit, which the repository sends
-    /// immediately after this read; no later statement of the transaction waits on them.
+    /// immediately after this read; no later statement of the transaction waits on them. The form's write lock the
+    /// transaction took first (<see cref="AcquireFormWriteLock"/>) keeps a create's read from meeting the uncommitted
+    /// base row of another create or of an update, and an update's read from meeting a create's.
     /// </remarks>
     /// <param name="schema">The form's catalogue view.</param>
     /// <param name="dataFields">The data fields to project, in data-field order.</param>
@@ -820,6 +869,63 @@ internal static class RecordSqlBuilder
         AppendBaseRowKey(core.Sql, schema, parameters, uniqueKey, globalRecordId, BaseAlias);
 
         return core.Finish(parameters);
+    }
+
+    /// <summary>
+    /// Takes the form's write lock inside a write transaction: <c>DECLARE @result int; EXEC @result =
+    /// sys.sp_getapplock @Resource = @p0, @LockMode = @p1, @LockOwner = @p2, @LockTimeout = @p3; SELECT @result</c>,
+    /// an application lock whose resource is a fixed prefix followed by the form's base-table name, owned by the
+    /// transaction, so its commit or rollback releases it.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A create takes the lock exclusive and an update takes it shared, each before any statement of its transaction
+    /// that holds a lock on a record table. The response snapshot (<see cref="RecordSnapshot"/>) reads the whole base
+    /// table under <c>HOLDLOCK</c> after the write's own exclusive lock on its base row, the new key of a create or the
+    /// stamped row of an update. Two such writes in progress together would each wait in that read for the other's
+    /// uncommitted row and end in a deadlock (1205). Under the lock a create of the form runs beside no other create
+    /// and no update of the form, so that read meets no uncommitted row of another create or update; updates still run
+    /// beside each other and serialise per record on <see cref="LockBase"/>. A soft delete takes no lock: it sends no
+    /// statement after its exclusive lock on its base row, so while it holds that lock it waits on no other writer and
+    /// closes no cycle. Reads take no lock.
+    /// </para>
+    /// <para>
+    /// The statement names no table: the resource, the mode, the owner and the lock timeout are all positional
+    /// parameters. The resource is the reader-built base-table name, at most 128 characters, after the fixed prefix,
+    /// so it stays within the 255 characters <c>sp_getapplock</c> takes, and two forms never share a lock. The lock
+    /// timeout is -1, which waits without a limit of its own, so the command timeout bounds the wait and a wait that
+    /// outlasts it fails as a command timeout.
+    /// </para>
+    /// </remarks>
+    /// <param name="schema">The form's catalogue view, whose base table names the resource.</param>
+    /// <param name="exclusive">
+    /// <see langword="true"/> for the exclusive lock of a create; <see langword="false"/> for the shared lock of an
+    /// update.
+    /// </param>
+    /// <returns>
+    /// A statement returning the <c>sp_getapplock</c> return code as one <c>int</c>: 0 or 1 when the lock is granted,
+    /// <see cref="FormWriteLockTimedOut"/> or <see cref="FormWriteLockDeadlockVictim"/> when SQL Server ended the
+    /// wait without granting it, and another negative code when it refused the request.
+    /// </returns>
+    /// <exception cref="ArgumentNullException"><paramref name="schema"/> is null.</exception>
+    internal static SqlStatement AcquireFormWriteLock(FormSchema schema, bool exclusive)
+    {
+        ArgumentNullException.ThrowIfNull(schema);
+
+        var parameters = new PositionalParameters();
+        var resource = parameters.Add(n =>
+            ColumnValueConverter.Text(n, FormWriteLockResourcePrefix + schema.BaseTable.Name));
+        var mode = parameters.Add(n => ColumnValueConverter.Text(n, exclusive ? ExclusiveLockMode : SharedLockMode));
+        var owner = parameters.Add(n => ColumnValueConverter.Text(n, TransactionLockOwner));
+        var timeout = parameters.Add(n => ColumnValueConverter.Int32(n, LockWaitWithoutLimit));
+        var sql = new StringBuilder("DECLARE @result int; EXEC @result = sys.sp_getapplock @Resource = ")
+            .Append(resource)
+            .Append(", @LockMode = ").Append(mode)
+            .Append(", @LockOwner = ").Append(owner)
+            .Append(", @LockTimeout = ").Append(timeout)
+            .Append("; SELECT @result");
+
+        return parameters.ToStatement(sql.ToString());
     }
 
     /// <summary>
@@ -1005,8 +1111,8 @@ internal static class RecordSqlBuilder
 
     /// <summary>
     /// Stamps a record's base row on update: <c>UPDATE [base] SET [LastSaveLogonName] = @p0, [LastSaveTime] = @p1
-    /// WHERE [UniqueKey] = @p2 AND [GlobalRecordId] = @p3 AND DATALENGTH([GlobalRecordId]) = DATALENGTH(@p3)</c>,
-    /// naming only the stamp columns the base table has.
+    /// WHERE [UniqueKey] = @p2 AND [GlobalRecordId] = @p3 AND DATALENGTH([GlobalRecordId]) = DATALENGTH(@p3);
+    /// SELECT @@ROWCOUNT</c>, naming only the stamp columns the base table has.
     /// </summary>
     /// <param name="schema">The form's catalogue view.</param>
     /// <param name="uniqueKey">The locked base row's <c>UniqueKey</c>.</param>
@@ -1016,7 +1122,10 @@ internal static class RecordSqlBuilder
     /// matches no row.
     /// </param>
     /// <param name="stamp">The save stamp of this write.</param>
-    /// <returns>The update, or <see langword="null"/> when the base table has neither last-save column.</returns>
+    /// <returns>
+    /// The update, whose one result row holds the number of base rows it changed, whatever the session's
+    /// <c>NOCOUNT</c> setting; or <see langword="null"/> when the base table has neither last-save column.
+    /// </returns>
     /// <exception cref="ArgumentNullException">An argument is null.</exception>
     /// <exception cref="ArgumentException">A value does not fit its column.</exception>
     /// <exception cref="InvalidOperationException">The base table lacks a required system column.</exception>
@@ -1039,14 +1148,15 @@ internal static class RecordSqlBuilder
 
     /// <summary>
     /// Writes the submitted columns of one page row: <c>UPDATE [page] SET [colA] = @p0, ... WHERE [GlobalRecordId] =
-    /// @pN</c>, at most <see cref="MaxColumnsPerUpdate"/> columns per statement, as legacy chunks its page updates
-    /// (<c>Epi.Core/Data/Services/CollectedDataProvider.cs:1274-1340</c>).
+    /// @pN; SELECT @@ROWCOUNT</c>, at most <see cref="MaxColumnsPerUpdate"/> columns per statement, as legacy chunks
+    /// its page updates (<c>Epi.Core/Data/Services/CollectedDataProvider.cs:1274-1340</c>).
     /// </summary>
     /// <remarks>
     /// Only submitted columns are named, so two concurrent saves of different fields both keep their values. Legacy
     /// rewrote every column of every page (<c>:1225-1392</c>); the delta is a deliberate reconciliation recorded in the
-    /// parity notes. Each statement has its own parameters, far below the SQL Server limit of 2,100. When the first
-    /// statement affects no row, the caller sends <see cref="InsertPageKey"/> and repeats it, as legacy does
+    /// parity notes. Each statement has its own parameters, far below the SQL Server limit of 2,100. Each returns the
+    /// number of page rows it changed as its one result row, whatever the session's <c>NOCOUNT</c> setting. When the
+    /// first statement reports none, the caller sends <see cref="InsertPageKey"/> and repeats it, as legacy does
     /// (<c>:1360-1380</c>).
     /// </remarks>
     /// <param name="page">The page whose table holds the row.</param>
@@ -1099,7 +1209,8 @@ internal static class RecordSqlBuilder
             }
 
             sql.Append(" WHERE ").Append(SqlIdentifier.Quote(key)).Append(" = ")
-                .Append(parameters.Add(n => ColumnValueConverter.ToSystemParameter(n, key, globalRecordId)));
+                .Append(parameters.Add(n => ColumnValueConverter.ToSystemParameter(n, key, globalRecordId)))
+                .Append(RowCountSelect);
             statements.Add(parameters.ToStatement(sql.ToString()));
         }
 
@@ -1138,7 +1249,7 @@ internal static class RecordSqlBuilder
     /// <summary>
     /// Soft-deletes a record on its base row only: <c>UPDATE [base] SET [RecStatus] = @p0[, [LastSaveLogonName] =
     /// @p1][, [LastSaveTime] = @p2] WHERE [UniqueKey] = @pN AND [GlobalRecordId] = @pM AND
-    /// DATALENGTH([GlobalRecordId]) = DATALENGTH(@pM)</c>.
+    /// DATALENGTH([GlobalRecordId]) = DATALENGTH(@pM); SELECT @@ROWCOUNT</c>.
     /// </summary>
     /// <remarks>
     /// <c>RecStatus</c> becomes <see cref="RecordQueryRules.DeletedRecStatus"/> and the last-save stamps are written
@@ -1154,7 +1265,10 @@ internal static class RecordSqlBuilder
     /// matches no row.
     /// </param>
     /// <param name="stamp">The save stamp of this write.</param>
-    /// <returns>The update statement.</returns>
+    /// <returns>
+    /// The update statement, whose one result row holds the number of base rows it changed, whatever the session's
+    /// <c>NOCOUNT</c> setting.
+    /// </returns>
     /// <exception cref="ArgumentNullException">An argument is null.</exception>
     /// <exception cref="ArgumentException">A value does not fit its column.</exception>
     /// <exception cref="InvalidOperationException">The base table lacks a required system column.</exception>
@@ -1385,7 +1499,8 @@ internal static class RecordSqlBuilder
     }
 
     // UPDATE [base] SET [a] = @p0, ... WHERE [UniqueKey] = @pN AND [GlobalRecordId] = @pM AND
-    // DATALENGTH([GlobalRecordId]) = DATALENGTH(@pM), with no alias.
+    // DATALENGTH([GlobalRecordId]) = DATALENGTH(@pM); SELECT @@ROWCOUNT, with no alias: the update returns its own
+    // row count, which the repository requires to be 1, the locked row.
     private static SqlStatement UpdateBaseRow(
         FormSchema schema,
         int uniqueKey,
@@ -1405,6 +1520,7 @@ internal static class RecordSqlBuilder
 
         sql.Append(" WHERE ");
         AppendBaseRowKey(sql, schema, parameters, uniqueKey, globalRecordId, alias: null);
+        sql.Append(RowCountSelect);
 
         return parameters.ToStatement(sql.ToString());
     }

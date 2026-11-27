@@ -109,6 +109,11 @@ export interface UseRecordEditorOptions {
   readonly onSaved: (record: RecordDto) => void;
   /** The DELETE returned 204. */
   readonly onDeleted: () => void;
+  /**
+   * A PUT returned 409: the record was deleted elsewhere. It stays open read-only, and
+   * navigation learns that the selected set has changed.
+   */
+  readonly onConflict: () => void;
   /** The record is gone (404) or its edits were discarded: open the nearest record. */
   readonly onDiscardToNearest: (notice?: string) => void;
   /**
@@ -196,8 +201,13 @@ export interface RecordEditor {
   /** Check-code DIALOGs in execution order; the first is shown. */
   readonly dialogs: readonly DialogMessage[];
   readonly dismissDialog: () => void;
-  /** A non-blocking notice that a field event could not be evaluated. */
-  readonly eventNotice: string | null;
+  /**
+   * The non-blocking notices of the fields whose field events could not be evaluated, one
+   * per field in the order of its first failure; empty when there is none. A field's notice
+   * lasts until each kind of event that failed on that field has since succeeded there, or
+   * the record changes.
+   */
+  readonly eventNotices: readonly string[];
 }
 
 type EditorActions = Pick<
@@ -239,7 +249,7 @@ interface EditorState {
   readonly deletedReadOnly: boolean;
   readonly deleteDialogOpen: boolean;
   readonly dialogs: readonly DialogMessage[];
-  readonly eventNotice: string | null;
+  readonly eventNotices: readonly string[];
   /** leave() is running: the draft is frozen until it resolves. */
   readonly leaving: boolean;
   /**
@@ -460,7 +470,7 @@ function freshDraft(index: FieldIndex, record: RecordDto | null, isNew: boolean,
     deletedReadOnly: false,
     deleteDialogOpen: false,
     dialogs: [],
-    eventNotice: null,
+    eventNotices: [],
     leaving: false,
     uncertain: false,
     saved: false,
@@ -744,11 +754,6 @@ function createController(host: ControllerHost): Controller {
 
   /** The draft is being left or replaced: no edit or field event may change it. */
   const frozen = (): boolean => leaveLocks > 0 || awaitingCommit || host.options().transitioning === true;
-  /**
-   * Counts the field-event failure notices shown. A successful write clears the notice
-   * only when none arrived while it was in flight, so a newer event's failure stays.
-   */
-  let noticeSerial = 0;
 
   const indexOf = (definition: FormDefinition): FieldIndex => {
     if (indexCache === null || indexCache.definition !== definition) {
@@ -774,10 +779,9 @@ function createController(host: ControllerHost): Controller {
         return;
       }
       const current = host.state();
-      // A later event succeeded, so an earlier event's failure notice no longer holds.
       if (recordProtected(current)) {
         // A deleted record keeps its values: only the check-code flags change.
-        host.update({ checkCodeDisabled: next.checkCodeDisabled, eventNotice: null });
+        host.update({ checkCodeDisabled: next.checkCodeDisabled });
         return;
       }
       for (const field of index().dataFields) {
@@ -796,7 +800,6 @@ function createController(host: ControllerHost): Controller {
         values: next.values,
         dirty: next.dirty,
         checkCodeDisabled: next.checkCodeDisabled,
-        eventNotice: null,
       });
     },
     onDialogs: (dialogs) => {
@@ -804,10 +807,11 @@ function createController(host: ControllerHost): Controller {
         host.update({ dialogs: [...host.state().dialogs, ...dialogs] });
       }
     },
-    onNotice: (message) => {
+    // The queue owns which failures stand: an event of another field, a save or a raise
+    // resolves none, so nothing else in the editor changes the list.
+    onNotices: (messages) => {
       if (active) {
-        noticeSerial += 1;
-        host.update({ eventNotice: message });
+        host.update({ eventNotices: messages });
       }
     },
   };
@@ -948,7 +952,6 @@ function createController(host: ControllerHost): Controller {
     const { client, viewId } = host.options();
     failedWrite = null;
     inFlightWrite = write;
-    const noticesBefore = noticeSerial;
     host.update({ saving: true, banner: null, saved: false });
     const result = await settle(() =>
       write.method === 'POST'
@@ -974,11 +977,8 @@ function createController(host: ControllerHost): Controller {
       carrySaved = leaveLocks > 0;
       host.update({ uncertain: false, saved: true });
       adoptRecord(result.data, write);
-      // The record was saved, so a field-event failure shown before the write, such as an
-      // unreachable database, no longer holds; one that arrived during the write stays.
-      if (noticeSerial === noticesBefore && host.state().eventNotice !== null) {
-        host.update({ eventNotice: null });
-      }
+      // A save runs no check code, so the field-event failures it drained stay on screen:
+      // their effects, such as an assigned Age, are still missing from the record.
       host.options().onSaved(result.data);
       return true;
     }
@@ -1017,6 +1017,7 @@ function createController(host: ControllerHost): Controller {
       // anything be saved to a deleted record, so no write is left to block.
       uncertainWrite = null;
       host.update({ deletedReadOnly: true, dirty: new Set(), banner, uncertain: false });
+      host.options().onConflict();
       return;
     }
     if (error.kind === 'server' || error.kind === 'unavailable' || error.kind === 'network') {
@@ -1314,10 +1315,9 @@ function createController(host: ControllerHost): Controller {
     return active && !isProtectedIn(host.state(), index(), name);
   }
 
+  // Raising changes no notice: the layout stays as it is while focus moves, and a failure
+  // stands until an event of its own kind on its own field succeeds.
   function raise(kind: FieldEventKind, name: string): void {
-    if (host.state().eventNotice !== null) {
-      host.update({ eventNotice: null });
-    }
     queue().raise(kind, name);
   }
 
@@ -1479,7 +1479,7 @@ function present(state: EditorState, index: FieldIndex, actions: EditorActions, 
     isDisabled: (name) => frozen || isProtected(name) || state.checkCodeDisabled.has(name),
     deleteDialogOpen: state.deleteDialogOpen,
     dialogs: state.dialogs,
-    eventNotice: state.eventNotice,
+    eventNotices: state.eventNotices,
     ...actions,
   };
 }

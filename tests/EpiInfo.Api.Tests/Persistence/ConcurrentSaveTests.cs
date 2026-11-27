@@ -16,12 +16,14 @@ namespace EpiInfo.Api.Tests.Persistence;
 /// The concurrency rule of the save path: two concurrent <c>PUT</c>s of one record serialise on the update lock of its
 /// base row, so a field only one save submits keeps that save's value, fields both saves submit hold the values of the
 /// later commit, together, and the page writes of the two saves never interleave. There is no row-version check: the
-/// later writer wins, as in legacy Epi Info.
+/// later writer wins, as in legacy Epi Info. Creates on the form, sent together with each other or beside an update of
+/// another record, all commit, each with its base row and one row on every page: no two such writes form a lock
+/// cycle, so none is ended as a deadlock victim and answered 503.
 /// </summary>
 /// <remarks>
 /// <para>
-/// Each test creates its own <c>FoodHistory</c> record, carrying a <see cref="TestDatabase.NewMarker"/> marker in
-/// <c>LastName</c>, and leaves it in the database. Its saves submit only <c>LastName</c> (page one,
+/// Each test creates its own <c>FoodHistory</c> records, each carrying a <see cref="TestDatabase.NewMarker"/> marker
+/// in <c>LastName</c>, and leaves them in the database. Its saves submit only <c>LastName</c> (page one,
 /// <c>FoodHistory2</c>, <c>nvarchar(4000)</c>) and <c>Lab</c> (page two, <c>FoodHistory3</c>, <c>nvarchar(4000)</c>),
 /// two text fields with no pattern, no maximum length and no legal values, so every value a test builds passes
 /// validation. No seeded row, metadata row or schema object is touched.
@@ -59,6 +61,14 @@ namespace EpiInfo.Api.Tests.Persistence;
 /// recorded commands, identify an overlapping pair's winner from the values SQL holds, require the two to agree, and
 /// every assertion holds for either order.
 /// </para>
+/// <para>
+/// The create cases send rounds of two and of ten simultaneous creates, and rounds of one create beside an update of
+/// another record the test created. Requests sent together can still run one after the other, so each case repeats
+/// to give the transactions many chances to overlap. Every request must succeed, and the snapshot taken before the
+/// first round, compared with the one after the last, must show exactly one new row per record table for each created
+/// record, its marker in <c>LastName</c>, and no other change than the update's own columns. Their messages name
+/// tables, columns, ids and counts, never a stored or submitted value.
+/// </para>
 /// </remarks>
 [Trait("Category", "Integration")]
 [Collection(DatabaseCollections.Database)]
@@ -92,6 +102,14 @@ public sealed partial class ConcurrentSaveTests : IAsyncLifetime
 
     // Rounds of the overlapping pair: more rounds give the two transactions more chances to contend for the lock.
     private const int OverlappingRounds = 5;
+
+    // Rounds of two simultaneous creates, then rounds of a burst of simultaneous creates, and rounds of a create sent
+    // beside an update of another record: requests sent together can still run one after the other, so each case
+    // repeats to give the transactions many chances to overlap.
+    private const int CreatePairRounds = 10;
+    private const int CreateBurstRounds = 2;
+    private const int CreateBurstSize = 10;
+    private const int CreateBesideUpdateRounds = 10;
 
     // RecStatus of an active record, as the save path writes it on insert.
     private const short ActiveRecStatus = 1;
@@ -463,6 +481,272 @@ public sealed partial class ConcurrentSaveTests : IAsyncLifetime
             await SettleAsync(putB);
         }
     }
+
+    [Fact]
+    public async Task Simultaneous_creates_on_the_form_all_commit_each_with_every_row_of_its_record()
+    {
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        CancellationToken ct = timeout.Token;
+        await using DatabaseWriteLock dbLock = await DatabaseWriteLock.AcquireExclusiveAsync(ct);
+
+        Factory.Clock.SetLocalNow(TestStart);
+        int viewId = await ApiTestClient.GetViewIdAsync(Client, FormName, ct);
+        SqlSnapshot before = await SqlSnapshot.CaptureAsync(ct);
+
+        // Each created record's marker, by the id its response returned.
+        var created = new Dictionary<string, string>(StringComparer.Ordinal);
+        for (int round = 1; round <= CreatePairRounds; round++)
+        {
+            await CreateSimultaneouslyAsync(
+                viewId,
+                count: 2,
+                string.Create(CultureInfo.InvariantCulture, $"round {round} of two simultaneous creates"),
+                created,
+                ct);
+        }
+
+        for (int round = 1; round <= CreateBurstRounds; round++)
+        {
+            await CreateSimultaneouslyAsync(
+                viewId,
+                CreateBurstSize,
+                string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"round {round} of {CreateBurstSize} simultaneous creates"),
+                created,
+                ct);
+        }
+
+        SqlSnapshot after = await SqlSnapshot.CaptureAsync(ct);
+        AssertOnlyCreatedRecordsAdded(
+            SqlSnapshot.Compare(before, after),
+            after,
+            created,
+            changedRecord: null,
+            allowedChanges: new HashSet<(string Table, string Column)>(),
+            "the simultaneous creates");
+    }
+
+    [Fact]
+    public async Task A_create_sent_beside_an_update_of_another_record_commits_and_the_update_commits()
+    {
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        CancellationToken ct = timeout.Token;
+        await using DatabaseWriteLock dbLock = await DatabaseWriteLock.AcquireExclusiveAsync(ct);
+
+        Factory.Clock.SetLocalNow(TestStart);
+        int viewId = await ApiTestClient.GetViewIdAsync(Client, FormName, ct);
+        string updatedId = await CreateRecordAsync(viewId, TestDatabase.NewMarker(), ct);
+        string updatedPath = RecordPath(viewId, updatedId);
+        SqlSnapshot before = await SqlSnapshot.CaptureAsync(ct);
+
+        var created = new Dictionary<string, string>(StringComparer.Ordinal);
+        string? lastLab = null;
+        for (int round = 1; round <= CreateBesideUpdateRounds; round++)
+        {
+            string label = string.Create(CultureInfo.InvariantCulture, $"round {round} of a create beside an update");
+            StampAt(minutes: round);
+            string marker = TestDatabase.NewMarker();
+            string lab = string.Create(CultureInfo.InvariantCulture, $"lab-U{round}-{Guid.NewGuid():N}");
+
+            // Both requests are in flight before either is awaited, so the create's transaction and the update's can
+            // overlap.
+            Task<CreatedRecord> create =
+                ApiTestClient.CreateRecordAsync(Client, viewId, FieldValues((PageOneField, marker)), ct);
+            Task<HttpResponseMessage> update = ApiTestClient.PutJsonAsync(
+                Client, updatedPath, new { values = FieldValues((PageTwoField, lab)) }, ct);
+            try
+            {
+                await WhenAllSettledAsync(create, update);
+
+                Assert.True(
+                    create.IsCompletedSuccessfully,
+                    $"{label}: the POST must return 201 with its record; {FailureOf(create)}");
+                RecordCreated(created, await create, marker, $"the POST of {label}");
+
+                Assert.True(
+                    update.IsCompletedSuccessfully,
+                    $"{label}: the PUT of GlobalRecordId {updatedId} sent no response; {FailureOf(update)}");
+                JsonElement updatedValues =
+                    await ReadSavedValuesAsync(await update, updatedId, $"the PUT of {label}", ct);
+                AssertResponseText(updatedValues, PageTwoField, lab, updatedId, $"the PUT of {label}");
+            }
+            finally
+            {
+                await SettleAsync(update);
+                await WhenAllSettledAsync(create);
+            }
+
+            lastLab = lab;
+        }
+
+        Assert.NotNull(lastLab);
+        SqlSnapshot after = await SqlSnapshot.CaptureAsync(ct);
+        AssertStoredTextWritten(after, PageTwoTable, PageTwoField, updatedId, lastLab, "the last update");
+        AssertOnlyCreatedRecordsAdded(
+            SqlSnapshot.Compare(before, after),
+            after,
+            created,
+            updatedId,
+            new HashSet<(string Table, string Column)>
+            {
+                (PageTwoTable, PageTwoField),
+                (BaseTable, LastSaveLogonNameColumn),
+                (BaseTable, LastSaveTimeColumn),
+            },
+            "the creates beside the updates");
+    }
+
+    // Sends count creates, each with a fresh marker in LastName, with every request in flight before any is awaited,
+    // so their write transactions can overlap. Every one must return 201 with a new id and its own marker; each is
+    // added to created.
+    private async Task CreateSimultaneouslyAsync(
+        int viewId,
+        int count,
+        string label,
+        Dictionary<string, string> created,
+        CancellationToken ct)
+    {
+        string[] markers = [.. Enumerable.Range(0, count).Select(_ => TestDatabase.NewMarker())];
+        Task<CreatedRecord>[] creates =
+        [
+            .. markers.Select(marker =>
+                ApiTestClient.CreateRecordAsync(Client, viewId, FieldValues((PageOneField, marker)), ct)),
+        ];
+        await WhenAllSettledAsync(creates);
+
+        string[] failures = [.. creates.Where(create => !create.IsCompletedSuccessfully).Select(FailureOf)];
+        Assert.True(
+            failures.Length == 0,
+            string.Create(
+                CultureInfo.InvariantCulture,
+                $"{label}: every POST must return 201 with its record; {failures.Length} of {count} did not: " +
+                $"{string.Join(" | ", failures)}"));
+
+        for (int index = 0; index < creates.Length; index++)
+        {
+            RecordCreated(
+                created,
+                await creates[index],
+                markers[index],
+                string.Create(CultureInfo.InvariantCulture, $"POST {index + 1} of {label}"));
+        }
+    }
+
+    // Adds a created record to created, keyed by its new id: an id no earlier create returned, whose response values
+    // hold the marker the request sent.
+    private static void RecordCreated(
+        Dictionary<string, string> created,
+        CreatedRecord record,
+        string marker,
+        string request)
+    {
+        Assert.True(
+            created.TryAdd(record.GlobalRecordId, marker),
+            $"{request} returned GlobalRecordId {record.GlobalRecordId}, which an earlier create of the test returned.");
+        if (record.Record.ValueKind != JsonValueKind.Object ||
+            !record.Record.TryGetProperty("values", out JsonElement values) ||
+            values.ValueKind != JsonValueKind.Object)
+        {
+            throw new XunitException(
+                $"{request} returned a Record of GlobalRecordId {record.GlobalRecordId} without a values object.");
+        }
+
+        AssertResponseText(values, PageOneField, marker, record.GlobalRecordId, request);
+    }
+
+    // Waits until every request has completed, successfully or not, without observing any outcome, so the caller
+    // inspects each one and no failure hides another.
+    private static async Task WhenAllSettledAsync(params Task[] requests) =>
+        await Task.WhenAll(requests).ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
+
+    // Why a request task did not complete with a value: the exception's type and message, which the API test client
+    // writes from the response's shape alone and never from a value, or the task's status.
+    private static string FailureOf(Task request) =>
+        request.Exception?.InnerException is { } failure
+            ? $"{failure.GetType().Name}: {failure.Message}"
+            : $"task status {request.Status}";
+
+    // The test's records are the only change: every created record added exactly one row to each of the form's record
+    // tables, with its marker in LastName; no other row was added or removed; no column set changed; and the only
+    // changed cells are allowedChanges of changedRecord. Messages name tables, columns, ids and counts, never a value.
+    private static void AssertOnlyCreatedRecordsAdded(
+        SnapshotDiff diff,
+        SqlSnapshot after,
+        IReadOnlyDictionary<string, string> created,
+        string? changedRecord,
+        IReadOnlySet<(string Table, string Column)> allowedChanges,
+        string context)
+    {
+        var violations = new List<string>();
+        violations.AddRange(diff.SchemaChanges.Select(change => $"the columns of {change.Table} changed"));
+        violations.AddRange(diff.RemovedRows.Select(row => $"a {row.Table} row {row.GlobalRecordId} was removed"));
+        violations.AddRange(diff.AddedRows
+            .Where(row => !created.ContainsKey(row.GlobalRecordId))
+            .Select(row => $"a {row.Table} row {row.GlobalRecordId} of no created record was added"));
+        violations.AddRange(diff.ChangedCells
+            .Where(cell => !string.Equals(cell.GlobalRecordId, changedRecord, StringComparison.Ordinal) ||
+                !allowedChanges.Contains((cell.Table, cell.Column)))
+            .Select(cell => $"{cell.Table}.{cell.Column} of GlobalRecordId {cell.GlobalRecordId} changed"));
+
+        foreach ((string globalRecordId, string marker) in created)
+        {
+            foreach (string table in RecordTables)
+            {
+                int added = diff.AddedRows.Count(row =>
+                    string.Equals(row.Table, table, StringComparison.Ordinal) &&
+                    string.Equals(row.GlobalRecordId, globalRecordId, StringComparison.Ordinal));
+                if (added != 1)
+                {
+                    violations.Add(string.Create(
+                        CultureInfo.InvariantCulture,
+                        $"created GlobalRecordId {globalRecordId} added {added} {table} rows, not 1"));
+                }
+            }
+
+            if (after.Row(PageOneTable, globalRecordId)?[PageOneField] is not string stored ||
+                !string.Equals(stored, marker, StringComparison.Ordinal))
+            {
+                violations.Add(
+                    $"{PageOneTable}.{PageOneField} of created GlobalRecordId {globalRecordId} does not hold its marker");
+            }
+        }
+
+        Assert.True(
+            violations.Count == 0,
+            string.Create(
+                CultureInfo.InvariantCulture,
+                $"After {context}, the record tables must hold the {created.Count} created records, each with one row " +
+                $"per table, and no other change; {violations.Count} violations: {string.Join("; ", violations)}."));
+    }
+
+    // The response's values carry expected as the text of field; the message names the field and id, never the text.
+    private static void AssertResponseText(
+        JsonElement values,
+        string field,
+        string expected,
+        string globalRecordId,
+        string request) =>
+        Assert.True(
+            values.TryGetProperty(field, out JsonElement value) &&
+            value.ValueKind == JsonValueKind.String &&
+            string.Equals(value.GetString(), expected, StringComparison.Ordinal),
+            $"{request} must return in {field} of GlobalRecordId {globalRecordId} the text it sent; it returned a " +
+            $"{(values.TryGetProperty(field, out JsonElement returned) ? returned.ValueKind.ToString() : "missing")} " +
+            "value that differs.");
+
+    // The record's row of a table holds expected in column; the message names the cell, never the text.
+    private static void AssertStoredTextWritten(
+        SqlSnapshot snapshot,
+        string table,
+        string column,
+        string globalRecordId,
+        string expected,
+        string context) =>
+        Assert.True(
+            snapshot.Row(table, globalRecordId)?[column] is string stored &&
+            string.Equals(stored, expected, StringComparison.Ordinal),
+            $"After {context}, {table}.{column} of GlobalRecordId {globalRecordId} does not hold the text it wrote.");
 
     // Creates the test's record at the current clock time, with the marker in LastName and an initial Lab, so both
     // fields the saves submit start with a value of their own. Returns the id as the base row stores it.

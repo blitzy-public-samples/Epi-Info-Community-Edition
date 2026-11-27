@@ -235,6 +235,7 @@ public sealed class IdentifierProvenanceTests
             Record + nameof(RecordSqlBuilder.RecordById),
             Record + nameof(RecordSqlBuilder.RecordByUniqueKey),
             Record + nameof(RecordSqlBuilder.RecordSnapshot),
+            Record + nameof(RecordSqlBuilder.AcquireFormWriteLock),
             Record + nameof(RecordSqlBuilder.InsertBase),
             Record + nameof(RecordSqlBuilder.InsertPage),
             Record + nameof(RecordSqlBuilder.LockBase),
@@ -354,14 +355,22 @@ public sealed class IdentifierProvenanceTests
 /// A <c>values</c> key the reader did not return is refused by the repository before any command names a base or
 /// page table, on insert and on update.
 /// </description></item>
+/// <item><description>
+/// Values the caller's own metadata accepts but the metadata read inside the write's transaction refuses, and an
+/// insert whose form that read no longer finds, mean the metadata changed after the caller read it: the write fails
+/// as a <see cref="DataStoreWriteException"/> reporting <see cref="WriteOutcome.NotWritten"/>, again before any
+/// record command, while the same values with the reader's own form stay the caller's
+/// <see cref="ArgumentException"/>. The caller's older metadata is built in memory from the reader's form, so no
+/// metadata row changes.
+/// </description></item>
 /// </list>
 /// </summary>
 /// <remarks>
 /// <para>
 /// Each form is resolved by name through the reader, never by a hard-coded id. The selected-set cases read only
 /// metadata and the catalogue and hold the shared test lock. The refusal cases hold the exclusive lock because they
-/// compare before-and-after snapshots, which must show no change: the only writes they attempt are refused, the
-/// update is refused on an id no row holds, and no record is created. The class writes nothing, edits no seeded
+/// compare before-and-after snapshots, which must show no change: the only writes they attempt are refused, every
+/// update and soft delete names an id no row holds, and no record is created. The class writes nothing, edits no seeded
 /// row, metadata row or schema object, and no failure message prints a parameter value.
 /// </para>
 /// <para>
@@ -381,6 +390,10 @@ public sealed class IdentifierProvenanceIntegrationTests
 
     // The text an unknown key is submitted with; it never reaches a statement.
     private const string UnknownKeyValue = "unknown";
+
+    // The values a read-only field is submitted with, by its type; neither reaches a statement.
+    private const string ReadOnlyFieldText = "R-1";
+    private const double ReadOnlyFieldNumber = 17;
 
     // The two seeded forms, resolved by name through the reader.
     private static readonly string[] SeededForms = ["CaseReport", "FoodHistory"];
@@ -403,6 +416,16 @@ public sealed class IdentifierProvenanceIntegrationTests
 
     /// <summary>The seeded forms.</summary>
     public static TheoryData<string> Forms => new(SeededForms);
+
+    /// <summary>
+    /// Each seeded form with one of its read-only data fields (testdata/sql/03_forms.sql): the text StateIDNumber on
+    /// CaseReport1 and the number OnsetWeek on FoodHistory2.
+    /// </summary>
+    public static TheoryData<string, string> ReadOnlyFields => new()
+    {
+        { "CaseReport", "StateIDNumber" },
+        { "FoodHistory", "OnsetWeek" },
+    };
 
     /// <summary>
     /// Each seeded form with each clause and set, and the keyword expected before the predicate:
@@ -556,6 +579,148 @@ public sealed class IdentifierProvenanceIntegrationTests
         AssertUnchanged(beforeUpdates, await SqlSnapshot.CaptureAsync(cancellationToken));
     }
 
+    // A caller that validated its values against metadata read while the field was still writable holds that field
+    // writable; the transaction's own metadata read finds it read-only. The same values are refused in both cases, but
+    // only the reader's own form makes the refusal the caller's broken argument. With the caller's older copy the
+    // metadata changed after the caller read it, so the write reports that it wrote nothing. The update runs on an id
+    // no row holds, and both refusals come before the locked read, so the gate never runs and no record is touched.
+    [Theory]
+    [MemberData(nameof(ReadOnlyFields))]
+    public async Task FieldMadeReadOnlyAfterTheCallersRead_IsRefusedAsNotWrittenBeforeAnyRecordSql(
+        string formName,
+        string readOnlyField)
+    {
+        await TestDatabase.EnsureReachableAsync();
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        CancellationToken cancellationToken = timeout.Token;
+        await using var writeLock = await DatabaseWriteLock.AcquireExclusiveAsync(cancellationToken);
+
+        RecordPath path = RecordPath.Create();
+        ProvenanceForm form = await path.ReadFormAsync(formName, cancellationToken);
+        DataFieldMetadata field = Assert.Single(
+            FormDefinitionFactory.GetDataFields(form.Metadata),
+            candidate => string.Equals(candidate.Name, readOnlyField, StringComparison.Ordinal));
+        Assert.True(field.Field.IsReadOnly, "The seeded field is not read-only.");
+        FormMetadata callersForm = WithWritableField(form.Metadata, readOnlyField);
+        IReadOnlyDictionary<string, FieldValue> values = Values(
+            (TestDatabase.MarkerField, FieldValue.FromText(TestDatabase.NewMarker())),
+            (readOnlyField, SampleValue(field)));
+        string unstoredId = Guid.NewGuid().ToString();
+        int gateCalls = 0;
+
+        Task Insert(FormMetadata callerForm) =>
+            path.Repository.InsertAsync(callerForm, values, NewStamp(), cancellationToken);
+        Task Update(FormMetadata callerForm) => path.Repository.UpdateAsync(
+            callerForm,
+            unstoredId,
+            values,
+            NewStamp,
+            _ =>
+            {
+                gateCalls++;
+                return RequiredGatePasses;
+            },
+            permissions: null,
+            cancellationToken);
+
+        SqlSnapshot before = await SqlSnapshot.CaptureAsync(cancellationToken);
+
+        // The reader's own form refuses the read-only field, so the caller broke its contract.
+        path.Recorder.Clear();
+        AssertRefusedBeforeRecordSql(
+            await Assert.ThrowsAsync<ArgumentException>(() => Insert(form.Metadata)),
+            "values",
+            readOnlyField,
+            path.Recorder,
+            form);
+
+        path.Recorder.Clear();
+        AssertRefusedBeforeRecordSql(
+            await Assert.ThrowsAsync<ArgumentException>(() => Update(form.Metadata)),
+            "submitted",
+            readOnlyField,
+            path.Recorder,
+            form);
+
+        // The caller's older copy accepts the same values, so the metadata changed after the caller read it.
+        path.Recorder.Clear();
+        AssertNotWrittenBeforeRecordSql(
+            await Assert.ThrowsAsync<DataStoreWriteException>(() => Insert(callersForm)),
+            RecordOperations.Insert,
+            path.Recorder,
+            form);
+
+        path.Recorder.Clear();
+        AssertNotWrittenBeforeRecordSql(
+            await Assert.ThrowsAsync<DataStoreWriteException>(() => Update(callersForm)),
+            RecordOperations.Update,
+            path.Recorder,
+            form);
+
+        Assert.Equal(0, gateCalls);
+        AssertUnchanged(before, await SqlSnapshot.CaptureAsync(cancellationToken));
+    }
+
+    // The caller's form came from the store's own metadata read, so an insert whose transaction no longer finds the
+    // form was given a form removed after that read: it reports that it wrote nothing, before any record SQL. An update
+    // and a soft delete of such a form keep their NotFound result. The removed form is the reader's form under a view
+    // id no metaViews row holds, so no metadata row changes.
+    [Theory]
+    [MemberData(nameof(Forms))]
+    public async Task FormRemovedAfterTheCallersRead_InsertIsRefusedAsNotWrittenBeforeAnyRecordSql(string formName)
+    {
+        await TestDatabase.EnsureReachableAsync();
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        CancellationToken cancellationToken = timeout.Token;
+        await using var writeLock = await DatabaseWriteLock.AcquireExclusiveAsync(cancellationToken);
+
+        RecordPath path = RecordPath.Create();
+        ProvenanceForm form = await path.ReadFormAsync(formName, cancellationToken);
+        IReadOnlyList<FormSummary> forms = await path.Reader.ListFormsAsync(cancellationToken);
+        FormMetadata removedForm = form.Metadata with { ViewId = forms.Max(summary => summary.ViewId) + 1 };
+        IReadOnlyDictionary<string, FieldValue> values =
+            Values((TestDatabase.MarkerField, FieldValue.FromText(TestDatabase.NewMarker())));
+        string unstoredId = Guid.NewGuid().ToString();
+        int gateCalls = 0;
+
+        SqlSnapshot before = await SqlSnapshot.CaptureAsync(cancellationToken);
+
+        path.Recorder.Clear();
+        AssertNotWrittenBeforeRecordSql(
+            await Assert.ThrowsAsync<DataStoreWriteException>(
+                () => path.Repository.InsertAsync(removedForm, values, NewStamp(), cancellationToken)),
+            RecordOperations.Insert,
+            path.Recorder,
+            form);
+
+        path.Recorder.Clear();
+        RecordWriteResult update = await path.Repository.UpdateAsync(
+            removedForm,
+            unstoredId,
+            values,
+            NewStamp,
+            _ =>
+            {
+                gateCalls++;
+                return RequiredGatePasses;
+            },
+            permissions: null,
+            cancellationToken);
+        Assert.Equal(RecordWriteStatus.NotFound, update.Status);
+        AssertNoRecordSql(path.Recorder, form);
+
+        path.Recorder.Clear();
+        SoftDeleteResult delete =
+            await path.Repository.SoftDeleteAsync(removedForm, unstoredId, NewStamp, cancellationToken);
+        Assert.Equal(SoftDeleteStatus.NotFound, delete.Status);
+        Assert.Null(delete.GlobalRecordId);
+        AssertNoRecordSql(path.Recorder, form);
+
+        Assert.Equal(0, gateCalls);
+        AssertUnchanged(before, await SqlSnapshot.CaptureAsync(cancellationToken));
+    }
+
+
     // The text a caller has written before the predicate: the reader-built base table and its alias, as
     // RecordSqlBuilder.Count writes them.
     private static string StatementStart(FormSchema schema) =>
@@ -596,19 +761,64 @@ public sealed class IdentifierProvenanceIntegrationTests
 
     private static SaveStamp NewStamp() => new(Environment.UserName, SaveStamp.TruncateToSeconds(DateTime.Now));
 
-    // The repository's documented refusal of a values key that names no data field: an unwrapped ArgumentException
-    // for the values parameter, whose fixed message names no key, sent after metadata reads only. A record command,
-    // a write, or any command under a record operation would mean the key reached record SQL.
+    // The reader's form as a caller holds it that read the metadata while fieldName was still writable: the same rows,
+    // with that one field's IsReadOnly cleared, built in memory.
+    private static FormMetadata WithWritableField(FormMetadata form, string fieldName) =>
+        form with
+        {
+            Fields =
+            [
+                .. form.Fields.Select(field => string.Equals(field.Name, fieldName, StringComparison.Ordinal)
+                    ? field with { IsReadOnly = false }
+                    : field),
+            ],
+        };
+
+    // A value of the field's own type that its column holds, so only the field's read-only flag decides its refusal.
+    private static FieldValue SampleValue(DataFieldMetadata field) => field.FieldType switch
+    {
+        FieldType.Text => FieldValue.FromText(ReadOnlyFieldText),
+        FieldType.Number => FieldValue.FromNumber(ReadOnlyFieldNumber),
+        _ => throw new ArgumentOutOfRangeException(
+            nameof(field),
+            field.FieldType,
+            "The tests sample read-only text and number fields only."),
+    };
+
+    // The repository's documented refusal of values that break the caller's own contract, such as a key that names no
+    // data field or a read-only field: an unwrapped ArgumentException for the values parameter, whose fixed message
+    // names no key, sent after metadata reads only.
     private static void AssertRefusedBeforeRecordSql(
         ArgumentException rejected,
         string expectedParameter,
-        string unknownKey,
+        string refusedKey,
         SqlCommandRecorder recorder,
         ProvenanceForm form)
     {
         Assert.Equal(expectedParameter, rejected.ParamName);
-        Assert.DoesNotContain(unknownKey, rejected.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(refusedKey, rejected.Message, StringComparison.Ordinal);
+        AssertNoRecordSql(recorder, form);
+    }
 
+    // The repository's refusal of a write whose metadata changed after the caller read it: a DataStoreWriteException
+    // for the write's operation that reports NotWritten and carries no SQL error number, sent after metadata reads
+    // only.
+    private static void AssertNotWrittenBeforeRecordSql(
+        DataStoreWriteException failure,
+        string expectedOperation,
+        SqlCommandRecorder recorder,
+        ProvenanceForm form)
+    {
+        Assert.Equal(expectedOperation, failure.Operation);
+        Assert.Equal(WriteOutcome.NotWritten, failure.Outcome);
+        Assert.Null(failure.SqlErrorNumber);
+        AssertNoRecordSql(recorder, form);
+    }
+
+    // No record SQL: a record command, a write, or any command under a record operation would mean the write reached
+    // a base or page table.
+    private static void AssertNoRecordSql(SqlCommandRecorder recorder, ProvenanceForm form)
+    {
         IReadOnlyList<RecordedCommand> commands = recorder.Commands;
         string[] reachedRecordSql =
         [

@@ -30,7 +30,7 @@ import { ConnectionError } from './ConnectionError';
 import { FieldRenderer } from './FieldRenderer';
 import { FindRecordDialog } from './FindRecordDialog';
 import { MessageDialog } from './MessageDialog';
-import { PageTabs } from './PageTabs';
+import { PageTabs, pageTabId, pageTabPanelId } from './PageTabs';
 import { RecordGrid } from './RecordGrid';
 import { RecordNavigator } from './RecordNavigator';
 import { ValidationSummary } from './ValidationSummary';
@@ -345,6 +345,12 @@ interface FocusRequest {
   readonly sequence: number;
 }
 
+/** A page tab's selection, whose panel is shown from its start; `sequence` repeats a selection of the same page. */
+interface RevealRequest {
+  readonly pageId: number;
+  readonly sequence: number;
+}
+
 function byPosition(a: PageDefinition, b: PageDefinition): number {
   return a.position - b.position || a.pageId - b.pageId;
 }
@@ -414,11 +420,39 @@ function focusFieldControl(fieldName: string): void {
   target?.focus();
 }
 
+/**
+ * Scrolls a selected page's panel back to its start when that start lies above the bottom
+ * edge the sticky page tab strip has while stuck under the workspace header, as it does on a
+ * page scrolled past its start: otherwise the user would land deep inside the new page, or
+ * past its end in the grid. The stuck edge is the strip's sticky offset plus its height, not
+ * its current rect: a shorter new panel can end above the viewport and take the strip with
+ * it. At the top of the page the panel starts below that edge, and where the strip is not
+ * sticky the panel always starts right at the strip, so nothing moves.
+ */
+function revealPanelStart(pageId: number): void {
+  const panel = document.getElementById(pageTabPanelId(pageId));
+  const tablist = document.getElementById(pageTabId(pageId))?.closest('[role="tablist"]') ?? null;
+  if (panel === null || tablist === null) {
+    return;
+  }
+  const style = getComputedStyle(tablist);
+  const stickyTop = Number.parseFloat(style.top);
+  if (style.position !== 'sticky' || Number.isNaN(stickyTop)) {
+    return;
+  }
+  const stuckBottom = stickyTop + tablist.getBoundingClientRect().height;
+  const hidden = stuckBottom - panel.getBoundingClientRect().top;
+  // A sliver under a pixel is layout rounding, not a hidden start.
+  if (hidden >= 1) {
+    window.scrollBy(0, -hidden);
+  }
+}
+
 /** The page on show in the workspace, and the two ways to change it. */
 interface PageSelection {
   /** The page whose panel is shown; `null` when the form has no page. */
   readonly selectedPageId: number | null;
-  /** Shows a page, as its tab does. */
+  /** Shows a page from its start, as its tab does. */
   readonly selectPage: (pageId: number) => void;
   /** Shows the page that lists `fieldName` and focuses its control, as a validation summary jump does. */
   readonly selectField: (fieldName: string) => void;
@@ -429,17 +463,32 @@ interface PageSelection {
  * selected page starts at the form's first page and survives record changes; only the user,
  * through a tab, or the validation summary changes it. A jump shows the field's page and
  * focuses the field's control once the commit that shows that page has run, and a repeated
- * jump to the same field focuses it again.
+ * jump to the same field focuses it again. A tab's selection, repeated or not, shows its
+ * page's panel from its start (revealPanelStart); a jump instead brings its focused control
+ * into view.
  */
 function usePageSelection(definition: FormDefinition): PageSelection {
   const [selectedPageId, setSelectedPageId] = useState<number | null>(() => firstPageId(definition.pages));
   const [focusRequest, setFocusRequest] = useState<FocusRequest | null>(null);
+  const [revealRequest, setRevealRequest] = useState<RevealRequest | null>(null);
   useEffect(() => {
     // Runs after the commit that shows the field's page, so the control is no longer hidden.
     if (focusRequest !== null) {
       focusFieldControl(focusRequest.fieldName);
     }
   }, [focusRequest]);
+  // A layout effect: it measures the panel the commit just showed, and the scroll lands
+  // before the browser paints that panel at the old scroll position.
+  useLayoutEffect(() => {
+    if (revealRequest !== null) {
+      revealPanelStart(revealRequest.pageId);
+    }
+  }, [revealRequest]);
+
+  const selectPage = useCallback((pageId: number) => {
+    setSelectedPageId(pageId);
+    setRevealRequest((previous) => ({ pageId, sequence: (previous?.sequence ?? 0) + 1 }));
+  }, []);
 
   const selectField = useCallback(
     (fieldName: string) => {
@@ -452,7 +501,86 @@ function usePageSelection(definition: FormDefinition): PageSelection {
     [definition],
   );
 
-  return { selectedPageId, selectPage: setSelectedPageId, selectField };
+  return { selectedPageId, selectPage, selectField };
+}
+
+// Custom properties on the workspace root that styles.css reads for the sticky header and
+// page tab strip: each part's border-box block size, in px.
+const HEADER_BLOCK_SIZE_PROPERTY = '--form-view-header-block-size';
+const TABS_BLOCK_SIZE_PROPERTY = '--form-view-tabs-block-size';
+
+/**
+ * Publishes the block sizes of the workspace header and of the page tab strip on the
+ * workspace root, where styles.css reads them: the strip sticks just below the header, and
+ * the scroll margins of the controls below keep a control that focus scrolls into view
+ * clear of both. Both sizes change as their controls wrap with the viewport width or the
+ * text size, so a ResizeObserver republishes them; where there is none (jsdom), the sizes
+ * measured at mount stay. A form with no pages has no tab strip, whose size is then 0.
+ */
+function useStickyBlockSizes(rootRef: RefObject<HTMLElement>, headerRef: RefObject<HTMLElement>): void {
+  useLayoutEffect(() => {
+    const root = rootRef.current;
+    const header = headerRef.current;
+    if (root === null || header === null) {
+      return undefined;
+    }
+    const tablist = root.querySelector<HTMLElement>('.page-tabs > [role="tablist"]');
+    const publish = (): void => {
+      root.style.setProperty(HEADER_BLOCK_SIZE_PROPERTY, `${header.getBoundingClientRect().height}px`);
+      root.style.setProperty(TABS_BLOCK_SIZE_PROPERTY, `${tablist?.getBoundingClientRect().height ?? 0}px`);
+    };
+    publish();
+    if (typeof ResizeObserver === 'undefined') {
+      return undefined;
+    }
+    const observer = new ResizeObserver(publish);
+    observer.observe(header, { box: 'border-box' });
+    if (tablist !== null) {
+      observer.observe(tablist, { box: 'border-box' });
+    }
+    return () => {
+      observer.disconnect();
+    };
+  }, [rootRef, headerRef]);
+}
+
+/**
+ * Keeps a control that takes focus in the workspace clear of the sticky header and tab
+ * strip, so focus is never hidden under them. styles.css gives each control a scroll
+ * margin as deep as the stuck parts above it, which the browser keeps clear when focus
+ * scrolls a control into view, but not when focus lands on a part inside a native control,
+ * such as the day, month or year of a date input: Shift+Tab would leave that date under the
+ * header. So a focused control that still starts inside its scroll margin is scrolled to
+ * start just below it. A control taller than the room below its margin, such as a tab panel
+ * that a click on its background focuses, is left where it is, and so is one with no
+ * margin: the header's controls, or any control where the header is not sticky.
+ */
+function useFocusClearOfStickyParts(rootRef: RefObject<HTMLElement>): void {
+  useEffect(() => {
+    const root = rootRef.current;
+    if (root === null) {
+      return undefined;
+    }
+    const handleFocusIn = (event: FocusEvent): void => {
+      if (!(event.target instanceof Element)) {
+        return;
+      }
+      const margin = Number.parseFloat(getComputedStyle(event.target).scrollMarginBlockStart);
+      // NaN where no style sheet sets it (jsdom); 0 where nothing sticks above the control.
+      if (!(margin > 0)) {
+        return;
+      }
+      const { top, height } = event.target.getBoundingClientRect();
+      // A sliver under a pixel is layout rounding, not a hidden control.
+      if (top <= margin - 1 && height <= document.documentElement.clientHeight - margin) {
+        window.scrollBy(0, top - margin);
+      }
+    };
+    root.addEventListener('focusin', handleFocusIn);
+    return () => {
+      root.removeEventListener('focusin', handleFocusIn);
+    };
+  }, [rootRef]);
 }
 
 /** The roles of the workspace's banners, each an alert or a status, whose buttons run the banner actions. */
@@ -563,6 +691,7 @@ function FormWorkspace({
       navigation.afterSave(record);
     },
     onDeleted: navigation.afterDelete,
+    onConflict: navigation.afterConflict,
     onDiscardToNearest: navigation.openNearest,
     transitioning: navigation.transitioning,
   });
@@ -576,6 +705,11 @@ function FormWorkspace({
   usePositionReport(navigation.n, navigation.includeDeleted, onPositionChange);
 
   const { selectedPageId, selectPage, selectField } = usePageSelection(definition);
+
+  const rootRef = useRef<HTMLDivElement>(null);
+  const headerRef = useRef<HTMLDivElement>(null);
+  useStickyBlockSizes(rootRef, headerRef);
+  useFocusClearOfStickyParts(rootRef);
 
   const [findOpen, setFindOpen] = useState(false);
 
@@ -774,27 +908,32 @@ function FormWorkspace({
   };
 
   return (
-    <div className="form-view">
+    <div ref={rootRef} className="form-view">
       <h2 ref={headingRef} tabIndex={-1}>
         {definition.name}
       </h2>
 
-      <WorkspaceToolbar
-        saveDisabled={saveDisabled}
-        saveBlocked={saveBlocked}
-        backBlocked={movesBlocked}
-        saving={editor.savePending}
-        saved={editor.saved}
-        deleteDisabled={deleteDisabled}
-        onBackToForms={backToForms}
-        onSave={() => {
-          void editor.save();
-        }}
-        onDelete={openDeleteDialog}
-        onFind={() => setFindOpen(true)}
-      />
+      {/* The workspace header, sticky where the viewport has room (styles.css), so Save and
+          "[n] of N" stay in reach on a long page and a dialog returns focus to an opener in
+          view. It holds the two toolbars only: notices and the summary scroll with the page. */}
+      <div ref={headerRef} className="form-view__header">
+        <WorkspaceToolbar
+          saveDisabled={saveDisabled}
+          saveBlocked={saveBlocked}
+          backBlocked={movesBlocked}
+          saving={editor.savePending}
+          saved={editor.saved}
+          deleteDisabled={deleteDisabled}
+          onBackToForms={backToForms}
+          onSave={() => {
+            void editor.save();
+          }}
+          onDelete={openDeleteDialog}
+          onFind={() => setFindOpen(true)}
+        />
 
-      <RecordNavigator navigation={navigation} busy={busy} blocked={movesBlocked} canInsert={canInsert} />
+        <RecordNavigator navigation={navigation} busy={busy} blocked={movesBlocked} canInsert={canInsert} />
+      </div>
 
       <WorkspaceNotices
         recordDeleted={recordDeleted && conflictBanner === null}
@@ -811,7 +950,7 @@ function FormWorkspace({
         onDiscardFormGone={() => runBannerAction(() => setDiscardChosen(true))}
         editorBanner={editor.banner}
         bannerHandlers={bannerHandlers}
-        eventNotice={editor.eventNotice}
+        eventNotices={editor.eventNotices}
       />
 
       {/* A request-level 400 is the editor banner's text, so the summary shows field messages only. */}
@@ -954,8 +1093,8 @@ interface WorkspaceNoticesProps {
   readonly editorBanner: EditorBanner | null;
   /** The editor banner's actions. */
   readonly bannerHandlers: EditorBannerHandlers;
-  /** The non-blocking notice that a field event could not be evaluated. */
-  readonly eventNotice: string | null;
+  /** The non-blocking notices of the fields whose field events could not be evaluated. */
+  readonly eventNotices: readonly string[];
 }
 
 /**
@@ -973,8 +1112,9 @@ function WorkspaceNotices({
   onDiscardFormGone,
   editorBanner,
   bannerHandlers,
-  eventNotice,
+  eventNotices,
 }: WorkspaceNoticesProps) {
+  const shownEventNotices = useHeldWhilePointerPressed(eventNotices);
   return (
     <>
       {recordDeleted && (
@@ -1013,13 +1153,78 @@ function WorkspaceNotices({
         <EditorBannerView key={bannerKeyOf(editorBanner)} banner={editorBanner} handlers={bannerHandlers} />
       )}
 
-      {eventNotice !== null && (
+      {shownEventNotices.length > 0 && (
         <div className="banner banner--info" role="status">
-          <p>{eventNotice}</p>
+          {/* One block, so each notice takes its own line instead of sharing one
+              with another short notice as a flex item of the banner. */}
+          <div className="banner__messages">
+            {shownEventNotices.map((notice, index) => (
+              // One notice per field, and a field's text can change in place, so the
+              // position is the key.
+              <p key={index}>{notice}</p>
+            ))}
+          </div>
         </div>
       )}
     </>
   );
+}
+
+/**
+ * `latest`, except while a pointer button is pressed anywhere in the document: then the
+ * value shown when it was pressed is kept, and `latest` is shown once it is released. A
+ * press moves focus, which raises field events whose notices may appear, change or go; if
+ * that moved the content between press and release, the release would land elsewhere and
+ * the click would be lost. The release is applied a task later, so its click is dispatched
+ * first. Losing the window's focus ends the hold too, for a release the window never sees.
+ * Keyboard use holds nothing.
+ */
+function useHeldWhilePointerPressed<T>(latest: T): T {
+  const latestRef = useRef(latest);
+  // Boxed, so that holding a value never reads as no hold, whatever the value is.
+  const [held, setHeld] = useState<{ readonly value: T } | null>(null);
+
+  useLayoutEffect(() => {
+    latestRef.current = latest;
+  });
+
+  useEffect(() => {
+    let release: ReturnType<typeof setTimeout> | undefined;
+    const cancelRelease = (): void => {
+      if (release !== undefined) {
+        clearTimeout(release);
+        release = undefined;
+      }
+    };
+    // Captured on the window, so a handler that stops the event cannot hide the press.
+    const press = (): void => {
+      cancelRelease();
+      // What the last commit shows, taken now: without a hold that is the latest value.
+      const shown = latestRef.current;
+      // A press during a hold, or before its release ran, keeps what the hold froze.
+      setHeld((current) => current ?? { value: shown });
+    };
+    const end = (): void => {
+      cancelRelease();
+      release = setTimeout(() => {
+        release = undefined;
+        setHeld(null);
+      }, 0);
+    };
+    window.addEventListener('pointerdown', press, true);
+    window.addEventListener('pointerup', end, true);
+    window.addEventListener('pointercancel', end, true);
+    window.addEventListener('blur', end);
+    return () => {
+      cancelRelease();
+      window.removeEventListener('pointerdown', press, true);
+      window.removeEventListener('pointerup', end, true);
+      window.removeEventListener('pointercancel', end, true);
+      window.removeEventListener('blur', end);
+    };
+  }, []);
+
+  return held === null ? latest : held.value;
 }
 
 interface WorkspaceDialogsProps {

@@ -5,8 +5,18 @@ using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using EpiInfo.Api.Tests.Infrastructure;
+using EpiInfo.Domain.Forms;
+using EpiInfo.Domain.Metadata;
+using EpiInfo.Domain.Records;
+using EpiInfo.Domain.Search;
+using EpiInfo.Domain.Storage;
+using EpiInfo.Domain.Validation;
+using EpiInfo.Domain.Values;
 using EpiInfo.Tests.Shared;
+using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.AspNetCore.TestHost;
 using Microsoft.Data.SqlClient;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace EpiInfo.Api.Tests.Persistence;
 
@@ -24,8 +34,16 @@ namespace EpiInfo.Api.Tests.Persistence;
 /// the response is 503 with <c>writeOutcome</c> <c>notWritten</c>.
 /// </para>
 /// <para>
-/// The test drives the API over HTTP on the SQL Server store, follows the request's statements through
-/// <see cref="ApiFactoryBase.Recorder"/>, and verifies with direct SQL; it uses no <c>EpiInfo.Data</c> internals. It
+/// A save the store refuses before any record statement reports <c>notWritten</c> too, whatever its status: a
+/// <c>POST</c> and a <c>PUT</c> that submit a field the API's metadata read found writable, but that the store's
+/// transaction, reading the metadata again, finds read-only, as when the field is made read-only between the two
+/// reads. Each is a 500 with <c>writeOutcome</c> <c>notWritten</c>, and nothing is stored. The host's store returns
+/// its own metadata read with the seeded read-only <c>OnsetWeek</c> writable, so no metadata row changes; the update
+/// names an id no row holds.
+/// </para>
+/// <para>
+/// The tests drive the API over HTTP on the SQL Server store, follow the requests' statements through
+/// <see cref="ApiFactoryBase.Recorder"/>, and verify with direct SQL; they use no <c>EpiInfo.Data</c> internals. Each
 /// holds the exclusive <see cref="DatabaseWriteLock"/> from the first count to the last verification read, so no other
 /// test process writes to the three tables in between and the counts can be compared exactly.
 /// </para>
@@ -61,6 +79,12 @@ public sealed partial class TransactionalSaveTests : IAsyncLifetime
     private const int GlobalRecordIdLength = 255;
 
     private const int MarkerColumnLength = 4000;
+
+    // FoodHistory2's seeded read-only number field, which check code assigns (testdata/sql/03_forms.sql), and a value
+    // its float column holds.
+    private const string ReadOnlyField = "OnsetWeek";
+
+    private const int ReadOnlyFieldValue = 17;
 
     private const string TakeTableLockSql =
         "SELECT COUNT(*) FROM [dbo].[" + PageTwoTable + "] WITH (TABLOCKX, HOLDLOCK);";
@@ -168,7 +192,12 @@ public sealed partial class TransactionalSaveTests : IAsyncLifetime
             var body = new { values = new Dictionary<string, object?> { [TestDatabase.MarkerField] = marker } };
             using (HttpResponseMessage response = await ApiTestClient.PostJsonAsync(Client, path, body, ct))
             {
-                await AssertUnavailableAndNotWrittenAsync(response, path, ct);
+                await AssertProblemAndNotWrittenAsync(
+                    response,
+                    "POST " + path,
+                    HttpStatusCode.ServiceUnavailable,
+                    $"the timed-out {PageTwoTable} insert",
+                    ct);
             }
 
             attemptedGlobalRecordId = AssertInsertSequence(Factory.Recorder, marker);
@@ -183,6 +212,112 @@ public sealed partial class TransactionalSaveTests : IAsyncLifetime
             $"Rolling back the transaction that held the {PageTwoTable} table lock failed with {rollbackFailure}.");
 
         await AssertNothingStoredAsync(attemptedGlobalRecordId, marker, before, ct);
+    }
+
+    [Fact]
+    public async Task Save_of_a_field_made_read_only_after_the_metadata_read_is_not_written()
+    {
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        CancellationToken ct = timeout.Token;
+        await using DatabaseWriteLock dbLock = await DatabaseWriteLock.AcquireExclusiveAsync(ct);
+
+        await using WebApplicationFactory<Program> host = Factory.WithWebHostBuilder(builder =>
+            builder.ConfigureTestServices(services => UseWritableFieldStore(services, ReadOnlyField)));
+        using HttpClient client = host.CreateClient();
+
+        int viewId = await ApiTestClient.GetViewIdAsync(client, FormName, ct);
+        string createPath = string.Create(CultureInfo.InvariantCulture, $"/api/forms/{viewId}/records");
+        string updatePath = string.Create(CultureInfo.InvariantCulture, $"{createPath}/{Guid.NewGuid()}");
+        string marker = TestDatabase.NewMarker();
+        var body = new
+        {
+            values = new Dictionary<string, object?>
+            {
+                [TestDatabase.MarkerField] = marker,
+                [ReadOnlyField] = ReadOnlyFieldValue,
+            },
+        };
+
+        TableCounts before;
+        await using (SqlConnection counting = await TestDatabase.OpenConnectionAsync(ct))
+        {
+            before = await ReadCountsAsync(counting, ct);
+        }
+
+        Factory.Recorder.Clear();
+        using (HttpResponseMessage response = await ApiTestClient.PostJsonAsync(client, createPath, body, ct))
+        {
+            await AssertProblemAndNotWrittenAsync(
+                response,
+                "POST " + createPath,
+                HttpStatusCode.InternalServerError,
+                "the store's refusal of the read-only field",
+                ct);
+        }
+
+        AssertNoRecordStatement(Factory.Recorder, "POST " + createPath);
+
+        Factory.Recorder.Clear();
+        using (HttpResponseMessage response = await ApiTestClient.PutJsonAsync(client, updatePath, body, ct))
+        {
+            await AssertProblemAndNotWrittenAsync(
+                response,
+                "PUT " + updatePath,
+                HttpStatusCode.InternalServerError,
+                "the store's refusal of the read-only field",
+                ct);
+        }
+
+        AssertNoRecordStatement(Factory.Recorder, "PUT " + updatePath);
+
+        await using SqlConnection connection = await TestDatabase.OpenConnectionAsync(ct);
+        TableCounts after = await ReadCountsAsync(connection, ct);
+        AssertCountUnchanged(BaseTable, before.Base, after.Base);
+        AssertCountUnchanged(PageOneTable, before.PageOne, after.PageOne);
+        AssertCountUnchanged(PageTwoTable, before.PageTwo, after.PageTwo);
+        int markerRows = await CountMatchesAsync(
+            connection, PageOneTable, TestDatabase.MarkerField, marker, MarkerColumnLength, ct);
+        Assert.True(
+            markerRows == 0,
+            string.Create(
+                CultureInfo.InvariantCulture,
+                $"[{PageOneTable}] holds {markerRows} row(s) with the request's {TestDatabase.MarkerField} marker."));
+    }
+
+    // Replaces the host's one IDataStore registration, the SQL Server store built by a factory, by a WritableFieldStore
+    // around the store that factory builds, with the same lifetime.
+    private static void UseWritableFieldStore(IServiceCollection services, string fieldName)
+    {
+        ServiceDescriptor[] registrations = services
+            .Where(descriptor => descriptor.ServiceType == typeof(IDataStore) && !descriptor.IsKeyedService)
+            .ToArray();
+        if (registrations.Length != 1 || registrations[0].ImplementationFactory is not { } createReal)
+        {
+            throw new InvalidOperationException(string.Create(
+                CultureInfo.InvariantCulture,
+                $"The host registers {registrations.Length} {nameof(IDataStore)} services; expected exactly one, " +
+                $"built by a factory."));
+        }
+
+        ServiceDescriptor real = registrations[0];
+        services.Remove(real);
+        services.Add(new ServiceDescriptor(
+            typeof(IDataStore),
+            provider => new WritableFieldStore((IDataStore)createReal(provider), fieldName),
+            real.Lifetime));
+    }
+
+    // No statement of the request wrote or named a record table: the store refused the write after its metadata reads.
+    private static void AssertNoRecordStatement(SqlCommandRecorder recorder, string request)
+    {
+        List<RecordedCommand> reached = recorder.Commands
+            .Where(command => command.IsWrite || SqlCommandRecorder.BracketedIdentifiers(command.CommandText)
+                .Any(name => Tables.Contains(name, StringComparer.OrdinalIgnoreCase)))
+            .ToList();
+        Assert.True(
+            reached.Count == 0,
+            $"{request} must send no statement that writes or names a {FormName} record table. It sent:" +
+            Describe(reached));
     }
 
     // Takes an exclusive table lock on FoodHistory3 inside the open transaction and proves it granted, failing before
@@ -249,21 +384,25 @@ public sealed partial class TransactionalSaveTests : IAsyncLifetime
         return failure;
     }
 
-    // 503 application/problem+json, a complete ProblemDetails with status 503, and writeOutcome exactly notWritten.
-    private static async Task AssertUnavailableAndNotWrittenAsync(
+    // The expected status as application/problem+json, a complete ProblemDetails with that status, and writeOutcome
+    // exactly notWritten. request is the method and path, and cause the failure the status is expected from; both are
+    // test text, named in failure messages.
+    private static async Task AssertProblemAndNotWrittenAsync(
         HttpResponseMessage response,
-        string path,
+        string request,
+        HttpStatusCode expected,
+        string cause,
         CancellationToken ct)
     {
-        if (response.StatusCode != HttpStatusCode.ServiceUnavailable)
+        int status = (int)expected;
+        if (response.StatusCode != expected)
         {
             string text = await response.Content.ReadAsStringAsync(ct);
             Assert.Fail(
                 string.Create(
                     CultureInfo.InvariantCulture,
-                    $"POST {path} returned {(int)response.StatusCode} {response.StatusCode}, expected 503 " +
-                    $"ServiceUnavailable from the timed-out {PageTwoTable} insert; {DescribeMediaType(response)}, " +
-                    $"body {DescribeBody(text)}."));
+                    $"{request} returned {(int)response.StatusCode} {response.StatusCode}, expected {status} " +
+                    $"{expected} from {cause}; {DescribeMediaType(response)}, body {DescribeBody(text)}."));
         }
 
         Assert.True(
@@ -271,17 +410,21 @@ public sealed partial class TransactionalSaveTests : IAsyncLifetime
                 response.Content.Headers.ContentType?.MediaType,
                 ProblemMediaType,
                 StringComparison.OrdinalIgnoreCase),
-            $"POST {path} returned 503 with {DescribeMediaType(response)}, expected {ProblemMediaType}.");
+            string.Create(
+                CultureInfo.InvariantCulture,
+                $"{request} returned {status} with {DescribeMediaType(response)}, expected {ProblemMediaType}."));
 
         JsonElement problem = ApiTestClient.AssertProblemDetails(
             await ApiTestClient.ReadJsonElementAsync(response, ct),
-            (int)HttpStatusCode.ServiceUnavailable);
+            status);
         Assert.True(
             problem.TryGetProperty("writeOutcome", out JsonElement outcome) &&
             outcome.ValueKind == JsonValueKind.String &&
             outcome.ValueEquals(NotWritten),
-            $"The 503 ProblemDetails member 'writeOutcome' must be the String \"{NotWritten}\"; it is " +
-            $"{DescribeWriteOutcome(problem)}.");
+            string.Create(
+                CultureInfo.InvariantCulture,
+                $"The {status} ProblemDetails member 'writeOutcome' must be the String \"{NotWritten}\"; it is " +
+                $"{DescribeWriteOutcome(problem)}."));
     }
 
     // The request's statements on its own connection, from the base insert on, must be exactly the three inserts in
@@ -394,7 +537,7 @@ public sealed partial class TransactionalSaveTests : IAsyncLifetime
             before == after,
             string.Create(
                 CultureInfo.InvariantCulture,
-                $"[{table}] held {before} rows before the failed insert and {after} after; it must be unchanged."));
+                $"[{table}] held {before} rows before the failed write and {after} after; it must be unchanged."));
 
     private static async Task<TableCounts> ReadCountsAsync(SqlConnection connection, CancellationToken ct) =>
         new(
@@ -550,4 +693,115 @@ public sealed partial class TransactionalSaveTests : IAsyncLifetime
     private static partial Regex Identifier();
 
     private readonly record struct TableCounts(int Base, int PageOne, int PageTwo);
+
+    /// <summary>
+    /// The host's real store, except that a form's metadata read returns the named field writable, as a caller holds
+    /// metadata it read before the field was made read-only. Every other call, and every argument and result, passes
+    /// through unchanged, so the real store's write transaction reads the metadata again and finds the field
+    /// read-only.
+    /// </summary>
+    /// <param name="real">The store every call is forwarded to.</param>
+    /// <param name="fieldName">The canonical name of the field returned writable.</param>
+    private sealed class WritableFieldStore(IDataStore real, string fieldName) : IDataStore
+    {
+        public async Task<FormMetadata?> GetFormMetadataAsync(int viewId, CancellationToken cancellationToken)
+        {
+            FormMetadata? form = await real.GetFormMetadataAsync(viewId, cancellationToken);
+            return form is null
+                ? null
+                : form with
+                {
+                    Fields =
+                    [
+                        .. form.Fields.Select(field => string.Equals(field.Name, fieldName, StringComparison.Ordinal)
+                            ? field with { IsReadOnly = false }
+                            : field),
+                    ],
+                };
+        }
+
+        public Task<IReadOnlyList<FormSummary>> ListFormsAsync(CancellationToken cancellationToken) =>
+            real.ListFormsAsync(cancellationToken);
+
+        public Task<IReadOnlyDictionary<string, IReadOnlyList<FieldOption>>> GetOptionsAsync(
+            FormMetadata form,
+            CancellationToken cancellationToken) =>
+            real.GetOptionsAsync(form, cancellationToken);
+
+        public Task<string?> GetCheckCodeAsync(int viewId, CancellationToken cancellationToken) =>
+            real.GetCheckCodeAsync(viewId, cancellationToken);
+
+        public Task<int> CountAsync(FormMetadata form, bool includeDeleted, CancellationToken cancellationToken) =>
+            real.CountAsync(form, includeDeleted, cancellationToken);
+
+        public Task<RecordDto?> GetAtPositionAsync(
+            FormMetadata form,
+            int position,
+            bool includeDeleted,
+            CancellationToken cancellationToken) =>
+            real.GetAtPositionAsync(form, position, includeDeleted, cancellationToken);
+
+        public Task<RecordDto?> GetByIdAsync(
+            FormMetadata form,
+            string globalRecordId,
+            CancellationToken cancellationToken) =>
+            real.GetByIdAsync(form, globalRecordId, cancellationToken);
+
+        public Task<NavigationPosition?> GetSetPositionAsync(
+            FormMetadata form,
+            string globalRecordId,
+            bool includeDeleted,
+            CancellationToken cancellationToken) =>
+            real.GetSetPositionAsync(form, globalRecordId, includeDeleted, cancellationToken);
+
+        public Task<RecordPage> ListAsync(
+            FormMetadata form,
+            RecordListQuery query,
+            CancellationToken cancellationToken) =>
+            real.ListAsync(form, query, cancellationToken);
+
+        public Task<SearchResponse> SearchAsync(
+            FormMetadata form,
+            IReadOnlyList<SearchCondition> conditions,
+            bool includeDeleted,
+            string? excludeGlobalRecordId,
+            CancellationToken cancellationToken) =>
+            real.SearchAsync(form, conditions, includeDeleted, excludeGlobalRecordId, cancellationToken);
+
+        public Task<bool> PingAsync(CancellationToken cancellationToken) => real.PingAsync(cancellationToken);
+
+        public Task<RecordDto> InsertAsync(
+            FormMetadata form,
+            IReadOnlyDictionary<string, FieldValue> values,
+            SaveStamp stamp,
+            CancellationToken cancellationToken) =>
+            real.InsertAsync(form, values, stamp, cancellationToken);
+
+        public Task<RecordWriteResult> UpdateAsync(
+            FormMetadata form,
+            string globalRecordId,
+            IReadOnlyDictionary<string, FieldValue> submitted,
+            Func<SaveStamp> createStamp,
+            Func<StoredRecord, RecordValidationResult> requiredGate,
+            FormPermissions? permissions,
+            CancellationToken cancellationToken) =>
+            real.UpdateAsync(
+                form,
+                globalRecordId,
+                submitted,
+                createStamp,
+                requiredGate,
+                permissions,
+                cancellationToken);
+
+        public Task<SoftDeleteResult> SoftDeleteAsync(
+            FormMetadata form,
+            string globalRecordId,
+            Func<SaveStamp> createStamp,
+            CancellationToken cancellationToken) =>
+            real.SoftDeleteAsync(form, globalRecordId, createStamp, cancellationToken);
+
+        public Task<FormPermissions?> GetPermissionsAsync(FormMetadata form, CancellationToken cancellationToken) =>
+            real.GetPermissionsAsync(form, cancellationToken);
+    }
 }

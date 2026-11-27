@@ -13,6 +13,7 @@ import { StrictMode, useLayoutEffect, useRef } from 'react';
 import { afterEach, describe, expect, it, vi, type Mock } from 'vitest';
 
 import { createApiClient } from '../api/client';
+import { isSafeToResend } from '../api/errors';
 import type {
   FieldDefinition,
   NavigationPosition,
@@ -35,6 +36,13 @@ const DELETED = 0;
  * matched independently of the client's own text.
  */
 const RECORD_GONE = /this record no longer exists/i;
+
+/**
+ * The notice of an open that lands on another record because the one it meant is deleted
+ * and the toggle hides deleted records: it names the deletion and the "Show deleted"
+ * toggle, matched independently of the client's own text.
+ */
+const DELETED_HIDDEN = /\bdeleted\b.*\bshow deleted\b/i;
 
 /** Page-2 data fields: a row without its page-2 row reads them as `null`. */
 const PAGE_2_FIELDS: readonly FieldDefinition[] = formDefinitionFixture.pages
@@ -366,6 +374,8 @@ interface MountOptions {
   readonly initialIncludeDeleted?: boolean;
   /** Replaces the default leave(), which notes `beforeLeave` in the log and resolves `true`. */
   readonly beforeLeave?: () => Promise<boolean>;
+  /** The client's request deadline; without it, the default one. */
+  readonly deadlineMs?: number;
   /** Mounts under StrictMode, which runs the mount effect, its cleanup and the effect again. */
   readonly strict?: boolean;
 }
@@ -387,7 +397,7 @@ async function mount(rows: readonly Row[], options: MountOptions = {}): Promise<
         return Promise.resolve(true);
       }),
   );
-  const client = createApiClient({ baseUrl: 'http://localhost', fetch: api.fetch });
+  const client = createApiClient({ baseUrl: 'http://localhost', fetch: api.fetch, deadlineMs: options.deadlineMs });
   const { result } = renderHook(
     () =>
       useRecordNavigation({
@@ -556,6 +566,26 @@ describe('useRecordNavigation', () => {
         expect(result.current.n).toBe(2);
       },
     );
+
+    it('an accepted goTo clears an earlier rejection even when beforeLeave resolves false', async () => {
+      const { api, result, beforeLeave } = await mount(activeRows(5));
+      expect(await perform(() => result.current.goTo(999999))).toBe(false);
+      expect(result.current.goToError).toBe('Enter a record number from 1 to 5.');
+      beforeLeave.mockImplementation(() => Promise.resolve(false));
+      const before = result.current;
+      const mark = api.mark();
+
+      const accepted = await perform(() => result.current.goTo(2));
+
+      // goToError describes the last goTo, which was a valid number, not the earlier one.
+      expect(accepted).toBe(false);
+      expect(result.current.goToError).toBeNull();
+      expect(beforeLeave).toHaveBeenCalledTimes(1);
+      expect(api.requestsSince(mark)).toEqual([]);
+      expect(result.current.n).toBe(1);
+      expect(result.current.record).toBe(before.record);
+      expect(result.current.recordGeneration).toBe(before.recordGeneration);
+    });
 
     it.each([
       { name: 'start', from: 1 },
@@ -753,6 +783,7 @@ describe('useRecordNavigation', () => {
       expect(result.current.record?.count).toBe(3);
       // Switching sets with an active record open does not leave it; only the goTo did.
       expect(beforeLeave).toHaveBeenCalledTimes(2);
+      expect(result.current.notice).toBeNull();
     });
 
     it('after openById, n is the position endpoint answer for the toggle, not the DTO position', async () => {
@@ -955,6 +986,42 @@ describe('useRecordNavigation', () => {
       expect(result.current.count).toBe(3);
       expect(result.current.record?.globalRecordId).toBe(B.globalRecordId);
       expect(result.current.recordGeneration).toBe(recordGeneration + 1);
+      expect(result.current.notice).toMatch(DELETED_HIDDEN);
+    });
+
+    it('switching it off after another session deleted the open record leaves it, reads the set again and opens at/{min(n, count)}', async () => {
+      const { api, result, beforeLeave } = await mount(mixedRows());
+      await perform(() => result.current.setIncludeDeleted(true));
+      await perform(() => result.current.openById(B.globalRecordId));
+      expect(result.current.n).toBe(3);
+      expect(result.current.count).toBe(4);
+      // B's DTO still says active when another session soft-deletes it.
+      api.setStatus(B.globalRecordId, DELETED);
+      const leaves = beforeLeave.mock.calls.length;
+      const { recordGeneration, listVersion } = result.current;
+      const mark = api.mark();
+
+      await perform(() => result.current.setIncludeDeleted(false));
+
+      // The toggle's reads find B outside the active set, so B is left and the set read again.
+      const log = api.logSince(mark);
+      const toggleReads = sorted([countRequest(), positionRequest(B.globalRecordId)]);
+      expect(sorted(log.slice(0, 2))).toEqual(toggleReads);
+      expect(log[2]).toBe('beforeLeave');
+      expect(sorted(log.slice(3, 5))).toEqual(toggleReads);
+      // The active set is A, C: position min(3, 2).
+      expect(log.slice(5)).toEqual([atRequest(2)]);
+      expect(beforeLeave).toHaveBeenCalledTimes(leaves + 1);
+      expect(result.current.includeDeleted).toBe(false);
+      expect(result.current.n).toBe(2);
+      expect(result.current.count).toBe(2);
+      expect(result.current.statusText).toBe('2 of 2');
+      expect(result.current.record?.globalRecordId).toBe(C.globalRecordId);
+      expect(result.current.recordGeneration).toBe(recordGeneration + 1);
+      expect(result.current.notice).toMatch(DELETED_HIDDEN);
+      // The grid reloads for the toggle change itself, so the list version stays.
+      expect(result.current.listVersion).toBe(listVersion);
+      expect(result.current.loadError).toBeNull();
     });
 
     it('switching it off shows New when every record is deleted', async () => {
@@ -981,7 +1048,86 @@ describe('useRecordNavigation', () => {
       expect(result.current.n).toBeNull();
       expect(result.current.count).toBe(0);
       expect(result.current.statusText).toBe('New record');
+      expect(result.current.notice).toMatch(DELETED_HIDDEN);
     });
+  });
+
+  describe('an open by id of a record deleted since it was listed', () => {
+    // A grid row or Find result still lists a record another session has soft-deleted: its
+    // read by id answers 200, and its position in the active set is null.
+    const deletedSinceListed: readonly {
+      readonly name: string;
+      readonly rows: readonly Row[];
+      readonly initialPosition: number;
+      /** Rows soft-deleted after the load, the opened one among them. */
+      readonly deleted: readonly string[];
+      readonly opening: string;
+      /** The requests after the open's three parallel reads. */
+      readonly landing: readonly string[];
+      readonly n: number | null;
+      readonly count: number;
+      readonly opened: string | null;
+      readonly isNew: boolean;
+      readonly statusText: string;
+    }[] = [
+      {
+        name: 'opens at/{min(n, count)} of the active set',
+        rows: activeRows(5),
+        initialPosition: 5,
+        deleted: [idOf(2)],
+        opening: idOf(2),
+        landing: [atRequest(4)],
+        n: 4,
+        count: 4,
+        // Position 4 of the remaining 1, 3, 4, 5: the record that was open.
+        opened: idOf(5),
+        isNew: false,
+        statusText: '4 of 4',
+      },
+      {
+        name: 'shows New when no active record is left',
+        rows: activeRows(2),
+        initialPosition: 1,
+        deleted: [idOf(1), idOf(2)],
+        opening: idOf(2),
+        landing: [],
+        n: null,
+        count: 0,
+        opened: null,
+        isNew: true,
+        statusText: 'New record',
+      },
+    ];
+
+    it.each(deletedSinceListed)(
+      'shows the notice, reloads the list, reads N only once and $name',
+      async ({ rows, initialPosition, deleted, opening, landing, n, count, opened, isNew, statusText }) => {
+        const { api, result } = await mount(rows, { initialPosition });
+        const { listVersion, recordGeneration } = result.current;
+        for (const id of deleted) {
+          api.setStatus(id, DELETED);
+        }
+        const mark = api.mark();
+
+        await perform(() => result.current.openById(opening));
+
+        const requests = api.requestsSince(mark);
+        expect(sorted(requests.slice(0, 3))).toEqual(
+          sorted([byIdRequest(opening), positionRequest(opening), countRequest()]),
+        );
+        // N comes from the open's own count, so the landing reads no count of its own.
+        expect(requests.slice(3)).toEqual(landing);
+        expect(result.current.notice).toMatch(DELETED_HIDDEN);
+        expect(result.current.listVersion).toBe(listVersion + 1);
+        expect(result.current.recordGeneration).toBe(recordGeneration + 1);
+        expect(result.current.n).toBe(n);
+        expect(result.current.count).toBe(count);
+        expect(result.current.record?.globalRecordId ?? null).toBe(opened);
+        expect(result.current.isNew).toBe(isNew);
+        expect(result.current.statusText).toBe(statusText);
+        expect(result.current.loadError).toBeNull();
+      },
+    );
   });
 
   describe('the deleted toggle on as the form loads', () => {
@@ -1517,6 +1663,146 @@ describe('useRecordNavigation', () => {
     });
   });
 
+  // The editor's onConflict: a save found the open record deleted elsewhere (409), and the
+  // record stays open, read-only, at the n and N shown before.
+  describe('afterConflict', () => {
+    const conflicts: readonly {
+      readonly name: string;
+      readonly open: number;
+      readonly includeDeleted: boolean;
+      /** Presses that send nothing before `press`. */
+      readonly idle: readonly NamedAction[];
+      readonly press: NamedAction;
+      readonly reads: readonly string[];
+      readonly opened: number;
+      readonly status: string;
+      readonly canNext: boolean;
+    }[] = [
+      {
+        // Next opens the record that followed the deleted one, which now stands at n.
+        name: 'middle record, active set',
+        open: 3,
+        includeDeleted: false,
+        idle: [],
+        press: NEXT,
+        reads: [countRequest(), atRequest(3)],
+        opened: 4,
+        status: '3 of 4',
+        canNext: true,
+      },
+      {
+        // Next has no record to go to, and Previous opens the new last record.
+        name: 'last record, active set',
+        open: 5,
+        includeDeleted: false,
+        idle: [NEXT],
+        press: PREVIOUS,
+        reads: [countRequest(), atRequest(4)],
+        opened: 4,
+        status: '4 of 4',
+        canNext: false,
+      },
+      {
+        // The deleted record keeps its place in the set, so Next opens n + 1.
+        name: 'middle record, deleted shown',
+        open: 3,
+        includeDeleted: true,
+        idle: [],
+        press: NEXT,
+        reads: [countRequest(true), atRequest(4, true)],
+        opened: 4,
+        status: '4 of 5',
+        canNext: true,
+      },
+    ];
+
+    it.each(conflicts)(
+      '$name: sends nothing and reloads the grid, then $press.name re-reads N and shows $status',
+      async ({ open, includeDeleted, idle, press, reads, opened, status, canNext }) => {
+        const { api, result } = await mount(activeRows(5), { initialPosition: open });
+        await perform(() => result.current.setIncludeDeleted(includeDeleted));
+        const { listVersion, recordGeneration } = result.current;
+        api.setStatus(idOf(open), DELETED);
+        const mark = api.mark();
+
+        act(() => {
+          result.current.afterConflict();
+        });
+
+        expect(api.requestsSince(mark)).toEqual([]);
+        expect(result.current.listVersion).toBe(listVersion + 1);
+        expect(result.current.recordGeneration).toBe(recordGeneration);
+        expect(result.current.record?.globalRecordId).toBe(idOf(open));
+        expect(result.current.statusText).toBe(`${open} of 5`);
+        expect(result.current.canNext).toBe(open < 5);
+        for (const action of idle) {
+          await perform(() => action.run(result.current));
+        }
+        expect(api.requestsSince(mark)).toEqual([]);
+
+        await perform(() => press.run(result.current));
+
+        expect(api.logSince(mark)).toEqual(['beforeLeave', ...reads]);
+        expect(result.current.record?.globalRecordId).toBe(idOf(opened));
+        expect(result.current.statusText).toBe(status);
+        expect(result.current.canNext).toBe(canNext);
+        expect(result.current.notice).toBeNull();
+        expect(result.current.loadError).toBeNull();
+      },
+    );
+
+    it('makes New re-read N', async () => {
+      const { api, result } = await mount(activeRows(5), { initialPosition: 3 });
+      api.setStatus(idOf(3), DELETED);
+      act(() => {
+        result.current.afterConflict();
+      });
+      const mark = api.mark();
+
+      await perform(() => result.current.newRecord());
+      await settled(result);
+
+      expect(api.logSince(mark)).toEqual(['beforeLeave', countRequest()]);
+      expect(result.current.isNew).toBe(true);
+      expect(result.current.count).toBe(4);
+      expect(result.current.statusText).toBe('New record');
+    });
+
+    it.each([
+      { open: 3, log: ['beforeLeave', countRequest(), atRequest(3), 'beforeLeave', countRequest(), atRequest(4)] },
+      // The slot holds the last record of the set without the deleted one, so the second Next has nowhere to go.
+      { open: 4, log: ['beforeLeave', countRequest(), atRequest(4)] },
+    ])(
+      'a second Next while the first from slot $open is pending counts in the set without the deleted record',
+      async ({ open, log }) => {
+        const { api, result } = await mount(activeRows(5), { initialPosition: open });
+        api.setStatus(idOf(open), DELETED);
+        act(() => {
+          result.current.afterConflict();
+        });
+        const mark = api.mark();
+        const gate = api.hold(`${RECORDS_PATH}/at/${open}`);
+        let pending: Promise<void> = Promise.resolve();
+
+        await act(async () => {
+          pending = result.current.next();
+          await gate.reached;
+        });
+        await perform(() => result.current.next());
+        await act(async () => {
+          gate.release();
+          await pending;
+        });
+
+        // Both land on the last record, with no false "no longer exists" from an at/5 past the end.
+        expect(api.logSince(mark)).toEqual(log);
+        expect(result.current.record?.globalRecordId).toBe(idOf(5));
+        expect(result.current.statusText).toBe('4 of 4');
+        expect(result.current.notice).toBeNull();
+      },
+    );
+  });
+
   describe('superseded loads', () => {
     it('ignores a response that a later move overtook', async () => {
       const { api, result } = await mount(activeRows(5));
@@ -1544,6 +1830,71 @@ describe('useRecordNavigation', () => {
       expect(result.current.record?.globalRecordId).toBe(idOf(4));
       expect(result.current.statusText).toBe('4 of 5');
     });
+  });
+
+  // The client's request deadline ends a read that never completes as a failure with no
+  // response, which Retry may resend (0.3.4.2); nothing resends it by itself. Real timers.
+  describe('a read that never completes', () => {
+    const DEADLINE_MS = 100;
+    // A timer fires no earlier than its delay, up to the millisecond the event loop rounds to.
+    const TIMER_SLACK_MS = 5;
+
+    const stalledReads: readonly {
+      readonly name: string;
+      readonly pathname: string;
+      readonly start: Action;
+      /** The position the Retry opens. */
+      readonly opened: number;
+    }[] = [
+      { name: 'the at/{n} read of a move', pathname: `${RECORDS_PATH}/at/2`, start: NEXT.run, opened: 2 },
+      {
+        name: 'the record read of an open by id',
+        pathname: `${RECORDS_PATH}/${idOf(4)}`,
+        start: (navigation) => navigation.openById(idOf(4)),
+        opened: 4,
+      },
+    ];
+
+    it.each(stalledReads)(
+      'shows $name unanswered at the deadline as a connection failure with Retry, and Retry alone sends it again and opens it',
+      async ({ pathname, start, opened }) => {
+        const { api, result } = await mount(activeRows(5), { deadlineMs: DEADLINE_MS });
+        const { recordGeneration } = result.current;
+        // Never released, so the read is never answered.
+        api.hold(pathname);
+        const sentTimes = (): number => api.calls.filter((call) => call.url.pathname === pathname).length;
+        const started = performance.now();
+
+        await perform(() => start(result.current));
+
+        expect(performance.now() - started).toBeGreaterThanOrEqual(DEADLINE_MS - TIMER_SLACK_MS);
+        const failure = result.current.loadError;
+        expect(failure?.kind).toBe('network');
+        expect(failure?.status).toBeNull();
+        expect(failure !== null && isSafeToResend(failure, 'GET')).toBe(true);
+        expect(result.current.loading).toBe(false);
+        expect(result.current.transitioning).toBe(false);
+        expect(result.current.record?.globalRecordId).toBe(idOf(1));
+        expect(result.current.recordGeneration).toBe(recordGeneration);
+        expect(result.current.n).toBe(1);
+
+        // Several deadlines later the read has still been sent once.
+        await act(async () => {
+          await new Promise((resolve) => {
+            setTimeout(resolve, DEADLINE_MS * 3);
+          });
+        });
+        expect(sentTimes()).toBe(1);
+
+        await perform(() => result.current.retryLoad());
+
+        expect(sentTimes()).toBe(2);
+        expect(result.current.loadError).toBeNull();
+        expect(result.current.record?.globalRecordId).toBe(idOf(opened));
+        expect(result.current.n).toBe(opened);
+        expect(result.current.statusText).toBe(`${opened} of 5`);
+      },
+    );
   });
 
   describe('a success body outside the contract', () => {
@@ -1866,6 +2217,188 @@ describe('record transitions (0.3.6, 0.3.4.2)', () => {
     });
   });
 
+  // Previous and Next count from the target of the move still running, not from the
+  // record still shown, so two quick presses move two records. They are available exactly
+  // when a press would move, counted the same way, while the status stays on the record
+  // shown until the move settles.
+  describe('a relative move while another is pending', () => {
+    const BOTH = { previous: true, next: true };
+    it.each([
+      {
+        from: 2,
+        first: NEXT,
+        second: NEXT,
+        held: 3,
+        available: BOTH,
+        log: ['beforeLeave', atRequest(3), 'beforeLeave', atRequest(4)],
+        to: 4,
+      },
+      {
+        from: 4,
+        first: PREVIOUS,
+        second: PREVIOUS,
+        held: 3,
+        available: BOTH,
+        log: ['beforeLeave', atRequest(3), 'beforeLeave', atRequest(2)],
+        to: 2,
+      },
+      {
+        from: 2,
+        first: NEXT,
+        second: PREVIOUS,
+        held: 3,
+        available: BOTH,
+        log: ['beforeLeave', atRequest(3), 'beforeLeave', atRequest(2)],
+        to: 2,
+      },
+      // Record 1 has no previous record, but the pending record 2 does.
+      {
+        from: 1,
+        first: NEXT,
+        second: PREVIOUS,
+        held: 2,
+        available: BOTH,
+        log: ['beforeLeave', atRequest(2), 'beforeLeave', atRequest(1)],
+        to: 1,
+      },
+      {
+        from: 1,
+        first: goTo(3),
+        second: NEXT,
+        held: 3,
+        available: BOTH,
+        log: ['beforeLeave', atRequest(3), 'beforeLeave', atRequest(4)],
+        to: 4,
+      },
+      // Record 4 has a next record, but the pending record 5 is the last, so Next does nothing.
+      {
+        from: 4,
+        first: NEXT,
+        second: NEXT,
+        held: 5,
+        available: { previous: true, next: false },
+        log: ['beforeLeave', atRequest(5)],
+        to: 5,
+      },
+      // Last lands on the end of the set, so Next from it does nothing and Last goes on.
+      {
+        from: 2,
+        first: LAST,
+        second: NEXT,
+        held: 5,
+        available: { previous: true, next: false },
+        log: ['beforeLeave', atRequest(5)],
+        to: 5,
+      },
+    ])(
+      '$second.name pressed while $first.name from $from waits for at/$held counts from there: the view ends at $to',
+      async ({ from, first, second, held, available, log, to }) => {
+        const { api, result } = await mount(activeRows(5), { initialPosition: from });
+        const mark = api.mark();
+        const gate = api.hold(`${RECORDS_PATH}/at/${held}`);
+        let pending: Promise<unknown> = Promise.resolve();
+
+        await act(async () => {
+          pending = first.run(result.current);
+          await gate.reached;
+        });
+        expect(result.current.n).toBe(from);
+        expect(result.current.statusText).toBe(`${from} of 5`);
+        expect(result.current.canPrevious).toBe(available.previous);
+        expect(result.current.canNext).toBe(available.next);
+
+        await perform(() => second.run(result.current));
+        // The first move's answer arrives last; it is shown only while that move is the latest.
+        await act(async () => {
+          gate.release();
+          await pending;
+        });
+
+        expect(api.logSince(mark)).toEqual(log);
+        expect(result.current.n).toBe(to);
+        expect(result.current.record?.globalRecordId).toBe(idOf(to));
+        expect(result.current.statusText).toBe(`${to} of 5`);
+        expect(result.current.loading).toBe(false);
+        expect(result.current.transitioning).toBe(false);
+      },
+    );
+
+    // Records 4 and 5 are deleted elsewhere while "2 of 5" is shown, so Last finds at/5 gone,
+    // and its recovery reads N (3) and opens at/3, which the case holds.
+    it.each([
+      { second: PREVIOUS, log: ['beforeLeave', countRequest(), atRequest(2)], to: 2, gone: false },
+      // 3 is the last of the 3 records left, so Next has nowhere to go and sends nothing.
+      { second: NEXT, log: [], to: 3, gone: true },
+    ])(
+      '$second.name pressed while the 404 recovery of Last waits for at/3 counts from that landing, in the N it read',
+      async ({ second, log, to, gone }) => {
+        const { api, result } = await mount(activeRows(5), { initialPosition: 2 });
+        api.setStatus(idOf(4), DELETED);
+        api.setStatus(idOf(5), DELETED);
+        const gate = api.hold(`${RECORDS_PATH}/at/3`);
+        const mark = api.mark();
+        let pending: Promise<unknown> = Promise.resolve();
+
+        await act(async () => {
+          pending = LAST.run(result.current);
+          await gate.reached;
+        });
+        expect(api.logSince(mark)).toEqual(['beforeLeave', atRequest(5), countRequest(), atRequest(3)]);
+        expect(result.current.statusText).toBe('2 of 5');
+        // Counted from record 3 of 3, where the recovery lands.
+        expect(result.current.canPrevious).toBe(true);
+        expect(result.current.canNext).toBe(false);
+        const pressMark = api.mark();
+
+        await perform(() => second.run(result.current));
+        await act(async () => {
+          gate.release();
+          await pending;
+        });
+
+        // Never at/4 of the N the failed at/5 assumed, so no second "no longer exists".
+        expect(api.logSince(pressMark)).toEqual(log);
+        expect(result.current.record?.globalRecordId).toBe(idOf(to));
+        expect(result.current.statusText).toBe(`${to} of 3`);
+        expect(RECORD_GONE.test(result.current.notice ?? '')).toBe(gone);
+        expect(result.current.loading).toBe(false);
+        expect(result.current.transitioning).toBe(false);
+      },
+    );
+
+    it.each([
+      {
+        name: 'its read failed (503)',
+        end: (connection: MountedWire): void => {
+          connection.failNext(`${RECORDS_PATH}/at/3`);
+        },
+        log: ['beforeLeave', atRequest(3), 'beforeLeave', atRequest(3)],
+      },
+      {
+        name: 'its leave was cancelled',
+        end: (connection: MountedWire): void => {
+          connection.beforeLeave.mockImplementationOnce(leaving(connection.api, false));
+        },
+        log: ['beforeLeave', 'beforeLeave', atRequest(3)],
+      },
+    ])('a Next that ended because $name leaves the next press counting from the record shown', async ({ end, log }) => {
+      const connection = await mountWire(activeRows(5), 2);
+      const { api, result } = connection;
+      end(connection);
+      const mark = api.mark();
+
+      await perform(() => result.current.next());
+      expect(result.current.n).toBe(2);
+
+      await perform(() => result.current.next());
+
+      expect(api.logSince(mark)).toEqual(log);
+      expect(result.current.n).toBe(3);
+      expect(result.current.record?.globalRecordId).toBe(idOf(3));
+      expect(result.current.loadError).toBeNull();
+    });
+  });
+
   describe('Retry of a load that replaces the record', () => {
     const failedLoads: readonly {
       readonly name: string;
@@ -2101,6 +2634,86 @@ describe('record transitions (0.3.6, 0.3.4.2)', () => {
     );
   });
 
+  describe('a failed landing in place of a deleted record the active set hides', () => {
+    const failedLandings: readonly {
+      readonly name: string;
+      readonly rows: readonly Row[];
+      readonly initialPosition?: number;
+      /** Opens the deleted record, or deletes the one a grid row still lists. */
+      readonly prepare: (connection: MountedWire) => Promise<void>;
+      readonly start: (navigation: RecordNavigation) => Promise<unknown>;
+      /** The active-set position the landing reads, which answers 503 once. */
+      readonly position: number;
+      /** The list version change before the landing: an open by id finds the list changed. */
+      readonly listChanged: number;
+      /** The record the successful Retry opens. */
+      readonly landed: string;
+    }[] = [
+      {
+        name: 'an open by id of a record deleted since it was listed',
+        rows: activeRows(5),
+        initialPosition: 3,
+        prepare: ({ api }) => {
+          api.setStatus(idOf(2), DELETED);
+          return Promise.resolve();
+        },
+        start: (navigation) => navigation.openById(idOf(2)),
+        position: 3,
+        listChanged: 1,
+        // Position 3 of the remaining 1, 3, 4, 5.
+        landed: idOf(4),
+      },
+      {
+        name: 'switching the toggle off with a deleted record open',
+        rows: [row(1), row(2, { recStatus: DELETED }), row(3)],
+        prepare: async ({ result }) => {
+          await perform(() => result.current.setIncludeDeleted(true));
+          await perform(() => result.current.openById(idOf(2)));
+        },
+        start: (navigation) => navigation.setIncludeDeleted(false),
+        position: 2,
+        listChanged: 0,
+        // Position 2 of the active 1, 3.
+        landed: idOf(3),
+      },
+    ];
+
+    it.each(failedLandings)(
+      'when the landing after $name fails, the record stays shown with the failure and no notice, and Retry lands with the notice',
+      async ({ rows, initialPosition, prepare, start, position, listChanged, landed }) => {
+        const connection = await mountWire(rows, initialPosition);
+        const { api, result } = connection;
+        await prepare(connection);
+        const { record, n, count, includeDeleted, recordGeneration, listVersion } = result.current;
+        connection.failNext(`${RECORDS_PATH}/at/${position}`);
+        const mark = api.mark();
+
+        await perform(() => start(result.current));
+        await settled(result);
+
+        expect(api.requestsSince(mark).at(-1)).toBe(atRequest(position));
+        expect(result.current.loadError?.kind).toBe('unavailable');
+        expect(result.current.notice).toBeNull();
+        expect(result.current.record).toBe(record);
+        expect(result.current.n).toBe(n);
+        expect(result.current.count).toBe(count);
+        expect(result.current.includeDeleted).toBe(includeDeleted);
+        expect(result.current.recordGeneration).toBe(recordGeneration);
+        expect(result.current.listVersion).toBe(listVersion + listChanged);
+        expect(result.current.transitioning).toBe(false);
+
+        await perform(() => result.current.retryLoad());
+        await settled(result);
+
+        expect(result.current.loadError).toBeNull();
+        expect(result.current.record?.globalRecordId).toBe(landed);
+        expect(result.current.n).toBe(position);
+        expect(result.current.includeDeleted).toBe(false);
+        expect(result.current.notice).toMatch(DELETED_HIDDEN);
+      },
+    );
+  });
+
   describe('cancelled reads', () => {
     const abortedReads: readonly {
       readonly name: string;
@@ -2187,8 +2800,10 @@ describe('record transitions (0.3.6, 0.3.4.2)', () => {
         expect(connection.selfAborted).toEqual([line]);
         const lines = connection.sent.slice(sentBefore).map((entry) => entry.line);
         expect(parallel ? sorted(lines) : lines).toEqual(reads);
-        // A parallel load cancels its other reads once one is aborted; a single read is left as it was.
-        expect(sentTo(connection, line).signal.aborted).toBe(parallel);
+        // The read is left as it was: a request's signal follows the load's only while the request
+        // is in flight, so a parallel load's cancelling of its other reads, once one is aborted, is
+        // seen on a read still held (the parallelLoads cases below).
+        expect(sentTo(connection, line).signal.aborted).toBe(false);
         expect(result.current.loading).toBe(false);
         expect(result.current.loadError).toBeNull();
         expect(result.current.notice).toBeNull();
@@ -2612,6 +3227,161 @@ describe('record transitions (0.3.6, 0.3.4.2)', () => {
     });
   });
 
+  // Another session deletes the open record while its coordinates are being read, and a
+  // save then finds it deleted (409). Reads sent before that conflict never install n and
+  // N over it: the record stays at the n and N shown, which still count it, and the next
+  // move re-reads N and opens the record that followed it.
+  describe('coordinates read before a conflict', () => {
+    it.each([
+      { held: 'count', path: `${RECORDS_PATH}/count`, line: countRequest() },
+      { held: 'position', path: `${RECORDS_PATH}/${idOf(4)}/position`, line: positionRequest(idOf(4)) },
+    ])(
+      'an after-save refresh whose $held read is held across the conflict is superseded, and Next re-reads N',
+      async ({ path, line }) => {
+        const connection = await mountWire(activeRows(5), 4);
+        const { api, result } = connection;
+        const gate = api.hold(path);
+        await act(async () => {
+          result.current.afterSave(api.dto(idOf(4)));
+          await gate.reached;
+        });
+        expect(result.current.loading).toBe(true);
+        const refresh = sentTo(connection, line);
+        api.setStatus(idOf(4), DELETED);
+
+        act(() => {
+          result.current.afterConflict();
+        });
+
+        expect(refresh.signal.aborted).toBe(true);
+        expect(result.current.loading).toBe(false);
+        // The held read answers after the conflict and installs nothing.
+        await act(async () => {
+          gate.release();
+          await flush();
+        });
+        expect(result.current.n).toBe(4);
+        expect(result.current.count).toBe(5);
+        expect(result.current.statusText).toBe('4 of 5');
+        expect(result.current.loading).toBe(false);
+        expect(result.current.loadError).toBeNull();
+        const mark = api.mark();
+
+        await perform(() => result.current.next());
+
+        expect(api.logSince(mark)).toEqual(['beforeLeave', countRequest(), atRequest(4)]);
+        expect(result.current.record?.globalRecordId).toBe(idOf(5));
+        expect(result.current.statusText).toBe('4 of 4');
+        expect(result.current.canNext).toBe(false);
+        expect(result.current.notice).toBeNull();
+      },
+    );
+
+    // Record 3 of 5 is deleted elsewhere once its save has answered, so the refresh finds it
+    // outside the active set.
+    it.each([
+      {
+        name: 'an after-save refresh',
+        refresh: async ({ api, result }: MountedWire): Promise<void> => {
+          const saved = api.dto(idOf(3));
+          api.setStatus(idOf(3), DELETED);
+          act(() => {
+            result.current.afterSave(saved);
+          });
+          await settled(result);
+        },
+        failure: null,
+      },
+      {
+        name: 'the coordinates refresh after a Next whose leave saved it fails',
+        refresh: async (connection: MountedWire): Promise<void> => {
+          const { api, result, beforeLeave } = connection;
+          beforeLeave.mockImplementationOnce(() => {
+            api.note('beforeLeave');
+            result.current.afterSave(api.dto(idOf(3)));
+            api.setStatus(idOf(3), DELETED);
+            return Promise.resolve(true);
+          });
+          connection.failNext(`${RECORDS_PATH}/at/4`);
+          await perform(() => result.current.next());
+          await act(flush);
+        },
+        failure: 'unavailable',
+      },
+    ])(
+      '$name placing the saved record outside the set keeps n and N, and Next opens the record that followed',
+      async ({ refresh, failure }) => {
+        const connection = await mountWire(activeRows(5), 3);
+        const { api, result } = connection;
+        const { listVersion } = result.current;
+        const mark = api.mark();
+
+        await refresh(connection);
+
+        expect(api.requestsSince(mark)).toContain(positionRequest(idOf(3)));
+        expect(result.current.record?.globalRecordId).toBe(idOf(3));
+        expect(result.current.n).toBe(3);
+        expect(result.current.count).toBe(5);
+        expect(result.current.statusText).toBe('3 of 5');
+        expect(result.current.canPrevious).toBe(true);
+        expect(result.current.canNext).toBe(true);
+        expect(result.current.loading).toBe(false);
+        expect(result.current.loadError?.kind ?? null).toBe(failure);
+        // The save and the record leaving the set each reload the grid.
+        expect(result.current.listVersion).toBe(listVersion + 2);
+        const moveMark = api.mark();
+
+        await perform(() => result.current.next());
+
+        expect(api.logSince(moveMark)).toEqual(['beforeLeave', countRequest(), atRequest(3)]);
+        expect(result.current.record?.globalRecordId).toBe(idOf(4));
+        expect(result.current.statusText).toBe('3 of 4');
+        expect(result.current.loadError).toBeNull();
+        expect(result.current.notice).toBeNull();
+      },
+    );
+
+    it('a toggle to the active set whose reads predate the conflict leaves the record and reads the set again', async () => {
+      const { api, result, beforeLeave } = await mount(activeRows(5), { initialPosition: 3 });
+      await perform(() => result.current.setIncludeDeleted(true));
+      expect(result.current.statusText).toBe('3 of 5');
+      const gate = api.hold(`${RECORDS_PATH}/count`);
+      const mark = api.mark();
+      const toggleReads = sorted([countRequest(), positionRequest(idOf(3))]);
+      let toggling: Promise<void> = Promise.resolve();
+      await act(async () => {
+        toggling = result.current.setIncludeDeleted(false);
+        await gate.reached;
+      });
+      // The position read has answered from before the delete: record 3 is 3 of the active set.
+      await waitFor(() => {
+        expect(sorted(api.requestsSince(mark))).toEqual(toggleReads);
+      });
+      api.setStatus(idOf(3), DELETED);
+      act(() => {
+        result.current.afterConflict();
+      });
+      const leaves = beforeLeave.mock.calls.length;
+
+      await act(async () => {
+        gate.release();
+        await toggling;
+      });
+
+      const log = api.logSince(mark);
+      expect(sorted(log.slice(0, 2))).toEqual(toggleReads);
+      expect(log[2]).toBe('beforeLeave');
+      expect(sorted(log.slice(3, 5))).toEqual(toggleReads);
+      expect(log.slice(5)).toEqual([atRequest(3)]);
+      expect(beforeLeave).toHaveBeenCalledTimes(leaves + 1);
+      expect(result.current.includeDeleted).toBe(false);
+      expect(result.current.record?.globalRecordId).toBe(idOf(4));
+      expect(result.current.statusText).toBe('3 of 4');
+      expect(result.current.notice).toMatch(DELETED_HIDDEN);
+      expect(result.current.loadError).toBeNull();
+    });
+  });
+
   describe('the editor wired to navigation as FormView wires them', () => {
     /** A writable text field the fake's records leave empty. */
     const EDITED = 'FirstName';
@@ -2633,6 +3403,7 @@ describe('record transitions (0.3.6, 0.3.4.2)', () => {
         recordGeneration: navigation.recordGeneration,
         onSaved: navigation.afterSave,
         onDeleted: navigation.afterDelete,
+        onConflict: navigation.afterConflict,
         onDiscardToNearest: navigation.openNearest,
         transitioning: navigation.transitioning,
       });

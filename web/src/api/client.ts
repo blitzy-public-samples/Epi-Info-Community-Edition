@@ -14,9 +14,11 @@
 // failure states no outcome, so the save may have been applied and is never resent
 // without the user's explicit consent.
 //
-// The client is stateless: no retries, caching or timers. Retry decisions belong to
-// isSafeToResend and the hooks, and values are sent exactly as the caller gives them,
-// because the editor alone decides which fields a save carries.
+// The client keeps no state, caching or retries; its one timer is each request's deadline
+// (REQUEST_DEADLINE_MS), which ends a request that has not completed as a failure with no
+// response and never resends it. Retry decisions belong to isSafeToResend and the hooks,
+// and values are sent exactly as the caller gives them, because the editor alone decides
+// which fields a save carries. Every request asks for JSON or ProblemDetails (Accept).
 //
 // Field values are exact in both directions: a field value that is a JSON integer beyond
 // ±Number.MAX_SAFE_INTEGER that a `bigint` column can hold, such as 9007199254740993, is
@@ -67,6 +69,11 @@ export interface ApiClientOptions {
   baseUrl?: string;
   /** Replaces the global fetch, as tests do; it receives the built `Request`. */
   fetch?: typeof fetch;
+  /**
+   * How long one request may take to complete, in milliseconds; REQUEST_DEADLINE_MS unless
+   * this is a positive finite number, and at most the longest delay a timer honours.
+   */
+  deadlineMs?: number;
 }
 
 /** Query of the records list; an absent member takes the server default. */
@@ -82,6 +89,11 @@ export type HealthyResponse = paths['/health']['get']['responses'][200]['content
  * Typed calls of every API endpoint. The last parameter of each is an optional
  * `AbortSignal`; an aborted call rejects with an AbortError, which callers recognise with
  * `isAbortError`, and every other outcome resolves to an `ApiResult`.
+ *
+ * A call whose request and whole response have not completed within the client's deadline
+ * (REQUEST_DEADLINE_MS) is cancelled and settles as a failure with no response, kind
+ * `network`: a read offers Retry, and a create or update counts as possibly applied. The
+ * deadline never resends a request.
  *
  * Members are function-typed properties rather than methods: they never use `this`, so a
  * hook may pass `client.getRecordAt` around unbound.
@@ -616,6 +628,111 @@ function abortable(signal: AbortSignal | undefined): { signal: AbortSignal | nul
 // The API rejects every other media type with 415, `+json` types included.
 const jsonHeaders: Record<string, string> = { 'Content-Type': 'application/json' };
 
+// Sent with every request: the media types the API answers with, a JSON body on success and
+// ProblemDetails on failure.
+const acceptHeaders: Record<string, string> = { Accept: 'application/json, application/problem+json' };
+
+/**
+ * How long one request may take, in milliseconds: one bound per attempt, from sending the
+ * request to receiving the whole response, headers and body. It is twice the API's default
+ * `Database:CommandTimeoutSeconds` (30 s), so when one database command stalls, the
+ * server's own 503 and its write outcome (a lock wait, for instance, answers `notWritten`,
+ * which Retry may resend) arrive before the client gives up. A request that never
+ * completes therefore cannot hold the editor's save or a record transition.
+ */
+export const REQUEST_DEADLINE_MS = 60_000;
+
+// The largest delay a timer honours; setTimeout fires at once for a longer one.
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+
+// REQUEST_DEADLINE_MS unless `deadlineMs` is a positive finite number, and at most
+// MAX_TIMER_DELAY_MS, the rule of the field-event queue's own deadline.
+function deadlineOf(deadlineMs: number | undefined): number {
+  if (deadlineMs === undefined || !Number.isFinite(deadlineMs) || deadlineMs <= 0) {
+    return REQUEST_DEADLINE_MS;
+  }
+  return Math.min(deadlineMs, MAX_TIMER_DELAY_MS);
+}
+
+// What a request that outlived its deadline rejects with. It is named TimeoutError, never
+// AbortError, so settle reports a failure with no response rather than the caller's abort.
+function deadlineExceeded(): DOMException {
+  return new DOMException('The request did not complete in time.', 'TimeoutError');
+}
+
+// What a call its caller aborted rejects with: the caller's signal's reason, as fetch rejects
+// such a call, or an AbortError when the signal carries none.
+function callerAbortReason(signal: AbortSignal): unknown {
+  const reason: unknown = signal.reason;
+  return reason === undefined ? new DOMException('The operation was aborted.', 'AbortError') : reason;
+}
+
+// What ended a call before its exchange completed: the caller's abort or the deadline.
+interface Stopped {
+  readonly stoppedBy: unknown;
+}
+
+/**
+ * Sends `request` through `send` and reads its whole response within `deadlineMs`; the body
+ * is read by readingJsonExactly, so nothing openapi-fetch reads after this returns can wait
+ * on the network. The caller's signal is the one openapi-fetch put on `request`. When it is
+ * already aborted, nothing is sent and the call rejects at once with the caller's reason, as
+ * fetch rejects such a request. Otherwise the request sent is a copy whose signal the
+ * caller's abort and the deadline both abort, and the call settles at the first of three
+ * things: the whole response; the caller's abort, which
+ * rejects it with the caller's reason; or the deadline, which rejects it with a TimeoutError.
+ * An abort or the deadline settles the call at once, independently of the transport, and
+ * only then cancels the transport with the same reason. So a transport that ignores its
+ * signal or never settles cannot hold the call, and one that rejects as soon as it is
+ * aborted cannot settle a timed-out call first with an AbortError, which settle would take
+ * for the caller's own abort. Whatever the transport does later is ignored, and nothing is
+ * resent.
+ */
+async function withinDeadline(
+  request: Request,
+  send: (request: Request) => Promise<Response>,
+  deadlineMs: number,
+): Promise<Response> {
+  const caller = request.signal;
+  if (caller.aborted) {
+    throw callerAbortReason(caller);
+  }
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let followCaller: (() => void) | undefined;
+  // Resolves with the reason, which the call then throws, rather than rejecting with it: the
+  // caller's reason may be any value, and the lint rules let a promise reject only with an Error.
+  const stopped = new Promise<Stopped>((resolve) => {
+    const stop = (reason: unknown): void => {
+      clearTimeout(timer);
+      resolve({ stoppedBy: reason });
+      controller.abort(reason);
+    };
+    followCaller = () => {
+      stop(callerAbortReason(caller));
+    };
+    caller.addEventListener('abort', followCaller, { once: true });
+    timer = setTimeout(() => {
+      stop(deadlineExceeded());
+    }, deadlineMs);
+  });
+  const sent = new Request(request, { signal: controller.signal });
+  const exchange = async (): Promise<Response> => readingJsonExactly(sent, await send(sent));
+
+  try {
+    const outcome = await Promise.race([exchange(), stopped]);
+    if ('stoppedBy' in outcome) {
+      throw outcome.stoppedBy;
+    }
+    return outcome;
+  } finally {
+    clearTimeout(timer);
+    if (followCaller !== undefined) {
+      caller.removeEventListener('abort', followCaller);
+    }
+  }
+}
+
 // Text made only of .NET whitespace (`char.IsWhiteSpace`), or empty.
 const DOTNET_BLANK = /^[\t\n\v\f\r \u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*$/;
 
@@ -1129,15 +1246,21 @@ function serializeJson(value: unknown): string | undefined {
 // statuses); a Response of one of them cannot be built with a body.
 const NULL_BODY_STATUSES: ReadonlySet<number> = new Set([101, 103, 204, 205, 304]);
 
-// A copy of `response` with `text` as its body, held decoded and whole, so it is neither
-// encoded nor chunked and carries its Content-Length; with `null`, a copy with no body,
-// whose Content-Length of 0 tells openapi-fetch to read none.
-function copyWithBody(response: Response, text: string | null): Response {
+// A copy of `response` with `body` as its body, held whole, so it is neither encoded nor
+// chunked and carries its Content-Length: decoded text, or the bytes received; with `null`,
+// a copy with no body, whose Content-Length of 0 tells openapi-fetch to read none.
+function copyWithBody(response: Response, body: string | ArrayBuffer | null): Response {
+  let length = 0;
+  if (typeof body === 'string') {
+    length = new TextEncoder().encode(body).byteLength;
+  } else if (body !== null) {
+    length = body.byteLength;
+  }
   const headers = new Headers(response.headers);
   headers.delete('Content-Encoding');
   headers.delete('Transfer-Encoding');
-  headers.set('Content-Length', String(text === null ? 0 : new TextEncoder().encode(text).byteLength));
-  return new Response(text, { status: response.status, statusText: response.statusText, headers });
+  headers.set('Content-Length', String(length));
+  return new Response(body, { status: response.status, statusText: response.statusText, headers });
 }
 
 // The body-less copy of a response whose body cannot be used, marked for settle.
@@ -1165,16 +1288,18 @@ function unreadable(response: Response): Response {
 //   exactly. Text that is not JSON, an empty body included, gives a copy marked
 //   unreadable. Otherwise the copy's json() answers the parsed body: openapi-fetch reads an
 //   OK body with json() when the response carries a Content-Length, which the copy does.
-// - An error body holds no field values, so the copy carries its text and openapi-fetch
-//   parses it as it parses any error body, a non-JSON one included.
+// - An error body holds no field values, so the copy carries the bytes received, undecoded,
+//   and openapi-fetch decodes and parses it once, as it parses any error body, a non-JSON one
+//   included. Decoding it here as well would drop a second leading byte order mark and could
+//   turn a body that is not JSON, and so states no write outcome, into one that is.
 async function readingJsonExactly(request: Request, response: Response): Promise<Response> {
   if (NULL_BODY_STATUSES.has(response.status)) {
     return copyWithBody(response, null);
   }
 
-  let text: string;
+  let text: string | ArrayBuffer;
   try {
-    text = await response.text();
+    text = response.ok ? await response.text() : await response.arrayBuffer();
   } catch (e) {
     if (request.signal.aborted) {
       throw e;
@@ -1182,7 +1307,7 @@ async function readingJsonExactly(request: Request, response: Response): Promise
     return unreadable(response);
   }
 
-  if (!response.ok) {
+  if (typeof text !== 'string') {
     return copyWithBody(response, text);
   }
 
@@ -1213,9 +1338,12 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
   // openapi-fetch captures globalThis.fetch when the client is built; resolving it per
   // call lets a fetch installed later, such as a test stub, reach the default client.
   const send = options.fetch ?? ((request: Request) => globalThis.fetch(request));
+  const deadlineMs = deadlineOf(options.deadlineMs);
   const http = createClient<paths>({
     baseUrl: options.baseUrl ?? pageOrigin(),
-    fetch: async (request: Request) => readingJsonExactly(request, await send(request)),
+    fetch: (request: Request) => withinDeadline(request, send, deadlineMs),
+    // openapi-fetch merges these into every request; Content-Type stays on the body calls.
+    headers: acceptHeaders,
     bodySerializer: serializeJson,
   });
 

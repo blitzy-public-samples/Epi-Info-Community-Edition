@@ -328,7 +328,9 @@ public sealed partial class SqlParameterizationTests : IAsyncLifetime
 /// because AAP 0.7.6 compares only the dynamic identifiers with the reader and leaves fixed names and aliases
 /// uncompared, and because the store also sends fixed text inside a write: an update reads the permissions again in
 /// its transaction through <c>SqlPermissionReader</c>, whose statement binds every table name as a parameter value
-/// and so names no table or column at all.
+/// and so names no table or column at all; and an insert and an update first take the form's write lock through
+/// <c>sys.sp_getapplock</c>, whose statement binds every value, the lock resource holding the base table's name
+/// included, as a parameter, and so names none either.
 /// </para>
 /// <para>
 /// A builder statement is held to the closed grammar of <c>RecordSqlBuilder</c>'s fixed text, position by position,
@@ -373,13 +375,16 @@ public sealed partial class SqlParameterizationTests : IAsyncLifetime
 /// </description></item>
 /// <item><description>
 /// Every bare word is a keyword of the builders, a call of a built-in function the store's fixed reads use
-/// (<c>HAS_PERMS_BY_NAME</c>), or a name the statement itself declares with <c>AS</c>: a column alias, a derived
+/// (<c>HAS_PERMS_BY_NAME</c>), a keyword of the form write lock's fixed text (<c>DECLARE</c>, <c>EXEC</c>,
+/// <c>int</c>), the system procedure that lock calls, written <c>sys.sp_getapplock</c> right after <c>EXEC</c> or
+/// <c>EXEC @variable =</c>, or a name the statement itself declares with <c>AS</c>: a column alias, a derived
 /// table's alias, or a name of the column list after that alias. An <c>AS</c> inside a <c>CAST</c> gives a type and
 /// declares nothing.
 /// </description></item>
 /// <item><description>
 /// Every bracketed name is likewise declared in the statement. A qualifier before a <c>.</c> is a derived-table alias
-/// the statement declares, and the name after it is bracketed and is a column that derived table declares.
+/// the statement declares, and the name after it is bracketed and is a column that derived table declares; the one
+/// other qualified name is that called system procedure.
 /// </description></item>
 /// <item><description>
 /// No string literal names a table or column of either form, read as T-SQL, and no identifier is double-quoted. No
@@ -442,6 +447,22 @@ public sealed class RecordCommandIdentifierProvenanceTests : IAsyncLifetime
     private static readonly HashSet<string> FixedStatementBuiltIns = new(
         ["HAS_PERMS_BY_NAME"],
         StringComparer.OrdinalIgnoreCase);
+
+    // The keywords of the form write lock, the fixed statement an insert and an update send first in their
+    // transaction, "DECLARE @result int; EXEC @result = sys.sp_getapplock @Resource = @p0, ...; SELECT @result",
+    // beyond the builders' own; and the one system procedure it calls, qualified by the system schema. Both compared
+    // ignoring case.
+    private static readonly HashSet<string> FixedStatementKeywords = new(
+        ["DECLARE", "EXEC", "int"],
+        StringComparer.OrdinalIgnoreCase);
+
+    private static readonly HashSet<string> FixedStatementProcedures = new(
+        ["sp_getapplock"],
+        StringComparer.OrdinalIgnoreCase);
+
+    private const string SystemSchema = "sys";
+
+    private const string ExecuteKeyword = "EXEC";
 
     // RecordSqlBuilder's IntrinsicPositionColumn and IntrinsicCountColumn without brackets: the columns its derived
     // table declares with AS.
@@ -955,8 +976,9 @@ public sealed class RecordCommandIdentifierProvenanceTests : IAsyncLifetime
     }
 
     // A bare word of a fixed statement: a table-position keyword followed by the "(" of a derived table, a qualifier
-    // that is a derived-table alias the statement declares, a keyword of the builders, a called built-in of the
-    // store's fixed reads, or a name the statement declares with AS.
+    // that is a derived-table alias the statement declares, the system schema or the system procedure of the form write
+    // lock's call, a keyword of the builders or of the form write lock, a called built-in of the store's fixed reads,
+    // or a name the statement declares with AS.
     private static string? FixedWordViolation(IReadOnlyList<SqlToken> tokens, int index, FixedStatementShape shape)
     {
         var word = tokens[index].Text;
@@ -972,6 +994,11 @@ public sealed class RecordCommandIdentifierProvenanceTests : IAsyncLifetime
                         "table of either form may only open a derived table after FROM or JOIN";
         }
 
+        if (IsCalledSystemProcedure(tokens, index) || IsCalledSystemProcedure(tokens, index + 2))
+        {
+            return null;
+        }
+
         if (hasNext && tokens[index + 1].Kind == TokenKind.Dot)
         {
             return shape.DerivedTableColumns.ContainsKey(word)
@@ -979,7 +1006,13 @@ public sealed class RecordCommandIdentifierProvenanceTests : IAsyncLifetime
                 : $"{word} qualifies a name but is not a derived-table alias the statement declares with AS";
         }
 
-        if (BuilderKeywords.Contains(word))
+        if (FixedStatementProcedures.Contains(word))
+        {
+            return $"{word} is the system procedure of the form write lock but is not called as " +
+                $"{SystemSchema}.{word} right after {ExecuteKeyword} or {ExecuteKeyword} @variable =";
+        }
+
+        if (BuilderKeywords.Contains(word) || FixedStatementKeywords.Contains(word))
         {
             return null;
         }
@@ -1026,9 +1059,15 @@ public sealed class RecordCommandIdentifierProvenanceTests : IAsyncLifetime
     }
 
     // A '.' of a fixed statement joins a name before it, which FixedWordViolation and FixedBracketedViolation judge as
-    // a qualifier, to a bracketed name after it.
+    // a qualifier, to a bracketed name after it; or it joins the system schema to the system procedure of the form
+    // write lock's call.
     private static string? FixedDotViolation(IReadOnlyList<SqlToken> tokens, int index)
     {
+        if (IsCalledSystemProcedure(tokens, index + 1))
+        {
+            return null;
+        }
+
         if (index == 0 || tokens[index - 1].Kind is not (TokenKind.Word or TokenKind.Bracketed))
         {
             return "a '.' qualifier follows " +
@@ -1040,6 +1079,28 @@ public sealed class RecordCommandIdentifierProvenanceTests : IAsyncLifetime
             ? null
             : "the name after a '.' qualifier is not bracket-quoted: " +
                 (index + 1 < tokens.Count ? Display(tokens[index + 1]) : "the end of the text");
+    }
+
+    // Whether the token at procedureIndex is the system procedure of the form write lock, called as the lock's fixed
+    // text calls it: "sys" "." procedure, right after EXEC or after EXEC @variable =.
+    private static bool IsCalledSystemProcedure(IReadOnlyList<SqlToken> tokens, int procedureIndex)
+    {
+        if (procedureIndex < 3
+            || procedureIndex >= tokens.Count
+            || tokens[procedureIndex].Kind != TokenKind.Word
+            || !FixedStatementProcedures.Contains(tokens[procedureIndex].Text)
+            || tokens[procedureIndex - 1].Kind != TokenKind.Dot
+            || !IsWord(tokens[procedureIndex - 2], SystemSchema))
+        {
+            return false;
+        }
+
+        var call = procedureIndex - 3;
+        return IsWord(tokens[call], ExecuteKeyword)
+            || (call >= 2
+                && IsSymbol(tokens[call], "=")
+                && tokens[call - 1].Kind == TokenKind.Parameter
+                && IsWord(tokens[call - 2], ExecuteKeyword));
     }
 
     // A token as a failure message names it: an identifier with its quotes, a string literal never by its content.

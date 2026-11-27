@@ -31,7 +31,7 @@ import { act, renderHook } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi, type Mock } from 'vitest';
 
 import { createApiClient, isExactDecimal, numberFromText, type ApiClient, type ApiResult } from '../api/client';
-import { errorMessages, type ApiErrorKind } from '../api/errors';
+import { errorMessages, isAbortError, isSafeToResend, type ApiError, type ApiErrorKind } from '../api/errors';
 import type {
   FieldDefinition,
   FieldEventResponse,
@@ -189,8 +189,8 @@ interface RecordedCall {
   readonly text: string | null;
 }
 
-/** The answer to one request: a response, or a function that settles it later or rejects. */
-type Reply = Response | (() => Promise<Response>);
+/** The answer to one request: a response, or a function of the request that settles it later or rejects. */
+type Reply = Response | ((request: Request) => Promise<Response>);
 
 /** A reply held at the fake until the test releases it. */
 interface Gate {
@@ -266,7 +266,7 @@ function createFakeApi(): FakeApi {
       unanswered.push(lineOf(call));
       throw new Error(`no reply queued for ${lineOf(call)}`);
     }
-    return next instanceof Response ? next : next();
+    return next instanceof Response ? next : next(request);
   };
 
   const api: FakeApi = {
@@ -402,6 +402,7 @@ interface Mounted {
   readonly rerender: (props: UseRecordEditorOptions) => void;
   readonly onSaved: Mock<(record: RecordDto) => void>;
   readonly onDeleted: Mock<() => void>;
+  readonly onConflict: Mock<() => void>;
   readonly onDiscardToNearest: Mock<(notice?: string) => void>;
 }
 
@@ -410,18 +411,20 @@ interface MountedRecord extends Mounted {
 }
 
 // The definition is fresh per test, and the same object across rerenders: a new definition starts a
-// new form.
+// new form. Without `deadlineMs` the client has its default request deadline.
 function mount(
   record: RecordDto | null,
   isNew: boolean,
   definition: FormDefinition = createFormDefinitionFixture(),
+  deadlineMs?: number,
 ): Mounted {
   const api = createFakeApi();
   const onSaved = vi.fn<(saved: RecordDto) => void>();
   const onDeleted = vi.fn<() => void>();
+  const onConflict = vi.fn<() => void>();
   const onDiscardToNearest = vi.fn<(notice?: string) => void>();
   const props: UseRecordEditorOptions = {
-    client: createApiClient({ baseUrl: 'http://localhost', fetch: api.fetch }),
+    client: createApiClient({ baseUrl: 'http://localhost', fetch: api.fetch, deadlineMs }),
     viewId: definition.viewId,
     definition,
     record,
@@ -429,20 +432,21 @@ function mount(
     recordGeneration: 1,
     onSaved,
     onDeleted,
+    onConflict,
     onDiscardToNearest,
   };
   const { result, rerender } = renderHook((options: UseRecordEditorOptions) => useRecordEditor(options), {
     initialProps: props,
   });
-  return { api, result, props, rerender, onSaved, onDeleted, onDiscardToNearest };
+  return { api, result, props, rerender, onSaved, onDeleted, onConflict, onDiscardToNearest };
 }
 
-function mountNew(definition?: FormDefinition): Mounted {
-  return mount(null, true, definition);
+function mountNew(definition?: FormDefinition, deadlineMs?: number): Mounted {
+  return mount(null, true, definition, deadlineMs);
 }
 
-function mountExisting(record: RecordDto = storedRecord(), definition?: FormDefinition): MountedRecord {
-  return { ...mount(record, false, definition), record };
+function mountExisting(record: RecordDto = storedRecord(), definition?: FormDefinition, deadlineMs?: number): MountedRecord {
+  return { ...mount(record, false, definition, deadlineMs), record };
 }
 
 /** Runs an action inside act and returns what it resolved to. */
@@ -1166,19 +1170,32 @@ describe('leaving a record (0.3.6)', () => {
     expect(api.lines()).toEqual([`PUT ${recordPath(record)}`]);
   });
 
-  it('shows a record found deleted (409) read-only, with no restore', async () => {
-    const { api, result } = mountExisting();
+  it.each([
+    { name: 'save', write: (editor: RecordEditor) => editor.save(), says: errorMessages.saveConflict },
+    // The move the leave was for is cancelled, and the text says so.
+    {
+      name: 'leave',
+      write: (editor: RecordEditor) => editor.leave(),
+      says: `${errorMessages.saveConflict} ${errorMessages.leaveCancelled}`,
+    },
+  ])('shows a record its $name found deleted (409) read-only, with no restore, and tells navigation once', async ({ write, says }) => {
+    const { api, result, onSaved, onDeleted, onConflict, onDiscardToNearest } = mountExisting();
     edit(result, TEXT, 'Jones');
     api.reply(problem(409));
 
-    expect(await perform(() => result.current.save())).toBe(false);
+    expect(await perform(() => write(result.current))).toBe(false);
 
+    // Navigation learns that the selected set changed; the record was neither saved nor left.
+    expect(onConflict).toHaveBeenCalledTimes(1);
+    expect(onSaved).not.toHaveBeenCalled();
+    expect(onDeleted).not.toHaveBeenCalled();
+    expect(onDiscardToNearest).not.toHaveBeenCalled();
     expect(result.current.deletedReadOnly).toBe(true);
     const banner = bannerOf(result.current);
     expect(banner.kind).toBe('deleted');
     expect(banner.message).toMatch(/deleted/i);
     // The edits stay on screen, read-only, and the text says they were not saved.
-    expect(banner.message).toBe(errorMessages.saveConflict);
+    expect(banner.message).toBe(says);
     expect(result.current.values[TEXT]).toBe('Jones');
     expect(banner.actions).toEqual([]);
     for (const field of allFields()) {
@@ -1188,6 +1205,7 @@ describe('leaving a record (0.3.6)', () => {
     expect(result.current.isDirty).toBe(false);
     expect(await perform(() => result.current.leave())).toBe(true);
     expect(api.lines()).toHaveLength(1);
+    expect(onConflict).toHaveBeenCalledTimes(1);
   });
 
   it.each([
@@ -1564,9 +1582,9 @@ interface DirtyDraft extends Mounted {
 }
 
 /** POST: a new record with TEXT entered. PUT: the stored record with TEXT edited. */
-function mountDirtyDraft(method: RecordWriteMethod): DirtyDraft {
+function mountDirtyDraft(method: RecordWriteMethod, deadlineMs?: number): DirtyDraft {
   if (method === 'POST') {
-    const mounted = mountNew();
+    const mounted = mountNew(undefined, deadlineMs);
     edit(mounted.result, TEXT, 'Smith');
     // C-10: every entered value, and `false` for each unchecked writable checkbox.
     const body: Values = { [TEXT]: 'Smith', ...uncheckedCheckboxes() };
@@ -1580,7 +1598,7 @@ function mountDirtyDraft(method: RecordWriteMethod): DirtyDraft {
       success: () => jsonResponse(201, saved),
     };
   }
-  const mounted = mountExisting();
+  const mounted = mountExisting(undefined, undefined, deadlineMs);
   edit(mounted.result, TEXT, 'Jones');
   // C-3: the dirty field only.
   const body: Values = { [TEXT]: 'Jones' };
@@ -1746,6 +1764,561 @@ describe('write outcomes and Retry (0.3.4.2)', () => {
     expect(onDeleted).toHaveBeenCalledTimes(1);
     expect(result.current.banner).toBeNull();
   });
+});
+
+// The client's request deadline: a request whose whole response has not arrived by then is
+// cancelled and settles as no response, which 0.3.4.2 lets Retry resend for a DELETE or a
+// read and never for a POST or PUT. Nothing resends it by itself. Real timers, short deadline.
+describe('the request deadline (0.3.4.2)', () => {
+  const DEADLINE_MS = 100;
+  // A timer fires no earlier than its delay, up to the millisecond the event loop rounds to.
+  const TIMER_SLACK_MS = 5;
+
+  function sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => {
+      setTimeout(resolve, ms);
+    });
+  }
+
+  function abortError(): DOMException {
+    return new DOMException('The operation was aborted.', 'AbortError');
+  }
+
+  /** The requests a transport received, in arrival order. */
+  interface Received {
+    readonly requests: readonly Request[];
+  }
+
+  /** The request received, which the deadline cancelled. */
+  function expectCancelledByDeadline({ requests }: Received): void {
+    expect(requests).toHaveLength(1);
+    const { signal } = requests[0];
+    expect(signal.aborted).toBe(true);
+    const reason: unknown = signal.reason;
+    expect(reason).toMatchObject({ name: 'TimeoutError' });
+  }
+
+  /** A fake API reply that never answers, as a stalled connection. */
+  interface Stall extends Received {
+    readonly reply: Reply;
+  }
+
+  function stall(): Stall {
+    const requests: Request[] = [];
+    return {
+      reply: (request) => {
+        requests.push(request);
+        return new Promise<Response>(() => undefined);
+      },
+      requests,
+    };
+  }
+
+  const STALLED_WRITES = RECORD_WRITE_METHODS.flatMap((method) =>
+    (['save', 'leave'] as const).map((action) => ({ method, action })),
+  );
+
+  it.each(STALLED_WRITES)(
+    'ends the $action of a $method that never answers at the deadline as a write that may have been applied, and never resends it',
+    async ({ method, action }) => {
+      const draft = mountDirtyDraft(method, DEADLINE_MS);
+      const { api, result, onSaved } = draft;
+      const held = stall();
+      api.reply(held.reply);
+      const { values } = result.current;
+      const dirty = new Set(result.current.dirty);
+      const started = performance.now();
+
+      expect(await perform(() => (action === 'save' ? result.current.save() : result.current.leave()))).toBe(false);
+
+      expect(performance.now() - started).toBeGreaterThanOrEqual(DEADLINE_MS - TIMER_SLACK_MS);
+      expectCancelledByDeadline(held);
+      const banner = bannerOf(result.current);
+      expect(banner.kind).toBe('uncertainWrite');
+      expect(banner.method).toBe(method);
+      expect(banner.isCreate).toBe(method === 'POST');
+      expect(banner.traceId).toBeNull();
+      expect(banner.actions).toEqual(['saveAgain']);
+      expect(banner.message).toMatch(MAY_ALREADY_BE_APPLIED);
+      expect(banner.message).toMatch(LIST_CANNOT_PROVE);
+      // The draft stays as it was, and the editor is no longer saving.
+      expect(result.current.values).toEqual(values);
+      expect(result.current.dirty).toEqual(dirty);
+      expect(result.current.saving).toBe(false);
+      expect(result.current.savePending).toBe(false);
+      expect(onSaved).not.toHaveBeenCalled();
+
+      // Several deadlines later the write has still been sent once.
+      await act(async () => {
+        await sleep(DEADLINE_MS * 3);
+      });
+      expect(api.lines()).toEqual([draft.line]);
+
+      // Save again, the explicit action, sends it once more, and its answer completes the save.
+      api.reply(draft.success());
+      expect(await perform(() => result.current.saveAgain())).toBe(true);
+
+      expect(api.lines()).toEqual([draft.line, draft.line]);
+      expect(sentValues(api.calls[1])).toEqual(draft.body);
+      expect(onSaved).toHaveBeenCalledTimes(1);
+      expect(onSaved).toHaveBeenCalledWith(draft.saved);
+      expect(result.current.banner).toBeNull();
+    },
+  );
+
+  it('ends a DELETE that never answers at the deadline with Retry, and sends it again only on Retry', async () => {
+    const { api, result, record, onDeleted } = mountExisting(undefined, undefined, DEADLINE_MS);
+    const line = `DELETE ${recordPath(record)}`;
+    run(() => {
+      result.current.requestDelete();
+    });
+    const held = stall();
+    api.reply(held.reply);
+    const started = performance.now();
+
+    await perform(() => result.current.confirmDelete());
+
+    expect(performance.now() - started).toBeGreaterThanOrEqual(DEADLINE_MS - TIMER_SLACK_MS);
+    expectCancelledByDeadline(held);
+    const banner = bannerOf(result.current);
+    expect(banner.kind).toBe('unavailable');
+    expect(banner.method).toBe('DELETE');
+    expect(banner.traceId).toBeNull();
+    expect(banner.actions).toEqual(['retry']);
+    expect(result.current.deleteDialogOpen).toBe(false);
+    expect(onDeleted).not.toHaveBeenCalled();
+
+    await act(async () => {
+      await sleep(DEADLINE_MS * 3);
+    });
+    expect(api.lines()).toEqual([line]);
+
+    api.reply(noContent());
+    await perform(() => result.current.retry());
+
+    expect(api.lines()).toEqual([line, line]);
+    expect(onDeleted).toHaveBeenCalledTimes(1);
+    expect(result.current.banner).toBeNull();
+  });
+
+  /** A fetch that keeps every request it receives. */
+  interface Transport extends Received {
+    readonly fetch: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
+  }
+
+  /**
+   * A transport whose exchange never completes: with `status` null it never answers; with a
+   * status it answers at once, and the body's first bytes arrive but its end never does. As
+   * fetch does, it fails with an AbortError, at once, when the request's signal aborts.
+   */
+  function neverCompleting(status: number | null): Transport {
+    const requests: Request[] = [];
+    const fetchNever = (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      const request = input instanceof Request ? input : new Request(input, init);
+      requests.push(request);
+      const { signal } = request;
+      if (status === null) {
+        return new Promise<Response>((_resolve, reject) => {
+          signal.addEventListener(
+            'abort',
+            () => {
+              reject(abortError());
+            },
+            { once: true },
+          );
+        });
+      }
+      const body = new ReadableStream<Uint8Array>({
+        start(stream) {
+          stream.enqueue(new TextEncoder().encode('{"'));
+          signal.addEventListener(
+            'abort',
+            () => {
+              stream.error(abortError());
+            },
+            { once: true },
+          );
+        },
+      });
+      return Promise.resolve(
+        new Response(body, {
+          status,
+          headers: { 'content-type': status < 400 ? 'application/json' : 'application/problem+json' },
+        }),
+      );
+    };
+    return { fetch: fetchNever, requests };
+  }
+
+  const NEVER_COMPLETING: readonly { readonly name: string; readonly status: number | null }[] = [
+    { name: 'never answers', status: null },
+    { name: 'answers 200 with a body that never ends', status: 200 },
+    { name: 'answers 503 with a body that never ends', status: 503 },
+  ];
+
+  it.each(NEVER_COMPLETING)('settles a request that $name as no response at the deadline, and cancels it', async ({ status }) => {
+    const transport = neverCompleting(status);
+    const client = createApiClient({ baseUrl: 'http://localhost', fetch: transport.fetch, deadlineMs: DEADLINE_MS });
+    const started = performance.now();
+
+    const read = await client.countRecords(VIEW_ID);
+
+    expect(performance.now() - started).toBeGreaterThanOrEqual(DEADLINE_MS - TIMER_SLACK_MS);
+    const error = read.ok ? null : read.error;
+    expect(error?.kind).toBe('network');
+    expect(error?.status).toBeNull();
+    expect(error?.traceId).toBeNull();
+    expect(error?.writeOutcome).toBeNull();
+    expectCancelledByDeadline(transport);
+  });
+
+  it.each(NEVER_COMPLETING)(
+    "rejects a request that $name with an AbortError when the caller aborts it before the deadline",
+    async ({ status }) => {
+      const transport = neverCompleting(status);
+      const client = createApiClient({ baseUrl: 'http://localhost', fetch: transport.fetch, deadlineMs: DEADLINE_MS });
+      const caller = new AbortController();
+      const read = client.countRecords(VIEW_ID, undefined, caller.signal);
+
+      await sleep(DEADLINE_MS / 4);
+      caller.abort();
+
+      await expect(read).rejects.toSatisfy(isAbortError);
+      expect(transport.requests).toHaveLength(1);
+      const { signal } = transport.requests[0];
+      expect(signal.aborted).toBe(true);
+      const reason: unknown = signal.reason;
+      expect(reason).toMatchObject({ name: 'AbortError' });
+    },
+  );
+
+  /**
+   * A transport that keeps every request and never answers it, deaf to its signal, as a
+   * replacement fetch may be: only the client can end the call.
+   */
+  function deafAndSilent(): Transport {
+    const requests: Request[] = [];
+    const fetchDeaf = (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      requests.push(input instanceof Request ? input : new Request(input, init));
+      return new Promise<Response>(() => undefined);
+    };
+    return { fetch: fetchDeaf, requests };
+  }
+
+  // A caller's abort ends the call at once, with the caller's own reason, however the
+  // transport behaves. The deadline is long, so a call it ended could not be mistaken for one
+  // the abort ended.
+  it.each(
+    [
+      {
+        operation: 'a read',
+        call: (client: ApiClient, signal: AbortSignal) => client.countRecords(VIEW_ID, undefined, signal),
+      },
+      {
+        operation: 'a create',
+        call: (client: ApiClient, signal: AbortSignal) => client.createRecord(VIEW_ID, { [TEXT]: 'Smith' }, signal),
+      },
+    ].flatMap(({ operation, call }) => [
+      // fetch rejects a request whose signal is already aborted without sending it.
+      { operation, call, when: 'before it starts', abortAfterMs: null, sent: 0 },
+      { operation, call, when: 'while its request is in flight', abortAfterMs: DEADLINE_MS / 4, sent: 1 },
+    ]),
+  )(
+    'rejects $operation aborted $when at once with the caller’s AbortError, though the transport ignores it and never answers',
+    async ({ call, abortAfterMs, sent }) => {
+      const deadlineMs = DEADLINE_MS * 10;
+      const transport = deafAndSilent();
+      const client = createApiClient({ baseUrl: 'http://localhost', fetch: transport.fetch, deadlineMs });
+      const caller = new AbortController();
+      if (abortAfterMs === null) {
+        caller.abort();
+      }
+      const pending = call(client, caller.signal);
+      if (abortAfterMs !== null) {
+        await sleep(abortAfterMs);
+        caller.abort();
+      }
+      const aborted = performance.now();
+      const reason: unknown = caller.signal.reason;
+
+      await expect(pending).rejects.toBe(reason);
+
+      expect(reason).toSatisfy(isAbortError);
+      // Settled by the abort itself, long before the deadline could end it.
+      expect(performance.now() - aborted).toBeLessThan(deadlineMs / 10);
+      expect(transport.requests).toHaveLength(sent);
+      // A request that was sent is cancelled with the caller's reason, never the deadline's.
+      for (const { signal } of transport.requests) {
+        expect(signal.aborted).toBe(true);
+        expect(signal.reason).toBe(reason);
+      }
+    },
+  );
+
+  /** A transport that answers `status` with `text` in two parts, the second, which ends the body, after `delayMs`. */
+  function answeringInParts(status: number, text: string, delayMs: number): Transport {
+    const requests: Request[] = [];
+    const fetchInParts = (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      requests.push(input instanceof Request ? input : new Request(input, init));
+      const encoder = new TextEncoder();
+      const middle = Math.floor(text.length / 2);
+      const body = new ReadableStream<Uint8Array>({
+        start(stream) {
+          stream.enqueue(encoder.encode(text.slice(0, middle)));
+          setTimeout(() => {
+            stream.enqueue(encoder.encode(text.slice(middle)));
+            stream.close();
+          }, delayMs);
+        },
+      });
+      return Promise.resolve(
+        new Response(body, {
+          status,
+          headers: { 'content-type': status < 400 ? 'application/json' : 'application/problem+json' },
+        }),
+      );
+    };
+    return { fetch: fetchInParts, requests };
+  }
+
+  const PROBLEM_503 = JSON.stringify({
+    type: 'about:blank',
+    title: 'Service Unavailable',
+    status: 503,
+    detail: 'A fixed server sentence.',
+    traceId: TRACE_ID,
+    writeOutcome: 'notWritten',
+  });
+
+  it.each<[string, (client: ApiClient) => Promise<ApiResult<unknown>>, number, string, ApiResult<unknown>]>([
+    ['an OK read', (client) => client.countRecords(VIEW_ID), 200, '{"count":7}', { ok: true, data: { count: 7 }, status: 200 }],
+    [
+      'a 503 of a create',
+      (client) => client.createRecord(VIEW_ID, { [TEXT]: 'Smith' }),
+      503,
+      PROBLEM_503,
+      {
+        ok: false,
+        error: {
+          kind: 'unavailable',
+          status: 503,
+          type: 'about:blank',
+          title: 'Service Unavailable',
+          detail: 'A fixed server sentence.',
+          traceId: TRACE_ID,
+          fieldErrors: {},
+          writeOutcome: 'notWritten',
+        },
+      },
+    ],
+  ])('reads %s whose body ends within the deadline as it was sent', async (_case, call, status, text, expected) => {
+    const transport = answeringInParts(status, text, DEADLINE_MS / 4);
+    const client = createApiClient({ baseUrl: 'http://localhost', fetch: transport.fetch, deadlineMs: DEADLINE_MS });
+
+    expect(await call(client)).toEqual(expected);
+
+    expect(transport.requests).toHaveLength(1);
+    expect(transport.requests[0].signal.aborted).toBe(false);
+  });
+
+  // An error body reaches the parser exactly as it was received and is decoded once, as fetch
+  // decodes a body: as UTF-8, dropping leading byte order marks. A mark that one decode leaves
+  // in the text makes the body not JSON, so a writeOutcome it seems to carry proves nothing
+  // (0.3.4.2); a second decode, which would drop that mark as well, must not happen.
+  const UTF8_BOM: readonly number[] = [0xef, 0xbb, 0xbf];
+
+  /** `marks` UTF-8 byte order marks followed by the UTF-8 bytes of `text`. */
+  function afterMarks(marks: number, text: string): Uint8Array<ArrayBuffer> {
+    const encoded = new TextEncoder().encode(text);
+    const bytes = new Uint8Array(UTF8_BOM.length * marks + encoded.length);
+    for (let mark = 0; mark < marks; mark += 1) {
+      bytes.set(UTF8_BOM, UTF8_BOM.length * mark);
+    }
+    bytes.set(encoded, UTF8_BOM.length * marks);
+    return bytes;
+  }
+
+  /**
+   * How many leading byte order marks one decode of a body by this runtime's fetch drops:
+   * one under the Encoding standard, as a browser decodes; Node's fetch has been seen to drop
+   * two. Measured, so each case below holds wherever the tests run.
+   */
+  async function marksOneDecodeDrops(): Promise<number> {
+    const marks = 4;
+    const text = await new Response(afterMarks(marks, '{}')).text();
+    return marks - text.indexOf('{');
+  }
+
+  /** A 503 whose body is `marks` byte order marks followed by the bytes of PROBLEM_503. */
+  function problemAfterMarks(marks: number): Response {
+    return new Response(afterMarks(marks, PROBLEM_503), {
+      status: 503,
+      headers: { 'content-type': 'application/problem+json' },
+    });
+  }
+
+  /** A transport that keeps every request and answers it with `response`. */
+  function answeringWith(response: Response): Transport {
+    const requests: Request[] = [];
+    const fetchAnswering = (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      requests.push(input instanceof Request ? input : new Request(input, init));
+      return Promise.resolve(response);
+    };
+    return { fetch: fetchAnswering, requests };
+  }
+
+  const READ_AS_SENT: ApiError = {
+    kind: 'unavailable',
+    status: 503,
+    type: 'about:blank',
+    title: 'Service Unavailable',
+    detail: 'A fixed server sentence.',
+    traceId: TRACE_ID,
+    fieldErrors: {},
+    writeOutcome: 'notWritten',
+  };
+  const NOT_JSON: ApiError = {
+    kind: 'unavailable',
+    status: 503,
+    type: null,
+    title: null,
+    detail: null,
+    traceId: null,
+    fieldErrors: {},
+    writeOutcome: null,
+  };
+
+  const MARKED_BODIES: readonly {
+    readonly body: string;
+    /** The marks before the JSON, given how many one decode drops. */
+    readonly marks: (dropped: number) => number;
+    readonly error: ApiError;
+    readonly resendable: boolean;
+  }[] = [
+    { body: 'no byte order mark', marks: () => 0, error: READ_AS_SENT, resendable: true },
+    {
+      body: 'the byte order marks one decode drops',
+      marks: (dropped) => dropped,
+      error: READ_AS_SENT,
+      resendable: true,
+    },
+    {
+      body: 'one byte order mark more than one decode drops',
+      marks: (dropped) => dropped + 1,
+      error: NOT_JSON,
+      resendable: false,
+    },
+  ];
+
+  it.each(MARKED_BODIES)(
+    'reads the notWritten 503 of a create whose body has $body as fetch decodes it, once',
+    async ({ marks, error, resendable }) => {
+      const dropped = await marksOneDecodeDrops();
+      expect(dropped).toBeGreaterThanOrEqual(1);
+      const transport = answeringWith(problemAfterMarks(marks(dropped)));
+      const client = createApiClient({ baseUrl: 'http://localhost', fetch: transport.fetch, deadlineMs: DEADLINE_MS });
+
+      const created = await client.createRecord(VIEW_ID, { [TEXT]: 'Smith' });
+
+      expect(created).toEqual({ ok: false, error });
+      expect(!created.ok && isSafeToResend(created.error, 'POST')).toBe(resendable);
+      expect(transport.requests).toHaveLength(1);
+    },
+  );
+
+  it.each(RECORD_WRITE_METHODS)(
+    'offers only Save again on a %s answered 503 notWritten with one byte order mark more than one decode drops',
+    async (method) => {
+      const marks = (await marksOneDecodeDrops()) + 1;
+      const draft = mountDirtyDraft(method, DEADLINE_MS);
+      const { api, result, onSaved } = draft;
+      api.reply(problemAfterMarks(marks));
+
+      expect(await perform(() => result.current.save())).toBe(false);
+
+      const banner = bannerOf(result.current);
+      expect(banner.kind).toBe('uncertainWrite');
+      expect(banner.method).toBe(method);
+      expect(banner.isCreate).toBe(method === 'POST');
+      expect(banner.traceId).toBeNull();
+      expect(banner.actions).toEqual(['saveAgain']);
+      expect(banner.message).toMatch(MAY_ALREADY_BE_APPLIED);
+      expect(banner.message).toMatch(LIST_CANNOT_PROVE);
+      // Retry does not resend it, and the draft stays.
+      await perform(() => result.current.retry());
+      expect(api.lines()).toEqual([draft.line]);
+      expect(result.current.values[TEXT]).toBe(draft.typed);
+      expect(result.current.isDirty).toBe(true);
+      expect(onSaved).not.toHaveBeenCalled();
+    },
+  );
+
+  // Each of these, as a timer delay, would fire within a millisecond or two: zero, a negative
+  // number and NaN count as no delay, and Infinity and 2^32 overflow the longest delay.
+  it.each([0, -1, Number.NaN, Number.POSITIVE_INFINITY, 2 ** 32])(
+    'gives a request more than a few milliseconds when deadlineMs is %s',
+    async (deadlineMs) => {
+      const transport = answeringInParts(200, '{"count":7}', 30);
+      const client = createApiClient({ baseUrl: 'http://localhost', fetch: transport.fetch, deadlineMs });
+
+      expect(await client.countRecords(VIEW_ID)).toEqual({ ok: true, data: { count: 7 }, status: 200 });
+    },
+  );
+});
+
+// Every request asks for a JSON body or ProblemDetails; only the four calls that send a body
+// declare it as JSON, the one media type the API accepts on them.
+describe('request headers', () => {
+  const ACCEPT = 'application/json, application/problem+json';
+  const JSON_BODY = 'application/json';
+
+  interface Operation {
+    readonly call: (client: ApiClient) => Promise<unknown>;
+    /** The request's Content-Type; `null` for a call that sends no body. */
+    readonly contentType: string | null;
+  }
+
+  // Keyed by every member of ApiClient, so an operation the client gains fails tsc until it is listed.
+  const OPERATIONS: Readonly<Record<keyof ApiClient, Operation>> = {
+    listForms: { call: (client) => client.listForms(), contentType: null },
+    getForm: { call: (client) => client.getForm(VIEW_ID), contentType: null },
+    listRecords: { call: (client) => client.listRecords(VIEW_ID, { q: 'Smith' }), contentType: null },
+    countRecords: { call: (client) => client.countRecords(VIEW_ID), contentType: null },
+    getRecordAt: { call: (client) => client.getRecordAt(VIEW_ID, 1), contentType: null },
+    getRecord: { call: (client) => client.getRecord(VIEW_ID, NEW_RECORD_ID), contentType: null },
+    getRecordPosition: { call: (client) => client.getRecordPosition(VIEW_ID, NEW_RECORD_ID), contentType: null },
+    createRecord: { call: (client) => client.createRecord(VIEW_ID, { [TEXT]: 'Smith' }), contentType: JSON_BODY },
+    updateRecord: {
+      call: (client) => client.updateRecord(VIEW_ID, NEW_RECORD_ID, { [TEXT]: 'Jones' }),
+      contentType: JSON_BODY,
+    },
+    deleteRecord: { call: (client) => client.deleteRecord(VIEW_ID, NEW_RECORD_ID), contentType: null },
+    searchRecords: { call: (client) => client.searchRecords(VIEW_ID, { criteria: [] }), contentType: JSON_BODY },
+    raiseFieldEvent: {
+      call: (client) => client.raiseFieldEvent(VIEW_ID, { event: 'FieldAfter', fieldName: TEXT, values: {} }),
+      contentType: JSON_BODY,
+    },
+    getHealth: { call: (client) => client.getHealth(), contentType: null },
+  };
+
+  it.each(Object.entries(OPERATIONS))(
+    '%s asks for JSON or ProblemDetails and declares a JSON body only when it sends one',
+    async (_name, { call, contentType }) => {
+      const requests: Request[] = [];
+      const fetchRecording = (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+        requests.push(input instanceof Request ? input : new Request(input, init));
+        return Promise.resolve(new Response(null, { status: 204 }));
+      };
+
+      await call(createApiClient({ baseUrl: 'http://localhost', fetch: fetchRecording }));
+
+      expect(requests).toHaveLength(1);
+      const [request] = requests;
+      expect(request.headers.get('Accept')).toBe(ACCEPT);
+      expect(request.headers.get('Content-Type')).toBe(contentType);
+      expect(request.body === null).toBe(contentType === null);
+    },
+  );
 });
 
 // A save whose outcome is unknown stays unknown until a save of the draft succeeds: the

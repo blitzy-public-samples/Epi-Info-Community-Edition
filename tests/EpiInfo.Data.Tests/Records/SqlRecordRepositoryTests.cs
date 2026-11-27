@@ -10,6 +10,8 @@ using EpiInfo.Domain.Forms;
 using EpiInfo.Domain.Metadata;
 using EpiInfo.Domain.Records;
 using EpiInfo.Domain.Search;
+using EpiInfo.Domain.Storage;
+using EpiInfo.Domain.Validation;
 using EpiInfo.Domain.Values;
 using EpiInfo.Tests.Shared;
 using Microsoft.Data.SqlClient;
@@ -19,8 +21,14 @@ namespace EpiInfo.Data.Tests.Records;
 /// <summary>
 /// Integration tests of the record statements the repository builds and runs, against the seeded forms of the
 /// rehearsal database. The metadata reader supplies every form, page, table and column schema, so each identifier a
-/// statement names is one the catalogue returned. The cases pin four contracts:
+/// statement names is one the catalogue returned. The cases pin five contracts:
 /// <list type="bullet">
+/// <item><description>
+/// The form write lock a create and an update take first, <see cref="RecordSqlBuilder.AcquireFormWriteLock"/>: it
+/// names no table, binds every value as a typed parameter, and holds the form's application lock exclusive for a
+/// create and shared for an update until its transaction ends; a write whose lock request conflicts with a held
+/// lock waits there, and the command timeout fails it as unavailable with nothing written.
+/// </description></item>
 /// <item><description>
 /// The page-row statements the repository sends when it creates and updates a record,
 /// <see cref="RecordSqlBuilder.InsertPage"/> and <see cref="RecordSqlBuilder.UpdatePageColumns"/>: they name writable
@@ -51,6 +59,9 @@ namespace EpiInfo.Data.Tests.Records;
 /// row on every page, and the repository reads the lowest such row whose <c>LastName</c> is plain seeded text. The
 /// identity cases' failure messages are fixed text, so no id reaches the output except through an equality assertion;
 /// the repository-read case describes commands with <see cref="RecordedCommand.Describe"/> without parameter values.
+/// The form-write-lock cases take only application locks, in a transaction they roll back or on a session they close,
+/// and change no data: the lock-wait case's insert and its update of an id no row holds both fail at the lock, before
+/// any INSERT or UPDATE, and it compares snapshots to prove it.
 /// Cases that compare snapshots hold the exclusive <see cref="DatabaseWriteLock"/>, the others the shared one.
 /// </para>
 /// <para>
@@ -73,6 +84,20 @@ public sealed class SqlRecordRepositoryTests : IAsyncLifetime
 
     // The fixed operation name every command of the identity tests reports to the recorder.
     private const string Operation = "test.recordIdentity";
+
+    // The form write lock: the operation its case reports, the resource prefix and owner RecordSqlBuilder binds, and
+    // the modes APPLOCK_MODE reports, which are also the modes the builder binds.
+    private const string LockOperation = "test.formWriteLock";
+    private const string FormWriteLockResourcePrefix = "EpiInfo.Web.RecordWrites/";
+    private const string TransactionLockOwner = "Transaction";
+    private const string ExclusiveLockMode = "Exclusive";
+    private const string SharedLockMode = "Shared";
+    private const string NoLockMode = "NoLock";
+
+    // The command timeout of the lock-wait case, in seconds, and the SQL error number SqlClient gives a command that
+    // outlasts it.
+    private const int LockWaitTimeoutSeconds = 2;
+    private const int CommandTimeoutErrorNumber = -2;
 
     // Trailing spaces that keep the padded id within the seeded nvarchar(255) column.
     private const int WithinWidthPadding = 3;
@@ -115,6 +140,148 @@ public sealed class SqlRecordRepositoryTests : IAsyncLifetime
     public Task InitializeAsync() => TestDatabase.EnsureReachableAsync();
 
     public Task DisposeAsync() => Task.CompletedTask;
+
+    // The form write lock of a create (exclusive) and of an update (shared): fixed text that names no table and holds
+    // no value, every value bound by position with an explicit type, the resource being the reader-built base-table
+    // name after the fixed prefix. Run in a transaction, it is granted, the transaction holds the form's application
+    // lock in that mode, and the rollback releases it.
+    [Theory]
+    [InlineData("CaseReport", true, ExclusiveLockMode)]
+    [InlineData("CaseReport", false, SharedLockMode)]
+    [InlineData("FoodHistory", true, ExclusiveLockMode)]
+    [InlineData("FoodHistory", false, SharedLockMode)]
+    public async Task AcquireFormWriteLock_BindsEveryValueAndHoldsTheFormLockInItsModeUntilTheTransactionEnds(
+        string formName,
+        bool exclusive,
+        string expectedMode)
+    {
+        await using DatabaseWriteLock dbLock = await DatabaseWriteLock.AcquireSharedAsync();
+        ReaderForm form = await ReaderForm.ReadAsync(formName);
+        string resource = FormWriteLockResourcePrefix + form.Schema.BaseTable.Name;
+
+        SqlStatement statement = RecordSqlBuilder.AcquireFormWriteLock(form.Schema, exclusive);
+
+        Assert.Equal(
+            "DECLARE @result int; EXEC @result = sys.sp_getapplock @Resource = @p0, @LockMode = @p1, " +
+            "@LockOwner = @p2, @LockTimeout = @p3; SELECT @result",
+            statement.Text);
+        Assert.Empty(SqlCommandRecorder.BracketedIdentifiers(statement.Text));
+        Assert.Equal(
+            new SqlParameterValue[]
+            {
+                new("@p0", DbType.String, resource, ColumnValueConverter.MaxSize),
+                new("@p1", DbType.String, expectedMode, ColumnValueConverter.MaxSize),
+                new("@p2", DbType.String, TransactionLockOwner, ColumnValueConverter.MaxSize),
+                new("@p3", DbType.Int32, -1, null),
+            },
+            statement.Parameters);
+
+        var options = new DatabaseOptions(TestDatabase.ConnectionString);
+        await using SqlConnection connection = await TestDatabase.OpenConnectionAsync();
+        await using (SqlTransaction transaction = connection.BeginTransaction(IsolationLevel.ReadCommitted))
+        {
+            int? result = await SqlExecution.ExecuteScalarAsync<int?>(
+                connection,
+                transaction,
+                LockOperation,
+                statement,
+                options.CommandTimeoutSeconds,
+                NullSqlCommandObserver.Instance,
+                CancellationToken.None);
+            Assert.True(result is 0 or 1, "The form write lock was not granted.");
+            Assert.Equal(expectedMode, await ApplicationLockModeAsync(connection, transaction, resource));
+            await transaction.RollbackAsync();
+        }
+
+        await using (SqlTransaction later = connection.BeginTransaction(IsolationLevel.ReadCommitted))
+        {
+            Assert.Equal(NoLockMode, await ApplicationLockModeAsync(connection, later, resource));
+            await later.RollbackAsync();
+        }
+    }
+
+    // The mode in which the transaction holds the application lock on resource, as APPLOCK_MODE names it.
+    private static async Task<string> ApplicationLockModeAsync(
+        SqlConnection connection,
+        SqlTransaction transaction,
+        string resource)
+    {
+        await using SqlCommand command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = "SELECT APPLOCK_MODE(N'public', @resource, N'Transaction');";
+        command.Parameters.Add(new SqlParameter("@resource", SqlDbType.NVarChar, 255) { Value = resource });
+        return Assert.IsType<string>(await command.ExecuteScalarAsync());
+    }
+
+    // A second session holds the form's application lock in a mode that conflicts with the write's: shared, as an
+    // update holds it, against a create's exclusive request; exclusive, as a create holds it, against an update's
+    // shared request. The write waits at its lock until the command timeout ends the wait, which fails it as
+    // unavailable (SQL error -2) with nothing written: it sent no INSERT or UPDATE, the snapshot shows no change, and
+    // its update targets an id no row holds, so no record exists for it to change.
+    [Theory]
+    [InlineData(SharedLockMode, true)]
+    [InlineData(ExclusiveLockMode, false)]
+    public async Task FormWriteLock_WriteWaitingPastTheCommandTimeout_FailsAsUnavailableWithNothingWritten(
+        string heldMode,
+        bool insert)
+    {
+        using var timeout = new CancellationTokenSource(RepositoryTestTimeout);
+        CancellationToken cancellationToken = timeout.Token;
+        await using DatabaseWriteLock dbLock = await DatabaseWriteLock.AcquireExclusiveAsync(cancellationToken);
+
+        ReaderForm form = await ReaderForm.ReadAsync(TwoPageForm);
+        var options = new DatabaseOptions(TestDatabase.ConnectionString, LockWaitTimeoutSeconds);
+        var connections = new SqlConnectionFactory(options);
+        var recorder = new SqlCommandRecorder();
+        var repository = new SqlRecordRepository(
+            connections,
+            new SqlMetadataReader(connections, options, recorder),
+            options,
+            recorder);
+        SqlSnapshot before = await SqlSnapshot.CaptureAsync(cancellationToken);
+
+        await using SqlConnection holder = await TestDatabase.OpenConnectionAsync(cancellationToken);
+        await using (SqlCommand take = holder.CreateCommand())
+        {
+            take.CommandText =
+                "DECLARE @result int; EXEC @result = sys.sp_getapplock @Resource = @resource, @LockMode = @mode, " +
+                "@LockOwner = N'Session', @LockTimeout = 0; SELECT @result;";
+            take.Parameters.Add(new SqlParameter("@resource", SqlDbType.NVarChar, 255)
+            {
+                Value = FormWriteLockResourcePrefix + form.Schema.BaseTable.Name,
+            });
+            take.Parameters.Add(new SqlParameter("@mode", SqlDbType.NVarChar, 32) { Value = heldMode });
+            Assert.True(
+                await take.ExecuteScalarAsync(cancellationToken) is 0,
+                "The second session could not take the form's application lock.");
+        }
+
+        IReadOnlyDictionary<string, FieldValue> values =
+            Values(ignoreCase: false, (LastNameField, FieldValue.FromText(TestDatabase.NewMarker())));
+        var stamp = new SaveStamp(Environment.UserName, SaveStamp.TruncateToSeconds(DateTime.Now));
+        DataStoreUnavailableException failure = insert
+            ? await Assert.ThrowsAsync<DataStoreUnavailableException>(() =>
+                repository.InsertAsync(form.Metadata, values, stamp, cancellationToken))
+            : await Assert.ThrowsAsync<DataStoreUnavailableException>(() =>
+                repository.UpdateAsync(
+                    form.Metadata,
+                    Guid.NewGuid().ToString(),
+                    values,
+                    () => stamp,
+                    _ => RecordValidationResult.Success(new Dictionary<string, FieldValue>(StringComparer.Ordinal)),
+                    permissions: null,
+                    cancellationToken));
+
+        Assert.Equal(WriteOutcome.NotWritten, failure.Outcome);
+        Assert.Equal(CommandTimeoutErrorNumber, failure.SqlErrorNumber);
+        Assert.Empty(recorder.Writes());
+        RecordedCommand waited = Assert.Single(recorder.Failed());
+        Assert.Contains("sp_getapplock", waited.CommandText, StringComparison.Ordinal);
+        Assert.Equal(CommandTimeoutErrorNumber, waited.SqlErrorNumber);
+        Assert.True(
+            SqlSnapshot.Compare(before, await SqlSnapshot.CaptureAsync(cancellationToken)).IsEmpty,
+            "The write that waited past the command timeout changed the record tables.");
+    }
 
     // CaseReport1 holds the seeded read-only data fields StateIDNumber, CDCIDNumber and ReportedToCDCDate
     // (testdata/sql/03_forms.sql) beside the writable Age and LastName.
@@ -352,7 +519,9 @@ public sealed class SqlRecordRepositoryTests : IAsyncLifetime
             RecordSqlBuilder.UpdatePageColumns(form.PageOf(lastName.Field), GlobalRecordId, submitted);
 
         SqlStatement statement = Assert.Single(statements);
-        Assert.Equal("UPDATE [CaseReport1] SET [LastName] = @p0 WHERE [GlobalRecordId] = @p1", statement.Text);
+        Assert.Equal(
+            "UPDATE [CaseReport1] SET [LastName] = @p0 WHERE [GlobalRecordId] = @p1; SELECT @@ROWCOUNT",
+            statement.Text);
         Assert.Equal(new object[] { "Ada", GlobalRecordId }, statement.Parameters.Select(parameter => parameter.Value));
     }
 

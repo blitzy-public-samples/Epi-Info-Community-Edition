@@ -240,10 +240,12 @@ function ListErrorBanner({ error, otherMessages, onRetry }: ListErrorBannerProps
 /**
  * The records page on screen. Its form keeps another form's rows off screen; its request
  * key says which request it answers, so rows of an earlier page, filter or set stay
- * visible while the next one loads but cannot be opened.
+ * visible while the next one loads but cannot be opened. Its listing key names the page
+ * without the reload counters, so a reload of the same page keeps the same listing.
  */
 interface ShownPage {
   key: string;
+  listingKey: string;
   viewId: number;
   page: RecordPage;
 }
@@ -324,6 +326,8 @@ export const RecordGrid = memo(function RecordGrid({
     setPageFilterKey(filterKey);
     setPage(1);
   }
+  // The page of which listing is asked for: the form, the set, the filter and the page.
+  const listingKey = JSON.stringify([viewId, includeDeleted, searchText, page]);
   // Every input of the list request: the page or failure on screen answers the request
   // with this key, or an earlier one.
   const requestKey = JSON.stringify([viewId, includeDeleted, searchText, page, listVersion, reloadToken]);
@@ -370,7 +374,7 @@ export const RecordGrid = memo(function RecordGrid({
             setPage(lastPage);
             return;
           }
-          setShown({ key: requestKey, viewId, page: outcome.data });
+          setShown({ key: requestKey, listingKey, viewId, page: outcome.data });
           setFailure(null);
           setLoading(false);
         },
@@ -393,7 +397,70 @@ export const RecordGrid = memo(function RecordGrid({
 
     return () => controller.abort();
     // requestKey also carries listVersion and reloadToken, whose changes reload the page.
-  }, [client, requestKey, viewId, searchText, includeDeleted, page]);
+  }, [client, requestKey, listingKey, viewId, searchText, includeDeleted, page]);
+
+  // The scroll box stays mounted while the next page loads, so a page of another listing
+  // would open at the old sideways offset, on a blank band past its narrower columns: it
+  // starts at the inline start instead. A reload of the same listing, after a save,
+  // keeps the offset the user scrolled to.
+  const shownListingKey = shown?.listingKey ?? null;
+  useLayoutEffect(() => {
+    if (scrollRef.current !== null) {
+      scrollRef.current.scrollLeft = 0;
+    }
+  }, [shownListingKey]);
+
+  // The grid ends the page, so a list that shrinks while the user types a search or
+  // switches "Show deleted" shrinks the document under the viewport: the browser clamps
+  // the window's scroll offset, and the control in use jumps down the screen. While one
+  // of those controls has focus and was in view, the section keeps the height the
+  // window's offset needs, and the window keeps its offset; the next change of the list
+  // releases that hold first. Any other change, paging from the footer among them,
+  // keeps the browser's clamp, which keeps the footer under the pointer.
+  const sectionRef = useRef<HTMLElement>(null);
+  const searchRef = useRef<HTMLInputElement>(null);
+  const toggleRef = useRef<HTMLInputElement>(null);
+  // The window's offset as of its last scroll event: a clamp's own event follows the
+  // commit that caused it, so during that commit this is still the offset before it.
+  const scrollYRef = useRef(0);
+  useEffect(() => {
+    const remember = () => {
+      scrollYRef.current = window.scrollY;
+    };
+    remember();
+    window.addEventListener('scroll', remember, { passive: true });
+    return () => window.removeEventListener('scroll', remember);
+  }, []);
+  useLayoutEffect(() => {
+    const section = sectionRef.current;
+    if (section === null) {
+      return;
+    }
+    // React renders the section with no style prop, so the hold is the only inline
+    // style it carries, and no render overwrites or clears it.
+    section.style.minBlockSize = '';
+    const control = document.activeElement;
+    if (control === null || (control !== searchRef.current && control !== toggleRef.current)) {
+      return;
+    }
+    const remembered = scrollYRef.current;
+    const shortfall = remembered - window.scrollY;
+    if (shortfall <= 0) {
+      return;
+    }
+    // The controls sit above the rows, in a section that packs its rows at its start, so
+    // their place in the document did not move: the clamp moved them down the viewport
+    // by the shortfall.
+    const box = control.getBoundingClientRect();
+    const topBefore = box.top - shortfall;
+    if (topBefore >= window.innerHeight || topBefore + box.height <= 0) {
+      return;
+    }
+    // box-sizing is border-box, so the section's border box plus the shortfall is the
+    // height that lets the window scroll back to where it was.
+    section.style.minBlockSize = `${section.getBoundingClientRect().height + shortfall}px`;
+    window.scrollTo({ left: window.scrollX, top: remembered, behavior: 'instant' });
+  }, [shown, failure]);
 
   const reload = useCallback(() => setReloadToken((token) => token + 1), []);
   // A Retry button leaves with the failure it answers, so focus moves to the list's live
@@ -617,9 +684,10 @@ export const RecordGrid = memo(function RecordGrid({
   ].join(' ');
 
   return (
-    <section className="record-grid" aria-label="Records">
+    <section ref={sectionRef} className="record-grid" aria-label="Records">
       <label htmlFor={searchId}>Search records</label>
       <input
+        ref={searchRef}
         id={searchId}
         type="search"
         autoComplete="off"
@@ -632,6 +700,7 @@ export const RecordGrid = memo(function RecordGrid({
       />
       <label className={togglePending ? 'record-grid__toggle record-grid__toggle--pending' : 'record-grid__toggle'}>
         <input
+          ref={toggleRef}
           type="checkbox"
           checked={requestedIncludeDeleted ?? includeDeleted}
           disabled={disabled}
@@ -640,7 +709,24 @@ export const RecordGrid = memo(function RecordGrid({
         />
         Show deleted
       </label>
-      {/* After the toggle, so the message takes its own full row below both controls. */}
+      {/* Always rendered, so loading, the outcome and the count are announced; it takes
+          focus from a Retry button that the new load removes. It follows the controls
+          whose results it reports, so a search or a toggle shows its outcome beside them
+          rather than below a page of rows. */}
+      <p
+        ref={statusRef}
+        role="status"
+        tabIndex={-1}
+        className={statusText === '' ? 'record-grid__status visually-hidden' : 'record-grid__status'}
+      >
+        {statusText}
+      </p>
+      {notLoaded && (
+        <button type="button" onClick={retry}>
+          {RETRY_TEXT}
+        </button>
+      )}
+      {/* After the controls and the status, so the message takes its own full row below them. */}
       {searchInvalid && (
         <div className="field-error" id={searchErrorId} role="alert">
           {searchMessages.map((message, index) => (
@@ -665,54 +751,43 @@ export const RecordGrid = memo(function RecordGrid({
           </div>
         </div>
       )}
-      <footer>
-        {/* Always rendered, so loading, the outcome and the count are announced; it takes
-            focus from a Retry button that the new load removes. */}
-        <p
-          ref={statusRef}
-          role="status"
-          tabIndex={-1}
-          className={statusText === '' ? 'visually-hidden' : undefined}
-        >
-          {statusText}
-        </p>
-        {notLoaded && (
-          <button type="button" onClick={retry}>
-            {RETRY_TEXT}
-          </button>
-        )}
-        {table !== null && result !== null && (
+      {/* Rendered with the paging only: an empty footer would add a row and a gap. */}
+      {table !== null && result !== null && (
+        <footer>
           <nav className="record-grid__paging" aria-label="Record list pages">
             {/* The requested page; its page count is known again once that page arrives. */}
             <p>{settled ? `Page ${page} of ${lastPage}` : `Page ${page}`}</p>
-            {/* Pending: aria-disabled rather than disabled, so a pressed button keeps focus. */}
-            <button
-              type="button"
-              disabled={disabled || page <= 1}
-              aria-disabled={settled ? undefined : 'true'}
-              onClick={() => {
-                if (settled) {
-                  setPage((current) => Math.max(1, current - 1));
-                }
-              }}
-            >
-              {EARLIER_TEXT}
-            </button>
-            <button
-              type="button"
-              disabled={disabled || page >= lastPage}
-              aria-disabled={settled ? undefined : 'true'}
-              onClick={() => {
-                if (settled) {
-                  setPage((current) => Math.min(lastPage, current + 1));
-                }
-              }}
-            >
-              {LATER_TEXT}
-            </button>
+            {/* One group, so the two buttons wrap as a pair and keep their reading order. */}
+            <div className="record-grid__paging-actions">
+              {/* Pending: aria-disabled rather than disabled, so a pressed button keeps focus. */}
+              <button
+                type="button"
+                disabled={disabled || page <= 1}
+                aria-disabled={settled ? undefined : 'true'}
+                onClick={() => {
+                  if (settled) {
+                    setPage((current) => Math.max(1, current - 1));
+                  }
+                }}
+              >
+                {EARLIER_TEXT}
+              </button>
+              <button
+                type="button"
+                disabled={disabled || page >= lastPage}
+                aria-disabled={settled ? undefined : 'true'}
+                onClick={() => {
+                  if (settled) {
+                    setPage((current) => Math.min(lastPage, current + 1));
+                  }
+                }}
+              >
+                {LATER_TEXT}
+              </button>
+            </div>
           </nav>
-        )}
-      </footer>
+        </footer>
+      )}
     </section>
   );
 });

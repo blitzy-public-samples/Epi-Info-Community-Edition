@@ -65,6 +65,8 @@ export interface FindRecordDialogProps {
 const MAX_SEARCH_FIELDS = 6;
 const LIMIT_NOTE = 'At most six fields can be searched.';
 const NO_FIELD_NOTE = 'Choose up to six fields, then enter a value for each.';
+// Checking a field moves focus to its value box; said in advance, as WCAG 3.2.2 asks.
+const PICKER_GUIDANCE = 'Checking a field moves focus to its value box.';
 
 // Text, multiline and legal values other than a Phone Number: the server strips a leading
 // >=, <=, <>, > or < and ignores it, so these hints offer no comparison. What is left
@@ -101,6 +103,10 @@ const SEARCHING = 'Searching…';
 const SEARCHING_OVER_RESULTS = 'Searching… The results below are from the previous search.';
 const STALE_RESULTS = 'These results are for the previous criteria; Search updates them.';
 const NO_MATCHES = 'No records match.';
+// The server leaves the record sent as excludeGlobalRecordId out before it counts, so a
+// count alone would hide it. The second text is for results that outlived that record.
+const OPEN_RECORD_NOT_LISTED = 'The record on screen is not listed.';
+const EARLIER_RECORD_NOT_LISTED = 'The record that was on screen when you searched is not listed.';
 // Name of the scrolling region around the results table, whose own name is its caption.
 // It holds none of the toolbar's and navigator's names, which Playwright matches by substring.
 const RESULTS_REGION_LABEL = 'Search results';
@@ -126,6 +132,10 @@ const SYSTEM_FIELDS: readonly SearchableField[] = [
 // Controls that can take focus inside the dialog, for the Tab cycle.
 const FOCUSABLE_SELECTOR = 'button, [href], input, select, textarea, summary, [tabindex]:not([tabindex="-1"])';
 const MODAL_SELECTOR = '[aria-modal="true"]';
+// What a settled search brings into view: its banner, then a value box its 400 marks.
+const INVALID_CRITERION_SELECTOR = '.find-dialog__criterion input[aria-invalid="true"]';
+const BANNER_SELECTOR = ':scope > [role="alert"]';
+const STALE_RESULTS_CLASS = 'find-dialog__results--stale';
 
 /** The field's prompt exactly as metadata holds it, or its name when the prompt is missing or blank. */
 function promptOf(field: FieldDefinition): string {
@@ -216,6 +226,55 @@ function columnLabels(definition: FormDefinition): ReadonlyMap<string, string> {
   return new Map(fieldsInOrder(definition).map((field) => [field.name, promptOf(field)]));
 }
 
+// The word boundaries inside a field name: lower to upper case (Last|Name), letter to
+// digit and back (N|2|milk), before the last capital of a run of capitals that a word
+// follows (CDCID|Number), and after an underscore or a hyphen.
+const NAME_WORD_BOUNDARY = /(?<=\p{Ll})(?=\p{Lu})|(?<=\p{L})(?=\p{N})|(?<=\p{N})(?=\p{L})|(?<=\p{Lu})(?=\p{Lu}\p{Ll})|(?<=[_-])(?=.)/u;
+
+/**
+ * A field name as the picker shows it: its text unchanged, with a line-break opportunity
+ * (`<wbr>`) at each word boundary, so a long name wraps between its words rather than
+ * inside one. A `<wbr>` adds no character to the text, but Chrome reads it as a space
+ * in an accessible name, so the checkbox takes its name from the plain field name.
+ */
+function nameWithWordBreaks(name: string): ReactNode[] {
+  return withWordBreaks(name, NAME_WORD_BOUNDARY);
+}
+
+// Where a prompt may wrap besides its spaces and hyphens: after a slash, a backslash or
+// an underscore between two letters (Encephalitis/|Encephalomyelitis). Chrome offers no
+// break there, so a long prompt would otherwise break inside its last word. Numbers keep
+// their slashes unbroken (1/2, 01/15/2011), as Chrome keeps them.
+const PROMPT_WORD_BOUNDARY = /(?<=\p{L}[/\\_])(?=\p{L})/u;
+
+/**
+ * A field's prompt as the picker shows it under the name: its text unchanged, with a
+ * line-break opportunity (`<wbr>`) after each slash, backslash or underscore that joins
+ * two words. Chrome reads a `<wbr>` as a space in an accessible description too, so the
+ * checkbox takes its description from the plain prompt.
+ */
+function promptWithWordBreaks(prompt: string): ReactNode[] {
+  return withWordBreaks(prompt, PROMPT_WORD_BOUNDARY);
+}
+
+/** `text` split at each match of `boundary`, with a `<wbr>` between consecutive parts. */
+function withWordBreaks(text: string, boundary: RegExp): ReactNode[] {
+  return text
+    .split(boundary)
+    .flatMap((word, index) => (index === 0 ? [word] : [<wbr key={`wbr-${index}`} />, word]));
+}
+
+/**
+ * The label of a criterion's value box: the field's prompt on one line, without the
+ * colon a form prompt often ends with, then the field name in parentheses. Prompts repeat
+ * within a form (Address, Phone, County) and legacy Find lists fields by name, so the
+ * name is left out only when the prompt is the name itself.
+ */
+function criterionLabel(field: SearchableField): string {
+  const prompt = field.label.replace(/\s+/g, ' ').trim().replace(/\s*:$/, '');
+  return prompt === '' || prompt === field.name ? field.name : `${prompt} (${field.name})`;
+}
+
 /** Text of a result cell; an empty value is blank, never "null" or "undefined". */
 function cellText(value: FieldValue | undefined): string {
   if (typeof value === 'string') {
@@ -258,6 +317,21 @@ interface SubmittedCriteria {
   readonly key: string;
   /** Each criterion's text as sent, by field name. */
   readonly texts: ReadonlyMap<string, string>;
+  /** The id the search sent as `excludeGlobalRecordId`; `null` when it excluded no record. */
+  readonly excludedRecordId: string | null;
+}
+
+/**
+ * The status line's sentence about the record the search left out, or `null` when it
+ * left none out, as for a new record. It names the record on screen while that is still
+ * the one excluded.
+ */
+function exclusionNote(submitted: SubmittedCriteria | null, openRecordId: string | null): string | null {
+  const excluded = submitted?.excludedRecordId ?? null;
+  if (excluded === null) {
+    return null;
+  }
+  return excluded === openRecordId ? OPEN_RECORD_NOT_LISTED : EARLIER_RECORD_NOT_LISTED;
 }
 
 /**
@@ -356,6 +430,30 @@ function focusInitial(dialog: HTMLElement): void {
   }
 }
 
+/**
+ * Scrolls the element into view as little as its scroll containers allow, the dialog
+ * first. A browser without scrollIntoView, as jsdom is, leaves the scroll unchanged.
+ */
+function scrollIntoViewNearest(element: Element | null): void {
+  if (element !== null && typeof element.scrollIntoView === 'function') {
+    element.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+  }
+}
+
+/**
+ * Focuses the control and scrolls it only as far as it needs to come into view, so what
+ * is already in view stays there. focus() alone does not promise that: Chrome centres a
+ * control it has to scroll to. Without scrollIntoView, focus() scrolls as it does.
+ */
+function focusNearest(element: HTMLElement): void {
+  if (typeof element.scrollIntoView === 'function') {
+    element.focus({ preventScroll: true });
+    scrollIntoViewNearest(element);
+  } else {
+    element.focus();
+  }
+}
+
 /** Keeps Tab and Shift+Tab inside the dialog, wrapping at its first and last controls. */
 function trapTab(event: KeyboardEvent, dialog: HTMLElement): void {
   const controls = focusableIn(dialog);
@@ -387,9 +485,10 @@ function trapTab(event: KeyboardEvent, dialog: HTMLElement): void {
  *
  * Like ConfirmDialog it is a plain role="dialog" element (jsdom has no
  * <dialog>.showModal()) rendered into <body>, so that, while it is open, every other
- * child of <body> can be made inert. Focus moves to the first field checkbox on open
- * and returns to the element focused before it on close. Picked fields and their
- * values outlive a close; results and errors do not.
+ * child of <body> can be made inert. Focus moves to the first field checkbox on open,
+ * to a field's value box when its checkbox is checked, and returns to the element
+ * focused before the dialog on close. Picked fields and their values outlive a close;
+ * results and errors do not.
  */
 export function FindRecordDialog({
   open,
@@ -406,13 +505,22 @@ export function FindRecordDialog({
   const headingId = `${baseId}-heading`;
   const formId = `${baseId}-form`;
   const limitNoteId = `${baseId}-limit`;
+  const guidanceId = `${baseId}-guidance`;
   const statusId = `${baseId}-status`;
   const backdropRef = useRef<HTMLDivElement>(null);
   const dialogRef = useRef<HTMLDivElement>(null);
   const checkboxRefs = useRef(new Map<string, HTMLInputElement>());
+  const valueRefs = useRef(new Map<string, HTMLInputElement>());
+  // The field whose checkbox the user just checked; its value box takes focus once rendered.
+  const focusValueOfRef = useRef<string | null>(null);
   const controllerRef = useRef<AbortController | null>(null);
   const searchButtonRef = useRef<HTMLButtonElement>(null);
+  const footerRef = useRef<HTMLDivElement>(null);
+  const resultsRef = useRef<HTMLDivElement>(null);
   const refocusSearchRef = useRef(false);
+  // Set when the latest search settles; the element focused when that search began.
+  const revealOutcomeRef = useRef(false);
+  const searchOriginRef = useRef<Element | null>(null);
 
   const fields = useMemo(() => searchableFields(definition), [definition]);
   const labels = useMemo(() => columnLabels(definition), [definition]);
@@ -592,6 +700,60 @@ export function FindRecordDialog({
     }
   }, [open, loading]);
 
+  // The latest search's outcome is brought into view once it settles, unless the user
+  // moved focus while it ran. A banner scrolls into view first. A 400 that marks
+  // criteria then focuses the first marked value box in picker order, scrolling only as
+  // far as that box needs, so the banner stays in view whenever both fit and the box
+  // wins when they do not. Otherwise focus stays as the refocus above left it: without
+  // a banner, current results scroll into view, followed by the footer above them, so
+  // the count, Search, Close and the first rows show together.
+  useEffect(() => {
+    if (!open || loading || !revealOutcomeRef.current) {
+      return;
+    }
+    revealOutcomeRef.current = false;
+    const origin = searchOriginRef.current;
+    searchOriginRef.current = null;
+    const dialog = dialogRef.current;
+    const active = document.activeElement;
+    const focusKept =
+      active === null ||
+      active === document.body ||
+      active === document.documentElement ||
+      active === searchButtonRef.current ||
+      active === origin;
+    if (dialog === null || !focusKept) {
+      return;
+    }
+    const banner = dialog.querySelector(BANNER_SELECTOR);
+    scrollIntoViewNearest(banner);
+    const invalid = dialog.querySelector(INVALID_CRITERION_SELECTOR);
+    if (invalid instanceof HTMLElement) {
+      focusNearest(invalid);
+      return;
+    }
+    if (banner !== null) {
+      return;
+    }
+    const results = resultsRef.current;
+    if (results !== null && !results.classList.contains(STALE_RESULTS_CLASS)) {
+      scrollIntoViewNearest(results);
+      scrollIntoViewNearest(footerRef.current);
+    }
+  }, [open, loading]);
+
+  // Checking a field moves focus to its new value box, so the next keys type its
+  // criterion instead of travelling through the rest of the picker; the picker's
+  // guidance says so in advance. Unchecking and Remove leave focus in the picker.
+  useEffect(() => {
+    const name = focusValueOfRef.current;
+    if (name === null) {
+      return;
+    }
+    focusValueOfRef.current = null;
+    valueRefs.current.get(name)?.focus();
+  }, [selected]);
+
   if (!open) {
     return null;
   }
@@ -612,7 +774,8 @@ export function FindRecordDialog({
   // no search is pending and the criteria on screen are the ones sent; otherwise they
   // stay on screen, marked out of date, and every row and Open button is
   // aria-disabled (focusable, inactive). A field's message shows while its criterion
-  // holds the text sent, and the banner only while the whole criteria are unchanged.
+  // holds the text sent, and the banner only while the whole criteria are unchanged,
+  // except a 400's summary line, which stays while any field's message shows.
   const current = submitted !== null && submitted.key === searchKey;
   const actionable = current && !loading;
   const { byField, other } = splitFieldErrors(error, fields, submitted, texts, selected);
@@ -671,6 +834,7 @@ export function FindRecordDialog({
     const sent: SubmittedCriteria = {
       key: searchKey,
       texts: new Map(entries.map((entry) => [entry.field, entry.value])),
+      excludedRecordId: request.excludeGlobalRecordId ?? null,
     };
 
     const settle = (nextResponse: SearchResponse | null, nextError: ApiError | null) => {
@@ -678,6 +842,7 @@ export function FindRecordDialog({
         return;
       }
       controllerRef.current = null;
+      revealOutcomeRef.current = true;
       setLoading(false);
       setResponse(nextResponse);
       setError(nextError);
@@ -685,6 +850,7 @@ export function FindRecordDialog({
     };
 
     refocusSearchRef.current = true;
+    searchOriginRef.current = document.activeElement;
     setLoading(true);
     setError(null);
     void client.searchRecords(viewId, request, controller.signal).then(
@@ -742,20 +908,25 @@ export function FindRecordDialog({
   const items = response?.items ?? [];
   const columns = items.length > 0 ? Object.keys(items[0].values) : [];
   let statusText = '';
+  // The excluded-record sentence, shown after statusText in an element of its own.
+  let statusNote: string | null = null;
   if (loading) {
     statusText = items.length > 0 ? SEARCHING_OVER_RESULTS : SEARCHING;
   } else if (response !== null) {
     statusText = current ? resultSummary(response) : `${resultSummary(response)} ${STALE_RESULTS}`;
+    statusNote = exclusionNote(submitted, openRecordId);
   }
 
-  // The banner speaks of the search that failed, so it shows only while the criteria
-  // on screen are the ones that search sent.
+  // The banner speaks of the search that failed, so its lines show only while the
+  // criteria on screen are the ones that search sent. A 400's summary line points at the
+  // messages beside the criteria, so it also shows while any of them is still shown.
   let banner: ReactNode = null;
-  if (error !== null && current) {
+  const summaryHolds = error?.kind === 'validation' && byField.size > 0;
+  if (error !== null && (current || summaryHolds)) {
     if (isConnectionFailure(error)) {
       banner = <ConnectionError error={error} method="GET" onRetry={runSearch} />;
     } else {
-      const lines = bannerLines(error, other, byField.size > 0);
+      const lines = bannerLines(error, current ? other : [], byField.size > 0);
       const traceId = error.kind === 'validation' ? null : error.traceId;
       const traceLine = traceId !== null && !lines.some((line) => line.includes(traceId)) ? traceId : null;
       // Empty once every field message belonged to a criterion the user has removed.
@@ -789,47 +960,73 @@ export function FindRecordDialog({
         {banner}
 
         <form id={formId} noValidate onSubmit={handleSubmit}>
-          <fieldset className="find-dialog__fields">
+          <fieldset className="find-dialog__fields" aria-describedby={guidanceId}>
             <legend>Fields to search</legend>
-            {fields.map((field, index) => {
-              const picked = selected.has(field.name);
-              const disabled = !picked && atLimit;
-              const nameId = `${baseId}-field-${index}`;
-              const descriptionId = `${nameId}-description`;
-              // A prompt that only repeats the name would be read twice.
-              const described = field.label !== field.name;
-              const describedBy = [described ? descriptionId : null, disabled ? limitNoteId : null]
-                .filter((id): id is string => id !== null)
-                .join(' ');
-              return (
-                <label key={field.name}>
-                  <input
-                    ref={(element) => {
-                      if (element === null) {
-                        checkboxRefs.current.delete(field.name);
-                      } else {
-                        checkboxRefs.current.set(field.name, element);
-                      }
-                    }}
-                    type="checkbox"
-                    checked={picked}
-                    disabled={disabled}
-                    aria-labelledby={nameId}
-                    aria-describedby={describedBy === '' ? undefined : describedBy}
-                    onChange={(event) => {
-                      setPicked(field.name, event.target.checked);
-                    }}
-                  />
-                  <span id={nameId}>{field.name}</span>
-                  {described && <small id={descriptionId}>{field.label}</small>}
-                </label>
-              );
-            })}
+            {/* Under the legend and outside the scrolling options, so both stay in view.
+                Always rendered, so the note is announced when the sixth field is picked. */}
+            <p id={limitNoteId} role="status" className={atLimit ? undefined : 'visually-hidden'}>
+              {atLimit ? LIMIT_NOTE : ''}
+            </p>
+            <p id={guidanceId}>
+              <small>{PICKER_GUIDANCE}</small>
+            </p>
+            <div className="find-dialog__options">
+              {fields.map((field, index) => {
+                const picked = selected.has(field.name);
+                const disabled = !picked && atLimit;
+                const nameId = `${baseId}-field-${index}`;
+                const descriptionId = `${nameId}-description`;
+                // A prompt that only repeats the name would be read twice.
+                const described = field.label !== field.name;
+                const describedBy = [described ? descriptionId : null, disabled ? limitNoteId : null]
+                  .filter((id): id is string => id !== null)
+                  .join(' ');
+                return (
+                  <label key={field.name}>
+                    <input
+                      ref={(element) => {
+                        if (element === null) {
+                          checkboxRefs.current.delete(field.name);
+                        } else {
+                          checkboxRefs.current.set(field.name, element);
+                        }
+                      }}
+                      type="checkbox"
+                      checked={picked}
+                      disabled={disabled}
+                      aria-labelledby={nameId}
+                      aria-describedby={describedBy === '' ? undefined : describedBy}
+                      onChange={(event) => {
+                        const checked = event.target.checked;
+                        setPicked(field.name, checked);
+                        if (checked && !atLimit) {
+                          focusValueOfRef.current = field.name;
+                        }
+                      }}
+                    />
+                    {/* The checkbox is named by the plain field name. Chrome reads each
+                        <wbr> of the shown copy as a space in a name, so that copy is
+                        hidden from assistive technology. */}
+                    <span id={nameId} hidden>
+                      {field.name}
+                    </span>
+                    <span aria-hidden="true">{nameWithWordBreaks(field.name)}</span>
+                    {/* Likewise the checkbox is described by the plain prompt: Chrome also
+                        reads a <wbr> as a space in a description, so the shown copy is
+                        hidden from assistive technology. */}
+                    {described && (
+                      <>
+                        <small id={descriptionId} hidden>
+                          {field.label}
+                        </small>
+                        <small aria-hidden="true">{promptWithWordBreaks(field.label)}</small>
+                      </>
+                    )}
+                  </label>
+                );
+              })}
+            </div>
           </fieldset>
-          {/* Always rendered, so the note is announced when the sixth field is picked. */}
-          <p id={limitNoteId} role="status" className={atLimit ? undefined : 'visually-hidden'}>
-            {atLimit ? LIMIT_NOTE : ''}
-          </p>
 
           {criteria.length === 0 ? (
             <p>
@@ -847,8 +1044,15 @@ export function FindRecordDialog({
               const invalid = messages.length > 0;
               return (
                 <div key={field.name} className="find-dialog__criterion">
-                  <label htmlFor={inputId}>Value for {field.name}</label>
+                  <label htmlFor={inputId}>{criterionLabel(field)}</label>
                   <input
+                    ref={(element) => {
+                      if (element === null) {
+                        valueRefs.current.delete(field.name);
+                      } else {
+                        valueRefs.current.set(field.name, element);
+                      }
+                    }}
                     id={inputId}
                     type="text"
                     value={texts.get(field.name) ?? ''}
@@ -882,27 +1086,36 @@ export function FindRecordDialog({
           )}
         </form>
 
-        {/* Outside the form, which lays its children out in one column; the form
-            attribute keeps Search the form's submit button, so Enter in a value searches. */}
-        <button ref={searchButtonRef} type="submit" form={formId} disabled={criteria.length === 0 || loading}>
-          Search
-        </button>
-        <button
-          type="button"
-          onClick={() => {
-            onClose();
-          }}
-        >
-          Close
-        </button>
-
-        {/* Always rendered, so "Searching…" and the result count are announced. */}
-        <p id={statusId} role="status" className={statusText === '' ? 'visually-hidden' : undefined}>
-          {statusText}
-        </p>
+        {/* The status line, Search and Close stay on the dialog's bottom edge while the
+            picker and criteria scroll, and on its top edge while the results do; after
+            the criteria and before the results in document and Tab order. Outside the
+            form, which lays its children out in one column; the form attribute keeps
+            Search the form's submit button, so Enter in a value searches. */}
+        <div ref={footerRef} className="find-dialog__footer">
+          {/* Always rendered, so "Searching…" and the result count are announced. */}
+          <p id={statusId} role="status" className={statusText === '' ? 'visually-hidden' : undefined}>
+            {statusText}
+            {statusNote !== null && <span>{` ${statusNote}`}</span>}
+          </p>
+          {/* One group, so the two buttons wrap together below a long status line. */}
+          <div className="find-dialog__actions">
+            <button ref={searchButtonRef} type="submit" form={formId} disabled={criteria.length === 0 || loading}>
+              Search
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                onClose();
+              }}
+            >
+              Close
+            </button>
+          </div>
+        </div>
         {items.length > 0 && (
           // A named, focusable region, so a keyboard can scroll the results sideways.
           <div
+            ref={resultsRef}
             className={actionable ? 'find-dialog__results' : 'find-dialog__results find-dialog__results--stale'}
             role="region"
             aria-label={RESULTS_REGION_LABEL}

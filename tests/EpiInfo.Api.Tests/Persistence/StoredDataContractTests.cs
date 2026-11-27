@@ -93,6 +93,11 @@ public sealed class SqlRecordRepositoryWriteTests : IAsyncLifetime
     private const string DeleteOperation = "records.delete";
     private const string MetadataOperationPrefix = "metadata.";
 
+    // The fixed opening of the form write lock a create and an update send first in their transaction, the
+    // transaction-owned application lock "DECLARE @result int; EXEC @result = sys.sp_getapplock @Resource = @p0, ...;
+    // SELECT @result", which binds its resource and names no table.
+    private const string FormWriteLockPrefix = "DECLARE @result int; EXEC @result = sys.sp_getapplock ";
+
     private const short ActiveStatus = 1;
     private const short DeletedStatus = 0;
 
@@ -796,8 +801,10 @@ public sealed class SqlRecordRepositoryWriteTests : IAsyncLifetime
     private static string[] StampColumns { get; } =
         new[] { LastSaveLogonNameColumn, LastSaveTimeColumn }.Order(StringComparer.Ordinal).ToArray();
 
-    // An update the locked read refused: it sent no write, the one repository command of its transaction is the locked
-    // read of the base row, which names no page table, so no page row was read, and the required gate never ran.
+    // An update the locked read refused: it sent no write; of the repository commands of its transaction exactly one
+    // names a table of the form, the locked read of the base row, which names no page table, so no page row was read;
+    // every other one is the form's write lock, which names no table, sent before the locked read; and the required
+    // gate never ran.
     private static void AssertStoppedAtLockedRead(
         ApiForm form,
         IReadOnlyList<RecordedCommand> commands,
@@ -806,17 +813,25 @@ public sealed class SqlRecordRepositoryWriteTests : IAsyncLifetime
     {
         IReadOnlyList<RecordedCommand> transaction = TransactionOf(commands, UpdateOperation);
         Assert.True(commands.All(command => !command.IsWrite), Describe(update + " sent a write.", commands));
-        RecordedCommand[] reads = transaction.Where(command => command.Operation == UpdateOperation).ToArray();
+        RecordedCommand[] own = transaction.Where(command => command.Operation == UpdateOperation).ToArray();
+        RecordedCommand[] reads = own.Where(command => form.TargetTable(command) is not null).ToArray();
         Assert.True(
             reads.Length == 1
             && Verb(reads[0]) == "SELECT"
             && form.TargetTable(reads[0]) == form.BaseTable
             && reads[0].CommandText.Contains("UPDLOCK", StringComparison.Ordinal),
             Describe(update + " did not stop at the locked read of the base row.", transaction));
-        IReadOnlyList<string> identifiers = SqlCommandRecorder.BracketedIdentifiers(reads[0].CommandText);
+        RecordedCommand lockedRead = reads[0];
+        IReadOnlyList<string> identifiers = SqlCommandRecorder.BracketedIdentifiers(lockedRead.CommandText);
         Assert.True(
             !form.Pages.Any(page => identifiers.Contains(page.Table, StringComparer.Ordinal)),
             Describe(update + " read a page row.", transaction));
+        Assert.True(
+            own.Where(command => command.Sequence != lockedRead.Sequence)
+                .All(command => IsFormWriteLock(command) && command.Sequence < lockedRead.Sequence),
+            Describe(
+                update + " sent a repository command other than the locked read and the form write lock before it.",
+                transaction));
         Assert.True(
             gateCalls.Count == 0,
             Describe(
@@ -922,6 +937,13 @@ public sealed class SqlRecordRepositoryWriteTests : IAsyncLifetime
 
         return text[..length].ToString().ToUpperInvariant();
     }
+
+    // The form write lock: a command that opens with the lock's fixed text, names no bracketed identifier, so no table,
+    // and holds no write statement.
+    private static bool IsFormWriteLock(RecordedCommand command) =>
+        command.CommandText.StartsWith(FormWriteLockPrefix, StringComparison.Ordinal)
+        && SqlCommandRecorder.BracketedIdentifiers(command.CommandText).Count == 0
+        && !command.IsWrite;
 
     // The distinct bracketed identifiers of a command other than the excluded names, in ordinal order.
     private static string[] IdentifiersExcept(RecordedCommand command, params string[] excluded) =>

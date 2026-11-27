@@ -8,6 +8,11 @@
  *   the values object itself, never a copy: the editor replaces it on every change. When E
  *   is sent, a field the user edited after s(E) carries its U(E) value and every other field
  *   its current value: E sees each edit made before it and never a later one.
+ * - Every data field is sent, read-only ones included, each value in its field type's wire
+ *   shape: a checkbox is `true` when checked and `false` otherwise, an untouched (`null`) box
+ *   included, as the record's POST sends it; any other value the server's field-event check
+ *   would reject, such as text in a number field, is sent as `null`, so it cannot fail this
+ *   event and every later one. Save still validates the value as the draft holds it.
  * - A response is applied by applyFieldEvent, which owns every effect rule; the queue only
  *   checks that the answer has the response's shape and tells applyFieldEvent which fields
  *   the user edited after s(E), whose edits win.
@@ -16,21 +21,28 @@
  *   Sequence numbers and generations stay local and are never sent.
  * - A request that stays unanswered for the deadline is cancelled.
  * - A failed event (no answer in time, a network error, a 4xx or 5xx, an answer that cannot
- *   be read, or effects that cannot be applied) shows a non-blocking notice of fixed text
- *   and counts as processed, so it never blocks leaving or saving. An event of an older
- *   generation fails silently. drain() never rejects.
+ *   be read, or effects that cannot be applied) counts as processed, so it never blocks
+ *   leaving or saving, and is recorded against its field and event kind. Each failure lasts
+ *   until an event of that same kind on that field is answered and applied; another field's
+ *   event, another kind of event on the field, and a save resolve nothing. The host
+ *   is given the whole list of non-blocking notices of fixed text whenever it changes: one
+ *   per failed field, in the order of the field's first failure, with the latest reason. An
+ *   event of an older generation fails silently, and reset() clears every failure. drain()
+ *   never rejects.
  *
  * The queue raises no event on its own, so loading or replacing a record raises none.
  */
-import { isFieldValue, type ApiClient, type ApiResult } from '../api/client';
+import { isExactDecimal, isFieldValue, type ApiClient, type ApiResult } from '../api/client';
 import { describeError, errorMessages, isAbortError, networkError, type ApiError } from '../api/errors';
 import type {
   Diagnostic,
   DiagnosticSeverity,
   DialogMessage,
+  FieldDefinition,
   FieldEventKind,
   FieldEventRequest,
   FieldEventResponse,
+  FieldType,
   FieldValue,
   FormDefinition,
   Values,
@@ -60,8 +72,12 @@ export interface FieldEventQueueHost {
   onDialogs(dialogs: readonly DialogMessage[]): void;
   /** The diagnostics of one response, in source order; called only when there is one. */
   onDiagnostics?(diagnostics: readonly Diagnostic[]): void;
-  /** A non-blocking notice that an event could not be evaluated. */
-  onNotice(message: string): void;
+  /**
+   * The non-blocking notices of the fields whose events could not be evaluated, one per field
+   * in the order of its first failure; empty once none is left. Called with a new array
+   * whenever the list changes, and never with an unchanged one.
+   */
+  onNotices(messages: readonly string[]): void;
 }
 
 export interface FieldEventQueueOptions {
@@ -83,7 +99,10 @@ export interface FieldEventQueue {
   noteUserEdit(fieldName: string): void;
   /** Settles once no event is pending or in flight, or at the next reset(); never rejects. */
   drain(): Promise<void>;
-  /** Starts a new record generation: drops pending events and cancels the in-flight one. */
+  /**
+   * Starts a new record generation: drops pending events, cancels the in-flight one and
+   * clears every failure, reporting the empty list when there was any.
+   */
   reset(): void;
   /** Events pending or in flight in the current generation. */
   readonly size: number;
@@ -256,17 +275,98 @@ function valueOf(values: Values, name: string): FieldValue {
   return Object.hasOwn(values, name) ? (values[name] ?? null) : null;
 }
 
-/** Every data field of the form, once each, in page and tab order. */
-function dataFieldNames(definition: FormDefinition): string[] {
-  const names = new Set<string>();
+/** Every data field of the form, once each by name, in page and tab order. */
+function dataFields(definition: FormDefinition): FieldDefinition[] {
+  const fields = new Map<string, FieldDefinition>();
   for (const page of definition.pages) {
     for (const field of page.fields) {
-      if (isDataField(field)) {
-        names.add(field.name);
+      if (isDataField(field) && !fields.has(field.name)) {
+        fields.set(field.name, field);
       }
     }
   }
-  return [...names];
+  return [...fields.values()];
+}
+
+// Event values
+//
+// The server checks that each event value has its field type's wire shape, and a single
+// value without it fails the whole request with 400. The draft can hold such a value for as
+// long as the user leaves it there, such as the text `abc` in a number field, so sending it
+// would fail every later event of the record and stop all its check code. The rules below
+// mirror the server's field-event shape check (ValuesReader.ToTyped and
+// FieldValueCoercion.Coerce) and nothing more: it applies no storage range, option count,
+// length, mask or legal-value rule to an event, so neither do they.
+
+// Exactly YYYY-MM-DD with ASCII digits; without the m flag, `$` matches only at the end of the text.
+const EVENT_DATE = /^(\d{4})-(\d{2})-(\d{2})$/;
+
+// The largest option index the server reads: int.MaxValue.
+const MAX_OPTION_INDEX = 2_147_483_647;
+
+// A calendar date of years 0001-9999, as the server's exact yyyy-MM-dd DateOnly parse reads
+// one: integer arithmetic only, since Date.parse and new Date(y, …) shift years 0-99 and roll
+// overflowing days into the next month.
+function isEventDate(text: string): boolean {
+  const match = EVENT_DATE.exec(text);
+  if (match === null) {
+    return false;
+  }
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  if (year < 1 || month < 1 || month > 12 || day < 1) {
+    return false;
+  }
+  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const daysInMonth = month === 2 ? (leapYear ? 29 : 28) : [4, 6, 9, 11].includes(month) ? 30 : 31;
+  return day <= daysInMonth;
+}
+
+// Whether a value that is not null has the wire shape the server's field-event check gives
+// its field type: a string for text; a finite number for a number, which the client may hold
+// as a bigint or an ExactDecimal; a YYYY-MM-DD calendar date for a date; a boolean for a
+// checkbox; and a whole number from 0 to MAX_OPTION_INDEX for an option.
+function hasEventShape(fieldType: FieldType, value: Exclude<FieldValue, null>): boolean {
+  switch (fieldType) {
+    case 'text':
+    case 'multiline':
+    case 'legalValues':
+      return typeof value === 'string';
+    case 'number':
+      return (
+        (typeof value === 'number' && Number.isFinite(value)) ||
+        typeof value === 'bigint' ||
+        (isExactDecimal(value) && Number.isFinite(Number(value.literal)))
+      );
+    case 'date':
+      return typeof value === 'string' && isEventDate(value);
+    case 'checkbox':
+      return typeof value === 'boolean';
+    case 'option':
+      return (
+        (typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= MAX_OPTION_INDEX) ||
+        (typeof value === 'bigint' && value >= 0n && value <= BigInt(MAX_OPTION_INDEX))
+      );
+    default:
+      // Labels, groups and unsupported fields hold no value.
+      return false;
+  }
+}
+
+/**
+ * The value an event carries for a field. A checkbox is `true` only when checked: an
+ * untouched box is `null` in the draft and shows unchecked, and legacy reads every unchecked
+ * box as `false`, as the record's POST sends it, so check code such as `Fever = (-)` sees it
+ * unchecked. Any other value without its type's wire shape is `null`, which the server
+ * accepts for every field, so the event and every later one still run; validation at save
+ * still reports the value.
+ */
+function eventValue(field: FieldDefinition, value: FieldValue): FieldValue {
+  if (field.fieldType === 'checkbox') {
+    return value === true;
+  }
+  return value === null || hasEventShape(field.fieldType, value) ? value : null;
 }
 
 /** The text a notice names a field by: its prompt, or its name when the prompt is blank. */
@@ -281,6 +381,15 @@ function fieldLabels(definition: FormDefinition): Map<string, string> {
     }
   }
   return labels;
+}
+
+/** The reason of a field's latest failure that still stands: the last entry of its reasons. */
+function latestReason(reasons: ReadonlyMap<FieldEventKind, string>): string {
+  let latest = '';
+  for (const reason of reasons.values()) {
+    latest = reason;
+  }
+  return latest;
 }
 
 // describeError's texts for these kinds speak of saving or opening records, which a field
@@ -300,7 +409,7 @@ function failureReason(error: ApiError): string {
 export function createFieldEventQueue(options: FieldEventQueueOptions): FieldEventQueue {
   const { client, viewId, definition, host } = options;
   const deadlineMs = deadlineOf(options.deadlineMs);
-  const fieldNames = dataFieldNames(definition);
+  const fields = dataFields(definition);
   const labels = fieldLabels(definition);
 
   let seq = 0;
@@ -309,6 +418,14 @@ export function createFieldEventQueue(options: FieldEventQueueOptions): FieldEve
   const pending: QueuedEvent[] = [];
   let inFlight: InFlight | null = null;
   let idleWaiters: (() => void)[] = [];
+  /**
+   * The current generation's failures: each field, in the order of its first failure, maps
+   * every event kind that failed and has not been applied since to the reason it failed,
+   * the latest failure last.
+   */
+  const failures = new Map<string, Map<FieldEventKind, string>>();
+  /** The notices the host was last given. */
+  let reported: readonly string[] = [];
 
   const releaseWaiters = (): void => {
     const waiters = idleWaiters;
@@ -331,32 +448,66 @@ export function createFieldEventQueue(options: FieldEventQueueOptions): FieldEve
   };
 
   // Built when the event is sent, not when it was raised, so it carries the effects of
-  // every earlier response. Object.fromEntries defines own properties, so no field name
-  // can reach the prototype.
+  // every earlier response. Each field's value is chosen by the capture rule and then sent
+  // in its wire shape (eventValue). Object.fromEntries defines own properties, so no field
+  // name can reach the prototype.
   const payloadValues = (event: QueuedEvent): Values => {
     const current = host.getSnapshot().values;
     const edited = editedSince(event);
     return Object.fromEntries(
-      fieldNames.map((name): [string, FieldValue] => [
-        name,
-        valueOf(edited.has(name) ? event.captured : current, name),
+      fields.map((field): [string, FieldValue] => [
+        field.name,
+        eventValue(field, valueOf(edited.has(field.name) ? event.captured : current, field.name)),
       ]),
     );
   };
 
-  // Silent for an event of an older generation, whose record is no longer on screen. A
-  // notice the host cannot show is dropped: it is the queue's only way to report, and the
-  // event must still count as processed so that drain() is released.
+  // Gives the host the notices of the current failures when they differ from the last list
+  // it was given. A list the host cannot show is dropped: it is the queue's only way to
+  // report, and the event must still count as processed so that drain() is released. The
+  // next change sends the whole list again.
+  const report = (): void => {
+    const messages: string[] = [];
+    for (const [fieldName, reasons] of failures) {
+      const label = labels.get(fieldName) ?? fieldName;
+      messages.push(`Check code could not run for ${label}. ${latestReason(reasons)}`);
+    }
+    if (messages.length === reported.length && messages.every((message, i) => message === reported[i])) {
+      return;
+    }
+    reported = messages;
+    try {
+      host.onNotices(messages);
+    } catch {
+      // Nothing is left to report the failure to.
+    }
+  };
+
+  // Silent for an event of an older generation, whose record is no longer on screen. A field
+  // that failed before keeps its place in the list, and the reason given becomes its latest.
   const notify = (event: QueuedEvent, reason: string): void => {
     if (!isCurrent(event)) {
       return;
     }
-    const label = labels.get(event.fieldName) ?? event.fieldName;
-    try {
-      host.onNotice(`Check code could not run for ${label}. ${reason}`);
-    } catch {
-      // Nothing is left to report the failure to.
+    const reasons = failures.get(event.fieldName) ?? new Map<FieldEventKind, string>();
+    // Removed and set again, so the latest failure is the field's last entry.
+    reasons.delete(event.kind);
+    reasons.set(event.kind, reason);
+    failures.set(event.fieldName, reasons);
+    report();
+  };
+
+  // An event that was answered and applied resolves the failure of its own kind on its own
+  // field, and nothing else: the field's other kinds and every other field keep theirs.
+  const clearFailure = (event: QueuedEvent): void => {
+    const reasons = failures.get(event.fieldName);
+    if (!isCurrent(event) || reasons === undefined || !reasons.delete(event.kind)) {
+      return;
     }
+    if (reasons.size === 0) {
+      failures.delete(event.fieldName);
+    }
+    report();
   };
 
   const apply = (event: QueuedEvent, response: FieldEventResponse): void => {
@@ -431,6 +582,7 @@ export function createFieldEventQueue(options: FieldEventQueueOptions): FieldEve
         return;
       }
       apply(event, response);
+      clearFailure(event);
     } catch {
       notify(event, EFFECTS_NOT_APPLIED);
     } finally {
@@ -491,6 +643,9 @@ export function createFieldEventQueue(options: FieldEventQueueOptions): FieldEve
       const stale = inFlight;
       inFlight = null;
       lastEditSeq.clear();
+      // The failures belonged to the record being left; the host is told that none is left.
+      failures.clear();
+      report();
       stale?.controller.abort();
       releaseWaiters();
     },

@@ -20,8 +20,9 @@ namespace EpiInfo.Data.Tests.Records;
 /// <summary>
 /// Integration tests on session temporary tables, for the identifiers and column types the seeded forms do not have,
 /// such as the T-SQL reserved words <c>Order</c>, <c>Select</c> and <c>Group</c> as column names, for stored
-/// values the seeded rows lack, such as text with trailing blanks, and for catalogue shapes the seeded forms never
-/// present, such as a page without its table. Each test creates its <c>#</c> tables on one
+/// values the seeded rows lack, such as text with trailing blanks, for catalogue shapes the seeded forms never
+/// present, such as a page without its table, and for session settings a server can default to, such as
+/// <c>NOCOUNT ON</c>. Each test creates its <c>#</c> tables on one
 /// dedicated connection, reads their schema through <see cref="SqlMetadataReader.ReadTempTableSchemaAsync"/>, builds an
 /// in-memory form over them (no <c>meta*</c> row is written), writes and reads through the open-connection overloads
 /// of <see cref="SqlRecordRepository"/>, or through <see cref="RecordSqlBuilder"/>, <see cref="SearchSqlBuilder"/>
@@ -121,6 +122,8 @@ public sealed class ReservedWordIdentifierTests
     private const string OutcomePage = "#OutcomePage";
     private const string IncompleteBase = "#IncompleteBase";
     private const string IncompletePage = "#IncompletePage";
+    private const string NocountBase = "#NocountBase";
+    private const string NocountPage = "#NocountPage";
 
     // A second page's table that lacks the GlobalRecordId record key column.
     private const string KeylessPage = "#KeylessPage";
@@ -132,6 +135,12 @@ public sealed class ReservedWordIdentifierTests
     // The fixed-width stamp fixture's tables, whose base logon-name stamp columns are nchar.
     private const string FixedStampBase = "#FixedStampBase";
     private const string FixedStampPage = "#FixedStampPage";
+
+    // The bit of @@OPTIONS that SET NOCOUNT turns on.
+    private const int NocountOption = 512;
+
+    // The tail every counted UPDATE of the builders ends with: the statement selects its own row count.
+    private const string RowCountSelect = "; SELECT @@ROWCOUNT";
 
     private static readonly TimeSpan TestTimeout = TimeSpan.FromSeconds(120);
 
@@ -1475,6 +1484,262 @@ public sealed class ReservedWordIdentifierTests
         }
     }
 
+    /// <summary>
+    /// An update of a page value on a record whose page row is missing inserts the row holding only its key and
+    /// repeats the update, as legacy repairs it (<c>Epi.Core/Data/Services/CollectedDataProvider.cs:1360-1380</c>),
+    /// whatever the session's <c>NOCOUNT</c> setting. Under <c>NOCOUNT ON</c> the provider reports -1 for an
+    /// <c>UPDATE</c> that changed a row and for one that changed none, so only the row count the statement selects
+    /// itself can show the row missing. The update succeeds, its response carries the submitted value, a direct read
+    /// finds exactly one page row holding it, and the recorder shows the base stamp, the page <c>UPDATE</c>, the
+    /// key-only <c>INSERT</c> and the repeated <c>UPDATE</c>, in that order.
+    /// </summary>
+    /// <param name="noCount">Whether the session runs with <c>NOCOUNT ON</c>.</param>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task UpdateOfMissingPageRow_InsertsTheRowAndRepeatsTheUpdate_WhateverNocount(bool noCount)
+    {
+        await TestDatabase.EnsureReachableAsync();
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        var cancellationToken = timeout.Token;
+        await using var writeLock = await DatabaseWriteLock.AcquireExclusiveAsync(cancellationToken);
+        await using var connection = await TestDatabase.OpenConnectionAsync(cancellationToken);
+        var sessionNoCount = await ReadNocountAsync(connection, cancellationToken);
+        try
+        {
+            var fixture = await CreateFixtureAsync(
+                connection,
+                NocountBase,
+                NocountPage,
+                $"[{Surname}] nvarchar(4000), [{Remarks}] nvarchar(4000)",
+                [
+                    new FixtureField(Surname, TextTypeId, TextTypeName),
+                    new FixtureField(Remarks, MultilineTypeId, MultilineTypeName),
+                ],
+                cancellationToken);
+            await SetNocountAsync(connection, noCount, cancellationToken);
+
+            var options = new DatabaseOptions(TestDatabase.ConnectionString);
+            var connections = new SqlConnectionFactory(options);
+            var repository = new SqlRecordRepository(
+                connections,
+                new SqlMetadataReader(connections, options, fixture.Recorder),
+                options,
+                fixture.Recorder);
+            var stamp = new SaveStamp(StampLogonName, SaveStamp.TruncateToSeconds(DateTime.Now));
+            var inserted = await repository.InsertAsync(
+                connection,
+                fixture.Form,
+                fixture.Schema,
+                Values((Surname, FieldValue.FromText("n-" + Guid.NewGuid().ToString("N")))),
+                stamp,
+                cancellationToken);
+
+            // The missing-page fixture: the record's page row is removed. The provider counts the removed row only
+            // without NOCOUNT, which proves the session suppresses counts as the case requires.
+            await using (var delete = new SqlCommand(
+                $"DELETE FROM [{NocountPage}] WHERE [GlobalRecordId] = @id",
+                connection))
+            {
+                delete.Parameters.Add(IdParameter(inserted.GlobalRecordId));
+                var reported = await delete.ExecuteNonQueryAsync(cancellationToken);
+                Assert.True(
+                    reported == (noCount ? -1 : 1),
+                    "The provider's count of the removed page row does not follow the session's NOCOUNT setting.");
+            }
+
+            Assert.Equal(0, await CountRowsAsync(connection, NocountPage, cancellationToken));
+
+            fixture.Recorder.Clear();
+            var remarks = FieldValue.FromText("r-" + Guid.NewGuid().ToString("N"));
+            var updated = await repository.UpdateAsync(
+                connection,
+                fixture.Form,
+                fixture.Schema,
+                inserted.GlobalRecordId,
+                Values((Remarks, remarks)),
+                () => stamp,
+                stored => RecordValidationResult.Success(stored.Values),
+                permissions: null,
+                cancellationToken);
+
+            // The repaired row holds only its key and the submitted value, so the removed Surname reads as null.
+            Assert.Equal(RecordWriteStatus.Success, updated.Status);
+            AssertSoleRecord(
+                inserted,
+                Assert.IsType<RecordDto>(updated.Record),
+                Values((Surname, FieldValue.Null), (Remarks, remarks)),
+                "update");
+
+            await using (var read = new SqlCommand(
+                $"SELECT [{Surname}], [{Remarks}] FROM [{NocountPage}] WHERE [GlobalRecordId] = @id",
+                connection))
+            {
+                read.Parameters.Add(IdParameter(inserted.GlobalRecordId));
+                await using var reader = await read.ExecuteReaderAsync(cancellationToken);
+                Assert.True(await reader.ReadAsync(cancellationToken), "The repaired page row was not found.");
+                Assert.True(reader.IsDBNull(0), Surname + " of the repaired page row is not NULL.");
+                Assert.True(
+                    reader.GetValue(1) is string stored
+                        && string.Equals(remarks.AsText(), stored, StringComparison.Ordinal),
+                    Remarks + " of the repaired page row does not hold the submitted text.");
+                Assert.False(await reader.ReadAsync(cancellationToken), "The page holds more than one row for the id.");
+            }
+
+            Assert.Equal(1, await CountRowsAsync(connection, NocountPage, cancellationToken));
+
+            // Every write ran inside the update's transaction and succeeded; each UPDATE selected its own row count,
+            // and the repeated page UPDATE is the first one, text and parameters alike.
+            var writes = fixture.Recorder.ForOperation(RecordOperations.Update)
+                .Where(command => command.IsWrite)
+                .ToArray();
+            Assert.True(
+                writes.Length == 4,
+                "The update did not send the base stamp and three page writes: " + Describe(writes));
+            Assert.StartsWith("UPDATE [" + NocountBase + "] ", writes[0].CommandText, StringComparison.Ordinal);
+            Assert.StartsWith("UPDATE [" + NocountPage + "] ", writes[1].CommandText, StringComparison.Ordinal);
+            Assert.Equal("INSERT INTO [" + NocountPage + "] ([GlobalRecordId]) VALUES (@p0)", writes[2].CommandText);
+            Assert.Equal(writes[1].CommandText, writes[3].CommandText);
+            Assert.True(
+                writes[1].Parameters.SequenceEqual(writes[3].Parameters),
+                "The repeated page UPDATE does not bind the parameters of the first.");
+            RecordedCommand[] updates = [writes[0], writes[1], writes[3]];
+            Assert.All(
+                updates,
+                update => Assert.EndsWith(RowCountSelect, update.CommandText, StringComparison.Ordinal));
+            Assert.All(writes, AssertSucceededInTransaction);
+        }
+        finally
+        {
+            await RestoreNocountAsync(connection, sessionNoCount);
+            await DropTablesAsync(connection, NocountPage, NocountBase);
+        }
+    }
+
+    /// <summary>
+    /// A page <c>UPDATE</c> that changes a number of rows other than the record's one is never reported as saved,
+    /// whatever the session's <c>NOCOUNT</c> setting. On a page table that does not key on <c>GlobalRecordId</c> and
+    /// holds two rows for the record, the update is abandoned on the row count the statement selects itself, which the
+    /// provider's count (-1 under <c>NOCOUNT ON</c>) would never show. The write fails with the store's
+    /// <see cref="DataStoreWriteException"/> for <c>records.update</c> and <see cref="WriteOutcome.NotWritten"/>,
+    /// because the rollback completed after the base stamp and the page <c>UPDATE</c> were sent, and neither table
+    /// keeps any of the update.
+    /// </summary>
+    /// <remarks>
+    /// The same guard refuses an <c>UPDATE</c> of the locked row that finds no row. That needs the row to change
+    /// between the locked read and the write, inside the write's transaction; a session temporary table is visible to
+    /// no other session and cannot carry a trigger, so no fixture of this class can produce it.
+    /// </remarks>
+    /// <param name="noCount">Whether the session runs with <c>NOCOUNT ON</c>.</param>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task PageUpdateChangingMoreThanTheRecordsRow_IsRolledBack_WhateverNocount(bool noCount)
+    {
+        await TestDatabase.EnsureReachableAsync();
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        var cancellationToken = timeout.Token;
+        await using var writeLock = await DatabaseWriteLock.AcquireExclusiveAsync(cancellationToken);
+        await using var connection = await TestDatabase.OpenConnectionAsync(cancellationToken);
+        var sessionNoCount = await ReadNocountAsync(connection, cancellationToken);
+        try
+        {
+            var fixture = await CreateFixtureAsync(
+                connection,
+                NocountBase,
+                NocountPage,
+                $"[{Surname}] nvarchar(4000), [{Remarks}] nvarchar(4000)",
+                [
+                    new FixtureField(Surname, TextTypeId, TextTypeName),
+                    new FixtureField(Remarks, MultilineTypeId, MultilineTypeName),
+                ],
+                cancellationToken,
+                pageKeyIsPrimaryKey: false);
+            await SetNocountAsync(connection, noCount, cancellationToken);
+
+            var options = new DatabaseOptions(TestDatabase.ConnectionString);
+            var connections = new SqlConnectionFactory(options);
+            var repository = new SqlRecordRepository(
+                connections,
+                new SqlMetadataReader(connections, options, fixture.Recorder),
+                options,
+                fixture.Recorder);
+            var insertStamp = new SaveStamp(StampLogonName, SaveStamp.TruncateToSeconds(DateTime.Now));
+            var inserted = await repository.InsertAsync(
+                connection,
+                fixture.Form,
+                fixture.Schema,
+                Values((Surname, FieldValue.FromText("d-" + Guid.NewGuid().ToString("N")))),
+                insertStamp,
+                cancellationToken);
+
+            // A second page row for the record, holding only its key, which the page table's missing key admits.
+            await using (var duplicate = new SqlCommand(
+                $"INSERT INTO [{NocountPage}] ([GlobalRecordId]) VALUES (@id)",
+                connection))
+            {
+                duplicate.Parameters.Add(IdParameter(inserted.GlobalRecordId));
+                await duplicate.ExecuteNonQueryAsync(cancellationToken);
+            }
+
+            Assert.Equal(2, await CountRowsAsync(connection, NocountPage, cancellationToken));
+
+            fixture.Recorder.Clear();
+            var updateStamp = new SaveStamp(StampLogonName + ".update", insertStamp.Time);
+            var failure = await Assert.ThrowsAsync<DataStoreWriteException>(() => repository.UpdateAsync(
+                connection,
+                fixture.Form,
+                fixture.Schema,
+                inserted.GlobalRecordId,
+                Values((Remarks, FieldValue.FromText("r-" + Guid.NewGuid().ToString("N")))),
+                () => updateStamp,
+                stored => RecordValidationResult.Success(stored.Values),
+                permissions: null,
+                cancellationToken));
+
+            Assert.Equal(RecordOperations.Update, failure.Operation);
+            Assert.Equal(WriteOutcome.NotWritten, failure.Outcome);
+            Assert.Null(failure.SqlErrorNumber);
+            Assert.IsType<InvalidOperationException>(failure.InnerException);
+            Assert.False(failure.Data.Contains(SqlErrorClassifier.RollbackExceptionTypeKey));
+
+            // The base stamp and the page UPDATE were sent and succeeded; the page UPDATE's count stopped the write.
+            var writes = fixture.Recorder.ForOperation(RecordOperations.Update)
+                .Where(command => command.IsWrite)
+                .ToArray();
+            Assert.True(
+                writes.Length == 2,
+                "The update did not stop after the base stamp and the page UPDATE: " + Describe(writes));
+            Assert.StartsWith("UPDATE [" + NocountBase + "] ", writes[0].CommandText, StringComparison.Ordinal);
+            Assert.StartsWith("UPDATE [" + NocountPage + "] ", writes[1].CommandText, StringComparison.Ordinal);
+            Assert.EndsWith(RowCountSelect, writes[1].CommandText, StringComparison.Ordinal);
+            Assert.All(writes, AssertSucceededInTransaction);
+
+            // The rollback left both tables as the insert and the second page row made them.
+            Assert.Equal(2, await CountRowsAsync(connection, NocountPage, cancellationToken));
+            await using (var command = new SqlCommand(
+                $"SELECT COUNT(*) FROM [{NocountPage}] WHERE [{Remarks}] IS NOT NULL",
+                connection))
+            {
+                var updatedRows = Assert.IsType<int>(await command.ExecuteScalarAsync(cancellationToken));
+                Assert.True(updatedRows == 0, "A page row keeps the value of the rolled-back update.");
+            }
+
+            await using (var command = new SqlCommand($"SELECT [LastSaveLogonName] FROM [{NocountBase}]", connection))
+            {
+                Assert.True(
+                    await command.ExecuteScalarAsync(cancellationToken) is string logonName
+                        && string.Equals(StampLogonName, logonName, StringComparison.Ordinal),
+                    "The base row keeps the stamp of the rolled-back update.");
+            }
+        }
+        finally
+        {
+            await RestoreNocountAsync(connection, sessionNoCount);
+            await DropTablesAsync(connection, NocountPage, NocountBase);
+        }
+    }
+
     // Creates the base and page tables on the test's connection, reads them back through the reader's temporary-table
     // overload, and builds the in-memory form over the reader-built tables. Constraints are unnamed, so the session's
     // tables never collide with another session's.
@@ -1486,6 +1751,7 @@ public sealed class ReservedWordIdentifierTests
         IReadOnlyList<FixtureField> fields,
         CancellationToken cancellationToken,
         bool lastSaveColumns = true,
+        bool pageKeyIsPrimaryKey = true,
         string logonNameType = "nvarchar(255)")
     {
         // The base table has the seeded base tables' columns (testdata/sql/05_data_tables.sql), less the two last-save
@@ -1494,6 +1760,10 @@ public sealed class ReservedWordIdentifierTests
         var lastSaveColumnDefinitions = lastSaveColumns
             ? $"[LastSaveLogonName] {logonNameType}, [LastSaveTime] datetime,"
             : string.Empty;
+
+        // The page table keys on GlobalRecordId as the seeded page tables do, unless pageKeyIsPrimaryKey is false,
+        // which lets it hold more than one row for a record.
+        var pageKeyConstraint = pageKeyIsPrimaryKey ? " PRIMARY KEY" : string.Empty;
         await ExecuteDdlAsync(
             connection,
             $"""
@@ -1506,7 +1776,7 @@ public sealed class ReservedWordIdentifierTests
                 {lastSaveColumnDefinitions}
                 [FKEY] nvarchar(255));
             CREATE TABLE [{pageName}] (
-                [GlobalRecordId] nvarchar(255) PRIMARY KEY NOT NULL,
+                [GlobalRecordId] nvarchar(255){pageKeyConstraint} NOT NULL,
                 {pageColumnDefinitions});
             """,
             cancellationToken);
@@ -1931,6 +2201,68 @@ public sealed class ReservedWordIdentifierTests
             await ExecuteDdlAsync(connection, $"DROP TABLE IF EXISTS [{tableName}];", CancellationToken.None);
         }
     }
+
+    // Whether the session runs with NOCOUNT ON, as @@OPTIONS reports it.
+    private static async Task<bool> ReadNocountAsync(SqlConnection connection, CancellationToken cancellationToken)
+    {
+        await using var command = new SqlCommand("SELECT @@OPTIONS", connection);
+        var options = Assert.IsType<int>(await command.ExecuteScalarAsync(cancellationToken));
+        return (options & NocountOption) != 0;
+    }
+
+    // Sets the session's NOCOUNT option, which a server's 'user options' can also make every session's default, and
+    // confirms it. The option lasts for the session, so the open-connection overloads run under it.
+    private static async Task SetNocountAsync(
+        SqlConnection connection,
+        bool noCount,
+        CancellationToken cancellationToken)
+    {
+        await using (var command = new SqlCommand(noCount ? "SET NOCOUNT ON;" : "SET NOCOUNT OFF;", connection))
+        {
+            await command.ExecuteNonQueryAsync(cancellationToken);
+        }
+
+        Assert.True(
+            await ReadNocountAsync(connection, cancellationToken) == noCount,
+            "The session's NOCOUNT option is not the one the case set.");
+    }
+
+    // Puts the session's own NOCOUNT option back, even after a timeout, before the pool can reuse the session; a
+    // closed connection has ended the session already.
+    private static async Task RestoreNocountAsync(SqlConnection connection, bool noCount)
+    {
+        if (connection.State != ConnectionState.Open)
+        {
+            return;
+        }
+
+        await using var command = new SqlCommand(noCount ? "SET NOCOUNT ON;" : "SET NOCOUNT OFF;", connection);
+        await command.ExecuteNonQueryAsync(CancellationToken.None);
+    }
+
+    // The record id bound as the fixture tables' nvarchar(255) key.
+    private static SqlParameter IdParameter(string globalRecordId) =>
+        new("@id", SqlDbType.NVarChar, 255) { Value = globalRecordId };
+
+    // The number of rows of a fixture table.
+    private static async Task<int> CountRowsAsync(
+        SqlConnection connection,
+        string tableName,
+        CancellationToken cancellationToken)
+    {
+        await using var command = new SqlCommand($"SELECT COUNT(*) FROM [{tableName}]", connection);
+        return Assert.IsType<int>(await command.ExecuteScalarAsync(cancellationToken));
+    }
+
+    // Commands as an assertion message lists them, without their parameter values.
+    private static string Describe(IEnumerable<RecordedCommand> commands) =>
+        string.Join("; ", commands.Select(command => command.Describe(includeParameterValues: false)));
+
+    // A write of the operation ran inside its transaction and succeeded.
+    private static void AssertSucceededInTransaction(RecordedCommand command) =>
+        Assert.True(
+            command.Completed && command.Succeeded && command.InTransaction,
+            "A write did not succeed inside its transaction: " + command.Describe(includeParameterValues: false));
 
     private sealed record FixtureField(string Name, int FieldTypeId, string FieldTypeName, string? List = null);
 

@@ -5,6 +5,7 @@
 // in the order the server sends them (sorted only when metadata asks), so nothing
 // here sorts or filters them. The legal-value rule is enforced by the server and
 // mirrored by clientValidation.ts, not here.
+import { Fragment } from 'react';
 import type { FieldComponentProps } from './fieldComponents';
 import {
   fieldAriaProps,
@@ -22,6 +23,15 @@ import {
  * select and its list never announce a blank item. A stored value missing from the
  * list is shown as one extra option after "No selection", so a read shows the stored
  * value unchanged.
+ *
+ * The options are keyed by the select's `disabled` state, so each change of it replaces
+ * every option node while the select itself stays mounted. An option has no state of
+ * its own here and inherits it from the select, and Chromium can keep an option's
+ * accessibility object from before such a change: after a record opened from Find
+ * re-enabled the select, every option was announced disabled and none selected. Options
+ * created in the select's current state are announced in that state. Keeping the select
+ * leaves its focus, label, value and ARIA attributes untouched, so the replacement raises
+ * no focus, blur or change.
  */
 export function LegalValuesSelect(props: FieldComponentProps) {
   const { field, value, disabled, errors, onChange, onFocus, onBlur } = props;
@@ -48,16 +58,18 @@ export function LegalValuesSelect(props: FieldComponentProps) {
           onBlur?.();
         }}
       >
-        <option value="">No selection</option>
-        {current !== '' && !currentIsListed && <option value={current}>{current}</option>}
-        {options.map((option, index) => {
-          const optionValue = fieldTextValue(option.value);
-          return (
-            <option key={`${index}-${optionValue}`} value={optionValue}>
-              {option.label}
-            </option>
-          );
-        })}
+        <Fragment key={disabled ? 'disabled' : 'enabled'}>
+          <option value="">No selection</option>
+          {current !== '' && !currentIsListed && <option value={current}>{current}</option>}
+          {options.map((option, index) => {
+            const optionValue = fieldTextValue(option.value);
+            return (
+              <option key={`${index}-${optionValue}`} value={optionValue}>
+                {option.label}
+              </option>
+            );
+          })}
+        </Fragment>
       </select>
       {errors.length > 0 && (
         <div className="field-error" id={fieldErrorId(field.name)}>

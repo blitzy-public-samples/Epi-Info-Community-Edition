@@ -704,7 +704,8 @@ async function runWorkflow(
     const find = page.getByRole('dialog', { name: 'Find record', exact: true });
     await expect(find).toBeVisible();
     await find.getByRole('checkbox', { name: 'LastName', exact: true }).check();
-    await find.getByLabel('Value for LastName', { exact: true }).fill(marker);
+    // A criterion is labelled by the field's prompt, then its name in parentheses.
+    await find.getByLabel(`${LAST_NAME_LABEL} (LastName)`, { exact: true }).fill(marker);
     const [searched] = await Promise.all([
       page.waitForResponse(isSearchPost),
       find.getByRole('button', { name: 'Search', exact: true }).click(),

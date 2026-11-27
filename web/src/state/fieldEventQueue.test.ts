@@ -2,7 +2,8 @@
 // the order raised; each event carries the values the user had when it was raised, plus
 // the effects of earlier responses; a user edit made after an event was raised beats that
 // event's `cleared`/`assigned`; a response for a replaced record is ignored; a failed event
-// shows a notice without blocking a save; and a number the client decodes exactly in
+// shows a notice without blocking a save, which lasts until an event of the same kind on the
+// same field succeeds or the record changes; and a number the client decodes exactly in
 // `assigned` is applied with the rest of its answer and saved as the same JSON token.
 //
 // createFieldEventQueue is tested directly against a mutable editor snapshot, and through
@@ -13,11 +14,14 @@
 import { act, renderHook, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi, type Mock } from 'vitest';
 
-import { createApiClient, numberFromText, sameFieldValue, type ApiClient } from '../api/client';
+import { createApiClient, isExactDecimal, numberFromText, sameFieldValue, type ApiClient } from '../api/client';
+import { isAbortError } from '../api/errors';
 import type {
   Diagnostic,
   DialogMessage,
+  ExactDecimal,
   FieldEventKind,
+  FieldEventRequest,
   FieldEventResponse,
   FieldValue,
   ProblemDetails,
@@ -49,6 +53,11 @@ const TRACE_ID = '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01';
 const CHECKBOX = 'Asian';
 /** A read-only field: check code may assign it, the editor never sends it. */
 const READ_ONLY = 'OnsetWeek';
+/** Every checkbox of the fixture form, read-only ones included: each is sent in every event. */
+const CHECKBOX_NAMES = definition.pages
+  .flatMap((page) => page.fields)
+  .filter((field) => field.fieldType === 'checkbox')
+  .map((field) => field.name);
 /** A writable number field with no range or mask, so any number assigned to it can be saved. */
 const PLAIN_NUMBER = 'CaseID';
 
@@ -124,6 +133,15 @@ function omitting(response: FieldEventResponse, member: keyof FieldEventResponse
 /** A full `values` object of the fixture form; recordFixture rejects a name that is not a data field. */
 function valuesWith(overrides: Values): Values {
   return recordFixture({ values: overrides }).values;
+}
+
+/** The ExactDecimal a number field holds for `text`; throws when the text makes none. */
+function exactDecimal(text: string): ExactDecimal {
+  const value = numberFromText(text);
+  if (!isExactDecimal(value)) {
+    throw new Error(`${text} is not an exact decimal`);
+  }
+  return value;
 }
 
 // Request bodies arrive as `unknown` and are narrowed here; a body of the wrong shape is
@@ -359,8 +377,13 @@ afterEach(() => {
 
 interface Harness {
   readonly api: FakeApi;
-  /** The real client over the fake, which also keeps every raiseFieldEvent result. */
+  /** The real client over the fake, which also keeps every raiseFieldEvent request and result. */
   readonly client: ApiClient;
+  /**
+   * Every field-event request as the client was given it, in order: values exactly as the
+   * client holds them, before JSON turns a bigint or an ExactDecimal into a plain number.
+   */
+  readonly requests: readonly FieldEventRequest[];
   /** The client's settled result of the `index`-th field event. */
   readonly eventResult: (index: number) => Promise<unknown>;
 }
@@ -368,10 +391,12 @@ interface Harness {
 function createHarness(stored: readonly RecordDto[] = []): Harness {
   const api = createFakeApi(stored);
   const base = createApiClient({ baseUrl: 'http://localhost', fetch: api.fetch });
+  const requests: FieldEventRequest[] = [];
   const results: Promise<unknown>[] = [];
   const client: ApiClient = {
     ...base,
     raiseFieldEvent: (viewId, request, signal) => {
+      requests.push(request);
       const result = base.raiseFieldEvent(viewId, request, signal);
       results.push(result);
       return result;
@@ -380,6 +405,7 @@ function createHarness(stored: readonly RecordDto[] = []): Harness {
   return {
     api,
     client,
+    requests,
     eventResult: (index) => {
       const result = results.at(index);
       if (result === undefined) {
@@ -413,12 +439,21 @@ async function putAt(api: FakeApi, index: number): Promise<HeldPut> {
   return api.heldPuts[index];
 }
 
-/** Answers the `index`-th field event and waits until the queue has processed the answer. */
+/**
+ * Answers the `index`-th field event and waits until the queue has processed the answer. A
+ * request whose signal was aborted reached its end at the abort: the client rejected it with
+ * an AbortError then, without waiting for the fake, which ignores the abort, so the answer
+ * that still arrives reaches no one.
+ */
 async function answer(harness: Harness, index: number, response: Response): Promise<void> {
   const held = await eventAt(harness.api, index);
   await act(async () => {
     held.respond(response);
-    await harness.eventResult(index);
+    if (held.signal.aborted) {
+      await expect(harness.eventResult(index)).rejects.toSatisfy(isAbortError);
+    } else {
+      await harness.eventResult(index);
+    }
     await flush();
   });
 }
@@ -448,7 +483,7 @@ interface TestHost extends FieldEventQueueHost {
   readonly getSnapshot: () => EditorSnapshot;
   readonly setSnapshot: Mock<(next: EditorSnapshot) => void>;
   readonly onDialogs: Mock<(dialogs: readonly DialogMessage[]) => void>;
-  readonly onNotice: Mock<(message: string) => void>;
+  readonly onNotices: Mock<(messages: readonly string[]) => void>;
 }
 
 function createHost(values: Values): TestHost {
@@ -459,7 +494,7 @@ function createHost(values: Values): TestHost {
       host.snapshot = next;
     }),
     onDialogs: vi.fn(),
-    onNotice: vi.fn(),
+    onNotices: vi.fn(),
   };
   return host;
 }
@@ -592,6 +627,40 @@ describe('createFieldEventQueue', () => {
     await answer(harness, 3, json(200, envelope()));
   });
 
+  // The server fails a whole field-event request when one value lacks its field type's wire
+  // shape, so such a draft value would fail every later event; it is sent as null. Any value
+  // with the shape is sent unchanged: an event applies none of the storage-range or
+  // option-count rules a save does.
+  it.each<{ value: string; fieldName: string; draft: FieldValue; outcome: 'as null' | 'unchanged' }>([
+    { value: 'text in a number field', fieldName: 'Age', draft: 'abc', outcome: 'as null' },
+    { value: 'a lone minus sign in a number field', fieldName: 'Age', draft: '-', outcome: 'as null' },
+    { value: 'a date that is not on the calendar', fieldName: 'DOB', draft: '2011-02-29', outcome: 'as null' },
+    { value: 'a fractional option index', fieldName: 'IllnessSeverity', draft: 2.5, outcome: 'as null' },
+    { value: 'a negative option index', fieldName: 'IllnessSeverity', draft: -1, outcome: 'as null' },
+    { value: 'a bigint number', fieldName: 'Age', draft: 9007199254740993n, outcome: 'unchanged' },
+    { value: 'an ExactDecimal number', fieldName: 'FeverTemp', draft: exactDecimal('9007199254740992.5'), outcome: 'unchanged' },
+    { value: 'a date before the datetime range', fieldName: 'DOB', draft: '0001-01-01', outcome: 'unchanged' },
+    { value: 'an option index beyond the option count', fieldName: 'IllnessSeverity', draft: 7, outcome: 'unchanged' },
+  ])('sends $value $outcome, as the current value and as the value captured before an edit', async (row) => {
+    const { fieldName, draft, outcome } = row;
+    const { harness, queue, edit } = createQueue(valuesWith({ DateofInterview: INTERVIEW_DATE, [fieldName]: draft }));
+    const sent = outcome === 'unchanged' ? draft : null;
+
+    // The first event is sent at once, with the current value.
+    queue.raise('FieldBefore', 'LastName');
+    await eventAt(harness.api, 0);
+    // The second waits; the user then changes the field, so it carries the captured value.
+    queue.raise('FieldAfter', 'LastName');
+    edit(fieldName, null);
+    await answer(harness, 0, json(200, envelope()));
+    await answer(harness, 1, json(200, envelope()));
+
+    expect(harness.requests.map((request) => request.values[fieldName])).toEqual([sent, sent]);
+    for (const request of harness.requests) {
+      expect(request.values.DateofInterview).toBe(INTERVIEW_DATE);
+    }
+  });
+
   it.each([
     { when: 'after the event was raised', winner: 'the edit', editAfterRaise: true, expectedAge: 30 },
     { when: 'before the event was raised', winner: 'check code', editAfterRaise: false, expectedAge: ASSIGNED_AGE },
@@ -681,7 +750,7 @@ describe('createFieldEventQueue', () => {
     expect(host.snapshot).toBe(before);
     expect(host.setSnapshot).not.toHaveBeenCalled();
     expect(host.onDialogs).not.toHaveBeenCalled();
-    expect(host.onNotice).not.toHaveBeenCalled();
+    expect(host.onNotices).not.toHaveBeenCalled();
     expect(queue.size).toBe(1);
 
     await answer(harness, 1, json(200, envelope()));
@@ -713,16 +782,114 @@ describe('createFieldEventQueue', () => {
     await answer(harness, 0, problem(500));
 
     // One notice, naming the field by its prompt and carrying the server's trace id.
-    expect(host.onNotice).toHaveBeenCalledTimes(1);
-    const [notice] = host.onNotice.mock.calls[0];
-    expect(notice).toContain('Last Name');
-    expect(notice).toContain(TRACE_ID);
+    expect(host.onNotices).toHaveBeenCalledTimes(1);
+    const [notices] = host.onNotices.mock.calls[0];
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toContain('Last Name');
+    expect(notices[0]).toContain(TRACE_ID);
     expect(host.setSnapshot).not.toHaveBeenCalled();
 
     const next = await eventAt(harness.api, 1);
     expect(next).toMatchObject({ event: 'FieldBefore', fieldName: 'FirstName' });
     await answer(harness, 1, json(200, envelope()));
     expect(drained).toBe(true);
+    // Another field's success leaves the failed field's notice as it was.
+    expect(host.onNotices).toHaveBeenCalledTimes(1);
+  });
+
+  const DOB_FAILED = `Check code could not run for DOB. An unexpected error occurred. Trace id: ${TRACE_ID}.`;
+  const DOB_UNREADABLE = "Check code could not run for DOB. The server's answer could not be read.";
+  const FIRST_NAME_FAILED = `Check code could not run for First Name. An unexpected error occurred. Trace id: ${TRACE_ID}.`;
+  const failed = (): Response => problem(500);
+  const unreadable = (): Response => rawJson('{"enabled":5}');
+  const applied = (): Response => json(200, envelope());
+
+  // UXFB-F13: a field's failure stands until an event of the same kind on that field is
+  // applied; the host is given the whole list on every change and only then.
+  it.each<{
+    readonly through: string;
+    readonly steps: readonly (readonly [FieldEventKind, string, () => Response])[];
+    readonly lists: readonly (readonly string[])[];
+  }>([
+    {
+      through: 'a later failure of another field, listed after it',
+      steps: [
+        ['FieldAfter', 'DOB', failed],
+        ['FieldAfter', 'FirstName', failed],
+      ],
+      lists: [[DOB_FAILED], [DOB_FAILED, FIRST_NAME_FAILED]],
+    },
+    {
+      through: "another field's successful events",
+      steps: [
+        ['FieldAfter', 'DOB', failed],
+        ['FieldBefore', 'FirstName', applied],
+        ['FieldAfter', 'FirstName', applied],
+      ],
+      lists: [[DOB_FAILED]],
+    },
+    {
+      through: 'a successful FieldBefore of the same field',
+      steps: [
+        ['FieldAfter', 'DOB', failed],
+        ['FieldBefore', 'DOB', applied],
+      ],
+      lists: [[DOB_FAILED]],
+    },
+    {
+      through: 'an applied FieldAfter of the same field, which removes it',
+      steps: [
+        ['FieldAfter', 'DOB', failed],
+        ['FieldAfter', 'FirstName', failed],
+        ['FieldAfter', 'DOB', applied],
+      ],
+      lists: [[DOB_FAILED], [DOB_FAILED, FIRST_NAME_FAILED], [FIRST_NAME_FAILED]],
+    },
+    {
+      through: 'a failure of another kind on the same field, whose reason it shows until that kind is applied',
+      steps: [
+        ['FieldAfter', 'DOB', failed],
+        ['FieldBefore', 'DOB', unreadable],
+        ['FieldBefore', 'DOB', applied],
+        ['FieldAfter', 'DOB', applied],
+      ],
+      lists: [[DOB_FAILED], [DOB_UNREADABLE], [DOB_FAILED], []],
+    },
+    {
+      through: 'repeated failures of the same field, which keeps its place and shows the latest reason',
+      steps: [
+        ['FieldAfter', 'DOB', failed],
+        ['FieldAfter', 'FirstName', failed],
+        ['FieldAfter', 'DOB', unreadable],
+        ['FieldAfter', 'DOB', unreadable],
+      ],
+      lists: [[DOB_FAILED], [DOB_FAILED, FIRST_NAME_FAILED], [DOB_UNREADABLE, FIRST_NAME_FAILED]],
+    },
+  ])('lists a FieldAfter DOB failure through $through', async ({ steps, lists }) => {
+    const { harness, host, queue } = createQueue();
+
+    for (const [index, [kind, fieldName, response]] of steps.entries()) {
+      queue.raise(kind, fieldName);
+      await answer(harness, index, response());
+    }
+
+    expect(sentEvents(harness.api)).toEqual(steps.map(([event, fieldName]) => ({ event, fieldName })));
+    expect(host.onNotices.mock.calls.map(([messages]) => messages)).toEqual(lists);
+  });
+
+  it('clears every failure at reset(), reports the empty list once, and keeps the new generation silent', async () => {
+    const { harness, host, queue } = createQueue();
+
+    queue.raise('FieldAfter', 'DOB');
+    await answer(harness, 0, problem(500));
+    queue.reset();
+    queue.reset();
+    expect(host.onNotices.mock.calls.map(([messages]) => messages)).toEqual([[DOB_FAILED], []]);
+
+    // The record now open has no failure for its own FieldAfter DOB to resolve.
+    queue.raise('FieldAfter', 'DOB');
+    await answer(harness, 1, json(200, envelope()));
+    expect(host.onNotices).toHaveBeenCalledTimes(2);
   });
 
   // A request that never answers, an answer of the wrong shape and a host callback that
@@ -758,8 +925,8 @@ describe('createFieldEventQueue', () => {
 
     const next = await eventAt(api, 1);
     expect(stalled.signal.aborted).toBe(true);
-    expect(host.onNotice.mock.calls).toEqual([
-      ['Check code could not run for Last Name. The server did not answer in time.'],
+    expect(host.onNotices.mock.calls).toEqual([
+      [['Check code could not run for Last Name. The server did not answer in time.']],
     ]);
     expect(next).toMatchObject({ event: 'FieldAfter', fieldName: 'DOB' });
     expect(next.values).toMatchObject({ DOB: DOB_ENTERED, DateofInterview: INTERVIEW_DATE });
@@ -775,7 +942,7 @@ describe('createFieldEventQueue', () => {
     await answer(harness, 0, json(200, envelope({ assigned: { Age: 30 }, dialogs: [FEVER_DIALOG] })));
     expect(host.snapshot.values.Age).toBe(ASSIGNED_AGE);
     expect(host.onDialogs).not.toHaveBeenCalled();
-    expect(host.onNotice).toHaveBeenCalledTimes(1);
+    expect(host.onNotices).toHaveBeenCalledTimes(1);
     // The stalled request stopped counting as open when it was cancelled.
     expect(api.maxOpenEvents()).toBe(1);
   });
@@ -789,7 +956,7 @@ describe('createFieldEventQueue', () => {
     expect(stale.signal.aborted).toBe(true);
     await elapse(STALL_DEADLINE_MS * 2);
 
-    expect(host.onNotice).not.toHaveBeenCalled();
+    expect(host.onNotices).not.toHaveBeenCalled();
     expect(host.setSnapshot).not.toHaveBeenCalled();
     expect(queue.size).toBe(0);
     await expect(queue.drain()).resolves.toBeUndefined();
@@ -843,7 +1010,9 @@ describe('createFieldEventQueue', () => {
     });
     await answer(harness, 0, rawJson(text));
 
-    expect(host.onNotice.mock.calls).toEqual([["Check code could not run for Last Name. The server's answer could not be read."]]);
+    expect(host.onNotices.mock.calls).toEqual([
+      [["Check code could not run for Last Name. The server's answer could not be read."]],
+    ]);
     expect(host.setSnapshot).not.toHaveBeenCalled();
     expect(host.onDialogs).not.toHaveBeenCalled();
 
@@ -866,7 +1035,7 @@ describe('createFieldEventQueue', () => {
       json(200, envelope({ assigned: { Age: ASSIGNED_AGE }, diagnostics: [firstLine, GEOCODE_DIAGNOSTIC] })),
     );
 
-    expect(host.onNotice).not.toHaveBeenCalled();
+    expect(host.onNotices).not.toHaveBeenCalled();
     expect(host.snapshot.values.Age).toBe(ASSIGNED_AGE);
     expect(onDiagnostics.mock.calls).toEqual([[[firstLine, GEOCODE_DIAGNOSTIC]]]);
   });
@@ -883,7 +1052,7 @@ describe('createFieldEventQueue', () => {
       notice: 'Check code could not run for Last Name. Its effects could not be applied.',
     },
     {
-      callback: 'onNotice',
+      callback: 'onNotices',
       response: (): Response => rawJson('null'),
       notice: "Check code could not run for Last Name. The server's answer could not be read.",
     },
@@ -901,7 +1070,7 @@ describe('createFieldEventQueue', () => {
     });
     await answer(harness, 0, response());
 
-    expect(host.onNotice.mock.calls).toEqual([[notice]]);
+    expect(host.onNotices.mock.calls).toEqual([[[notice]]]);
     const next = await eventAt(harness.api, 1);
     expect(next).toMatchObject({ event: 'FieldBefore', fieldName: 'FirstName' });
     await answer(harness, 1, json(200, envelope({ assigned: { Age: ASSIGNED_AGE } })));
@@ -935,6 +1104,7 @@ interface EditorProps {
 async function mountEditor(harness: Harness) {
   const onSaved = vi.fn<(record: RecordDto) => void>();
   const onDeleted = vi.fn<() => void>();
+  const onConflict = vi.fn<() => void>();
   const onDiscardToNearest = vi.fn<(notice?: string) => void>();
   const view = renderHook(
     ({ record, recordGeneration }: EditorProps) =>
@@ -947,6 +1117,7 @@ async function mountEditor(harness: Harness) {
         recordGeneration,
         onSaved,
         onDeleted,
+        onConflict,
         onDiscardToNearest,
       }),
     { initialProps: { record: RECORD_A, recordGeneration: 1 } },
@@ -994,6 +1165,48 @@ describe('useRecordEditor field events', () => {
     expect(result.current.dirty.size).toBe(0);
   });
 
+  // EC-FEVER-01's `Fever = (-)` matches only `false`. A box the user never touched is `null`
+  // in the draft, on a new record and on a stored record whose bit column is NULL; it is
+  // shown unchecked and a new record's POST saves it as false, so every event sends false.
+  it.each<{ record: string; open: RecordDto | null }>([
+    { record: 'a new record', open: null },
+    { record: 'a stored record whose checkbox columns are NULL', open: RECORD_A },
+  ])('sends each untouched checkbox of $record as false, read-only ones included', async ({ open }) => {
+    const harness = createHarness(open === null ? [] : [open]);
+    const { result } = renderHook(() =>
+      useRecordEditor({
+        client: harness.client,
+        viewId: VIEW_ID,
+        definition,
+        record: open,
+        isNew: open === null,
+        recordGeneration: 1,
+        onSaved: vi.fn<(record: RecordDto) => void>(),
+        onDeleted: vi.fn<() => void>(),
+        onConflict: vi.fn<() => void>(),
+        onDiscardToNearest: vi.fn<(notice?: string) => void>(),
+      }),
+    );
+    await act(flush);
+    expect(CHECKBOX_NAMES.filter((name) => readOnlyFieldNames.includes(name))).toEqual(['Headache']);
+    expect(CHECKBOX_NAMES.map((name) => result.current.values[name])).toEqual(CHECKBOX_NAMES.map(() => null));
+
+    act(() => {
+      result.current.setValue('FeverTemp', 101);
+      result.current.onFieldBlur('FeverTemp');
+    });
+    const blur = await eventAt(harness.api, 0);
+    await answer(harness, 0, json(200, envelope()));
+
+    expect(blur).toMatchObject({ event: 'FieldAfter', fieldName: 'FeverTemp' });
+    expect(blur.values).toMatchObject({
+      FeverTemp: 101,
+      ...Object.fromEntries(CHECKBOX_NAMES.map((name) => [name, false])),
+    });
+    // Only the event's copy changes: the draft still holds null for each box.
+    expect(CHECKBOX_NAMES.map((name) => result.current.values[name])).toEqual(CHECKBOX_NAMES.map(() => null));
+  });
+
   // An answer the API writes with an exact number in `assigned`, beside every other kind of
   // effect: the client decodes the number exactly, the queue applies the whole answer, and
   // the save sends the number back as the same JSON token. 9007199254740993 is a bigint;
@@ -1019,7 +1232,7 @@ describe('useRecordEditor field events', () => {
       expect(result.current.values.FirstName).toBeNull();
       expect([...result.current.checkCodeDisabled]).toEqual(['LastName']);
       expect(result.current.dialogs).toEqual([FEVER_DIALOG]);
-      expect(result.current.eventNotice).toBeNull();
+      expect(result.current.eventNotices).toEqual([]);
       expect([...result.current.dirty].sort()).toEqual([PLAIN_NUMBER, 'FirstName'].sort());
 
       expect(await perform(() => result.current.save())).toBe(true);
@@ -1111,15 +1324,16 @@ describe('useRecordEditor field events', () => {
     expect(result.current.dirty.size).toBe(0);
   });
 
-  it('saves after a field event that failed with 500, showing its non-blocking notice until the save succeeds', async () => {
+  it('saves after a FieldAfter DOB that the save drained failed with 500, and keeps its notice after the save', async () => {
     const harness = createHarness([RECORD_A]);
     const { api } = harness;
     api.holdPuts();
     const { result, onSaved } = await mountEditor(harness);
+    const notice = `Check code could not run for DOB. An unexpected error occurred. Trace id: ${TRACE_ID}.`;
 
     act(() => {
-      result.current.setValue('LastName', 'Jones');
-      result.current.onFieldBlur('LastName');
+      result.current.setValue('DOB', DOB_ENTERED);
+      result.current.onFieldBlur('DOB');
     });
     await eventAt(api, 0);
     const saving = result.current.save();
@@ -1129,11 +1343,9 @@ describe('useRecordEditor field events', () => {
     // The failed event counts as drained, so the save goes ahead while the notice is shown.
     await answer(harness, 0, problem(500));
     const put = await putAt(api, 0);
-    expect(put.values).toEqual({ LastName: 'Jones' });
+    expect(put.values).toEqual({ DOB: DOB_ENTERED });
     expect(result.current.saving).toBe(true);
-    expect(result.current.eventNotice).toBe(
-      `Check code could not run for Last Name. An unexpected error occurred. Trace id: ${TRACE_ID}.`,
-    );
+    expect(result.current.eventNotices).toEqual([notice]);
     expect(result.current.banner).toBeNull();
 
     const saved = await perform(() => {
@@ -1142,14 +1354,14 @@ describe('useRecordEditor field events', () => {
     });
 
     expect(saved).toBe(true);
-    expect(api.puts()).toEqual([{ LastName: 'Jones' }]);
+    expect(api.puts()).toEqual([{ DOB: DOB_ENTERED }]);
     expect(onSaved).toHaveBeenCalledTimes(1);
-    // The server answered the save, so the notice of the earlier failure is gone.
-    expect(result.current.eventNotice).toBeNull();
+    // A save runs no check code: Age was not recalculated, and the notice still says so.
+    expect(result.current.eventNotices).toEqual([notice]);
     expect(result.current.banner).toBeNull();
   });
 
-  it('keeps the notice of an event that failed with 503 until Retry saves the record', async () => {
+  it('keeps the notice of an event that failed with 503 through a failed save and the Retry that saves the record', async () => {
     const harness = createHarness([RECORD_A]);
     const { api } = harness;
     api.holdPuts();
@@ -1162,7 +1374,7 @@ describe('useRecordEditor field events', () => {
       result.current.onFieldBlur('FirstName');
     });
     await answer(harness, 0, problem(503));
-    expect(result.current.eventNotice).toBe(notice);
+    expect(result.current.eventNotices).toEqual([notice]);
 
     // The database is still unreachable: the PUT writes nothing, so Retry is offered.
     const saving = result.current.save();
@@ -1177,7 +1389,7 @@ describe('useRecordEditor field events', () => {
       message: 'The database cannot be reached. Your changes are still on screen.',
       actions: ['retry'],
     });
-    expect(result.current.eventNotice).toBe(notice);
+    expect(result.current.eventNotices).toEqual([notice]);
     expect(onSaved).not.toHaveBeenCalled();
 
     // The database is back: Retry resends the same PUT, which succeeds.
@@ -1191,49 +1403,91 @@ describe('useRecordEditor field events', () => {
     expect(api.puts()).toEqual([{ FirstName: 'Anna' }, { FirstName: 'Anna' }]);
     expect(onSaved).toHaveBeenCalledTimes(1);
     expect(result.current.banner).toBeNull();
-    expect(result.current.eventNotice).toBeNull();
+    // The record is saved, but First Name's check code still has not run.
+    expect(result.current.eventNotices).toEqual([notice]);
     expect(result.current.values.FirstName).toBe('Anna');
     expect(result.current.dirty.size).toBe(0);
   });
 
-  it('clears a failure notice once a later event succeeds, although it was raised before the failure', async () => {
+  it("keeps a failure notice through raising and answering other events, until the field's own FieldAfter succeeds", async () => {
     const harness = createHarness();
     const { result } = await mountEditor(harness);
+    const notice = `Check code could not run for Last Name. An unexpected error occurred. Trace id: ${TRACE_ID}.`;
 
-    // Both events are raised before the first fails, so raising is not what clears the notice.
     act(() => {
       result.current.onFieldBlur('LastName');
-      result.current.onFieldFocus('FirstName');
     });
     await answer(harness, 0, problem(500));
-    expect(result.current.eventNotice).toBe(
-      `Check code could not run for Last Name. An unexpected error occurred. Trace id: ${TRACE_ID}.`,
-    );
+    const shown = result.current.eventNotices;
+    expect(shown).toEqual([notice]);
 
+    // QAFE-F03: raising FieldBefore on another field leaves the notice as it is, so the
+    // layout does not move while focus does.
+    act(() => {
+      result.current.onFieldFocus('FirstName');
+    });
+    expect(result.current.eventNotices).toBe(shown);
+    // UXFB-F13: neither another field's successful events nor the failed field's own
+    // FieldBefore resolve a FieldAfter failure.
     await answer(harness, 1, json(200, envelope()));
-    expect(result.current.eventNotice).toBeNull();
+    act(() => {
+      result.current.onFieldBlur('FirstName');
+      result.current.onFieldFocus('LastName');
+    });
+    await answer(harness, 2, json(200, envelope()));
+    await answer(harness, 3, json(200, envelope()));
+    expect(result.current.eventNotices).toBe(shown);
+
+    act(() => {
+      result.current.onFieldBlur('LastName');
+    });
+    await answer(harness, 4, json(200, envelope()));
+    expect(sentEvents(harness.api)).toEqual([
+      { event: 'FieldAfter', fieldName: 'LastName' },
+      { event: 'FieldBefore', fieldName: 'FirstName' },
+      { event: 'FieldAfter', fieldName: 'FirstName' },
+      { event: 'FieldBefore', fieldName: 'LastName' },
+      { event: 'FieldAfter', fieldName: 'LastName' },
+    ]);
+    expect(result.current.eventNotices).toEqual([]);
   });
 
-  it('keeps a failure notice on screen when the next event is answered 200 without the response envelope', async () => {
+  it('lists both failures, in order, when the next event is answered 200 without the response envelope', async () => {
     const harness = createHarness();
     const { result } = await mountEditor(harness);
+    const lastName =
+      'Check code could not run for Last Name. The database cannot be reached. Your changes are still on screen.';
 
     act(() => {
       result.current.onFieldBlur('LastName');
       result.current.onFieldFocus('FirstName');
     });
     await answer(harness, 0, problem(503));
-    expect(result.current.eventNotice).toBe(
-      'Check code could not run for Last Name. The database cannot be reached. Your changes are still on screen.',
-    );
+    expect(result.current.eventNotices).toEqual([lastName]);
 
     // An OK status alone is no success: the answer is unreadable, so it reports its own failure.
     await answer(harness, 1, rawJson('{"message":"Not available"}'));
-    expect(result.current.eventNotice).toBe(
+    expect(result.current.eventNotices).toEqual([
+      lastName,
       "Check code could not run for First Name. The server's answer could not be read.",
-    );
+    ]);
     expect(result.current.values).toEqual(RECORD_A.values);
     expect(result.current.dirty.size).toBe(0);
+  });
+
+  it('drops the notices of a record that was replaced', async () => {
+    const harness = createHarness();
+    const { result, rerender } = await mountEditor(harness);
+
+    act(() => {
+      result.current.onFieldBlur('LastName');
+    });
+    await answer(harness, 0, problem(500));
+    expect(result.current.eventNotices).toHaveLength(1);
+
+    rerender({ record: RECORD_B, recordGeneration: 2 });
+    await act(flush);
+    expect(result.current.eventNotices).toEqual([]);
   });
 
   it('keeps the notice of an event that failed while a save was in flight after that save succeeds', async () => {
@@ -1253,7 +1507,7 @@ describe('useRecordEditor field events', () => {
       result.current.onFieldFocus('FirstName');
     });
     await answer(harness, 0, problem(500));
-    expect(result.current.eventNotice).toBe(notice);
+    expect(result.current.eventNotices).toEqual([notice]);
 
     const saved = await perform(() => {
       put.save();
@@ -1264,7 +1518,7 @@ describe('useRecordEditor field events', () => {
     expect(api.puts()).toEqual([{ LastName: 'Jones' }]);
     expect(onSaved).toHaveBeenCalledTimes(1);
     // The event failed after the PUT was sent, so the save's success says nothing about it.
-    expect(result.current.eventNotice).toBe(notice);
+    expect(result.current.eventNotices).toEqual([notice]);
   });
 
   it('reports the save pending, with no request in flight, while it waits for an unanswered field event', async () => {
@@ -1346,7 +1600,7 @@ describe('useRecordEditor field events', () => {
     expect(result.current.dirty.size).toBe(0);
     expect(result.current.checkCodeDisabled.size).toBe(0);
     expect(result.current.dialogs).toEqual([]);
-    expect(result.current.eventNotice).toBeNull();
+    expect(result.current.eventNotices).toEqual([]);
   });
 
   it('appends the dialogs of each response, in order, for the form to show one at a time', async () => {
