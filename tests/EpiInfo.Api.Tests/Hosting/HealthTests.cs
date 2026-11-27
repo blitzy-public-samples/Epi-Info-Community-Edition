@@ -59,6 +59,10 @@ public sealed class HealthTests
     private const int PingFailedEventId = 1;
     private const int PingNotAnsweredEventId = 2;
 
+    // The 405 wire contract written out here rather than read from ApiProblems, so a changed product text fails.
+    private const string ProblemMediaType = "application/problem+json";
+    private const string ExpectedMethodNotAllowedDetail = "method not allowed";
+
     private const string CheckNameKey = "CheckName";
     private const string ExceptionTypeKey = "ExceptionType";
     private const string OperationKey = "Operation";
@@ -70,6 +74,25 @@ public sealed class HealthTests
     // The logger category of the framework's health-check service, which runs the check for the endpoint.
     private const string HealthCheckServiceCategory =
         "Microsoft.Extensions.Diagnostics.HealthChecks.DefaultHealthCheckService";
+
+    /// <summary>Each method sent to <c>/health</c>, with the client served from a folder and with it absent.</summary>
+    public static TheoryData<bool, string> HealthMethodCases
+    {
+        get
+        {
+            string[] methods = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"];
+            var data = new TheoryData<bool, string>();
+            foreach (bool clientServed in new[] { true, false })
+            {
+                foreach (string method in methods)
+                {
+                    data.Add(clientServed, method);
+                }
+            }
+
+            return data;
+        }
+    }
 
     // The real SQL Server store runs: the connection to port 1 fails, the store reports the database unavailable, and
     // the check answers Unhealthy without passing the exception on, so neither the body nor any log line carries the
@@ -125,6 +148,65 @@ public sealed class HealthTests
         await HealthResponses.AssertAsync(response, HttpStatusCode.OK, HealthResponses.Healthy);
         Assert.Equal(new FakeStoreCall(PingOperation, IsWrite: false), Assert.Single(store.Calls));
         Assert.DoesNotContain(factory.Logs.Entries, entry => entry.Category == HealthCheckCategory);
+    }
+
+    // GET is the one method /health maps, whether or not the client is served. Every other method, HEAD included, is
+    // the 405 ProblemDetails whose Allow lists GET alone, and the check never runs: the client fallback, which answers
+    // GET and HEAD, excludes the health path by its route, so it adds no method there. GET keeps the health body, never
+    // the client's index.html.
+    [Theory]
+    [MemberData(nameof(HealthMethodCases))]
+    public async Task HealthAllowsGetAloneWithOrWithoutTheClient(bool clientServed, string method)
+    {
+        string clientFolder = clientServed
+            ? Directory.CreateTempSubdirectory("epiinfo-health-client-").FullName
+            : Path.Combine(Path.GetTempPath(), "epiinfo-absent-client-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            if (clientServed)
+            {
+                await File.WriteAllTextAsync(
+                    Path.Combine(clientFolder, ClientAppHosting.IndexFileName),
+                    "<!doctype html><title>client</title>");
+            }
+
+            var store = new FakeDataStore();
+            await using var factory = new ApiFactory(ApiFactoryOptions.ForFake(store) with
+            {
+                ExtraSettings = new Dictionary<string, string?> { [ApiOptions.ClientPathKey] = clientFolder },
+            });
+            using HttpClient client = factory.CreateClient();
+            using var request = new HttpRequestMessage(new HttpMethod(method), HealthResponses.RequestPath);
+
+            using HttpResponseMessage response = await client.SendAsync(request);
+
+            if (method == HttpMethod.Get.Method)
+            {
+                await HealthResponses.AssertAsync(response, HttpStatusCode.OK, HealthResponses.Healthy);
+                return;
+            }
+
+            Assert.Equal(HttpStatusCode.MethodNotAllowed, response.StatusCode);
+            Assert.Equal(new[] { HttpMethod.Get.Method }, response.Content.Headers.Allow);
+            Assert.Empty(store.Calls);
+
+            // A HEAD response carries no body to read.
+            if (method != HttpMethod.Head.Method)
+            {
+                Assert.Equal(ProblemMediaType, response.Content.Headers.ContentType?.MediaType);
+                JsonElement problem = ApiTestClient.AssertProblemDetails(
+                    await ApiTestClient.ReadJsonElementAsync(response),
+                    (int)HttpStatusCode.MethodNotAllowed);
+                Assert.Equal(ExpectedMethodNotAllowedDetail, Text(problem.GetProperty("detail")));
+            }
+        }
+        finally
+        {
+            if (clientServed)
+            {
+                Directory.Delete(clientFolder, recursive: true);
+            }
+        }
     }
 
     // The published contract pins each status to its one body: the response is the HealthResponse component narrowed to

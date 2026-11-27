@@ -22,9 +22,11 @@ using Microsoft.AspNetCore.Hosting.Server.Features;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Http.Features;
 using Microsoft.AspNetCore.Routing;
+using Microsoft.AspNetCore.Routing.Matching;
 using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Logging;
 
 namespace EpiInfo.Api.Tests.Hosting;
@@ -73,8 +75,9 @@ internal enum GuardOrder
 /// Services: ProblemDetails customised by <see cref="ApiProblems.Customize"/>, <see cref="ApiExceptionHandler"/>,
 /// the API JSON settings, <see cref="RouteHandlerOptions.ThrowOnBadRequest"/> on, <see cref="ApiOptions"/> from
 /// configuration, the store as <see cref="IDataStore"/>, the real <see cref="CheckCodeEngine"/>,
-/// <see cref="TimeProvider.System"/>, <see cref="SaveStampProvider"/>, and the scoped <see cref="FormService"/>,
-/// <see cref="RecordService"/> and <see cref="FieldEventService"/>.
+/// <see cref="TimeProvider.System"/>, <see cref="SaveStampProvider"/>, the scoped <see cref="FormService"/>,
+/// <see cref="RecordService"/> and <see cref="FieldEventService"/>, and the routing policy
+/// <see cref="RouteConstraintMatcherPolicy"/>.
 /// </para>
 /// <para>
 /// Pipeline, in order, as the API's composition root builds it: <c>UseExceptionHandler</c>,
@@ -266,6 +269,7 @@ internal sealed class GuardPipelineHost : IAsyncDisposable
         services.AddScoped<FormService>();
         services.AddScoped<RecordService>();
         services.AddScoped<FieldEventService>();
+        services.TryAddEnumerable(ServiceDescriptor.Singleton<MatcherPolicy, RouteConstraintMatcherPolicy>());
 
         WebApplication app = builder.Build();
         app.UseExceptionHandler();
@@ -474,7 +478,8 @@ public sealed class MediaTypeFixture : IAsyncLifetime
 /// missing <c>Content-Type</c>, <c>+json</c> types, another or empty charset, and any extra or repeated parameter is
 /// the fixed 415 ProblemDetails, with or without a body and ahead of the empty-body 400, and nothing is written.
 /// Malformed JSON and an empty body are two distinct request-level 400s. Outside the body endpoints a route miss
-/// stays 404 and a method mismatch 405.
+/// stays 404 and a method mismatch 405, and a form id the <c>int</c> constraint rejects is the route miss whatever
+/// the method or media type.
 /// </para>
 /// <para>
 /// Every body-endpoint case runs on the API's own composition root through <see cref="KestrelApiFactory"/>, where the
@@ -612,6 +617,62 @@ public sealed class MediaTypeTests : IClassFixture<MediaTypeFixture>
             {
                 data.Add(endpoint, BodyShape.Malformed);
                 data.Add(endpoint, BodyShape.Empty);
+            }
+
+            return data;
+        }
+    }
+
+    /// <summary>
+    /// Each form, record and field-event route with a form id the <c>int</c> constraint rejects, under every media type
+    /// that decides a matched route's status, and each body route with an integer form id that names no form.
+    /// Formats take the form id as <c>{0}</c> and the seeded record id as <c>{1}</c>.
+    /// </summary>
+    public static TheoryData<string, string, string?, HttpStatusCode, string> FormIdConstraintCases
+    {
+        get
+        {
+            (string Method, string PathFormat)[] nonIntegerFormIdRoutes =
+            [
+                ("POST", "/api/forms/abc/records/search"),
+                ("POST", "/api/forms/abc/records"),
+                ("PUT", "/api/forms/abc/records/{1}"),
+                ("POST", "/api/forms/abc/checkcode/field-event"),
+                ("POST", "/api/forms/1.5/records/search"),
+                ("POST", "/api/forms/99999999999/records/search"),
+                ("PATCH", "/api/forms/abc/records/{1}"),
+                ("POST", "/api/forms/abc"),
+                ("POST", "/api/forms/abc/records/count"),
+                ("POST", "/api/forms/abc/records/search/"),
+                ("POST", "/API/Forms/abc/Records/Search"),
+                ("PATCH", "/api/forms/abc/records/{1}/"),
+            ];
+            string?[] mediaTypes = ["text/plain", "application/merge-patch+json", null, JsonMediaType];
+
+            var data = new TheoryData<string, string, string?, HttpStatusCode, string>();
+            foreach ((string method, string pathFormat) in nonIntegerFormIdRoutes)
+            {
+                foreach (string? mediaType in mediaTypes)
+                {
+                    data.Add(method, pathFormat, mediaType, HttpStatusCode.NotFound, ExpectedResourceNotFoundDetail);
+                }
+            }
+
+            (string Method, string PathFormat)[] unknownIntegerFormIdRoutes =
+            [
+                ("POST", "/api/forms/-1/records/search"),
+                ("POST", "/api/forms/-1/records"),
+                ("PUT", "/api/forms/-1/records/{1}"),
+                ("POST", "/api/forms/-1/checkcode/field-event"),
+            ];
+            foreach ((string method, string pathFormat) in unknownIntegerFormIdRoutes)
+            {
+                data.Add(
+                    method,
+                    pathFormat,
+                    "text/plain",
+                    HttpStatusCode.UnsupportedMediaType,
+                    ExpectedUnsupportedMediaTypeDetail);
             }
 
             return data;
@@ -778,6 +839,37 @@ public sealed class MediaTypeTests : IClassFixture<MediaTypeFixture>
         using HttpResponseMessage response = await Client.SendAsync(request);
 
         await AssertProblemAsync(response, expected, expectedDetail);
+    }
+
+    // AAP 0.3.4.1 and 0.3.4.7: a form id the int constraint rejects matches no route, so it is the route miss 404
+    // whatever the method or media type, never the 405 or 415 that routing's method and media-type checks give a
+    // matched route. An integer form id satisfies the constraint even when no form has it, so the body routes still
+    // answer their 415 first. The body is valid JSON for a create, so only routing can turn it away, and nothing is
+    // written.
+    [Theory]
+    [MemberData(nameof(FormIdConstraintCases))]
+    public async Task FormIdConstraintDecidesBeforeTheMethodAndMediaType(
+        string method,
+        string pathFormat,
+        string? contentType,
+        HttpStatusCode expected,
+        string expectedDetail)
+    {
+        FakeRecordState seeded = SeededRecord();
+        int writesBefore = _fixture.Store.WriteCalls.Count;
+        string path = string.Format(
+            CultureInfo.InvariantCulture,
+            pathFormat,
+            _fixture.ViewId,
+            Uri.EscapeDataString(_fixture.RecordId));
+        byte[] body = Encoding.UTF8.GetBytes(ValidBody(BodyEndpoint.Create, TestDatabase.NewMarker()));
+
+        using HttpRequestMessage request = CreateRequest(new HttpMethod(method), path, body, contentType);
+        using HttpResponseMessage response = await Client.SendAsync(request);
+
+        await AssertProblemAsync(response, expected, expectedDetail);
+        Assert.Equal(writesBefore, _fixture.Store.WriteCalls.Count);
+        AssertSeededRecordUnchanged(seeded);
     }
 
     // AAP 0.3.4.7: the guard acts only on an endpoint that carries JsonBodyMetadata. The probes differ in that marker

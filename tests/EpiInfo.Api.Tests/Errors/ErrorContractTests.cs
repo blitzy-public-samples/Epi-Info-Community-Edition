@@ -286,6 +286,46 @@ public sealed class ErrorContractTests
     }
 
     /// <summary>
+    /// Paths holding an empty segment, with the client served, in each environment: a missing file after one, the health
+    /// path followed by one, and, beside them, a top-level missing file, each under every method, which are the route
+    /// miss; and client routes after one, which keep the <c>index.html</c> fallback for GET and its 405 for any other
+    /// method.
+    /// </summary>
+    public static TheoryData<string, string, string, HttpStatusCode> EmptySegmentPathCases
+    {
+        get
+        {
+            string[] missPaths = ["/health//", "/client//missing.js", "/missing.js"];
+            string[] missMethods = ["POST", "PUT", "GET", "HEAD"];
+            (string Method, string Path, HttpStatusCode Expected)[] clientRoutes =
+            [
+                ("GET", "/client//route", HttpStatusCode.OK),
+                ("GET", "/health//x", HttpStatusCode.OK),
+                ("POST", "/client//route", HttpStatusCode.MethodNotAllowed),
+            ];
+
+            var data = new TheoryData<string, string, string, HttpStatusCode>();
+            foreach (string environment in EnvironmentNames)
+            {
+                foreach (string path in missPaths)
+                {
+                    foreach (string method in missMethods)
+                    {
+                        data.Add(environment, method, path, HttpStatusCode.NotFound);
+                    }
+                }
+
+                foreach ((string method, string path, HttpStatusCode expected) in clientRoutes)
+                {
+                    data.Add(environment, method, path, expected);
+                }
+            }
+
+            return data;
+        }
+    }
+
+    /// <summary>
     /// The generic 500 results, <see cref="ApiProblems.Unexpected"/> (<see langword="null"/> outcome) and
     /// <see cref="ApiProblems.UnexpectedWrite"/> for each outcome, written with and without a current activity.
     /// </summary>
@@ -499,6 +539,81 @@ public sealed class ErrorContractTests
             Assert.True(
                 allow.Contains(HttpMethods.Get) && allow.Contains(HttpMethods.Head),
                 "The 405 lost the Allow header listing GET and HEAD.");
+        }
+        finally
+        {
+            clientFolder.Delete(recursive: true);
+        }
+    }
+
+    // AAP 0.3.4.7 and 0.3.4.2: with the client served, routing captures an empty segment's route values as it always
+    // does, and the client route's rule decides them before the method check. A missing file after an empty segment, or
+    // the health path followed by one, is the route miss 404 whatever the method, never a 405 that borrows the
+    // fallback's GET and HEAD; a client route after one keeps index.html for GET and the 405 listing GET and HEAD for
+    // any other method.
+    [Theory]
+    [MemberData(nameof(EmptySegmentPathCases))]
+    public async Task EmptySegmentPathsKeepTheRouteMissAndTheClientFallback(
+        string environment,
+        string method,
+        string path,
+        HttpStatusCode expected)
+    {
+        const string IndexDocument = "<!doctype html><title>client</title>";
+        DirectoryInfo clientFolder = Directory.CreateTempSubdirectory("epiinfo-error-contract-");
+        try
+        {
+            await File.WriteAllTextAsync(
+                Path.Combine(clientFolder.FullName, ClientAppHosting.IndexFileName),
+                IndexDocument);
+
+            await using ApiFactory factory = CreateFactory(environment, clientFolder.FullName);
+            using HttpClient client = factory.CreateClient();
+            using var request = new HttpRequestMessage(new HttpMethod(method), path);
+
+            using HttpResponseMessage response = await client.SendAsync(request);
+
+            switch (expected)
+            {
+                case HttpStatusCode.OK:
+                    Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+                    Assert.Equal("text/html", response.Content.Headers.ContentType?.MediaType);
+                    string document = await response.Content.ReadAsStringAsync();
+                    Assert.True(
+                        string.Equals(IndexDocument, document, StringComparison.Ordinal),
+                        "The client route did not answer with the client's index.html.");
+                    break;
+
+                case HttpStatusCode.MethodNotAllowed:
+                    await AssertFixedProblemAsync(
+                        response,
+                        HttpStatusCode.MethodNotAllowed,
+                        MethodNotAllowedType,
+                        "Method Not Allowed",
+                        ExpectedMethodNotAllowedDetail);
+                    Assert.Equal(
+                        new[] { HttpMethods.Get, HttpMethods.Head },
+                        response.Content.Headers.Allow.Order(StringComparer.Ordinal));
+                    break;
+
+                // A HEAD response carries no body to read.
+                case HttpStatusCode.NotFound when method == HttpMethods.Head:
+                    Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+                    break;
+
+                case HttpStatusCode.NotFound:
+                    await AssertFixedProblemAsync(
+                        response,
+                        HttpStatusCode.NotFound,
+                        NotFoundType,
+                        "Not Found",
+                        ExpectedResourceNotFoundDetail);
+                    break;
+
+                default:
+                    Assert.Fail("The case expects a status this test does not check.");
+                    break;
+            }
         }
         finally
         {

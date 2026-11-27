@@ -215,11 +215,11 @@ public static partial class ClientAppHosting
     }
 
     // Built the way MapFallbackToFile builds its endpoint, except for the route. Its single "{*path:nonfile}" pattern
-    // with a GET/HEAD restriction would sit in the route-table node of every path, /api/** included, and the
-    // HTTP-method policy gives such a node a 405 endpoint before any constraint runs, so a POST to /api/unknown would
-    // be a 405 instead of the 404 an unknown API route must return. The route table only prunes a route from the
-    // api and openapi nodes through a required simple parameter, never through a catch-all or an optional
-    // parameter, so client routes take two endpoints: the root, and a required first segment plus a catch-all rest.
+    // with a GET/HEAD restriction would sit in the route-table node of every path, /api/** included, and nonfile
+    // accepts api/unknown, so the HTTP-method policy would answer a POST to /api/unknown with a 405 instead of the 404
+    // an unknown API route must return. The route table only prunes a route from the api and openapi nodes through a
+    // required simple parameter, never through a catch-all or an optional parameter, so client routes take two
+    // endpoints: the root, and a required first segment plus a catch-all rest.
     private static void MapClientFallback(WebApplication app, StaticFileOptions staticOptions)
     {
         RequestDelegate serveIndex = BuildServeIndex(app, staticOptions);
@@ -301,7 +301,9 @@ public static partial class ClientAppHosting
 
         // Asked for each literal first segment of the other routes, such as api, health and openapi. Returning false
         // keeps the fallback out of that literal's whole subtree in the route table. /health is left to Match,
-        // because the health literal also begins client routes such as /health/x.
+        // because the health literal also begins client routes such as /health/x. The API's
+        // RouteConstraintMatcherPolicy runs Match before the HTTP-method policy, so the fallback's GET and HEAD never
+        // join the methods /health allows.
         public bool MatchesLiteral(string parameterName, string literal) => !IsServerPrefix(literal);
 
         private static string ReadValue(RouteValueDictionary values, string key) =>
