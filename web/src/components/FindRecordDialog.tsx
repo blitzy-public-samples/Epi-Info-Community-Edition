@@ -101,6 +101,9 @@ const SEARCHING = 'Searching…';
 const SEARCHING_OVER_RESULTS = 'Searching… The results below are from the previous search.';
 const STALE_RESULTS = 'These results are for the previous criteria; Search updates them.';
 const NO_MATCHES = 'No records match.';
+// Name of the scrolling region around the results table, whose own name is its caption.
+// It holds none of the toolbar's and navigator's names, which Playwright matches by substring.
+const RESULTS_REGION_LABEL = 'Search results';
 
 // The data-field types SearchCriteriaParser accepts. Labels, groups and unsupported
 // fields (Yes/No, grids, relates, command buttons, …) hold no searchable value.
@@ -898,7 +901,13 @@ export function FindRecordDialog({
           {statusText}
         </p>
         {items.length > 0 && (
-          <div className={actionable ? 'find-dialog__results' : 'find-dialog__results find-dialog__results--stale'}>
+          // A named, focusable region, so a keyboard can scroll the results sideways.
+          <div
+            className={actionable ? 'find-dialog__results' : 'find-dialog__results find-dialog__results--stale'}
+            role="region"
+            aria-label={RESULTS_REGION_LABEL}
+            tabIndex={0}
+          >
             <table aria-busy={loading}>
               <caption className="visually-hidden">Matching records</caption>
               <thead>
@@ -943,11 +952,15 @@ export function FindRecordDialog({
                         </button>
                         {deleted && <span> (deleted)</span>}
                       </td>
-                      {columns.map((column) => (
-                        <td key={column}>
-                          {cellText(Object.hasOwn(item.values, column) ? item.values[column] : undefined)}
-                        </td>
-                      ))}
+                      {columns.map((column) => {
+                        const text = cellText(Object.hasOwn(item.values, column) ? item.values[column] : undefined);
+                        // The title holds the full value, which the column may cut short.
+                        return (
+                          <td key={column} title={text === '' ? undefined : text}>
+                            {text}
+                          </td>
+                        );
+                      })}
                     </tr>
                   );
                 })}

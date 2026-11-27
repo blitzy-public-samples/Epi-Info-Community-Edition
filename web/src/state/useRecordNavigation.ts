@@ -27,6 +27,19 @@ export interface UseRecordNavigationOptions {
   /** 1-based position opened on load; absent, or not a positive integer, opens the first record. */
   readonly initialPosition?: number;
   /**
+   * The initial position as the user wrote it, such as the `record` URL parameter. When the
+   * load cannot open it as asked, its notice names it and says what opened instead: the
+   * first record for text that is not a record number, the last for a position past the
+   * end, New on an empty set. Absent, the notice names `initialPosition`, and with neither
+   * the first record opens with no notice.
+   */
+  readonly initialPositionText?: string;
+  /**
+   * The deleted toggle as the form loads: `true` starts it on, so the first count, record
+   * and list read every record; absent starts it off. A later toggle change replaces it.
+   */
+  readonly initialIncludeDeleted?: boolean;
+  /**
    * The editor's leave(): drains pending field events and saves a dirty draft. A user
    * transition awaits it first and is cancelled, with no request, when it resolves `false`.
    */
@@ -148,6 +161,11 @@ const INITIAL_STATE: NavigationState = {
   loadError: null,
 };
 
+/** The state a form starts in: nothing open, with the deleted toggle as `options` asks. */
+function initialStateOf(options: UseRecordNavigationOptions): NavigationState {
+  return { ...INITIAL_STATE, includeDeleted: options.initialIncludeDeleted === true };
+}
+
 /** Legacy SharedStrings.NEW_RECORD. */
 const NEW_RECORD_TEXT = 'New record';
 const NO_RECORDS_TO_GO_TO = 'There are no records to go to.';
@@ -155,6 +173,30 @@ const NO_RECORDS_TO_GO_TO = 'There are no records to go to.';
 function goToRange(count: number): string {
   return `Enter a record number from 1 to ${count}.`;
 }
+
+/**
+ * The notice of an initial position that is not a record number, `asked` as written: the
+ * first record opens instead, or New on an empty set.
+ */
+function notARecordNumber(asked: string, empty: boolean): string {
+  const problem = asked.trim() === '' ? 'The record number is blank' : `'${asked}' is not a record number`;
+  return empty
+    ? `${problem}, and there are no records to show, so a new record is shown.`
+    : `${problem}, so the first record is shown.`;
+}
+
+/**
+ * The notice of an initial position past the end of the set, `asked` as written: the last
+ * record, `landing`, opens instead, or New (`null`) on an empty set.
+ */
+function noSuchRecord(asked: string, landing: number | null): string {
+  return landing === null
+    ? `There is no record ${asked}; there are no records to show, so a new record is shown.`
+    : `There is no record ${asked}; showing the last record, ${landing}.`;
+}
+
+/** A recovery's notice naming where it landed: a position of the set, or `null` for New on an empty set. */
+type LandingNotice = (landing: number | null) => string;
 
 type Move = 'first' | 'previous' | 'next' | 'last';
 
@@ -492,9 +534,16 @@ function createController(host: ControllerHost): Controller {
    * Opens the record at `position`; n is the requested position. A 404 shows "This
    * record no longer exists." and opens the record nearest to `position` once: when
    * `recovering` is set this already is that attempt, and a second 404 installs New
-   * instead of looping.
+   * instead of looping. `landed`, when given, replaces that notice once the recovery
+   * knows where it lands.
    */
-  async function openAt(load: Load, position: number, set: SetView, recovering: boolean): Promise<boolean> {
+  async function openAt(
+    load: Load,
+    position: number,
+    set: SetView,
+    recovering: boolean,
+    landed?: LandingNotice,
+  ): Promise<boolean> {
     const result = await settle(readAt(load, position, set.includeDeleted));
     if (!isCurrent(load)) {
       return false;
@@ -515,17 +564,23 @@ function createController(host: ControllerHost): Controller {
       installNew(set, errorMessages.notFound);
       return false;
     }
-    await openNearestTo(position, set.includeDeleted, errorMessages.notFound, true);
+    await openNearestTo(position, set.includeDeleted, errorMessages.notFound, true, landed);
     return false;
   }
 
-  /** Opens `position`, or installs New when the set is empty. */
-  function openOrNew(load: Load, position: number, set: SetView, recovering: boolean): Promise<boolean> {
+  /** Opens `position`, or installs New when the set is empty; `landed` as for openAt. */
+  function openOrNew(
+    load: Load,
+    position: number,
+    set: SetView,
+    recovering: boolean,
+    landed?: LandingNotice,
+  ): Promise<boolean> {
     if (set.count === 0) {
       installNew(set);
       return Promise.resolve(false);
     }
-    return openAt(load, position, set, recovering);
+    return openAt(load, position, set, recovering, landed);
   }
 
   /** Handles a failed read of a record by id or of its position: a 404 recovers once. */
@@ -540,13 +595,15 @@ function createController(host: ControllerHost): Controller {
   /**
    * Re-reads N and opens the record nearest to `anchor`, or New on an empty set: the
    * landing after a 404 on open, a delete or discarded edits. The list may have changed,
-   * so the grid reloads.
+   * so the grid reloads. `notice` shows at once; `landed`, when given, replaces it once N
+   * is read, naming the position the recovery lands on.
    */
   function openNearestTo(
     anchor: number,
     includeDeleted: boolean,
     notice: string | null,
     recovering: boolean,
+    landed?: LandingNotice,
   ): Promise<boolean> {
     const listVersion = host.state().listVersion + 1;
     host.update(notice === null ? { listVersion } : { listVersion, notice });
@@ -554,19 +611,53 @@ function createController(host: ControllerHost): Controller {
       // The record still shown may have been edited since a failure, so Retry leaves it first.
       const load = begin(() => guarded(run));
       const set = await readSet(load, includeDeleted);
-      return set === null ? false : openOrNew(load, nearest(anchor, set.count), set, recovering);
+      if (set === null) {
+        return false;
+      }
+      const landing = nearest(anchor, set.count);
+      if (landed !== undefined) {
+        host.update({ notice: landed(set.count === 0 ? null : landing) });
+      }
+      return openOrNew(load, landing, set, recovering);
     };
     return run();
   }
 
-  /** Mount and form change: N, then the initial position, or New on an empty form. No leave. */
+  /**
+   * Mount and form change: N, then the initial position, or New on an empty form. No leave.
+   * A position that cannot be opened as asked gets a notice naming it as written
+   * (`initialPositionText`) and saying what opened instead; a position past the end says
+   * so once the 404 of its `at` read has been recovered from, which tells where it landed.
+   */
   function loadInitial(includeDeleted: boolean): Promise<boolean> {
-    const requested = host.options().initialPosition;
-    const position = requested !== undefined && Number.isInteger(requested) && requested >= 1 ? requested : 1;
+    const { initialPosition: requested, initialPositionText } = host.options();
+    const valid = requested !== undefined && Number.isInteger(requested) && requested >= 1;
+    const position = valid ? requested : 1;
+    // What a notice names: the position as written, else as given; with neither, there is no notice.
+    const asked = initialPositionText ?? (requested === undefined ? undefined : String(requested));
     const run = async (): Promise<boolean> => {
       const load = begin(run);
       const set = await readSet(load, includeDeleted);
-      return set === null ? false : openOrNew(load, position, set, false);
+      if (set === null) {
+        return false;
+      }
+      if (asked === undefined) {
+        return openOrNew(load, position, set, false);
+      }
+      if (!valid) {
+        host.update({ notice: notARecordNumber(asked, set.count === 0) });
+        return openOrNew(load, position, set, false);
+      }
+      if (set.count === 0) {
+        host.update({ notice: noSuchRecord(asked, null) });
+      }
+      // A landing short of the position asked for is the last record. One at it means the
+      // record there went away after N was read, which the 404 notice alone describes.
+      return openOrNew(load, position, set, false, (landing) =>
+        landing !== null && landing >= position
+          ? errorMessages.notFound
+          : `${errorMessages.notFound} ${noSuchRecord(asked, landing)}`,
+      );
     };
     return run();
   }
@@ -938,7 +1029,11 @@ function createController(host: ControllerHost): Controller {
       if (activeViewId !== null && activeViewId !== id) {
         const { recordGeneration, listVersion } = host.state();
         countStale = false;
-        host.update({ ...INITIAL_STATE, recordGeneration: recordGeneration + 1, listVersion: listVersion + 1 });
+        host.update({
+          ...initialStateOf(host.options()),
+          recordGeneration: recordGeneration + 1,
+          listVersion: listVersion + 1,
+        });
       } else if (host.state().transitioning) {
         // deactivate dropped every operation in flight, the one that owned the flag among them.
         host.update({ transitioning: false });
@@ -1008,7 +1103,7 @@ export function useRecordNavigation(options: UseRecordNavigationOptions): Record
     optionsRef.current = options;
   });
 
-  const [state, setState] = useState<NavigationState>(INITIAL_STATE);
+  const [state, setState] = useState<NavigationState>(() => initialStateOf(options));
   // Async transitions read the latest state between renders, so every update lands in
   // the ref synchronously and is rendered from there.
   const stateRef = useRef(state);

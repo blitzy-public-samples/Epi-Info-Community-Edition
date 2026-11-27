@@ -794,7 +794,7 @@ public sealed class FakeDataStoreFindTests
             Form,
             partial,
             new Dictionary<string, FieldValue> { [NotesField] = FieldValue.FromText("filled") },
-            stamp,
+            () => stamp,
             _ => RecordValidationResult.Success(new Dictionary<string, FieldValue>()),
             permissions: null,
             CancellationToken.None);
@@ -806,9 +806,10 @@ public sealed class FakeDataStoreFindTests
         Assert.Equal(stamp, state.LastSave);
         Assert.Equal(new[] { partial, inserted.GlobalRecordId }, await SearchIdsAsync(store, criteria));
 
+        var deleted = await store.SoftDeleteAsync(Form, inserted.GlobalRecordId, () => stamp, CancellationToken.None);
         Assert.Equal(
-            SoftDeleteResult.Deleted,
-            await store.SoftDeleteAsync(Form, inserted.GlobalRecordId, stamp, CancellationToken.None));
+            (SoftDeleteStatus.Deleted, inserted.GlobalRecordId),
+            (deleted.Status, deleted.GlobalRecordId));
         Assert.Equal(new[] { partial }, await SearchIdsAsync(store, criteria));
         var all = await store.ListAsync(
             Form, RecordListQuery.Default with { IncludeDeleted = true }, CancellationToken.None);
@@ -894,7 +895,7 @@ public sealed class FakeDataStoreFindTests
                 form.Metadata,
                 id,
                 values,
-                stamp,
+                () => stamp,
                 _ => RecordValidationResult.Success(new Dictionary<string, FieldValue>()),
                 permissions: null,
                 CancellationToken.None)

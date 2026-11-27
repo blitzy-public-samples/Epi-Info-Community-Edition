@@ -27,6 +27,7 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { sameFieldValue, type ApiClient, type ApiResult } from '../api/client';
 import {
   describeError,
+  describeUncertainWrite,
   errorMessages,
   isSafeToResend,
   networkError,
@@ -72,7 +73,8 @@ export type EditorBannerKind =
 
 /**
  * A failed write as the form shows it. The text is fixed, or the server's own fixed
- * request-level `detail`; it never holds a field value.
+ * request-level `detail`; it never holds a field value. A 413's text may name a field by
+ * its prompt, which is form metadata.
  *
  * `error`, `method` and `isCreate` go beyond the banner text so that `unavailable` and
  * `uncertainWrite` can be rendered by ConnectionError, which takes the failed request.
@@ -132,9 +134,23 @@ export interface RecordEditor {
   /** A save or delete is in flight. */
   readonly saving: boolean;
   /**
+   * A write of the draft may already have been applied, so every save but Save again is
+   * refused, and so is every move that must first save the draft, until a write of it
+   * succeeds. A refused save shows that write's banner again.
+   */
+  readonly saveBlocked: boolean;
+  /**
+   * The last save of the draft succeeded and left nothing unsaved: Save, a save on leave,
+   * Retry or Save again. It holds until the next edit, write, delete or discard, and is kept
+   * on the record that a leave's save made way for, so a move that saved first confirms it.
+   */
+  readonly saved: boolean;
+  /**
    * A save is under way: one started by save(), saveAgain() or a Retry of a POST or PUT,
    * from its start, through the field-event drain and client validation, until its write
-   * settles. A delete is not a save.
+   * settles; and a leave() of a draft with unsaved edits, from the start of its drain, since
+   * it saves the draft once the drain ends, unless a write of unknown outcome refuses that
+   * save. A delete is not a save.
    */
   readonly savePending: boolean;
   /** The record was found deleted (409) or was just deleted; every field is protected. */
@@ -226,6 +242,16 @@ interface EditorState {
   readonly eventNotice: string | null;
   /** leave() is running: the draft is frozen until it resolves. */
   readonly leaving: boolean;
+  /**
+   * A POST or PUT of the draft may already have been applied. Kept in step with the
+   * controller's uncertain write, which holds the write itself, so a render can show it.
+   */
+  readonly uncertain: boolean;
+  /**
+   * The last write of the draft succeeded, and no edit, write, delete or discard has
+   * followed. Kept across the record change that a leave's save made way for.
+   */
+  readonly saved: boolean;
 }
 
 interface FieldIndex {
@@ -260,10 +286,6 @@ interface FailedWrite {
   readonly error: ApiError;
 }
 
-const UNCERTAIN_WRITE_MESSAGE =
-  'The save may already have been applied, and the record list cannot prove whether it was. ' +
-  'Your changes are still on screen.';
-const DUPLICATE_RISK_MESSAGE = ' Saving again may create a duplicate record.';
 const DELETE_UNAVAILABLE_MESSAGE = 'The delete could not be confirmed: the database cannot be reached.';
 const DELETE_NETWORK_MESSAGE = 'The delete could not be confirmed: the server could not be reached.';
 
@@ -378,6 +400,21 @@ function requiredErrors(definition: FormDefinition, write: RecordWrite): FieldEr
   return Object.fromEntries(Object.entries(errors).filter(([name]) => Object.hasOwn(write.values, name)));
 }
 
+/**
+ * Whether `value`, a normalised entry of `field`, is the value of the record the draft
+ * edits as the server last returned it: the loaded record, or the DTO a save installed;
+ * `null` on New. A checkbox compares its checked state only, so `null` and `false` are
+ * alike, as an unchecked box is no value in isEmptyNewDraft.
+ */
+function isRecordValue(state: EditorState, field: FieldDefinition, value: FieldValue): boolean {
+  const stored = state.record === null ? null : normalizeValue(field, ownValue(state.record.values, field.name));
+  if (field.fieldType === 'checkbox') {
+    return (value === true) === (stored === true);
+  }
+  // sameFieldValue: a bigint compares by value and an exact decimal by its literal.
+  return sameFieldValue(value, stored);
+}
+
 function hasWritableDirty(state: EditorState, index: FieldIndex): boolean {
   for (const name of state.dirty) {
     const field = index.byName.get(name);
@@ -425,6 +462,8 @@ function freshDraft(index: FieldIndex, record: RecordDto | null, isNew: boolean,
     dialogs: [],
     eventNotice: null,
     leaving: false,
+    uncertain: false,
+    saved: false,
   };
 }
 
@@ -461,11 +500,64 @@ function makeBanner(
 }
 
 /**
+ * The label a 413 banner names a field by: the prompt, or the name when the prompt is blank,
+ * of the field whose text takes the most bytes in `values` as the JSON body sends it; `null`
+ * when `values` holds no text. Only metadata reaches the banner, never a value.
+ */
+function largestTextLabel(index: FieldIndex, values: Values): string | null {
+  const encoder = new TextEncoder();
+  let largest: { readonly name: string; readonly size: number } | null = null;
+  for (const [name, value] of Object.entries(values)) {
+    if (typeof value !== 'string') {
+      continue;
+    }
+    const size = encoder.encode(JSON.stringify(value)).length;
+    if (largest === null || size > largest.size) {
+      largest = { name, size };
+    }
+  }
+  if (largest === null) {
+    return null;
+  }
+  const prompt = index.byName.get(largest.name)?.prompt?.trim() ?? '';
+  return prompt === '' ? largest.name : prompt;
+}
+
+/**
  * The banner of a failed POST or PUT (a field-level 400 shows its messages instead). A 500,
  * 503 or lost response offers Retry only when the server reported `notWritten`; every
  * other outcome may mean the save was applied, so it offers Save again only.
+ * @param leaving The failed save was leaving the record, which a failed save cancels, so
+ *   the text says so; a Retry or Save again that then succeeds does not resume the move.
  */
-function saveFailureBanner(error: ApiError, method: 'POST' | 'PUT'): EditorBanner {
+function saveFailureBanner(error: ApiError, write: RecordWrite, index: FieldIndex, leaving: boolean): EditorBanner {
+  const banner = failedSaveBanner(error, write, index);
+  return leaving ? { ...banner, message: banner.message + leaveCancelledSuffix(banner.kind) } : banner;
+}
+
+/**
+ * What a save failure's text adds when the save was leaving the record: that leaving was
+ * cancelled, and that the draft is kept where the text does not already say so. A 409's
+ * edits were not saved and can no longer be, so its text adds only the first.
+ */
+function leaveCancelledSuffix(kind: EditorBannerKind): string {
+  switch (kind) {
+    case 'badRequest':
+    case 'forbidden':
+    case 'notFound':
+      return ` ${errorMessages.leaveCancelled} ${errorMessages.draftKept}`;
+    case 'deleted':
+    case 'tooLarge':
+    case 'server':
+    case 'unavailable':
+    case 'uncertainWrite':
+      return ` ${errorMessages.leaveCancelled}`;
+  }
+}
+
+/** saveFailureBanner's banner of a save that was not leaving the record. */
+function failedSaveBanner(error: ApiError, write: RecordWrite, index: FieldIndex): EditorBanner {
+  const { method } = write;
   const action: ErrorAction = method === 'POST' ? 'create' : 'update';
   switch (error.kind) {
     case 'validation':
@@ -478,24 +570,28 @@ function saveFailureBanner(error: ApiError, method: 'POST' | 'PUT'): EditorBanne
     case 'notFound':
       return makeBanner('notFound', errorMessages.notFound, error, method, ['discardEdits']);
     case 'conflict':
-      return makeBanner('deleted', errorMessages.conflict, error, method, []);
+      return makeBanner('deleted', errorMessages.saveConflict, error, method, []);
     case 'tooLarge':
-      return makeBanner('tooLarge', errorMessages.tooLarge, error, method, []);
+      return makeBanner(
+        'tooLarge',
+        errorMessages.saveTooLarge(largestTextLabel(index, write.values)),
+        error,
+        method,
+        [],
+      );
     case 'server':
     case 'unavailable':
     case 'network':
       if (isSafeToResend(error, method)) {
-        return makeBanner(error.kind === 'server' ? 'server' : 'unavailable', describeError(error), error, method, [
-          'retry',
-        ]);
+        // A 500's text says the draft is kept, as the connection texts do; its trace id
+        // shows on a line of its own.
+        return error.kind === 'server'
+          ? makeBanner('server', errorMessages.serverWithDraft, error, method, ['retry'])
+          : makeBanner('unavailable', describeError(error), error, method, ['retry']);
       }
-      return makeBanner(
-        'uncertainWrite',
-        method === 'POST' ? UNCERTAIN_WRITE_MESSAGE + DUPLICATE_RISK_MESSAGE : UNCERTAIN_WRITE_MESSAGE,
-        error,
-        method,
-        ['saveAgain'],
-      );
+      return makeBanner('uncertainWrite', describeUncertainWrite(error, method === 'POST'), error, method, [
+        'saveAgain',
+      ]);
   }
 }
 
@@ -600,8 +696,12 @@ function createController(host: ControllerHost): Controller {
    * blocks every save and Retry but saveAgain until a write of the draft succeeds, the
    * record proves deleted (409) or the draft is replaced; a later failure, of a Save again
    * included, never lifts it, and one reported `notWritten` offers Save again, not Retry.
+   * `error` is the latest failure's, so the banner shows its trace id; its `writeOutcome`
+   * stays the uncertain one.
    */
   let uncertainWrite: { readonly write: RecordWrite; readonly error: ApiError } | null = null;
+  /** The POST or PUT whose request is in flight, from just before it is sent until it settles. */
+  let inFlightWrite: RecordWrite | null = null;
   /** The save in flight; a second save() returns it. */
   let activeSave: Promise<boolean> | null = null;
   /** Writes run one after another; the tail never rejects. */
@@ -635,6 +735,12 @@ function createController(host: ControllerHost): Controller {
    * that the next record is about to replace.
    */
   let awaitingCommit = false;
+  /**
+   * A save made by leave() succeeded, so the record change that follows keeps `saved` for
+   * the record it installs. Dropped by that install, and by a commit that shows no record
+   * change will follow: a failed or cancelled move never carries it to a later one.
+   */
+  let carrySaved = false;
 
   /** The draft is being left or replaced: no edit or field event may change it. */
   const frozen = (): boolean => leaveLocks > 0 || awaitingCommit || host.options().transitioning === true;
@@ -735,13 +841,22 @@ function createController(host: ControllerHost): Controller {
     focusGenerations.clear();
     blurredForDialog = null;
     queue().reset();
-    const { saving, savePending } = host.state();
-    host.update({ ...freshDraft(index(), record, isNew, generation), saving, savePending, leaving: leaveLocks > 0 });
+    const { saving, savePending, saved } = host.state();
+    host.update({
+      ...freshDraft(index(), record, isNew, generation),
+      saving,
+      savePending,
+      leaving: leaveLocks > 0,
+      saved: carrySaved && saved,
+    });
+    carrySaved = false;
   }
 
   /** Drops the draft's edits, banner and check-code state; the record stays open. */
   function discardDraft(): void {
     const { record, isNew, generation } = host.state();
+    // Nothing on screen is the save it reported any more.
+    carrySaved = false;
     install(record, isNew, generation);
   }
 
@@ -825,20 +940,22 @@ function createController(host: ControllerHost): Controller {
     if (uncertain === null || uncertain.write.generation !== generation) {
       return false;
     }
-    host.update({ banner: saveFailureBanner(uncertain.error, uncertain.write.method) });
+    host.update({ banner: saveFailureBanner(uncertain.error, uncertain.write, index(), leaveLocks > 0) });
     return true;
   }
 
   async function sendWrite(write: RecordWrite): Promise<boolean> {
     const { client, viewId } = host.options();
     failedWrite = null;
+    inFlightWrite = write;
     const noticesBefore = noticeSerial;
-    host.update({ saving: true, banner: null });
+    host.update({ saving: true, banner: null, saved: false });
     const result = await settle(() =>
       write.method === 'POST'
         ? client.createRecord(viewId, write.values)
         : client.updateRecord(viewId, write.globalRecordId, write.values),
     );
+    inFlightWrite = null;
     host.update({ saving: false });
     // The draft was replaced meanwhile, or the editor is gone: the record now shown is not touched.
     if (!active || host.state().generation !== write.generation) {
@@ -853,6 +970,9 @@ function createController(host: ControllerHost): Controller {
       }
       // The draft is now stored, so no earlier write of it is left in doubt.
       uncertainWrite = null;
+      // A save leave() made precedes the record change it made way for, which keeps `saved`.
+      carrySaved = leaveLocks > 0;
+      host.update({ uncertain: false, saved: true });
       adoptRecord(result.data, write);
       // The record was saved, so a field-event failure shown before the write, such as an
       // unreachable database, no longer holds; one that arrived during the write stays.
@@ -866,26 +986,52 @@ function createController(host: ControllerHost): Controller {
     return false;
   }
 
+  /**
+   * Whether a write of the draft of `generation` that the server may still receive or may
+   * already hold carries `name`: the write in flight, a failed POST or PUT that Retry would
+   * resend as it was sent, or a write whose outcome is unknown. The server's value of the
+   * field may then be that write's, not the record's, so only a save can settle it.
+   */
+  function pendingWriteCarries(name: string, generation: number): boolean {
+    const failed = failedWrite?.write;
+    const pending: readonly (RecordWrite | null | undefined)[] = [
+      inFlightWrite,
+      failed?.method === 'DELETE' ? null : failed,
+      uncertainWrite?.write,
+    ];
+    return pending.some(
+      (write) => write !== null && write !== undefined && write.generation === generation && Object.hasOwn(write.values, name),
+    );
+  }
+
   function failWrite(write: RecordWrite, error: ApiError): void {
+    // A failed write confirms no save, whatever an earlier one reported.
+    host.update({ saved: false });
     if (error.kind === 'validation') {
       host.update({ fieldErrors: copyFieldErrors(error.fieldErrors), banner: null });
       return;
     }
-    const banner = saveFailureBanner(error, write.method);
+    const banner = saveFailureBanner(error, write, index(), leaveLocks > 0);
     if (error.kind === 'conflict') {
       // The edits cannot be saved, so they no longer hold the user on the record; nor can
       // anything be saved to a deleted record, so no write is left to block.
       uncertainWrite = null;
-      host.update({ deletedReadOnly: true, dirty: new Set(), banner });
+      host.update({ deletedReadOnly: true, dirty: new Set(), banner, uncertain: false });
       return;
     }
     if (error.kind === 'server' || error.kind === 'unavailable' || error.kind === 'network') {
+      const uncertain = uncertainWrite;
       if (!isSafeToResend(error, write.method)) {
         uncertainWrite = { write, error };
-      } else if (blockedByUncertainWrite(write.generation)) {
+        host.update({ uncertain: true });
+      } else if (uncertain !== null && uncertain.write.generation === write.generation) {
         // This write was not applied, but an earlier one of the draft may have been, so a
-        // Retry would resend the draft without consent: the earlier write's banner, which
-        // offers Save again only, is shown instead and nothing is kept for retry().
+        // Retry would resend the draft without consent: the uncertain banner, which offers
+        // Save again only, is shown instead and nothing is kept for retry(). It reports this
+        // failure, the latest, by its status, cause and trace id, while the outcome stays the
+        // earlier write's, which is never `notWritten`, so the banner can never offer Retry.
+        uncertainWrite = { write: uncertain.write, error: { ...error, writeOutcome: uncertain.error.writeOutcome } };
+        blockedByUncertainWrite(write.generation);
         return;
       }
       failedWrite = { write, error };
@@ -936,7 +1082,7 @@ function createController(host: ControllerHost): Controller {
     // Permission flags are null until reported; only `false` denies. The same rule disables
     // the Save and New buttons, so a save started by leaving is refused like an explicit one.
     if (write.method === 'POST' ? definition.canInsert === false : definition.canUpdate === false) {
-      host.update({ banner: saveFailureBanner(knownDenial(), write.method) });
+      host.update({ banner: saveFailureBanner(knownDenial(), write, idx, leaveLocks > 0) });
       return false;
     }
     // Both checks see only what the write submits: the draft may be stale, and the server's gate
@@ -950,6 +1096,12 @@ function createController(host: ControllerHost): Controller {
   }
 
   function save(): Promise<boolean> {
+    // Refused at once while a write of the draft may already have been applied: its banner is
+    // shown again, as a new banner, and no save starts, so nothing reports Saving… or
+    // disables Save meanwhile. A write queued behind a running save is judged in runSave.
+    if (activeSave === null && blockedByUncertainWrite(host.state().generation)) {
+      return Promise.resolve(false);
+    }
     return exclusiveSave(() => runSave(false));
   }
 
@@ -1008,7 +1160,7 @@ function createController(host: ControllerHost): Controller {
   async function sendDelete(write: DeleteWrite): Promise<void> {
     const { client, viewId } = host.options();
     failedWrite = null;
-    host.update({ saving: true, banner: null });
+    host.update({ saving: true, banner: null, saved: false });
     const result = await settle(() => client.deleteRecord(viewId, write.globalRecordId));
     host.update({ saving: false, deleteDialogOpen: false });
     if (!active || host.state().generation !== write.generation) {
@@ -1033,7 +1185,9 @@ function createController(host: ControllerHost): Controller {
 
   function requestDelete(): void {
     const s = host.state();
-    if (recordProtected(s) || s.deleteDialogOpen) {
+    // An empty new draft holds nothing to discard, so it asks nothing; one with entries is
+    // still asked about, and its confirmation discards it without a request.
+    if (recordProtected(s) || s.deleteDialogOpen || (s.isNew && isEmptyNewDraft(index(), s.values))) {
       return;
     }
     host.update({ deleteDialogOpen: true });
@@ -1135,12 +1289,22 @@ function createController(host: ControllerHost): Controller {
     if (field === undefined || !isDataField(field) || isProtectedIn(s, idx, name) || frozen()) {
       return;
     }
+    const value = normalizeValue(field, raw);
     const dirty = new Set(s.dirty);
-    dirty.add(name);
+    // An edit back to the record's value leaves nothing to save, so the field leaves the
+    // dirty set: no PUT rewrites the stored row, and no leave prompt holds the user. While a
+    // pending write carries the field it stays, so the next save sends the value on screen.
+    // Only the user's own edits come here; a check-code effect marks a field dirty as before.
+    if (isRecordValue(s, field, value) && !pendingWriteCarries(name, s.generation)) {
+      dirty.delete(name);
+    } else {
+      dirty.add(name);
+    }
     host.update({
-      values: withValue(s.values, name, normalizeValue(field, raw)),
+      values: withValue(s.values, name, value),
       dirty,
       fieldErrors: withoutErrorsFor(s.fieldErrors, name),
+      saved: false,
     });
     noteChange(name);
     queue().noteUserEdit(name);
@@ -1219,7 +1383,7 @@ function createController(host: ControllerHost): Controller {
   function sync(): void {
     // The options now hold the committed `transitioning`, which takes over from leave().
     awaitingCommit = false;
-    const { record, isNew, recordGeneration } = host.options();
+    const { record, isNew, recordGeneration, transitioning } = host.options();
     // Started here as well as on first use, so a changed form drops the old form's events at once.
     queue();
     if (recordGeneration !== seenGeneration) {
@@ -1228,6 +1392,11 @@ function createController(host: ControllerHost): Controller {
       seenIsNew = isNew;
       install(record, isNew, recordGeneration);
       return;
+    }
+    if (transitioning !== true && leaveLocks === 0) {
+      // No leave runs and no record change is pending: the move a leave's save made way for
+      // failed or was cancelled, or none followed, so a later move must not carry `saved`.
+      carrySaved = false;
     }
     if (record === seenRecord && isNew === seenIsNew) {
       return;
@@ -1290,14 +1459,19 @@ function present(state: EditorState, index: FieldIndex, actions: EditorActions, 
   // protects none: protection stays read-only metadata, an unsupported field, a deleted
   // record or none open, and only it takes the protected styling.
   const isProtected = (name: string): boolean => isProtectedIn(state, index, name);
+  const isDirty = isDraftDirty(state, index);
   return {
     values: state.values,
     dirty: state.dirty,
-    isDirty: isDraftDirty(state, index),
+    isDirty,
     fieldErrors: state.fieldErrors,
     banner: state.banner,
     saving: state.saving,
-    savePending: state.savePending,
+    saveBlocked: state.uncertain,
+    saved: state.saved && !isDirty,
+    // A leave of a dirty draft saves it once its drain ends, so the save is under way from
+    // the drain's start; one a write of unknown outcome refuses never starts.
+    savePending: state.savePending || (state.leaving && isDirty && !state.uncertain),
     deletedReadOnly: state.deletedReadOnly,
     checkCodeDisabled: state.checkCodeDisabled,
     frozen,

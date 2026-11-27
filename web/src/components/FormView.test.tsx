@@ -18,14 +18,17 @@
 // the first Save of a new record follows canInsert and Save of a stored record canUpdate,
 // and a 403 keeps the draft; the validation summary lists each errored field's prompt
 // with its message, from client validation or a field-level 400; and the toolbar
-// announces Saving… while a save is under way. The connection-banner cases answer their
+// announces Saving… while a save is under way, a leave's from the start of its field-event
+// drain, then Changes saved. until the next edit. The connection-banner cases answer their
 // own outage reads and failed writes, and check the banner each shows.
 //
 // A number field holds an integer beyond ±Number.MAX_SAFE_INTEGER, which a `bigint`
 // column admits, exactly: read from JSON, shown and entered digit for digit. A number typed
 // as a fraction whose nearest double is whole is sent as typed, in its field event and its
-// save. A tabIndex beyond the safe range, read from the form route's own body text, still
-// orders the page and Find.
+// save. A number field shows the number its text stands for once it loses focus, so Age
+// typed as `1e2` shows the 100 it saves, while text that is not a number stays as typed
+// beside its error. A tabIndex beyond the safe range, read from the form route's own body
+// text, still orders the page and Find.
 //
 // The navigator cases hold a navigation read: a pending load disables no control, marks the
 // toolbar and its status busy and announces itself outside them, a press supersedes it, and
@@ -67,7 +70,7 @@ import {
   withField,
   writableCheckboxNames,
 } from '../test/formDefinitionFixture';
-import { formatRequiredMessage } from '../validation/clientValidation';
+import { clientMessages, formatRequiredMessage } from '../validation/clientValidation';
 import { FormView } from './FormView';
 import { RecordNavigator, type RecordNavigatorProps } from './RecordNavigator';
 import type { RecordGridProps } from './RecordGrid';
@@ -444,7 +447,7 @@ function deferred(): { readonly response: Promise<Response>; readonly release: (
 interface RenderedForm {
   readonly container: HTMLElement;
   readonly definition: FormDefinition;
-  readonly onExit: Mock<() => void>;
+  readonly onExit: Mock<(saved: boolean) => void>;
   readonly onFormNotFound: Mock<() => void>;
 }
 
@@ -464,7 +467,7 @@ function mountForm(
 ): RenderedForm & { readonly records: readonly RecordDto[] } {
   // A copy, so the writes of one case never change the records another case stores.
   const records = [...(options.records ?? [RECORD])];
-  const onExit = vi.fn<() => void>();
+  const onExit = vi.fn<(saved: boolean) => void>();
   const onFormNotFound = vi.fn<() => void>();
   const serve = fakeApi(definition, records, options);
   const { answerRead, onCommit } = options;
@@ -1752,7 +1755,7 @@ describe('FormView field rendering: isolation, row identity, registry lookup and
 });
 
 describe('FormView save progress', () => {
-  it('announces Saving… in the form toolbar while a save is under way, with Save disabled and still named Save', async () => {
+  it('announces Saving… in the form toolbar while a save is under way, with Save disabled and still named Save, then Changes saved. until the next edit', async () => {
     const { definition } = await renderForm();
     const formActions = screen.getByRole('toolbar', { name: 'Form actions' });
     const status = within(formActions).getByRole('status');
@@ -1773,14 +1776,80 @@ describe('FormView save progress', () => {
     expect(isDisabled(save)).toBe(true);
 
     held.release({ kind: 'saved', record: savedWith(RECORD, { LastName: EDITED_LAST_NAME }) });
+    // The same status confirms the stored edit, visibly, until the draft changes again.
     await waitFor(() => {
-      expect(status.textContent).toBe('');
+      expect(status.textContent).toBe('Changes saved.');
     });
+    expect(status.classList.contains('visually-hidden')).toBe(false);
 
     expect(isDisabled(save)).toBe(false);
     const writes = writeCalls();
     expect(writes.map(requestLine)).toEqual([`PUT ${FORM_PATH}/records/${RECORD.globalRecordId}`]);
     expect(writtenValues(writes[0])).toEqual({ LastName: EDITED_LAST_NAME });
+
+    edit(definition, 'FirstName', 'Augusta');
+    expect(within(formActions).getByRole('status')).toBe(status);
+    expect(status.textContent).toBe('');
+    expect(status.classList.contains('visually-hidden')).toBe(true);
+  });
+
+  it('announces Saving… and holds Save, Delete, the navigator and the grid from the start of the drain a move of a dirty record awaits', async () => {
+    const held = deferred();
+    const events: Call[] = [];
+    const { definition } = await renderForm(createFormDefinitionFixture(), {
+      records: [RECORD_A, RECORD_B],
+      route: (call) => {
+        if (call.method !== 'POST' || !call.url.pathname.endsWith('/checkcode/field-event')) {
+          return null;
+        }
+        events.push(call);
+        return held.response;
+      },
+    });
+    const formActions = screen.getByRole('toolbar', { name: 'Form actions' });
+    const navigator = screen.getByRole('toolbar', { name: 'Record navigation' });
+    const status = within(formActions).getByRole('status');
+    edit(definition, 'LastName', EDITED_LAST_NAME);
+    // Leaving the field raises FieldAfter, which the fake holds.
+    fireEvent.blur(controlOf(definition, 'LastName'));
+    await waitFor(() => {
+      expect(events).toHaveLength(1);
+    });
+
+    fireEvent.click(navigatorButton('Next'));
+
+    // Still draining: nothing is written yet, and the save the leave makes is already shown.
+    await waitFor(() => {
+      expect(status.textContent).toBe('Saving…');
+    });
+    expect(writeCalls().map(requestLine)).toEqual([`POST ${FORM_PATH}/checkcode/field-event`]);
+    expect(isDisabled(formActionButton('Save'))).toBe(true);
+    expect(isDisabled(formActionButton('Delete'))).toBe(true);
+    for (const name of ['First', 'Previous', 'Next', 'Last', 'Go', 'New']) {
+      expect(isDisabled(within(navigator).getByRole('button', { name })), name).toBe(true);
+    }
+    expect(navigator.getAttribute('aria-busy')).toBe('true');
+    const grid = screen.getByRole('region', { name: 'Records' });
+    expect(within(grid).getByRole('row', { name: new RegExp(B_LAST_NAME) }).getAttribute('aria-disabled')).toBe('true');
+
+    replyToWrite({ kind: 'saved', record: savedWith(RECORD_A, { LastName: EDITED_LAST_NAME }) });
+    held.release(jsonResponse(200, NO_EFFECTS));
+
+    await waitFor(() => {
+      expect(navigatorStatus()).toBe('2 of 2');
+    });
+    expect(writeCalls().map(requestLine)).toEqual([
+      `POST ${FORM_PATH}/checkcode/field-event`,
+      `PUT ${FORM_PATH}/records/${RECORD_A.globalRecordId}`,
+    ]);
+    expect(isDisabled(navigatorButton('Previous'))).toBe(false);
+    // The save the move made is confirmed on the record it made way for, until a later move.
+    expect(status.textContent).toBe('Changes saved.');
+    fireEvent.click(navigatorButton('Previous'));
+    await waitFor(() => {
+      expect(navigatorStatus()).toBe('1 of 2');
+    });
+    expect(status.textContent).toBe('');
   });
 });
 
@@ -2292,6 +2361,25 @@ describe('FormView leaving a dirty record', () => {
     expect(writeCalls()).toEqual([put]);
   });
 
+  it.each<{ label: string; edited: boolean }>([
+    { label: 'an edited record, whose save Back to forms made', edited: true },
+    { label: 'a clean record, which Back to forms left without a save', edited: false },
+  ])('tells onExit whether Back to forms saved, for $label', async ({ edited }) => {
+    const { definition, onExit } = await renderForm();
+    if (edited) {
+      edit(definition, 'LastName', EDITED_LAST_NAME);
+      replyToWrite({ kind: 'saved', record: savedWith(RECORD, { LastName: EDITED_LAST_NAME }) });
+    }
+
+    fireEvent.click(formActionButton('Back to forms'));
+
+    await waitFor(() => {
+      expect(onExit).toHaveBeenCalledTimes(1);
+    });
+    expect(onExit).toHaveBeenCalledWith(edited);
+    expect(writeCalls().map(requestLine)).toEqual(edited ? [`PUT ${FORM_PATH}/records/${RECORD.globalRecordId}`] : []);
+  });
+
   it.each(REJECTIONS)(
     'keeps the draft and does not exit when the save before Back to forms fails: $label',
     async ({ problem, shown }) => {
@@ -2491,6 +2579,82 @@ describe('FormView with no pages', () => {
   });
 });
 
+describe('FormView malformed form metadata', () => {
+  // An option value and a bound hold only with the published arm their field's type takes: a
+  // 0-based int32 index on an option field and the label text on a legal-values field, a finite
+  // number on a number field and a YYYY-MM-DD calendar date on a date field, `null` when unset.
+  // Options are a list, possibly empty, on an option or legal-values field and `null` on a
+  // field of every other published type. A definition departing from that is a failed load,
+  // never a form whose radio group or list silently substitutes a choice or offers none, or
+  // whose range check drops a bound.
+
+  type OptionValue = NonNullable<FieldDefinition['options']>[number]['value'];
+  type Bound = FieldDefinition['validation']['lower'];
+
+  /** The fixture with the `options` of `name` replaced by `options`. */
+  function withOptions(name: string, options: FieldDefinition['options']): FormDefinition {
+    return withField(name, (field) => ({ ...field, options }));
+  }
+
+  /** The fixture with the first option value of `name` replaced by `value`, as a response may carry it. */
+  function withFirstOptionValue(name: string, value: unknown): FormDefinition {
+    return withField(name, (field) => ({
+      ...field,
+      options: present(field.options, `options of ${name}`).map((option, index) =>
+        index === 0 ? { ...option, value: value as OptionValue } : option,
+      ),
+    }));
+  }
+
+  /** The fixture with the `bound` of `name` replaced by `value`, as a response may carry it. */
+  function withBound(name: string, bound: 'lower' | 'upper', value: unknown): FormDefinition {
+    return withField(name, (field) => ({ ...field, validation: { ...field.validation, [bound]: value as Bound } }));
+  }
+
+  it.each<{ label: string; definition: () => FormDefinition }>([
+    { label: 'a boolean option value', definition: () => withFirstOptionValue('IllnessSeverity', true) },
+    { label: 'a null option value', definition: () => withFirstOptionValue('IllnessSeverity', null) },
+    { label: 'a negative option index', definition: () => withFirstOptionValue('IllnessSeverity', -1) },
+    { label: 'a fractional option index', definition: () => withFirstOptionValue('IllnessSeverity', 1.5) },
+    { label: 'an option index beyond int32', definition: () => withFirstOptionValue('IllnessSeverity', 2 ** 31) },
+    { label: 'a text value on an option field', definition: () => withFirstOptionValue('IllnessSeverity', 'Mild') },
+    { label: 'an index on a legal-values field', definition: () => withFirstOptionValue('Sex', 0) },
+    { label: 'an options list on a text field', definition: () => withOptions('LastName', [{ value: 'M-Male', label: 'M-Male' }]) },
+    { label: 'an empty options list on a text field', definition: () => withOptions('LastName', []) },
+    { label: 'null options on an option field', definition: () => withOptions('IllnessSeverity', null) },
+    { label: 'null options on a legal-values field', definition: () => withOptions('Sex', null) },
+    { label: 'a boolean number bound', definition: () => withBound('Age', 'lower', true) },
+    { label: 'a date as a number bound', definition: () => withBound('Age', 'upper', '2011-01-15') },
+    { label: 'a number as a date bound', definition: () => withBound('DateofInterview', 'lower', 20110115) },
+    { label: 'an impossible date bound', definition: () => withBound('DateofInterview', 'upper', '2011-13-45') },
+    { label: '29 February of a common year as a date bound', definition: () => withBound('OnsetDate', 'lower', '2011-02-29') },
+  ])('reports a definition with $label as a failed load and renders none of its fields', async ({ definition }) => {
+    const malformed = definition();
+    const { container } = mountForm(malformed);
+
+    const banner = await screen.findByRole('alert');
+    expect(within(banner).getByText('An unexpected error occurred.')).toBeTruthy();
+    expect(within(banner).getByRole('button', { name: 'Retry' })).toBeTruthy();
+    expect(screen.getByRole('status').textContent).toBe('The form could not be loaded.');
+    expect(screen.queryByRole('heading', { name: malformed.name })).toBeNull();
+    expect(screen.queryByRole('tablist')).toBeNull();
+    expect(container.querySelectorAll(NATIVE_CONTROLS)).toHaveLength(0);
+    expect(calls.map(requestLine)).toEqual([`GET ${FORM_PATH}`]);
+  });
+
+  it.each<{ label: string; field: string; definition: () => FormDefinition }>([
+    { label: 'the unmodified fixture', field: 'IllnessSeverity', definition: createFormDefinitionFixture },
+    { label: 'an empty options list on a legal-values field', field: 'Sex', definition: () => withOptions('Sex', []) },
+    { label: 'a fractional negative number bound', field: 'Age', definition: () => withBound('Age', 'lower', -0.5) },
+    { label: 'a leap day as a date bound', field: 'OnsetDate', definition: () => withBound('OnsetDate', 'upper', '2012-02-29') },
+  ])('loads $label with every field rendered', async ({ field, definition }) => {
+    const { container, definition: rendered } = await renderForm(definition());
+
+    expect(container.querySelectorAll('[data-field-name]')).toHaveLength(allFields(rendered).length);
+    expect(wrapperOf(container, field).querySelectorAll(NATIVE_CONTROLS).length).toBeGreaterThan(0);
+  });
+});
+
 describe('FormView connection banners', () => {
   // These cases answer the writes they make, so they route their own requests. Reads fall
   // through to the read routes above, and any other request still fails the test.
@@ -2595,6 +2759,8 @@ describe('FormView connection banners', () => {
     failure: () => Answer;
     saveAgainName: string;
     duplicate: boolean;
+    /** What failed, which the banner names first. */
+    cause: string;
   }>([
     {
       label: 'a create that got no response',
@@ -2602,6 +2768,7 @@ describe('FormView connection banners', () => {
       failure: () => 'no response',
       saveAgainName: 'Save again (this may create a duplicate record)',
       duplicate: true,
+      cause: 'The server could not be reached.',
     },
     {
       label: 'an update answered 503 with writeOutcome unknown',
@@ -2609,12 +2776,14 @@ describe('FormView connection banners', () => {
       failure: () => unavailable('unknown'),
       saveAgainName: 'Save again (the earlier save may already have been applied)',
       duplicate: false,
+      cause: 'The database cannot be reached.',
     },
   ])('shows the risk before an explicit Save again, and no Retry, for $label', async ({
     create,
     failure,
     saveAgainName,
     duplicate,
+    cause,
   }) => {
     const method = create ? 'POST' : 'PUT';
     const path = create ? `${FORM_PATH}/records` : RECORD_PATH;
@@ -2632,6 +2801,7 @@ describe('FormView connection banners', () => {
     const alert = await screen.findByRole('alert');
     // Visible text, not only an accessible name: the banner says what the save may have done.
     const text = alert.textContent ?? '';
+    expect(text.startsWith(`${cause} `)).toBe(true);
     expect(text).toContain('may already have been applied');
     expect(text).toContain('cannot prove');
     expect(text).toContain('Your changes are still on screen.');
@@ -2646,6 +2816,37 @@ describe('FormView connection banners', () => {
     expect(within(alert).getByRole('button', { name: 'Dismiss' })).toBeTruthy();
     // Nothing was resent without the user's explicit action.
     expect(linesOf(method)).toEqual([`${method} ${path}`]);
+  });
+
+  it('shows the latest trace id, and still only Save again, when Save again of an uncertain update gets a 503 notWritten', async () => {
+    const firstTrace = '00-test-written-00';
+    const written: WriteProblemDetails = {
+      type: 'https://tools.ietf.org/html/rfc9110#section-15.6.1',
+      title: 'An error occurred while processing your request.',
+      status: 500,
+      detail: 'An unexpected error occurred.',
+      traceId: firstTrace,
+      writeOutcome: 'written',
+    };
+    const updates = [jsonResponse(500, written), unavailable('notWritten')];
+    renderWith((call) => (call.method === 'PUT' && call.url.pathname === RECORD_PATH ? updates.shift() : undefined));
+    await loaded();
+    const saveAgainName = 'Save again (the earlier save may already have been applied)';
+
+    fireEvent.change(screen.getByLabelText('Last Name'), { target: { value: 'Byron' } });
+    fireEvent.click(formAction('Save'));
+    const first = await findAlertContaining(`Trace id: ${firstTrace}`);
+    fireEvent.click(within(first).getByRole('button', { name: saveAgainName }));
+
+    // The 503 replaced the 500's banner: its own cause and trace id, the first save still in doubt.
+    const latest = await findAlertContaining(`Trace id: ${TRACE_ID}`);
+    expect(latest.textContent?.startsWith('The database cannot be reached. ')).toBe(true);
+    expect(latest.textContent).toContain('may already have been applied');
+    expect(latest.textContent).not.toContain(firstTrace);
+    expect(within(latest).getByRole('button', { name: saveAgainName })).toBeTruthy();
+    expect(within(latest).queryByRole('button', { name: 'Retry' })).toBeNull();
+    expect(linesOf('PUT')).toEqual([`PUT ${RECORD_PATH}`, `PUT ${RECORD_PATH}`]);
+    expect(updates).toEqual([]);
   });
 
   it.each<{ label: string; failure: () => Answer; text: string; traced: boolean }>([
@@ -2706,6 +2907,147 @@ describe('FormView connection banners', () => {
     expect(screen.queryByRole('alert')).toBeNull();
     expect(linesOf('DELETE')).toEqual([`DELETE ${RECORD_PATH}`, `DELETE ${RECORD_PATH}`]);
     expect(linesOf('PUT')).toEqual([]);
+  });
+});
+
+describe('FormView Delete of a new record', () => {
+  // A new draft with no entry holds nothing to delete or discard, so Delete is disabled until
+  // something is entered. A draft with an entry asks first, and Confirm discards it with no
+  // request (0.3.6). Confirm leaves Delete disabled on the empty draft, so the heading takes
+  // the focus; Cancel keeps the draft, and the focus returns to Delete.
+  it.each<{ label: string; choice: string; lastName: string; focus: 'heading' | 'Delete' }>([
+    { label: 'Confirm discards it and focuses the heading', choice: 'Delete record', lastName: '', focus: 'heading' },
+    { label: 'Cancel keeps it and focuses Delete', choice: 'Cancel', lastName: EDITED_LAST_NAME, focus: 'Delete' },
+  ])('disables Delete on an empty new record; on a typed one, $label', async ({ choice, lastName, focus }) => {
+    const { definition } = await renderForm();
+    fireEvent.click(navigatorButton('New'));
+    await waitFor(() => {
+      expect(navigatorStatus()).toBe('New record');
+    });
+    const remove = formActionButton('Delete');
+    expect(isDisabled(remove)).toBe(true);
+
+    edit(definition, 'LastName', EDITED_LAST_NAME);
+    expect(isDisabled(remove)).toBe(false);
+
+    remove.focus();
+    fireEvent.click(remove);
+    const dialog = await screen.findByRole('dialog');
+    expect(dialog.textContent).toContain('never been saved');
+    fireEvent.click(within(dialog).getByRole('button', { name: choice }));
+
+    await waitFor(() => {
+      expect(screen.queryByRole('dialog')).toBeNull();
+    });
+    expect(controlValue(controlOf(definition, 'LastName'))).toBe(lastName);
+    expect(isDisabled(remove)).toBe(lastName === '');
+    expect(document.activeElement).toBe(
+      focus === 'heading' ? screen.getByRole('heading', { level: 2, name: definition.name }) : remove,
+    );
+    expect(navigatorStatus()).toBe('New record');
+    expect(writeCalls()).toEqual([]);
+  });
+});
+
+describe('FormView while a save may already have been applied', () => {
+  // A 500 or 503 whose writeOutcome is unknown leaves the save in doubt, and only Save again
+  // may send the draft (0.3.4.2). Save, Back to forms and the navigator's moves, each of which
+  // would first save the dirty draft, stay operable but are marked unavailable, and a press
+  // shows the banner again as a new alert, announced again. Save again takes the warning tone.
+  const SAVE_AGAIN_NAME = 'Save again (the earlier save may already have been applied)';
+
+  function unknownOutcome(status: 500 | 503): WriteProblemDetails {
+    return {
+      type: `https://tools.ietf.org/html/rfc9110#section-15.6.${status === 503 ? 4 : 1}`,
+      title: status === 503 ? 'Service Unavailable' : 'An error occurred while processing your request.',
+      status,
+      detail: 'The test server lost track of this write.',
+      traceId: '00-test-unknown-outcome-00',
+      writeOutcome: 'unknown',
+    };
+  }
+
+  /** Back to forms, Save, and the navigator's moves enabled at record 1 of 2: all but Previous. */
+  function refusingButtons(): HTMLElement[] {
+    return [
+      formActionButton('Back to forms'),
+      formActionButton('Save'),
+      ...['First', 'Next', 'Last', 'Go', 'New'].map(navigatorButton),
+    ];
+  }
+
+  function bannerShown(): HTMLElement | undefined {
+    return screen
+      .queryAllByRole('alert')
+      .find((alert) => (alert.textContent ?? '').includes('may already have been applied'));
+  }
+
+  it.each<{ label: string; status: 500 | 503 }>([
+    { label: 'a 503', status: 503 },
+    { label: 'a 500', status: 500 },
+  ])('marks the refused controls, and shows the banner again on each press, after $label with writeOutcome unknown', async ({
+    status,
+  }) => {
+    const { definition, onExit } = await renderForm(createFormDefinitionFixture(), { records: [RECORD_A, RECORD_B] });
+    edit(definition, 'LastName', EDITED_LAST_NAME);
+    replyToWrite({ kind: 'problem', problem: unknownOutcome(status) });
+    fireEvent.click(formActionButton('Save'));
+    let banner = await waitFor(() => present(bannerShown(), 'the banner of the uncertain save'));
+    await flush();
+
+    // The risky resend is told apart from Dismiss beside it.
+    expect(within(banner).getByRole('button', { name: SAVE_AGAIN_NAME }).classList.contains('button--warning')).toBe(true);
+    expect(within(banner).getByRole('button', { name: 'Dismiss' }).classList.contains('button--warning')).toBe(false);
+    for (const button of refusingButtons()) {
+      expect([button.textContent, button.getAttribute('aria-disabled'), button.className]).toEqual([
+        button.textContent,
+        'true',
+        'button--blocked',
+      ]);
+      expect(isDisabled(button)).toBe(false);
+    }
+    // A disabled control already says so, and the actions that save nothing are not refused.
+    expect(isDisabled(navigatorButton('Previous'))).toBe(true);
+    for (const button of [navigatorButton('Previous'), formActionButton('Delete'), formActionButton('Find')]) {
+      expect(button.hasAttribute('aria-disabled')).toBe(false);
+    }
+
+    // Go needs a record number to try the move at all.
+    fireEvent.change(screen.getByRole('textbox', { name: 'Go to record' }), { target: { value: '2' } });
+    for (const button of refusingButtons()) {
+      const before = banner;
+      fireEvent.click(button);
+      banner = await waitFor(() => {
+        const shown = present(bannerShown(), `the banner shown again by ${button.textContent ?? ''}`);
+        expect(shown).not.toBe(before);
+        return shown;
+      });
+      expect(before.isConnected).toBe(false);
+    }
+    await flush();
+    expect(writeCalls().map(requestLine)).toEqual([`PUT ${FORM_PATH}/records/${RECORD_A.globalRecordId}`]);
+    expect(onExit).not.toHaveBeenCalled();
+    expect(navigatorStatus()).toBe('1 of 2');
+    expect(controlValue(controlOf(definition, 'LastName'))).toBe(EDITED_LAST_NAME);
+
+    // Save again sends the draft, and once it is stored nothing is refused.
+    replyToWrite({ kind: 'saved', record: savedWith(RECORD_A, { LastName: EDITED_LAST_NAME }) });
+    fireEvent.click(within(banner).getByRole('button', { name: SAVE_AGAIN_NAME }));
+    await waitFor(() => {
+      expect(bannerShown()).toBeUndefined();
+      expect(formActionButton('Save').hasAttribute('aria-disabled')).toBe(false);
+    });
+    for (const button of refusingButtons()) {
+      expect([button.textContent, button.getAttribute('aria-disabled'), button.className]).toEqual([
+        button.textContent,
+        null,
+        '',
+      ]);
+    }
+    expect(writeCalls().map(requestLine)).toEqual([
+      `PUT ${FORM_PATH}/records/${RECORD_A.globalRecordId}`,
+      `PUT ${FORM_PATH}/records/${RECORD_A.globalRecordId}`,
+    ]);
   });
 });
 
@@ -3206,6 +3548,100 @@ describe('FormView banner action focus', () => {
   });
 });
 
+describe('FormView record found deleted by its save (409)', () => {
+  // The 409's banner says the record is deleted and read-only and that the edits on screen
+  // were not saved; while it is up it stands in for the deleted status, which returns once
+  // it is dismissed. Save stays disabled, so the heading takes the focus Save lost; a
+  // navigator button whose leave the 409 cancelled keeps the focus returned to it.
+  const CONFLICT_PROBLEM: ProblemDetails = {
+    type: 'https://tools.ietf.org/html/rfc9110#section-15.5.10',
+    title: 'Conflict',
+    status: 409,
+    detail: 'The record has been deleted.',
+    traceId: '00-test-conflict-00',
+  };
+  const DELETED_STATUS = 'This record is deleted and is read-only.';
+  const CONFLICT_TEXT = 'This record has been deleted and is read-only. Your unsaved changes were not saved.';
+
+  function deletedStatus(): HTMLElement | undefined {
+    return screen.queryAllByRole('status').find((status) => status.textContent === DELETED_STATUS);
+  }
+
+  it.each<{ label: string; focusFind: boolean }>([
+    { label: 'gives the heading the focus that Save lost', focusFind: false },
+    { label: 'leaves focus where the user moved it', focusFind: true },
+  ])('says the edits were not saved in place of the deleted status, and $label', async ({ focusFind }) => {
+    const { definition } = await renderForm();
+    edit(definition, 'LastName', EDITED_LAST_NAME);
+    const held = holdWrite();
+    // The click does not focus Save, so focus is on the page body, as when Save is disabled while it saves.
+    fireEvent.click(formActionButton('Save'));
+    await waitFor(() => {
+      expect(writeCalls()).toHaveLength(1);
+    });
+    const find = formActionButton('Find');
+    if (focusFind) {
+      find.focus();
+    }
+    held.release({ kind: 'problem', problem: CONFLICT_PROBLEM });
+
+    const alert = await findAlertContaining('not saved');
+    await flush();
+    expect(within(alert).getByText(CONFLICT_TEXT)).toBeTruthy();
+    expect(deletedStatus()).toBeUndefined();
+    expect(isDisabled(formActionButton('Save'))).toBe(true);
+    expect(isDisabled(formActionButton('Delete'))).toBe(true);
+    expect(controlValue(controlOf(definition, 'LastName'))).toBe(EDITED_LAST_NAME);
+    expect(isDisabled(controlOf(definition, 'LastName'))).toBe(true);
+    expect(document.activeElement).toBe(
+      focusFind ? find : screen.getByRole('heading', { level: 2, name: definition.name }),
+    );
+
+    fireEvent.click(within(alert).getByRole('button', { name: 'Dismiss' }));
+
+    expect(alert.isConnected).toBe(false);
+    expect(deletedStatus()).toBeDefined();
+    expect(writeCalls().map(requestLine)).toEqual([`PUT ${FORM_PATH}/records/${RECORD.globalRecordId}`]);
+  });
+
+  it('leaves the focus returned to the navigator button whose leave the 409 cancelled', async () => {
+    const { definition } = await renderForm(createFormDefinitionFixture(), { records: [RECORD_A, RECORD_B] });
+    edit(definition, 'LastName', EDITED_LAST_NAME);
+    const next = navigatorButton('Next');
+    const held = holdWrite();
+    // The click does not focus Next, so focus is on the page body, where the browser drops it
+    // when the pressed Next is disabled while the leave saves.
+    fireEvent.click(next);
+    await waitFor(() => {
+      expect(writeCalls()).toHaveLength(1);
+    });
+    expect(isDisabled(next)).toBe(true);
+    expect(document.activeElement).toBe(document.body);
+    // As the shell does for a button that lost focus by being disabled: once it is enabled
+    // again, a MutationObserver microtask after that commit returns focus to it, unless focus
+    // has gone elsewhere meanwhile.
+    const focusReturn = new MutationObserver(() => {
+      const active = document.activeElement;
+      if (!isDisabled(next) && (active === null || active === document.body)) {
+        next.focus();
+      }
+    });
+    focusReturn.observe(next, { attributes: true, attributeFilter: ['disabled'] });
+    try {
+      held.release({ kind: 'problem', problem: CONFLICT_PROBLEM });
+
+      await findAlertContaining('not saved');
+      await flush();
+      expect(isDisabled(next)).toBe(false);
+      expect(document.activeElement).toBe(next);
+      expect(navigatorStatus()).toBe('1 of 2');
+      expect(writeCalls().map(requestLine)).toEqual([`PUT ${FORM_PATH}/records/${RECORD_A.globalRecordId}`]);
+    } finally {
+      focusReturn.disconnect();
+    }
+  });
+});
+
 describe('number fields hold integers beyond the safe range exactly', () => {
   const CASE_ID = fieldByName('CaseID');
 
@@ -3221,7 +3657,9 @@ describe('number fields hold integers beyond the safe range exactly', () => {
     },
   );
 
-  it.each<[string, FieldValue]>([
+  // An expected ExactDecimal is written as its plain shape, which the call is compared with
+  // member by member: only the client can make a real one.
+  it.each<[string, FieldValue | { readonly kind: 'decimal'; readonly literal: string }]>([
     ['9007199254740993', 9007199254740993n],
     ['-9007199254740993', -9007199254740993n],
     ['9223372036854775807', 9223372036854775807n],
@@ -3305,8 +3743,8 @@ describe('a number typed as a fraction whose nearest double is whole is sent as 
     act(() => {
       input.blur();
     });
-    // The draft keeps the text as typed, sign and spaces included.
-    expect(input).toHaveProperty('value', text);
+    // Leaving the control shows the number the draft stands for, the token a save sends.
+    expect(input).toHaveProperty('value', token);
     const formActions = screen.getByRole('toolbar', { name: 'Form actions' });
     fireEvent.click(within(formActions).getByRole('button', { name: 'Save' }));
 
@@ -3321,6 +3759,76 @@ describe('a number typed as a fraction whose nearest double is whole is sent as 
       expect(input).toHaveProperty('value', '1042');
     });
   });
+});
+
+describe('a number field shows the number its text stands for once it loses focus', () => {
+  /** Focuses Age, types `text` and leaves it, as a user does; FieldBefore and FieldAfter are raised. */
+  async function enterAge(definition: FormDefinition, text: string): Promise<HTMLElement> {
+    // Installing the record moves focus without raising an event; the case's own focus comes after it.
+    await flush();
+    const age = controlOf(definition, 'Age');
+    act(() => {
+      age.focus();
+    });
+    fireEvent.change(age, { target: { value: text } });
+    act(() => {
+      age.blur();
+    });
+    return age;
+  }
+
+  // The server accepts each for the mask ###, so the client accepts it too and shows what is saved.
+  it.each<[string, number]>([
+    ['1e2', 100],
+    ['045', 45],
+    ['45.', 45],
+    [' 45 ', 45],
+  ])(
+    'saves the text %j in Age as %s and shows that number from leaving the field to after the save',
+    async (text, stored) => {
+      const { definition } = await renderForm(createFormDefinitionFixture(), { answersFieldEvents: true });
+      replyToWrite({ kind: 'saved', record: savedWith(RECORD, { Age: stored }) });
+
+      const age = await enterAge(definition, text);
+
+      expect(age).toHaveProperty('value', String(stored));
+      fireEvent.click(formActionButton('Save'));
+      const update = await waitFor(() => present(calls.find((call) => call.method === 'PUT'), 'the update'));
+      expect(update.body).toBe(`{"values":{"Age":${String(stored)}}}`);
+      const status = within(screen.getByRole('toolbar', { name: 'Form actions' })).getByRole('status');
+      // The save has settled once the toolbar confirms it.
+      await waitFor(() => {
+        expect(status.textContent).toBe('Changes saved.');
+      });
+      await flush();
+      expect(age).toHaveProperty('value', String(stored));
+      // Leaving the field still raised its one FieldAfter event.
+      const fieldAfters = calls.filter(
+        (call) => call.method === 'POST' && call.body?.includes('"event":"FieldAfter"') === true,
+      );
+      expect(fieldAfters.map((call) => call.body?.includes('"fieldName":"Age"'))).toEqual([true]);
+    },
+  );
+
+  it.each<[string]>([['-'], ['abc'], ['1e400']])(
+    'keeps the text %j in Age as typed once it loses focus, beside its error, and sends no write',
+    async (text) => {
+      const { definition } = await renderForm(createFormDefinitionFixture(), { answersFieldEvents: true });
+
+      const age = await enterAge(definition, text);
+
+      expect(age).toHaveProperty('value', text);
+      fireEvent.click(formActionButton('Save'));
+      const summary = await findValidationSummary();
+      await flush();
+      expect(calls.filter((call) => call.method === 'PUT')).toEqual([]);
+      const items = summaryItemsFor(summary, promptOf(fieldByName('Age', definition)));
+      expect(items.map((item) => item.textContent?.includes(clientMessages.numberExpected))).toEqual([true]);
+      expect(within(summary).getAllByRole('listitem')).toHaveLength(1);
+      expect(descriptionOf(age)).toContain(clientMessages.numberExpected);
+      expect(age).toHaveProperty('value', text);
+    },
+  );
 });
 
 describe('a tabIndex beyond the safe range', () => {
@@ -3997,6 +4505,36 @@ describe('FormView Find record', () => {
     expect(shown()).toEqual(sentState);
   });
 
+  it('titles each nonblank result cell with its full value', async () => {
+    const long = 'L'.repeat(4000);
+    await renderForm(undefined, {
+      route: searchRoute(() => matches({ ...MATCH, values: { LastName: long, FirstName: null } })),
+    });
+    const dialog = openFind();
+    fireEvent.change(pick(dialog, 'LastName'), { target: { value: 'L*' } });
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Search' }));
+    await within(dialog).findByText('1 record matches.');
+
+    const open = within(dialog).getByRole('button', { name: 'Open record at position 1' });
+    const cells = within(present(open.closest('tr'), 'result row')).getAllByRole('cell');
+    // The position cell holds the Open button, named by the position; the others hold values.
+    expect(cells.map((cell) => cell.getAttribute('title'))).toEqual([null, long, null]);
+  });
+
+  it('wraps the results in a named region that takes focus, so a keyboard can scroll it', async () => {
+    await renderForm(undefined, { route: searchRoute(() => matches(MATCH)) });
+    const dialog = openFind();
+    fireEvent.change(pick(dialog, 'LastName'), { target: { value: 'Lovelace' } });
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Search' }));
+    await within(dialog).findByText('1 record matches.');
+
+    const region = within(dialog).getByRole('region', { name: 'Search results' });
+    expect(within(region).getByRole('table', { name: 'Matching records' })).toBeTruthy();
+    expect(region.tabIndex).toBe(0);
+    region.focus();
+    expect(document.activeElement).toBe(region);
+  });
+
   /** The fixture plus `LASTNAME`, just before `LastName`, whose name differs from it only in letter case. */
   function caseDistinctDefinition(): FormDefinition {
     const definition = createFormDefinitionFixture();
@@ -4609,15 +5147,26 @@ describe('FormView record grid', () => {
     await recordOpened();
   });
 
-  it.each<{ row: string; recStatus: number; values: RecordSummary['values']; name: string }>([
-    { row: 'an active row', recStatus: 1, values: {}, name: OPEN_NAME },
-    { row: 'a deleted row', recStatus: 0, values: {}, name: `${OPEN_NAME} (deleted)` },
-    // The next grid column, FirstName, is the first nonblank cell.
-    { row: 'a row with a blank first cell', recStatus: 1, values: { CaseID: null }, name: 'Open record Ada' },
-  ])('names the open action of $row and opens that record by id', async ({ recStatus, values, name }) => {
+  const CASE_ID_TEXT = recordNumberText(RECORD, 'CaseID');
+  it.each<{ row: string; recStatus: number; values: RecordSummary['values']; name: string; shown: string }>([
+    { row: 'an active row', recStatus: 1, values: {}, name: OPEN_NAME, shown: CASE_ID_TEXT },
+    { row: 'a deleted row', recStatus: 0, values: {}, name: `${OPEN_NAME} (deleted)`, shown: CASE_ID_TEXT },
+    // The next grid column, FirstName, is the first nonblank cell; the blank cell's button shows "Open".
+    {
+      row: 'a row with a blank first cell',
+      recStatus: 1,
+      values: { CaseID: null },
+      name: 'Open record Ada',
+      shown: 'Open',
+    },
+  ])('names and visibly labels the open action of $row, and opens that record by id', async (example) => {
+    const { recStatus, values, name, shown } = example;
     mountForm(undefined, { route: (call) => (isGet(call, LIST_PATH) ? listPage(1, 1, recStatus, values) : null) });
     await recordOpened();
     const open = await within(records()).findByRole('button', { name });
+    // The text drawn on screen: the button's content outside its visually hidden parts.
+    const drawn = Array.from(open.querySelectorAll(':scope > :not(.visually-hidden)'), (part) => part.textContent);
+    expect(drawn.join('')).toBe(shown);
     const row = present(open.closest('tr'), 'grid row');
     // The button is the row's only control and its one tab stop; the row takes no focus.
     expect(row.hasAttribute('tabindex')).toBe(false);
@@ -4629,6 +5178,58 @@ describe('FormView record grid', () => {
       expect(openCalls()).toHaveLength(1);
     });
     await recordOpened();
+  });
+
+  // 150 characters, 149 of them outside the BMP, then 3850 more: a cut by UTF-16 units
+  // would split a surrogate pair or keep too few characters.
+  const LONG_START = `A${'𝒜'.repeat(149)}`;
+  const LONG_TEXT = `${LONG_START}${'b'.repeat(3850)}`;
+  const EXACT_TEXT = 'c'.repeat(150);
+  it.each<{ row: string; values: RecordSummary['values']; name: string }>([
+    { row: 'a first cell past 150 characters', values: { CaseID: LONG_TEXT }, name: `Open record ${LONG_START}…` },
+    {
+      row: 'a first cell of exactly 150 characters',
+      values: { CaseID: EXACT_TEXT },
+      name: `Open record ${EXACT_TEXT}`,
+    },
+    {
+      row: 'a blank first cell before a cell past 150 characters',
+      values: { CaseID: null, FirstName: LONG_TEXT },
+      name: `Open record ${LONG_START}…`,
+    },
+  ])('names the open action of $row by at most 150 of its characters', async ({ values, name }) => {
+    mountForm(undefined, {
+      route: (call) => (isGet(call, LIST_PATH) ? listPage(1, 1, RECORD.recStatus, values) : null),
+    });
+    await recordOpened();
+    expect(await within(records()).findByRole('button', { name })).toBeTruthy();
+  });
+
+  it('wraps the table in a named region that takes focus, so a keyboard can scroll it', async () => {
+    const { definition } = await renderForm();
+    const region = within(records()).getByRole('region', { name: 'Record list' });
+    expect(within(region).getByRole('table', { name: `${definition.name} records` })).toBeTruthy();
+    expect(region.tabIndex).toBe(0);
+    region.focus();
+    expect(document.activeElement).toBe(region);
+  });
+
+  it('titles each nonblank grid cell with its full value', async () => {
+    mountForm(undefined, {
+      route: (call) =>
+        isGet(call, LIST_PATH) ? listPage(1, 1, RECORD.recStatus, { CaseID: LONG_TEXT, Sex: null }) : null,
+    });
+    await recordOpened();
+    const open = await within(records()).findByRole('button', { name: `Open record ${LONG_START}…` });
+    const cells = within(present(open.closest('tr'), 'grid row')).getAllByRole('cell');
+    expect(cells.map((cell) => cell.getAttribute('title'))).toEqual([
+      LONG_TEXT,
+      'Ada',
+      'Lovelace',
+      null,
+      '1980-05-01',
+      '31',
+    ]);
   });
 
   it('shows a "Show deleted" change as pending, ignoring further changes, until navigation applies it', async () => {

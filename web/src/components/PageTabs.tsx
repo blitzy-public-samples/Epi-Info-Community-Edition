@@ -109,6 +109,9 @@ export function PageTabs({
       <div role="tablist" aria-label={label}>
         {orderedPages.map((page, index) => {
           const selected = page.pageId === selectedId;
+          const text = tabText(page, index);
+          // data-text feeds a hidden bold copy (styles.css) that holds every tab at its
+          // selected width, so selecting a tab moves none of its neighbours.
           return (
             <button
               key={page.pageId}
@@ -125,10 +128,11 @@ export function PageTabs({
               aria-selected={selected}
               aria-controls={pageTabPanelId(page.pageId)}
               tabIndex={selected ? 0 : -1}
+              data-text={text}
               onClick={() => onSelect(page.pageId)}
               onKeyDown={(event) => handleTabKeyDown(event, index)}
             >
-              {tabText(page, index)}
+              {text}
             </button>
           );
         })}

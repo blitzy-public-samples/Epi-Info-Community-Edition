@@ -43,12 +43,26 @@ export interface FormViewProps {
   client?: ApiClient;
   /** 1-based position opened on load (the `record` URL parameter); absent opens the first record. */
   initialPosition?: number;
-  /** Called once "Back to forms" has left the record: a dirty draft was saved, or there was nothing to save. */
-  onExit: () => void;
+  /**
+   * The `record` URL parameter as written. When that record cannot be opened as asked, the
+   * navigation notice names it and says what opened instead; absent, it names `initialPosition`.
+   */
+  initialPositionText?: string;
+  /** Whether "Show deleted" is on as the form opens (the `deleted` URL parameter); absent opens it off. */
+  initialIncludeDeleted?: boolean;
+  /**
+   * Called once "Back to forms" has left the record: a dirty draft was saved, or there was
+   * nothing to save. `saved` is `true` when a save succeeded while that leave ran, so the
+   * caller can confirm it once the form, and its own confirmation, are gone.
+   */
+  onExit: (saved: boolean) => void;
   /** Called once when the API reports that the form does not exist. */
   onFormNotFound: () => void;
-  /** Called whenever the navigator's position changes; `null` for a new record. */
-  onPositionChange?: (n: number | null) => void;
+  /**
+   * Called whenever the navigator's position or its "Show deleted" toggle changes, with
+   * both: `n` is `null` for a new record, and counts the set the toggle selects.
+   */
+  onPositionChange?: (n: number | null, includeDeleted: boolean) => void;
 }
 
 type DefinitionState =
@@ -71,8 +85,9 @@ const LOADING_TEXT = 'Loading form…';
 const LOAD_FAILED_TEXT = 'The form could not be loaded.';
 const FORM_NOT_FOUND_TEXT = 'This form no longer exists.';
 const DELETED_TEXT = 'This record is deleted and is read-only.';
-// A status, not a control, so the toolbar-name rule above does not reach it.
+// Statuses, not controls, so the toolbar-name rule above does not reach them.
 const SAVING_TEXT = 'Saving…';
+const SAVED_TEXT = 'Changes saved.';
 const RETRY = 'Retry';
 const DISMISS = 'Dismiss';
 const DISCARD_EDITS = 'Discard edits';
@@ -80,6 +95,29 @@ const DISCARD_EDITS = 'Discard edits';
 const SAVE_AGAIN = 'Save again';
 const SAVE_AGAIN_CREATE_LABEL = 'Save again (this may create a duplicate record)';
 const SAVE_AGAIN_UPDATE_LABEL = 'Save again (the earlier save may already have been applied)';
+// Save again resends a write that may already have been applied, so it takes the warning
+// tone, apart from Retry and Dismiss beside it.
+const WARNING_BUTTON_CLASS = 'button--warning';
+// A control refused while a write of the draft may already have been applied: it looks and
+// is announced unavailable, yet a press still runs it, and its refusal shows the banner again.
+const BLOCKED_BUTTON_CLASS = 'button--blocked';
+
+/**
+ * A key per editor banner object. A refused save shows its banner again as a new object, so
+ * the alert remounts and is announced again, while every render of one banner keeps its element.
+ */
+const bannerKeys = new WeakMap<EditorBanner, number>();
+let lastBannerKey = 0;
+
+function bannerKeyOf(banner: EditorBanner): number {
+  let key = bannerKeys.get(banner);
+  if (key === undefined) {
+    lastBannerKey += 1;
+    key = lastBannerKey;
+    bannerKeys.set(banner, key);
+  }
+  return key;
+}
 
 /** "Trace id: …" when the message does not already end with it, as describeError's 500 text does. */
 function traceLineOf(message: string, traceId: string | null): string | null {
@@ -118,6 +156,8 @@ export function FormView({
   viewId,
   client = apiClient,
   initialPosition,
+  initialPositionText,
+  initialIncludeDeleted,
   onExit,
   onFormNotFound,
   onPositionChange,
@@ -212,6 +252,8 @@ export function FormView({
           viewId={current.viewId}
           definition={current.definition}
           initialPosition={initialPosition}
+          initialPositionText={initialPositionText}
+          initialIncludeDeleted={initialIncludeDeleted}
           headingRef={headingRef}
           onExit={onExit}
           onFormNotFound={onFormNotFound}
@@ -227,7 +269,7 @@ interface DefinitionLoadStatusProps {
   /** The status line, which Retry focuses before the reload replaces the failure's controls. */
   readonly statusRef: RefObject<HTMLParagraphElement>;
   readonly onRetry: () => void;
-  readonly onExit: () => void;
+  readonly onExit: (saved: boolean) => void;
 }
 
 /**
@@ -265,7 +307,8 @@ function DefinitionLoadStatus({ error, statusRef, onRetry, onExit }: DefinitionL
     <div className="form-view">
       {error !== null && (
         <div className="form-toolbar" role="toolbar" aria-label="Form actions">
-          <button type="button" onClick={() => onExit()}>
+          {/* No record was open, so nothing was saved. */}
+          <button type="button" onClick={() => onExit(false)}>
             {BACK_TO_FORMS}
           </button>
         </div>
@@ -284,14 +327,16 @@ interface FormWorkspaceProps {
   /** Kept as loaded while the form is open: the editor starts a new field-event queue for a new object. */
   readonly definition: FormDefinition;
   readonly initialPosition: number | undefined;
+  readonly initialPositionText: string | undefined;
+  readonly initialIncludeDeleted: boolean | undefined;
   /**
    * The form's heading, which FormView focuses once a retried definition load succeeds,
    * and which takes focus from a banner control that its own action removed.
    */
   readonly headingRef: RefObject<HTMLHeadingElement>;
-  readonly onExit: () => void;
+  readonly onExit: (saved: boolean) => void;
   readonly onFormNotFound: () => void;
-  readonly onPositionChange: ((n: number | null) => void) | undefined;
+  readonly onPositionChange: ((n: number | null, includeDeleted: boolean) => void) | undefined;
 }
 
 /** A field-focus request from the validation summary; `sequence` repeats a request for the same field. */
@@ -456,21 +501,27 @@ function useBannerFocusReturn(targetRef: RefObject<HTMLElement>): (action: () =>
 }
 
 /**
- * Reports each change of the navigator's position. The position the workspace mounts
- * with (`null` until the first record opens) is not a change and is not reported.
+ * Reports each change of the navigator's position or of its deleted toggle, with both, so
+ * a toggle that leaves n as it was is reported too. The pair the workspace mounts with
+ * (`null` until the first record opens) is not a change and is not reported.
  */
-function usePositionReport(n: number | null, report: ((n: number | null) => void) | undefined): void {
+function usePositionReport(
+  n: number | null,
+  includeDeleted: boolean,
+  report: ((n: number | null, includeDeleted: boolean) => void) | undefined,
+): void {
   const reportRef = useRef(report);
   useLayoutEffect(() => {
     reportRef.current = report;
   });
-  const reportedRef = useRef<number | null>(n);
+  const reportedRef = useRef({ n, includeDeleted });
   useEffect(() => {
-    if (n !== reportedRef.current) {
-      reportedRef.current = n;
-      reportRef.current?.(n);
+    const reported = reportedRef.current;
+    if (n !== reported.n || includeDeleted !== reported.includeDeleted) {
+      reportedRef.current = { n, includeDeleted };
+      reportRef.current?.(n, includeDeleted);
     }
-  }, [n]);
+  }, [n, includeDeleted]);
 }
 
 /** The workspace of a loaded form: composes navigation and the editor and renders them. */
@@ -479,6 +530,8 @@ function FormWorkspace({
   viewId,
   definition,
   initialPosition,
+  initialPositionText,
+  initialIncludeDeleted,
   headingRef,
   onExit,
   onFormNotFound,
@@ -488,10 +541,14 @@ function FormWorkspace({
   // navigator's record and callbacks; the ref breaks that cycle. Until the editor's leave
   // is installed nothing is open, so there is nothing to save.
   const leaveRef = useRef<() => Promise<boolean>>(() => Promise.resolve(true));
+  // Successful saves of this workspace, counted so Back to forms can tell whether its leave saved.
+  const savesRef = useRef(0);
   const navigation = useRecordNavigation({
     client,
     viewId,
     initialPosition,
+    initialPositionText,
+    initialIncludeDeleted,
     beforeLeave: () => leaveRef.current(),
   });
   const editor = useRecordEditor({
@@ -501,7 +558,10 @@ function FormWorkspace({
     record: navigation.record,
     isNew: navigation.isNew,
     recordGeneration: navigation.recordGeneration,
-    onSaved: navigation.afterSave,
+    onSaved: (record) => {
+      savesRef.current += 1;
+      navigation.afterSave(record);
+    },
     onDeleted: navigation.afterDelete,
     onDiscardToNearest: navigation.openNearest,
     transitioning: navigation.transitioning,
@@ -513,7 +573,7 @@ function FormWorkspace({
   // The browser's leave prompt for a dirty draft is registered by useRecordEditor itself,
   // so none is registered here: two listeners would prompt twice.
 
-  usePositionReport(navigation.n, onPositionChange);
+  usePositionReport(navigation.n, navigation.includeDeleted, onPositionChange);
 
   const { selectedPageId, selectPage, selectField } = usePageSelection(definition);
 
@@ -590,11 +650,13 @@ function FormWorkspace({
       return;
     }
     exitingRef.current = true;
+    const savesBefore = savesRef.current;
     void editor.leave().then(
       (left) => {
         exitingRef.current = false;
         if (left) {
-          onExit();
+          // The form, and the toolbar's confirmation with it, unmounts: the caller confirms the save.
+          onExit(savesRef.current > savesBefore);
         }
       },
       () => {
@@ -605,15 +667,21 @@ function FormWorkspace({
 
   const recordDeleted = navigation.record?.recStatus === 0 || editor.deletedReadOnly;
   const nothingOpen = navigation.record === null && !navigation.isNew;
+  // A write is in flight, or a save is under way, a leave's included from the start of its
+  // field-event drain: Save, Delete, the navigator and the grid wait for it.
+  const busy = editor.saving || editor.savePending;
   // Permission flags are null until permission awareness is delivered; only `false` restricts.
   const { canInsert, canUpdate, canDelete } = definition;
   const saveDisabled =
-    editor.saving ||
-    editor.savePending ||
-    recordDeleted ||
-    nothingOpen ||
-    (navigation.isNew ? canInsert === false : canUpdate === false);
-  const deleteDisabled = editor.saving || recordDeleted || nothingOpen || canDelete === false;
+    busy || recordDeleted || nothingOpen || (navigation.isNew ? canInsert === false : canUpdate === false);
+  // A new draft with no entry has nothing to delete or discard, so Delete waits for one.
+  const deleteDisabled =
+    busy || recordDeleted || nothingOpen || canDelete === false || (navigation.isNew && !editor.isDirty);
+  // While a write of the draft may already have been applied, Save refuses, and so does each
+  // move that would first save the dirty draft (Back to forms and the navigator's moves): a
+  // press shows that write's banner again. They stay operable for that, marked unavailable.
+  const saveBlocked = editor.saveBlocked && !saveDisabled;
+  const movesBlocked = editor.saveBlocked && editor.isDirty;
 
   const isProtected = (field: FieldDefinition): boolean => editor.isProtected(field.name);
   const isCheckCodeDisabled = (field: FieldDefinition): boolean => editor.checkCodeDisabled.has(field.name);
@@ -645,9 +713,32 @@ function FormWorkspace({
     />
   );
 
-  // A 409 banner says the same as the deleted banner, which is shown instead.
-  const editorBanner =
-    editor.banner !== null && !(recordDeleted && editor.banner.kind === 'deleted') ? editor.banner : null;
+  // A 409's banner says the record is deleted and read-only, and that the edits were not
+  // saved, so while it is up it stands in for the deleted status, which returns once the
+  // banner is dismissed.
+  const conflictBanner = editor.banner?.kind === 'deleted' ? editor.banner : null;
+  // Save stays disabled on a deleted record, so focus that a pressed Save lost while it
+  // saved never returns to it: the heading takes it once a 409's banner is up. It does so a
+  // task after the banner's commit, not in it. A navigator button whose leave the 409
+  // cancelled is enabled again by that same commit, and the shell returns the focus it lost
+  // in a microtask after the commit, which runs first and keeps it. The heading takes focus
+  // only when it is still on the page body by then, so focus the user or the shell placed
+  // elsewhere stays there. A newer banner, the banner's removal or unmounting cancels a
+  // move still pending, so none lands on a record the banner no longer speaks for.
+  useEffect(() => {
+    if (conflictBanner === null) {
+      return undefined;
+    }
+    const timer = setTimeout(() => {
+      const active = document.activeElement;
+      if (active === null || active === document.body) {
+        headingRef.current?.focus();
+      }
+    }, 0);
+    return () => {
+      clearTimeout(timer);
+    };
+  }, [conflictBanner, headingRef]);
   // Every banner action removes the banner whose control ran it, so each goes through
   // runBannerAction, which hands that control's focus on to the heading.
   const runBannerAction = useBannerFocusReturn(headingRef);
@@ -665,6 +756,23 @@ function FormWorkspace({
   };
   const openRecordId = navigation.record?.globalRecordId ?? null;
 
+  // Where the delete dialog returns focus first. Confirming on a new draft discards it, which
+  // leaves Delete disabled on the empty draft, so the dialog would fall back to the toolbar's
+  // first button, Back to forms, where a keyboard user's next Enter would leave the form: the
+  // heading takes focus instead. Every other close returns it to Delete, as the dialog does.
+  const deleteReturnFocusRef = useRef<HTMLElement | null>(null);
+  const { requestDelete, confirmDelete } = editor;
+  const openDeleteDialog = (): void => {
+    deleteReturnFocusRef.current = null;
+    requestDelete();
+  };
+  const confirmDeleteDialog = (): Promise<void> => {
+    if (navigation.isNew) {
+      deleteReturnFocusRef.current = headingRef.current;
+    }
+    return confirmDelete();
+  };
+
   return (
     <div className="form-view">
       <h2 ref={headingRef} tabIndex={-1}>
@@ -673,20 +781,23 @@ function FormWorkspace({
 
       <WorkspaceToolbar
         saveDisabled={saveDisabled}
+        saveBlocked={saveBlocked}
+        backBlocked={movesBlocked}
         saving={editor.savePending}
+        saved={editor.saved}
         deleteDisabled={deleteDisabled}
         onBackToForms={backToForms}
         onSave={() => {
           void editor.save();
         }}
-        onDelete={editor.requestDelete}
+        onDelete={openDeleteDialog}
         onFind={() => setFindOpen(true)}
       />
 
-      <RecordNavigator navigation={navigation} busy={editor.saving} canInsert={canInsert} />
+      <RecordNavigator navigation={navigation} busy={busy} blocked={movesBlocked} canInsert={canInsert} />
 
       <WorkspaceNotices
-        recordDeleted={recordDeleted}
+        recordDeleted={recordDeleted && conflictBanner === null}
         navigationNotice={navigation.notice}
         onDismissNavigationNotice={() => runBannerAction(() => navigation.dismissNotice())}
         loadError={navigation.loadError}
@@ -698,7 +809,7 @@ function FormWorkspace({
         formGone={formGone}
         offerDiscard={editor.isDirty && !discardChosen}
         onDiscardFormGone={() => runBannerAction(() => setDiscardChosen(true))}
-        editorBanner={editorBanner}
+        editorBanner={editor.banner}
         bannerHandlers={bannerHandlers}
         eventNotice={editor.eventNotice}
       />
@@ -728,7 +839,7 @@ function FormWorkspace({
         openRecordId={openRecordId}
         onOpen={openFromGrid}
         onFormNotFound={handleFormNotFound}
-        disabled={editor.saving}
+        disabled={busy}
       />
 
       <WorkspaceDialogs
@@ -738,7 +849,8 @@ function FormWorkspace({
         busy={editor.saving}
         isNew={navigation.isNew}
         deleteDialogOpen={editor.deleteDialogOpen}
-        onConfirmDelete={editor.confirmDelete}
+        deleteReturnFocusRef={deleteReturnFocusRef}
+        onConfirmDelete={confirmDeleteDialog}
         onCancelDelete={editor.cancelDelete}
         dialogs={editor.dialogs}
         onDismissDialog={editor.dismissDialog}
@@ -758,8 +870,14 @@ function FormWorkspace({
 
 interface WorkspaceToolbarProps {
   readonly saveDisabled: boolean;
+  /** Save is enabled, yet refuses while a write of the draft may already have been applied. */
+  readonly saveBlocked: boolean;
+  /** Back to forms would first save the dirty draft, which that write blocks, so it refuses. */
+  readonly backBlocked: boolean;
   /** A save is under way, from the field-event drain to the write's answer. */
   readonly saving: boolean;
+  /** The last save of the draft succeeded and nothing has changed since. */
+  readonly saved: boolean;
   readonly deleteDisabled: boolean;
   readonly onBackToForms: () => void;
   readonly onSave: () => void;
@@ -770,19 +888,35 @@ interface WorkspaceToolbarProps {
 /** The form's actions, Back to forms, Save, Delete and Find, under the names the smoke test matches. */
 function WorkspaceToolbar({
   saveDisabled,
+  saveBlocked,
+  backBlocked,
   saving,
+  saved,
   deleteDisabled,
   onBackToForms,
   onSave,
   onDelete,
   onFind,
 }: WorkspaceToolbarProps) {
+  const statusText = saving ? SAVING_TEXT : saved ? SAVED_TEXT : '';
   return (
     <div className="form-toolbar" role="toolbar" aria-label="Form actions">
-      <button type="button" onClick={() => onBackToForms()}>
+      {/* A blocked control is marked, not disabled: its press shows the banner again. */}
+      <button
+        type="button"
+        aria-disabled={backBlocked ? true : undefined}
+        className={backBlocked ? BLOCKED_BUTTON_CLASS : undefined}
+        onClick={() => onBackToForms()}
+      >
         {BACK_TO_FORMS}
       </button>
-      <button type="button" disabled={saveDisabled} onClick={() => onSave()}>
+      <button
+        type="button"
+        disabled={saveDisabled}
+        aria-disabled={saveBlocked ? true : undefined}
+        className={saveBlocked ? BLOCKED_BUTTON_CLASS : undefined}
+        onClick={() => onSave()}
+      >
         {SAVE}
       </button>
       <button type="button" disabled={deleteDisabled} onClick={() => onDelete()}>
@@ -792,15 +926,17 @@ function WorkspaceToolbar({
         {FIND}
       </button>
       {/* Always rendered, so the status text is announced when it appears; it tells a save
-          under way apart from a Save disabled by permission or protection. */}
-      <span role="status" className={saving ? undefined : 'visually-hidden'}>
-        {saving ? SAVING_TEXT : ''}
+          under way apart from a Save disabled by permission or protection, and confirms a
+          save that succeeded until the next edit. Visually hidden only while empty. */}
+      <span role="status" className={statusText === '' ? 'visually-hidden' : undefined}>
+        {statusText}
       </span>
     </div>
   );
 }
 
 interface WorkspaceNoticesProps {
+  /** Shows the deleted, read-only status: the record is deleted and no 409 banner already says so. */
   readonly recordDeleted: boolean;
   /** Navigation's informational text, such as a record that no longer exists. */
   readonly navigationNotice: string | null;
@@ -814,7 +950,7 @@ interface WorkspaceNoticesProps {
   readonly offerDiscard: boolean;
   /** "Discard edits" on the form-gone banner: the draft may be dropped and the forms list shown. */
   readonly onDiscardFormGone: () => void;
-  /** The failed save or delete; `null` when there is none or the deleted warning says the same. */
+  /** The failed save or delete; `null` when there is none. */
   readonly editorBanner: EditorBanner | null;
   /** The editor banner's actions. */
   readonly bannerHandlers: EditorBannerHandlers;
@@ -872,7 +1008,10 @@ function WorkspaceNotices({
         </div>
       )}
 
-      {editorBanner !== null && <EditorBannerView banner={editorBanner} handlers={bannerHandlers} />}
+      {/* Keyed by the banner object, so a banner shown again remounts and is announced again. */}
+      {editorBanner !== null && (
+        <EditorBannerView key={bannerKeyOf(editorBanner)} banner={editorBanner} handlers={bannerHandlers} />
+      )}
 
       {eventNotice !== null && (
         <div className="banner banner--info" role="status">
@@ -891,6 +1030,8 @@ interface WorkspaceDialogsProps {
   readonly busy: boolean;
   readonly isNew: boolean;
   readonly deleteDialogOpen: boolean;
+  /** Focused first when the delete dialog closes; `null` leaves the dialog's own return. */
+  readonly deleteReturnFocusRef: RefObject<HTMLElement>;
   readonly onConfirmDelete: () => Promise<void>;
   readonly onCancelDelete: () => void;
   /** Check-code DIALOG messages in execution order. */
@@ -915,6 +1056,7 @@ function WorkspaceDialogs({
   busy,
   isNew,
   deleteDialogOpen,
+  deleteReturnFocusRef,
   onConfirmDelete,
   onCancelDelete,
   dialogs,
@@ -932,6 +1074,7 @@ function WorkspaceDialogs({
         open={deleteDialogOpen}
         busy={busy}
         isNew={isNew}
+        returnFocusRef={deleteReturnFocusRef}
         onConfirm={onConfirmDelete}
         onCancel={onCancelDelete}
       />
@@ -1069,6 +1212,7 @@ function BannerActionButton({ action, isCreate, handlers }: BannerActionButtonPr
       return (
         <button
           type="button"
+          className={WARNING_BUTTON_CLASS}
           aria-label={isCreate ? SAVE_AGAIN_CREATE_LABEL : SAVE_AGAIN_UPDATE_LABEL}
           onClick={() => handlers.onSaveAgain()}
         >

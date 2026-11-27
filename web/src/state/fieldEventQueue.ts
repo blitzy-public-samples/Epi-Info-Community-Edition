@@ -22,7 +22,7 @@
  *
  * The queue raises no event on its own, so loading or replacing a record raises none.
  */
-import type { ApiClient, ApiResult } from '../api/client';
+import { isFieldValue, type ApiClient, type ApiResult } from '../api/client';
 import { describeError, errorMessages, isAbortError, networkError, type ApiError } from '../api/errors';
 import type {
   Diagnostic,
@@ -149,15 +149,6 @@ function isString(value: unknown): value is string {
   return typeof value === 'string';
 }
 
-function isWireValue(value: unknown): value is FieldValue {
-  return (
-    value === null ||
-    typeof value === 'string' ||
-    typeof value === 'boolean' ||
-    (typeof value === 'number' && Number.isFinite(value))
-  );
-}
-
 function isDialog(value: unknown): value is DialogMessage {
   return isObject(value) && isString(value.message) && (value.title === null || isString(value.title));
 }
@@ -196,14 +187,19 @@ function readList<T>(value: unknown, isEntry: (entry: unknown) => entry is T): T
   return entries;
 }
 
-/** `assigned` as own entries in the server's order, or null when it is missing, null or not a map of wire values. */
+/**
+ * `assigned` as own entries in the server's order, or null when it is missing, null or not a
+ * map of field values. An entry is checked by the client's own field-value check, so a value
+ * the client decoded exactly, such as the bigint of 9007199254740993, is an assignment like
+ * any other.
+ */
 function readAssigned(value: unknown): Values | null {
   if (!isObject(value)) {
     return null;
   }
   const entries: [string, FieldValue][] = [];
   for (const [name, entry] of Object.entries(value)) {
-    if (!isWireValue(entry)) {
+    if (!isFieldValue(entry)) {
       return null;
     }
     entries.push([name, entry]);

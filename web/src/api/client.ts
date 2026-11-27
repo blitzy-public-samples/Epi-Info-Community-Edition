@@ -5,10 +5,14 @@
 // ApiResult here, and every failure is parsed by ./errors.
 //
 // A success body is checked against its contract shape before it is reported: callers
-// receive only well-formed data, and an OK response whose body is malformed settles as a
-// failure, as does a record create or update answered by any status but its contracted
-// 201 or 200. For a POST or PUT that failure states no outcome, so the save may have been
-// applied and is never resent without the user's explicit consent.
+// receive only well-formed data, and an OK response whose body is malformed or is not
+// JSON settles as a failure of its own status, as does a record create, update or delete
+// answered by any status but its contracted 201, 200 or 204, and a health check answered
+// by any but its 200. So does a response, OK or
+// not, whose body could not be read to its end: its status arrived, so only a request
+// that received no response at all settles as networkError(). For a POST or PUT such a
+// failure states no outcome, so the save may have been applied and is never resent
+// without the user's explicit consent.
 //
 // The client is stateless: no retries, caching or timers. Retry decisions belong to
 // isSafeToResend and the hooks, and values are sent exactly as the caller gives them,
@@ -17,10 +21,11 @@
 // Field values are exact in both directions: a field value that is a JSON integer beyond
 // ±Number.MAX_SAFE_INTEGER that a `bigint` column can hold, such as 9007199254740993, is
 // read as a bigint rather than rounded to the nearest double, and a bigint is written as
-// that JSON integer, digit for digit. Every other number, such as a `tabIndex` or a
-// `count`, is read as JSON.parse reads it. A number typed as a fraction whose nearest
-// double is whole, such as 9007199254740992.5, is an ExactDecimal and is written as the
-// literal typed, never as that whole double. The wire keeps plain JSON numbers.
+// that JSON integer, digit for digit. A field value that is not whole although its nearest
+// double is, such as 9007199254740992.5 typed into a number field or an assigned
+// 1.0000000000000001 the API writes, is an ExactDecimal, read and written as that JSON
+// number token, never as the whole double. Every other number, such as a `tabIndex` or a
+// `count`, is read as JSON.parse reads it. The wire keeps plain JSON numbers.
 import createClient from 'openapi-fetch';
 
 import { isAbortError, networkError, parseProblem, type ApiError } from './errors';
@@ -33,11 +38,11 @@ import type {
   FieldEventRequest,
   FieldEventResponse,
   FieldOption,
+  FieldType,
   FieldValidation,
   FieldValue,
   FormDefinition,
   FormSummary,
-  HealthResponse,
   NavigationPosition,
   PageDefinition,
   RecordCountResponse,
@@ -69,6 +74,9 @@ export type RecordListQuery = NonNullable<paths['/api/forms/{viewId}/records']['
 
 /** Selects the record set; without `includeDeleted` the server uses the active set. */
 export type RecordSetOptions = NonNullable<paths['/api/forms/{viewId}/records/count']['get']['parameters']['query']>;
+
+/** The body of a `GET /health` 200: the health answer whose status is `healthy`. */
+export type HealthyResponse = paths['/health']['get']['responses'][200]['content']['application/json'];
 
 /**
  * Typed calls of every API endpoint. The last parameter of each is an optional
@@ -148,7 +156,9 @@ export interface ApiClient {
 
   /**
    * `DELETE /api/forms/{viewId}/records/{globalRecordId}`: soft-deletes the record;
-   * succeeds with status 204 and `data: null`, also when it was already deleted.
+   * succeeds with status 204 only, and `data: null`, also when it was already deleted.
+   * Any other 2xx settles as a failure with no write outcome, so the delete is never
+   * reported done without its acknowledgement.
    */
   readonly deleteRecord: (viewId: number, globalRecordId: string, signal?: AbortSignal) => Promise<ApiResult<null>>;
 
@@ -166,8 +176,13 @@ export interface ApiClient {
     signal?: AbortSignal,
   ) => Promise<ApiResult<FieldEventResponse>>;
 
-  /** `GET /health`: 200 when SQL Server answers; a 503 settles as an `unavailable` error. */
-  readonly getHealth: (signal?: AbortSignal) => Promise<ApiResult<HealthResponse>>;
+  /**
+   * `GET /health`: succeeds with status 200 only, and `{status: 'healthy'}`, when SQL Server
+   * answers. A 503 settles as an `unavailable` error, a 200 whose body is not that contracted
+   * `healthy` answer, `unhealthy` included, as a `server` error of status 200, and any other
+   * 2xx, a 202 or 203 with a `healthy` body included, as a `server` error of its own status.
+   */
+  readonly getHealth: (signal?: AbortSignal) => Promise<ApiResult<HealthyResponse>>;
 }
 
 /** What an openapi-fetch call resolves to; `data` and `error` are never both set. */
@@ -177,6 +192,11 @@ interface Exchange<D> {
   readonly response: Response;
 }
 
+// The body-less copies readingJsonExactly returns for a response whose status arrived but
+// whose body could not be read, or whose OK body is not JSON. openapi-fetch resolves the
+// exchange with the very Response the fetch wrapper returned, so settle recognises them.
+const unreadableResponses = new WeakSet<Response>();
+
 // Settles one call. `read` turns an OK response's body into the result's data, returning
 // `undefined` when the body is missing or is not the shape the endpoint's contract
 // returns. Such a response settles as a failure of its own status, which parseProblem
@@ -185,6 +205,8 @@ interface Exchange<D> {
 // With `successStatus`, an OK response of any other status settles the same way: a write
 // is acknowledged only by the status its contract gives, so a 202 or another 2xx from
 // something other than the API proves neither that the write was applied nor that it was not.
+// A response marked unreadable (readingJsonExactly), OK or not, also settles as a failure
+// of its own status with no write outcome: a 2xx as `server`, an error status by its kind.
 async function settle<D, T>(
   signal: AbortSignal | undefined,
   send: () => Promise<Exchange<D>>,
@@ -199,12 +221,19 @@ async function settle<D, T>(
     if (signal?.aborted === true || isAbortError(e)) {
       throw e;
     }
-    // No response was confirmed: a network failure, or an OK response whose body could
-    // not be parsed. Either way nothing is known about a write.
+    // No response arrived: a network failure, so nothing is known about a write. A
+    // response whose body could not be read or parsed does not end here; it resolves
+    // marked unreadable and settles below with the status it carried.
     return { ok: false, error: networkError() };
   }
 
   const { data, error, response } = exchange;
+  // The status arrived but the body did not, or an OK body was not JSON: nothing in it can
+  // be trusted, so it settles as a failure of that status that states no write outcome.
+  if (unreadableResponses.has(response)) {
+    return { ok: false, error: parseProblem(response.status, undefined) };
+  }
+
   // openapi-fetch reports an empty error body as `error: undefined`, so only the status
   // decides between success and failure.
   if (!response.ok) {
@@ -238,17 +267,26 @@ function withBody<D>(
   return settle(signal, send, (data) => (isBody(data) ? data : undefined), successStatus);
 }
 
-/** Settles a call whose success carries no body (204). */
+/**
+ * Settles a call whose one success is a bodyless 204, as a record delete has. Any other
+ * OK status, a 205 or a 200 with a body included, acknowledges nothing and settles as a
+ * failure of its own status.
+ */
 function withoutBody(signal: AbortSignal | undefined, send: () => Promise<Exchange<unknown>>): Promise<ApiResult<null>> {
-  return settle(signal, send, () => null);
+  return settle(signal, send, () => null, 204);
 }
 
 // Success bodies. Each guard reads a parsed body as `unknown` and holds only when every
 // member its schema in ./schema requires is present with the type the contract gives it,
-// so no caller reads a member that a malformed body lacks. Two parts are left to their
-// one reader: a field's `fieldType` is checked as a string, because FieldRenderer shows a
-// field of a type it does not know as a protected placeholder, and the field-event
-// response is passed on as parsed (raiseFieldEvent).
+// so no caller reads a member that a malformed body lacks. A member the contract types as
+// a union holds only with one of its published arms, narrowed to the one arm its field's
+// type takes where the form definition fixes it: an option value is a 0-based `int32`
+// index on an `option` field and the label text on a `legalValues` field, and a bound is a
+// number on a `number` field and a `YYYY-MM-DD` date on a `date` field. Likewise a field's
+// `options` are a list on an `option` or `legalValues` field and `null` on a field of every
+// other published type. Two parts are left to their one reader: a field's `fieldType` is
+// checked as a string, because FieldRenderer shows a field of a type it does not know as a
+// protected placeholder, and the field-event response is passed on as parsed (raiseFieldEvent).
 
 function isObject(value: unknown): value is Readonly<Record<string, unknown>> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -291,11 +329,22 @@ function isArrayOf<T>(value: unknown, isItem: (item: unknown) => item is T): val
   return items.every(isItem);
 }
 
-// A field value as parseJson reads one: a bigint is a whole number beyond the safe range
-// that it kept exact (FIELD_VALUE_PATHS). No response carries an ExactDecimal, so an
-// object is never a field value here.
-function isFieldValue(value: unknown): value is FieldValue {
-  return value === null || isString(value) || isBoolean(value) || isFiniteNumber(value) || typeof value === 'bigint';
+/**
+ * Whether `value` is a field value as this client reads and holds one: `null`, a string, a
+ * boolean, a finite number, a bigint, which is a whole number beyond the safe range kept
+ * exact (FIELD_VALUE_PATHS), or an {@link ExactDecimal} this module made. It is the one check
+ * of a scalar field value in a parsed response, so a reader of a body that is passed on
+ * unchecked, such as a field-event answer, accepts every value the client decodes.
+ */
+export function isFieldValue(value: unknown): value is FieldValue {
+  return (
+    value === null ||
+    isString(value) ||
+    isBoolean(value) ||
+    isFiniteNumber(value) ||
+    typeof value === 'bigint' ||
+    isExactDecimal(value)
+  );
 }
 
 /** A `values` map: an object whose own entries are all scalar field values. */
@@ -367,34 +416,152 @@ function isDiagnosticSeverity(value: unknown): value is DiagnosticSeverity {
   return isString(value) && Object.hasOwn(DIAGNOSTIC_SEVERITIES, value);
 }
 
-function isFieldOption(body: unknown): body is FieldOption {
-  return isObject(body) && isFieldValue(body.value) && isString(body.label);
+// The field types whose option values or bounds the form definition narrows to one
+// published arm. Typed by the contract, so a renamed field type fails tsc here.
+const OPTION_FIELD = 'option' satisfies FieldType;
+const LEGAL_VALUES_FIELD = 'legalValues' satisfies FieldType;
+const NUMBER_FIELD = 'number' satisfies FieldType;
+const DATE_FIELD = 'date' satisfies FieldType;
+
+// The largest `int32`, the format of an option index.
+const MAX_INT32 = 2_147_483_647;
+
+/** An option index as the contract publishes one: an `int32` of at least 0. */
+function isOptionIndex(value: unknown): value is number {
+  return isInteger(value) && value >= 0 && value <= MAX_INT32;
 }
 
-function isFieldValidation(body: unknown): body is FieldValidation {
+// A bound's `date` format: YYYY-MM-DD with ASCII digits; without the m flag, `$` matches
+// only at the end of the text.
+const ISO_DATE = /^(\d{4})-(\d{2})-(\d{2})$/;
+
+// A YYYY-MM-DD text naming a real day, by integer arithmetic, so 2011-02-30 and 2011-13-45
+// are not dates. Year 0000 is not one either: the server writes a bound from a .NET
+// DateOnly, whose years start at 0001.
+function isCalendarDate(value: unknown): value is string {
+  if (!isString(value)) {
+    return false;
+  }
+  const match = ISO_DATE.exec(value);
+  if (match === null) {
+    return false;
+  }
+
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  if (year < 1 || month < 1 || month > 12 || day < 1) {
+    return false;
+  }
+
+  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const daysInMonth = month === 2 ? (leapYear ? 29 : 28) : [4, 6, 9, 11].includes(month) ? 30 : 31;
+  return day <= daysInMonth;
+}
+
+/**
+ * An option value of a field of `fieldType`: the index on an `option` field, the label
+ * text on a `legalValues` field, and either published arm on a field of any other type.
+ */
+function isOptionValue(value: unknown, fieldType: string): value is FieldOption['value'] {
+  switch (fieldType) {
+    case OPTION_FIELD:
+      return isOptionIndex(value);
+    case LEGAL_VALUES_FIELD:
+      return isString(value);
+    default:
+      return isOptionIndex(value) || isString(value);
+  }
+}
+
+function isFieldOption(body: unknown, fieldType: string): body is FieldOption {
+  return isObject(body) && isOptionValue(body.value, fieldType) && isString(body.label);
+}
+
+// Whether a field of each published type carries an options list: an `option` or
+// `legalValues` field does, possibly empty, and every other type carries `null`. Keyed by
+// the contract's FieldType, so a renamed, added or removed field type fails tsc here.
+const OPTION_LISTS: Readonly<Record<FieldType, boolean>> = {
+  label: false,
+  group: false,
+  text: false,
+  multiline: false,
+  number: false,
+  date: false,
+  checkbox: false,
+  option: true,
+  legalValues: true,
+  unsupported: false,
+};
+
+/** A type the contract publishes; an own key only, so `constructor` or `__proto__` is none. */
+function isPublishedFieldType(fieldType: string): fieldType is FieldType {
+  return Object.hasOwn(OPTION_LISTS, fieldType);
+}
+
+/**
+ * The `options` of a field of `fieldType`: a list, possibly empty, of that type's options on
+ * an `option` or `legalValues` field, and `null` on a field of every other published type.
+ * A field of a type the contract does not name takes `null` or a list of either published
+ * arm, because FieldRenderer shows it as a protected placeholder that reads no option.
+ */
+function isFieldOptions(value: unknown, fieldType: string): value is FieldDefinition['options'] {
+  const isOption = (option: unknown): option is FieldOption => isFieldOption(option, fieldType);
+  if (!isPublishedFieldType(fieldType)) {
+    return value === null || isArrayOf(value, isOption);
+  }
+  return OPTION_LISTS[fieldType] ? isArrayOf(value, isOption) : value === null;
+}
+
+/**
+ * A `lower` or `upper` bound of a field of `fieldType`: `null` when unset, else a finite
+ * number on a `number` field, a calendar date on a `date` field, and either on a field of
+ * any other type. A bound is no field value, so parseJson reads it as JSON.parse does,
+ * never as a bigint.
+ */
+function isBound(value: unknown, fieldType: string): value is FieldValidation['lower'] {
+  if (value === null) {
+    return true;
+  }
+  switch (fieldType) {
+    case NUMBER_FIELD:
+      return isFiniteNumber(value);
+    case DATE_FIELD:
+      return isCalendarDate(value);
+    default:
+      return isFiniteNumber(value) || isCalendarDate(value);
+  }
+}
+
+function isFieldValidation(body: unknown, fieldType: string): body is FieldValidation {
   return (
     isObject(body) &&
     isBoolean(body.required) &&
     isBoolean(body.readOnly) &&
     isIntegerOrNull(body.maxLength) &&
-    isFieldValue(body.lower) &&
-    isFieldValue(body.upper) &&
+    isBound(body.lower, fieldType) &&
+    isBound(body.upper, fieldType) &&
     isStringOrNull(body.pattern)
   );
 }
 
 function isFieldDefinition(body: unknown): body is FieldDefinition {
+  if (!isObject(body)) {
+    return false;
+  }
+  // The field's type decides whether it carries options, and the arm its option values and
+  // bounds take.
+  const { fieldType } = body;
   return (
-    isObject(body) &&
     isString(body.name) &&
-    isString(body.fieldType) &&
+    isString(fieldType) &&
     isStringOrNull(body.prompt) &&
     isFiniteNumber(body.tabIndex) &&
     isInteger(body.pageId) &&
     isBoolean(body.unsupported) &&
     isStringOrNull(body.unsupportedType) &&
-    isFieldValidation(body.validation) &&
-    (body.options === null || isArrayOf(body.options, isFieldOption)) &&
+    isFieldValidation(body.validation, fieldType) &&
+    isFieldOptions(body.options, fieldType) &&
     (body.members === null || isArrayOf(body.members, isString))
   );
 }
@@ -433,8 +600,11 @@ function isFormDefinition(body: unknown): body is FormDefinition {
   );
 }
 
-function isHealthResponse(body: unknown): body is HealthResponse {
-  return isObject(body) && isString(body.status);
+// The one status a `GET /health` 200 carries; typed by the contract, so a renamed status fails tsc here.
+const HEALTHY: HealthyResponse['status'] = 'healthy';
+
+function isHealthyResponse(body: unknown): body is HealthyResponse {
+  return isObject(body) && body.status === HEALTHY;
 }
 
 // `null` rather than an absent member, so the init also compiles under
@@ -589,8 +759,9 @@ function fractionLiteral(literal: string): string | null {
  *   exact bigint (`9007199254740993`, `9.007199254740993e15`), as the client reads it
  *   from JSON;
  * - a number that is not whole but whose nearest double is (`9007199254740992.5`,
- *   `2.0000000000000001`, `1e-400`) is the frozen {@link ExactDecimal} of its literal,
- *   which the client writes bare, so it never reaches the server as that whole double.
+ *   `2.0000000000000001`, `1e-400`) is the frozen {@link ExactDecimal} of its literal, as
+ *   the client reads such a field value from JSON, and the client writes it bare, so it
+ *   never reaches the server as that whole double.
  *
  * Every other fraction, such as `34.5` or `0.1`, and every other whole number, such as
  * `1e20`, is its nearest double. The text is read as Number() reads it: surrounding
@@ -602,29 +773,42 @@ export function numberFromText(text: string): number | bigint | ExactDecimal | n
     return null;
   }
 
-  const value = exactNumber(trimmed);
-  const literal = typeof value === 'number' && Number.isInteger(value) ? fractionLiteral(trimmed) : null;
-  if (literal === null) {
-    return value;
+  return exactFieldNumber(trimmed);
+}
+
+// A number literal as a field value holds it, for typed text and for a field value in a
+// response alike: exactNumber's value, except that a literal that is not whole although
+// that value is becomes the ExactDecimal of its JSON number token, so 1.0000000000000001
+// never becomes the whole number 1 on its way in or out.
+function exactFieldNumber(literal: string): number | bigint | ExactDecimal {
+  const value = exactNumber(literal);
+  const fraction = typeof value === 'number' && Number.isInteger(value) ? fractionLiteral(literal) : null;
+  return fraction === null ? value : exactDecimal(fraction);
+}
+
+// Every ExactDecimal this module made, and nothing else. Membership, not shape, makes one, so
+// a `values` map whose fields are named `kind` and `literal` stays a map wherever it goes.
+const EXACT_DECIMALS = new WeakSet<object>();
+
+// The one maker of an ExactDecimal: frozen, so its literal can never change after it is
+// checked. `literal` comes from fractionLiteral, which only ever builds a JSON number token.
+function exactDecimal(literal: string): ExactDecimal {
+  if (!JSON_NUMBER_TOKEN.test(literal)) {
+    throw new RangeError('An exact decimal literal must be a JSON number token.');
   }
-  const decimal: ExactDecimal = Object.freeze({ kind: 'decimal', literal });
+  // The brand is type-only, so the object made here is asserted to carry it.
+  const decimal = Object.freeze({ kind: 'decimal', literal }) as ExactDecimal;
+  EXACT_DECIMALS.add(decimal);
   return decimal;
 }
 
 /**
- * Whether `value` is an {@link ExactDecimal}: an object of kind `decimal` whose `literal` is
- * a JSON number token, so writing it bare can only ever write a number.
+ * Whether `value` is an {@link ExactDecimal} this module made. An object that merely has its
+ * shape, such as a `values` map with a `kind` of `decimal` and a `literal` field, is not one,
+ * so only a literal checked as a JSON number token is ever written bare.
  */
 export function isExactDecimal(value: unknown): value is ExactDecimal {
-  return (
-    typeof value === 'object' &&
-    value !== null &&
-    'kind' in value &&
-    value.kind === 'decimal' &&
-    'literal' in value &&
-    typeof value.literal === 'string' &&
-    JSON_NUMBER_TOKEN.test(value.literal)
-  );
+  return typeof value === 'object' && value !== null && EXACT_DECIMALS.has(value);
 }
 
 /**
@@ -786,16 +970,17 @@ function readJsonLiteral<T>(cursor: JsonCursor, word: string, value: T): T {
   return value;
 }
 
-// A field value as exactNumber reads it; any other number as JSON.parse does, the nearest
+// A field value as a number field holds it (exactFieldNumber), so the API's
+// 1.0000000000000001 is an ExactDecimal; any other number as JSON.parse does, the nearest
 // double, which Number() gives for every token of the grammar.
-function readJsonNumber(cursor: JsonCursor, fieldValue: boolean): number | bigint {
+function readJsonNumber(cursor: JsonCursor, fieldValue: boolean): number | bigint | ExactDecimal {
   JSON_NUMBER.lastIndex = cursor.at;
   const match = JSON_NUMBER.exec(cursor.text);
   if (match === null) {
     throw jsonSyntaxError(cursor);
   }
   cursor.at = JSON_NUMBER.lastIndex;
-  return fieldValue ? exactNumber(match[0]) : Number(match[0]);
+  return fieldValue ? exactFieldNumber(match[0]) : Number(match[0]);
 }
 
 function readJsonString(cursor: JsonCursor): string {
@@ -894,7 +1079,8 @@ function readJsonObject(cursor: JsonCursor, path: JsonPath | undefined): Record<
 
 // JSON.parse of a response body with exact field values: the same value for the same text,
 // except that a field value (FIELD_VALUE_PATHS) that is a whole number beyond the safe
-// range and within the 64-bit range is the bigint it stands for. Throws a SyntaxError for
+// range and within the 64-bit range is the bigint it stands for, and one that is not whole
+// although its nearest double is, the ExactDecimal of its token. Throws a SyntaxError for
 // text that is not JSON. Nesting is recursive, which the API's shallow bodies never strain.
 function parseJson(text: string): unknown {
   const cursor: JsonCursor = { text, at: 0 };
@@ -909,8 +1095,9 @@ function parseJson(text: string): unknown {
 // JSON.stringify of plain data (objects, arrays, strings, numbers, booleans, null), except
 // that a bigint is written as the JSON integer it holds, where JSON.stringify throws, and an
 // ExactDecimal as its literal, the JSON number typed, where JSON.stringify writes an object.
-// As JSON.stringify does, an `undefined`, function or symbol member is left out, and such an
-// array element is written as `null`.
+// Any other object is written as an object, whatever its members are named, so a `values`
+// map holding text fields named `kind` and `literal` stays a map. As JSON.stringify does, an
+// `undefined`, function or symbol member is left out, and such an array element is written as `null`.
 function serializeJson(value: unknown): string | undefined {
   if (typeof value === 'bigint') {
     return value.toString();
@@ -938,24 +1125,75 @@ function serializeJson(value: unknown): string | undefined {
   return JSON.stringify(value);
 }
 
-// openapi-fetch reads an OK body with Response.json() when the response carries a
-// Content-Length, and with text() and the global JSON.parse when it does not. The copy
-// therefore always carries one, and its json() is parseJson, so the field values of every
-// OK body are read exactly. Error bodies hold no field values and keep openapi-fetch's own
-// parsing.
-async function readingJsonExactly(response: Response): Promise<Response> {
-  if (!response.ok || response.status === 204 || response.status === 205) {
-    return response;
-  }
+// The statuses whose response has no body by definition (the Fetch standard's null body
+// statuses); a Response of one of them cannot be built with a body.
+const NULL_BODY_STATUSES: ReadonlySet<number> = new Set([101, 103, 204, 205, 304]);
 
-  const text = await response.text();
-  // The copy holds the decoded text whole, so it is neither encoded nor chunked.
+// A copy of `response` with `text` as its body, held decoded and whole, so it is neither
+// encoded nor chunked and carries its Content-Length; with `null`, a copy with no body,
+// whose Content-Length of 0 tells openapi-fetch to read none.
+function copyWithBody(response: Response, text: string | null): Response {
   const headers = new Headers(response.headers);
   headers.delete('Content-Encoding');
   headers.delete('Transfer-Encoding');
-  headers.set('Content-Length', String(new TextEncoder().encode(text).byteLength));
-  const copy = new Response(text, { status: response.status, statusText: response.statusText, headers });
-  Object.defineProperty(copy, 'json', { value: () => Promise.resolve(text).then(parseJson) });
+  headers.set('Content-Length', String(text === null ? 0 : new TextEncoder().encode(text).byteLength));
+  return new Response(text, { status: response.status, statusText: response.statusText, headers });
+}
+
+// The body-less copy of a response whose body cannot be used, marked for settle.
+function unreadable(response: Response): Response {
+  const copy = copyWithBody(response, null);
+  unreadableResponses.add(copy);
+  return copy;
+}
+
+// Reads every response body here, once its status has arrived, so a body that fails is
+// told apart from a request that got no response; the latter alone rejects (settle).
+// - A null body status has no body, whatever its headers advertise, so it gives a copy
+//   with no body and a Content-Length of 0, which openapi-fetch does not read. Passed on
+//   as it came, a 205 advertising a nonzero Content-Length would have openapi-fetch, which
+//   skips the body only of a 204 or a Content-Length of 0, parse the missing body as JSON
+//   and reject, the no-response case. The copy settles by its status alone: a 204
+//   acknowledges a delete, and any other such status answers no call, so it settles as a
+//   failure of that status.
+// - A body whose stream fails, such as a connection cut mid-body, gives a copy marked
+//   unreadable, so its status is kept, unless the request's signal is aborted: an abort
+//   stays an abort. Only that signal, which follows the caller's and any deadline composed
+//   into the request, tells a cancellation apart from a failed stream; the error's name
+//   does not, since a stream can fail with an AbortError that no abort of the call caused.
+// - An OK body is parsed by parseJson, so the field values of every OK body are read
+//   exactly. Text that is not JSON, an empty body included, gives a copy marked
+//   unreadable. Otherwise the copy's json() answers the parsed body: openapi-fetch reads an
+//   OK body with json() when the response carries a Content-Length, which the copy does.
+// - An error body holds no field values, so the copy carries its text and openapi-fetch
+//   parses it as it parses any error body, a non-JSON one included.
+async function readingJsonExactly(request: Request, response: Response): Promise<Response> {
+  if (NULL_BODY_STATUSES.has(response.status)) {
+    return copyWithBody(response, null);
+  }
+
+  let text: string;
+  try {
+    text = await response.text();
+  } catch (e) {
+    if (request.signal.aborted) {
+      throw e;
+    }
+    return unreadable(response);
+  }
+
+  if (!response.ok) {
+    return copyWithBody(response, text);
+  }
+
+  let body: unknown;
+  try {
+    body = parseJson(text);
+  } catch {
+    return unreadable(response);
+  }
+  const copy = copyWithBody(response, text);
+  Object.defineProperty(copy, 'json', { value: () => Promise.resolve(body) });
   return copy;
 }
 
@@ -977,7 +1215,7 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
   const send = options.fetch ?? ((request: Request) => globalThis.fetch(request));
   const http = createClient<paths>({
     baseUrl: options.baseUrl ?? pageOrigin(),
-    fetch: async (request: Request) => readingJsonExactly(await send(request)),
+    fetch: async (request: Request) => readingJsonExactly(request, await send(request)),
     bodySerializer: serializeJson,
   });
 
@@ -1114,7 +1352,7 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
         (data) => data,
       ),
 
-    getHealth: (signal) => withBody(signal, () => http.GET('/health', abortable(signal)), isHealthResponse),
+    getHealth: (signal) => withBody(signal, () => http.GET('/health', abortable(signal)), isHealthyResponse, 200),
   };
 }
 

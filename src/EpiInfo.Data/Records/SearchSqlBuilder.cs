@@ -91,10 +91,22 @@ internal static class SearchSqlBuilder
     internal const int PositionOrdinal = 3;
 
     /// <summary>
+    /// The native type of the navigation position at <see cref="PositionOrdinal"/>: <c>bigint</c>, the type of
+    /// <c>ROW_NUMBER()</c>.
+    /// </summary>
+    internal const DbType PositionType = DbType.Int64;
+
+    /// <summary>
     /// The ordinal of a list row's page flag in a <see cref="ListSelect"/>, an <c>int</c>: 1 for a row of the requested
     /// page, 0 for the one row an empty page returns, which carries only the total.
     /// </summary>
     internal const int InPageOrdinal = 3;
+
+    /// <summary>
+    /// The native type of the page flag at <see cref="InPageOrdinal"/>: <c>int</c>, the type of a <c>CASE</c> whose
+    /// results are the literals 0 and 1.
+    /// </summary>
+    internal const DbType InPageType = DbType.Int32;
 
     /// <summary>
     /// The ordinal of the total in a <see cref="SearchSelect"/> or a <see cref="ListSelect"/>, a <c>bigint</c> that
@@ -102,6 +114,11 @@ internal static class SearchSqlBuilder
     /// filtered set, whatever the page, in the list.
     /// </summary>
     internal const int TotalOrdinal = 4;
+
+    /// <summary>
+    /// The native type of the total at <see cref="TotalOrdinal"/>: <c>bigint</c>, the type of <c>COUNT_BIG(*)</c>.
+    /// </summary>
+    internal const DbType TotalType = DbType.Int64;
 
     // The first grid-column ordinal of each result layout.
     private const int SearchFirstColumnOrdinal = 5;

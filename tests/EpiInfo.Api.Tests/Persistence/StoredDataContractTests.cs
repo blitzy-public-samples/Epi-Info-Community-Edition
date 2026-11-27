@@ -34,7 +34,9 @@ namespace EpiInfo.Api.Tests.Persistence;
 /// so these proofs live here: each record is created with <c>POST</c> on the API that
 /// <see cref="GateObservingApiFactory.ForDatabaseAsync"/> hosts, the host <see cref="ApiFactory.ForDatabaseAsync"/>
 /// builds, carrying a <see cref="TestDatabase.NewMarker"/> marker in <see cref="TestDatabase.MarkerField"/> and in no
-/// other field, and every later write is a request on it. The records stay in the database, so a rerun needs no reset.
+/// other field, and every later write is a request on it, except where a case needs what only the store's interface
+/// offers, its result or its stamp source: that case calls the host's own store, which every request of the host
+/// reaches, on its own record. The records stay in the database, so a rerun needs no reset.
 /// </para>
 /// <para>
 /// The required gate the API hands <see cref="IDataStore.UpdateAsync"/> is observed by a forwarding decorator over the
@@ -471,6 +473,98 @@ public sealed class SqlRecordRepositoryWriteTests : IAsyncLifetime
             Describe("A delete of an unknown id sent a write.", Factory.Recorder.Commands));
     }
 
+    // The soft delete's result carries the GlobalRecordId its locked read returned, as stored, which the API's
+    // post-commit log line names. Whether an upper-cased spelling finds the lower-case stored id is the column
+    // collation's decision, which testdata/sql/00_create_database.sql leaves to the server, so SQL Server is asked on
+    // the test's own connection with the locked read's predicate. Where it matches, the upper-cased delete is Deleted
+    // with the stored spelling; where it does not, that delete is NotFound with nothing written, and the stored
+    // spelling then deletes the record. Either way the base row keyed by the stored spelling is the one that changes,
+    // a repeat in the same spelling finds it deleted and carries the stored spelling, and an unknown id carries none.
+    // The record's id always holds a letter, so its upper-cased spelling always differs. The result can only be read
+    // on the store, so this case calls the host's own store, the one every request of the host reaches, on a record
+    // created through the API.
+    [Fact]
+    public async Task SoftDeleteResultCarriesTheStoredSpellingOfTheId()
+    {
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        CancellationToken ct = timeout.Token;
+        await using DatabaseWriteLock dbLock = await DatabaseWriteLock.AcquireExclusiveAsync(ct);
+
+        ApiForm form = await ReadFormAsync(FoodHistory, ct);
+        Stamp(FirstTime);
+        string id = await CreateRecordWithALetterAsync(form.ViewId, ct);
+        string upperCased = id.ToUpperInvariant();
+        Assert.NotEqual(id, upperCased);
+        bool upperCasedMatches = await MatchesStoredIdAsync(form.BaseTable, upperCased, id, ct);
+
+        IDataStore store = Factory.Services.GetRequiredService<IDataStore>();
+        FormMetadata metadata = await store.GetFormMetadataAsync(form.ViewId, ct)
+            ?? throw new XunitException($"The store holds no form {form.BaseTable}.");
+
+        SqlSnapshot before = await SqlSnapshot.CaptureAsync(ct);
+        string deleteSpelling = upperCased;
+        if (!upperCasedMatches)
+        {
+            // The collation tells the letter cases apart, so the upper-cased spelling names no row: the delete finds
+            // nothing, carries no id and writes nothing.
+            SoftDeleteResult missed = await store.SoftDeleteAsync(
+                metadata,
+                upperCased,
+                () => new SaveStamp(Environment.UserName, SecondTime),
+                ct);
+            Assert.Equal(
+                (SoftDeleteStatus.NotFound, false, (string?)null),
+                (missed.Status, missed.IsFound, missed.GlobalRecordId));
+            SnapshotDiff missedDiff = SqlSnapshot.Compare(before, await SqlSnapshot.CaptureAsync(ct));
+            Assert.True(missedDiff.IsEmpty, missedDiff.ToString());
+            deleteSpelling = id;
+        }
+
+        SoftDeleteResult deleted = await store.SoftDeleteAsync(
+            metadata,
+            deleteSpelling,
+            () => new SaveStamp(Environment.UserName, SecondTime),
+            ct);
+        SqlSnapshot afterDelete = await SqlSnapshot.CaptureAsync(ct);
+
+        Assert.Equal(
+            (SoftDeleteStatus.Deleted, true, (string?)id),
+            (deleted.Status, deleted.IsFound, deleted.GlobalRecordId));
+        SnapshotDiff diff = SqlSnapshot.Compare(before, afterDelete);
+        Assert.True(
+            diff.AddedRows.Count == 0 && diff.RemovedRows.Count == 0 && diff.SchemaChanges.Count == 0,
+            diff.ToString());
+        Assert.Equal(
+            new[]
+            {
+                new SnapshotCellChange(form.BaseTable, id, RecStatusColumn, ActiveStatus, DeletedStatus),
+                new SnapshotCellChange(form.BaseTable, id, LastSaveTimeColumn, FirstTime, SecondTime),
+            }.OrderBy(cell => cell.Column, StringComparer.Ordinal),
+            diff.ChangedCells.OrderBy(cell => cell.Column, StringComparer.Ordinal));
+
+        SoftDeleteResult repeated = await store.SoftDeleteAsync(
+            metadata,
+            deleteSpelling,
+            () => new SaveStamp(Environment.UserName, ThirdTime),
+            ct);
+        Assert.Equal(
+            (SoftDeleteStatus.AlreadyDeleted, true, (string?)id),
+            (repeated.Status, repeated.IsFound, repeated.GlobalRecordId));
+
+        SoftDeleteResult unknown = await store.SoftDeleteAsync(
+            metadata,
+            Guid.NewGuid().ToString().ToUpperInvariant(),
+            () => new SaveStamp(Environment.UserName, FourthTime),
+            ct);
+        Assert.Equal(
+            (SoftDeleteStatus.NotFound, false, (string?)null),
+            (unknown.Status, unknown.IsFound, unknown.GlobalRecordId));
+
+        // Neither the repeat nor the unknown id wrote anything, stamps included.
+        SnapshotDiff unchanged = SqlSnapshot.Compare(afterDelete, await SqlSnapshot.CaptureAsync(ct));
+        Assert.True(unchanged.IsEmpty, unchanged.ToString());
+    }
+
     // AAP 0.3.4.6, update step 1: the locked read stops an update at RecStatus 0 (409) or at a missing base row (404),
     // before the page rows are read and the required gate runs on them, and before any write.
     [Fact]
@@ -515,6 +609,187 @@ public sealed class SqlRecordRepositoryWriteTests : IAsyncLifetime
 
         SnapshotDiff diff = SqlSnapshot.Compare(before, await SqlSnapshot.CaptureAsync(ct));
         Assert.True(diff.IsEmpty, diff.ToString());
+    }
+
+    // AAP 0.3.4.6 (save stamp, statement order) and 0.3.4.2: the store asks for the save stamp only once its locked
+    // checks decide that the operation writes, inside the transaction and before its first data statement. A source
+    // that throws or returns no stamp, on an active record, rolls the update and the soft delete back with nothing
+    // written and reports NotWritten. An update the required gate refuses, an update of a deleted or unknown record,
+    // and a soft delete of an already-deleted or unknown record never ask. A successful update and soft delete each
+    // ask exactly once, after the locked read and the gate and before every write, and store that stamp. The source is
+    // only reachable on the store, so this case calls the host's own store, the one every request of the host
+    // reaches, on a record created through the API.
+    [Fact]
+    public async Task StoreAsksForTheStampOnlyOnceAWriteIsDecided()
+    {
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        CancellationToken ct = timeout.Token;
+        await using DatabaseWriteLock dbLock = await DatabaseWriteLock.AcquireExclusiveAsync(ct);
+
+        ApiForm form = await ReadFormAsync(FoodHistory, ct);
+        Stamp(FirstTime);
+        CreatedRecord created = await ApiTestClient.CreateRecordAsync(
+            Client,
+            form.ViewId,
+            new Dictionary<string, object?> { [TestDatabase.MarkerField] = TestDatabase.NewMarker() },
+            ct);
+        string id = created.GlobalRecordId;
+        string unknownId = Guid.NewGuid().ToString();
+
+        IDataStore store = Factory.Services.GetRequiredService<IDataStore>();
+        FormMetadata metadata = await store.GetFormMetadataAsync(form.ViewId, ct)
+            ?? throw new XunitException($"The store holds no form {form.BaseTable}.");
+        var submitted = new Dictionary<string, FieldValue> { [FirstNameField] = FieldValue.FromText("Stamped") };
+        Func<StoredRecord, RecordValidationResult> passes =
+            _ => RecordValidationResult.Success(new Dictionary<string, FieldValue>());
+
+        // Each call of a counting source records the sequence of the last command the recorder had seen, as the
+        // gate's observer does, and returns a stamp at the given time.
+        var stampCalls = new List<long>();
+        Func<SaveStamp> CountingSource(DateTime time) => () =>
+        {
+            IReadOnlyList<RecordedCommand> commands = Factory.Recorder.Commands;
+            stampCalls.Add(commands.Count == 0 ? 0 : commands[^1].Sequence);
+            return new SaveStamp(Environment.UserName, time);
+        };
+
+        // A refusing source on the active record: asked once per call, and each call rolls back with nothing written.
+        SqlSnapshot before = await SqlSnapshot.CaptureAsync(ct);
+        Factory.Recorder.Clear();
+        var refusal = new InvalidOperationException("The test's stamp source refuses.");
+        var refusing = new (string Name, Func<SaveStamp> Source, Action<Exception?> AssertInner)[]
+        {
+            (
+                "throws",
+                () =>
+                {
+                    stampCalls.Add(-1);
+                    throw refusal;
+                },
+                inner => Assert.Same(refusal, inner)),
+            (
+                "returns no stamp",
+                () =>
+                {
+                    stampCalls.Add(-1);
+                    return null!;
+                },
+                inner => Assert.IsType<InvalidOperationException>(inner)),
+        };
+        foreach ((string name, Func<SaveStamp> source, Action<Exception?> assertInner) in refusing)
+        {
+            stampCalls.Clear();
+            DataStoreWriteException update = await Assert.ThrowsAsync<DataStoreWriteException>(
+                () => store.UpdateAsync(metadata, id, submitted, source, passes, permissions: null, ct));
+            DataStoreWriteException delete = await Assert.ThrowsAsync<DataStoreWriteException>(
+                () => store.SoftDeleteAsync(metadata, id, source, ct));
+
+            Assert.True(stampCalls.Count == 2, $"A source that {name} was not asked once per write.");
+            Assert.Equal(
+                (UpdateOperation, WriteOutcome.NotWritten, (int?)null),
+                (update.Operation, update.Outcome, update.SqlErrorNumber));
+            Assert.Equal(
+                (DeleteOperation, WriteOutcome.NotWritten, (int?)null),
+                (delete.Operation, delete.Outcome, delete.SqlErrorNumber));
+            assertInner(update.InnerException);
+            assertInner(delete.InnerException);
+        }
+
+        Assert.True(
+            Factory.Recorder.Writes().Count == 0,
+            Describe("A write whose stamp was refused sent a write.", Factory.Recorder.Commands));
+        SnapshotDiff refusedDiff = SqlSnapshot.Compare(before, await SqlSnapshot.CaptureAsync(ct));
+        Assert.True(refusedDiff.IsEmpty, refusedDiff.ToString());
+
+        // An update the required gate refuses writes nothing, so it never asks.
+        stampCalls.Clear();
+        RecordWriteResult gated = await store.UpdateAsync(
+            metadata,
+            id,
+            submitted,
+            CountingSource(SecondTime),
+            _ => RecordValidationResult.RequestFailure("The test's gate refuses the record."),
+            permissions: null,
+            ct);
+        Assert.Equal((RecordWriteStatus.ValidationFailed, 0), (gated.Status, stampCalls.Count));
+
+        // A successful update asks once, after the locked read and the gate and before its first write.
+        stampCalls.Clear();
+        Factory.Recorder.Clear();
+        Factory.ClearGateCalls();
+        RecordWriteResult updated = await store.UpdateAsync(
+            metadata,
+            id,
+            submitted,
+            CountingSource(SecondTime),
+            passes,
+            permissions: null,
+            ct);
+        Assert.Equal(RecordWriteStatus.Success, updated.Status);
+        long atStamp = Assert.Single(stampCalls);
+        long atGate = Assert.Single(Factory.GateCalls);
+        IReadOnlyList<RecordedCommand> updateWrites = WritesOf(Factory.Recorder.Commands, UpdateOperation);
+        Assert.True(
+            atGate <= atStamp && updateWrites.Count > 0 && updateWrites.All(write => write.Sequence > atStamp),
+            Describe(
+                string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"The update asked for its stamp after command #{atStamp}."),
+                Factory.Recorder.Commands));
+
+        // A soft delete of the active record asks once, after its locked read and before its one write.
+        stampCalls.Clear();
+        Factory.Recorder.Clear();
+        SoftDeleteResult deleted = await store.SoftDeleteAsync(metadata, id, CountingSource(ThirdTime), ct);
+        Assert.Equal((SoftDeleteStatus.Deleted, (string?)id), (deleted.Status, deleted.GlobalRecordId));
+        atStamp = Assert.Single(stampCalls);
+        IReadOnlyList<RecordedCommand> deleteTransaction = TransactionOf(Factory.Recorder.Commands, DeleteOperation);
+        RecordedCommand deleteWrite = Assert.Single(deleteTransaction, command => command.IsWrite);
+        Assert.True(
+            deleteTransaction.Any(command => !command.IsWrite && command.Sequence <= atStamp)
+            && deleteWrite.Sequence > atStamp,
+            Describe(
+                string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"The delete asked for its stamp after command #{atStamp}."),
+                deleteTransaction));
+
+        // Both writes stored the stamp the source gave them.
+        SqlSnapshot afterWrites = await SqlSnapshot.CaptureAsync(ct);
+        AssertCells(
+            RowOf(afterWrites, form.BaseTable, id),
+            new Dictionary<string, object?>(StringComparer.Ordinal)
+            {
+                [RecStatusColumn] = DeletedStatus,
+                [LastSaveLogonNameColumn] = Environment.UserName,
+                [LastSaveTimeColumn] = ThirdTime,
+            });
+        AssertCells(
+            RowOf(afterWrites, FoodHistoryPageOne, id),
+            new Dictionary<string, object?>(StringComparer.Ordinal) { [FirstNameField] = "Stamped" });
+
+        // The record is now deleted: an update of it, a repeated soft delete, and both writes of an unknown id write
+        // nothing, so none asks.
+        stampCalls.Clear();
+        Factory.Recorder.Clear();
+        RecordWriteResult updateOfDeleted = await store.UpdateAsync(
+            metadata, id, submitted, CountingSource(FourthTime), passes, permissions: null, ct);
+        SoftDeleteResult repeated = await store.SoftDeleteAsync(metadata, id, CountingSource(FourthTime), ct);
+        RecordWriteResult updateOfUnknown = await store.UpdateAsync(
+            metadata, unknownId, submitted, CountingSource(FourthTime), passes, permissions: null, ct);
+        SoftDeleteResult deleteOfUnknown =
+            await store.SoftDeleteAsync(metadata, unknownId, CountingSource(FourthTime), ct);
+
+        Assert.Equal(
+            (RecordWriteStatus.Deleted, SoftDeleteStatus.AlreadyDeleted, RecordWriteStatus.NotFound,
+                SoftDeleteStatus.NotFound, 0),
+            (updateOfDeleted.Status, repeated.Status, updateOfUnknown.Status, deleteOfUnknown.Status,
+                stampCalls.Count));
+        Assert.True(
+            Factory.Recorder.Writes().Count == 0,
+            Describe("A write the store answered without writing sent a write.", Factory.Recorder.Commands));
+        SnapshotDiff unchanged = SqlSnapshot.Compare(afterWrites, await SqlSnapshot.CaptureAsync(ct));
+        Assert.True(unchanged.IsEmpty, unchanged.ToString());
     }
 
     // The base-table last-save stamp columns an update writes, in ordinal order.
@@ -710,6 +985,66 @@ public sealed class SqlRecordRepositoryWriteTests : IAsyncLifetime
 
     // Sets the host clock the save stamps are read from; every time this class sets is a whole second.
     private void Stamp(DateTime localTime) => Factory.Clock.SetLocalNow(localTime);
+
+    // Creates a record through POST carrying a new marker and returns its id, creating another while the generated id
+    // holds no letter, so the id always has a spelling in the other letter case. A version-4 GUID string lacks a letter
+    // only when every hex digit but its fixed version digit is a decimal digit, about once in 2.7 million ids, so even
+    // a second attempt is rare. Every record created carries its own marker and stays in the database, as the class's
+    // records do.
+    private async Task<string> CreateRecordWithALetterAsync(int viewId, CancellationToken ct)
+    {
+        const int Attempts = 8;
+        for (int attempt = 0; attempt < Attempts; attempt++)
+        {
+            CreatedRecord created = await ApiTestClient.CreateRecordAsync(
+                Client,
+                viewId,
+                new Dictionary<string, object?> { [TestDatabase.MarkerField] = TestDatabase.NewMarker() },
+                ct);
+            if (created.GlobalRecordId.Any(char.IsAsciiLetter))
+            {
+                return created.GlobalRecordId;
+            }
+        }
+
+        throw new XunitException(string.Create(
+            CultureInfo.InvariantCulture,
+            $"{Attempts} records created through the API all have an id without a letter."));
+    }
+
+    // Whether spelling finds the stored id under the base column's own collation, by the predicate of the store's
+    // locked read (RecordSqlBuilder.LockBase): equal text and equal byte length, with spelling bound as nvarchar(max),
+    // as the store binds it. Ids are unique GUID strings, so the only row it may find is the test's own record; any
+    // other row fails the test.
+    private static async Task<bool> MatchesStoredIdAsync(
+        string baseTable,
+        string spelling,
+        string storedId,
+        CancellationToken ct)
+    {
+        await using SqlConnection connection = await TestDatabase.OpenConnectionAsync(ct);
+        await using var command = new SqlCommand(
+            $"SELECT [{GlobalRecordIdColumn}] FROM [dbo].[{baseTable}] WHERE [{GlobalRecordIdColumn}] = @spelling "
+                + $"AND DATALENGTH([{GlobalRecordIdColumn}]) = DATALENGTH(@spelling);",
+            connection);
+        command.Parameters.Add(new SqlParameter("@spelling", SqlDbType.NVarChar, -1) { Value = spelling });
+
+        var matched = new List<string>();
+        await using (SqlDataReader reader = await command.ExecuteReaderAsync(ct))
+        {
+            while (await reader.ReadAsync(ct))
+            {
+                matched.Add(reader.GetString(0));
+            }
+        }
+
+        Assert.True(
+            matched.Count == 0 || (matched.Count == 1 && string.Equals(matched[0], storedId, StringComparison.Ordinal)),
+            string.Create(
+                CultureInfo.InvariantCulture,
+                $"The spelling matched {matched.Count} rows of {baseTable} that are not only the test's record."));
+        return matched.Count == 1;
+    }
 
     // The page-two row of a record the test created, removed by the id bound as a typed parameter; returns the rows
     // removed.
@@ -1052,7 +1387,7 @@ public sealed class SqlRecordRepositoryWriteTests : IAsyncLifetime
             FormMetadata form,
             string globalRecordId,
             IReadOnlyDictionary<string, FieldValue> submitted,
-            SaveStamp stamp,
+            Func<SaveStamp> createStamp,
             Func<StoredRecord, RecordValidationResult> requiredGate,
             FormPermissions? permissions,
             CancellationToken cancellationToken)
@@ -1062,7 +1397,7 @@ public sealed class SqlRecordRepositoryWriteTests : IAsyncLifetime
                 form,
                 globalRecordId,
                 submitted,
-                stamp,
+                createStamp,
                 _observe(requiredGate),
                 permissions,
                 cancellationToken);
@@ -1072,9 +1407,9 @@ public sealed class SqlRecordRepositoryWriteTests : IAsyncLifetime
         public Task<SoftDeleteResult> SoftDeleteAsync(
             FormMetadata form,
             string globalRecordId,
-            SaveStamp stamp,
+            Func<SaveStamp> createStamp,
             CancellationToken cancellationToken) =>
-            _real.SoftDeleteAsync(form, globalRecordId, stamp, cancellationToken);
+            _real.SoftDeleteAsync(form, globalRecordId, createStamp, cancellationToken);
 
         /// <inheritdoc />
         public Task<FormPermissions?> GetPermissionsAsync(FormMetadata form, CancellationToken cancellationToken) =>
@@ -1807,4 +2142,384 @@ public sealed partial class StoredDataContractTests : IAsyncLifetime
         IReadOnlyList<string> PageTables,
         IReadOnlyList<FieldWrite> Create,
         IReadOnlyList<FieldWrite> Update);
+}
+
+/// <summary>
+/// Holds the numbers <see cref="FakeDataStore"/> stores to what SQL Server's columns hold and the SQL store reads back,
+/// so the API tests that run on the double see the values the stored-data contract produces. A <c>float</c> column
+/// holds a binary64 double, which the SQL store binds as <see cref="DbType.Double"/> and reads back as a double, so a
+/// seed, an insert and an update each store a number as its nearest double; an integer column holds the exact integer,
+/// beyond 2^53 included.
+/// </summary>
+/// <remarks>
+/// The class needs no database: it carries no <c>Integration</c> trait, joins no database collection and takes no
+/// lock. Its form is synthetic: view 9120 on the unseeded base table <c>FakeStoredValue</c>, with the number
+/// <c>Weight</c> on a <c>float</c> column and the number <c>Count</c> on a <c>bigint</c> column on one page. Each
+/// number is parsed exactly, as the API reads a JSON number, so <c>9007199254740993</c> keeps its exact integer and
+/// <c>2.0000000000000001</c> holds none until a float column stores it. The API cases host the production pipeline
+/// over the double through <see cref="ApiFactoryOptions.ForFake"/> and read the number the response's JSON carries.
+/// </remarks>
+public sealed class FakeDataStoreStoredNumberTests
+{
+    private const int ViewId = 9120;
+    private const int PageId = 912001;
+    private const string BaseTable = "FakeStoredValue";
+    private const string WeightField = "Weight";
+    private const string CountField = "Count";
+
+    private static readonly FormMetadata Form = CreateForm();
+
+    private static readonly SaveStamp Stamp = new("tester", new DateTime(2024, 1, 2, 3, 4, 5, DateTimeKind.Utc));
+
+    // The form has no required field, so its required gate always passes.
+    private static readonly Func<StoredRecord, RecordValidationResult> Pass =
+        _ => RecordValidationResult.Success(new Dictionary<string, FieldValue>());
+
+    /// <summary>How a number reaches the store.</summary>
+    public enum Write
+    {
+        /// <summary><see cref="FakeDataStore.SeedRecord"/>.</summary>
+        Seed,
+
+        /// <summary><see cref="FakeDataStore.InsertAsync"/>, or <c>POST</c> through the API.</summary>
+        Insert,
+
+        /// <summary>
+        /// <see cref="FakeDataStore.UpdateAsync"/> of a seeded record whose fields are null, or <c>PUT</c> through the
+        /// API.
+        /// </summary>
+        Update,
+    }
+
+    /// <summary>
+    /// Each write, a number field, the number the write carries and the number its column then holds.
+    /// </summary>
+    public static TheoryData<Write, string, string, string> StoredNumbers
+    {
+        get
+        {
+            var cases = new TheoryData<Write, string, string, string>();
+            foreach (var write in Enum.GetValues<Write>())
+            {
+                // 2^53 + 1 is not a double, so a float column holds its nearest double, 2^53, which it keeps as is.
+                // 2.0000000000000001 holds no integer, yet its nearest double is the whole 2.
+                cases.Add(write, WeightField, "9007199254740993", "9007199254740992");
+                cases.Add(write, WeightField, "9007199254740992", "9007199254740992");
+                cases.Add(write, WeightField, "2.0000000000000001", "2");
+
+                // A bigint column holds every Int64 exactly, 2^53 + 1 and both range limits included.
+                cases.Add(write, CountField, "9007199254740993", "9007199254740993");
+                cases.Add(write, CountField, "9223372036854775807", "9223372036854775807");
+                cases.Add(write, CountField, "-9223372036854775808", "-9223372036854775808");
+            }
+
+            return cases;
+        }
+    }
+
+    // The record the write returns, the record read by id, the inspection snapshot and the stored record a later
+    // update's required gate is handed all hold the number the column holds, as its exact integer.
+    [Theory]
+    [MemberData(nameof(StoredNumbers))]
+    public async Task EachWriteStoresTheNumberItsColumnHolds(Write write, string field, string number, string stored)
+    {
+        var store = CreateStore();
+        var expected = Number(stored);
+        var expectedInteger = long.Parse(stored, NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture);
+
+        var (id, returned) = await WriteAsync(store, write, field, Number(number));
+        var read = Assert.IsType<RecordDto>(await store.GetByIdAsync(Form, id, CancellationToken.None));
+        var state = Assert.IsType<FakeRecordState>(store.GetRecord(ViewId, id));
+        var gated = await GatedRecordAsync(store, id);
+
+        var values = new List<FieldValue> { read.Values[field], state.Values[field], gated.Values[field] };
+        if (returned is not null)
+        {
+            values.Add(returned.Values[field]);
+        }
+
+        Assert.All(values, value =>
+        {
+            Assert.Equal(expected, value);
+            Assert.True(value.TryGetInteger(out var integer));
+            Assert.Equal(expectedInteger, integer);
+        });
+    }
+
+    // The API answers a write with the stored record, so its JSON carries the number the column holds, as the SQL
+    // store reads it back: 2^53 + 1 on the float Weight answers 2^53, and on the bigint Count itself.
+    [Theory]
+    [InlineData(Write.Insert, WeightField, "9007199254740993", "9007199254740992")]
+    [InlineData(Write.Insert, WeightField, "2.0000000000000001", "2")]
+    [InlineData(Write.Insert, CountField, "9007199254740993", "9007199254740993")]
+    [InlineData(Write.Update, WeightField, "9007199254740993", "9007199254740992")]
+    [InlineData(Write.Update, CountField, "9007199254740993", "9007199254740993")]
+    public async Task ApiAnswersWithTheNumberItsColumnHolds(Write write, string field, string number, string json)
+    {
+        var store = CreateStore();
+        await using var factory = new ApiFactory(ApiFactoryOptions.ForFake(store));
+        using var client = factory.CreateClient();
+        var records = string.Create(CultureInfo.InvariantCulture, $"/api/forms/{ViewId}/records");
+
+        // The number goes on the wire as written, which no double could carry.
+        using var body = JsonDocument.Parse("{\"values\":{\"" + field + "\":" + number + "}}");
+        using var response = write switch
+        {
+            Write.Insert => await ApiTestClient.PostJsonAsync(client, records, body.RootElement),
+            Write.Update => await ApiTestClient.PutJsonAsync(
+                client, records + "/" + Uri.EscapeDataString(store.SeedRecord(ViewId)), body.RootElement),
+            _ => throw new ArgumentOutOfRangeException(nameof(write), write, "The API writes only by POST and PUT."),
+        };
+
+        Assert.Equal(write == Write.Insert ? HttpStatusCode.Created : HttpStatusCode.OK, response.StatusCode);
+        var record = await ApiTestClient.ReadJsonElementAsync(response);
+        Assert.Equal(json, record.GetProperty("values").GetProperty(field).GetRawText());
+        var id = record.GetProperty("globalRecordId").GetString();
+        Assert.NotNull(id);
+        Assert.Equal(Number(json), Assert.IsType<FakeRecordState>(store.GetRecord(ViewId, id)).Values[field]);
+    }
+
+    private static FakeDataStore CreateStore() => new(new FakeForm(
+        Form,
+        new Dictionary<string, IReadOnlyList<FieldOption>>(StringComparer.OrdinalIgnoreCase),
+        null));
+
+    // A number parsed as the API reads a JSON number, exactly.
+    private static FieldValue Number(string text)
+    {
+        Assert.True(FieldValueCoercion.TryParseNumber(text, out var number));
+        return number;
+    }
+
+    // Writes the number to a new record. Returns the record's id and the record the write returns, which a seed has
+    // none of.
+    private static async Task<(string Id, RecordDto? Returned)> WriteAsync(
+        FakeDataStore store,
+        Write write,
+        string field,
+        FieldValue number)
+    {
+        var values = new Dictionary<string, FieldValue> { [field] = number };
+        switch (write)
+        {
+            case Write.Seed:
+                return (store.SeedRecord(ViewId, values), null);
+
+            case Write.Insert:
+                var inserted = await store.InsertAsync(Form, values, Stamp, CancellationToken.None);
+                return (inserted.GlobalRecordId, inserted);
+
+            case Write.Update:
+                var id = store.SeedRecord(ViewId);
+                var result = await store.UpdateAsync(
+                    Form, id, values, () => Stamp, Pass, permissions: null, CancellationToken.None);
+                Assert.True(result.IsSuccess);
+                return (id, result.Record);
+
+            default:
+                throw new ArgumentOutOfRangeException(nameof(write), write, "No case uses this write.");
+        }
+    }
+
+    // The stored record an update's required gate is handed, after the locked read and before any write; the empty
+    // delta changes no value.
+    private static async Task<StoredRecord> GatedRecordAsync(FakeDataStore store, string id)
+    {
+        StoredRecord? gated = null;
+        var result = await store.UpdateAsync(
+            Form,
+            id,
+            new Dictionary<string, FieldValue>(),
+            () => Stamp,
+            record =>
+            {
+                gated = record;
+                return Pass(record);
+            },
+            permissions: null,
+            CancellationToken.None);
+        Assert.True(result.IsSuccess);
+        return Assert.IsType<StoredRecord>(gated);
+    }
+
+    // The system rows and field-type ids are the seeded metaFields and metaFieldTypes rows, as FakeForms builds them.
+    private static FormMetadata CreateForm()
+    {
+        PageMetadata[] pages = [new(PageId, "Page 1", 0, BaseTable + PageId.ToString(CultureInfo.InvariantCulture))];
+        FieldMetadata[] fields =
+        [
+            SystemRow(1, "UniqueKey", 23),
+            SystemRow(2, "RecStatus", 22),
+            SystemRow(3, "GlobalRecordId", 26),
+            NumberField(4, 1m, WeightField, "float"),
+            NumberField(5, 2m, CountField, "bigint"),
+        ];
+        return new FormMetadata(ViewId, BaseTable, BaseTable, Array.AsReadOnly(pages), Array.AsReadOnly(fields));
+    }
+
+    private static FieldMetadata SystemRow(int ordinal, string name, int fieldTypeId) => new()
+    {
+        FieldId = (ViewId * 1000) + ordinal,
+        Name = name,
+        FieldTypeId = fieldTypeId,
+        FieldTypeName = name,
+        TabIndex = 0m,
+    };
+
+    // A Number field (metaFieldTypes 5) whose column has the type's 8-byte catalogue size.
+    private static FieldMetadata NumberField(int ordinal, decimal tabIndex, string name, string sqlTypeName) => new()
+    {
+        FieldId = (ViewId * 1000) + ordinal,
+        Name = name,
+        FieldTypeId = 5,
+        FieldTypeName = "Number",
+        Prompt = name,
+        TabIndex = tabIndex,
+        PageId = PageId,
+        Column = FieldTypeMapper.DescribeColumn(name, sqlTypeName, 8),
+    };
+}
+
+/// <summary>
+/// The structured log line that follows a soft delete (AAP 0.3.4.6: form, <c>globalRecordId</c>, operation, outcome)
+/// names the record by its <c>GlobalRecordId</c> as stored, as the line of its insert does, whatever letter case the
+/// <c>DELETE</c> route spells the id in, so every line about one record carries one spelling.
+/// </summary>
+/// <remarks>
+/// The class needs no database: it carries no <c>Integration</c> trait, joins no database collection and takes no
+/// lock. The host runs the production pipeline over <see cref="FakeDataStore"/>, whose lookup ignores letter case as a
+/// case-insensitive column collation does, and its lines are read from <see cref="ApiFactoryBase.Logs"/>, which holds
+/// what the committed logging configuration lets through. <c>SqlRecordRepositoryWriteTests</c> proves on SQL Server,
+/// under the collation it finds there, that the store's result carries the stored spelling. Every id these cases
+/// delete holds a letter, so its spelling in the other letter case always differs from the stored one.
+/// </remarks>
+public sealed class StoredDataContractSoftDeleteLogTests
+{
+    private const int ViewId = FakeForms.TwoPageViewId;
+    private const string LastNameField = "LastName";
+
+    // The record service's fixed post-commit log event and the operation and outcome texts it writes.
+    private const int RecordWriteEventId = 1;
+    private const string SoftDeleteOperation = "softDelete";
+    private const string CommittedOutcome = "committed";
+    private const string UnchangedOutcome = "unchanged";
+
+    private static readonly string RecordServiceCategory = typeof(EpiInfo.Api.Services.RecordService).FullName!;
+
+    // A record created through POST holds the lower-case id the store generates, and the route spells it upper-case; a
+    // seeded record holds an upper-case id, which the store keeps as given, and the route spells it lower-case. Either
+    // way the first DELETE commits and the second finds the record deleted, each answering 204, and both lines, like
+    // the insert's, carry the stored spelling, while no line's text or state carries the route's. A POST is repeated
+    // while its generated id holds no letter; a repeated record's lines name its own id, so only the deleted record's
+    // lines are counted.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task SoftDeleteLogLinesNameTheStoredId(bool seededUpperCase)
+    {
+        var store = new FakeDataStore(FakeForms.TwoPage);
+        await using var factory = new ApiFactory(ApiFactoryOptions.ForFake(store));
+        using var client = factory.CreateClient();
+
+        string stored = seededUpperCase
+            ? store.SeedRecord(
+                ViewId,
+                new Dictionary<string, FieldValue> { [LastNameField] = FieldValue.FromText("Seeded") },
+                globalRecordId: GuidWithALetter().ToUpperInvariant())
+            : await CreateRecordWithALetterAsync(client);
+        string routed = seededUpperCase ? stored.ToLowerInvariant() : stored.ToUpperInvariant();
+        Assert.NotEqual(stored, routed);
+
+        string path = string.Create(
+            CultureInfo.InvariantCulture,
+            $"/api/forms/{ViewId}/records/{Uri.EscapeDataString(routed)}");
+        for (int attempt = 0; attempt < 2; attempt++)
+        {
+            using HttpResponseMessage response = await client.DeleteAsync(path);
+            Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
+        }
+
+        FakeRecordState? record = store.GetRecord(ViewId, stored);
+        Assert.NotNull(record);
+        Assert.Equal((stored, RecordQueryRules.DeletedRecStatus), (record.GlobalRecordId, record.RecStatus));
+
+        CapturedLogEntry[] writes = factory.Logs
+            .Find(entry => entry.Category == RecordServiceCategory
+                && entry.EventId.Id == RecordWriteEventId
+                && StateValue(entry, "GlobalRecordId") is string named
+                && string.Equals(named, stored, StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+        Assert.Equal(
+            new (object?, object?)[] { (stored, CommittedOutcome), (stored, UnchangedOutcome) },
+            writes
+                .Where(entry => Equals(StateValue(entry, "Operation"), SoftDeleteOperation))
+                .Select(entry => (StateValue(entry, "GlobalRecordId"), StateValue(entry, "Outcome"))));
+        Assert.All(writes, entry => Assert.Equal(stored, StateValue(entry, "GlobalRecordId")));
+        Assert.Equal(seededUpperCase ? 2 : 3, writes.Length);
+
+        // No line's text or state names the record as the route spelled it. The request's scope carries the path,
+        // which the JSON console never writes (IncludeScopes is off), so scopes are not searched.
+        Assert.DoesNotContain(
+            factory.Logs.Entries,
+            entry => entry.Message.Contains(routed, StringComparison.Ordinal)
+                || entry.State.Any(pair =>
+                    pair.Value is string text && text.Contains(routed, StringComparison.Ordinal)));
+    }
+
+    // The result the log line reads its id from carries the matched row's GlobalRecordId exactly, whatever text the
+    // NOT NULL nvarchar(255) column holds (testdata/sql/05_data_tables.sql), an empty, whitespace or space-padded id
+    // included, so a found record's 204 and its log line never fail on the id. Only a missing id is refused, because a
+    // row the locked read matched always has one.
+    [Theory]
+    [InlineData("")]
+    [InlineData(" ")]
+    [InlineData("\t \r\n")]
+    [InlineData("0aec0af6-64e6-4e94-a88b-b1b11474e101 ")]
+    public void SoftDeleteResultCarriesTheMatchedIdUnchanged(string stored)
+    {
+        var factories = new (SoftDeleteStatus Status, Func<string, SoftDeleteResult> Create)[]
+        {
+            (SoftDeleteStatus.Deleted, SoftDeleteResult.Deleted),
+            (SoftDeleteStatus.AlreadyDeleted, SoftDeleteResult.AlreadyDeleted),
+        };
+        foreach ((SoftDeleteStatus status, Func<string, SoftDeleteResult> create) in factories)
+        {
+            SoftDeleteResult result = create(stored);
+            Assert.Equal((status, true), (result.Status, result.IsFound));
+            Assert.Same(stored, result.GlobalRecordId);
+            Assert.Equal(
+                "globalRecordId",
+                Assert.Throws<ArgumentNullException>(() => create(null!)).ParamName);
+        }
+    }
+
+    // A version-4 GUID string in D format whose first hex digit is a letter, so it always differs from its spelling in
+    // the other letter case.
+    private static string GuidWithALetter() =>
+        "a" + Guid.NewGuid().ToString("D", CultureInfo.InvariantCulture)[1..];
+
+    // POSTs a record holding LastName "Created" and returns the id the store generated, posting another while that id
+    // holds no letter, which a version-4 GUID string lacks about once in 2.7 million ids.
+    private static async Task<string> CreateRecordWithALetterAsync(HttpClient client)
+    {
+        const int Attempts = 8;
+        for (int attempt = 0; attempt < Attempts; attempt++)
+        {
+            string id = (await ApiTestClient.CreateRecordAsync(
+                client,
+                ViewId,
+                new Dictionary<string, object?> { [LastNameField] = "Created" })).GlobalRecordId;
+            if (id.Any(char.IsAsciiLetter))
+            {
+                return id;
+            }
+        }
+
+        throw new XunitException(string.Create(
+            CultureInfo.InvariantCulture,
+            $"{Attempts} records created through the API all have an id without a letter."));
+    }
+
+    private static object? StateValue(CapturedLogEntry entry, string key) =>
+        Assert.Single(entry.State, pair => pair.Key == key).Value;
 }

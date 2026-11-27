@@ -843,7 +843,10 @@ internal sealed class SqlMetadataReader(
     /// Legacy keeps the distinct texts with <c>DataView.ToTable(true, ...)</c>, which compares values with
     /// <c>Equals</c>, so case variants stay apart, and it lists blank texts. Each text here is likewise kept exactly
     /// as stored, untrimmed, and only an exact repeat is collapsed, because a saved legal value must equal an option
-    /// ordinally. A SQL <c>NULL</c> is no stored text, so it is never offered as a choice.
+    /// ordinally. A SQL <c>NULL</c> is no stored text, so it is never offered as a choice. An <c>nchar(n)</c>
+    /// code-table column returns every text padded with spaces to n, and each option keeps that padding verbatim. An
+    /// option shorter than an <c>nchar</c> page column is saved as given and SQL Server pads it to the column's
+    /// width, so it reads back padded, as a text that is no option.
     /// <para>
     /// Legacy sorts a <c>Sort</c> = 1 list with <c>ComboBox.Sorted</c>, whose item comparer calls the current culture
     /// of the process running data entry with <see cref="CompareOptions.StringSort"/>, case-sensitively. The reader

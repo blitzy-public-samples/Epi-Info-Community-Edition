@@ -80,6 +80,20 @@ public sealed class RecordValidatorTests
         new Dictionary<string, IReadOnlyList<FieldOption>>(StringComparer.Ordinal);
 
     /// <summary>
+    /// The options of <see cref="FixedWidthForm"/>'s <c>Grade</c>, each its stored text: <c>F-Fem</c> at the column's
+    /// full width of five, <c>M    </c> padded to it as an <c>nchar(5)</c> code table returns it, and the short
+    /// <c>U</c>, as a code table of another type could hold it.
+    /// </summary>
+    private static readonly IReadOnlyDictionary<string, IReadOnlyList<FieldOption>> FixedWidthLegalValues =
+        new Dictionary<string, IReadOnlyList<FieldOption>>(StringComparer.Ordinal)
+        {
+            ["Grade"] = Array.AsReadOnly(
+                new[] { "F-Fem", "M    ", "U" }
+                    .Select(text => new FieldOption(FieldValue.FromText(text), text))
+                    .ToArray()),
+        };
+
+    /// <summary>
     /// Fixture A: the seeded fields whose rules the validator enforces, with their seeded metadata. <c>Zip</c>
     /// (<c>MaxLength</c> 5), <c>PhoneNumber</c> (mask <c>###-###-####</c>), <c>Age</c> (bounds 0 and 120, pattern
     /// <c>###</c>) and read-only <c>StateIDNumber</c> come from <c>CaseReport</c>. <c>LastName</c> carries the
@@ -345,6 +359,21 @@ public sealed class RecordValidatorTests
             Row(3, "Notes", TextType, pageId: 1, Nvarchar(4000)),
         ]);
 
+    /// <summary>
+    /// Fixture K: a Text field and a Legal Values field on fixed-width <c>nchar(5)</c> columns, which no seeded column
+    /// is; <c>Grade</c> offers <see cref="FixedWidthLegalValues"/>.
+    /// </summary>
+    private static readonly FormMetadata FixedWidthForm = new(
+        ViewId: 13,
+        Name: "FixedWidth",
+        BaseTableName: "FixedWidth",
+        Pages: [new PageMetadata(1, "Page 1", 0, "FixedWidth1")],
+        Fields:
+        [
+            Row(1, "Code", TextType, pageId: 1, Nchar(5)),
+            Row(2, "Grade", LegalValuesType, pageId: 1, Nchar(5)),
+        ]);
+
     // Column catalogue facts as sys.columns.max_length reports them, in bytes: nvarchar(n) is 2·n.
     private static (string SqlType, int MaxLengthBytes) FloatColumn => ("float", 8);
 
@@ -393,6 +422,7 @@ public sealed class RecordValidatorTests
         { "CaseVariant", ["Age", "Notes", "AGE"] },
         { "CaseVariantLabel", ["Age", "AGE"] },
         { "RepeatedName", ["Age", "Notes"] },
+        { "FixedWidth", ["Code", "Grade"] },
     };
 
     /// <summary>
@@ -1015,6 +1045,46 @@ public sealed class RecordValidatorTests
         Assert.Equal(FieldValue.FromText(text), values["Memo"]);
     }
 
+    // An nchar(5) column admits text of up to five characters, which SQL Server pads with spaces to five, so short
+    // text, a short legal value and a padded code-table text are all accepted unchanged, never padded or trimmed here.
+    [Theory]
+    [InlineData("Code", "abc")]
+    [InlineData("Grade", "U")]
+    [InlineData("Grade", "M    ")]
+    public void ValidateInput_TextUpToTheNcharWidth_IsAcceptedAsSubmitted(string field, string text)
+    {
+        var values = AssertValid(
+            Validate(Validator(FixedWidthForm, FixedWidthLegalValues), (field, FieldValue.FromText(text))));
+
+        Assert.Equal(FieldValue.FromText(text), values[field]);
+    }
+
+    // Text longer than an nchar(5) column gets only the storage message naming its length, before the legal-values
+    // check.
+    [Theory]
+    [InlineData("Code")]
+    [InlineData("Grade")]
+    public void ValidateInput_TextLongerThanTheNcharWidth_IsTooLongForTheColumn(string field)
+    {
+        var result = Validate(
+            Validator(FixedWidthForm, FixedWidthLegalValues),
+            (field, FieldValue.FromText("abcdef")));
+
+        AssertOnlyFieldError(result, field, ValidationMessages.FormatTextTooLongForColumn(5));
+    }
+
+    // SQL Server stores the short option U padded to U followed by four spaces, which is no option, so resubmitting
+    // that read-back text verbatim is refused by the ordinal legal-values check; choosing U again is accepted above.
+    [Fact]
+    public void ValidateInput_PaddedReadBackOfAShortNcharOption_IsNotALegalValue()
+    {
+        var result = Validate(
+            Validator(FixedWidthForm, FixedWidthLegalValues),
+            ("Grade", FieldValue.FromText("U    ")));
+
+        AssertOnlyFieldError(result, "Grade", ValidationMessages.NotALegalValue);
+    }
+
     // ---- MaxLength, range, pattern and legal values ----
 
     [Fact]
@@ -1240,6 +1310,105 @@ public sealed class RecordValidatorTests
         Assert.False(FieldValueCoercion.TryParseIntegerLimits(text, out var floor, out var ceiling));
         Assert.Equal(BigInteger.Zero, floor);
         Assert.Equal(BigInteger.Zero, ceiling);
+    }
+
+    // Number texts in the invariant grammar beside the exact JSON number each keeps, or null for a number whose
+    // nearest double already keeps its integrality: an exact integer, zero, or a double that is not whole.
+    public static TheoryData<string, string?> JsonNumberOfNumberText => new()
+    {
+        { "2.0000000000000001", "2.0000000000000001" },
+        { " +2.0000000000000001\t", "2.0000000000000001" },
+        { "9007199254740992.50\0", "9007199254740992.50" },
+        { "-9223372036854775808.5", "-9223372036854775808.5" },
+        { "1e-400", "1e-400" },
+        { "-1E-400", "-1e-400" },
+        { ".5e-400", "0.5e-400" },
+        { "+0005.E-0400", "5e-0400" },
+        { "9223372036854775808", "9223372036854775808" },
+        { "1e20", "1e20" },
+        { "9007199254740993", null },
+        { "2.0", null },
+        { "-0e-400", null },
+        { "37.5", null },
+        { "0.1", null },
+    };
+
+    /// <summary>
+    /// A number that holds no exact signed 64-bit integer although its nearest double is whole keeps an RFC 8259 number
+    /// exactly equal in value to its text, spelled from the parts the scanner reads: no white space, NUL or <c>+</c>, no
+    /// leading zero in the integer part, a 0 before a bare point and no point without fraction digits. Reading that
+    /// JSON number again gives an equal value with the same JSON number. Every other number keeps none.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(JsonNumberOfNumberText))]
+    public void TryParseNumber_NumberWithAWholeNearestDouble_KeepsItsExactJsonNumber(string text, string? expected)
+    {
+        var value = ExactNumber(text);
+
+        Assert.Equal(expected is not null, value.TryGetJsonNumber(out var jsonNumber));
+        Assert.Equal(expected, jsonNumber);
+        if (expected is null)
+        {
+            return;
+        }
+
+        using var document = System.Text.Json.JsonDocument.Parse(expected);
+        Assert.Equal(System.Text.Json.JsonValueKind.Number, document.RootElement.ValueKind);
+        var reread = ExactNumber(expected);
+        Assert.Equal(value, reread);
+        Assert.True(reread.TryGetJsonNumber(out var rereadNumber));
+        Assert.Equal(expected, rereadNumber);
+    }
+
+    /// <summary>
+    /// The JSON number is a spelling of a number, not part of its value: two numbers whose nearest doubles and floors
+    /// agree are equal, with equal hash codes, however differently they are spelled, while
+    /// <c>1.9999999999999999</c>, whose floor is 1, still differs from <c>2.0000000000000001</c>.
+    /// </summary>
+    [Fact]
+    public void TryParseNumber_SpellingsOfTheSameSlots_AreEqualWithEqualHashCodes()
+    {
+        var plain = ExactNumber("2.0000000000000001");
+        var respelled = ExactNumber("+2.00000000000000010e0");
+        Assert.True(plain.TryGetJsonNumber(out var plainNumber));
+        Assert.True(respelled.TryGetJsonNumber(out var respelledNumber));
+        Assert.NotEqual(plainNumber, respelledNumber);
+
+        Assert.Equal(plain, respelled);
+        Assert.True(plain == respelled);
+        Assert.Equal(plain.GetHashCode(), respelled.GetHashCode());
+        Assert.NotEqual(plain, ExactNumber("1.9999999999999999"));
+    }
+
+    // Numeric primitives beside the exact JSON number each keeps as a number value, or null: a decimal or ulong whose
+    // nearest double is whole although it holds no exact signed 64-bit integer keeps one, and a double never needs one,
+    // because it is exactly the number it stands for.
+    public static TheoryData<object, string?> JsonNumberOfNumericPrimitive => new()
+    {
+        { 2.0000000000000001m, "2.0000000000000001" },
+        { -9223372036854775808.5m, "-9223372036854775808.5" },
+        { 79228162514264337593543950335m, "79228162514264337593543950335" },
+        { 37.5m, null },
+        { 2m, null },
+        { 18446744073709551615UL, "18446744073709551615" },
+        { 9223372036854775807UL, null },
+        { 1e20, null },
+        { 2.5, null },
+    };
+
+    /// <summary>
+    /// A decimal or ulong number keeps the JSON number of its exact value exactly when its nearest double is whole
+    /// although it holds no exact signed 64-bit integer, so <c>2.0000000000000001m</c> is never written as 2.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(JsonNumberOfNumericPrimitive))]
+    public void Coerce_NumericPrimitive_KeepsAJsonNumberOnlyWhereItsDoubleWouldMisstateIt(object raw, string? expected)
+    {
+        var result = FieldValueCoercion.Coerce(raw, FieldValueKind.Number);
+
+        Assert.True(result.Succeeded);
+        Assert.Equal(expected is not null, result.Value.TryGetJsonNumber(out var jsonNumber));
+        Assert.Equal(expected, jsonNumber);
     }
 
     // Each range-message helper for an exact integer bound, beside its literal text.
@@ -2183,11 +2352,14 @@ public sealed class RecordValidatorTests
         "CaseVariant" => CaseVariantForm,
         "CaseVariantLabel" => CaseVariantLabelForm,
         "RepeatedName" => RepeatedNameForm,
+        "FixedWidth" => FixedWidthForm,
         _ => throw new ArgumentOutOfRangeException(nameof(name), name, "No fixture form has that name."),
     };
 
     private static IReadOnlyDictionary<string, IReadOnlyList<FieldOption>> LegalValuesOf(FormMetadata form) =>
-        ReferenceEquals(form, MirrorForm) ? MirrorLegalValues : NoLegalValues;
+        ReferenceEquals(form, MirrorForm) ? MirrorLegalValues
+        : ReferenceEquals(form, FixedWidthForm) ? FixedWidthLegalValues
+        : NoLegalValues;
 
     private static RecordValidator MirrorValidator() => Validator(MirrorForm, MirrorLegalValues);
 
@@ -2357,6 +2529,8 @@ public sealed class RecordValidatorTests
     }
 
     private static (string SqlType, int MaxLengthBytes) Nvarchar(int characters) => ("nvarchar", 2 * characters);
+
+    private static (string SqlType, int MaxLengthBytes) Nchar(int characters) => ("nchar", 2 * characters);
 
     // A metaFields.List of count Option items, L0 to L(count - 1), so the item at index i reads Li.
     private static string OptionList(int count) => string.Join(

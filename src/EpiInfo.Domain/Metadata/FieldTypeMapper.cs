@@ -294,7 +294,11 @@ public static class FieldTypeMapper
     /// <list type="bullet">
     /// <item><description>
     /// character: text of at most <see cref="ColumnMetadata.MaxCharacters"/> UTF-16 code units, the way SQL Server
-    /// counts <c>nvarchar(n)</c>, or of any length when that is <see langword="null"/>;
+    /// counts <c>nvarchar(n)</c> and <c>nchar(n)</c>, so a surrogate pair counts two, or of any length when that is
+    /// <see langword="null"/>. Text is judged as given, never trimmed, trailing spaces counting as characters. On a
+    /// fixed-width <c>nchar(n)</c> column shorter text is representable too: it is written as given and SQL Server
+    /// pads it with spaces to n, so it reads back padded and two texts that differ only in trailing spaces store
+    /// one value;
     /// </description></item>
     /// <item><description>
     /// integer: an exact whole number or an option index within the range of <c>tinyint</c> (0 to 255),

@@ -62,6 +62,12 @@ const RETRY_TEXT = 'Retry';
 // Each row's open button is named by this prefix and its first cell's text, never by cell
 // data alone, and the prefix holds none of the toolbar's and navigator's names.
 const OPEN_RECORD_PREFIX = 'Open record ';
+// An open button's name holds at most this many characters of its cell's text, so a
+// 4000-character value is not read out in full. A grid column, even one spanning the whole
+// content width, shows fewer characters of ordinary text, so the name keeps the visible text.
+const NAME_TEXT_MAX = 150;
+// The visible label of an open button whose first cell is blank, which its name starts with.
+const OPEN_FALLBACK_TEXT = 'Open';
 // The search box's query parameter, which keys its messages in a 400's `errors` map.
 const SEARCH_PARAMETER = 'q';
 // Column of last resort, for a form whose server-chosen grid columns are empty: a row
@@ -72,6 +78,9 @@ const RECORD_ID_COLUMN = 'Record ID';
 // navigator and toolbar own: Playwright matches accessible names by substring.
 const EARLIER_TEXT = 'Earlier records';
 const LATER_TEXT = 'Later records';
+// Name of the scrolling region around the table, whose own name is its caption. Not
+// "Records", the section's exact name, and free of the names above for the same reason.
+const SCROLL_REGION_LABEL = 'Record list';
 
 /** The form's fields by exact name, and by lower-cased name where only one field name folds to it. */
 interface FieldLookup {
@@ -112,6 +121,24 @@ function cellText(value: FieldValue | undefined): string {
     return value.literal;
   }
   return '';
+}
+
+/**
+ * The cell text an open button shows and is named by: the text itself, or past
+ * NAME_TEXT_MAX characters its first NAME_TEXT_MAX and an ellipsis. Characters are code
+ * points, so a surrogate pair is never split.
+ */
+function nameTextOf(text: string): string {
+  let end = 0;
+  let count = 0;
+  for (const character of text) {
+    if (count === NAME_TEXT_MAX) {
+      return `${text.slice(0, end)}…`;
+    }
+    end += character.length;
+    count += 1;
+  }
+  return text;
 }
 
 function pageCountOf(result: RecordPage): number {
@@ -231,6 +258,20 @@ type ListFailure =
   | { key: string; kind: 'notLoaded' }
   | { key: string; kind: 'formGone' };
 
+/** The sides of the table's scroll box past which columns lie out of view. */
+interface HiddenSides {
+  readonly start: boolean;
+  readonly end: boolean;
+}
+
+const NO_HIDDEN_SIDES: HiddenSides = { start: false, end: false };
+
+/** Which sides of `box` hide part of its content; a sub-pixel remainder hides nothing. */
+function hiddenSidesOf(box: HTMLElement): HiddenSides {
+  const hiddenAtEnd = box.scrollWidth - box.clientWidth - box.scrollLeft;
+  return { start: box.scrollLeft >= 1, end: hiddenAtEnd >= 1 };
+}
+
 /**
  * The searchable, pageable record list of the open form. It displays what
  * `GET /api/forms/{viewId}/records` returns and sends nothing else: the search box is
@@ -269,6 +310,9 @@ export const RecordGrid = memo(function RecordGrid({
   const [reloadToken, setReloadToken] = useState(0);
   // The "Show deleted" state asked for and not yet applied; `null` when none is pending.
   const [requestedIncludeDeleted, setRequestedIncludeDeleted] = useState<boolean | null>(null);
+  // The table's scroll box, and which of its sides hide columns, for its scroll cue.
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const [hiddenSides, setHiddenSides] = useState<HiddenSides>(NO_HIDDEN_SIDES);
 
   const searchText = filterText(debouncedQ);
 
@@ -484,11 +528,12 @@ export const RecordGrid = memo(function RecordGrid({
             const [firstColumn, ...otherColumns] = hasColumns ? columns : [];
             const firstText = firstColumn === undefined ? row.globalRecordId : cellText(row.values[firstColumn]);
             // A blank first cell names its record by the row's first nonblank cell, else by id.
-            const nameText =
+            const nameText = nameTextOf(
               firstText !== ''
                 ? firstText
                 : (otherColumns.map((key) => cellText(row.values[key])).find((text) => text !== '') ??
-                  row.globalRecordId);
+                    row.globalRecordId),
+            );
             // A pointer click anywhere on the row opens the record; the first cell's button
             // is the row's one tab stop and its named Open action. aria-disabled, unlike
             // disabled, keeps the button focused while the rows wait for the current page.
@@ -500,7 +545,8 @@ export const RecordGrid = memo(function RecordGrid({
                 aria-disabled={rowsInert ? 'true' : undefined}
                 onClick={() => open(row.globalRecordId)}
               >
-                <td>
+                {/* Each nonblank cell's title holds its full value, which its column may cut short. */}
+                <td title={firstText === '' ? undefined : firstText}>
                   <button
                     type="button"
                     className="record-grid__open"
@@ -508,13 +554,28 @@ export const RecordGrid = memo(function RecordGrid({
                     onClick={(event) => handleOpenClick(event, row.globalRecordId)}
                   >
                     <span className="visually-hidden">{OPEN_RECORD_PREFIX}</span>
-                    {firstText === '' ? <span className="visually-hidden">{nameText}</span> : firstText}
+                    {firstText === '' ? (
+                      <>
+                        {/* Shown so the row has a visible open action; the name already starts with it. */}
+                        <span className="record-grid__open-text" aria-hidden="true">
+                          {OPEN_FALLBACK_TEXT}
+                        </span>
+                        <span className="visually-hidden">{nameText}</span>
+                      </>
+                    ) : (
+                      <span className="record-grid__open-text">{nameText}</span>
+                    )}
                     {deleted && <span className="visually-hidden"> (deleted)</span>}
                   </button>
                 </td>
-                {otherColumns.map((key) => (
-                  <td key={key}>{cellText(row.values[key])}</td>
-                ))}
+                {otherColumns.map((key) => {
+                  const text = cellText(row.values[key]);
+                  return (
+                    <td key={key} title={text === '' ? undefined : text}>
+                      {text}
+                    </td>
+                  );
+                })}
               </tr>
             );
           })}
@@ -522,6 +583,38 @@ export const RecordGrid = memo(function RecordGrid({
       </table>
     );
   }
+
+  // Measured before paint, and again whenever the box scrolls or it or its table changes
+  // size. Without ResizeObserver (jsdom) the box keeps its first measurement.
+  const showsTable = table !== null;
+  useLayoutEffect(() => {
+    const box = scrollRef.current;
+    if (!showsTable || box === null) {
+      return;
+    }
+    const measure = () => {
+      const next = hiddenSidesOf(box);
+      setHiddenSides((current) => (current.start === next.start && current.end === next.end ? current : next));
+    };
+    measure();
+    box.addEventListener('scroll', measure, { passive: true });
+    const observer = typeof ResizeObserver === 'function' ? new ResizeObserver(measure) : null;
+    if (observer !== null) {
+      observer.observe(box);
+      if (box.firstElementChild !== null) {
+        observer.observe(box.firstElementChild);
+      }
+    }
+    return () => {
+      box.removeEventListener('scroll', measure);
+      observer?.disconnect();
+    };
+  }, [showsTable]);
+  const frameClassName = [
+    'record-grid__frame',
+    ...(hiddenSides.start ? ['record-grid__frame--more-start'] : []),
+    ...(hiddenSides.end ? ['record-grid__frame--more-end'] : []),
+  ].join(' ');
 
   return (
     <section className="record-grid" aria-label="Records">
@@ -556,8 +649,22 @@ export const RecordGrid = memo(function RecordGrid({
         </div>
       )}
       {banner}
-      {/* Only the table scrolls sideways, so the search box, toggle and paging stay in view. */}
-      {table !== null && <div className="record-grid__scroll">{table}</div>}
+      {/* Only the table scrolls sideways, so the search box, toggle and paging stay in view.
+          The frame shades each side past which columns lie out of view. */}
+      {table !== null && (
+        <div className={frameClassName}>
+          {/* A named, focusable region, so a keyboard can scroll the table sideways. */}
+          <div
+            ref={scrollRef}
+            className="record-grid__scroll"
+            role="region"
+            aria-label={SCROLL_REGION_LABEL}
+            tabIndex={0}
+          >
+            {table}
+          </div>
+        </div>
+      )}
       <footer>
         {/* Always rendered, so loading, the outcome and the count are announced; it takes
             focus from a Retry button that the new load removes. */}

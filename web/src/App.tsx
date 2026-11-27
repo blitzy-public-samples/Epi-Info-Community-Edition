@@ -5,11 +5,14 @@
 // goes through the ApiClient, and the open form is React state, not a route.
 //
 // Legacy command-line switches become URL parameters: `?view=<form name>&record=<1-based
-// position>` opens that form at that record. `title` and `project` are ignored, because
-// the page title is fixed and the API's configured connection string is the project. Once
-// read, the query string follows the shell: `?view=<name>&record=<n>` while a form is
-// open, without `record` for a new record or before the first one opens, and the bare
-// path `/` on the forms list.
+// position>` opens that form at that record; a `record` that is not a record number, or
+// lies past the end, opens the first or the last record with a notice naming it as
+// written. `title` and `project` are ignored, because the page title is fixed and the
+// API's configured connection string is the project. `deleted=1` opens the form with
+// "Show deleted" on, so `record` counts every record, as the navigator does with the
+// toggle on. Once read, the query string follows the shell: `?view=<name>&record=<n>`
+// while a form is open, with `&deleted=1` while the toggle is on, without `record` for a
+// new record or before the first one opens, and the bare path `/` on the forms list.
 //
 // The URL's request ends only when it is settled: the form opens, the forms list proves no
 // form has that name, or the user chooses "Show forms list". A lookup that fails (a 503, a
@@ -30,32 +33,55 @@ export interface AppProps {
   client?: ApiClient;
 }
 
-/** The open form. `initialPosition` is the 1-based record it opens at; absent opens FormView's default. */
+/**
+ * The open form. `initialPosition` is the 1-based record it opens at; absent opens
+ * FormView's default. `initialPositionText` is the URL's `record` as written, which
+ * FormView's notice names when it cannot open that record as asked.
+ * `initialIncludeDeleted` opens it with "Show deleted" on.
+ */
 interface SelectedForm {
   readonly viewId: number;
   readonly name: string;
   readonly initialPosition: number | undefined;
+  readonly initialPositionText: string | undefined;
+  readonly initialIncludeDeleted: boolean;
 }
 
-/** The form and record the page URL asked for when the shell loaded. */
+/**
+ * The form, record and deleted toggle the page URL asked for when the shell loaded.
+ * `recordText` is `record` as written; absent when the URL has none.
+ */
 interface UrlSwitches {
   readonly view: string;
   readonly record: number | undefined;
+  readonly recordText: string | undefined;
+  readonly deleted: boolean;
 }
 
 const TITLE = 'Epi Info Data Entry';
+const DISMISS = 'Dismiss';
 const FORM_NOT_FOUND_NOTICE = 'This form no longer exists.';
 const LIST_PATH = '/';
 const RETRY = 'Retry';
 const SHOW_FORMS_LIST = 'Show forms list';
 
+/** The forms list's confirmation that Back to forms saved the draft of the form `name`. */
+function savedNoticeOf(name: string): string {
+  return `Changes to the ${name} record were saved.`;
+}
+
 const POSITION_PATTERN = /^[1-9]\d*$/;
 // The API reads a position as a 32-bit integer and answers 400 above it. A larger `record`
 // is still a record beyond the count, so it is capped here, and FormView's 404 recovery
-// then opens the nearest record, as it does for any position past the end.
+// then opens the nearest record, as it does for any position past the end; its notice
+// names `record` as written, not the cap.
 const MAX_POSITION = 2_147_483_647;
 
-/** `view` and `record` from a query string; null when no form is named. */
+const DELETED_PARAM = 'deleted';
+/** The `deleted` values that switch "Show deleted" on, compared trimmed and ignoring case; any other is off. */
+const DELETED_ON: ReadonlySet<string> = new Set(['1', 'true']);
+
+/** `view`, `record` and `deleted` from a query string; null when no form is named. */
 function readUrlSwitches(search: string): UrlSwitches | null {
   const params = new URLSearchParams(search);
   const view = params.get('view')?.trim() ?? '';
@@ -65,7 +91,8 @@ function readUrlSwitches(search: string): UrlSwitches | null {
   const record = params.get('record');
   const position =
     record !== null && POSITION_PATTERN.test(record) ? Math.min(Number(record), MAX_POSITION) : undefined;
-  return { view, record: position };
+  const deleted = DELETED_ON.has(params.get(DELETED_PARAM)?.trim().toLowerCase() ?? '');
+  return { view, record: position, recordText: record ?? undefined, deleted };
 }
 
 /**
@@ -95,10 +122,14 @@ function findForm(forms: readonly FormSummary[], view: string): FormSummary | un
   return forms.find((form) => form.name === view) ?? forms.find((form) => form.name.toLowerCase() === lower);
 }
 
-function formUrl(name: string, position: number | null): string {
+/** The open form's URL: `position` counts the set the deleted toggle selects, so the toggle goes with it. */
+function formUrl(name: string, position: number | null, includeDeleted: boolean): string {
   const params = new URLSearchParams({ view: name });
   if (position !== null) {
     params.set('record', String(position));
+  }
+  if (includeDeleted) {
+    params.set(DELETED_PARAM, '1');
   }
   return `${LIST_PATH}?${params.toString()}`;
 }
@@ -217,6 +248,11 @@ export default function App({ client = apiClient }: AppProps) {
   const [lookupAttempt, setLookupAttempt] = useState(0);
   const [selected, setSelected] = useState<SelectedForm | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  // Informational, unlike `notice`: the save Back to forms made, confirmed on the forms list
+  // because the form's own confirmation unmounted with it. Cleared by the next screen change.
+  const [savedNotice, setSavedNotice] = useState<string | null>(null);
+  // Whether the URL named no form when the shell loaded, so the shell starts on the forms list.
+  const startedOnListRef = useRef(switches === null);
 
   // The open form as of the last change, read by position reports that may arrive late.
   const openRef = useRef<SelectedForm | null>(null);
@@ -230,14 +266,24 @@ export default function App({ client = apiClient }: AppProps) {
     openRef.current = form;
     setSelected(form);
     setNotice(nextNotice);
-    replaceUrl(form === null ? LIST_PATH : formUrl(form.name, null));
+    setSavedNotice(null);
+    replaceUrl(form === null ? LIST_PATH : formUrl(form.name, null, form.initialIncludeDeleted));
+  }, []);
+
+  // The forms list's address is the bare path, so a URL that names no form, such as
+  // `?record=3` or `?view=&record=2`, is rewritten to it once, as the shell starts. Every
+  // later URL is the shell's own, and StrictMode's repeated effect finds it already there.
+  useEffect(() => {
+    if (startedOnListRef.current) {
+      replaceUrl(LIST_PATH);
+    }
   }, []);
 
   useEffect(() => {
     if (switches === null) {
       return;
     }
-    const { view, record } = switches;
+    const { view, record, recordText, deleted } = switches;
     // Unmounting, a Retry, or StrictMode's repeated effect aborts this lookup; only the last
     // one applies.
     const controller = new AbortController();
@@ -271,7 +317,17 @@ export default function App({ client = apiClient }: AppProps) {
       setSwitches(null);
       const form = findForm(result.data, view);
       if (form !== undefined) {
-        show({ viewId: form.viewId, name: form.name, initialPosition: record }, null);
+        show(
+          {
+            viewId: form.viewId,
+            name: form.name,
+            initialPosition: record,
+            // User input from the URL; FormView's notice renders it as text, never as markup.
+            initialPositionText: recordText,
+            initialIncludeDeleted: deleted,
+          },
+          null,
+        );
       } else {
         // `view` is user input from the URL; React renders it as text, never as markup.
         show(null, `Form '${view}' was not found.`);
@@ -293,30 +349,52 @@ export default function App({ client = apiClient }: AppProps) {
   const openFromList = useCallback(
     (form: FormSummary) => {
       focusTitleRef.current = true;
-      show({ viewId: form.viewId, name: form.name, initialPosition: undefined }, null);
+      show(
+        {
+          viewId: form.viewId,
+          name: form.name,
+          initialPosition: undefined,
+          initialPositionText: undefined,
+          initialIncludeDeleted: false,
+        },
+        null,
+      );
     },
     [show],
   );
 
-  const returnToList = useCallback(() => {
-    focusTitleRef.current = true;
-    show(null, null);
-  }, [show]);
+  const returnToList = useCallback(
+    (saved: boolean) => {
+      // Read before show() forgets the form that was open.
+      const closed = openRef.current;
+      focusTitleRef.current = true;
+      show(null, null);
+      if (saved && closed !== null) {
+        setSavedNotice(savedNoticeOf(closed.name));
+      }
+    },
+    [show],
+  );
 
   const formNotFound = useCallback(() => {
     focusTitleRef.current = true;
     show(null, FORM_NOT_FOUND_NOTICE);
   }, [show]);
 
-  const reportPosition = useCallback((form: SelectedForm, n: number | null) => {
+  const reportPosition = useCallback((form: SelectedForm, n: number | null, includeDeleted: boolean) => {
     // A form already closed must not write its URL back over the list's.
     if (openRef.current === form) {
-      replaceUrl(formUrl(form.name, n));
+      replaceUrl(formUrl(form.name, n, includeDeleted));
     }
   }, []);
 
-  // Both remove the button just pressed, and the title stays on every screen, so focus goes
+  // Each removes the button just pressed, and the title stays on every screen, so focus goes
   // there first rather than falling to the page body.
+  const dismissNotice = useCallback(() => {
+    headingRef.current?.focus();
+    setNotice(null);
+  }, []);
+
   const retryLookup = useCallback(() => {
     headingRef.current?.focus();
     setLookupFailure(null);
@@ -346,9 +424,11 @@ export default function App({ client = apiClient }: AppProps) {
         viewId={selected.viewId}
         client={client}
         initialPosition={selected.initialPosition}
+        initialPositionText={selected.initialPositionText}
+        initialIncludeDeleted={selected.initialIncludeDeleted}
         onExit={returnToList}
         onFormNotFound={formNotFound}
-        onPositionChange={(n) => reportPosition(selected, n)}
+        onPositionChange={(n, includeDeleted) => reportPosition(selected, n, includeDeleted)}
       />
     );
   }
@@ -361,8 +441,18 @@ export default function App({ client = apiClient }: AppProps) {
       {notice !== null && (
         <div className="banner banner--error" role="alert">
           <p>{notice}</p>
+          <button type="button" onClick={() => dismissNotice()}>
+            {DISMISS}
+          </button>
         </div>
       )}
+      {/* The shell's one status of its own; each screen keeps its own statuses. Always rendered,
+          so the polite live region exists before its text arrives and the confirmation is
+          announced, and unnamed, since a name on a live region can be read in place of its
+          content. Visually hidden while empty. */}
+      <p role="status" className={savedNotice === null ? 'visually-hidden' : 'banner banner--info'}>
+        {savedNotice ?? ''}
+      </p>
       {content}
     </main>
   );

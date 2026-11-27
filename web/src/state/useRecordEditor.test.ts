@@ -11,13 +11,17 @@
 //   always safe to resend.
 // - A write is acknowledged only by its contracted status (201 for POST, 200 for PUT)
 //   with its complete Record DTO; any other 2xx offers Save again only, as no response does.
+//   A DELETE is acknowledged by its bodyless 204 alone; any other 2xx offers Retry.
+// - A response whose body cannot be read, cut off or not JSON, is a failure of the status
+//   it carried, never the no-response case, and states no write outcome.
 // - C-6: Delete asks first; Cancel sends nothing, Confirm sends exactly one DELETE.
 // - P2 permissions (0.2.4): a save the definition's flags deny sends no request; a known
 //   denial or a 403 keeps the draft and offers Discard edits, which reverts it in place.
 // - Exact numbers: the client reads a field value that is an integer beyond
 //   ±Number.MAX_SAFE_INTEGER, which a `bigint` column admits, as its bigint and saves it
 //   digit for digit, and reads every other number, such as a `tabIndex`, `uniqueKey` or
-//   `count`, and every other JSON body, as JSON.parse does. Client feedback compares a
+//   `count`, and every other JSON body, as JSON.parse does. A `values` map is written as a
+//   map whatever its fields are named, `kind` and `literal` included. Client feedback compares a
 //   number with its bounds only where the server compares alike on every column, and
 //   leaves the rest to its 400.
 //
@@ -26,8 +30,8 @@
 import { act, renderHook } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi, type Mock } from 'vitest';
 
-import { createApiClient, numberFromText, type ApiClient, type ApiResult } from '../api/client';
-import { errorMessages } from '../api/errors';
+import { createApiClient, isExactDecimal, numberFromText, type ApiClient, type ApiResult } from '../api/client';
+import { errorMessages, type ApiErrorKind } from '../api/errors';
 import type {
   FieldDefinition,
   FieldEventResponse,
@@ -65,6 +69,15 @@ const LIST_CANNOT_PROVE = /the record list cannot prove whether it was/i;
 const DUPLICATE_RECORD = /duplicate record/i;
 
 // Fields, chosen by their metadata so the cases hold whatever the fixture names them.
+
+/** The fixture field's prompt, which a 413 banner names it by. */
+function promptOf(name: string): string {
+  const { prompt } = fieldByName(name);
+  if (prompt === null || prompt.trim() === '') {
+    throw new Error(`the fixture field ${name} needs a prompt`);
+  }
+  return prompt;
+}
 
 function isWritableDataField(field: FieldDefinition): boolean {
   return isDataField(field) && !field.validation.readOnly;
@@ -312,6 +325,8 @@ interface ProblemExtra {
   readonly errors?: Readonly<Record<string, readonly string[]>>;
   /** The wire value as sent: any string, so a value outside the contract's outcomes can be served. */
   readonly writeOutcome?: string;
+  /** The failed request's trace id; TRACE_ID when absent. */
+  readonly traceId?: string;
 }
 
 /** A ProblemDetails response, with a field-level `errors` map or a `writeOutcome` when given. */
@@ -321,7 +336,7 @@ function problem(status: ProblemStatus, extra: ProblemExtra = {}): Response {
     title: PROBLEM_TITLES[status],
     status,
     detail: extra.detail ?? 'A fixed server sentence.',
-    traceId: TRACE_ID,
+    traceId: extra.traceId ?? TRACE_ID,
     ...(extra.errors === undefined ? {} : { errors: extra.errors }),
     ...(extra.writeOutcome === undefined ? {} : { writeOutcome: extra.writeOutcome }),
   };
@@ -333,6 +348,11 @@ function problem(status: ProblemStatus, extra: ProblemExtra = {}): Response {
 
 function noContent(): Response {
   return new Response(null, { status: 204 });
+}
+
+/** A response of a null body status, which has no body, whose headers advertise a 5-byte one. */
+function nullBodyAdvertisingFive(status: 204 | 205 | 304): Response {
+  return new Response(null, { status, headers: { 'Content-Length': '5' } });
 }
 
 /** A request that never received a response. */
@@ -603,6 +623,115 @@ describe('update bodies (C-3)', () => {
     expect(await perform(() => result.current.save())).toBe(true);
     expect(await perform(() => result.current.leave())).toBe(true);
     expect(api.calls).toEqual([]);
+  });
+});
+
+// A field the user edits back to the record's value is clean again: it leaves the dirty set,
+// so no PUT rewrites the stored row and no leave prompt holds the page. While a write that may
+// still reach the server, or may already have been applied, carries the field, it stays dirty,
+// so the next save sends the value on screen (0.3.6 dirty tracking).
+describe('an edit back to the record value', () => {
+  /** Whether the browser's leave prompt would hold the page: a beforeunload listener cancels the event. */
+  function promptsOnUnload(): boolean {
+    const event = new Event('beforeunload', { cancelable: true });
+    window.dispatchEvent(event);
+    return event.defaultPrevented;
+  }
+
+  it.each<[string, string, FieldValue, FieldValue, FieldValue]>([
+    ['a text field edited and typed back', TEXT, 'Smith', 'Jones', 'Smith'],
+    ['a text field typed into and cleared', TEXT, null, '121', ''],
+    ['a number field edited and typed back', NUMBER, 31, 32, 31],
+    ['a number field typed into and cleared', NUMBER, null, 121, null],
+    // An unchecked box is no value, so a box checked and unchecked again is back at its stored null.
+    ['a checkbox stored as null, checked and unchecked', CHECKBOX, null, true, false],
+  ])('leaves %s clean, with no leave prompt and no request on leaving', async (_case, name, stored, edited, back) => {
+    const record = recordFixture({ values: { [name]: stored } });
+    const { api, result } = mountExisting(record);
+    edit(result, name, edited);
+    expect([...result.current.dirty]).toEqual([name]);
+    expect(result.current.isDirty).toBe(true);
+    expect(promptsOnUnload()).toBe(true);
+
+    edit(result, name, back);
+
+    expect(result.current.dirty.size).toBe(0);
+    expect(result.current.isDirty).toBe(false);
+    expect(promptsOnUnload()).toBe(false);
+    expect(await perform(() => result.current.leave())).toBe(true);
+    expect(await perform(() => result.current.save())).toBe(true);
+    expect(api.calls).toEqual([]);
+  });
+
+  it('keeps a field typed back during a PUT that carries it dirty for the next PUT, and drops one the PUT does not carry', async () => {
+    const { api, result, record } = mountExisting();
+    edit(result, TEXT, 'Jones');
+    const put = api.hold();
+    const saving = await startHeld(() => result.current.save(), put);
+
+    // The PUT may store Jones, so Smith on screen still has to be saved; OTHER_TEXT is not in it.
+    edit(result, TEXT, 'Smith');
+    edit(result, OTHER_TEXT, 'Brown');
+    edit(result, OTHER_TEXT, 'Other');
+    expect([...result.current.dirty]).toEqual([TEXT]);
+    await act(async () => {
+      put.release(jsonResponse(200, savedCopy(record, { [TEXT]: 'Jones' })));
+      await saving.promise;
+    });
+
+    expect(saving.outcome()).toBe(true);
+    expect(result.current.values[TEXT]).toBe('Smith');
+    expect([...result.current.dirty]).toEqual([TEXT]);
+    expect(result.current.isDirty).toBe(true);
+
+    api.reply(jsonResponse(200, savedCopy(record, { [TEXT]: 'Smith' })));
+    expect(await perform(() => result.current.leave())).toBe(true);
+
+    expect(api.calls.map(sentValues)).toEqual([{ [TEXT]: 'Jones' }, { [TEXT]: 'Smith' }]);
+    expect(result.current.isDirty).toBe(false);
+  });
+
+  it('keeps a field typed back after a notWritten PUT dirty, and saves it after the PUT Retry resends', async () => {
+    const { api, result, record } = mountExisting();
+    edit(result, TEXT, 'Jones');
+    api.reply(problem(503, { writeOutcome: 'notWritten' }));
+    expect(await perform(() => result.current.save())).toBe(false);
+
+    edit(result, TEXT, 'Smith');
+    expect([...result.current.dirty]).toEqual([TEXT]);
+
+    // Retry resends the failed PUT as it was sent; the value typed back since stays to be saved.
+    api.reply(jsonResponse(200, savedCopy(record, { [TEXT]: 'Jones' })));
+    await perform(() => result.current.retry());
+    expect(result.current.values[TEXT]).toBe('Smith');
+    expect([...result.current.dirty]).toEqual([TEXT]);
+
+    api.reply(jsonResponse(200, savedCopy(record, { [TEXT]: 'Smith' })));
+    expect(await perform(() => result.current.save())).toBe(true);
+
+    expect(api.calls.map(sentValues)).toEqual([{ [TEXT]: 'Jones' }, { [TEXT]: 'Jones' }, { [TEXT]: 'Smith' }]);
+    expect(result.current.isDirty).toBe(false);
+  });
+
+  it('keeps a field typed back after a PUT of unknown outcome dirty and blocked until Save again sends it', async () => {
+    const { api, result, record } = mountExisting();
+    edit(result, TEXT, 'Jones');
+    api.reply(problem(503, { writeOutcome: 'unknown' }));
+    expect(await perform(() => result.current.save())).toBe(false);
+
+    // The server may hold Jones, so Smith on screen is not known to be stored.
+    edit(result, TEXT, 'Smith');
+    expect([...result.current.dirty]).toEqual([TEXT]);
+    expect(result.current.isDirty).toBe(true);
+    expect(result.current.saveBlocked).toBe(true);
+    expect(await perform(() => result.current.leave())).toBe(false);
+    expect(api.lines()).toEqual([`PUT ${recordPath(record)}`]);
+
+    api.reply(jsonResponse(200, savedCopy(record, { [TEXT]: 'Smith' })));
+    expect(await perform(() => result.current.saveAgain())).toBe(true);
+
+    expect(api.calls.map(sentValues)).toEqual([{ [TEXT]: 'Jones' }, { [TEXT]: 'Smith' }]);
+    expect(result.current.isDirty).toBe(false);
   });
 });
 
@@ -1048,6 +1177,9 @@ describe('leaving a record (0.3.6)', () => {
     const banner = bannerOf(result.current);
     expect(banner.kind).toBe('deleted');
     expect(banner.message).toMatch(/deleted/i);
+    // The edits stay on screen, read-only, and the text says they were not saved.
+    expect(banner.message).toBe(errorMessages.saveConflict);
+    expect(result.current.values[TEXT]).toBe('Jones');
     expect(banner.actions).toEqual([]);
     for (const field of allFields()) {
       expect(result.current.isProtected(field.name)).toBe(true);
@@ -1060,18 +1192,19 @@ describe('leaving a record (0.3.6)', () => {
 
   it.each([
     {
+      // The 413 names the field holding the most text in the refused body, the one edit.
       status: 413 as const,
       writeOutcome: undefined,
       kind: 'tooLarge',
-      says: /request too large/i,
+      says: errorMessages.saveTooLarge(promptOf(TEXT)),
       actions: [],
     },
     {
-      // The generic error banner names the trace id in its text.
+      // The text says the draft is kept; the trace id is the banner's own, shown on its own line.
       status: 500 as const,
       writeOutcome: 'notWritten' as const,
       kind: 'server',
-      says: TRACE_ID,
+      says: errorMessages.serverWithDraft,
       actions: ['retry'],
     },
   ])('keeps the draft on a $status, in a $kind banner with the trace id', async (row) => {
@@ -1083,13 +1216,93 @@ describe('leaving a record (0.3.6)', () => {
 
     const banner = bannerOf(result.current);
     expect(banner.kind).toBe(row.kind);
-    expect(banner.message).toMatch(row.says);
+    // The save was leaving the record, so the text also says that leaving was cancelled.
+    expect(banner.message).toBe(`${row.says} ${errorMessages.leaveCancelled}`);
     expect(banner.traceId).toBe(TRACE_ID);
     expect(banner.actions).toEqual(row.actions);
     expect(result.current.values[TEXT]).toBe('Jones');
     expect(result.current.isDirty).toBe(true);
     expect(onSaved).not.toHaveBeenCalled();
     expect(api.lines()).toHaveLength(1);
+  });
+});
+
+// What a failed save's banner tells the user to do next.
+describe('save failure banners', () => {
+  it.each<{ readonly name: string; readonly edits: Values; readonly label: string | null }>([
+    {
+      name: 'the field holding the most text',
+      edits: { [TEXT]: 'Jones', [OTHER_TEXT]: 'x'.repeat(64) },
+      label: promptOf(OTHER_TEXT),
+    },
+    {
+      // The body is sent as UTF-8, so text is measured in bytes: 40 two-byte letters outweigh 60 one-byte ones.
+      name: 'the field whose text takes the most bytes',
+      edits: { [TEXT]: 'é'.repeat(40), [OTHER_TEXT]: 'x'.repeat(60) },
+      label: promptOf(TEXT),
+    },
+    { name: 'no field when the body holds no text', edits: { [NUMBER]: 7 }, label: null },
+  ])('explains the size limit of a 413 and names $name', async ({ edits, label }) => {
+    const { api, result } = mountExisting();
+    for (const [name, value] of Object.entries(edits)) {
+      edit(result, name, value);
+    }
+    api.reply(problem(413));
+
+    expect(await perform(() => result.current.save())).toBe(false);
+
+    const banner = bannerOf(result.current);
+    expect(banner.kind).toBe('tooLarge');
+    // No leave was running, so the text says nothing of one.
+    expect(banner.message).toBe(errorMessages.saveTooLarge(label));
+    expect(banner.message).toMatch(/request too large/i);
+    expect(banner.message).toContain('1 MB');
+    expect(banner.traceId).toBe(TRACE_ID);
+    expect(banner.actions).toEqual([]);
+    expect(sentValues(api.calls[0])).toEqual(edits);
+    expect(result.current.isDirty).toBe(true);
+  });
+
+  const LEAVE_CANCELLED = ` ${errorMessages.leaveCancelled}`;
+  const LEAVE_CANCELLED_DRAFT_KEPT = ` ${errorMessages.leaveCancelled} ${errorMessages.draftKept}`;
+
+  it.each<{ readonly failure: string; readonly reply: () => Response; readonly text: string; readonly suffix: string }>([
+    // The 409's edits were not saved and no longer can be, so it says nothing of a kept draft.
+    { failure: 'a 409', reply: () => problem(409), text: errorMessages.saveConflict, suffix: LEAVE_CANCELLED },
+    {
+      failure: 'a 503 reporting notWritten',
+      reply: () => problem(503, { writeOutcome: 'notWritten' }),
+      text: errorMessages.unavailable,
+      suffix: LEAVE_CANCELLED,
+    },
+    { failure: 'a 404', reply: () => problem(404), text: errorMessages.notFound, suffix: LEAVE_CANCELLED_DRAFT_KEPT },
+    {
+      failure: 'a 403',
+      reply: () => problem(403),
+      text: errorMessages.forbidden.update,
+      suffix: LEAVE_CANCELLED_DRAFT_KEPT,
+    },
+    {
+      failure: 'a request-level 400',
+      reply: () => problem(400, { detail: 'malformed JSON' }),
+      text: 'malformed JSON',
+      suffix: LEAVE_CANCELLED_DRAFT_KEPT,
+    },
+  ])('says that leaving was cancelled when $failure stops the save of a leave, and only then', async (row) => {
+    const leaving = mountExisting();
+    edit(leaving.result, TEXT, 'Jones');
+    leaving.api.reply(row.reply());
+
+    expect(await perform(() => leaving.result.current.leave())).toBe(false);
+    expect(bannerOf(leaving.result.current).message).toBe(row.text + row.suffix);
+
+    // The same failure of a plain save, with no leave running, says nothing of leaving.
+    const saving = mountExisting();
+    edit(saving.result, TEXT, 'Jones');
+    saving.api.reply(row.reply());
+
+    expect(await perform(() => saving.result.current.save())).toBe(false);
+    expect(bannerOf(saving.result.current).message).toBe(row.text);
   });
 });
 
@@ -1137,6 +1350,64 @@ describe('save progress', () => {
     expect(result.current.savePending).toBe(false);
   });
 
+  it.each<[string, boolean]>([
+    ['is pending from the start of the field-event drain that leave() of a dirty record awaits', true],
+    ['stays false through the field-event drain that leave() of a clean record awaits', false],
+  ])('%s', async (_case, edited) => {
+    const { api, result, record } = mountExisting();
+    const eventLine = `POST /api/forms/${VIEW_ID}/checkcode/field-event`;
+    apisRaisingEvents.add(api);
+    // The record installed at mount raises no event until a tick after it is committed.
+    await act(
+      () =>
+        new Promise<void>((resolve) => {
+          setTimeout(resolve, 0);
+        }),
+    );
+    if (edited) {
+      edit(result, TEXT, 'Jones');
+    }
+    const event = api.hold();
+    await act(async () => {
+      result.current.onFieldBlur(TEXT);
+      await event.reached;
+    });
+
+    const leaves: Promise<boolean>[] = [];
+    run(() => {
+      leaves.push(result.current.leave());
+    });
+
+    // The leave waits on the held event; a dirty draft's save is under way from here on.
+    expect(result.current.frozen).toBe(true);
+    expect(result.current.savePending).toBe(edited);
+    expect(result.current.saving).toBe(false);
+    expect(api.lines()).toEqual([eventLine]);
+
+    if (edited) {
+      api.reply(jsonResponse(200, savedCopy(record, { [TEXT]: 'Jones' })));
+    }
+    const noEffects: FieldEventResponse = {
+      enabled: [],
+      disabled: [],
+      cleared: [],
+      assigned: {},
+      dialogs: [],
+      diagnostics: [],
+    };
+    expect(
+      await perform(() => {
+        event.release(
+          new Response(JSON.stringify(noEffects), { status: 200, headers: { 'content-type': 'application/json' } }),
+        );
+        return Promise.all(leaves);
+      }),
+    ).toEqual([true]);
+
+    expect(result.current.savePending).toBe(false);
+    expect(api.lines()).toEqual(edited ? [eventLine, `PUT ${recordPath(record)}`] : [eventLine]);
+  });
+
   it('ends a save that client validation stops before any request', async () => {
     const { api, result } = mountExisting();
     edit(result, ZIP.name, '1'.repeat(ZIP_MAX_LENGTH + 1));
@@ -1171,6 +1442,103 @@ describe('save progress', () => {
   });
 });
 
+
+// `saved` confirms the last successful save of the draft until the next edit, write, delete or
+// discard. A save leave() made is confirmed on the record its move installs; the record a later
+// move installs without a save, or after a move that failed, confirms nothing.
+describe('save confirmation', () => {
+  /** The record a move installs. */
+  function nextRecord(): RecordDto {
+    return recordFixture({
+      globalRecordId: '3f2b8c1e-5d4a-4c1b-9e7f-000000000002',
+      uniqueKey: 2,
+      position: 2,
+      values: { [TEXT]: 'Next' },
+    });
+  }
+
+  it.each<[string, (mounted: MountedRecord) => Promise<void>]>([
+    [
+      'Save',
+      async ({ api, result, record }) => {
+        api.reply(jsonResponse(200, savedCopy(record, { [TEXT]: 'Jones' })));
+        expect(await perform(() => result.current.save())).toBe(true);
+      },
+    ],
+    [
+      'Retry of a notWritten PUT',
+      async ({ api, result, record }) => {
+        api.reply(problem(503, { writeOutcome: 'notWritten' }));
+        expect(await perform(() => result.current.save())).toBe(false);
+        expect(result.current.saved).toBe(false);
+        api.reply(jsonResponse(200, savedCopy(record, { [TEXT]: 'Jones' })));
+        await perform(() => result.current.retry());
+      },
+    ],
+    [
+      'Save again after a PUT of unknown outcome',
+      async ({ api, result, record }) => {
+        api.reply(problem(503, { writeOutcome: 'unknown' }));
+        expect(await perform(() => result.current.save())).toBe(false);
+        expect(result.current.saved).toBe(false);
+        api.reply(jsonResponse(200, savedCopy(record, { [TEXT]: 'Jones' })));
+        expect(await perform(() => result.current.saveAgain())).toBe(true);
+      },
+    ],
+  ])('confirms a save made by %s until the next edit', async (_case, succeed) => {
+    const mounted = mountExisting();
+    const { result } = mounted;
+    edit(result, TEXT, 'Jones');
+    expect(result.current.saved).toBe(false);
+
+    await succeed(mounted);
+
+    expect(result.current.saved).toBe(true);
+    expect(result.current.isDirty).toBe(false);
+    edit(result, OTHER_TEXT, 'Brown');
+    expect(result.current.saved).toBe(false);
+  });
+
+  it('confirms the save leave() made on the record its move installs, and nothing on the record after a move that saved nothing', async () => {
+    const { api, result, record, props, rerender } = mountExisting();
+    edit(result, TEXT, 'Jones');
+    // Navigation freezes the draft before it awaits leave(), and installs the next record after.
+    rerender({ ...props, transitioning: true });
+    api.reply(jsonResponse(200, savedCopy(record, { [TEXT]: 'Jones' })));
+    expect(await perform(() => result.current.leave())).toBe(true);
+    expect(result.current.saved).toBe(true);
+
+    const next = nextRecord();
+    rerender({ ...props, record: next, recordGeneration: props.recordGeneration + 1, transitioning: false });
+    expect(result.current.values[TEXT]).toBe('Next');
+    expect(result.current.saved).toBe(true);
+
+    rerender({ ...props, record: next, recordGeneration: props.recordGeneration + 1, transitioning: true });
+    expect(await perform(() => result.current.leave())).toBe(true);
+    rerender({ ...props, recordGeneration: props.recordGeneration + 2, transitioning: false });
+    expect(result.current.values[TEXT]).toBe('Smith');
+    expect(result.current.saved).toBe(false);
+    expect(api.lines()).toEqual([`PUT ${recordPath(record)}`]);
+  });
+
+  it('confirms nothing on a later move once the move a leave() save made way for has failed', async () => {
+    const { api, result, record, props, rerender } = mountExisting();
+    edit(result, TEXT, 'Jones');
+    rerender({ ...props, transitioning: true });
+    api.reply(jsonResponse(200, savedCopy(record, { [TEXT]: 'Jones' })));
+    expect(await perform(() => result.current.leave())).toBe(true);
+    // The move's read failed: navigation ends its transition with the saved record still open.
+    rerender({ ...props, transitioning: false });
+    expect(result.current.saved).toBe(true);
+
+    rerender({ ...props, transitioning: true });
+    expect(await perform(() => result.current.leave())).toBe(true);
+    rerender({ ...props, record: nextRecord(), recordGeneration: props.recordGeneration + 1, transitioning: false });
+    expect(result.current.values[TEXT]).toBe('Next');
+    expect(result.current.saved).toBe(false);
+    expect(api.lines()).toEqual([`PUT ${recordPath(record)}`]);
+  });
+});
 
 // The write-outcome table of 0.3.4.2, for a create and an update
 
@@ -1227,12 +1595,12 @@ function mountDirtyDraft(method: RecordWriteMethod): DirtyDraft {
   };
 }
 
-/** notWritten, the one outcome Retry resends; the banner follows the status. */
+/** notWritten, the one outcome Retry resends; the banner follows the status, and both say the draft is kept. */
 const NOT_WRITTEN_CASES = RECORD_WRITE_METHODS.flatMap((method) => [
-  // The generic error banner with the trace id.
-  { method, status: 500 as const, kind: 'server', says: TRACE_ID as string | RegExp },
-  // The connection banner, whose wording the plan leaves open: it only has to say something.
-  { method, status: 503 as const, kind: 'unavailable', says: /\S/ },
+  // The generic error banner; its trace id is the banner's own.
+  { method, status: 500 as const, kind: 'server', says: errorMessages.serverWithDraft },
+  // The connection banner.
+  { method, status: 503 as const, kind: 'unavailable', says: errorMessages.unavailable },
 ]);
 
 /** The 500 and 503 bodies that do not prove the save was not applied. */
@@ -1251,6 +1619,8 @@ interface UnsafeCase {
   readonly reply: () => Reply;
   /** The banner's trace id: the server's, or `null` when no response arrived. */
   readonly traceId: string | null;
+  /** What failed, which the banner names first. */
+  readonly cause: string;
 }
 
 /** Every failed save that Retry must not resend: each unproven 500 and 503, and no response. */
@@ -1262,10 +1632,17 @@ const UNSAFE_CASES: readonly UnsafeCase[] = RECORD_WRITE_METHODS.flatMap((method
         failure: `a ${String(status)} with ${name}`,
         reply: () => problem(status, extra),
         traceId: TRACE_ID,
+        cause: status === 500 ? errorMessages.server : errorMessages.unavailableWithoutDraft,
       }),
     ),
   ),
-  { method, failure: 'no response', reply: () => networkFailure, traceId: null },
+  {
+    method,
+    failure: 'no response',
+    reply: () => networkFailure,
+    traceId: null,
+    cause: errorMessages.networkWithoutDraft,
+  },
 ]);
 
 describe('write outcomes and Retry (0.3.4.2)', () => {
@@ -1280,7 +1657,7 @@ describe('write outcomes and Retry (0.3.4.2)', () => {
     expect(banner.kind).toBe(row.kind);
     expect(banner.method).toBe(row.method);
     expect(banner.actions).toEqual(['retry']);
-    expect(banner.message).toMatch(row.says);
+    expect(banner.message).toBe(row.says);
     expect(banner.traceId).toBe(TRACE_ID);
     expect(result.current.values[TEXT]).toBe(draft.typed);
     expect(onSaved).not.toHaveBeenCalled();
@@ -1296,7 +1673,7 @@ describe('write outcomes and Retry (0.3.4.2)', () => {
     expect(result.current.banner).toBeNull();
   });
 
-  it.each(UNSAFE_CASES)('offers only Save again on a $method after $failure', async ({ method, reply, traceId }) => {
+  it.each(UNSAFE_CASES)('offers only Save again on a $method after $failure', async ({ method, reply, traceId, cause }) => {
     const draft = mountDirtyDraft(method);
     const { api, result, onSaved } = draft;
     api.reply(reply());
@@ -1317,11 +1694,18 @@ describe('write outcomes and Retry (0.3.4.2)', () => {
     } else {
       expect(banner.message).not.toMatch(/duplicate/i);
     }
+    // The cause comes first, then what the save may have done and that the draft is kept.
+    const risk = method === 'POST' ? ` ${errorMessages.duplicateRisk}` : '';
+    const uncertainText = `${cause} ${errorMessages.uncertainWrite}${risk}`;
+    expect(banner.message).toBe(uncertainText);
 
     // Neither Retry nor an ordinary save or leave resends it, and the draft stays.
     await perform(() => result.current.retry());
     expect(await perform(() => result.current.save())).toBe(false);
+    expect(bannerOf(result.current).message).toBe(uncertainText);
     expect(await perform(() => result.current.leave())).toBe(false);
+    // The refused leave's banner says that leaving was cancelled.
+    expect(bannerOf(result.current).message).toBe(`${uncertainText} ${errorMessages.leaveCancelled}`);
     expect(api.lines()).toEqual([draft.line]);
     expect(bannerOf(result.current).actions).toEqual(['saveAgain']);
     expect(result.current.values[TEXT]).toBe(draft.typed);
@@ -1374,6 +1758,55 @@ describe('an uncertain save blocks every save but Save again (0.3.4.2)', () => {
   function malformedSuccess(status: number, body: unknown): Response {
     return new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
   }
+
+  it.each(RECORD_WRITE_METHODS)(
+    'reports a %s of unknown outcome as saveBlocked until Save again succeeds',
+    async (method) => {
+      const draft = mountDirtyDraft(method);
+      const { api, result } = draft;
+      expect(result.current.saveBlocked).toBe(false);
+      api.reply(problem(503, { writeOutcome: 'unknown' }));
+      expect(await perform(() => result.current.save())).toBe(false);
+
+      expect(result.current.saveBlocked).toBe(true);
+      // A Save again the server also leaves in doubt keeps it blocked.
+      api.reply(networkFailure);
+      expect(await perform(() => result.current.saveAgain())).toBe(false);
+      expect(result.current.saveBlocked).toBe(true);
+
+      api.reply(draft.success());
+      expect(await perform(() => result.current.saveAgain())).toBe(true);
+      expect(result.current.saveBlocked).toBe(false);
+      expect(api.lines()).toEqual([draft.line, draft.line, draft.line]);
+    },
+  );
+
+  it('refuses a blocked save at once: the banner is shown again as a new banner, and no save is pending', async () => {
+    const { api, result, record } = mountExisting();
+    edit(result, TEXT, 'Jones');
+    api.reply(problem(503, { writeOutcome: 'unknown' }));
+    expect(await perform(() => result.current.save())).toBe(false);
+    const shown = bannerOf(result.current);
+    run(() => {
+      result.current.dismissBanner();
+    });
+    expect(result.current.banner).toBeNull();
+
+    const refusals: Promise<boolean>[] = [];
+    run(() => {
+      refusals.push(result.current.save());
+    });
+
+    // Before any drain or request: no save started, so nothing reports Saving… meanwhile.
+    expect(result.current.savePending).toBe(false);
+    expect(result.current.saving).toBe(false);
+    const again = bannerOf(result.current);
+    expect(again).not.toBe(shown);
+    expect(again).toEqual(shown);
+    expect(await perform(() => Promise.all(refusals))).toEqual([false]);
+    expect(result.current.savePending).toBe(false);
+    expect(api.lines()).toEqual([`PUT ${recordPath(record)}`]);
+  });
 
   it('keeps a PUT uncertain when Save again stops at client validation', async () => {
     const { api, result, record, onSaved } = mountExisting();
@@ -1522,6 +1955,43 @@ describe('an uncertain save blocks every save but Save again (0.3.4.2)', () => {
     },
   );
 
+  it.each(RECORD_WRITE_METHODS)(
+    'reports the latest failure when Save again of an uncertain %s gets a 503 reporting notWritten',
+    async (method) => {
+      const firstTrace = '00-1111111111111111111111111111aaaa-111111111111aaaa-00';
+      const latestTrace = '00-2222222222222222222222222222bbbb-222222222222bbbb-00';
+      const draft = mountDirtyDraft(method);
+      const { api, result } = draft;
+      api.reply(problem(500, { writeOutcome: 'written', traceId: firstTrace }));
+      expect(await perform(() => result.current.save())).toBe(false);
+      expect(bannerOf(result.current).traceId).toBe(firstTrace);
+
+      api.reply(problem(503, { writeOutcome: 'notWritten', traceId: latestTrace }));
+      expect(await perform(() => result.current.saveAgain())).toBe(false);
+
+      // The latest request's trace id and cause, while the first save may still have been applied.
+      const banner = bannerOf(result.current);
+      expect(banner.kind).toBe('uncertainWrite');
+      expect(banner.actions).toEqual(['saveAgain']);
+      expect(banner.traceId).toBe(latestTrace);
+      expect(banner.error.status).toBe(503);
+      expect(banner.error.writeOutcome).toBe('written');
+      expect(banner.message.startsWith(`${errorMessages.unavailableWithoutDraft} `)).toBe(true);
+      expect(banner.message).toMatch(MAY_ALREADY_BE_APPLIED);
+
+      // A refused save shows the latest failure again, and sends nothing.
+      run(() => {
+        result.current.dismissBanner();
+      });
+      expect(await perform(() => result.current.save())).toBe(false);
+      const refused = bannerOf(result.current);
+      expect(refused.kind).toBe('uncertainWrite');
+      expect(refused.actions).toEqual(['saveAgain']);
+      expect(refused.traceId).toBe(latestTrace);
+      expect(api.lines()).toEqual([draft.line, draft.line]);
+    },
+  );
+
   it.each([
     { status: 201, name: 'null', body: null },
     {
@@ -1635,6 +2105,161 @@ describe('an uncertain save blocks every save but Save again (0.3.4.2)', () => {
   });
 });
 
+// A response whose status arrived but whose body cannot be used is a failure of that
+// status, never the no-response case, and its body states no write outcome (0.3.4.2).
+describe('a response whose body cannot be read (0.3.4.2)', () => {
+  /** A response whose status and first body bytes arrive before its body stream fails with `failure`. */
+  function interruptedBody(status: number, failure: Error = new TypeError('terminated')): Response {
+    let started = false;
+    const body = new ReadableStream<Uint8Array>({
+      pull(stream) {
+        if (!started) {
+          started = true;
+          stream.enqueue(new TextEncoder().encode('{"globalRecordId":"'));
+          return;
+        }
+        stream.error(failure);
+      },
+    });
+    return new Response(body, { status, headers: { 'content-type': 'application/json' } });
+  }
+
+  function textResponse(status: number, contentType: string, text: string): Response {
+    return new Response(text, { status, headers: { 'content-type': contentType } });
+  }
+
+  const HTML_PAGE = '<html><body>proxy page</body></html>';
+
+  /** A body stream failure named AbortError that no abort of the caller caused. */
+  function strayAbortError(): DOMException {
+    return new DOMException('The body stream was aborted.', 'AbortError');
+  }
+
+  /**
+   * Per method: its contracted 2xx with a body that is not JSON or is cut off, and a cut-off
+   * 503. A cut-off body is cut off with a network error, or with an AbortError the caller did
+   * not cause, which only the caller's own abort makes an abort.
+   */
+  const UNREADABLE_SAVES = RECORD_WRITE_METHODS.flatMap((method) => {
+    const success = method === 'POST' ? 201 : 200;
+    return [
+      { method, status: success, kind: 'server', failure: 'a text/plain body', reply: () => textResponse(success, 'text/plain', 'OK') },
+      { method, status: success, kind: 'server', failure: 'an HTML page', reply: () => textResponse(success, 'text/html', HTML_PAGE) },
+      { method, status: success, kind: 'server', failure: 'a body cut off mid-stream', reply: () => interruptedBody(success) },
+      { method, status: 503, kind: 'unavailable', failure: 'a body cut off mid-stream', reply: () => interruptedBody(503) },
+      {
+        method,
+        status: success,
+        kind: 'server',
+        failure: 'a body cut off by a stray AbortError',
+        reply: () => interruptedBody(success, strayAbortError()),
+      },
+      {
+        method,
+        status: 503,
+        kind: 'unavailable',
+        failure: 'a body cut off by a stray AbortError',
+        reply: () => interruptedBody(503, strayAbortError()),
+      },
+    ];
+  });
+
+  it.each(UNREADABLE_SAVES)(
+    'keeps the $status of a $method answered with $failure, and offers only Save again',
+    async ({ method, status, kind, reply }) => {
+      const draft = mountDirtyDraft(method);
+      const { api, result, onSaved } = draft;
+      api.reply(reply());
+
+      expect(await perform(() => result.current.save())).toBe(false);
+
+      const banner = bannerOf(result.current);
+      expect(banner.error).toMatchObject({ kind, status, traceId: null, writeOutcome: null });
+      expect(banner.kind).toBe('uncertainWrite');
+      expect(banner.method).toBe(method);
+      expect(banner.actions).toEqual(['saveAgain']);
+      expect(banner.message).toMatch(MAY_ALREADY_BE_APPLIED);
+      expect(result.current.values[TEXT]).toBe(draft.typed);
+      expect(result.current.isDirty).toBe(true);
+      expect(onSaved).not.toHaveBeenCalled();
+
+      // The save may have been applied, so Retry does not resend it; Save again sends it once more.
+      await perform(() => result.current.retry());
+      expect(api.lines()).toEqual([draft.line]);
+      api.reply(draft.success());
+      expect(await perform(() => result.current.saveAgain())).toBe(true);
+
+      expect(api.lines()).toEqual([draft.line, draft.line]);
+      expect(sentValues(api.calls[1])).toEqual(draft.body);
+      expect(onSaved).toHaveBeenCalledTimes(1);
+      expect(onSaved).toHaveBeenCalledWith(draft.saved);
+    },
+  );
+
+  it.each<[string, () => Promise<Response>, Record<string, unknown>]>([
+    ['a 200 whose body is cut off', () => Promise.resolve(interruptedBody(200)), { kind: 'server', status: 200, traceId: null }],
+    ['a 503 whose body is cut off', () => Promise.resolve(interruptedBody(503)), { kind: 'unavailable', status: 503, traceId: null }],
+    [
+      'a 503 whose body is cut off by an AbortError the caller did not cause',
+      () => Promise.resolve(interruptedBody(503, strayAbortError())),
+      { kind: 'unavailable', status: 503, traceId: null },
+    ],
+    ['a 200 HTML page', () => Promise.resolve(textResponse(200, 'text/html', HTML_PAGE)), { kind: 'server', status: 200, traceId: null }],
+    // A null body status has no body whatever its headers advertise, so its status still decides.
+    ['a 205 with a Content-Length of 5', () => Promise.resolve(nullBodyAdvertisingFive(205)), { kind: 'server', status: 205, traceId: null }],
+    ['a 304 with a Content-Length of 5', () => Promise.resolve(nullBodyAdvertisingFive(304)), { kind: 'server', status: 304, traceId: null }],
+    // A readable error body is still parsed as ProblemDetails.
+    ['a 404 ProblemDetails', () => Promise.resolve(problem(404)), { kind: 'notFound', status: 404, traceId: TRACE_ID }],
+    // Only a request that got no response at all is a network failure.
+    ['no response', networkFailure, { kind: 'network', status: null, traceId: null }],
+  ])('settles a read answered with %s as that failure', async (_case, answer, expected) => {
+    const client = createApiClient({ baseUrl: 'http://localhost', fetch: answer });
+
+    const read = await client.getRecord(VIEW_ID, 'g');
+
+    expect(read.ok).toBe(false);
+    expect(read.ok ? null : read.error).toMatchObject({ ...expected, writeOutcome: null });
+  });
+
+  it.each<[string, DOMException | undefined, string]>([
+    ['without a reason', undefined, 'AbortError'],
+    ['with a deadline reason', new DOMException('The deadline passed.', 'TimeoutError'), 'TimeoutError'],
+  ])('rejects a call aborted %s while its body is read with the abort reason', async (_case, reason, name) => {
+    const controller = new AbortController();
+    const client = createApiClient({
+      baseUrl: 'http://localhost',
+      // As fetch does, an abort during the body fails the body stream with the abort's reason.
+      fetch: (input: RequestInfo | URL, init?: RequestInit) => {
+        const request = input instanceof Request ? input : new Request(input, init);
+        let started = false;
+        const body = new ReadableStream<Uint8Array>({
+          pull(stream) {
+            if (!started) {
+              started = true;
+              stream.enqueue(new TextEncoder().encode('{"globalRecordId":"'));
+              return;
+            }
+            request.signal.addEventListener('abort', () => {
+              stream.error(request.signal.reason);
+            });
+            controller.abort(reason);
+          },
+        });
+        return Promise.resolve(new Response(body, { status: 200, headers: { 'content-type': 'application/json' } }));
+      },
+    });
+
+    const failure = await client.getRecord(VIEW_ID, 'g', controller.signal).then(
+      () => null,
+      (e: unknown) => e,
+    );
+
+    expect(failure).not.toBeNull();
+    expect(failure).toBe(controller.signal.reason);
+    expect(failure).toMatchObject({ name });
+  });
+});
+
 describe('delete (C-6)', () => {
   it('cancel closes the dialog without a PUT or a DELETE and keeps the draft', () => {
     const { api, result } = mountExisting();
@@ -1654,13 +2279,17 @@ describe('delete (C-6)', () => {
     expect(result.current.isDirty).toBe(true);
   });
 
-  it('confirm discards the edits and sends exactly one DELETE, with no PUT before it', async () => {
+  it.each([
+    { name: 'a 204', reply: noContent },
+    // A 204 has no body whatever its headers advertise, so a stray Content-Length changes nothing.
+    { name: 'a 204 with a Content-Length of 5', reply: (): Response => nullBodyAdvertisingFive(204) },
+  ])('confirm discards the edits and sends exactly one DELETE, with no PUT before it, completed by $name', async ({ reply }) => {
     const { api, result, record, onDeleted, onSaved } = mountExisting();
     edit(result, TEXT, 'Jones');
     run(() => {
       result.current.requestDelete();
     });
-    api.reply(noContent());
+    api.reply(reply());
 
     await perform(() => result.current.confirmDelete());
 
@@ -1672,6 +2301,70 @@ describe('delete (C-6)', () => {
     expect(result.current.isDirty).toBe(false);
     expect(result.current.deleteDialogOpen).toBe(false);
     expect(result.current.deletedReadOnly).toBe(true);
+  });
+
+  it.each<[string, readonly (readonly [string, FieldValue])[]]>([
+    ['an untouched new record', []],
+    [
+      'a new record whose one entry is a checkbox checked and unchecked again',
+      [
+        [CHECKBOX, true],
+        [CHECKBOX, false],
+      ],
+    ],
+  ])('asks nothing on Delete of %s, which holds nothing to discard', (_case, entries) => {
+    const { api, result } = mountNew();
+    for (const [name, value] of entries) {
+      edit(result, name, value);
+    }
+
+    run(() => {
+      result.current.requestDelete();
+    });
+
+    expect(result.current.deleteDialogOpen).toBe(false);
+    expect(result.current.isDirty).toBe(false);
+    expect(api.calls).toEqual([]);
+  });
+
+  // DELETE is acknowledged by its bodyless 204 alone; another 2xx proves nothing, whatever its body.
+  it.each([
+    { status: 205, name: 'no body', reply: (): Response => new Response(null, { status: 205 }) },
+    // A null body status has no body whatever its headers advertise, so its status still decides.
+    { status: 205, name: 'no body but a Content-Length of 5', reply: (): Response => nullBodyAdvertisingFive(205) },
+    {
+      status: 200,
+      name: 'a JSON body',
+      reply: (): Response =>
+        new Response(JSON.stringify({ deleted: true }), { status: 200, headers: { 'content-type': 'application/json' } }),
+    },
+  ])('reports a DELETE answered $status with $name as not done, and offers Retry', async ({ status, reply }) => {
+    const { api, result, record, onDeleted } = mountExisting();
+    const line = `DELETE ${recordPath(record)}`;
+    run(() => {
+      result.current.requestDelete();
+    });
+    api.reply(reply());
+
+    await perform(() => result.current.confirmDelete());
+
+    expect(api.lines()).toEqual([line]);
+    expect(onDeleted).not.toHaveBeenCalled();
+    expect(result.current.deletedReadOnly).toBe(false);
+    const banner = bannerOf(result.current);
+    expect(banner.kind).toBe('server');
+    expect(banner.method).toBe('DELETE');
+    expect(banner.actions).toEqual(['retry']);
+    expect(banner.error).toMatchObject({ kind: 'server', status, writeOutcome: null });
+
+    // Repeating a DELETE is safe, and its 204 completes the delete exactly once.
+    api.reply(noContent());
+    await perform(() => result.current.retry());
+
+    expect(api.lines()).toEqual([line, line]);
+    expect(onDeleted).toHaveBeenCalledTimes(1);
+    expect(result.current.deletedReadOnly).toBe(true);
+    expect(result.current.banner).toBeNull();
   });
 
   it('discards a never-saved new record without a request', async () => {
@@ -1732,7 +2425,9 @@ describe('permission flags (P2)', () => {
 
     const banner = bannerOf(result.current);
     expect(banner.kind).toBe('forbidden');
-    expect(banner.message).toBe(errorMessages.forbidden[row.action]);
+    expect(banner.message).toBe(
+      `${errorMessages.forbidden[row.action]} ${errorMessages.leaveCancelled} ${errorMessages.draftKept}`,
+    );
     expect(banner.actions).toEqual(['discardEdits']);
     expect(banner.traceId).toBeNull();
     expect(banner.isCreate).toBe(row.isNew);
@@ -1741,12 +2436,12 @@ describe('permission flags (P2)', () => {
     expect(result.current.isProtected(TEXT)).toBe(false);
     expect(result.current.saving).toBe(false);
 
-    // An explicit save is refused the same way.
+    // An explicit save is refused the same way, with no leave to speak of.
     run(() => {
       result.current.dismissBanner();
     });
     expect(await perform(() => result.current.save())).toBe(false);
-    expect(result.current.banner).toEqual(banner);
+    expect(result.current.banner).toEqual({ ...banner, message: errorMessages.forbidden[row.action] });
     expect(api.calls).toEqual([]);
 
     run(() => {
@@ -1804,7 +2499,9 @@ describe('permission flags (P2)', () => {
     expect(api.lines()).toEqual([row.line]);
     const banner = bannerOf(result.current);
     expect(banner.kind).toBe('forbidden');
-    expect(banner.message).toBe(errorMessages.forbidden[row.action]);
+    expect(banner.message).toBe(
+      `${errorMessages.forbidden[row.action]} ${errorMessages.leaveCancelled} ${errorMessages.draftKept}`,
+    );
     expect(banner.actions).toEqual(['discardEdits']);
     expect(banner.traceId).toBe(TRACE_ID);
     expect(result.current.values[TEXT]).toBe('Jones');
@@ -2035,6 +2732,52 @@ describe('leaving a record: the frozen draft (0.3.6)', () => {
   });
 });
 
+describe('health', () => {
+  // GET /health publishes its 200 only as {status: 'healthy'} and its 503 as {status: 'unhealthy'}.
+  // Any other 200 body, and any other OK status whatever its body, acknowledges no health, so the
+  // client settles it as a server failure of that status, through the same path as every other
+  // malformed OK body.
+
+  /** A client whose every request is recorded and answered with `status` and the JSON `body`. */
+  function clientAnsweringHealth(status: number, body: unknown, requests: string[]): ApiClient {
+    return createApiClient({
+      baseUrl: 'http://localhost',
+      fetch: (input) => {
+        const request = input instanceof Request ? input : new Request(input);
+        requests.push(`${request.method} ${new URL(request.url).pathname}`);
+        return Promise.resolve(
+          new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } }),
+        );
+      },
+    });
+  }
+
+  it('reports a 200 {status: "healthy"} as healthy', async () => {
+    const requests: string[] = [];
+
+    const result = await clientAnsweringHealth(200, { status: 'healthy' }, requests).getHealth();
+
+    expect(result).toEqual({ ok: true, data: { status: 'healthy' }, status: 200 });
+    expect(requests).toEqual(['GET /health']);
+  });
+
+  it.each<{ label: string; status: number; body: unknown; kind: string }>([
+    { label: 'a 200 {status: "ok"}', status: 200, body: { status: 'ok' }, kind: 'server' },
+    { label: 'a 200 {status: "unhealthy"}', status: 200, body: { status: 'unhealthy' }, kind: 'server' },
+    { label: 'a 202 {status: "healthy"}', status: 202, body: { status: 'healthy' }, kind: 'server' },
+    { label: 'a 203 {status: "healthy"}', status: 203, body: { status: 'healthy' }, kind: 'server' },
+    { label: 'a 503 {status: "unhealthy"}', status: 503, body: { status: 'unhealthy' }, kind: 'unavailable' },
+  ])('reports $label as a $kind failure of its status', async ({ status, body, kind }) => {
+    const requests: string[] = [];
+
+    const result = await clientAnsweringHealth(status, body, requests).getHealth();
+
+    expect(result.ok).toBe(false);
+    expect(result.ok ? null : { kind: result.error.kind, status: result.error.status }).toEqual({ kind, status });
+    expect(requests).toEqual(['GET /health']);
+  });
+});
+
 describe('exact numbers', () => {
   /** A client whose every request is answered 200 with the JSON body text `text`. */
   function clientAnswering(text: string): ApiClient {
@@ -2179,8 +2922,9 @@ describe('exact numbers', () => {
 
   // ±9007199254740993 at every number of each response body: a field value, wherever its
   // map entry's name, is its bigint; every other number, such as a `tabIndex`, `uniqueKey`,
-  // `count`, bound or option value, is the double JSON.parse reads, ±2^53, so arithmetic on it
-  // never meets a bigint.
+  // `count` or bound, is the double JSON.parse reads, ±2^53, so arithmetic on it never meets
+  // a bigint. An option value is the one exception: the contract holds it to an `int32`
+  // index, so the definition's option carries 0, and a larger one fails the load.
   const UNSAFE = '9007199254740993';
   const EXACT = 9007199254740993n;
   const DOUBLE = 2 ** 53;
@@ -2209,7 +2953,7 @@ describe('exact numbers', () => {
         `"lower":-${UNSAFE},"upper":${UNSAFE},"pattern":null},"options":null,"members":null},` +
         `{"name":"o","fieldType":"option","prompt":null,"tabIndex":-${UNSAFE},"pageId":${UNSAFE},"unsupported":false,` +
         `"unsupportedType":null,"validation":{"required":false,"readOnly":false,"maxLength":null,"lower":null,` +
-        `"upper":null,"pattern":null},"options":[{"value":${UNSAFE},"label":"l"}],"members":null}]}],` +
+        `"upper":null,"pattern":null},"options":[{"value":0,"label":"l"}],"members":null}]}],` +
         `"unsupportedCheckCode":[{"severity":"warning","form":"F","line":${UNSAFE},"command":"c","message":"m"}],` +
         `"canInsert":null,"canUpdate":null,"canDelete":null}`,
       {
@@ -2242,7 +2986,7 @@ describe('exact numbers', () => {
                 unsupported: false,
                 unsupportedType: null,
                 validation: { required: false, readOnly: false, maxLength: null, lower: null, upper: null, pattern: null },
-                options: [{ value: DOUBLE, label: 'l' }],
+                options: [{ value: 0, label: 'l' }],
                 members: null,
               },
             ],
@@ -2335,12 +3079,230 @@ describe('exact numbers', () => {
     '{"values":{"a":"unterminated}}',
     '{"values":{}} trailing',
     '{"values":{"a":tru}}',
-  ])('reports the malformed OK body %j as a failed exchange, as JSON.parse rejects it', async (text) => {
+  ])('reports the malformed OK body %j as a failure of its 200, as JSON.parse rejects it', async (text) => {
     expect((): unknown => JSON.parse(text)).toThrow(SyntaxError);
 
     const read = await clientAnswering(text).getRecord(VIEW_ID, 'any');
 
+    // The status arrived, so this is no lost response, and nothing of the body is used.
     expect(read.ok).toBe(false);
-    expect(read.ok ? null : read.error.kind).toBe('network');
+    expect(read.ok ? null : read.error).toMatchObject({ kind: 'server', status: 200, traceId: null, writeOutcome: null });
+  });
+
+  it.each<[string, unknown, boolean]>([
+    ['the exact decimal numberFromText makes', numberFromText('2.0000000000000001'), true],
+    ['an object of its shape', { kind: 'decimal', literal: '1' }, false],
+    ['a frozen object of its shape', Object.freeze({ kind: 'decimal', literal: '1' }), false],
+  ])('takes %s for an exact decimal: %s', (_case, value, expected) => {
+    expect(isExactDecimal(value)).toBe(expected);
+  });
+
+  // A `values` map is data whatever its fields are named: text fields named `kind` and `literal`
+  // that hold `decimal` and `42` are written as those two strings, never as the decimal 42 they
+  // resemble, beside a real exact decimal, which is written bare as the number typed.
+  const RECORD_TEXT = '{"globalRecordId":"g","uniqueKey":1,"recStatus":1,"position":1,"count":1,"values":{}}';
+  const ENVELOPE_TEXT = '{"enabled":[],"disabled":[],"cleared":[],"assigned":{},"dialogs":[],"diagnostics":[]}';
+
+  interface ValuesWrite {
+    readonly write: string;
+    readonly send: (client: ApiClient, values: Values) => Promise<ApiResult<unknown>>;
+    /** The status and JSON text the API answers the write with. */
+    readonly status: number;
+    readonly reply: string;
+    /** The request line and body text expected for the JSON text of the values. */
+    readonly request: (valuesText: string) => string;
+  }
+
+  it.each<ValuesWrite>([
+    {
+      write: 'a create',
+      send: (client, values) => client.createRecord(VIEW_ID, values),
+      status: 201,
+      reply: RECORD_TEXT,
+      request: (valuesText) => `POST {"values":${valuesText}}`,
+    },
+    {
+      write: 'an update',
+      send: (client, values) => client.updateRecord(VIEW_ID, 'g', values),
+      status: 200,
+      reply: RECORD_TEXT,
+      request: (valuesText) => `PUT {"values":${valuesText}}`,
+    },
+    {
+      write: 'a field event',
+      send: (client, values) => client.raiseFieldEvent(VIEW_ID, { event: 'FieldAfter', fieldName: NUMBER, values }),
+      status: 200,
+      reply: ENVELOPE_TEXT,
+      request: (valuesText) => `POST {"event":"FieldAfter","fieldName":${JSON.stringify(NUMBER)},"values":${valuesText}}`,
+    },
+  ])('writes the values of $write as a map, its fields named kind and literal as text', async (row) => {
+    const { send, status, reply, request } = row;
+    const sent: string[] = [];
+    const client = createApiClient({
+      baseUrl: 'http://localhost',
+      fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
+        const received = input instanceof Request ? input : new Request(input, init);
+        sent.push(`${received.method} ${await received.text()}`);
+        return new Response(reply, { status, headers: { 'content-type': 'application/json' } });
+      },
+    });
+    const values: Values = { kind: 'decimal', literal: '42', [NUMBER]: typed('2.0000000000000001') };
+
+    const result = await send(client, values);
+
+    expect(result.ok).toBe(true);
+    expect(sent).toEqual([request(`{"kind":"decimal","literal":"42",${JSON.stringify(NUMBER)}:2.0000000000000001}`)]);
+  });
+});
+
+// Every /api error body is a ProblemDetails whose `type` is the problem's URI reference
+// (0.3.4.2), and the client keeps it as text on the ApiError. The HTTP status alone picks
+// the kind, so a `type` naming another status changes nothing, and a body with no usable
+// `type`, the /health 503 body, a non-JSON body and no response at all give `null`. So does
+// a JSON body that is no ProblemDetails, one without a string `title` and a `status` equal
+// to the HTTP status, such as a proxy's own error envelope, whatever `type` it carries.
+describe('the ProblemDetails type (0.3.4.2)', () => {
+  const BAD_REQUEST_TYPE = 'https://tools.ietf.org/html/rfc9110#section-15.5.1';
+  const UNAVAILABLE_TYPE = 'https://tools.ietf.org/html/rfc9110#section-15.6.4';
+
+  /** An error response carrying `body` as JSON, or as the text itself when it is a string. */
+  function answer(status: number, body: unknown, contentType = 'application/problem+json'): Response {
+    return new Response(typeof body === 'string' ? body : JSON.stringify(body), {
+      status,
+      headers: { 'content-type': contentType },
+    });
+  }
+
+  /** A ProblemDetails response whose `type` member is `type`, or which has none when `undefined`. */
+  function typedProblem(status: number, type: unknown, extra: Readonly<Record<string, unknown>> = {}): Response {
+    return answer(status, {
+      ...(type === undefined ? {} : { type }),
+      title: 'A fixed title.',
+      status,
+      detail: 'A fixed server sentence.',
+      traceId: TRACE_ID,
+      ...extra,
+    });
+  }
+
+  interface TypeCase {
+    readonly name: string;
+    readonly reply: () => Reply;
+    readonly read: (client: ApiClient) => Promise<ApiResult<unknown>>;
+    readonly type: string | null;
+    readonly kind: ApiErrorKind;
+    readonly status: number | null;
+  }
+
+  const record = storedRecord();
+  const getRecord = (client: ApiClient): Promise<ApiResult<unknown>> => client.getRecord(VIEW_ID, record.globalRecordId);
+  const updateRecord = (client: ApiClient): Promise<ApiResult<unknown>> =>
+    client.updateRecord(VIEW_ID, record.globalRecordId, { [TEXT]: 'Jones' });
+
+  it.each<TypeCase>([
+    {
+      name: 'the about:blank type of a write 503',
+      reply: () => problem(503, { writeOutcome: 'notWritten' }),
+      read: updateRecord,
+      type: 'about:blank',
+      kind: 'unavailable',
+      status: 503,
+    },
+    {
+      name: 'the RFC 9110 type of a field-level 400',
+      reply: () => typedProblem(400, BAD_REQUEST_TYPE, { errors: { includeDeleted: ['A fixed message.'] } }),
+      read: (client) => client.countRecords(VIEW_ID),
+      type: BAD_REQUEST_TYPE,
+      kind: 'validation',
+      status: 400,
+    },
+    {
+      name: 'a 404 whose type names a 503',
+      reply: () => typedProblem(404, UNAVAILABLE_TYPE),
+      read: getRecord,
+      type: UNAVAILABLE_TYPE,
+      kind: 'notFound',
+      status: 404,
+    },
+    {
+      name: 'a ProblemDetails without type',
+      reply: () => typedProblem(409, undefined),
+      read: updateRecord,
+      type: null,
+      kind: 'conflict',
+      status: 409,
+    },
+    { name: 'a blank type', reply: () => typedProblem(404, '  '), read: getRecord, type: null, kind: 'notFound', status: 404 },
+    { name: 'a numeric type', reply: () => typedProblem(500, 42), read: getRecord, type: null, kind: 'server', status: 500 },
+    { name: 'a null type', reply: () => typedProblem(403, null), read: updateRecord, type: null, kind: 'forbidden', status: 403 },
+    {
+      name: "a proxy's JSON envelope with a type but no title or status",
+      reply: () => answer(502, { type: 'gateway_error', message: 'The upstream did not answer.' }, 'application/json'),
+      read: getRecord,
+      type: null,
+      kind: 'unavailable',
+      status: 502,
+    },
+    {
+      name: 'a typed body whose status differs from the HTTP status',
+      reply: () => typedProblem(404, UNAVAILABLE_TYPE, { status: 503 }),
+      read: getRecord,
+      type: null,
+      kind: 'notFound',
+      status: 404,
+    },
+    {
+      name: 'a typed body whose status is not an integer',
+      reply: () => typedProblem(400, BAD_REQUEST_TYPE, { status: '400' }),
+      read: (client) => client.countRecords(VIEW_ID),
+      type: null,
+      kind: 'badRequest',
+      status: 400,
+    },
+    {
+      name: 'a typed body without a title',
+      reply: () => typedProblem(409, BAD_REQUEST_TYPE, { title: undefined }),
+      read: updateRecord,
+      type: null,
+      kind: 'conflict',
+      status: 409,
+    },
+    {
+      name: 'a non-JSON error text',
+      reply: () => answer(502, 'Bad Gateway', 'text/plain'),
+      read: getRecord,
+      type: null,
+      kind: 'unavailable',
+      status: 502,
+    },
+    {
+      name: 'an empty error body',
+      reply: () => new Response(null, { status: 500 }),
+      read: getRecord,
+      type: null,
+      kind: 'server',
+      status: 500,
+    },
+    {
+      name: 'the /health 503 body',
+      reply: () => answer(503, { status: 'unhealthy' }, 'application/json'),
+      read: (client) => client.getHealth(),
+      type: null,
+      kind: 'unavailable',
+      status: 503,
+    },
+    { name: 'no response', reply: () => networkFailure, read: getRecord, type: null, kind: 'network', status: null },
+  ])('reads $name as type $type, with the kind of its status', async (row) => {
+    const api = createFakeApi();
+    api.reply(row.reply());
+
+    const result = await row.read(createApiClient({ baseUrl: 'http://localhost', fetch: api.fetch }));
+
+    expect(api.calls).toHaveLength(1);
+    if (result.ok) {
+      throw new Error(`${row.name} settled as a success`);
+    }
+    const { type, kind, status } = result.error;
+    expect({ type, kind, status }).toEqual({ type: row.type, kind: row.kind, status: row.status });
   });
 });

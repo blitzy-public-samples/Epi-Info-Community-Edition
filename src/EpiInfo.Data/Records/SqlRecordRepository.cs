@@ -103,12 +103,11 @@ internal sealed class SqlRecordRepository(
     private const string RepeatedFieldMessage = "Two values name the same field ignoring case.";
     private const string MismatchedSchemaMessage = "The form schema does not describe the form.";
     private const string ConnectionNotOpenMessage = "The connection must be open.";
-    private const string MissingSystemValueMessage = "A stored system column holds no value.";
-    private const string UnexpectedSystemValueMessage = "A stored system column holds a value of an unexpected type.";
     private const string MissingRecordMessage = "The written record could not be read back inside its transaction.";
     private const string MissingCoordinatesMessage = "The record read carries no intrinsic position and count.";
     private const string RowNotWrittenMessage = "A write statement affected no row of the locked record.";
     private const string GateResultMessage = "The required gate returned no result.";
+    private const string StampResultMessage = "The save stamp source returned no stamp.";
 
     // The name a submitted value is bound under to test it against its column; that parameter is never sent.
     private const string ProbeParameterName = "@p0";
@@ -200,6 +199,7 @@ internal sealed class SqlRecordRepository(
                     connection,
                     transaction: null,
                     RecordOperations.At,
+                    read.Schema,
                     select,
                     cancellationToken)
                 .ConfigureAwait(false);
@@ -290,9 +290,18 @@ internal sealed class SqlRecordRepository(
                     async (reader, token) =>
                         await reader.ReadAsync(token).ConfigureAwait(false)
                             ? new SetPlacement(
-                                ReadInt32(reader, RecordSqlBuilder.BaseRowRecStatusOrdinal),
-                                ReadInt32(reader, RecordSqlBuilder.SetPositionOrdinal),
-                                ReadInt32(reader, RecordSqlBuilder.SetCountOrdinal))
+                                ReadSystemInteger(
+                                    reader,
+                                    read.Schema.RecStatus,
+                                    RecordSqlBuilder.BaseRowRecStatusOrdinal),
+                                ReadComputedInteger(
+                                    reader,
+                                    RecordSqlBuilder.SetPositionType,
+                                    RecordSqlBuilder.SetPositionOrdinal),
+                                ReadComputedInteger(
+                                    reader,
+                                    RecordSqlBuilder.SetCountType,
+                                    RecordSqlBuilder.SetCountOrdinal))
                             : null)
                 .ConfigureAwait(false) is not { } placement)
             {
@@ -358,16 +367,22 @@ internal sealed class SqlRecordRepository(
                         {
                             // Every row carries the same total. An empty page, past the end or of an empty set, still
                             // returns one row, flagged as no item, so the total always arrives.
-                            total = ReadInt32(reader, SearchSqlBuilder.TotalOrdinal);
-                            if (ReadInt32(reader, SearchSqlBuilder.InPageOrdinal) == 0)
+                            total = ReadComputedInteger(
+                                reader,
+                                SearchSqlBuilder.TotalType,
+                                SearchSqlBuilder.TotalOrdinal);
+                            if (ReadComputedInteger(
+                                    reader,
+                                    SearchSqlBuilder.InPageType,
+                                    SearchSqlBuilder.InPageOrdinal) == 0)
                             {
                                 continue;
                             }
 
                             summaries.Add(new RecordSummary(
-                                ReadText(reader, SearchSqlBuilder.IdOrdinal),
-                                ReadInt32(reader, SearchSqlBuilder.UniqueKeyOrdinal),
-                                ReadInt32(reader, SearchSqlBuilder.RecStatusOrdinal),
+                                ReadSystemText(reader, read.Schema.GlobalRecordId, SearchSqlBuilder.IdOrdinal),
+                                ReadSystemInteger(reader, read.Schema.UniqueKey, SearchSqlBuilder.UniqueKeyOrdinal),
+                                ReadSystemInteger(reader, read.Schema.RecStatus, SearchSqlBuilder.RecStatusOrdinal),
                                 ReadValues(reader, page.Columns)));
                         }
 
@@ -444,14 +459,20 @@ internal sealed class SqlRecordRepository(
                             // Every row carries the same uncapped total, counted before TOP applies.
                             if (results.Count == 0)
                             {
-                                total = ReadInt32(reader, SearchSqlBuilder.TotalOrdinal);
+                                total = ReadComputedInteger(
+                                    reader,
+                                    SearchSqlBuilder.TotalType,
+                                    SearchSqlBuilder.TotalOrdinal);
                             }
 
                             results.Add(new SearchResult(
-                                ReadText(reader, SearchSqlBuilder.IdOrdinal),
-                                ReadInt32(reader, SearchSqlBuilder.UniqueKeyOrdinal),
-                                ReadInt32(reader, SearchSqlBuilder.RecStatusOrdinal),
-                                ReadInt32(reader, SearchSqlBuilder.PositionOrdinal),
+                                ReadSystemText(reader, read.Schema.GlobalRecordId, SearchSqlBuilder.IdOrdinal),
+                                ReadSystemInteger(reader, read.Schema.UniqueKey, SearchSqlBuilder.UniqueKeyOrdinal),
+                                ReadSystemInteger(reader, read.Schema.RecStatus, SearchSqlBuilder.RecStatusOrdinal),
+                                ReadComputedInteger(
+                                    reader,
+                                    SearchSqlBuilder.PositionType,
+                                    SearchSqlBuilder.PositionOrdinal),
                                 ReadValues(reader, select.Columns)));
                         }
 
@@ -524,16 +545,20 @@ internal sealed class SqlRecordRepository(
     /// In order: the locked base read (<c>NotFound</c>, or <c>Deleted</c> for <c>RecStatus</c> 0); the page-row read;
     /// the required gate; when <paramref name="permissions"/> is not <see langword="null"/>, one permission read inside
     /// this transaction for the base table and every page table, which must grant UPDATE on each of them and INSERT on
-    /// the table of every page whose row is missing (<c>Forbidden</c>); the base last-save stamp; for each page
-    /// holding a submitted field, in page order, the submitted columns, inserting the page row first when the update
-    /// finds none, as legacy repairs it; then the snapshot and the commit.
+    /// the table of every page whose row is missing (<c>Forbidden</c>); the one call of
+    /// <paramref name="createStamp"/>; the base last-save stamp; for each page holding a submitted field, in page
+    /// order, the submitted columns, inserting the page row first when the update finds none, as legacy repairs it;
+    /// then the snapshot and the commit.
     /// Concurrent saves of one record serialise on the base-row lock and the later commit wins for a field both
     /// submitted, with no row-version check.
     /// </remarks>
     /// <param name="form">The form's metadata, as the store's metadata read returned it.</param>
     /// <param name="globalRecordId">The record's base-table <c>GlobalRecordId</c>, matched exactly.</param>
     /// <param name="submitted">The validated values of the writable data fields the request submitted.</param>
-    /// <param name="stamp">The save stamp of this write.</param>
+    /// <param name="createStamp">
+    /// Creates the save stamp of this write; called once, only after every check has decided the update writes and
+    /// before its first data statement, as <see cref="IDataStore.UpdateAsync"/> defines.
+    /// </param>
     /// <param name="requiredGate">The required-field check of the stored record overlaid with the submitted values.</param>
     /// <param name="permissions">
     /// Non-null turns on the UPDATE and missing-page INSERT check, which this transaction decides from its own
@@ -552,14 +577,15 @@ internal sealed class SqlRecordRepository(
     /// </exception>
     /// <exception cref="DataStoreUnavailableException">The database was unavailable; the outcome says what is known.</exception>
     /// <exception cref="DataStoreWriteException">
-    /// Any other failure, an exception of <paramref name="requiredGate"/> included, which reports
-    /// <see cref="WriteOutcome.NotWritten"/> with no SQL error number.
+    /// Any other failure, an exception or a <see langword="null"/> result of <paramref name="requiredGate"/> or
+    /// <paramref name="createStamp"/> included, which reports <see cref="WriteOutcome.NotWritten"/> with no SQL error
+    /// number.
     /// </exception>
     public async Task<RecordWriteResult> UpdateAsync(
         FormMetadata form,
         string globalRecordId,
         IReadOnlyDictionary<string, FieldValue> submitted,
-        SaveStamp stamp,
+        Func<SaveStamp> createStamp,
         Func<StoredRecord, RecordValidationResult> requiredGate,
         FormPermissions? permissions,
         CancellationToken cancellationToken)
@@ -567,7 +593,7 @@ internal sealed class SqlRecordRepository(
         ArgumentNullException.ThrowIfNull(form);
         ArgumentNullException.ThrowIfNull(globalRecordId);
         ArgumentNullException.ThrowIfNull(submitted);
-        ArgumentNullException.ThrowIfNull(stamp);
+        ArgumentNullException.ThrowIfNull(createStamp);
         ArgumentNullException.ThrowIfNull(requiredGate);
 
         SqlConnection connection = await connections
@@ -592,7 +618,7 @@ internal sealed class SqlRecordRepository(
                             read.Schema,
                             globalRecordId,
                             submitted,
-                            stamp,
+                            createStamp,
                             requiredGate,
                             permissions,
                             cancellationToken)
@@ -607,25 +633,35 @@ internal sealed class SqlRecordRepository(
     /// with the last-save stamp, in one transaction. Page rows are never touched and nothing cascades.
     /// </summary>
     /// <param name="form">The form's metadata, as the store's metadata read returned it.</param>
-    /// <param name="globalRecordId">The record's base-table <c>GlobalRecordId</c>, matched exactly.</param>
-    /// <param name="stamp">The save stamp, written only when the record is active.</param>
+    /// <param name="globalRecordId">
+    /// The record's base-table <c>GlobalRecordId</c>, matched as <see cref="RecordSqlBuilder.LockBase"/> matches it:
+    /// letter case follows the column's collation, and the byte length must be equal.
+    /// </param>
+    /// <param name="createStamp">
+    /// Creates the save stamp; called once, only when the locked read found an active record and before the soft
+    /// delete's data statement, never for an unknown or already-deleted record.
+    /// </param>
     /// <param name="cancellationToken">The request's abort token.</param>
     /// <returns>
-    /// <see cref="SoftDeleteResult.Deleted"/> when the transaction committed; <see cref="SoftDeleteResult.AlreadyDeleted"/>
-    /// with nothing written, stamps included, for a record with <c>RecStatus</c> 0; <see cref="SoftDeleteResult.NotFound"/>
-    /// for an unknown id or a form no longer present.
+    /// <see cref="SoftDeleteStatus.Deleted"/> when the transaction committed;
+    /// <see cref="SoftDeleteStatus.AlreadyDeleted"/> with nothing written, stamps included, for a record with
+    /// <c>RecStatus</c> 0; each with the base row's <c>GlobalRecordId</c> as the locked read returned it, the stored
+    /// spelling. <see cref="SoftDeleteStatus.NotFound"/>, with no id, for an unknown id or a form no longer present.
     /// </returns>
     /// <exception cref="DataStoreUnavailableException">The database was unavailable; the outcome says what is known.</exception>
-    /// <exception cref="DataStoreWriteException">Any other failure; the outcome says what is known.</exception>
+    /// <exception cref="DataStoreWriteException">
+    /// Any other failure, the outcome saying what is known; an exception or a <see langword="null"/> result of
+    /// <paramref name="createStamp"/> reports <see cref="WriteOutcome.NotWritten"/> with no SQL error number.
+    /// </exception>
     public async Task<SoftDeleteResult> SoftDeleteAsync(
         FormMetadata form,
         string globalRecordId,
-        SaveStamp stamp,
+        Func<SaveStamp> createStamp,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(form);
         ArgumentNullException.ThrowIfNull(globalRecordId);
-        ArgumentNullException.ThrowIfNull(stamp);
+        ArgumentNullException.ThrowIfNull(createStamp);
 
         SqlConnection connection = await connections
             .OpenAsync(RecordOperations.Delete, cancellationToken)
@@ -640,10 +676,10 @@ internal sealed class SqlRecordRepository(
                             .ReadFormAsync(scope.Connection, scope.Transaction, form.ViewId, cancellationToken)
                             .ConfigureAwait(false) is not { } read)
                     {
-                        return WriteDecision<SoftDeleteResult>.RolledBack(SoftDeleteResult.NotFound);
+                        return WriteDecision<SoftDeleteResult>.RolledBack(SoftDeleteResult.NotFound());
                     }
 
-                    return await SoftDeleteCoreAsync(scope, read.Schema, globalRecordId, stamp, cancellationToken)
+                    return await SoftDeleteCoreAsync(scope, read.Schema, globalRecordId, createStamp, cancellationToken)
                         .ConfigureAwait(false);
                 },
                 cancellationToken)
@@ -700,7 +736,10 @@ internal sealed class SqlRecordRepository(
     /// <param name="schema">The fixture's catalogue schema, with the view id of <paramref name="form"/>.</param>
     /// <param name="globalRecordId">The record's base-table <c>GlobalRecordId</c>.</param>
     /// <param name="submitted">The values of the writable data fields to write.</param>
-    /// <param name="stamp">The save stamp of this write.</param>
+    /// <param name="createStamp">
+    /// Creates the save stamp of this write, called as the public overload calls it: once, only when the update
+    /// writes, before its first data statement.
+    /// </param>
     /// <param name="requiredGate">The required-field check of the stored record.</param>
     /// <param name="permissions">
     /// Non-null turns on the UPDATE and missing-page INSERT check, decided from this transaction's own permission
@@ -714,7 +753,7 @@ internal sealed class SqlRecordRepository(
         FormSchema schema,
         string globalRecordId,
         IReadOnlyDictionary<string, FieldValue> submitted,
-        SaveStamp stamp,
+        Func<SaveStamp> createStamp,
         Func<StoredRecord, RecordValidationResult> requiredGate,
         FormPermissions? permissions,
         CancellationToken cancellationToken)
@@ -722,7 +761,7 @@ internal sealed class SqlRecordRepository(
         RequireFixture(connection, form, schema);
         ArgumentNullException.ThrowIfNull(globalRecordId);
         ArgumentNullException.ThrowIfNull(submitted);
-        ArgumentNullException.ThrowIfNull(stamp);
+        ArgumentNullException.ThrowIfNull(createStamp);
         ArgumentNullException.ThrowIfNull(requiredGate);
 
         return await RunWriteAsync(
@@ -735,7 +774,7 @@ internal sealed class SqlRecordRepository(
                     schema,
                     globalRecordId,
                     submitted,
-                    stamp,
+                    createStamp,
                     requiredGate,
                     permissions,
                     cancellationToken),
@@ -786,6 +825,7 @@ internal sealed class SqlRecordRepository(
                 connection,
                 transaction: null,
                 RecordOperations.Get,
+                schema,
                 select,
                 cancellationToken)
             .ConfigureAwait(false);
@@ -822,7 +862,8 @@ internal sealed class SqlRecordRepository(
                 resolved.ByName));
         }
 
-        int uniqueKey = await SqlExecution.ExecuteScalarAsync<int>(
+        // OUTPUT INSERTED returns the new key uncoerced, so the converter checks it against its reader-built column.
+        object? insertedKey = await SqlExecution.ExecuteScalarAsync<object>(
                 scope.Connection,
                 scope.Transaction,
                 RecordOperations.Insert,
@@ -832,6 +873,7 @@ internal sealed class SqlRecordRepository(
                 cancellationToken,
                 onDispatch: scope.MarkDmlSent)
             .ConfigureAwait(false);
+        int uniqueKey = ColumnValueConverter.FromSystemInteger(RecordSqlBuilder.Require(schema.UniqueKey), insertedKey);
 
         foreach (SqlStatement pageInsert in pageInserts)
         {
@@ -857,7 +899,7 @@ internal sealed class SqlRecordRepository(
         FormSchema schema,
         string globalRecordId,
         IReadOnlyDictionary<string, FieldValue> submitted,
-        SaveStamp stamp,
+        Func<SaveStamp> createStamp,
         Func<StoredRecord, RecordValidationResult> requiredGate,
         FormPermissions? permissions,
         CancellationToken cancellationToken)
@@ -871,6 +913,7 @@ internal sealed class SqlRecordRepository(
                 scope.Connection,
                 scope.Transaction,
                 RecordOperations.Update,
+                schema,
                 RecordSqlBuilder.LockBase(schema, globalRecordId),
                 cancellationToken)
             .ConfigureAwait(false) is not { } locked)
@@ -888,6 +931,7 @@ internal sealed class SqlRecordRepository(
                 scope.Connection,
                 scope.Transaction,
                 RecordOperations.Update,
+                schema,
                 RecordSqlBuilder.RecordByUniqueKey(schema, dataFields, locked.UniqueKey, locked.GlobalRecordId),
                 cancellationToken)
             .ConfigureAwait(false)
@@ -913,11 +957,13 @@ internal sealed class SqlRecordRepository(
             return WriteDecision<RecordWriteResult>.RolledBack(RecordWriteResult.Forbidden());
         }
 
+        // Every check has decided that the update writes, and no data statement has been sent, so the stamp is created
+        // here: an update the checks refuse needs none, and a stamp that cannot be made rolls back with nothing written.
         SqlStatement? baseStamp = RecordSqlBuilder.UpdateBaseStamp(
             schema,
             locked.UniqueKey,
             locked.GlobalRecordId,
-            stamp);
+            CreateStamp(createStamp));
         IReadOnlyList<PageUpdate> pageUpdates = PlanPageUpdates(schema, resolved, locked.GlobalRecordId);
 
         if (baseStamp is not null)
@@ -979,41 +1025,50 @@ internal sealed class SqlRecordRepository(
     }
 
     // The base-only soft delete, inside the transaction RunWriteAsync opened. A record already deleted is left exactly
-    // as it is, stamps included, so a repeated DELETE writes nothing.
+    // as it is, stamps included, so a repeated DELETE writes nothing. A found record's result carries the id as the
+    // locked read returned it, so the caller names the record by its stored spelling without another statement.
     private async Task<WriteDecision<SoftDeleteResult>> SoftDeleteCoreAsync(
         WriteScope scope,
         FormSchema schema,
         string globalRecordId,
-        SaveStamp stamp,
+        Func<SaveStamp> createStamp,
         CancellationToken cancellationToken)
     {
         if (await ReadBaseRowAsync(
                 scope.Connection,
                 scope.Transaction,
                 RecordOperations.Delete,
+                schema,
                 RecordSqlBuilder.LockBase(schema, globalRecordId),
                 cancellationToken)
             .ConfigureAwait(false) is not { } locked)
         {
-            return WriteDecision<SoftDeleteResult>.RolledBack(SoftDeleteResult.NotFound);
+            return WriteDecision<SoftDeleteResult>.RolledBack(SoftDeleteResult.NotFound());
         }
 
         if (locked.RecStatus == RecordQueryRules.DeletedRecStatus)
         {
-            return WriteDecision<SoftDeleteResult>.RolledBack(SoftDeleteResult.AlreadyDeleted);
+            return WriteDecision<SoftDeleteResult>.RolledBack(SoftDeleteResult.AlreadyDeleted(locked.GlobalRecordId));
         }
 
+        // Only an active record is written, so only it needs a stamp, created before the one data statement.
         SqlStatement softDelete = RecordSqlBuilder.SoftDelete(
             schema,
             locked.UniqueKey,
             locked.GlobalRecordId,
-            stamp);
+            CreateStamp(createStamp));
 
         await ExecuteOnLockedRowAsync(scope, RecordOperations.Delete, softDelete, cancellationToken)
             .ConfigureAwait(false);
 
-        return WriteDecision<SoftDeleteResult>.Committed(SoftDeleteResult.Deleted);
+        return WriteDecision<SoftDeleteResult>.Committed(SoftDeleteResult.Deleted(locked.GlobalRecordId));
     }
+
+    // The one call of an update's or soft delete's stamp source, inside its transaction once the write is decided and
+    // before its first data statement. An exception of the source, or the null stamp that breaks its contract, is
+    // raised before any DML, so the transaction rolls back and the write reports NotWritten.
+    private static SaveStamp CreateStamp(Func<SaveStamp> createStamp) =>
+        createStamp() ?? throw new InvalidOperationException(StampResultMessage);
 
     // The response snapshot of a write, read inside its transaction after every write and before the commit: one
     // statement returns the base and page rows by the clustered key with the record's intrinsic position and count over
@@ -1032,6 +1087,7 @@ internal sealed class SqlRecordRepository(
                 scope.Connection,
                 scope.Transaction,
                 operation,
+                schema,
                 RecordSqlBuilder.RecordSnapshot(schema, dataFields, uniqueKey, globalRecordId),
                 cancellationToken)
             .ConfigureAwait(false)
@@ -1486,11 +1542,12 @@ internal sealed class SqlRecordRepository(
         return updates.AsReadOnly();
     }
 
-    // Reads the first row of a record SELECT, or null when it returns none.
+    // Reads the first row of a record SELECT built from schema, or null when it returns none.
     private Task<RecordRow?> ReadRecordAsync(
         SqlConnection connection,
         SqlTransaction? transaction,
         string operation,
+        FormSchema schema,
         RecordSelect select,
         CancellationToken cancellationToken) =>
         SqlExecution.ReadAsync<RecordRow?>(
@@ -1502,13 +1559,14 @@ internal sealed class SqlRecordRepository(
             observer,
             cancellationToken,
             async (reader, token) =>
-                await reader.ReadAsync(token).ConfigureAwait(false) ? ReadRecordRow(reader, select) : null);
+                await reader.ReadAsync(token).ConfigureAwait(false) ? ReadRecordRow(reader, schema, select) : null);
 
-    // Reads the first row of the locked base-row read (LockBase), or null when it returns none.
+    // Reads the first row of the locked base-row read (LockBase) built from schema, or null when it returns none.
     private Task<BaseRow?> ReadBaseRowAsync(
         SqlConnection connection,
         SqlTransaction? transaction,
         string operation,
+        FormSchema schema,
         SqlStatement statement,
         CancellationToken cancellationToken) =>
         SqlExecution.ReadAsync<BaseRow?>(
@@ -1522,12 +1580,13 @@ internal sealed class SqlRecordRepository(
             async (reader, token) =>
                 await reader.ReadAsync(token).ConfigureAwait(false)
                     ? new BaseRow(
-                        ReadInt32(reader, RecordSqlBuilder.BaseRowUniqueKeyOrdinal),
-                        ReadInt32(reader, RecordSqlBuilder.BaseRowRecStatusOrdinal),
-                        ReadText(reader, RecordSqlBuilder.BaseRowGlobalRecordIdOrdinal))
+                        ReadSystemInteger(reader, schema.UniqueKey, RecordSqlBuilder.BaseRowUniqueKeyOrdinal),
+                        ReadSystemInteger(reader, schema.RecStatus, RecordSqlBuilder.BaseRowRecStatusOrdinal),
+                        ReadSystemText(reader, schema.GlobalRecordId, RecordSqlBuilder.BaseRowGlobalRecordIdOrdinal))
                     : null);
 
-    // Runs a COUNT_BIG statement and narrows its bigint to the int the port reports, failing rather than wrapping.
+    // Runs a COUNT_BIG statement and reads its raw bigint through the converter, which narrows it to the int the port
+    // reports, failing rather than wrapping.
     private async Task<int> ReadCountAsync(
         SqlConnection connection,
         SqlTransaction? transaction,
@@ -1535,7 +1594,7 @@ internal sealed class SqlRecordRepository(
         SqlStatement statement,
         CancellationToken cancellationToken)
     {
-        long count = await SqlExecution.ExecuteScalarAsync<long>(
+        object? count = await SqlExecution.ExecuteScalarAsync<object>(
                 connection,
                 transaction,
                 operation,
@@ -1544,18 +1603,19 @@ internal sealed class SqlRecordRepository(
                 observer,
                 cancellationToken)
             .ConfigureAwait(false);
-        return checked((int)count);
+        return ColumnValueConverter.FromComputedInteger(RecordSqlBuilder.CountType, count);
     }
 
-    // One row of a record SELECT, by the ordinals its RecordSelect records: the base system columns, the intrinsic
-    // coordinates when the statement computes them, the page-row presence keys and every data-field value. A page with
-    // no row for the record reads NULL in each of its columns, so each of its fields is FieldValue.Null.
-    private static RecordRow ReadRecordRow(DbDataReader reader, RecordSelect select)
+    // One row of a record SELECT built from schema, by the ordinals its RecordSelect records: the base system columns,
+    // the intrinsic coordinates when the statement computes them, the page-row presence keys and every data-field
+    // value. A page with no row for the record reads NULL in each of its columns, so each of its fields is
+    // FieldValue.Null.
+    private static RecordRow ReadRecordRow(DbDataReader reader, FormSchema schema, RecordSelect select)
     {
         var record = new StoredRecord(
-            ReadText(reader, RecordSqlBuilder.RecordGlobalRecordIdOrdinal),
-            ReadInt32(reader, RecordSqlBuilder.RecordUniqueKeyOrdinal),
-            ReadInt32(reader, RecordSqlBuilder.RecordRecStatusOrdinal),
+            ReadSystemText(reader, schema.GlobalRecordId, RecordSqlBuilder.RecordGlobalRecordIdOrdinal),
+            ReadSystemInteger(reader, schema.UniqueKey, RecordSqlBuilder.RecordUniqueKeyOrdinal),
+            ReadSystemInteger(reader, schema.RecStatus, RecordSqlBuilder.RecordRecStatusOrdinal),
             ReadValues(reader, select.Columns));
 
         var missingPages = new List<PageTableSchema>();
@@ -1571,8 +1631,14 @@ internal sealed class SqlRecordRepository(
         int? count = null;
         if (select.HasIntrinsicCoordinates)
         {
-            position = ReadInt32(reader, RecordSqlBuilder.RecordIntrinsicPositionOrdinal);
-            count = ReadInt32(reader, RecordSqlBuilder.RecordIntrinsicCountOrdinal);
+            position = ReadComputedInteger(
+                reader,
+                RecordSqlBuilder.RecordIntrinsicPositionType,
+                RecordSqlBuilder.RecordIntrinsicPositionOrdinal);
+            count = ReadComputedInteger(
+                reader,
+                RecordSqlBuilder.RecordIntrinsicCountType,
+                RecordSqlBuilder.RecordIntrinsicCountOrdinal);
         }
 
         return new RecordRow(record, missingPages.AsReadOnly(), position, count);
@@ -1596,35 +1662,19 @@ internal sealed class SqlRecordRepository(
         return new ReadOnlyDictionary<string, FieldValue>(values);
     }
 
-    // A system integer (UniqueKey, RecStatus, a COUNT_BIG or ROW_NUMBER) as the int the port carries, accepting each
-    // integer width SQL Server returns and failing, rather than wrapping, on a bigint beyond the int range.
-    private static int ReadInt32(DbDataReader reader, int ordinal)
-    {
-        if (reader.IsDBNull(ordinal))
-        {
-            throw new InvalidOperationException(MissingSystemValueMessage);
-        }
+    // The system integer (UniqueKey or RecStatus) at ordinal, read raw and converted for the reader-built column the
+    // statement projected there.
+    private static int ReadSystemInteger(DbDataReader reader, ColumnSchema? column, int ordinal) =>
+        ColumnValueConverter.FromSystemInteger(RecordSqlBuilder.Require(column), reader.GetValue(ordinal));
 
-        return reader.GetValue(ordinal) switch
-        {
-            int value => value,
-            short value => value,
-            byte value => value,
-            long value => checked((int)value),
-            _ => throw new InvalidOperationException(UnexpectedSystemValueMessage),
-        };
-    }
+    // The system text (GlobalRecordId) at ordinal, read raw and converted, exactly as stored, for the reader-built
+    // column the statement projected there.
+    private static string ReadSystemText(DbDataReader reader, ColumnSchema? column, int ordinal) =>
+        ColumnValueConverter.FromSystemText(RecordSqlBuilder.Require(column), reader.GetValue(ordinal));
 
-    // A system text (GlobalRecordId) exactly as stored.
-    private static string ReadText(DbDataReader reader, int ordinal)
-    {
-        if (reader.IsDBNull(ordinal))
-        {
-            throw new InvalidOperationException(MissingSystemValueMessage);
-        }
-
-        return reader.GetValue(ordinal) as string ?? throw new InvalidOperationException(UnexpectedSystemValueMessage);
-    }
+    // The integer the statement computed at ordinal, read raw and converted for the native type its builder declares.
+    private static int ReadComputedInteger(DbDataReader reader, DbType nativeType, int ordinal) =>
+        ColumnValueConverter.FromComputedInteger(nativeType, reader.GetValue(ordinal));
 
     // The fixture overloads take a schema the caller composed, so they confirm it describes the form they are given.
     private static void RequireFixture(SqlConnection connection, FormMetadata form, FormSchema schema)

@@ -466,7 +466,7 @@ public sealed class PermissionTests
             harness.Form,
             lacking,
             new Dictionary<string, FieldValue> { [FirstPageField] = FieldValue.FromText("Applied") },
-            stamp,
+            () => stamp,
             _ => RecordValidationResult.Success(new Dictionary<string, FieldValue>()),
             argument,
             CancellationToken.None);

@@ -108,8 +108,9 @@ internal sealed record SqlStatement(string Text, IReadOnlyList<SqlParameterValue
 
 /// <summary>
 /// The SQL-side owner of value conversion: it turns a field value into a typed parameter for the column that stores
-/// it, a stored column value back into a field value, a system-column value or a search criterion into a typed
-/// parameter, and binds the scalars the builders need. The wire side is <c>FieldValueJsonConverter</c> in the API.
+/// it, a stored column value back into a field value, a stored system-column value or a computed integer back into
+/// the value the port carries, a system-column value or a search criterion into a typed parameter, and binds the
+/// scalars the builders need. The wire side is <c>FieldValueJsonConverter</c> in the API.
 /// </summary>
 /// <remarks>
 /// <para>
@@ -127,6 +128,12 @@ internal sealed record SqlStatement(string Text, IReadOnlyList<SqlParameterValue
 /// the representability rule <see cref="FieldTypeMapper.IsRepresentable"/> owns. The record validator has already
 /// rejected such input with a 400, so reaching that exception is a programming error; the check exists so that
 /// SqlClient never truncates a string to the parameter size or rounds a number into an integer column.
+/// </para>
+/// <para>
+/// Text is bound and read as it stands: nothing here trims or pads it. A fixed-width <c>nchar(n)</c> column admits
+/// text of up to n UTF-16 code units, for a data field and a system column alike, and binds it as given; SQL Server
+/// pads shorter text with spaces to n, as it does for legacy's writes. A stored value is returned as stored, the
+/// padding included, so short text written to an <c>nchar(n)</c> column reads back padded.
 /// </para>
 /// <para>
 /// Every exception message is fixed text that names no value, field, column or SQL text, as the redaction policy
@@ -150,6 +157,13 @@ internal static class ColumnValueConverter
     private const string SearchNullMessage = "An IS NULL alternative binds no parameter.";
     private const string SearchTargetMessage = "The search target and field type do not form a searchable column.";
     private const string SearchKindMismatchMessage = "The criterion value does not fit the searched column.";
+    private const string NotIntegerColumnMessage = "The column type is not an integer type the data layer converts.";
+    private const string NotCharacterColumnMessage = "The column type is not a character type the data layer converts.";
+    private const string ComputedIntegerTypeMessage = "A computed integer is declared as Int32 or Int64 only.";
+    private const string MissingSystemValueMessage = "A system column or computed integer was read with no value.";
+    private const string UnexpectedSystemValueMessage =
+        "A system column or computed integer was not read as its native type.";
+    private const string SystemValueRangeMessage = "A system column or computed integer lies outside the int range.";
 
     // The largest magnitude up to which every integer is an exact double, so an integral system value bound to a
     // float column is never rounded.
@@ -172,15 +186,17 @@ internal static class ColumnValueConverter
     /// <param name="value">The value; <see cref="FieldValue.Null"/> writes SQL <c>NULL</c>.</param>
     /// <returns>
     /// A parameter typed by the column: the null value is <see cref="DBNull.Value"/>; text is bound unchanged as
-    /// <see cref="DbType.String"/> sized to the column, <c>-1</c> for <c>nvarchar(max)</c> and <c>ntext</c>; a number
-    /// as the column's integer type or <see cref="DbType.Double"/>; a date as <see cref="DbType.DateTime"/> at
-    /// 00:00:00 with an unspecified kind, because a date field is date-only; a checkbox as
-    /// <see cref="DbType.Boolean"/>; and an option as its 0-based index in the column's integer type.
+    /// <see cref="DbType.String"/> sized to the column, <c>-1</c> for <c>nvarchar(max)</c> and <c>ntext</c>, and on an
+    /// <c>nchar(n)</c> column shorter text too, which SQL Server stores padded with spaces to n; a number as the
+    /// column's integer type or <see cref="DbType.Double"/>; a date as <see cref="DbType.DateTime"/> at 00:00:00 with
+    /// an unspecified kind, because a date field is date-only; a checkbox as <see cref="DbType.Boolean"/>; and an
+    /// option as its 0-based index in the column's integer type.
     /// </returns>
     /// <exception cref="ArgumentNullException"><paramref name="column"/> is null.</exception>
     /// <exception cref="ArgumentException">
     /// <paramref name="name"/> is blank; the field type is a label, group or unsupported; the column type is not one
-    /// the field type admits; the value's kind is not the field type's; or the column cannot hold the value exactly.
+    /// the field type admits; the value's kind is not the field type's; or the column cannot hold the value exactly,
+    /// text longer than the n code units of an <c>nvarchar(n)</c> or <c>nchar(n)</c> column included.
     /// </exception>
     internal static SqlParameterValue ToParameter(
         string name,
@@ -227,7 +243,8 @@ internal static class ColumnValueConverter
     /// <exception cref="ArgumentNullException"><paramref name="column"/> is null.</exception>
     /// <exception cref="ArgumentException">
     /// <paramref name="name"/> is blank; the column type is not one the data layer converts; the value's runtime type
-    /// does not suit the column; or the value is out of the column's range or longer than its size.
+    /// does not suit the column; or the value is out of the column's range or longer than its size. Text shorter than
+    /// an <c>nchar(n)</c> column, such as a logon name, is not refused: it is bound as given and SQL Server pads it.
     /// </exception>
     internal static SqlParameterValue ToSystemParameter(string name, ColumnSchema column, object? value)
     {
@@ -294,9 +311,10 @@ internal static class ColumnValueConverter
     /// </param>
     /// <returns>
     /// <see cref="FieldValue.Null"/> for <see langword="null"/> and <see cref="DBNull"/>; otherwise text unchanged,
-    /// the empty string included, since reads never normalise; a number, the stored double of a <c>float</c> column
-    /// or the exact integer of an integer column, a <c>bigint</c> beyond 2^53 included; a date with any time of day
-    /// discarded, because a date field is date-only; a boolean; or an option index.
+    /// the empty string included, since reads never normalise, and the text of an <c>nchar(n)</c> column as stored,
+    /// with the spaces SQL Server padded any shorter write with, never trimmed; a number, the stored double of a
+    /// <c>float</c> column or the exact integer of an integer column, a <c>bigint</c> beyond 2^53 included; a date
+    /// with any time of day discarded, because a date field is date-only; a boolean; or an option index.
     /// </returns>
     /// <exception cref="ArgumentNullException"><paramref name="column"/> is null.</exception>
     /// <exception cref="ArgumentException">
@@ -373,6 +391,116 @@ internal static class ColumnValueConverter
         }
 
         throw new InvalidOperationException(UnexpectedStoredValueMessage);
+    }
+
+    /// <summary>
+    /// Reads a stored base-table system integer, <c>UniqueKey</c> or <c>RecStatus</c>, as the <see cref="int"/> the
+    /// port carries, typed by the column the metadata reader discovered rather than by its name.
+    /// </summary>
+    /// <param name="column">
+    /// The reader-built column the value was read from, for example the seeded <c>UniqueKey int</c> or
+    /// <c>RecStatus smallint</c>. Its type must be one the data layer binds as an integer: <c>tinyint</c>,
+    /// <c>smallint</c>, <c>int</c> or <c>bigint</c>.
+    /// </param>
+    /// <param name="dbValue">
+    /// The value the data reader, or an <c>OUTPUT</c> clause read as a scalar, returned for the column, uncoerced: a
+    /// stored value has the runtime type SqlClient returns for the column's native type, <see cref="byte"/> for
+    /// <c>tinyint</c>, <see cref="short"/> for <c>smallint</c>, <see cref="int"/> for <c>int</c> and
+    /// <see cref="long"/> for <c>bigint</c>.
+    /// </param>
+    /// <returns>The stored integer, widened exactly and narrowed to <see cref="int"/> without wrapping.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="column"/> is null.</exception>
+    /// <exception cref="ArgumentException">
+    /// The column type is not an integer type the data layer converts, whatever the value.
+    /// </exception>
+    /// <exception cref="InvalidOperationException">
+    /// The value is <see langword="null"/> or <see cref="DBNull"/>; its runtime type is not the one SqlClient returns
+    /// for the column's native type, such as an <see cref="int"/> from a <c>smallint</c> column, a
+    /// <see cref="long"/> from an <c>int</c> column, a <see cref="double"/> or a <see cref="string"/>; or it lies
+    /// outside the <see cref="int"/> range.
+    /// </exception>
+    internal static int FromSystemInteger(ColumnSchema column, object? dbValue)
+    {
+        ArgumentNullException.ThrowIfNull(column);
+
+        if (BindingFor(column.Metadata) is not
+            { DbType: DbType.Byte or DbType.Int16 or DbType.Int32 or DbType.Int64 } binding)
+        {
+            throw new ArgumentException(NotIntegerColumnMessage, nameof(column));
+        }
+
+        return ReadNativeInt32(binding.DbType, dbValue);
+    }
+
+    /// <summary>
+    /// Reads a stored base-table system text, <c>GlobalRecordId</c>, exactly as stored, typed by the column the
+    /// metadata reader discovered rather than by its name.
+    /// </summary>
+    /// <param name="column">
+    /// The reader-built column the value was read from, for example the seeded <c>GlobalRecordId nvarchar(255)</c>. Its
+    /// type must be one the data layer binds as text: <c>nvarchar(n)</c>, <c>nchar(n)</c>, <c>nvarchar(max)</c> or
+    /// <c>ntext</c>.
+    /// </param>
+    /// <param name="dbValue">
+    /// The value the data reader returned for the column, uncoerced: a <see cref="string"/>.
+    /// </param>
+    /// <returns>
+    /// The stored text unchanged, trailing spaces included, so every later statement binds the spelling the row holds.
+    /// </returns>
+    /// <exception cref="ArgumentNullException"><paramref name="column"/> is null.</exception>
+    /// <exception cref="ArgumentException">
+    /// The column type is not a character type the data layer converts, whatever the value.
+    /// </exception>
+    /// <exception cref="InvalidOperationException">
+    /// The value is <see langword="null"/> or <see cref="DBNull"/>, or it is not a <see cref="string"/>.
+    /// </exception>
+    internal static string FromSystemText(ColumnSchema column, object? dbValue)
+    {
+        ArgumentNullException.ThrowIfNull(column);
+
+        if (BindingFor(column.Metadata) is not { DbType: DbType.String })
+        {
+            throw new ArgumentException(NotCharacterColumnMessage, nameof(column));
+        }
+
+        return dbValue switch
+        {
+            null or DBNull => throw new InvalidOperationException(MissingSystemValueMessage),
+            string text => text,
+            _ => throw new InvalidOperationException(UnexpectedSystemValueMessage),
+        };
+    }
+
+    /// <summary>
+    /// Reads an integer a statement computes rather than stores, such as a <c>COUNT_BIG</c>, a <c>ROW_NUMBER</c>, a
+    /// running <c>SUM</c> of <c>bigint</c> or a fixed <c>CASE</c> flag, as the <see cref="int"/> the port carries.
+    /// </summary>
+    /// <param name="nativeType">
+    /// The native type the builder declares for the computed column: <see cref="DbType.Int64"/> for <c>bigint</c>
+    /// or <see cref="DbType.Int32"/> for <c>int</c>.
+    /// </param>
+    /// <param name="dbValue">
+    /// The value the data reader or the scalar read returned, uncoerced: a <see cref="long"/> for
+    /// <see cref="DbType.Int64"/> and an <see cref="int"/> for <see cref="DbType.Int32"/>.
+    /// </param>
+    /// <returns>The computed integer, widened exactly and narrowed to <see cref="int"/> without wrapping.</returns>
+    /// <exception cref="ArgumentException">
+    /// <paramref name="nativeType"/> is neither <see cref="DbType.Int32"/> nor <see cref="DbType.Int64"/>, whatever the
+    /// value.
+    /// </exception>
+    /// <exception cref="InvalidOperationException">
+    /// The value is <see langword="null"/> or <see cref="DBNull"/>; its runtime type is not the one SqlClient returns
+    /// for the declared type, such as an <see cref="int"/> for <see cref="DbType.Int64"/>; or it lies outside the
+    /// <see cref="int"/> range.
+    /// </exception>
+    internal static int FromComputedInteger(DbType nativeType, object? dbValue)
+    {
+        if (nativeType is not (DbType.Int32 or DbType.Int64))
+        {
+            throw new ArgumentException(ComputedIntegerTypeMessage, nameof(nativeType));
+        }
+
+        return ReadNativeInt32(nativeType, dbValue);
     }
 
     /// <summary>
@@ -688,6 +816,25 @@ internal static class ColumnValueConverter
 
         whole = native.GetValueOrDefault();
         return native.HasValue;
+    }
+
+    // A system or computed integer, accepted only as the type SqlClient returns for its native type, widened exactly
+    // and narrowed to the int the port carries; a value beyond the int range fails rather than wrapping.
+    private static int ReadNativeInt32(DbType nativeType, object? dbValue)
+    {
+        if (dbValue is null or DBNull)
+        {
+            throw new InvalidOperationException(MissingSystemValueMessage);
+        }
+
+        if (!TryReadNativeInteger(nativeType, dbValue, out var whole))
+        {
+            throw new InvalidOperationException(UnexpectedSystemValueMessage);
+        }
+
+        return whole is >= int.MinValue and <= int.MaxValue
+            ? (int)whole
+            : throw new InvalidOperationException(SystemValueRangeMessage);
     }
 
     // Widens an integral CLR number to long exactly; a ulong above long.MaxValue fits no admitted column.

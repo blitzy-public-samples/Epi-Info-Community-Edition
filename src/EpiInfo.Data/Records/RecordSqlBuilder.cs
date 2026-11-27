@@ -1,3 +1,4 @@
+using System.Data;
 using System.Globalization;
 using System.Text;
 using EpiInfo.Data.Metadata;
@@ -242,10 +243,22 @@ internal static class RecordSqlBuilder
     internal const int RecordIntrinsicPositionOrdinal = 3;
 
     /// <summary>
+    /// The native type of the intrinsic position at <see cref="RecordIntrinsicPositionOrdinal"/>: <c>bigint</c>, the
+    /// type of both its running <c>SUM</c> of <c>CAST(1 AS bigint)</c> and its <c>ROW_NUMBER()</c>.
+    /// </summary>
+    internal const DbType RecordIntrinsicPositionType = DbType.Int64;
+
+    /// <summary>
     /// The ordinal of the record's intrinsic count, a <c>bigint</c>, in a <see cref="RecordSelect"/> whose
     /// <see cref="RecordSelect.HasIntrinsicCoordinates"/> is set.
     /// </summary>
     internal const int RecordIntrinsicCountOrdinal = 4;
+
+    /// <summary>
+    /// The native type of the intrinsic count at <see cref="RecordIntrinsicCountOrdinal"/>: <c>bigint</c>, the type of
+    /// both its windowed <c>SUM</c> of <c>CAST(1 AS bigint)</c> and its <c>COUNT_BIG(*)</c>.
+    /// </summary>
+    internal const DbType RecordIntrinsicCountType = DbType.Int64;
 
     /// <summary>
     /// The ordinal of the record's position in the selected set, a <c>bigint</c>, in <see cref="SetPositionLookup"/>.
@@ -253,8 +266,25 @@ internal static class RecordSqlBuilder
     /// </summary>
     internal const int SetPositionOrdinal = 3;
 
+    /// <summary>
+    /// The native type of the selected-set position at <see cref="SetPositionOrdinal"/>: <c>bigint</c>, the type of
+    /// both its running <c>SUM</c> of <c>CAST(1 AS bigint)</c> and its <c>ROW_NUMBER()</c>.
+    /// </summary>
+    internal const DbType SetPositionType = DbType.Int64;
+
     /// <summary>The ordinal of the selected-set count, a <c>bigint</c>, in <see cref="SetPositionLookup"/>.</summary>
     internal const int SetCountOrdinal = 4;
+
+    /// <summary>
+    /// The native type of the selected-set count at <see cref="SetCountOrdinal"/>: <c>bigint</c>, the type of both its
+    /// windowed <c>SUM</c> of <c>CAST(1 AS bigint)</c> and its <c>COUNT_BIG(*)</c>.
+    /// </summary>
+    internal const DbType SetCountType = DbType.Int64;
+
+    /// <summary>
+    /// The native type of the one value <see cref="Count"/> returns: <c>bigint</c>, the type of <c>COUNT_BIG(*)</c>.
+    /// </summary>
+    internal const DbType CountType = DbType.Int64;
 
     /// <summary>
     /// The most columns one page <c>UPDATE</c> sets, the chunk size legacy Epi Info uses

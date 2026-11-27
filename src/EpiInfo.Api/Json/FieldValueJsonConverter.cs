@@ -13,8 +13,10 @@ namespace EpiInfo.Api.Json;
 /// <remarks>
 /// <para>
 /// Writing: null is <c>null</c>; text and legal values are strings; a number is a JSON number, written digit for
-/// digit when it holds an exact integer and in round-trip form otherwise; a checkbox is a boolean; a date is the
-/// string <c>YYYY-MM-DD</c> with no time of day; an option is its 0-based index as a JSON integer.
+/// digit when it holds an exact integer, as its exact JSON number token when it holds none although its nearest
+/// double is whole (<see cref="FieldValue.TryGetJsonNumber"/>, so <c>1.0000000000000001</c> is never written as
+/// <c>1</c>), and in round-trip form otherwise; a checkbox is a boolean; a date is the string <c>YYYY-MM-DD</c>
+/// with no time of day; an option is its 0-based index as a JSON integer.
 /// </para>
 /// <para>
 /// Reading is raw and field-type blind: a string becomes text, even when it holds an ISO date; a number becomes a
@@ -106,6 +108,13 @@ public sealed class FieldValueJsonConverter : JsonConverter<FieldValue>
                 {
                     // An exact integer is written digit for digit, so a bigint beyond 2^53 is not rounded.
                     writer.WriteNumberValue(integer);
+                }
+                else if (value.TryGetJsonNumber(out var jsonNumber))
+                {
+                    // A number whose nearest double is whole although the number holds no exact integer, such as
+                    // 1.0000000000000001, is written as its exact JSON number: its double, 1, would make it a whole
+                    // number that an integer column or an option index accepts. The token is validated as JSON.
+                    writer.WriteRawValue(jsonNumber, skipInputValidation: false);
                 }
                 else
                 {

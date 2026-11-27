@@ -1,9 +1,13 @@
-import { useEffect, useId, useRef, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent } from 'react';
+import { useEffect, useId, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent } from 'react';
 import { createPortal } from 'react-dom';
 import type { DialogMessage } from '../api/types';
 
 export interface MessageDialogProps {
-  /** Check-code `DIALOG` messages in execution order; only the first is shown. */
+  /**
+   * Check-code `DIALOG` messages in execution order; only the first is shown.
+   * Messages are added only at the end and removed only from the front, which
+   * lets the dialog number each one within its open session.
+   */
   dialogs: readonly DialogMessage[];
   /** Removes the first message, so the next one, if any, is shown. */
   onDismiss: () => void;
@@ -32,6 +36,28 @@ function messageKey(message: DialogMessage): number {
     messageKeys.set(message, key);
   }
   return key;
+}
+
+/** The queue a render showed, and the messages of its open session dismissed before its first. */
+interface Session {
+  readonly queue: readonly DialogMessage[];
+  readonly dismissed: number;
+}
+
+/**
+ * The messages of the open session dismissed before `queue[0]`, from the
+ * previous render's session. The queue only grows at its end and shrinks at its
+ * front, so the previous queue's messages ahead of the new first one are those
+ * dismissed since. An empty queue ends the session, and so does a first message
+ * the previous queue did not hold: every message of that session is gone, so
+ * the queue emptied even if no render showed it empty, and a new session starts.
+ */
+function dismissedBefore(previous: Session, queue: readonly DialogMessage[]): number {
+  if (queue.length === 0) {
+    return 0;
+  }
+  const removed = previous.queue.indexOf(queue[0]);
+  return removed < 0 ? 0 : previous.dismissed + removed;
 }
 
 /** Whether the element is, or contains, a modal dialog. */
@@ -70,8 +96,11 @@ function handleDialogKey(
 /**
  * Shows the check-code `DIALOG` messages one at a time, in order, as a modal
  * message box with a single OK button, as legacy `MsgBox.Show(text, title)` did.
- * It holds no check-code logic and no state: OK, Enter and Escape call
- * `onDismiss`, which removes the first message so the next one appears.
+ * It holds no check-code logic: OK, Enter and Escape call `onDismiss`, which
+ * removes the first message so the next one appears. Its one piece of state
+ * counts the messages dismissed in the open session, from the first message to
+ * the dismissal of the last, so that the counter reads "Message n of N" across
+ * the session, its total growing as messages are added while it is open.
  *
  * Like ConfirmDialog it is a plain role="dialog" element (jsdom has no
  * <dialog>.showModal()) rendered into <body>, so that, while a message is
@@ -87,6 +116,16 @@ export function MessageDialog({ dialogs, onDismiss }: MessageDialogProps) {
 
   const current = dialogs.length > 0 ? dialogs[0] : null;
   const open = current !== null;
+
+  // The session follows the queue during render, React's pattern for state
+  // derived from a changed prop, so a message's first render already shows its number.
+  const [session, setSession] = useState<Session>(() => ({ queue: dialogs, dismissed: 0 }));
+  let dismissed = session.dismissed;
+  if (session.queue !== dialogs) {
+    dismissed = dismissedBefore(session, dialogs);
+    setSession({ queue: dialogs, dismissed });
+  }
+  const total = dismissed + dialogs.length;
 
   // The document listeners live for a whole open session and read the latest callback here.
   const onDismissRef = useRef(onDismiss);
@@ -242,9 +281,9 @@ export function MessageDialog({ dialogs, onDismiss }: MessageDialogProps) {
         <p id={textId}>{current.message}</p>
         {/* Prefixed with "Message", never a bare "1 of 3", which would read like
             the record navigator's "[n] of N" position. */}
-        {dialogs.length > 1 && (
+        {total > 1 && (
           <p>
-            <small>{`Message 1 of ${dialogs.length}`}</small>
+            <small>{`Message ${dismissed + 1} of ${total}`}</small>
           </p>
         )}
         <button ref={okRef} type="button" onClick={() => onDismiss()}>

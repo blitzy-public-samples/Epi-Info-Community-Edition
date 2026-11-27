@@ -9,9 +9,8 @@ type Schemas = components['schemas'];
 /**
  * A generated schema type as the client holds it: every member the wire types as
  * `FieldValue` (record and grid `values`, `assigned` and criterion values) is the
- * client's {@link FieldValue}, which may also be a bigint or, in what the client sends,
- * an {@link ExactDecimal}; every other member, the narrower bound and option value types
- * included, is unchanged.
+ * client's {@link FieldValue}, which may also be a bigint or an {@link ExactDecimal};
+ * every other member, the narrower bound and option value types included, is unchanged.
  */
 type ClientValued<T> =
   Equals<T, Schemas['FieldValue']> extends true
@@ -68,24 +67,35 @@ export type FieldOption = ClientValued<Schemas['FieldOption']>;
  * `bigint` column, which a JavaScript number cannot hold exactly, is a `bigint`, such as
  * 9007199254740993n; every other number is a `number`. `./client` reads and writes a
  * bigint as the JSON integer it holds, digit for digit, and reads and types such an
- * integer only as a bigint, so `===` compares it exactly. A number typed as a fraction
- * whose nearest double is a whole number is an {@link ExactDecimal}; it never comes from
- * the wire.
+ * integer only as a bigint, so `===` compares it exactly. A number that is not whole
+ * although its nearest double is, typed into a number field or read as a field value of a
+ * response, is an {@link ExactDecimal}.
  */
 export type FieldValue = string | number | bigint | boolean | null | ExactDecimal;
 
 /**
- * A number typed into a number field that is not a whole number although its nearest double
- * is one, such as `9007199254740992.5`, `-9223372036854775808.5`, `2.0000000000000001` or
- * `1e-400`. Sent as that double, it would reach the server as a different, whole number,
- * which an integer column may accept; `literal` keeps the exact JSON number token instead
- * (no `+`, no leading zero in the integer part, a digit on each side of any point), and
- * `./client` writes it bare, so the server decides: an integer column rejects it as not a
- * whole number and a `float` column stores its nearest double. Only `numberFromText` in
- * `./client` makes one, frozen, and two are the same value when their literals are equal.
- * Every other number stays a `number` or a `bigint`; no response carries one.
+ * A number field value that is not a whole number although its nearest double is one, such
+ * as `9007199254740992.5`, `-9223372036854775808.5`, `2.0000000000000001` or `1e-400`:
+ * typed into a number field, or written by the API as a field value, such as the
+ * `1.0000000000000001` a check-code `ASSIGN` copies from another field. Held or sent as
+ * that double, it would become a different, whole number, which an integer column may
+ * accept; `literal` keeps the exact JSON number token instead (no `+`, no leading zero in
+ * the integer part, a digit on each side of any point), and `./client` reads it from that
+ * token and writes it bare, so the server decides: an integer column rejects it as not a
+ * whole number and a `float` column stores its nearest double. Only `./client` makes one,
+ * frozen, and `isExactDecimal` there recognises exactly the ones it made, so a `values` map
+ * whose fields happen to be named `kind` and `literal` is never taken for one. Two are the
+ * same value when their literals are equal. Every other number stays a `number` or a `bigint`.
  */
-export type ExactDecimal = { readonly kind: 'decimal'; readonly literal: string };
+export type ExactDecimal = {
+  readonly kind: 'decimal';
+  readonly literal: string;
+  /** Type-only: no object literal can supply it, so only `./client` can produce an ExactDecimal. */
+  readonly [exactDecimalBrand]: true;
+};
+
+/** The brand of {@link ExactDecimal}; it exists only in the type system and is never emitted. */
+declare const exactDecimalBrand: unique symbol;
 
 /**
  * Field values keyed by canonical field name: `YYYY-MM-DD` dates, boolean
@@ -129,7 +139,7 @@ export type SearchResponse = ClientValued<Schemas['SearchResponse']>;
 // Check code
 
 /** Exact wire spellings of the field events. */
-export type FieldEventKind = 'FieldBefore' | 'FieldAfter' | 'FieldClick';
+export type FieldEventKind = Schemas['FieldEventRequest']['event'];
 
 /**
  * Effects of one field event. A field is in at most one of `enabled`/`disabled` and
@@ -172,7 +182,7 @@ export type HttpValidationProblemDetails = Schemas['HttpValidationProblemDetails
 export type WriteProblemDetails = Schemas['WriteProblemDetails'];
 
 /** What a failed write is known to have done; only `notWritten` is safe to resend automatically. */
-export type WriteOutcome = 'notWritten' | 'unknown' | 'written';
+export type WriteOutcome = Schemas['WriteProblemDetails']['writeOutcome'];
 
 // Contract drift checks
 
@@ -194,8 +204,10 @@ export type ContractChecks = [
   Assert<Equals<FieldEventResponse['assigned'], Values>>,
   // A bound is no FieldValue on the wire, so the client reads it as JSON.parse does, never as a bigint.
   Assert<Equals<FieldValidation['lower'], Schemas['FieldValidation']['lower']>>,
-  Assert<Equals<WriteOutcome, NonNullable<Schemas['WriteProblemDetails']['writeOutcome']>>>,
-  Assert<Equals<FieldEventKind, Schemas['FieldEventRequest']['event']>>,
+  // Pin the wire spellings the client's literals rely on: errors.ts WRITE_OUTCOMES and the
+  // event names useRecordEditor raises through the field-event queue.
+  Assert<Equals<WriteOutcome, 'notWritten' | 'unknown' | 'written'>>,
+  Assert<Equals<FieldEventKind, 'FieldBefore' | 'FieldAfter' | 'FieldClick'>>,
   Assert<
     Equals<
       FieldType,

@@ -374,6 +374,8 @@ public static class FakeForms
 /// it: the selected set and <c>UniqueKey</c> order of <see cref="RecordQueryRules"/>, page rows read as a
 /// <c>LEFT JOIN</c> (missing pages give <see cref="FieldValue.Null"/>), search over records that have every page row,
 /// base-only soft delete, delta updates, and the gates of <see cref="UpdateAsync"/> in the interface's order. A
+/// number written to a <c>float</c> column is stored as its nearest double, the binary64 value SQL Server holds and
+/// reads back, so <c>9007199254740993</c> reads as <c>9007199254740992</c>; every other value is stored exactly. A
 /// <c>values</c> key that is not a data field, a value not of its field's kind, or a value its column cannot store,
 /// is an <see cref="ArgumentException"/> raised before any change, as the SQL builders raise it, and so is a search
 /// condition with a <c>LIKE</c> pattern holding a <c>[...]</c> set that no SQL Server construct can evaluate
@@ -1179,7 +1181,7 @@ public sealed class FakeDataStore : IDataStore
         FormMetadata form,
         string globalRecordId,
         IReadOnlyDictionary<string, FieldValue> submitted,
-        SaveStamp stamp,
+        Func<SaveStamp> createStamp,
         Func<StoredRecord, RecordValidationResult> requiredGate,
         FormPermissions? permissions,
         CancellationToken cancellationToken) =>
@@ -1188,7 +1190,7 @@ public sealed class FakeDataStore : IDataStore
             ArgumentNullException.ThrowIfNull(form);
             ArgumentNullException.ThrowIfNull(globalRecordId);
             ArgumentNullException.ThrowIfNull(submitted);
-            ArgumentNullException.ThrowIfNull(stamp);
+            ArgumentNullException.ThrowIfNull(createStamp);
             ArgumentNullException.ThrowIfNull(requiredGate);
             lock (_gate)
             {
@@ -1241,6 +1243,10 @@ public sealed class FakeDataStore : IDataStore
                     }
                 }
 
+                // Every check has decided that the update writes, so its stamp is created now, before the first data
+                // statement, as the SQL store creates it.
+                var stamp = CreateStamp(nameof(UpdateAsync), createStamp);
+
                 // The first data statement: the base-row stamp update.
                 ThrowInjected(nameof(UpdateAsync), FakeFailureStage.BeforeWrite);
                 cancellationToken.ThrowIfCancellationRequested();
@@ -1286,13 +1292,13 @@ public sealed class FakeDataStore : IDataStore
     public Task<SoftDeleteResult> SoftDeleteAsync(
         FormMetadata form,
         string globalRecordId,
-        SaveStamp stamp,
+        Func<SaveStamp> createStamp,
         CancellationToken cancellationToken) =>
         Complete(() =>
         {
             ArgumentNullException.ThrowIfNull(form);
             ArgumentNullException.ThrowIfNull(globalRecordId);
-            ArgumentNullException.ThrowIfNull(stamp);
+            ArgumentNullException.ThrowIfNull(createStamp);
             lock (_gate)
             {
                 ThrowIfEveryMemberFails();
@@ -1303,13 +1309,18 @@ public sealed class FakeDataStore : IDataStore
                 cancellationToken.ThrowIfCancellationRequested();
                 if (state.Find(globalRecordId) is not { } row)
                 {
-                    return SoftDeleteResult.NotFound;
+                    return SoftDeleteResult.NotFound();
                 }
 
+                // A found record's result carries its id as stored, which the lookup matched ignoring case, as the
+                // SQL store's locked read returns it.
                 if (row.RecStatus == RecordQueryRules.DeletedRecStatus)
                 {
-                    return SoftDeleteResult.AlreadyDeleted;
+                    return SoftDeleteResult.AlreadyDeleted(row.GlobalRecordId);
                 }
+
+                // Only an active record is written, so only it needs a stamp, created before the data statement.
+                var stamp = CreateStamp(nameof(SoftDeleteAsync), createStamp);
 
                 ThrowInjected(nameof(SoftDeleteAsync), FakeFailureStage.BeforeWrite);
                 cancellationToken.ThrowIfCancellationRequested();
@@ -1319,7 +1330,7 @@ public sealed class FakeDataStore : IDataStore
                 state.Replace(row, row with { RecStatus = RecordQueryRules.DeletedRecStatus, LastSave = stamp });
 
                 ThrowInjected(nameof(SoftDeleteAsync), FakeFailureStage.AfterWrite);
-                return SoftDeleteResult.Deleted;
+                return SoftDeleteResult.Deleted(row.GlobalRecordId);
             }
         });
 
@@ -1343,6 +1354,21 @@ public sealed class FakeDataStore : IDataStore
 
     // The format the SQL store writes: a lower-case hyphenated GUID, as legacy Guid.NewGuid().ToString() gives it.
     private static string NewGlobalRecordId() => Guid.NewGuid().ToString("D", CultureInfo.InvariantCulture);
+
+    // The one call of an update's or soft delete's stamp source, once the write is decided and before its first data
+    // statement. An exception of the source, or the null stamp that breaks its contract, reports NotWritten with the
+    // failure as its inner exception, as the SQL store's rollback before any DML does, and as a required-gate failure.
+    private static SaveStamp CreateStamp(string operation, Func<SaveStamp> createStamp)
+    {
+        try
+        {
+            return createStamp() ?? throw new InvalidOperationException("The save stamp source returned no stamp.");
+        }
+        catch (Exception exception)
+        {
+            throw new DataStoreWriteException(operation, WriteOutcome.NotWritten, null, exception);
+        }
+    }
 
     private static int PositionOf(IReadOnlyList<StoredRow> selected, int uniqueKey) =>
         selected.Count(row => row.UniqueKey <= uniqueKey);
@@ -1444,7 +1470,11 @@ public sealed class FakeDataStore : IDataStore
     // map compares canonical names ordinally, so fields whose names differ only by case keep a value each; the repeat
     // check ignores case, as the validator's does, so two such keys are still rejected. A write refuses a read-only
     // field's key, even with a null value, as the builders do before converting its value; a seed admits it, because
-    // a seeded record stands for a stored row, which may hold a historical read-only value.
+    // a seeded record stands for a stored row, which may hold a historical read-only value. Each value is stored as
+    // SQL Server holds it, so insert, update and seed read back what the SQL store reads: a number on a float column
+    // becomes its nearest double, the binary64 value the SQL store binds and reads, so 9007199254740993 is stored as
+    // 9007199254740992 and 2.0000000000000001 as 2; every other column keeps the value exactly, an integer column's
+    // exact integer beyond 2^53 included.
     private static Dictionary<string, FieldValue> NormaliseValues(
         FormState state,
         IReadOnlyDictionary<string, FieldValue> values,
@@ -1482,7 +1512,12 @@ public sealed class FakeDataStore : IDataStore
                 throw new ArgumentException("Two values name the same field ignoring case.", paramName);
             }
 
-            normalised.Add(field.Name, value);
+            // IsRepresentable admits only a number on a float column, and every number's nearest double is finite.
+            normalised.Add(
+                field.Name,
+                !value.IsNull && field.Column.Family == ColumnFamily.Float
+                    ? FieldValue.FromNumber(value.AsNumber())
+                    : value);
         }
 
         return normalised;

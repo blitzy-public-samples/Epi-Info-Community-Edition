@@ -100,7 +100,7 @@ public sealed class ErrorContractTests
     // these cases: one fixed sentence, then the label that introduces the body's traceId.
     internal const string ExpectedUnexpectedSentence = "An unexpected error occurred.";
 
-    private const string ExpectedTraceIdLabel = " Trace id: ";
+    internal const string ExpectedTraceIdLabel = " Trace id: ";
 
     // The rest of the wire contract, written out the same way so that a changed or swapped product text fails these
     // cases and the other classes of this file: the traceId member, the fixed detail of each status and request-level
@@ -3308,18 +3308,25 @@ public sealed class ErrorContractTests
             FormMetadata form,
             string globalRecordId,
             IReadOnlyDictionary<string, FieldValue> submitted,
-            SaveStamp stamp,
+            Func<SaveStamp> createStamp,
             Func<StoredRecord, RecordValidationResult> requiredGate,
             FormPermissions? permissions,
             CancellationToken cancellationToken) =>
-            inner.UpdateAsync(form, globalRecordId, submitted, stamp, requiredGate, permissions, cancellationToken);
+            inner.UpdateAsync(
+                form,
+                globalRecordId,
+                submitted,
+                createStamp,
+                requiredGate,
+                permissions,
+                cancellationToken);
 
         public Task<SoftDeleteResult> SoftDeleteAsync(
             FormMetadata form,
             string globalRecordId,
-            SaveStamp stamp,
+            Func<SaveStamp> createStamp,
             CancellationToken cancellationToken) =>
-            inner.SoftDeleteAsync(form, globalRecordId, stamp, cancellationToken);
+            inner.SoftDeleteAsync(form, globalRecordId, createStamp, cancellationToken);
 
         public Task<FormPermissions?> GetPermissionsAsync(FormMetadata form, CancellationToken cancellationToken) =>
             inner.GetPermissionsAsync(form, cancellationToken);
@@ -4563,7 +4570,8 @@ internal sealed record RawExchange(string Response, bool ConnectionReset);
 /// <summary>
 /// The write outcome of a record write whose store failure reports its own outcome agrees with the stored data and
 /// the store's write log, proved through <see cref="RecordService"/> and <see cref="ApiExceptionHandler"/> over
-/// <see cref="FakeDataStore"/>.
+/// <see cref="FakeDataStore"/>; and a write the save stamp refuses, because the process has no OS user name, is
+/// <c>notWritten</c> with nothing stored, proved through <see cref="SaveStampProvider"/> and the API's own pipeline.
 /// </summary>
 /// <remarks>
 /// Each case asserts the error response, the stored record and the store's write log together. The class needs no
@@ -4580,6 +4588,11 @@ public sealed class StoreFailureWriteOutcomeTests
 
     private const string OriginalLastName = "Original";
     private const string ChangedLastName = "Changed";
+
+    // The refusal of a stamp for a process without a user name, written out here rather than read from the product so
+    // a changed text fails these cases.
+    private const string NoUserNameMessage =
+        "The API process has no OS user name, so the save stamp cannot name who saved; nothing was written.";
 
     private static readonly string[] WriteMethods = [Insert, Update, SoftDelete];
 
@@ -4749,6 +4762,228 @@ public sealed class StoreFailureWriteOutcomeTests
         Assert.Equal(method, Assert.Single(store.WriteCalls).Method);
     }
 
+    /// <summary>
+    /// Each hosting environment, which selects the committed logging configuration, with each write method.
+    /// </summary>
+    public static TheoryData<string, string> EnvironmentsAndWriteMethods()
+    {
+        var data = new TheoryData<string, string>();
+        foreach (var environment in new[] { Environments.Production, Environments.Development })
+        {
+            foreach (var method in WriteMethods)
+            {
+                data.Add(environment, method);
+            }
+        }
+
+        return data;
+    }
+
+    // AAP 0.3.4.6 and A11: a user name that is missing, empty or whitespace names nobody, so no stamp is made, and the
+    // refusal is the one fixed sentence, which carries no value.
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("   ")]
+    [InlineData("\t\r\n")]
+    public void StampForAProcessWithoutAUserNameIsRefused(string? userName)
+    {
+        var provider = new SaveStampProvider(new ControlledTimeProvider(), () => userName);
+
+        var refused = Assert.Throws<InvalidOperationException>(() => provider.Create());
+
+        Assert.Equal(NoUserNameMessage, refused.Message);
+    }
+
+    // AAP 0.3.4.6: the stamp names the user the source gives, read again for each stamp, at the clock's local time,
+    // never UTC, cut to whole seconds with its Unspecified kind kept. The public constructor, the one dependency
+    // injection uses, names Environment.UserName of the process (A11).
+    [Fact]
+    public void StampNamesTheProcessUserAtTheClocksLocalTimeInWholeSeconds()
+    {
+        // Two hours east of UTC, so a stamp taken in UTC would be two hours early.
+        var zone = TimeZoneInfo.CreateCustomTimeZone("Stamp+02", TimeSpan.FromHours(2), "Stamp+02", "Stamp+02");
+        var clock = new ControlledTimeProvider(
+            zone,
+            new DateTime(2024, 6, 3, 10, 15, 30, 789, DateTimeKind.Unspecified));
+        var expectedTime = new DateTime(2024, 6, 3, 10, 15, 30, DateTimeKind.Unspecified);
+        var names = new Queue<string?>(["first-user", "second-user"]);
+        var provider = new SaveStampProvider(clock, names.Dequeue);
+
+        var first = provider.Create();
+        var second = provider.Create();
+        var process = new SaveStampProvider(clock).Create();
+
+        Assert.Equal("first-user", first.LogonName);
+        Assert.Equal("second-user", second.LogonName);
+        Assert.Equal(Environment.UserName, process.LogonName);
+        foreach (var stamp in new[] { first, second, process })
+        {
+            Assert.Equal(expectedTime, stamp.Time);
+            Assert.Equal(DateTimeKind.Unspecified, stamp.Time.Kind);
+        }
+    }
+
+    // Both constructors refuse a missing clock, and the one with a user-name source refuses a missing source.
+    [Fact]
+    public void ConstructorsRefuseAMissingClockOrUserNameSource()
+    {
+        Assert.Equal(
+            "timeProvider",
+            Assert.Throws<ArgumentNullException>(() => new SaveStampProvider(null!)).ParamName);
+        Assert.Equal(
+            "timeProvider",
+            Assert.Throws<ArgumentNullException>(() => new SaveStampProvider(null!, () => "epi-user")).ParamName);
+        Assert.Equal(
+            "userName",
+            Assert.Throws<ArgumentNullException>(() => new SaveStampProvider(TimeProvider.System, null!)).ParamName);
+    }
+
+    /// <summary>A request the store answers without writing, so it needs no save stamp.</summary>
+    public enum UnstampedRequest
+    {
+        /// <summary>A <c>PUT</c> of an id the base table does not hold: 404.</summary>
+        UpdateOfAnUnknownRecord,
+
+        /// <summary>A <c>PUT</c> of a deleted record: 409.</summary>
+        UpdateOfADeletedRecord,
+
+        /// <summary>
+        /// A <c>PUT</c> whose stored record, overlaid with the submitted values, fails the required gate: 400.
+        /// </summary>
+        UpdateFailingTheRequiredGate,
+
+        /// <summary>
+        /// A <c>PUT</c> of a record lacking its page row, whose table the store's in-transaction permission read denies
+        /// INSERT on: 403.
+        /// </summary>
+        UpdateDeniedAMissingPageRow,
+
+        /// <summary>A <c>DELETE</c> of an id the base table does not hold: 404.</summary>
+        DeleteOfAnUnknownRecord,
+
+        /// <summary>A <c>DELETE</c> of an already-deleted record: 204.</summary>
+        DeleteOfADeletedRecord,
+    }
+
+    // AAP 0.3.4.2, 0.3.4.6 and 0.9.3, through the API as Program.cs composes it: a write that passes its checks in a
+    // process without a user name stops at its stamp, before any data statement. A POST asks for the stamp before the
+    // store call, so the store's insert never runs; a PUT and a DELETE of an active record hand the stamp source to the
+    // store, which asks it only after its locked read has decided the write, so its locked read ran and nothing else
+    // did. Each is the generic 500 with writeOutcome notWritten; the source was asked exactly once; no write was
+    // recorded, the seeded record is unchanged and no record was added; and the one handler line names the exception
+    // type, operation and outcome, with no exception object, no submitted value and not the refusal's text.
+    [Theory]
+    [MemberData(nameof(EnvironmentsAndWriteMethods))]
+    public async Task WriteInAProcessWithoutAUserNameIsRefusedBeforeAnyDataStatementAsNotWritten(
+        string environment,
+        string method)
+    {
+        var (store, _, id) = CreateServices();
+        var before = store.GetRecords(FakeForms.TwoPageViewId);
+        var valueSentinel = "SENTINEL-" + Guid.NewGuid().ToString("N");
+        var user = new NamelessUser();
+
+        await using var factory = new ApiFactory(ApiFactoryOptions.ForFake(store, environment));
+        await using var host = WithUserNameSource(factory, user);
+        using var client = host.CreateClient();
+        store.ClearCalls();
+
+        using var response = await SendWriteAsync(client, method, id, valueSentinel);
+        var text = await response.Content.ReadAsStringAsync();
+
+        // The response: the generic 500 with the body's trace id, and notWritten.
+        Assert.Equal(HttpStatusCode.InternalServerError, response.StatusCode);
+        Assert.Equal(ErrorContractTests.ProblemMediaType, response.Content.Headers.ContentType?.MediaType);
+        using var document = JsonDocument.Parse(text);
+        var problem = ApiTestClient.AssertProblemDetails(
+            document.RootElement,
+            StatusCodes.Status500InternalServerError);
+        var traceId = problem.GetProperty("traceId").GetString();
+        Assert.Equal(
+            ErrorContractTests.ExpectedUnexpectedSentence + ErrorContractTests.ExpectedTraceIdLabel + traceId,
+            problem.GetProperty("detail").GetString());
+        Assert.Equal(ErrorContractTests.ExpectedNotWritten, problem.GetProperty("writeOutcome").GetString());
+        Assert.DoesNotContain(valueSentinel, text, StringComparison.Ordinal);
+        Assert.DoesNotContain(NoUserNameMessage, text, StringComparison.Ordinal);
+
+        // The stamp source was asked once, for the one stamp the write would have stored.
+        Assert.Equal(1, user.Calls);
+
+        // The store: an insert was never called; an update or a delete ran only its locked read. Nothing changed.
+        FakeStoreCall[] expectedCalls = method == Insert ? [] : [new FakeStoreCall(method, IsWrite: false)];
+        Assert.Equal(expectedCalls, store.Calls.Where(call => call.Method == method));
+        Assert.Empty(store.WriteCalls);
+        AssertRecordsUnchanged(before, store.GetRecords(FakeForms.TwoPageViewId));
+        var stored = Assert.Single(store.GetRecords(FakeForms.TwoPageViewId));
+        Assert.Equal(
+            (id, RecordQueryRules.ActiveRecStatus, OriginalLastName),
+            (stored.GlobalRecordId, stored.RecStatus, stored.Values["LastName"].AsText()));
+        Assert.Null(stored.FirstSave);
+        Assert.Null(stored.LastSave);
+
+        // The logs: one handler line, and no post-commit line, because nothing was committed. The insert's refusal
+        // reaches the handler as itself under the endpoint's operation; the store reports an update's or a delete's
+        // as its own failure, with nothing written, under the store's operation name.
+        var line = Assert.Single(
+            factory.Logs.Find(entry => entry.Category == typeof(ApiExceptionHandler).FullName));
+        Assert.Equal(LogLevel.Error, line.Level);
+        Assert.Equal("RequestFailed", line.EventId.Name);
+        Assert.Null(line.ExceptionType);
+        Assert.Equal<object?>(StatusCodes.Status500InternalServerError, LogValue(line, "StatusCode"));
+        Assert.Equal<object?>(
+            (method == Insert ? typeof(InvalidOperationException) : typeof(DataStoreWriteException)).FullName,
+            LogValue(line, "ExceptionType"));
+        Assert.Equal<object?>(method == Insert ? OperationName(method) : method, LogValue(line, "Operation"));
+        Assert.Null(LogValue(line, "SqlErrorNumber"));
+        Assert.Equal<object?>(ErrorContractTests.ExpectedNotWritten, LogValue(line, "WriteOutcome"));
+        Assert.Equal<object?>(traceId, LogValue(line, "TraceId"));
+        Assert.Empty(factory.Logs.Find(entry => entry.Category == typeof(RecordService).FullName));
+        Assert.Empty(factory.Logs.Find(entry => entry.ExceptionType is not null));
+        Assert.False(factory.Logs.ContainsText(valueSentinel), "A log line holds the submitted value.");
+        Assert.False(factory.Logs.ContainsText(NoUserNameMessage), "A log line holds the exception's message.");
+    }
+
+    // AAP 0.3.4.2 (Retry), 0.3.4.6 (statement order, save stamp) and 0.2.4, through the API as Program.cs composes it:
+    // in a process without a user name, a PUT or DELETE the store answers without writing keeps its usual answer,
+    // because the store asks for the stamp only once its locked checks decide that the operation writes. The stamp
+    // source is never asked, the store's locked read ran and recorded no write, and every record of the form is as it
+    // was, stamps included.
+    [Theory]
+    [InlineData(UnstampedRequest.UpdateOfAnUnknownRecord, StatusCodes.Status404NotFound)]
+    [InlineData(UnstampedRequest.UpdateOfADeletedRecord, StatusCodes.Status409Conflict)]
+    [InlineData(UnstampedRequest.UpdateFailingTheRequiredGate, StatusCodes.Status400BadRequest)]
+    [InlineData(UnstampedRequest.UpdateDeniedAMissingPageRow, StatusCodes.Status403Forbidden)]
+    [InlineData(UnstampedRequest.DeleteOfAnUnknownRecord, StatusCodes.Status404NotFound)]
+    [InlineData(UnstampedRequest.DeleteOfADeletedRecord, StatusCodes.Status204NoContent)]
+    public async Task RequestThatWritesNothingKeepsItsAnswerInAProcessWithoutAUserName(
+        UnstampedRequest request,
+        int status)
+    {
+        var store = FakeDataStore.WithStandardForms();
+        var (viewId, id, method, values) = ArrangeUnstamped(store, request);
+        var before = store.GetRecords(viewId);
+        var user = new NamelessUser();
+
+        await using var factory = new ApiFactory(ApiFactoryOptions.ForFake(store));
+        await using var host = WithUserNameSource(factory, user);
+        using var client = host.CreateClient();
+        store.ClearCalls();
+
+        var path = string.Create(
+            CultureInfo.InvariantCulture,
+            $"/api/forms/{viewId}/records/{Uri.EscapeDataString(id)}");
+        using var response = method == Update
+            ? await ApiTestClient.PutJsonAsync(client, path, new { values })
+            : await client.DeleteAsync(path);
+
+        Assert.Equal(status, (int)response.StatusCode);
+        Assert.Equal(0, user.Calls);
+        Assert.Equal([new FakeStoreCall(method, IsWrite: false)], store.Calls.Where(call => call.Method == method));
+        Assert.Empty(store.WriteCalls);
+        AssertRecordsUnchanged(before, store.GetRecords(viewId));
+    }
+
     // A store holding one active TwoPage record whose LastName is OriginalLastName, and the services over it.
     private static (FakeDataStore Store, RecordService Records, string Id) CreateServices()
     {
@@ -4763,6 +4998,110 @@ public sealed class StoreFailureWriteOutcomeTests
             new SaveStampProvider(TimeProvider.System),
             NullLogger<RecordService>.Instance);
         return (store, records, id);
+    }
+
+    // The form, record id, write method and PUT values of each request the store answers without writing. Every case
+    // seeds the record it names, or, for an unknown id, a record beside it, so an unchanged store is a real check.
+    private static (int ViewId, string Id, string Method, Dictionary<string, object?> Values) ArrangeUnstamped(
+        FakeDataStore store,
+        UnstampedRequest request)
+    {
+        var changed = new Dictionary<string, object?> { ["LastName"] = ChangedLastName };
+        var original = new Dictionary<string, FieldValue> { ["LastName"] = FieldValue.FromText(OriginalLastName) };
+        var unknownId = Guid.NewGuid().ToString("D", CultureInfo.InvariantCulture);
+        switch (request)
+        {
+            case UnstampedRequest.UpdateOfAnUnknownRecord:
+                store.SeedRecord(FakeForms.TwoPageViewId, original);
+                return (FakeForms.TwoPageViewId, unknownId, Update, changed);
+
+            case UnstampedRequest.UpdateOfADeletedRecord:
+                return (
+                    FakeForms.TwoPageViewId,
+                    store.SeedRecord(FakeForms.TwoPageViewId, original, RecordQueryRules.DeletedRecStatus),
+                    Update,
+                    changed);
+
+            case UnstampedRequest.UpdateFailingTheRequiredGate:
+                // The stored record leaves the required field empty and the PUT does not submit it.
+                return (
+                    FakeForms.RequiredViewId,
+                    store.SeedRecord(FakeForms.RequiredViewId),
+                    Update,
+                    new Dictionary<string, object?> { ["Comment"] = ChangedLastName });
+
+            case UnstampedRequest.UpdateDeniedAMissingPageRow:
+                // The PUT fills the required field, so it passes the gate, and the service's own check passes, because
+                // UPDATE is granted everywhere; only the store's in-transaction check refuses the missing page's
+                // INSERT.
+                var form = FakeForms.WithRequiredField.Metadata;
+                var page = Assert.Single(form.Pages);
+                var lacking = store.SeedRecord(FakeForms.RequiredViewId, missingPageIds: [page.PageId]);
+                store.SetPermissions(
+                    FakeForms.RequiredViewId,
+                    new FormPermissions(
+                    [
+                        new TablePermission(form.BaseTableName, CanInsert: true, CanUpdate: true),
+                        new TablePermission(page.TableName, CanInsert: false, CanUpdate: true),
+                    ]));
+                return (
+                    FakeForms.RequiredViewId,
+                    lacking,
+                    Update,
+                    new Dictionary<string, object?>
+                    {
+                        [FakeForms.RequiredFieldName] = "Filled",
+                        ["Comment"] = ChangedLastName,
+                    });
+
+            case UnstampedRequest.DeleteOfAnUnknownRecord:
+                store.SeedRecord(FakeForms.TwoPageViewId, original);
+                return (FakeForms.TwoPageViewId, unknownId, SoftDelete, changed);
+
+            case UnstampedRequest.DeleteOfADeletedRecord:
+                return (
+                    FakeForms.TwoPageViewId,
+                    store.SeedRecord(FakeForms.TwoPageViewId, original, RecordQueryRules.DeletedRecStatus),
+                    SoftDelete,
+                    changed);
+
+            default:
+                throw new ArgumentOutOfRangeException(nameof(request), request, "No case arranges this request.");
+        }
+    }
+
+    // The API as Program.cs composes it over the factory's store, with a save stamp provider whose user name comes from
+    // user.
+    private static WebApplicationFactory<Program> WithUserNameSource(ApiFactory factory, NamelessUser user) =>
+        factory.WithWebHostBuilder(builder =>
+            builder.ConfigureTestServices(services =>
+            {
+                services.RemoveAll<SaveStampProvider>();
+                services.AddSingleton(provider => new SaveStampProvider(
+                    provider.GetRequiredService<TimeProvider>(),
+                    user.Read));
+            }));
+
+    // Each record holds exactly what it held before, in the same order: id, key, status, every value, page rows and
+    // both stamps.
+    private static void AssertRecordsUnchanged(
+        IReadOnlyList<FakeRecordState> before,
+        IReadOnlyList<FakeRecordState> after)
+    {
+        Assert.Equal(before.Select(record => record.GlobalRecordId), after.Select(record => record.GlobalRecordId));
+        foreach (var (was, now) in before.Zip(after))
+        {
+            Assert.Equal(
+                (was.UniqueKey, was.RecStatus, was.FirstSave, was.LastSave),
+                (now.UniqueKey, now.RecStatus, now.FirstSave, now.LastSave));
+            Assert.Equal(was.Values.Keys, now.Values.Keys);
+            foreach (var (name, value) in was.Values)
+            {
+                Assert.Equal(value, now.Values[name]);
+            }
+
+            Assert.Equal(was.PresentPageIds.Order(), now.PresentPageIds.Order());
+        }
     }
 
     private static Exception Failure(string kind, WriteOutcome outcome) => kind switch
@@ -4803,6 +5142,38 @@ public sealed class StoreFailureWriteOutcomeTests
         };
     }
 
+    // The HTTP request of each write method on the TwoPage form: POST and PUT submit LastName = lastName; the DELETE
+    // sends no body.
+    private static Task<HttpResponseMessage> SendWriteAsync(
+        HttpClient client,
+        string method,
+        string id,
+        string lastName)
+    {
+        var records = string.Create(CultureInfo.InvariantCulture, $"/api/forms/{FakeForms.TwoPageViewId}/records");
+        var record = records + "/" + Uri.EscapeDataString(id);
+        var body = new { values = new Dictionary<string, object?> { ["LastName"] = lastName } };
+        return method switch
+        {
+            Insert => ApiTestClient.PostJsonAsync(client, records, body),
+            Update => ApiTestClient.PutJsonAsync(client, record, body),
+            SoftDelete => client.DeleteAsync(record),
+            _ => throw new ArgumentOutOfRangeException(nameof(method)),
+        };
+    }
+
+    // The fixed operation name the handler line gives each write method's endpoint.
+    private static string OperationName(string method) => method switch
+    {
+        Insert => "record.insert",
+        Update => "record.update",
+        SoftDelete => "record.softDelete",
+        _ => throw new ArgumentOutOfRangeException(nameof(method)),
+    };
+
+    private static object? LogValue(CapturedLogEntry entry, string key) =>
+        Assert.Single(entry.State, pair => pair.Key == key).Value;
+
     // The writeOutcome wire values of the error contract.
     private static string WireValue(WriteOutcome outcome) => outcome switch
     {
@@ -4811,4 +5182,19 @@ public sealed class StoreFailureWriteOutcomeTests
         WriteOutcome.Written => "written",
         _ => throw new ArgumentOutOfRangeException(nameof(outcome)),
     };
+
+    // A user-name source for a process whose OS user has no name: every read answers the empty name, and is counted,
+    // so a case can tell whether a stamp was asked for. Requests may run on any thread, so the count is atomic.
+    private sealed class NamelessUser
+    {
+        private int _calls;
+
+        public int Calls => Volatile.Read(ref _calls);
+
+        public string? Read()
+        {
+            Interlocked.Increment(ref _calls);
+            return string.Empty;
+        }
+    }
 }

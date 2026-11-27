@@ -1,6 +1,7 @@
 using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 using System.Numerics;
+using System.Text;
 
 namespace EpiInfo.Domain.Values;
 
@@ -118,7 +119,8 @@ public static class FieldValueCoercion
     /// a number needs a finite numeric primitive, kept exact: an integer primitive, or a whole decimal, within the
     /// signed 64-bit range keeps its exact integer, and any other value keeps its nearest double without being
     /// rounded into a whole number, and its exact floor (<see cref="FieldValue.TryGetFloor"/>) when that lies
-    /// within the range;
+    /// within the range, and, for a decimal or <see cref="ulong"/> whose nearest double is whole, its exact JSON
+    /// number token (<see cref="FieldValue.TryGetJsonNumber"/>);
     /// </description></item>
     /// <item><description>a boolean needs a <see cref="bool"/>;</description></item>
     /// <item><description>a date needs a <c>yyyy-MM-dd</c> string or a <see cref="DateOnly"/>;</description></item>
@@ -287,8 +289,10 @@ public static class FieldValueCoercion
     /// <c>2.0000000000000001</c> is not the integer 2, and also its exact floor
     /// (<see cref="FieldValue.TryGetFloor"/>) when that lies within the signed 64-bit range: <c>9007199254740992.5</c>,
     /// whose nearest double is the whole 9007199254740992, keeps the floor 9007199254740992 and <c>-1e-400</c> the
-    /// floor -1. The floor is read from the text itself in one pass bounded by its length, whatever its digit count
-    /// or exponent. Negative zero becomes zero.
+    /// floor -1. A number whose nearest double is whole also keeps its exact JSON number token
+    /// (<see cref="FieldValue.TryGetJsonNumber"/>), spelled from the parts the scanner reads, so
+    /// <c> +2.0000000000000001 </c> keeps <c>2.0000000000000001</c>. The floor and the token are read from the text
+    /// itself in one pass bounded by its length, whatever its digit count or exponent. Negative zero becomes zero.
     /// </summary>
     /// <param name="text">Search or metadata text, such as <c>120</c> or <c>37.5</c>.</param>
     /// <param name="value">The number, or <see cref="FieldValue.Null"/> when parsing fails.</param>
@@ -318,7 +322,8 @@ public static class FieldValueCoercion
     /// Parses a finite number from UTF-8 text exactly, with the rules of
     /// <see cref="TryParseNumber(string, out FieldValue)"/>. It serves JSON number literals, which the JSON reader
     /// has already checked against the JSON number grammar, so <c>9007199254740993</c> keeps its exact integer,
-    /// <c>9007199254740992.5</c> its exact floor, and <c>1e400</c> is refused rather than read as infinity.
+    /// <c>9007199254740992.5</c> its exact floor and its JSON number token, and <c>1e400</c> is refused rather than
+    /// read as infinity.
     /// </summary>
     /// <param name="utf8Text">The UTF-8 text, such as a JSON number literal.</param>
     /// <param name="value">The number, or <see cref="FieldValue.Null"/> when parsing fails.</param>
@@ -483,13 +488,26 @@ public static class FieldValueCoercion
         byte value => FieldValueCoercionResult.Success(FieldValue.FromInteger(value)),
         ushort value => FieldValueCoercionResult.Success(FieldValue.FromInteger(value)),
         uint value => FieldValueCoercionResult.Success(FieldValue.FromInteger(value)),
-        // A ulong above long.MaxValue is a whole number beyond the signed 64-bit range, so it has no floor within it.
-        ulong value => FieldValueCoercionResult.Success(value <= long.MaxValue
-            ? FieldValue.FromInteger((long)value)
-            : FieldValue.FromNonInt64Number(value, floor: null)),
+        ulong value => NumberFromUInt64(value),
         decimal value => NumberFromDecimal(value),
         _ => FieldValueCoercionResult.Failure(FieldValueCoercionError.WrongType),
     };
+
+    // A ulong above long.MaxValue is a whole number beyond the signed 64-bit range, so it has no floor within it. Its
+    // nearest double is whole and may round it, as 18446744073709551615 rounds to 2^64, so it keeps its exact digits.
+    private static FieldValueCoercionResult NumberFromUInt64(ulong value)
+    {
+        if (value <= long.MaxValue)
+        {
+            return FieldValueCoercionResult.Success(FieldValue.FromInteger((long)value));
+        }
+
+        double nearest = value;
+        return FieldValueCoercionResult.Success(FieldValue.FromNonInt64Number(
+            nearest,
+            floor: null,
+            JsonNumberOfInvariantText(value.ToString(CultureInfo.InvariantCulture), nearest)));
+    }
 
     // A double or float is exact as given, so FromNumber keeps a whole one as its exact integer.
     private static FieldValueCoercionResult NumberFromDouble(double value) => double.IsFinite(value)
@@ -500,7 +518,8 @@ public static class FieldValueCoercion
     // value, and floored, in decimal arithmetic. The explicit conversion to double divides by a power of ten and is
     // not always the nearest double, so a non-integral result could lie on the other side of an integer from the
     // decimal; the nearest double is therefore parsed from the decimal's exact invariant text, which the parser
-    // rounds correctly. Every decimal lies within the range of double, so the parse cannot overflow.
+    // rounds correctly, and that text also gives the exact JSON number a whole nearest double needs. Every decimal
+    // lies within the range of double, so the parse cannot overflow.
     private static FieldValueCoercionResult NumberFromDecimal(decimal value)
     {
         if (decimal.Truncate(value) == value && value >= long.MinValue && value <= long.MaxValue)
@@ -510,20 +529,22 @@ public static class FieldValueCoercion
 
         var floor = decimal.Floor(value);
         long? exactFloor = floor >= long.MinValue && floor <= long.MaxValue ? (long)floor : null;
-        var nearest = double.Parse(
-            value.ToString(CultureInfo.InvariantCulture), NumberStyles.Float, CultureInfo.InvariantCulture);
-        return FieldValueCoercionResult.Success(FieldValue.FromNonInt64Number(nearest, exactFloor));
+        var text = value.ToString(CultureInfo.InvariantCulture);
+        var nearest = double.Parse(text, NumberStyles.Float, CultureInfo.InvariantCulture);
+        return FieldValueCoercionResult.Success(
+            FieldValue.FromNonInt64Number(nearest, exactFloor, JsonNumberOfInvariantText(text, nearest)));
     }
 
     // long.TryParse refuses every number that is not exactly a whole number within the signed 64-bit range, so a
-    // number reaching here keeps its nearest double and the exact floor the scanner reads from the same text. The
-    // invariant culture accepts "NaN", "Infinity" and "∞", and overflow yields an infinity, so a successful double
-    // parse alone does not make a field value. Text the scanner does not read as the parser does is refused rather
-    // than given a floor it cannot vouch for.
+    // number reaching here keeps its nearest double and the exact floor the scanner reads from the same text, and,
+    // when that double is whole, the exact JSON number the scanner spells from it. The invariant culture accepts
+    // "NaN", "Infinity" and "∞", and overflow yields an infinity, so a successful double parse alone does not make a
+    // field value. Text the scanner does not read as the parser does is refused rather than given a floor it cannot
+    // vouch for.
     private static bool TryFromNonInt64Number<TChar>(ReadOnlySpan<TChar> text, double nearest, out FieldValue value)
         where TChar : struct, IBinaryInteger<TChar>
     {
-        if (!double.IsFinite(nearest) || !TryScanExactInterval(text, out var interval))
+        if (!double.IsFinite(nearest) || !TryScanExactInterval(text, out var interval, out var spelling))
         {
             value = FieldValue.Null;
             return false;
@@ -532,8 +553,85 @@ public static class FieldValueCoercion
         // The scan finding a whole number within range is defensive: long.TryParse normally accepts every such text.
         value = interval.Integer is { } integer
             ? FieldValue.FromInteger(integer)
-            : FieldValue.FromNonInt64Number(nearest, interval.Floor);
+            : FieldValue.FromNonInt64Number(
+                nearest,
+                interval.Floor,
+                Math.Truncate(nearest) == nearest ? SpellJsonNumber(text, spelling) : null);
         return true;
+    }
+
+    // The JSON number a decimal or ulong whose nearest double is whole keeps (FieldValue.FromNonInt64Number), spelled
+    // by the scanner from the value's invariant text as from any other number text; null when that double is not
+    // whole, which needs none. Invariant formatting writes digits, a '-' sign and a point only, which always scan.
+    private static string? JsonNumberOfInvariantText(string text, double nearest) =>
+        Math.Truncate(nearest) == nearest && TryScanExactInterval(text.AsSpan(), out _, out var spelling)
+            ? SpellJsonNumber(text.AsSpan(), spelling)
+            : null;
+
+    // The RFC 8259 number token of a scanned number text, exactly equal in value to it: '-' for a negative sign and
+    // nothing for '+'; the integer digits without leading zeros, or 0 when none remain; a point and the fraction digits
+    // as written only when there are fraction digits; and, for an exponent, 'e', its '-' sign and its digits as
+    // written. Surrounding white space and trailing NULs are left out, so " +00.5E-0400 " becomes 0.5e-0400 and
+    // "5.e+3" would become 5e3. The token is at most one code unit longer than the text, when a 0 is supplied before
+    // a point, as in ".5".
+    private static string SpellJsonNumber<TChar>(ReadOnlySpan<TChar> text, NumberSpelling spelling)
+        where TChar : struct, IBinaryInteger<TChar>
+    {
+        var token = new StringBuilder(text.Length + 1);
+        if (spelling.Negative)
+        {
+            token.Append('-');
+        }
+
+        var integerEnd = spelling.PointIndex >= 0 ? spelling.PointIndex : spelling.MantissaEnd;
+        var integerStart = spelling.MantissaStart;
+        while (integerStart < integerEnd && CodeUnit(text, integerStart) == '0')
+        {
+            integerStart++;
+        }
+
+        if (integerStart == integerEnd)
+        {
+            token.Append('0');
+        }
+
+        AppendCodeUnits(token, text, integerStart, integerEnd);
+
+        var fractionStart = spelling.PointIndex + 1;
+        if (spelling.PointIndex >= 0 && fractionStart < spelling.MantissaEnd)
+        {
+            token.Append('.');
+            AppendCodeUnits(token, text, fractionStart, spelling.MantissaEnd);
+        }
+
+        if (spelling.ExponentStart >= 0)
+        {
+            token.Append('e');
+            var exponentDigitsStart = spelling.ExponentStart;
+            if (CodeUnit(text, exponentDigitsStart) is '+' or '-')
+            {
+                if (CodeUnit(text, exponentDigitsStart) == '-')
+                {
+                    token.Append('-');
+                }
+
+                exponentDigitsStart++;
+            }
+
+            AppendCodeUnits(token, text, exponentDigitsStart, spelling.ExponentEnd);
+        }
+
+        return token.ToString();
+    }
+
+    // Appends the ASCII code units of text from start up to end, each as the character it encodes.
+    private static void AppendCodeUnits<TChar>(StringBuilder builder, ReadOnlySpan<TChar> text, int start, int end)
+        where TChar : struct, IBinaryInteger<TChar>
+    {
+        for (var index = start; index < end; index++)
+        {
+            builder.Append((char)CodeUnit(text, index));
+        }
     }
 
     // Reads the exact integer interval of a number in the invariant NumberStyles.Float grammar, as the .NET parser
@@ -543,11 +641,16 @@ public static class FieldValueCoercion
     // text; and any number of trailing U+0000 characters, which the parser ignores. It runs in time linear in the
     // text and allocates nothing: leading zeros are skipped, the exponent saturates, and at most 19 integer digits are
     // accumulated, because a number with more integer digits than that is at least 10^19, beyond the signed 64-bit
-    // range. UTF-8 and UTF-16 text share it: the grammar is ASCII, and a code unit outside it ends the number.
-    private static bool TryScanExactInterval<TChar>(ReadOnlySpan<TChar> text, out ExactInterval interval)
+    // range. UTF-8 and UTF-16 text share it: the grammar is ASCII, and a code unit outside it ends the number. A
+    // number it reads also gets the spelling of its parts, from which SpellJsonNumber writes its JSON number token.
+    private static bool TryScanExactInterval<TChar>(
+        ReadOnlySpan<TChar> text,
+        out ExactInterval interval,
+        out NumberSpelling spelling)
         where TChar : struct, IBinaryInteger<TChar>
     {
         interval = default;
+        spelling = default;
         var position = 0;
         while (position < text.Length && IsNumberWhite(CodeUnit(text, position)))
         {
@@ -566,6 +669,7 @@ public static class FieldValueCoercion
         long digitCount = 0;
         long fractionDigitCount = 0;
         var pointSeen = false;
+        var pointIndex = -1;
         for (; position < text.Length; position++)
         {
             var unit = CodeUnit(text, position);
@@ -580,6 +684,7 @@ public static class FieldValueCoercion
             else if (unit == '.' && !pointSeen)
             {
                 pointSeen = true;
+                pointIndex = position;
             }
             else
             {
@@ -594,6 +699,7 @@ public static class FieldValueCoercion
         }
 
         long exponent = 0;
+        var exponentStart = -1;
         if (position < text.Length && CodeUnit(text, position) is 'e' or 'E')
         {
             var exponentPosition = position + 1;
@@ -617,10 +723,12 @@ public static class FieldValueCoercion
                 }
 
                 exponent = negativeExponent ? -exponent : exponent;
+                exponentStart = position + 1;
                 position = exponentPosition;
             }
         }
 
+        var exponentEnd = position;
         while (position < text.Length && IsNumberWhite(CodeUnit(text, position)))
         {
             position++;
@@ -635,6 +743,8 @@ public static class FieldValueCoercion
         {
             return false;
         }
+
+        spelling = new NumberSpelling(negative, mantissaStart, pointIndex, mantissaEnd, exponentStart, exponentEnd);
 
         // The mantissa's digits, read as one integer, are scaled by 10^(exponent - fractionDigitCount). Without its
         // leading zeros that integer has significantCount digits, so the number has integerDigitCount integer digits;
@@ -927,4 +1037,15 @@ public static class FieldValueCoercion
     // signed 64-bit range; otherwise Floor has one when the greatest integer not above the number lies within that
     // range. Both are null for a number beyond the range.
     private readonly record struct ExactInterval(long? Integer, long? Floor);
+
+    // Where the parts of a scanned number text lie, as code-unit positions: whether its sign is '-'; its mantissa from
+    // MantissaStart up to MantissaEnd, with its point at PointIndex or -1 when it has none; and the exponent's sign and
+    // digits after its marker, from ExponentStart up to ExponentEnd, or -1 when it has no exponent.
+    private readonly record struct NumberSpelling(
+        bool Negative,
+        int MantissaStart,
+        int PointIndex,
+        int MantissaEnd,
+        int ExponentStart,
+        int ExponentEnd);
 }

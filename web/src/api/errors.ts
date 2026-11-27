@@ -11,7 +11,8 @@
 //
 // Banner text is fixed: it is never built from a submitted value or anything else the
 // client sent, only from the fixed texts below, the server's own fixed request-level
-// `detail` and the server's trace id.
+// `detail` and the server's trace id. The one addition is a save too large to send, whose
+// text may name a field by its prompt: form metadata, never the field's value.
 import type { WriteOutcome } from './types';
 
 /** What a failed request means to the user, decided by its HTTP status. */
@@ -38,6 +39,14 @@ export interface ApiError {
   readonly kind: ApiErrorKind;
   /** The response's HTTP status; `null` when no response was received. */
   readonly status: number | null;
+  /**
+   * The ProblemDetails `type` URI reference, or `null` when absent, blank or not a string,
+   * and when the body is no ProblemDetails: one without a string `title` and a `status`
+   * equal to the HTTP status, such as a proxy's own JSON error envelope, the /health body
+   * or no response at all. `kind` never depends on it, so a body without one is
+   * classified like any other.
+   */
+  readonly type: string | null;
   /** The ProblemDetails `title`, or `null` when absent, blank or not a string. */
   readonly title: string | null;
   /** The ProblemDetails `detail`, or `null` when absent, blank or not a string. */
@@ -70,18 +79,55 @@ export const errorMessages = {
   },
   notFound: 'This record no longer exists.',
   conflict: 'This record has been deleted and is read-only.',
+  /** A save refused with 409: the record was deleted meanwhile, so the edits on screen were never stored. */
+  saveConflict: 'This record has been deleted and is read-only. Your unsaved changes were not saved.',
+  /** Completes a failed save's text when the save was leaving the record: the user stays on it. */
+  leaveCancelled: 'Leaving this record was cancelled.',
   tooLarge: 'Request too large.',
+  /**
+   * A save refused with 413: its body exceeded the API's 1,048,576-byte limit, and the draft
+   * stays on screen. `fieldLabel` names the field holding the most text in the refused body
+   * by its prompt (its name when the prompt is blank), or is `null` when it holds no text.
+   */
+  saveTooLarge: (fieldLabel: string | null): string =>
+    'Request too large: a save can send at most 1 MB, and this one is larger. ' +
+    (fieldLabel === null
+      ? 'Shorten long text, then save again.'
+      : `Shorten long text, starting with ${fieldLabel}, then save again.`) +
+    ' Your changes are still on screen.',
   unsupportedMediaType: 'The request format is not supported.',
   server: 'An unexpected error occurred.',
   /** Appended to the `server` text when the response carried a trace id. */
   traceIdSuffix: (traceId: string): string => ` Trace id: ${traceId}.`,
+  /** Completes a failed save's text that does not already say the draft is kept. */
+  draftKept: 'Your changes are still on screen.',
+  /**
+   * A save the server failed unexpectedly and reported `notWritten`: the draft stays for
+   * Retry. The text holds no trace id, which the banner shows on a line of its own.
+   */
+  serverWithDraft: 'An unexpected error occurred. Your changes are still on screen.',
+  /**
+   * A POST or PUT not proven `notWritten`: the save may have been applied. describeUncertainWrite
+   * puts the cause before it.
+   */
+  uncertainWrite:
+    'The save may already have been applied, and the record list cannot prove whether it was. ' +
+    'Your changes are still on screen.',
+  /** The risk of resending a create whose outcome is unknown; it follows `uncertainWrite`. */
+  duplicateRisk: 'Saving again may create a duplicate record.',
   /** A 503 where a draft exists: a failed save keeps it on screen. */
   unavailable: 'The database cannot be reached. Your changes are still on screen.',
   /** No response where a draft exists: a failed save keeps it on screen. */
   network: 'The server could not be reached. Your changes are still on screen.',
-  /** A 503 where no draft exists: a read, or a delete whose confirmation discarded the draft. */
+  /**
+   * A 503 where no draft exists: a read, or a delete whose confirmation discarded the draft.
+   * Also the cause describeUncertainWrite names first.
+   */
   unavailableWithoutDraft: 'The database cannot be reached.',
-  /** No response where no draft exists: a read, or a delete whose confirmation discarded the draft. */
+  /**
+   * No response where no draft exists: a read, or a delete whose confirmation discarded the
+   * draft. Also the cause describeUncertainWrite names first.
+   */
   networkWithoutDraft: 'The server could not be reached.',
 } as const;
 
@@ -103,6 +149,15 @@ function isString(value: unknown): value is string {
 
 function readText(value: unknown): string | null {
   return isString(value) && value.trim() !== '' ? value : null;
+}
+
+// Whether `problem` is a ProblemDetails answering the response with `status`, so that its
+// `type` names the problem rather than a foreign error envelope's own code (a proxy's
+// {"type":"gateway_error", ...}). Every /api error body the server writes carries a string
+// `title` and an integer `status` beside `type`, and its `status` is the HTTP status, as
+// RFC 9457 §3.1.2 asks; a body lacking either is not one of them.
+function isProblemDetailsFor(problem: Record<string, unknown>, status: number): boolean {
+  return isString(problem.title) && Number.isInteger(problem.status) && problem.status === status;
 }
 
 // Null prototype: a parsed key such as "__proto__" or "constructor" becomes an own
@@ -167,8 +222,11 @@ function kindOf(status: number, hasFieldErrors: boolean): ApiErrorKind {
 }
 
 /**
- * Parses a failed response.
- * @param status The response's HTTP status; the body's own `status` member is ignored.
+ * Parses a failed response. The HTTP status alone decides `kind`. The body's own `status`
+ * member serves only to recognise a ProblemDetails: `type` is kept only from a body that
+ * has a string `title` and whose integer `status` is the HTTP status, while `title`,
+ * `detail`, `traceId`, `errors` and `writeOutcome` are read from any object body.
+ * @param status The response's HTTP status.
  * @param body The parsed JSON body, the raw text of a non-JSON body, or `undefined` for
  *   an empty one.
  */
@@ -179,6 +237,7 @@ export function parseProblem(status: number, body: unknown): ApiError {
   return {
     kind: kindOf(status, Object.keys(fieldErrors).length > 0),
     status,
+    type: isProblemDetailsFor(problem, status) ? readText(problem.type) : null,
     title: readText(problem.title),
     detail: readText(problem.detail),
     traceId: readText(problem.traceId),
@@ -195,6 +254,7 @@ export function networkError(): ApiError {
   return {
     kind: 'network',
     status: null,
+    type: null,
     title: null,
     detail: null,
     traceId: null,
@@ -228,6 +288,35 @@ export function isSafeToResend(error: ApiError, method: ApiMethod): boolean {
     case 'PUT':
       return error.writeOutcome === 'notWritten';
   }
+}
+
+/**
+ * The text of a POST or PUT that may have been applied: what failed, when that is known,
+ * then that the save may have been applied while the draft stays on screen, and for a
+ * create the risk of a duplicate record. The trace id is not included; the banner shows it
+ * on a line of its own.
+ * @param isCreate The failed write was the first POST of a new record.
+ */
+export function describeUncertainWrite(error: ApiError, isCreate: boolean): string {
+  const parts: string[] = [];
+  switch (error.kind) {
+    case 'unavailable':
+      parts.push(errorMessages.unavailableWithoutDraft);
+      break;
+    case 'network':
+      parts.push(errorMessages.networkWithoutDraft);
+      break;
+    case 'server':
+      parts.push(errorMessages.server);
+      break;
+    default:
+      break;
+  }
+  parts.push(errorMessages.uncertainWrite);
+  if (isCreate) {
+    parts.push(errorMessages.duplicateRisk);
+  }
+  return parts.join(' ');
 }
 
 /**

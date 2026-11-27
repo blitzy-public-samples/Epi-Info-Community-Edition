@@ -34,11 +34,21 @@ export interface RecordNavigatorProps {
   /** The editor is saving: every control is disabled until it settles. */
   busy?: boolean;
   /**
+   * Every move would first save a dirty draft that a write of unknown outcome blocks, so it
+   * would refuse. Each button not already disabled is marked unavailable (aria-disabled and
+   * the blocked styling), yet stays operable: its press runs the move, whose refused save
+   * shows the editor's banner again.
+   */
+  blocked?: boolean;
+  /**
    * Form-definition insert permission. Only `false` disables New; `null` or absent means
    * no restriction, which holds until permission awareness is delivered.
    */
   canInsert?: boolean | null;
 }
+
+/** How a move button is marked while `blocked` holds and the button is not disabled. */
+const BLOCKED_BUTTON_PROPS = { 'aria-disabled': true, className: 'button--blocked' } as const;
 
 /** An optional sign, then ASCII digits only: "1e3", "2.0" and "0x10" are not record numbers. */
 const RECORD_NUMBER_PATTERN = /^[+-]?\d+$/;
@@ -60,7 +70,7 @@ interface EntryError {
  * may contain First, Previous, Next, Last, New, Save, Delete or Find: Playwright matches
  * names by substring.
  */
-export function RecordNavigator({ navigation, busy = false, canInsert = null }: RecordNavigatorProps) {
+export function RecordNavigator({ navigation, busy = false, blocked = false, canInsert = null }: RecordNavigatorProps) {
   const inputId = useId();
   const errorId = `${inputId}-error`;
   const [entry, setEntry] = useState('');
@@ -72,9 +82,15 @@ export function RecordNavigator({ navigation, busy = false, canInsert = null }: 
   // unavailable: an edge or an empty set (canX false), a save in progress (busy), or, for
   // New, a denied insert permission.
   const pending = navigation.loading;
+  const firstDisabled = !navigation.canFirst || busy;
+  const previousDisabled = !navigation.canPrevious || busy;
+  const nextDisabled = !navigation.canNext || busy;
+  const lastDisabled = !navigation.canLast || busy;
   const goToDisabled = !navigation.canGoTo || busy;
   // Legacy GotoNewRecord runs only with canInsertRecords; New stays enabled on an empty form.
   const newDisabled = busy || canInsert === false;
+  // A disabled button already says it is unavailable; only an enabled one takes the marking.
+  const blockedMarking = (disabled: boolean) => (blocked && !disabled ? BLOCKED_BUTTON_PROPS : {});
 
   // A move, New or a reload installs another record and leaves an earlier entry's
   // message stale; the hook clears its own goToError on the same transitions.
@@ -121,7 +137,8 @@ export function RecordNavigator({ navigation, busy = false, canInsert = null }: 
       >
         <button
           type="button"
-          disabled={!navigation.canFirst || busy}
+          disabled={firstDisabled}
+          {...blockedMarking(firstDisabled)}
           onClick={() => {
             void navigation.first();
           }}
@@ -130,7 +147,8 @@ export function RecordNavigator({ navigation, busy = false, canInsert = null }: 
         </button>
         <button
           type="button"
-          disabled={!navigation.canPrevious || busy}
+          disabled={previousDisabled}
+          {...blockedMarking(previousDisabled)}
           onClick={() => {
             void navigation.previous();
           }}
@@ -144,7 +162,8 @@ export function RecordNavigator({ navigation, busy = false, canInsert = null }: 
         </span>
         <button
           type="button"
-          disabled={!navigation.canNext || busy}
+          disabled={nextDisabled}
+          {...blockedMarking(nextDisabled)}
           onClick={() => {
             void navigation.next();
           }}
@@ -153,7 +172,8 @@ export function RecordNavigator({ navigation, busy = false, canInsert = null }: 
         </button>
         <button
           type="button"
-          disabled={!navigation.canLast || busy}
+          disabled={lastDisabled}
+          {...blockedMarking(lastDisabled)}
           onClick={() => {
             void navigation.last();
           }}
@@ -177,12 +197,13 @@ export function RecordNavigator({ navigation, busy = false, canInsert = null }: 
           }}
           onKeyDown={handleEntryKeyDown}
         />
-        <button type="button" disabled={goToDisabled} onClick={submitGoTo}>
+        <button type="button" disabled={goToDisabled} {...blockedMarking(goToDisabled)} onClick={submitGoTo}>
           Go
         </button>
         <button
           type="button"
           disabled={newDisabled}
+          {...blockedMarking(newDisabled)}
           onClick={() => {
             void navigation.newRecord();
           }}

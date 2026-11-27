@@ -389,6 +389,12 @@ public sealed partial class RecordService(
     /// denied on the base table or a page table, or INSERT denied on the table of a page whose row is missing. The
     /// service's earlier read only turns that check on.
     /// </para>
+    /// <para>
+    /// The store calls <see cref="SaveStampProvider.Create"/> only once those checks decide that the update writes, so
+    /// the 404, 409, 400 and 403 answers never need a stamp. A stamp that cannot be made, because the process has no OS
+    /// user name, fails only an update that would write, as the store's failure with nothing written: a 500 whose
+    /// <c>writeOutcome</c> is <c>notWritten</c>.
+    /// </para>
     /// </remarks>
     /// <param name="httpContext">The current request, which carries the <see cref="WriteOutcomeFeature"/>.</param>
     /// <param name="viewId">The form's <c>metaViews.ViewId</c> from the route.</param>
@@ -433,7 +439,8 @@ public sealed partial class RecordService(
             return ApiProblems.Forbidden(ForbiddenAction.Update);
         }
 
-        var stamp = stamps.Create();
+        // The store creates the stamp only once its locked checks decide the update writes, so an answer that writes
+        // nothing needs no stamp, and a stamp it cannot create is the store's failure with nothing written.
         var outcome = WriteOutcomeFeature.GetOrCreate(httpContext);
         outcome.MarkWriteStarted();
 
@@ -441,7 +448,7 @@ public sealed partial class RecordService(
                 form,
                 globalRecordId,
                 submitted,
-                stamp,
+                stamps.Create,
                 stored => validator.CheckRequired(stored, submitted),
                 permissions,
                 cancellationToken)
@@ -483,6 +490,19 @@ public sealed partial class RecordService(
     /// <c>RecStatus</c> becomes 0 with the last-save stamp. Page rows are not touched, nothing cascades and no save
     /// precedes it.
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The log line that follows a found record, committed or unchanged, names it by the <c>GlobalRecordId</c> the
+    /// store's locked read returned, as stored. It therefore carries the spelling the record's insert and update lines
+    /// carry, whatever letter case the route used.
+    /// </para>
+    /// <para>
+    /// The store calls <see cref="SaveStampProvider.Create"/> only when its locked read finds an active record, so the
+    /// 404 and the already-deleted 204 never need a stamp. A stamp that cannot be made, because the process has no OS
+    /// user name, fails only the delete of an active record, as the store's failure with nothing written: a 500 whose
+    /// <c>writeOutcome</c> is <c>notWritten</c>.
+    /// </para>
+    /// </remarks>
     /// <param name="httpContext">The current request, which carries the <see cref="WriteOutcomeFeature"/>.</param>
     /// <param name="viewId">The form's <c>metaViews.ViewId</c> from the route.</param>
     /// <param name="globalRecordId">The record's <c>GlobalRecordId</c> from the route.</param>
@@ -516,28 +536,31 @@ public sealed partial class RecordService(
             return ApiProblems.Forbidden(ForbiddenAction.Delete);
         }
 
-        var stamp = stamps.Create();
+        // The store creates the stamp only for an active record, the one case that writes, so a 404 and the
+        // already-deleted 204 need none.
         var outcome = WriteOutcomeFeature.GetOrCreate(httpContext);
         outcome.MarkWriteStarted();
 
-        var result = await store.SoftDeleteAsync(form, globalRecordId, stamp, cancellationToken).ConfigureAwait(false);
+        var result = await store.SoftDeleteAsync(form, globalRecordId, stamps.Create, cancellationToken)
+            .ConfigureAwait(false);
 
-        switch (result)
+        // Each log line names the record by the stored id the store returned, never by the route's spelling.
+        switch (result.Status)
         {
-            case SoftDeleteResult.Deleted:
+            case SoftDeleteStatus.Deleted when result.IsFound:
                 // The store reported the commit; nothing after this line reads the database.
                 outcome.MarkWritten();
-                LogWrite(form, SoftDeleteOperation, globalRecordId, CommittedOutcome);
+                LogWrite(form, SoftDeleteOperation, result.GlobalRecordId, CommittedOutcome);
                 return TypedResults.NoContent();
 
             // Both results below mean the store wrote nothing, so a failure while the response is written must report
             // notWritten, not unknown; an already-deleted record is never marked written.
-            case SoftDeleteResult.AlreadyDeleted:
+            case SoftDeleteStatus.AlreadyDeleted when result.IsFound:
                 outcome.MarkNotWritten();
-                LogWrite(form, SoftDeleteOperation, globalRecordId, UnchangedOutcome);
+                LogWrite(form, SoftDeleteOperation, result.GlobalRecordId, UnchangedOutcome);
                 return TypedResults.NoContent();
 
-            case SoftDeleteResult.NotFound:
+            case SoftDeleteStatus.NotFound:
                 outcome.MarkNotWritten();
                 return ApiProblems.RecordNotFound();
 

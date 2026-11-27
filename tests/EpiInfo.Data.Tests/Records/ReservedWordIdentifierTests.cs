@@ -5,6 +5,7 @@ using System.Text.RegularExpressions;
 using EpiInfo.Data.Metadata;
 using EpiInfo.Data.Records;
 using EpiInfo.Data.Sql;
+using EpiInfo.Domain.Forms;
 using EpiInfo.Domain.Metadata;
 using EpiInfo.Domain.Records;
 using EpiInfo.Domain.Search;
@@ -59,6 +60,8 @@ public sealed class ReservedWordIdentifierTests
     private const string CheckboxTypeName = "Checkbox";
     private const int OptionTypeId = 12;
     private const string OptionTypeName = "Option";
+    private const int LegalValuesTypeId = 17;
+    private const string LegalValuesTypeName = "Legal Values";
 
     // The items of every Option field: indexes 0, 1 and 2.
     private const string OptionItems = "A,B,C";
@@ -74,6 +77,20 @@ public sealed class ReservedWordIdentifierTests
     private const string Surname = "Surname";
     private const string Remarks = "Remarks";
     private const string Phone = "Phone";
+    private const string Grade = "Grade";
+    private const string Code = "Code";
+
+    // The width of the fixed-width fixture's nchar columns, and the Legal Values choices of its Grade field: one at
+    // the full width, one padded to it as an nchar code table returns it, and a short one SQL Server pads to the
+    // width when it stores it, which reads back as a text that is no choice.
+    private const int FixedWidth = 5;
+    private const string FullWidthChoice = "F-Fem";
+    private const string PaddedChoice = "M    ";
+    private const string ShortChoice = "U";
+    private const string PaddedShortChoice = "U    ";
+
+    // The width of the fixed-width stamp fixture's nchar(n) logon-name columns.
+    private const int FixedLogonNameWidth = 255;
 
     // T-SQL reserved words as column names, one per admitted column family: an unquoted one is a syntax error.
     private const string ReservedOrder = "Order";
@@ -107,6 +124,14 @@ public sealed class ReservedWordIdentifierTests
 
     // A second page's table that lacks the GlobalRecordId record key column.
     private const string KeylessPage = "#KeylessPage";
+
+    // The fixed-width fixture's tables, whose page columns are nchar.
+    private const string FixedWidthBase = "#FixedWidthBase";
+    private const string FixedWidthPage = "#FixedWidthPage";
+
+    // The fixed-width stamp fixture's tables, whose base logon-name stamp columns are nchar.
+    private const string FixedStampBase = "#FixedStampBase";
+    private const string FixedStampPage = "#FixedStampPage";
 
     private static readonly TimeSpan TestTimeout = TimeSpan.FromSeconds(120);
 
@@ -179,7 +204,7 @@ public sealed class ReservedWordIdentifierTests
                 fixture.Schema,
                 inserted.GlobalRecordId,
                 updatedValues,
-                stamp,
+                () => stamp,
                 stored =>
                 {
                     gated.Add(stored);
@@ -812,6 +837,393 @@ public sealed class ReservedWordIdentifierTests
     }
 
     /// <summary>
+    /// A full-width Legal Values choice that ends in spaces, and full-width Text ending in spaces, on <c>nchar(5)</c>
+    /// columns, which no seeded table has: the validator accepts them, the repository's production insert stores
+    /// them, a direct read finds exactly the texts written at their full width (<c>DATALENGTH</c> 10), the
+    /// repository's by-id read returns them unchanged, and the validator accepts the values read back again.
+    /// </summary>
+    [Fact]
+    public async Task FixedWidthColumns_FullWidthChoiceEndingInSpaces_RoundTripsExactly()
+    {
+        await TestDatabase.EnsureReachableAsync();
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        var cancellationToken = timeout.Token;
+        await using var writeLock = await DatabaseWriteLock.AcquireExclusiveAsync(cancellationToken);
+        await using var connection = await TestDatabase.OpenConnectionAsync(cancellationToken);
+        try
+        {
+            var fixture = await CreateFixedWidthFixtureAsync(connection, cancellationToken);
+            var validator = FixedWidthValidator(fixture);
+            var options = new DatabaseOptions(TestDatabase.ConnectionString);
+            var connections = new SqlConnectionFactory(options);
+            var repository = new SqlRecordRepository(
+                connections,
+                new SqlMetadataReader(connections, options, fixture.Recorder),
+                options,
+                fixture.Recorder);
+            var stamp = new SaveStamp(StampLogonName, SaveStamp.TruncateToSeconds(DateTime.Now));
+
+            var submitted = Values((Grade, FieldValue.FromText(PaddedChoice)), (Code, FieldValue.FromText("ab   ")));
+            var accepted = validator.ValidateInput([.. submitted]);
+            Assert.True(accepted.IsValid, "The validator refused full-width text.");
+            Assert.NotNull(accepted.Values);
+            AssertValues(accepted.Values, submitted, "validation");
+
+            var inserted = await repository.InsertAsync(
+                connection,
+                fixture.Form,
+                fixture.Schema,
+                accepted.Values,
+                stamp,
+                cancellationToken);
+            AssertSoleRecord(inserted, inserted, submitted, "insert");
+
+            var stored = await ReadFixedWidthRowAsync(connection, inserted.GlobalRecordId, cancellationToken);
+            Assert.True(
+                string.Equals(PaddedChoice, stored.Grade, StringComparison.Ordinal),
+                Grade + " does not hold the exact text written.");
+            Assert.Equal(2 * FixedWidth, stored.GradeBytes);
+            Assert.True(
+                string.Equals("ab   ", stored.Code, StringComparison.Ordinal),
+                Code + " does not hold the exact text written.");
+            Assert.Equal(2 * FixedWidth, stored.CodeBytes);
+
+            var read = Assert.IsType<RecordDto>(await repository.GetByIdAsync(
+                connection,
+                fixture.Form,
+                fixture.Schema,
+                inserted.GlobalRecordId,
+                cancellationToken));
+            AssertSoleRecord(inserted, read, submitted, "read");
+
+            var resubmitted = validator.ValidateInput([.. read.Values]);
+            Assert.True(resubmitted.IsValid, "The validator refused the values read back.");
+            Assert.NotNull(resubmitted.Values);
+            AssertValues(resubmitted.Values, submitted, "revalidation");
+        }
+        finally
+        {
+            await DropTablesAsync(connection, FixedWidthPage, FixedWidthBase);
+        }
+    }
+
+    /// <summary>
+    /// A short Legal Values choice and short Text on <c>nchar(5)</c> columns: the validator accepts them as submitted,
+    /// the repository's production insert binds them as given, and SQL Server stores each padded with spaces to five
+    /// characters, which a direct read finds at <c>DATALENGTH</c> 10. The insert's snapshot and the repository's by-id
+    /// read return exactly the padded texts, never trimmed. The padded choice read back is no option, so the validator
+    /// refuses it as not a legal value, while the short option chosen again is accepted.
+    /// </summary>
+    [Fact]
+    public async Task FixedWidthColumns_ShortValues_AreStoredPaddedAndReadBackAsStored()
+    {
+        await TestDatabase.EnsureReachableAsync();
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        var cancellationToken = timeout.Token;
+        await using var writeLock = await DatabaseWriteLock.AcquireExclusiveAsync(cancellationToken);
+        await using var connection = await TestDatabase.OpenConnectionAsync(cancellationToken);
+        try
+        {
+            var fixture = await CreateFixedWidthFixtureAsync(connection, cancellationToken);
+            var validator = FixedWidthValidator(fixture);
+            var options = new DatabaseOptions(TestDatabase.ConnectionString);
+            var connections = new SqlConnectionFactory(options);
+            var repository = new SqlRecordRepository(
+                connections,
+                new SqlMetadataReader(connections, options, fixture.Recorder),
+                options,
+                fixture.Recorder);
+            var stamp = new SaveStamp(StampLogonName, SaveStamp.TruncateToSeconds(DateTime.Now));
+
+            const string shortText = "abc";
+            const string paddedShortText = "abc  ";
+            var submitted = Values((Grade, FieldValue.FromText(ShortChoice)), (Code, FieldValue.FromText(shortText)));
+            var accepted = validator.ValidateInput([.. submitted]);
+            Assert.True(accepted.IsValid, "The validator refused short text on a fixed-width column.");
+            Assert.NotNull(accepted.Values);
+            AssertValues(accepted.Values, submitted, "validation");
+
+            var inserted = await repository.InsertAsync(
+                connection,
+                fixture.Form,
+                fixture.Schema,
+                accepted.Values,
+                stamp,
+                cancellationToken);
+            var padded = Values(
+                (Grade, FieldValue.FromText(PaddedShortChoice)),
+                (Code, FieldValue.FromText(paddedShortText)));
+            AssertSoleRecord(inserted, inserted, padded, "insert");
+
+            var stored = await ReadFixedWidthRowAsync(connection, inserted.GlobalRecordId, cancellationToken);
+            Assert.True(
+                string.Equals(PaddedShortChoice, stored.Grade, StringComparison.Ordinal),
+                Grade + " is not the short choice padded to the column's width.");
+            Assert.Equal(2 * FixedWidth, stored.GradeBytes);
+            Assert.True(
+                string.Equals(paddedShortText, stored.Code, StringComparison.Ordinal),
+                Code + " is not the short text padded to the column's width.");
+            Assert.Equal(2 * FixedWidth, stored.CodeBytes);
+
+            var read = Assert.IsType<RecordDto>(await repository.GetByIdAsync(
+                connection,
+                fixture.Form,
+                fixture.Schema,
+                inserted.GlobalRecordId,
+                cancellationToken));
+            AssertSoleRecord(inserted, read, padded, "read");
+
+            var resubmitted = validator.ValidateInput([.. read.Values]);
+            Assert.False(
+                resubmitted.IsValid,
+                "The validator accepted the padded choice read back, which is no option.");
+            var (key, messages) = Assert.Single(resubmitted.FieldErrors);
+            Assert.Equal(Grade, key);
+            Assert.Equal(new[] { ValidationMessages.NotALegalValue }, messages);
+
+            var reselected = validator.ValidateInput([.. Values((Grade, FieldValue.FromText(ShortChoice)))]);
+            Assert.True(reselected.IsValid, "The validator refused the short option chosen again.");
+            Assert.Empty(fixture.Recorder.Failed());
+        }
+        finally
+        {
+            await DropTablesAsync(connection, FixedWidthPage, FixedWidthBase);
+        }
+    }
+
+    /// <summary>
+    /// Two writes to an <c>nchar(5)</c> Text column that differ only in trailing spaces, <c>ab</c> through the
+    /// repository's production insert and <c>ab</c> with one trailing space through its production update, store one
+    /// value: SQL Server pads both to <c>ab</c> and three spaces at <c>DATALENGTH</c> 10, and the update's snapshot
+    /// returns that stored text.
+    /// </summary>
+    [Fact]
+    public async Task FixedWidthColumns_TextsDifferingOnlyInTrailingSpaces_StoreOneValue()
+    {
+        await TestDatabase.EnsureReachableAsync();
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        var cancellationToken = timeout.Token;
+        await using var writeLock = await DatabaseWriteLock.AcquireExclusiveAsync(cancellationToken);
+        await using var connection = await TestDatabase.OpenConnectionAsync(cancellationToken);
+        try
+        {
+            var fixture = await CreateFixedWidthFixtureAsync(connection, cancellationToken);
+            var options = new DatabaseOptions(TestDatabase.ConnectionString);
+            var connections = new SqlConnectionFactory(options);
+            var repository = new SqlRecordRepository(
+                connections,
+                new SqlMetadataReader(connections, options, fixture.Recorder),
+                options,
+                fixture.Recorder);
+            var stamp = new SaveStamp(StampLogonName, SaveStamp.TruncateToSeconds(DateTime.Now));
+
+            const string paddedText = "ab   ";
+            var inserted = await repository.InsertAsync(
+                connection,
+                fixture.Form,
+                fixture.Schema,
+                Values((Grade, FieldValue.FromText(FullWidthChoice)), (Code, FieldValue.FromText("ab"))),
+                stamp,
+                cancellationToken);
+            var afterInsert = await ReadFixedWidthRowAsync(connection, inserted.GlobalRecordId, cancellationToken);
+
+            var updated = await repository.UpdateAsync(
+                connection,
+                fixture.Form,
+                fixture.Schema,
+                inserted.GlobalRecordId,
+                Values((Code, FieldValue.FromText("ab "))),
+                () => stamp,
+                stored => RecordValidationResult.Success(stored.Values),
+                permissions: null,
+                cancellationToken);
+            Assert.Equal(RecordWriteStatus.Success, updated.Status);
+            var afterUpdate = await ReadFixedWidthRowAsync(connection, inserted.GlobalRecordId, cancellationToken);
+
+            const string pageUpdatePrefix = "UPDATE [" + FixedWidthPage + "]";
+            var pageUpdate = Assert.Single(
+                fixture.Recorder.ForOperation(RecordOperations.Update),
+                command => command.CommandText.StartsWith(pageUpdatePrefix, StringComparison.Ordinal));
+            Assert.True(pageUpdate.Completed && pageUpdate.Succeeded, "The page update did not succeed.");
+
+            Assert.True(
+                string.Equals(paddedText, afterInsert.Code, StringComparison.Ordinal),
+                Code + " after the insert is not the text padded to the column's width.");
+            Assert.True(
+                string.Equals(afterInsert.Code, afterUpdate.Code, StringComparison.Ordinal),
+                Code + " holds another value after the update of text differing only in trailing spaces.");
+            Assert.Equal(2 * FixedWidth, afterInsert.CodeBytes);
+            Assert.Equal(2 * FixedWidth, afterUpdate.CodeBytes);
+            AssertSoleRecord(
+                inserted,
+                Assert.IsType<RecordDto>(updated.Record),
+                Values((Grade, FieldValue.FromText(FullWidthChoice)), (Code, FieldValue.FromText(paddedText))),
+                "update");
+            Assert.Empty(fixture.Recorder.Failed());
+        }
+        finally
+        {
+            await DropTablesAsync(connection, FixedWidthPage, FixedWidthBase);
+        }
+    }
+
+    /// <summary>
+    /// Short text written into <c>nchar(5)</c> columns by direct SQL, as legacy writes the text it is given, is padded
+    /// with spaces to five characters by SQL Server, and the repository's by-id read returns exactly the stored text,
+    /// the padding included, never trimmed.
+    /// </summary>
+    [Fact]
+    public async Task FixedWidthColumns_ShortValueWrittenByDirectSql_ReadsBackAsStoredPaddingIncluded()
+    {
+        await TestDatabase.EnsureReachableAsync();
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        var cancellationToken = timeout.Token;
+        await using var writeLock = await DatabaseWriteLock.AcquireExclusiveAsync(cancellationToken);
+        await using var connection = await TestDatabase.OpenConnectionAsync(cancellationToken);
+        try
+        {
+            var fixture = await CreateFixedWidthFixtureAsync(connection, cancellationToken);
+            var globalRecordId = await InsertBaseAsync(fixture, connection, cancellationToken);
+            await using (var command = new SqlCommand(
+                $"INSERT INTO [{FixedWidthPage}] ([GlobalRecordId], [{Grade}], [{Code}]) VALUES (@id, @grade, @code)",
+                connection))
+            {
+                command.Parameters.Add(new SqlParameter("@id", SqlDbType.NVarChar, 255) { Value = globalRecordId });
+                command.Parameters.Add(new SqlParameter("@grade", SqlDbType.NVarChar, 4000) { Value = ShortChoice });
+                command.Parameters.Add(new SqlParameter("@code", SqlDbType.NVarChar, 4000) { Value = "ab" });
+                Assert.Equal(1, await command.ExecuteNonQueryAsync(cancellationToken));
+            }
+
+            const string paddedCode = "ab   ";
+            var stored = await ReadFixedWidthRowAsync(connection, globalRecordId, cancellationToken);
+            Assert.True(
+                string.Equals(PaddedShortChoice, stored.Grade, StringComparison.Ordinal),
+                Grade + " is not the short text padded to the column's width.");
+            Assert.Equal(2 * FixedWidth, stored.GradeBytes);
+            Assert.True(
+                string.Equals(paddedCode, stored.Code, StringComparison.Ordinal),
+                Code + " is not the short text padded to the column's width.");
+            Assert.Equal(2 * FixedWidth, stored.CodeBytes);
+
+            var options = new DatabaseOptions(TestDatabase.ConnectionString);
+            var connections = new SqlConnectionFactory(options);
+            var repository = new SqlRecordRepository(
+                connections,
+                new SqlMetadataReader(connections, options, fixture.Recorder),
+                options,
+                fixture.Recorder);
+            var read = Assert.IsType<RecordDto>(await repository.GetByIdAsync(
+                connection,
+                fixture.Form,
+                fixture.Schema,
+                globalRecordId,
+                cancellationToken));
+            Assert.True(
+                string.Equals(globalRecordId, read.GlobalRecordId, StringComparison.Ordinal),
+                "The read returned another GlobalRecordId.");
+            AssertValues(
+                read.Values,
+                Values((Grade, FieldValue.FromText(PaddedShortChoice)), (Code, FieldValue.FromText(paddedCode))),
+                "read");
+        }
+        finally
+        {
+            await DropTablesAsync(connection, FixedWidthPage, FixedWidthBase);
+        }
+    }
+
+    /// <summary>
+    /// A base table whose <c>FirstSaveLogonName</c> and <c>LastSaveLogonName</c> are <c>nchar(255)</c> takes a logon
+    /// name shorter than 255 characters on every write that stamps: the repository's production insert and update, and
+    /// the soft delete statement the repository builds and sends for an active record. Each binds the logon name as
+    /// given, and SQL Server stores it padded with spaces to 255 characters, which a direct read finds at
+    /// <c>DATALENGTH</c> 510.
+    /// </summary>
+    [Fact]
+    public async Task FixedWidthStampColumns_ShortLogonName_IsStoredPaddedByInsertUpdateAndSoftDelete()
+    {
+        await TestDatabase.EnsureReachableAsync();
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        var cancellationToken = timeout.Token;
+        await using var writeLock = await DatabaseWriteLock.AcquireExclusiveAsync(cancellationToken);
+        await using var connection = await TestDatabase.OpenConnectionAsync(cancellationToken);
+        try
+        {
+            var fixture = await CreateFixtureAsync(
+                connection,
+                FixedStampBase,
+                FixedStampPage,
+                $"[{Surname}] nvarchar(4000)",
+                [new FixtureField(Surname, TextTypeId, TextTypeName)],
+                cancellationToken,
+                logonNameType: $"nchar({FixedLogonNameWidth})");
+            foreach (var column in new[] { fixture.Schema.FirstSaveLogonName, fixture.Schema.LastSaveLogonName })
+            {
+                Assert.NotNull(column);
+                Assert.Equal("nchar", column.Metadata.SqlTypeName);
+                Assert.Equal(FixedLogonNameWidth, column.Metadata.MaxCharacters);
+            }
+
+            var options = new DatabaseOptions(TestDatabase.ConnectionString);
+            var connections = new SqlConnectionFactory(options);
+            var repository = new SqlRecordRepository(
+                connections,
+                new SqlMetadataReader(connections, options, fixture.Recorder),
+                options,
+                fixture.Recorder);
+            var time = SaveStamp.TruncateToSeconds(DateTime.Now);
+            var insertStamp = new SaveStamp(StampLogonName, time);
+            var updateStamp = new SaveStamp("RwUpdate", time);
+            var deleteStamp = new SaveStamp("RwDelete", time);
+
+            var inserted = await repository.InsertAsync(
+                connection,
+                fixture.Form,
+                fixture.Schema,
+                Values((Surname, FieldValue.FromText("s-" + Guid.NewGuid().ToString("N")))),
+                insertStamp,
+                cancellationToken);
+            var afterInsert = await ReadStampRowAsync(connection, inserted.GlobalRecordId, cancellationToken);
+            AssertPaddedLogonName(insertStamp.LogonName, afterInsert.FirstSave, afterInsert.FirstSaveBytes, "insert");
+            AssertPaddedLogonName(insertStamp.LogonName, afterInsert.LastSave, afterInsert.LastSaveBytes, "insert");
+            Assert.Equal((short)RecordQueryRules.ActiveRecStatus, afterInsert.RecStatus);
+
+            var updated = await repository.UpdateAsync(
+                connection,
+                fixture.Form,
+                fixture.Schema,
+                inserted.GlobalRecordId,
+                Values((Surname, FieldValue.FromText("updated"))),
+                () => updateStamp,
+                stored => RecordValidationResult.Success(stored.Values),
+                permissions: null,
+                cancellationToken);
+            Assert.Equal(RecordWriteStatus.Success, updated.Status);
+            var afterUpdate = await ReadStampRowAsync(connection, inserted.GlobalRecordId, cancellationToken);
+            AssertPaddedLogonName(insertStamp.LogonName, afterUpdate.FirstSave, afterUpdate.FirstSaveBytes, "update");
+            AssertPaddedLogonName(updateStamp.LogonName, afterUpdate.LastSave, afterUpdate.LastSaveBytes, "update");
+            Assert.Equal((short)RecordQueryRules.ActiveRecStatus, afterUpdate.RecStatus);
+
+            var softDelete = RecordSqlBuilder.SoftDelete(
+                fixture.Schema,
+                inserted.UniqueKey,
+                inserted.GlobalRecordId,
+                deleteStamp);
+            Assert.Equal(1, await ExecuteAsync(fixture, connection, softDelete, cancellationToken));
+            var afterDelete = await ReadStampRowAsync(connection, inserted.GlobalRecordId, cancellationToken);
+            AssertPaddedLogonName(insertStamp.LogonName, afterDelete.FirstSave, afterDelete.FirstSaveBytes, "delete");
+            AssertPaddedLogonName(deleteStamp.LogonName, afterDelete.LastSave, afterDelete.LastSaveBytes, "delete");
+            Assert.Equal((short)RecordQueryRules.DeletedRecStatus, afterDelete.RecStatus);
+
+            Assert.Empty(fixture.Recorder.Failed());
+        }
+        finally
+        {
+            await DropTablesAsync(connection, FixedStampPage, FixedStampBase);
+        }
+    }
+
+    /// <summary>
     /// A page column named like Dapper's literal token for a numeric parameter of the same statement, <c>{=p1}</c>,
     /// is written by an insert and an update whose command text keeps the bracketed name exactly as the recorder saw
     /// it, which proves that the data layer's binder never rewrote the text after the observer was told about it.
@@ -938,7 +1350,7 @@ public sealed class ReservedWordIdentifierTests
                 fixture.Schema,
                 inserted.GlobalRecordId,
                 Values(),
-                stamp,
+                () => stamp,
                 stored =>
                 {
                     gateCalls++;
@@ -1042,7 +1454,7 @@ public sealed class ReservedWordIdentifierTests
                     fixture.Schema,
                     inserted.GlobalRecordId,
                     Values(),
-                    stamp,
+                    () => stamp,
                     stored => RecordValidationResult.Success(stored.Values),
                     permissions: null,
                     cancellationToken));
@@ -1073,12 +1485,14 @@ public sealed class ReservedWordIdentifierTests
         string pageColumnDefinitions,
         IReadOnlyList<FixtureField> fields,
         CancellationToken cancellationToken,
-        bool lastSaveColumns = true)
+        bool lastSaveColumns = true,
+        string logonNameType = "nvarchar(255)")
     {
         // The base table has the seeded base tables' columns (testdata/sql/05_data_tables.sql), less the two last-save
-        // stamp columns when lastSaveColumns is false, which the write path then never names.
+        // stamp columns when lastSaveColumns is false, which the write path then never names, and with logonNameType
+        // as the type of its logon-name stamp columns.
         var lastSaveColumnDefinitions = lastSaveColumns
-            ? "[LastSaveLogonName] nvarchar(255), [LastSaveTime] datetime,"
+            ? $"[LastSaveLogonName] {logonNameType}, [LastSaveTime] datetime,"
             : string.Empty;
         await ExecuteDdlAsync(
             connection,
@@ -1087,7 +1501,7 @@ public sealed class ReservedWordIdentifierTests
                 [UniqueKey] int IDENTITY(1,1) PRIMARY KEY NOT NULL,
                 [RecStatus] smallint NOT NULL DEFAULT 1,
                 [GlobalRecordId] nvarchar(255) NOT NULL,
-                [FirstSaveLogonName] nvarchar(255),
+                [FirstSaveLogonName] {logonNameType},
                 [FirstSaveTime] datetime,
                 {lastSaveColumnDefinitions}
                 [FKEY] nvarchar(255));
@@ -1350,6 +1764,89 @@ public sealed class ReservedWordIdentifierTests
         }
     }
 
+    // The fixed-width fixture: a Legal Values field and a Text field, each on an nchar(5) page column.
+    private static Task<Fixture> CreateFixedWidthFixtureAsync(
+        SqlConnection connection,
+        CancellationToken cancellationToken) =>
+        CreateFixtureAsync(
+            connection,
+            FixedWidthBase,
+            FixedWidthPage,
+            $"[{Grade}] nchar({FixedWidth}), [{Code}] nchar({FixedWidth})",
+            [
+                new FixtureField(Grade, LegalValuesTypeId, LegalValuesTypeName),
+                new FixtureField(Code, TextTypeId, TextTypeName),
+            ],
+            cancellationToken);
+
+    // The validator as the API builds it over the fixed-width fixture's form, with Grade's choices held in memory,
+    // because no code-table row is written.
+    private static RecordValidator FixedWidthValidator(Fixture fixture)
+    {
+        var options = new Dictionary<string, IReadOnlyList<FieldOption>>(StringComparer.Ordinal)
+        {
+            [Grade] = new[] { FullWidthChoice, PaddedChoice, ShortChoice }
+                .Select(text => new FieldOption(FieldValue.FromText(text), text))
+                .ToArray(),
+        };
+        return new RecordValidator(fixture.Form, FormDefinitionFactory.Create(fixture.Form, options, []));
+    }
+
+    // The fixed-width page row read by a plain parameterised command: each text as stored and its DATALENGTH in bytes.
+    private static async Task<FixedWidthRow> ReadFixedWidthRowAsync(
+        SqlConnection connection,
+        string globalRecordId,
+        CancellationToken cancellationToken)
+    {
+        await using var command = new SqlCommand(
+            $"SELECT [{Grade}], DATALENGTH([{Grade}]), [{Code}], DATALENGTH([{Code}]) FROM [{FixedWidthPage}] " +
+            "WHERE [GlobalRecordId] = @id",
+            connection);
+        command.Parameters.Add(new SqlParameter("@id", SqlDbType.NVarChar, 255) { Value = globalRecordId });
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        Assert.True(await reader.ReadAsync(cancellationToken), "The page row was not found.");
+        var row = new FixedWidthRow(
+            Assert.IsType<string>(reader.GetValue(0)),
+            Assert.IsType<int>(reader.GetValue(1)),
+            Assert.IsType<string>(reader.GetValue(2)),
+            Assert.IsType<int>(reader.GetValue(3)));
+        Assert.False(await reader.ReadAsync(cancellationToken), "The page holds more than one row for the id.");
+        return row;
+    }
+
+    // The fixed-width stamp fixture's base row read by a plain parameterised command: each logon-name stamp as stored
+    // with its DATALENGTH in bytes, and RecStatus.
+    private static async Task<StampRow> ReadStampRowAsync(
+        SqlConnection connection,
+        string globalRecordId,
+        CancellationToken cancellationToken)
+    {
+        await using var command = new SqlCommand(
+            "SELECT [FirstSaveLogonName], DATALENGTH([FirstSaveLogonName]), [LastSaveLogonName], " +
+            $"DATALENGTH([LastSaveLogonName]), [RecStatus] FROM [{FixedStampBase}] WHERE [GlobalRecordId] = @id",
+            connection);
+        command.Parameters.Add(new SqlParameter("@id", SqlDbType.NVarChar, 255) { Value = globalRecordId });
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        Assert.True(await reader.ReadAsync(cancellationToken), "The base row was not found.");
+        var row = new StampRow(
+            Assert.IsType<string>(reader.GetValue(0)),
+            Assert.IsType<int>(reader.GetValue(1)),
+            Assert.IsType<string>(reader.GetValue(2)),
+            Assert.IsType<int>(reader.GetValue(3)),
+            Assert.IsType<short>(reader.GetValue(4)));
+        Assert.False(await reader.ReadAsync(cancellationToken), "The base table holds more than one row for the id.");
+        return row;
+    }
+
+    // An nchar(255) logon-name stamp holds the logon name written, padded with spaces by SQL Server to 255 characters.
+    private static void AssertPaddedLogonName(string written, string stored, int storedBytes, string step)
+    {
+        Assert.True(
+            string.Equals(written.PadRight(FixedLogonNameWidth), stored, StringComparison.Ordinal),
+            "A logon-name stamp after the " + step + " is not the name written, padded to the column's width.");
+        Assert.Equal(2 * FixedLogonNameWidth, storedBytes);
+    }
+
     // A statement naming the reserved-word columns ran as recorded, quoted each of them in brackets, and succeeded.
     private static void AssertQuotesReservedWords(RecordedCommand command, bool inTransaction)
     {
@@ -1436,6 +1933,17 @@ public sealed class ReservedWordIdentifierTests
     }
 
     private sealed record FixtureField(string Name, int FieldTypeId, string FieldTypeName, string? List = null);
+
+    // The fixed-width page row's texts as stored, each with its DATALENGTH in bytes.
+    private readonly record struct FixedWidthRow(string Grade, int GradeBytes, string Code, int CodeBytes);
+
+    // The fixed-width stamp fixture's logon-name stamps as stored, each with its DATALENGTH in bytes, and RecStatus.
+    private readonly record struct StampRow(
+        string FirstSave,
+        int FirstSaveBytes,
+        string LastSave,
+        int LastSaveBytes,
+        short RecStatus);
 
     // Records every command, and closes the write's connection once the first INSERT or UPDATE has succeeded, so the
     // server has run DML that the write's next statement and its rollback then cannot follow. A fault injection for

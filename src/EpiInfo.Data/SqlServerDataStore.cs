@@ -245,7 +245,7 @@ public sealed class SqlServerDataStore : IDataStore
         FormMetadata form,
         string globalRecordId,
         IReadOnlyDictionary<string, FieldValue> submitted,
-        SaveStamp stamp,
+        Func<SaveStamp> createStamp,
         Func<StoredRecord, RecordValidationResult> requiredGate,
         FormPermissions? permissions,
         CancellationToken cancellationToken) =>
@@ -256,7 +256,7 @@ public sealed class SqlServerDataStore : IDataStore
                 form,
                 globalRecordId,
                 submitted,
-                stamp,
+                createStamp,
                 requiredGate,
                 permissions,
                 cancellationToken),
@@ -266,12 +266,12 @@ public sealed class SqlServerDataStore : IDataStore
     public Task<SoftDeleteResult> SoftDeleteAsync(
         FormMetadata form,
         string globalRecordId,
-        SaveStamp stamp,
+        Func<SaveStamp> createStamp,
         CancellationToken cancellationToken) =>
         RunAsync(
             nameof(IDataStore.SoftDeleteAsync),
             OperationKind.Write,
-            () => recordRepository.SoftDeleteAsync(form, globalRecordId, stamp, cancellationToken),
+            () => recordRepository.SoftDeleteAsync(form, globalRecordId, createStamp, cancellationToken),
             cancellationToken);
 
     /// <inheritdoc />

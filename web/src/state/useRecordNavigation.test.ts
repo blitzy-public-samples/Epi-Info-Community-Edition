@@ -9,7 +9,7 @@
 // count are intrinsic, over the active set for an active record and over every row for a
 // deleted one.
 import { act, renderHook, waitFor } from '@testing-library/react';
-import { useLayoutEffect, useRef } from 'react';
+import { StrictMode, useLayoutEffect, useRef } from 'react';
 import { afterEach, describe, expect, it, vi, type Mock } from 'vitest';
 
 import { createApiClient } from '../api/client';
@@ -362,8 +362,12 @@ interface Mounted {
 
 interface MountOptions {
   readonly initialPosition?: number;
+  readonly initialPositionText?: string;
+  readonly initialIncludeDeleted?: boolean;
   /** Replaces the default leave(), which notes `beforeLeave` in the log and resolves `true`. */
   readonly beforeLeave?: () => Promise<boolean>;
+  /** Mounts under StrictMode, which runs the mount effect, its cleanup and the effect again. */
+  readonly strict?: boolean;
 }
 
 /** Waits until no load is in flight. */
@@ -384,8 +388,17 @@ async function mount(rows: readonly Row[], options: MountOptions = {}): Promise<
       }),
   );
   const client = createApiClient({ baseUrl: 'http://localhost', fetch: api.fetch });
-  const { result } = renderHook(() =>
-    useRecordNavigation({ client, viewId: VIEW_ID, initialPosition: options.initialPosition, beforeLeave }),
+  const { result } = renderHook(
+    () =>
+      useRecordNavigation({
+        client,
+        viewId: VIEW_ID,
+        initialPosition: options.initialPosition,
+        initialPositionText: options.initialPositionText,
+        initialIncludeDeleted: options.initialIncludeDeleted,
+        beforeLeave,
+      }),
+    options.strict === true ? { wrapper: StrictMode } : {},
   );
   await settled(result);
   return { api, result, beforeLeave };
@@ -971,6 +984,253 @@ describe('useRecordNavigation', () => {
     });
   });
 
+  describe('the deleted toggle on as the form loads', () => {
+    // Position 2 of every record is the deleted D; of the active set, B.
+    it.each([{ strict: false }, { strict: true }])(
+      'with initialIncludeDeleted the first count and at/2 read every record and open D (StrictMode $strict)',
+      async ({ strict }) => {
+        const { api, result, beforeLeave } = await mount(mixedRows(), {
+          initialPosition: 2,
+          initialIncludeDeleted: true,
+          strict,
+        });
+
+        // StrictMode's repeated effect may send the count twice; no request reads the active set.
+        const requests = api.requests();
+        expect(requests.slice(-2)).toEqual([countRequest(true), atRequest(2, true)]);
+        expect(requests.filter((line) => line !== countRequest(true) && line !== atRequest(2, true))).toEqual([]);
+        expect(result.current.includeDeleted).toBe(true);
+        expect(result.current.n).toBe(2);
+        expect(result.current.count).toBe(4);
+        expect(result.current.record?.globalRecordId).toBe(D.globalRecordId);
+        expect(result.current.statusText).toBe('2 of 4');
+        expect(beforeLeave).not.toHaveBeenCalled();
+
+        // A later toggle change replaces the initial one, as any toggle does.
+        const mark = api.mark();
+        await perform(() => result.current.setIncludeDeleted(false));
+
+        const toggled = api.requestsSince(mark);
+        expect(sorted(toggled.slice(0, 2))).toEqual(sorted([countRequest(), positionRequest(D.globalRecordId)]));
+        expect(toggled.slice(2)).toEqual([atRequest(2)]);
+        expect(result.current.includeDeleted).toBe(false);
+        expect(result.current.record?.globalRecordId).toBe(B.globalRecordId);
+        expect(result.current.statusText).toBe('2 of 3');
+      },
+    );
+
+    it.each([undefined, false])(
+      'with initialIncludeDeleted %s the first load reads the active set and opens B',
+      async (initialIncludeDeleted) => {
+        const { api, result } = await mount(mixedRows(), { initialPosition: 2, initialIncludeDeleted });
+
+        expect(api.requests()).toEqual([countRequest(), atRequest(2)]);
+        expect(result.current.includeDeleted).toBe(false);
+        expect(result.current.record?.globalRecordId).toBe(B.globalRecordId);
+        expect(result.current.statusText).toBe('2 of 3');
+      },
+    );
+  });
+
+  describe('the notice of an initial position that cannot be opened as asked', () => {
+    const PAST_THE_END = [countRequest(), atRequest(7), countRequest(), atRequest(3)];
+
+    it.each<{
+      readonly name: string;
+      readonly rows: readonly Row[];
+      readonly initialPosition?: number;
+      readonly initialPositionText?: string;
+      readonly requests: readonly string[];
+      readonly opened: string | null;
+      readonly statusText: string;
+      readonly notice: string | null;
+    }>([
+      {
+        name: 'text that is not a record number opens the first record',
+        rows: activeRows(3),
+        initialPositionText: 'abc',
+        requests: [countRequest(), atRequest(1)],
+        opened: idOf(1),
+        statusText: '1 of 3',
+        notice: "'abc' is not a record number, so the first record is shown.",
+      },
+      {
+        name: 'blank text opens the first record',
+        rows: activeRows(3),
+        initialPositionText: ' ',
+        requests: [countRequest(), atRequest(1)],
+        opened: idOf(1),
+        statusText: '1 of 3',
+        notice: 'The record number is blank, so the first record is shown.',
+      },
+      {
+        name: 'a position that is not one, with no text, is named as given',
+        rows: activeRows(3),
+        initialPosition: 0,
+        requests: [countRequest(), atRequest(1)],
+        opened: idOf(1),
+        statusText: '1 of 3',
+        notice: "'0' is not a record number, so the first record is shown.",
+      },
+      {
+        name: 'text that is not a record number opens New on an empty form',
+        rows: [],
+        initialPositionText: 'abc',
+        requests: [countRequest()],
+        opened: null,
+        statusText: 'New record',
+        notice: "'abc' is not a record number, and there are no records to show, so a new record is shown.",
+      },
+      {
+        name: 'a position past the end opens the last record after the 404',
+        rows: activeRows(3),
+        initialPosition: 7,
+        initialPositionText: '7',
+        requests: PAST_THE_END,
+        opened: idOf(3),
+        statusText: '3 of 3',
+        notice: 'This record no longer exists. There is no record 7; showing the last record, 3.',
+      },
+      {
+        name: 'a position past the end, with no text, is named as given',
+        rows: activeRows(3),
+        initialPosition: 7,
+        requests: PAST_THE_END,
+        opened: idOf(3),
+        statusText: '3 of 3',
+        notice: 'This record no longer exists. There is no record 7; showing the last record, 3.',
+      },
+      {
+        name: 'a capped position is named as written',
+        rows: activeRows(3),
+        initialPosition: 2_147_483_647,
+        initialPositionText: '99999999999',
+        requests: [countRequest(), atRequest(2_147_483_647), countRequest(), atRequest(3)],
+        opened: idOf(3),
+        statusText: '3 of 3',
+        notice: 'This record no longer exists. There is no record 99999999999; showing the last record, 3.',
+      },
+      {
+        name: 'a position on an empty form opens New, with no at read',
+        rows: [],
+        initialPosition: 3,
+        initialPositionText: '3',
+        requests: [countRequest()],
+        opened: null,
+        statusText: 'New record',
+        notice: 'There is no record 3; there are no records to show, so a new record is shown.',
+      },
+      {
+        name: 'a position the set holds opens with no notice',
+        rows: activeRows(3),
+        initialPosition: 2,
+        initialPositionText: '2',
+        requests: [countRequest(), atRequest(2)],
+        opened: idOf(2),
+        statusText: '2 of 3',
+        notice: null,
+      },
+      {
+        name: 'neither position nor text opens the first record with no notice',
+        rows: activeRows(3),
+        requests: [countRequest(), atRequest(1)],
+        opened: idOf(1),
+        statusText: '1 of 3',
+        notice: null,
+      },
+    ])('$name', async ({ rows, initialPosition, initialPositionText, requests, opened, statusText, notice }) => {
+      const { api, result, beforeLeave } = await mount(rows, { initialPosition, initialPositionText });
+
+      expect(api.requests()).toEqual(requests);
+      expect(result.current.notice).toBe(notice);
+      expect(result.current.record?.globalRecordId ?? null).toBe(opened);
+      expect(result.current.isNew).toBe(opened === null);
+      expect(result.current.statusText).toBe(statusText);
+      expect(result.current.loadError).toBeNull();
+      expect(beforeLeave).not.toHaveBeenCalled();
+    });
+
+    // The count said record 2 existed, so a 404 on at/2 means it went away after N was read.
+    it.each<{
+      readonly name: string;
+      readonly rows: readonly Row[];
+      /** Runs while at/2 is held, before it answers. */
+      readonly whileAt: (api: FakeApi) => void;
+      /** Runs while the recovery's count is held, before it answers. */
+      readonly whileCount: (api: FakeApi) => void;
+      readonly requests: readonly string[];
+      readonly opened: string | null;
+      readonly statusText: string;
+      readonly notice: string;
+    }>([
+      {
+        name: 'the set is empty by the recovery, so New opens',
+        rows: activeRows(2),
+        whileAt: (api) => {
+          api.remove(idOf(1));
+          api.remove(idOf(2));
+        },
+        whileCount: () => undefined,
+        requests: [countRequest(), atRequest(2), countRequest()],
+        opened: null,
+        statusText: 'New record',
+        notice: 'This record no longer exists. There is no record 2; there are no records to show, so a new record is shown.',
+      },
+      {
+        name: 'the set has a record 2 again by the recovery, which opens with the 404 notice alone',
+        rows: activeRows(3),
+        whileAt: (api) => {
+          api.remove(idOf(2));
+          api.remove(idOf(3));
+        },
+        whileCount: (api) => {
+          api.add(row(4));
+          api.add(row(5));
+        },
+        requests: [countRequest(), atRequest(2), countRequest(), atRequest(2)],
+        opened: idOf(4),
+        statusText: '2 of 3',
+        notice: 'This record no longer exists.',
+      },
+    ])(
+      'a 404 on the initial at/2 that N counted says no "last record" when $name',
+      async ({ rows, whileAt, whileCount, requests, opened, statusText, notice }) => {
+        const api = createFakeApi(rows);
+        const atGate = api.hold(`${RECORDS_PATH}/at/2`);
+        const client = createApiClient({ baseUrl: 'http://localhost', fetch: api.fetch });
+        const { result } = renderHook(() =>
+          useRecordNavigation({
+            client,
+            viewId: VIEW_ID,
+            initialPosition: 2,
+            initialPositionText: '2',
+            beforeLeave: () => Promise.resolve(true),
+          }),
+        );
+        await act(async () => {
+          await atGate.reached;
+        });
+        const countGate = api.hold(`${RECORDS_PATH}/count`);
+        whileAt(api);
+
+        await act(async () => {
+          atGate.release();
+          await countGate.reached;
+        });
+        whileCount(api);
+        act(() => {
+          countGate.release();
+        });
+        await settled(result);
+
+        expect(api.requests()).toEqual(requests);
+        expect(result.current.notice).toBe(notice);
+        expect(result.current.record?.globalRecordId ?? null).toBe(opened);
+        expect(result.current.statusText).toBe(statusText);
+        expect(result.current.loadError).toBeNull();
+      },
+    );
+  });
 
   describe('a record that no longer exists (404 on open)', () => {
     it('openById shows the notice, reloads the list and N, and opens at/{min(n, count)}', async () => {
@@ -1471,6 +1731,36 @@ describe('record transitions (0.3.6, 0.3.4.2)', () => {
     }
     return found;
   }
+
+  it('Retry of a failed initial load keeps initialIncludeDeleted, so the repeated count and at/2 read every record', async () => {
+    // Record 2 is deleted: only the set of every record has a position 2.
+    const connection = wire([row(1), row(2, { recStatus: DELETED })]);
+    connection.failNext(`${RECORDS_PATH}/count`);
+    const beforeLeave = vi.fn(leaving(connection.api, true));
+    const { result } = renderHook(() =>
+      useRecordNavigation({
+        client: connection.client,
+        viewId: VIEW_ID,
+        initialPosition: 2,
+        initialIncludeDeleted: true,
+        beforeLeave,
+      }),
+    );
+    await settled(result);
+    expect(connection.api.requests()).toEqual([countRequest(true)]);
+    expect(result.current.loadError?.kind).toBe('unavailable');
+    expect(result.current.includeDeleted).toBe(true);
+    const mark = connection.api.mark();
+
+    await perform(() => result.current.retryLoad());
+
+    expect(connection.api.requestsSince(mark)).toEqual([countRequest(true), atRequest(2, true)]);
+    expect(result.current.loadError).toBeNull();
+    expect(result.current.includeDeleted).toBe(true);
+    expect(result.current.record?.globalRecordId).toBe(idOf(2));
+    expect(result.current.statusText).toBe('2 of 2');
+    expect(beforeLeave).not.toHaveBeenCalled();
+  });
 
   const RECORD_CHANGES: readonly NamedAction[] = [
     FIRST,

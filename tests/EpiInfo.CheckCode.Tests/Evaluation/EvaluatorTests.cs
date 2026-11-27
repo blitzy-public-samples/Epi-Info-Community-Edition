@@ -804,7 +804,8 @@ public sealed class EvaluatorTests
     }
 
     // No double builds the expected value: the nearest double of 2.0000000000000001 is the whole number 2, while the
-    // literal is not whole, so the two parts of the value are checked separately.
+    // literal is not whole, so the parts of the value are checked separately. Its exact JSON number is what an ASSIGN
+    // of it puts on the wire, where the double would read as the whole number 2.
     [Fact]
     public void LiteralToValue_OfANonIntegralSpellingWithAWholeDouble_IsNotAnInteger()
     {
@@ -814,6 +815,8 @@ public sealed class EvaluatorTests
         Assert.False(value.TryGetInteger(out _));
         Assert.True(value.TryGetNumber(out double nearest));
         Assert.Equal(2.0, nearest);
+        Assert.True(value.TryGetJsonNumber(out string? jsonNumber));
+        Assert.Equal("2.0000000000000001", jsonNumber);
     }
 
     [Theory]

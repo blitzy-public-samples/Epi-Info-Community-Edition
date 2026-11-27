@@ -16,6 +16,19 @@ namespace EpiInfo.Data.Sql;
 /// physical connections. Nothing is retried, cached or logged here.
 /// </para>
 /// <para>
+/// SqlClient's pool blocking period is disabled (<see cref="PoolBlockingPeriod.NeverBlock"/>) unless the connection
+/// string sets <c>Pool Blocking Period</c> (or <c>PoolBlockingPeriod</c>) itself, in which case that setting is kept:
+/// <see cref="EffectiveConnectionString"/> puts the default ahead of the configured string, whose own setting SqlClient
+/// reads last and keeps. With blocking enabled, the SqlClient default for a server outside Azure SQL, one failed open
+/// makes the pool answer every open for the next 5 to 60 seconds with that cached failure, without contacting the
+/// server, so the API would go on reporting the database unavailable after SQL Server is back. With it disabled, each
+/// open after a failure contacts the server again, so the next request after SQL Server returns succeeds without a
+/// restart. That is not a retry: each call still opens once, and the failure of that open is what it reports. The cost
+/// is that, while the server stays unreachable, each open takes as long as SqlClient's own attempt, up to the
+/// connection string's connect timeout, before it fails; a connection string that prefers the cached failure sets
+/// <c>Pool Blocking Period</c> itself.
+/// </para>
+/// <para>
 /// The connection string carries the database password, so it never appears in an exception this class raises: the
 /// exceptions carry their fixed messages, the caller's fixed operation name and, at most, a SQL error number. The
 /// original failure is attached only as the inner exception, which the API never logs or returns.
@@ -25,6 +38,11 @@ namespace EpiInfo.Data.Sql;
 /// <param name="options">The connection string and command timeout.</param>
 internal sealed class SqlConnectionFactory(DatabaseOptions options)
 {
+    // The default every connection string with a setting of its own opens behind. It goes first, never last: SqlClient
+    // keeps the last value it reads for a keyword, under either of its spellings, so a Pool Blocking Period or
+    // PoolBlockingPeriod the configured string sets wins over it.
+    private const string NeverBlockDefault = "Pool Blocking Period=NeverBlock;";
+
     private readonly DatabaseOptions options = options ?? throw new ArgumentNullException(nameof(options));
 
     /// <summary>
@@ -35,9 +53,19 @@ internal sealed class SqlConnectionFactory(DatabaseOptions options)
 
     /// <summary>Opens a new connection to the configured database.</summary>
     /// <remarks>
+    /// <para>
+    /// The connection opens with <see cref="EffectiveConnectionString"/>: the configured string, behind a default that
+    /// disables the pool blocking period unless the string sets it. SqlClient reads and validates that string when the
+    /// connection is created, on each call and never at construction, exactly as it reads the configured string alone,
+    /// so the default changes neither which strings are accepted nor any other setting. After a failed open, the next
+    /// call therefore contacts the server again instead of receiving the pool's cached failure, and succeeds as soon as
+    /// SQL Server answers.
+    /// </para>
+    /// <para>
     /// A connection that fails to open is released here, only after its failure is classified
     /// (<see cref="OpenFailureAsync"/>). An error from that release is discarded, so the exception raised is always the
     /// one for the open failure.
+    /// </para>
     /// </remarks>
     /// <param name="operation">
     /// The fixed name of the store operation that needs the connection, such as <c>InsertAsync</c>; never request input.
@@ -67,9 +95,10 @@ internal sealed class SqlConnectionFactory(DatabaseOptions options)
         SqlConnection connection;
         try
         {
-            connection = new SqlConnection(options.ConnectionString);
+            // Not null: HasConnectionString, checked above, is false for a null string.
+            connection = new SqlConnection(EffectiveConnectionString(options.ConnectionString!));
         }
-        catch (ArgumentException exception)
+        catch (Exception exception) when (IsConnectionStringFault(exception))
         {
             // SqlClient parses the string here and rejects a malformed one; that is a configuration fault (500), not an
             // unavailable server.
@@ -94,6 +123,56 @@ internal sealed class SqlConnectionFactory(DatabaseOptions options)
 
         return connection;
     }
+
+    /// <summary>
+    /// The connection string every connection opens with: <c>Pool Blocking Period=NeverBlock;</c> followed by
+    /// <paramref name="configured"/>, verbatim. SqlClient reads a connection string's settings in order and keeps the
+    /// last value of each keyword, under either of its spellings, so a <c>Pool Blocking Period</c> or
+    /// <c>PoolBlockingPeriod</c> the configured string sets is the one that applies, and the default applies only when
+    /// it sets none.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The string is not parsed here, so the default changes neither which strings are accepted nor how any setting
+    /// is read: <see cref="SqlConnection"/> parses and validates the result as it would the configured string alone.
+    /// The default's closing <c>;</c> returns SqlClient's parser to the state it starts in, so the configured string is
+    /// read from that state, and SqlClient validates only the value it keeps for each keyword. A configured string
+    /// SqlClient rejects, an invalid <c>Pool Blocking Period</c> included, is still rejected; one it accepts, with an
+    /// earlier duplicate holding an invalid value or with leading or trailing separators, is still accepted with the
+    /// same settings.
+    /// </para>
+    /// <para>
+    /// A configured string of nothing but <c>;</c> separators, white space and NUL terminators holds no setting, and
+    /// is returned unchanged. SqlClient refuses to open such a string without contacting any server, or rejects it
+    /// when a <c>;</c> follows a NUL; behind the default, the default would be its one setting, and the open would
+    /// contact the default local server instead.
+    /// </para>
+    /// <para>
+    /// Internal, rather than private, so that <c>SqlErrorClassifierTests</c> can check the string and clear the pool
+    /// it keys.
+    /// </para>
+    /// </remarks>
+    /// <param name="configured">
+    /// The configured connection string, not null. It carries the database password, so neither it nor the result is
+    /// ever put in a message.
+    /// </param>
+    /// <returns>
+    /// The effective connection string; <paramref name="configured"/> itself when it holds no setting.
+    /// </returns>
+    internal static string EffectiveConnectionString(string configured) =>
+        HoldsNoSetting(configured) ? configured : NeverBlockDefault + configured;
+
+    // SqlClient's parser skips ';' and white space between settings, and after a NUL accepts only NULs and white
+    // space, so any other character starts a setting or makes SqlClient reject the string.
+    private static bool HoldsNoSetting(string configured) =>
+        configured.All(static character => character is ';' or '\0' || char.IsWhiteSpace(character));
+
+    // Every way SqlConnection rejects a connection string before any connection exists. It raises an
+    // ArgumentException for a syntax error, an unknown keyword, a value that does not convert, is out of range or is
+    // too long, and for settings that contradict each other, such as a Min Pool Size above Max Pool Size; and a
+    // NotSupportedException for a keyword this platform does not support, such as Network Library.
+    private static bool IsConnectionStringFault(Exception exception) =>
+        exception is ArgumentException or NotSupportedException;
 
     /// <summary>
     /// Classifies a failure to open <paramref name="connection"/>, then releases the connection, and returns the

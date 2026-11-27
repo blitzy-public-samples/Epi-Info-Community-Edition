@@ -540,7 +540,7 @@ public sealed class IdentifierProvenanceIntegrationTests
                     form.Metadata,
                     unstoredId,
                     submitted,
-                    NewStamp(),
+                    NewStamp,
                     _ =>
                     {
                         gateCalls++;

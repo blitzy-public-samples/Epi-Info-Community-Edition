@@ -1,8 +1,9 @@
 // Ordering and races of check-code field events: the queue sends one event at a time in
 // the order raised; each event carries the values the user had when it was raised, plus
 // the effects of earlier responses; a user edit made after an event was raised beats that
-// event's `cleared`/`assigned`; a response for a replaced record is ignored; and a failed
-// event shows a notice without blocking a save.
+// event's `cleared`/`assigned`; a response for a replaced record is ignored; a failed event
+// shows a notice without blocking a save; and a number the client decodes exactly in
+// `assigned` is applied with the rest of its answer and saved as the same JSON token.
 //
 // createFieldEventQueue is tested directly against a mutable editor snapshot, and through
 // useRecordEditor, which drains the queue before saving and suppresses the focus and blur
@@ -12,7 +13,7 @@
 import { act, renderHook, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi, type Mock } from 'vitest';
 
-import { createApiClient, type ApiClient } from '../api/client';
+import { createApiClient, numberFromText, sameFieldValue, type ApiClient } from '../api/client';
 import type {
   Diagnostic,
   DialogMessage,
@@ -48,6 +49,8 @@ const TRACE_ID = '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01';
 const CHECKBOX = 'Asian';
 /** A read-only field: check code may assign it, the editor never sends it. */
 const READ_ONLY = 'OnsetWeek';
+/** A writable number field with no range or mask, so any number assigned to it can be saved. */
+const PLAIN_NUMBER = 'CaseID';
 
 const RECORD_A_ID = '3f2b8c1e-5d4a-4c1b-9e7f-00000000000a';
 const RECORD_B_ID = '3f2b8c1e-5d4a-4c1b-9e7f-00000000000b';
@@ -188,6 +191,8 @@ interface RecordedCall {
   readonly method: string;
   readonly path: string;
   readonly body: unknown;
+  /** The body text exactly as sent, whose numbers JSON.parse may have rounded in `body`. */
+  readonly text: string;
 }
 
 /** A field-event request held at the fake until the test answers it. */
@@ -314,7 +319,7 @@ function createFakeApi(stored: readonly RecordDto[]): FakeApi {
 
     try {
       const body: unknown = text === '' ? null : JSON.parse(text);
-      calls.push({ method: request.method, path, body });
+      calls.push({ method: request.method, path, body, text });
       if (request.method === 'POST' && path === FIELD_EVENT_PATH) {
         return await holdFieldEvent(readFieldEvent(body), request.signal);
       }
@@ -988,6 +993,42 @@ describe('useRecordEditor field events', () => {
     expect(result.current.values).toMatchObject({ DOB: DOB_ENTERED, Age: ASSIGNED_AGE, [READ_ONLY]: 5 });
     expect(result.current.dirty.size).toBe(0);
   });
+
+  // An answer the API writes with an exact number in `assigned`, beside every other kind of
+  // effect: the client decodes the number exactly, the queue applies the whole answer, and
+  // the save sends the number back as the same JSON token. 9007199254740993 is a bigint;
+  // 1.0000000000000001, whose nearest double is the whole number 1, is an exact decimal, so
+  // the server, not a rounded 1, decides whether the field's column can hold it.
+  it.each<{ token: string }>([{ token: '9007199254740993' }, { token: '1.0000000000000001' }])(
+    'applies in full an answer assigning $token to a number field and saves that token digit for digit',
+    async ({ token }) => {
+      const harness = createHarness([RECORD_A]);
+      const { api } = harness;
+      const { result, onSaved } = await mountEditor(harness);
+      const answerText = JSON.stringify(
+        envelope({ disabled: ['LastName'], cleared: ['FirstName'], dialogs: [FEVER_DIALOG] }),
+      ).replace('"assigned":{}', `"assigned":{"${PLAIN_NUMBER}":${token}}`);
+
+      act(() => {
+        result.current.onFieldBlur('LastName');
+      });
+      await answer(harness, 0, rawJson(answerText));
+
+      const expected = numberFromText(token);
+      expect(sameFieldValue(result.current.values[PLAIN_NUMBER], expected)).toBe(true);
+      expect(result.current.values.FirstName).toBeNull();
+      expect([...result.current.checkCodeDisabled]).toEqual(['LastName']);
+      expect(result.current.dialogs).toEqual([FEVER_DIALOG]);
+      expect(result.current.eventNotice).toBeNull();
+      expect([...result.current.dirty].sort()).toEqual([PLAIN_NUMBER, 'FirstName'].sort());
+
+      expect(await perform(() => result.current.save())).toBe(true);
+
+      const writes = api.calls.filter((call) => call.method === 'PUT');
+      expect(writes.map((call) => call.text)).toEqual([`{"values":{"${PLAIN_NUMBER}":${token},"FirstName":null}}`]);
+      expect(onSaved).toHaveBeenCalledTimes(1);
+    },
+  );
 
   it.each<{ effect: string; response: FieldEventResponse; put: Values | null }>([
     { effect: 'an assigned Age', response: envelope({ assigned: { Age: ASSIGNED_AGE } }), put: { Age: ASSIGNED_AGE } },

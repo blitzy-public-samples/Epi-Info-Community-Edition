@@ -2,6 +2,7 @@ using System.Collections;
 using System.ComponentModel;
 using System.Data;
 using System.Globalization;
+using System.Net;
 using System.Net.Sockets;
 using System.Reflection;
 using System.Security.Authentication;
@@ -954,10 +955,28 @@ public sealed class SqlErrorClassifierTests
         Assert.Equal(DataStoreUnavailableException.FixedMessage, failure.Message);
     }
 
-    [Fact]
-    public async Task OpenAsync_MalformedConnectionString_IsUnexpectedWriteExceptionAndNotWritten()
+    // Every way SqlClient rejects a connection string, each with the exception SqlConnection raises for it, the same
+    // behind the pool default as alone: no key-value syntax; a value that does not convert; an integer beyond Int32; a
+    // value outside the keyword's set, under either spelling of Pool Blocking Period; settings that contradict each
+    // other; and a keyword this platform does not support. A string holding no setting at all is refused when it is
+    // opened, before any server is contacted.
+    [Theory]
+    [InlineData(MalformedConnectionString, typeof(ArgumentException))]
+    [InlineData("Server=127.0.0.1,1;Connect Timeout=abc", typeof(ArgumentException))]
+    [InlineData("Server=127.0.0.1,1;Pooling=maybe", typeof(ArgumentException))]
+    [InlineData("Server=127.0.0.1,1;Connect Timeout=99999999999", typeof(ArgumentException))]
+    [InlineData("Server=127.0.0.1,1;Pool Blocking Period=Sometimes", typeof(ArgumentException))]
+    [InlineData("Server=127.0.0.1,1;PoolBlockingPeriod=Bogus", typeof(ArgumentException))]
+    [InlineData("Server=127.0.0.1,1;Type System Version=Unknown", typeof(ArgumentException))]
+    [InlineData("Server=127.0.0.1,1;Min Pool Size=5;Max Pool Size=1", typeof(ArgumentException))]
+    [InlineData("Server=127.0.0.1,1;Network Library=dbmssocn", typeof(NotSupportedException))]
+    [InlineData(";", typeof(InvalidOperationException))]
+    [InlineData(" ;\t; ", typeof(InvalidOperationException))]
+    public async Task OpenAsync_MalformedConnectionString_IsUnexpectedWriteExceptionAndNotWritten(
+        string connectionString,
+        Type expectedInnerType)
     {
-        var factory = new SqlConnectionFactory(new DatabaseOptions(MalformedConnectionString));
+        var factory = new SqlConnectionFactory(new DatabaseOptions(connectionString));
 
         DataStoreWriteException failure = await Assert.ThrowsAsync<DataStoreWriteException>(
             () => factory.OpenAsync("Ping", CancellationToken.None));
@@ -965,8 +984,44 @@ public sealed class SqlErrorClassifierTests
         Assert.Equal("Ping", failure.Operation);
         Assert.Equal(WriteOutcome.NotWritten, failure.Outcome);
         Assert.Null(failure.SqlErrorNumber);
-        Assert.IsType<ArgumentException>(failure.InnerException);
+        Assert.IsType(expectedInnerType, failure.InnerException);
         Assert.Equal(DataStoreWriteException.FixedMessage, failure.Message);
+    }
+
+    // The password of the connection strings the effective-string cases parse; no login uses it, and none is opened.
+    private const string PoolPasswordSentinel = "Sentinel-Pool-5d8e1b";
+
+    // The effective connection string disables the pool blocking period unless the configured string sets one, under
+    // either spelling and in any case, and keeps every other setting as given, the password included: the configured
+    // string follows the default verbatim, so SqlClient reads its own setting last.
+    [Theory]
+    [InlineData(
+        "Server=127.0.0.1,1;Database=Fixture;User Id=sa;Password=" + PoolPasswordSentinel +
+        ";TrustServerCertificate=True;Connect Timeout=2;Application Name=Fixture",
+        PoolBlockingPeriod.NeverBlock)]
+    [InlineData(
+        "Server=127.0.0.1,1;User Id=sa;Password=" + PoolPasswordSentinel + ";PoolBlockingPeriod=AlwaysBlock",
+        PoolBlockingPeriod.AlwaysBlock)]
+    [InlineData(
+        "Server=127.0.0.1,1;User Id=sa;Password=" + PoolPasswordSentinel + ";Pool Blocking Period=Auto",
+        PoolBlockingPeriod.Auto)]
+    [InlineData(
+        "pool blocking period=alwaysblock;Server=127.0.0.1,1;User Id=sa;Password=" + PoolPasswordSentinel,
+        PoolBlockingPeriod.AlwaysBlock)]
+    public void EffectiveConnectionString_BlocksOnlyWhenTheStringSaysSoAndKeepsEveryOtherSetting(
+        string configured,
+        PoolBlockingPeriod expected)
+    {
+        string effectiveString = SqlConnectionFactory.EffectiveConnectionString(configured);
+        var effective = new SqlConnectionStringBuilder(effectiveString);
+        var expectedSettings = new SqlConnectionStringBuilder(configured) { PoolBlockingPeriod = expected };
+
+        Assert.EndsWith(configured, effectiveString, StringComparison.Ordinal);
+        Assert.Equal(expected, effective.PoolBlockingPeriod);
+        Assert.True(effective.ShouldSerialize("Pool Blocking Period"), "The effective string leaves the setting out.");
+        Assert.True(
+            expectedSettings.EquivalentTo(effective),
+            "The effective string adds, drops or changes a setting other than Pool Blocking Period.");
     }
 
     // A failed open is classified before the unopened connection is released, so a release that throws neither
@@ -1323,5 +1378,332 @@ public sealed class DatabaseWriteLockTests : IAsyncLifetime
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
             DatabaseWriteLock.AcquireExclusiveAsync(cancellation.Token));
+    }
+}
+
+/// <summary>
+/// Integration tests of the connection string <see cref="SqlConnectionFactory"/> opens with: the pool default it puts
+/// ahead of the configured string changes neither which strings SqlClient accepts nor how SqlClient reads them. Each
+/// configured string opens through the factory as it opens through SqlClient alone, with the same session settings.
+/// They need the rehearsal database and change no data: their only statement reads the session's own properties.
+/// </summary>
+[Collection(DatabaseCollections.Database)]
+[Trait("Category", "Integration")]
+public sealed class SqlConnectionFactoryConnectionStringTests : IAsyncLifetime
+{
+    public Task InitializeAsync() => TestDatabase.EnsureReachableAsync();
+
+    public Task DisposeAsync() => Task.CompletedTask;
+
+    // The test database's connection string, surrounded by text SqlClient accepts: a Connect Timeout set twice, first
+    // to an invalid value, which SqlConnectionStringBuilder rejects and SqlClient accepts, because it validates only
+    // the value it keeps; and leading or trailing separators and white space. A null timeout is whatever SqlClient
+    // reads from the configured string.
+    [Theory]
+    [InlineData("", ";Connect Timeout=-1;Connect Timeout=5", 5)]
+    [InlineData(";", "", null)]
+    [InlineData(" \t", "", null)]
+    [InlineData("", ";", null)]
+    [InlineData(" ; ;", ";; ", null)]
+    public async Task OpenAsync_ConnectionStringSqlClientAccepts_OpensWithTheSettingsSqlClientReadsFromIt(
+        string leading,
+        string trailing,
+        int? expectedConnectTimeout)
+    {
+        string configured = leading + TestDatabase.ConnectionString + trailing;
+        var factory = new SqlConnectionFactory(new DatabaseOptions(configured));
+        await using var reference = new SqlConnection(configured);
+        try
+        {
+            await reference.OpenAsync();
+            await using SqlConnection connection = await factory.OpenAsync(
+                nameof(IDataStore.PingAsync),
+                CancellationToken.None);
+            try
+            {
+                (int One, string Database, string Application, string Login) session =
+                    await DescribeSessionAsync(connection);
+
+                Assert.Equal(1, session.One);
+                Assert.Equal(await DescribeSessionAsync(reference), session);
+                Assert.Equal(reference.ConnectionTimeout, connection.ConnectionTimeout);
+                if (expectedConnectTimeout is int timeout)
+                {
+                    Assert.Equal(timeout, connection.ConnectionTimeout);
+                }
+            }
+            finally
+            {
+                // Closes the pooled session the effective string keys, so it does not outlive the test.
+                SqlConnection.ClearPool(connection);
+            }
+        }
+        finally
+        {
+            // Closes the pooled session the configured string keys, so it does not outlive the test.
+            SqlConnection.ClearPool(reference);
+        }
+    }
+
+    // What the server reports for the session: the result of SELECT 1, the database, the application name and the
+    // login, each of which follows from a connection string setting.
+    private static async Task<(int One, string Database, string Application, string Login)> DescribeSessionAsync(
+        SqlConnection connection)
+    {
+        await using var command = new SqlCommand("SELECT 1, DB_NAME(), APP_NAME(), SUSER_SNAME();", connection);
+        await using SqlDataReader reader = await command.ExecuteReaderAsync();
+        Assert.True(await reader.ReadAsync(), "The session query returned no row.");
+        return (reader.GetInt32(0), reader.GetString(1), reader.GetString(2), reader.GetString(3));
+    }
+}
+
+/// <summary>
+/// Integration test of recovery without a restart (<see cref="SqlConnectionFactory"/>): once SQL Server answers again
+/// after a failed open, the very next open reaches it, instead of receiving SqlClient's cached failure for the pool's
+/// blocking period. The server is reached through <see cref="SwitchableForwarder"/>, so the outage is this test's own,
+/// and its pool, keyed by the forwarder's port and a unique application name, is shared with no other test. It needs
+/// the rehearsal database and changes no data: its only statement is <c>SELECT 1</c>.
+/// </summary>
+[Collection(DatabaseCollections.Database)]
+[Trait("Category", "Integration")]
+public sealed class SqlConnectionFactoryRecoveryTests : IAsyncLifetime
+{
+    // Short, so the failed open ends soon; long enough for a login relayed over loopback.
+    private const int ConnectTimeoutSeconds = 3;
+
+    private const int DefaultSqlServerPort = 1433;
+    private const string TcpPrefix = "tcp:";
+    private const string ApplicationNamePrefix = "EpiInfo.Web.Tests recovery ";
+
+    public Task InitializeAsync() => TestDatabase.EnsureReachableAsync();
+
+    public Task DisposeAsync() => Task.CompletedTask;
+
+    [Fact]
+    public async Task OpenAsync_ServerBackAfterAFailedOpen_NextOpenReachesItWithoutWaitingOutThePoolBlockingPeriod()
+    {
+        SqlConnectionStringBuilder target = TestDatabase.Builder();
+        (string host, int port) = UpstreamEndpoint(target.DataSource);
+        SwitchableForwarder forwarder = SwitchableForwarder.Start(host, port);
+        string? effective = null;
+        try
+        {
+            // The certificate is still checked against the server's own name, not the forwarder's address.
+            if (!target.ShouldSerialize("Host Name In Certificate"))
+            {
+                target.HostNameInCertificate = host;
+            }
+
+            target.DataSource = string.Create(CultureInfo.InvariantCulture, $"{TcpPrefix}127.0.0.1,{forwarder.Port}");
+            target.ConnectTimeout = ConnectTimeoutSeconds;
+            target.ApplicationName = ApplicationNamePrefix + Guid.NewGuid().ToString("N");
+
+            // The test is about the factory's own pool default, so the fixture string never decides it: a Pool Blocking
+            // Period from the environment's connection string, under either spelling, would override that default, and
+            // without pooling there would be no pool to block.
+            target.Remove("Pool Blocking Period");
+            target.Pooling = true;
+            effective = SqlConnectionFactory.EffectiveConnectionString(target.ConnectionString);
+            var factory = new SqlConnectionFactory(new DatabaseOptions(target.ConnectionString));
+
+            DataStoreUnavailableException outage = await Assert.ThrowsAsync<DataStoreUnavailableException>(
+                () => factory.OpenAsync(nameof(IDataStore.PingAsync), CancellationToken.None));
+            Assert.Equal(WriteOutcome.NotWritten, outage.Outcome);
+
+            // The server is back. A pool in its blocking period would now answer with the cached failure for at least
+            // five seconds without contacting the server, so this open would fail at once.
+            forwarder.Forwarding = true;
+            await using SqlConnection connection = await factory.OpenAsync(
+                nameof(IDataStore.PingAsync),
+                CancellationToken.None);
+            await using var command = new SqlCommand("SELECT 1;", connection);
+
+            Assert.Equal(1, await command.ExecuteScalarAsync());
+        }
+        finally
+        {
+            // Only this test's pool is cleared: the one keyed by the effective string of its own connection string.
+            if (effective is not null)
+            {
+                await using var poolKey = new SqlConnection(effective);
+                SqlConnection.ClearPool(poolKey);
+            }
+
+            await forwarder.DisposeAsync();
+        }
+    }
+
+    // The TCP endpoint of the test server's data source: "host" (port 1433) or "host,port", optionally prefixed "tcp:",
+    // where an "\instance" is ignored when a port is given, as SqlClient ignores it. An instance without a port is found
+    // through the SQL Server Browser, and a named pipe or LocalDB has no TCP endpoint, so the forwarder cannot stand in
+    // for either; the test then fails naming the data source, which holds no secret.
+    private static (string Host, int Port) UpstreamEndpoint(string dataSource)
+    {
+        string source = dataSource.Trim();
+        if (source.StartsWith(TcpPrefix, StringComparison.OrdinalIgnoreCase))
+        {
+            source = source[TcpPrefix.Length..];
+        }
+
+        string[] parts = source.Split(',');
+        string server = parts[0].Trim();
+        int instanceStart = server.IndexOf('\\', StringComparison.Ordinal);
+        string host = instanceStart < 0 ? server : server[..instanceStart];
+        if (host is "." || string.Equals(host, "(local)", StringComparison.OrdinalIgnoreCase))
+        {
+            host = "localhost";
+        }
+
+        int port = DefaultSqlServerPort;
+        bool usable = parts.Length <= 2
+            && host.Length > 0
+            && !host.Contains(':', StringComparison.Ordinal)
+            && !host.StartsWith('(')
+            && (parts.Length == 2
+                ? int.TryParse(parts[1].Trim(), NumberStyles.None, CultureInfo.InvariantCulture, out port)
+                    && port is > 0 and <= IPEndPoint.MaxPort
+                : instanceStart < 0);
+        if (!usable)
+        {
+            Assert.Fail(
+                $"{nameof(SqlConnectionFactoryRecoveryTests)} relays to the test server over TCP, so its data source " +
+                $"must be host or host,port, optionally prefixed {TcpPrefix}; '{dataSource}' is not. Set " +
+                $"{TestDatabase.SqlHostVariable} or {TestDatabase.ConnectionStringVariable} to such a data source.");
+        }
+
+        return (host, port);
+    }
+
+    /// <summary>
+    /// A loopback TCP listener standing in for the test server. Each connection it accepts is either reset at once
+    /// (<see cref="Forwarding"/> false, the initial state: the server has gone away) or relayed byte for byte to the
+    /// server (true). Switching keeps the same port, so the factory's connection string, and with it its pool, is the
+    /// same during the outage and after it.
+    /// </summary>
+    private sealed class SwitchableForwarder : IAsyncDisposable
+    {
+        private readonly TcpListener listener = new(IPAddress.Loopback, 0);
+        private readonly CancellationTokenSource stopping = new();
+        private readonly List<Task> relays = [];
+        private readonly string upstreamHost;
+        private readonly int upstreamPort;
+        private Task accepting = Task.CompletedTask;
+        private volatile bool forwarding;
+
+        private SwitchableForwarder(string upstreamHost, int upstreamPort)
+        {
+            this.upstreamHost = upstreamHost;
+            this.upstreamPort = upstreamPort;
+        }
+
+        /// <summary>The port it listens on, on 127.0.0.1.</summary>
+        public int Port => ((IPEndPoint)listener.LocalEndpoint).Port;
+
+        /// <summary>Whether a connection accepted from now on is relayed to the server rather than reset.</summary>
+        public bool Forwarding
+        {
+            get => forwarding;
+            set => forwarding = value;
+        }
+
+        /// <summary>Starts listening on a free loopback port, resetting every connection it accepts.</summary>
+        /// <param name="upstreamHost">The test server's host.</param>
+        /// <param name="upstreamPort">The test server's TCP port.</param>
+        /// <returns>The running forwarder; the caller disposes it.</returns>
+        public static SwitchableForwarder Start(string upstreamHost, int upstreamPort)
+        {
+            var forwarder = new SwitchableForwarder(upstreamHost, upstreamPort);
+            forwarder.listener.Start();
+            forwarder.accepting = forwarder.AcceptAsync(forwarder.stopping.Token);
+            return forwarder;
+        }
+
+        /// <summary>Stops listening, ends every relay, and returns once each has closed both of its sockets.</summary>
+        /// <returns>A task that completes when the forwarder has stopped.</returns>
+        public async ValueTask DisposeAsync()
+        {
+            await stopping.CancelAsync();
+            listener.Stop();
+            await accepting;
+
+            // The accept loop has ended, so no relay is added while these are awaited.
+            await Task.WhenAll(relays);
+            stopping.Dispose();
+        }
+
+        private async Task AcceptAsync(CancellationToken stop)
+        {
+            while (true)
+            {
+                Socket client;
+                try
+                {
+                    client = await listener.AcceptSocketAsync(stop);
+                }
+                catch (Exception failure) when (stop.IsCancellationRequested && IsTransportEnd(failure))
+                {
+                    return;
+                }
+
+                if (forwarding)
+                {
+                    relays.Add(RelayAsync(client, stop));
+                }
+                else
+                {
+                    // A zero linger timeout makes the close send a TCP reset, as a server that has gone away does.
+                    client.LingerState = new LingerOption(enable: true, seconds: 0);
+                    client.Dispose();
+                }
+            }
+        }
+
+        // Relays one accepted connection until either side closes it or the forwarder stops. A transport error ends
+        // the relay quietly: the test asserts what SqlClient reports, not how the relay ended.
+        private async Task RelayAsync(Socket client, CancellationToken stop)
+        {
+            using var upstream = new TcpClient();
+            try
+            {
+                try
+                {
+                    await upstream.ConnectAsync(upstreamHost, upstreamPort, stop);
+                }
+                catch (Exception failure) when (IsTransportEnd(failure))
+                {
+                    return;
+                }
+
+                await using var clientStream = new NetworkStream(client, ownsSocket: false);
+                NetworkStream serverStream = upstream.GetStream();
+                Task toServer = PumpAsync(clientStream, serverStream, stop);
+                Task toClient = PumpAsync(serverStream, clientStream, stop);
+                await Task.WhenAny(toServer, toClient);
+
+                // One side has closed: closing both sockets ends the other direction as well.
+                client.Close();
+                upstream.Close();
+                await Task.WhenAll(toServer, toClient);
+            }
+            finally
+            {
+                client.Dispose();
+            }
+        }
+
+        private static async Task PumpAsync(Stream source, Stream destination, CancellationToken stop)
+        {
+            try
+            {
+                await source.CopyToAsync(destination, stop);
+            }
+            catch (Exception failure) when (IsTransportEnd(failure))
+            {
+                // The connection closed or the forwarder stopped; either way this direction is done.
+            }
+        }
+
+        private static bool IsTransportEnd(Exception failure) =>
+            failure is IOException or SocketException or OperationCanceledException or ObjectDisposedException;
     }
 }

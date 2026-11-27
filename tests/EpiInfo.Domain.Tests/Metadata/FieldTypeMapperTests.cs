@@ -438,6 +438,29 @@ public sealed class FieldTypeMapperTests
             () => FieldTypeMapper.DescribeColumn("F1", sqlTypeName, maxLengthBytes));
     }
 
+    // nchar(n) and nvarchar(n) both admit text of up to n UTF-16 code units, judged as given and never trimmed, so
+    // trailing and all-space text count every space, and a surrogate pair counts two units. Shorter text is admitted
+    // on nchar(n) too, where SQL Server pads it with spaces to n; only longer text is refused.
+    [Theory]
+    [InlineData("nchar(5)", "abcd", true)]
+    [InlineData("nchar(5)", "abcde", true)]
+    [InlineData("nchar(5)", "ab   ", true)]
+    [InlineData("nchar(5)", "     ", true)]
+    [InlineData("nchar(5)", "abc\U0001F600", true)]
+    [InlineData("nchar(5)", "abcd\U0001F600", false)]
+    [InlineData("nchar(5)", "abcdef", false)]
+    [InlineData("nvarchar(5)", "abcd", true)]
+    [InlineData("nvarchar(5)", "ab  ", true)]
+    public void IsRepresentable_TextOnBoundedCharacterColumn_IsAtMostTheColumnsCodeUnits(
+        string sqlType,
+        string text,
+        bool expected)
+    {
+        ColumnMetadata column = Column(DefaultFieldName, sqlType);
+
+        Assert.Equal(expected, FieldTypeMapper.IsRepresentable(column, FieldValue.FromText(text)));
+    }
+
     [Theory]
     [InlineData(FieldType.Label, false, false)]
     [InlineData(FieldType.Group, false, false)]

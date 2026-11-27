@@ -13,6 +13,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import { createApiClient } from '../api/client';
 import type {
+  DialogMessage,
   FieldEventKind,
   FieldEventResponse,
   FieldValue,
@@ -57,8 +58,27 @@ const ASSIGNED_AGE = 11;
 
 type EventKey = `${FieldEventKind}:${string}`;
 
-/** Field-event responses by `${event}:${fieldName}`; an unlisted event gets the empty envelope. */
-type ConfiguredResponses = Partial<Record<EventKey, Partial<FieldEventResponse>>>;
+/**
+ * Field-event responses by `${event}:${fieldName}`; an unlisted event gets the empty envelope.
+ * A promise holds its event in flight until the test settles it (heldResponse).
+ */
+type ConfiguredResponses = Partial<
+  Record<EventKey, Partial<FieldEventResponse> | Promise<Partial<FieldEventResponse>>>
+>;
+
+/** A field-event response the test releases when it chooses. */
+interface HeldResponse {
+  readonly response: Promise<Partial<FieldEventResponse>>;
+  readonly release: (effects: Partial<FieldEventResponse>) => void;
+}
+
+function heldResponse(): HeldResponse {
+  let release: (effects: Partial<FieldEventResponse>) => void = () => undefined;
+  const response = new Promise<Partial<FieldEventResponse>>((resolve) => {
+    release = resolve;
+  });
+  return { response, release };
+}
 
 function envelope(effects: Partial<FieldEventResponse> = {}): FieldEventResponse {
   return { enabled: [], disabled: [], cleared: [], assigned: {}, dialogs: [], diagnostics: [], ...effects };
@@ -193,7 +213,7 @@ function createFakeApi(responses: ConfiguredResponses): FakeApi {
         const text = await request.text();
         const sent = readFieldEvent(JSON.parse(text));
         events.push(sent);
-        return json(envelope(responses[`${sent.event}:${sent.fieldName}`]));
+        return json(envelope(await responses[`${sent.event}:${sent.fieldName}`]));
       }
       faults.push(`unrouted ${line}`);
     } catch (e) {
@@ -299,6 +319,42 @@ function sentEvent(api: FakeApi, key: EventKey): SentEvent {
     throw new Error(`no ${key} event was sent`);
   }
   return found;
+}
+
+/** The "Message n of N" counter a message dialog shows, or null when it shows none. */
+function messageCounter(dialog: HTMLElement): string | null {
+  return within(dialog).queryByText(/^Message \d+ of \d+$/)?.textContent ?? null;
+}
+
+/** A message as the user sees it: the dialog's name, its text and its counter. */
+interface ShownMessage {
+  readonly title: string;
+  readonly message: string;
+  readonly counter: string | null;
+}
+
+/** How each of `dialogs` is shown when its session holds exactly these messages. */
+function shownMessages(dialogs: readonly DialogMessage[], counters: readonly (string | null)[]): ShownMessage[] {
+  if (counters.length !== dialogs.length) {
+    throw new Error('every message needs its expected counter');
+  }
+  return dialogs.map((dialog, index) => ({
+    title: dialog.title ?? 'Message',
+    message: dialog.message,
+    counter: counters[index],
+  }));
+}
+
+/** Reads each message in turn, with focus on its OK, and presses Enter to dismiss it. */
+async function readAndDismiss(messages: readonly ShownMessage[]): Promise<void> {
+  for (const { title, message, counter } of messages) {
+    const dialog = await screen.findByRole('dialog', { name: title });
+    expect(within(dialog).queryByText(message)).not.toBeNull();
+    expect(messageCounter(dialog)).toBe(counter);
+    const ok = within(dialog).getByRole('button', { name: 'OK' });
+    expect(document.activeElement).toBe(ok);
+    fireEvent.keyDown(ok, { key: 'Enter' });
+  }
 }
 
 describe('FieldEffects: check-code effects reach the screen (SC-10)', () => {
@@ -464,6 +520,79 @@ describe('FieldEffects: check-code effects reach the screen (SC-10)', () => {
     });
     // Opening and closing the dialogs raised no event of its own.
     expect(eventKeys(api)).toEqual(['FieldBefore:DOB', 'FieldAfter:DOB']);
+  });
+
+  // A session runs from the first message to the dismissal of the last; the next event's
+  // messages start a new one, numbered from 1 again. A lone message shows no counter.
+  it.each([
+    {
+      batch: 'three messages',
+      dialogs: [
+        { message: 'First', title: 'Title A' },
+        { message: 'Second', title: null },
+        { message: 'Third', title: 'Title C' },
+      ],
+      counters: ['Message 1 of 3', 'Message 2 of 3', 'Message 3 of 3'],
+    },
+    { batch: 'one message', dialogs: [{ message: 'Only', title: 'Title A' }], counters: [null] },
+  ])('numbers $batch of one event across its session, and the next session alike', async ({ dialogs, counters }) => {
+    const api = await openForm({ 'FieldAfter:DOB': { dialogs }, 'FieldAfter:FirstName': { dialogs } });
+
+    for (const name of ['DOB', 'FirstName']) {
+      const element = fieldControl(name);
+      focus(element);
+      blur(element);
+
+      await readAndDismiss(shownMessages(dialogs, counters));
+      await waitFor(() => {
+        expect(screen.queryByRole('dialog')).toBeNull();
+      });
+    }
+    expect(eventKeys(api)).toEqual(['FieldBefore:DOB', 'FieldAfter:DOB', 'FieldBefore:FirstName', 'FieldAfter:FirstName']);
+  });
+
+  // FieldAfter is sent behind FieldBefore, so its messages reach a dialog that is already
+  // open: the session's total grows, and the numbering goes on from the message on screen.
+  it('adds the messages of an event answered while the dialog is open to its session', async () => {
+    const fieldAfter = heldResponse();
+    const api = await openForm({
+      'FieldBefore:DOB': {
+        dialogs: [
+          { message: 'First', title: 'Title A' },
+          { message: 'Second', title: 'Title B' },
+        ],
+      },
+      'FieldAfter:DOB': fieldAfter.response,
+    });
+
+    const dob = fieldControl('DOB');
+    focus(dob);
+    blur(dob);
+
+    await readAndDismiss([{ title: 'Title A', message: 'First', counter: 'Message 1 of 2' }]);
+    expect(messageCounter(await screen.findByRole('dialog', { name: 'Title B' }))).toBe('Message 2 of 2');
+    await waitFor(() => {
+      expect(eventKeys(api)).toEqual(['FieldBefore:DOB', 'FieldAfter:DOB']);
+    });
+
+    fieldAfter.release({
+      dialogs: [
+        { message: 'Third', title: 'Title C' },
+        { message: 'Fourth', title: null },
+      ],
+    });
+    await waitFor(() => {
+      expect(messageCounter(screen.getByRole('dialog', { name: 'Title B' }))).toBe('Message 2 of 4');
+    });
+
+    await readAndDismiss([
+      { title: 'Title B', message: 'Second', counter: 'Message 2 of 4' },
+      { title: 'Title C', message: 'Third', counter: 'Message 3 of 4' },
+      { title: 'Message', message: 'Fourth', counter: 'Message 4 of 4' },
+    ]);
+    await waitFor(() => {
+      expect(screen.queryByRole('dialog')).toBeNull();
+    });
   });
 
   it('shows a value assigned to a read-only field and keeps the field disabled', async () => {

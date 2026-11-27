@@ -16,7 +16,9 @@ public enum FieldValueKind
 
     /// <summary>
     /// A finite number, held by number fields: an exact signed 64-bit integer when the number is a whole number
-    /// within that range, otherwise its floor when that lies within the range, and always its nearest double.
+    /// within that range, otherwise its floor when that lies within the range, and always its nearest double. A
+    /// number that holds no exact signed 64-bit integer although its nearest double is whole also keeps its exact
+    /// JSON number token.
     /// </summary>
     Number = 2,
 
@@ -35,15 +37,19 @@ public enum FieldValueKind
 /// JSON scalar and the data layer converts it to a SQL parameter.
 /// </summary>
 /// <remarks>
-/// Each factory fills only the slots of its own kind and leaves every other slot at its default, so the
-/// synthesized record equality is exact and values of different kinds are never equal. A number fills three
-/// slots: its nearest double always; its exact signed 64-bit integer when the number is exactly a whole number
-/// within that range; and otherwise its floor, the greatest integer not above its exact value, when that floor
-/// lies within the range. Two numbers are therefore equal only when all three slots agree, so
-/// <c>FromNumber(2)</c> equals <c>FromInteger(2)</c>, a number never equals the option index of the same
-/// value, a non-integral number whose nearest double is whole never equals that whole number, and two numbers
-/// that hold no exact integer are equal only when their nearest doubles and their floors agree, so
-/// <c>2.0000000000000001</c> and <c>1.9999999999999999</c>, which share the nearest double 2, differ.
+/// Each factory fills only the slots of its own kind and leaves every other slot at its default, so equality is
+/// exact over those slots and values of different kinds are never equal. A number fills three slots: its nearest
+/// double always; its exact signed 64-bit integer when the number is exactly a whole number within that range; and
+/// otherwise its floor, the greatest integer not above its exact value, when that floor lies within the range. Two
+/// numbers are therefore equal only when all three slots agree, so <c>FromNumber(2)</c> equals
+/// <c>FromInteger(2)</c>, a number never equals the option index of the same value, a non-integral number whose
+/// nearest double is whole never equals that whole number, and two numbers that hold no exact integer are equal
+/// only when their nearest doubles and their floors agree, so <c>2.0000000000000001</c> and
+/// <c>1.9999999999999999</c>, which share the nearest double 2, differ.
+/// A number that holds no exact integer although its nearest double is whole also keeps a JSON number token exactly
+/// equal to it (<see cref="TryGetJsonNumber"/>), so that the wire never carries that whole double in its place.
+/// The token is a spelling of the value, not a slot: equality and hashing ignore it, so a number compares exactly as
+/// its three slots decide, however it was spelled.
 /// The value text is field data, which the redaction policy keeps out of logs and error bodies:
 /// never pass a <see cref="FieldValue"/>, its <see cref="ToString"/> or its
 /// <see cref="ToInvariantString"/> to a logger or an error message.
@@ -65,6 +71,12 @@ public readonly record struct FieldValue
     // lies in, which its nearest double can lose: 9007199254740992.5 has the nearest double 9007199254740992.
     private readonly long? _floor;
 
+    // Set exactly when Kind is Number, the number holds no exact 64-bit integer and its nearest double is whole, which
+    // only a number parsed from text or coerced from a decimal or ulong can be: the RFC 8259 number token exactly equal
+    // in value to it, such as 1.0000000000000001, whose nearest double is the whole number 1. A double is exact as
+    // given, so FromNumber never needs one. Not part of equality or hashing.
+    private readonly string? _jsonNumber;
+
     private FieldValue(
         FieldValueKind kind,
         string? text = null,
@@ -73,7 +85,8 @@ public readonly record struct FieldValue
         DateOnly date = default,
         int index = 0,
         long? integer = null,
-        long? floor = null)
+        long? floor = null,
+        string? jsonNumber = null)
     {
         Kind = kind;
         _text = text;
@@ -83,6 +96,7 @@ public readonly record struct FieldValue
         _index = index;
         _integer = integer;
         _floor = floor;
+        _jsonNumber = jsonNumber;
     }
 
     /// <summary>The null value, equal to <c>default(FieldValue)</c>.</summary>
@@ -152,37 +166,55 @@ public readonly record struct FieldValue
     /// 64-bit range: a non-integral number such as <c>2.0000000000000001</c>, or an integer beyond that range
     /// such as <c>9223372036854775808</c>. Its nearest double and its exact floor are kept, and
     /// <see cref="TryGetInteger"/> returns <see langword="false"/> even when that double is whole, so rounding
-    /// cannot turn the number into an integer or an option index. Negative zero is stored as zero.
+    /// cannot turn the number into an integer or an option index. When that double is whole, the exact JSON number
+    /// token is kept as well, which <see cref="TryGetJsonNumber"/> returns. Negative zero is stored as zero.
     /// </summary>
     /// <remarks>
     /// When <paramref name="nearest"/> is not whole, the floor is fully determined by it: no integer lies between
     /// a number and its non-integral nearest double, because every integer of that magnitude is itself a double.
-    /// A different floor is therefore a caller error and is rejected. When <paramref name="nearest"/> is whole,
-    /// as for <c>2.0000000000000001</c>, <c>1.9999999999999999</c> or <c>1e-400</c>, only the caller knows the
-    /// exact number, and its floor is kept as given.
+    /// A different floor is therefore a caller error and is rejected, and the double itself states the number as a
+    /// non-integral one, so no token is kept. When <paramref name="nearest"/> is whole, as for
+    /// <c>2.0000000000000001</c>, <c>1.9999999999999999</c> or <c>1e-400</c>, only the caller knows the exact
+    /// number, so its floor and its token are kept as given.
     /// </remarks>
     /// <param name="nearest">The double nearest to the number.</param>
     /// <param name="floor">
     /// The greatest integer not above the number's exact value, or <see langword="null"/> when that integer lies
     /// beyond the signed 64-bit range.
     /// </param>
+    /// <param name="jsonNumber">
+    /// An RFC 8259 number token exactly equal in value to the number, such as <c>2.0000000000000001</c>: required
+    /// when <paramref name="nearest"/> is whole, and ignored otherwise.
+    /// </param>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="nearest"/> is NaN or infinite.</exception>
     /// <exception cref="ArgumentException">
-    /// <paramref name="nearest"/> is not whole and <paramref name="floor"/> is not its floor.
+    /// <paramref name="nearest"/> is not whole and <paramref name="floor"/> is not its floor, or
+    /// <paramref name="nearest"/> is whole and <paramref name="jsonNumber"/> is <see langword="null"/> or empty.
     /// </exception>
-    internal static FieldValue FromNonInt64Number(double nearest, long? floor)
+    internal static FieldValue FromNonInt64Number(double nearest, long? floor, string? jsonNumber)
     {
         if (!double.IsFinite(nearest))
         {
             throw new ArgumentOutOfRangeException(nameof(nearest), "A number field value must be finite.");
         }
 
+        var nearestIsWhole = Math.Truncate(nearest) == nearest;
+
         // A non-integral double has magnitude below 2^52, so its floor converts to long exactly.
-        if (Math.Truncate(nearest) != nearest && floor != (long)Math.Floor(nearest))
+        if (!nearestIsWhole && floor != (long)Math.Floor(nearest))
         {
             throw new ArgumentException(
                 "The floor of a number whose nearest double is not whole must be the floor of that double.",
                 nameof(floor));
+        }
+
+        // Written as its double, such a number would reach the wire as a different, whole number, which an integer
+        // column or an option index could then accept.
+        if (nearestIsWhole && string.IsNullOrEmpty(jsonNumber))
+        {
+            throw new ArgumentException(
+                "A number whose nearest double is whole must keep its exact JSON number token.",
+                nameof(jsonNumber));
         }
 
         // A number nearer to zero than the smallest double, such as -1e-400, rounds to -0; it is stored as +0,
@@ -192,7 +224,11 @@ public readonly record struct FieldValue
             nearest = 0d;
         }
 
-        return new FieldValue(FieldValueKind.Number, number: nearest, floor: floor);
+        return new FieldValue(
+            FieldValueKind.Number,
+            number: nearest,
+            floor: floor,
+            jsonNumber: nearestIsWhole ? jsonNumber : null);
     }
 
     /// <summary>Creates a boolean value.</summary>
@@ -307,6 +343,54 @@ public readonly record struct FieldValue
         return false;
     }
 
+    /// <summary>
+    /// Gets the exact JSON number token of a number value that holds no exact signed 64-bit integer although its
+    /// nearest double is whole, such as <c>2.0000000000000001</c>, <c>9007199254740992.5</c> or <c>1e-400</c>, whose
+    /// nearest doubles are 2, 9007199254740992 and 0. The token is an RFC 8259 number exactly equal in value to the
+    /// number, spelled with no <c>+</c>, no leading zero in its integer part and a digit on each side of any point,
+    /// so writing it in place of the double keeps a non-integral number non-integral on the wire. A number whose
+    /// double already keeps its integrality, such as <c>37.5</c>, <c>FromNumber(2)</c> or an exact integer, has none.
+    /// </summary>
+    /// <param name="value">The token, or <see langword="null"/> when this is not such a number.</param>
+    /// <returns>Whether this is a number value holding such a token.</returns>
+    public bool TryGetJsonNumber([NotNullWhen(true)] out string? value)
+    {
+        value = Kind == FieldValueKind.Number ? _jsonNumber : null;
+        return value is not null;
+    }
+
+    /// <summary>
+    /// Whether <paramref name="other"/> holds the same value: the same kind and equal slots of that kind, as the
+    /// type remarks describe. The JSON number token is a spelling of a number, not a slot, and is not compared.
+    /// </summary>
+    /// <param name="other">The value to compare with.</param>
+    /// <returns>Whether the two values are equal.</returns>
+    public bool Equals(FieldValue other) =>
+        Kind == other.Kind
+        && string.Equals(_text, other._text, StringComparison.Ordinal)
+        && _number.Equals(other._number)
+        && _boolean == other._boolean
+        && _date == other._date
+        && _index == other._index
+        && _integer == other._integer
+        && _floor == other._floor;
+
+    /// <summary>A hash code over the slots <see cref="Equals(FieldValue)"/> compares.</summary>
+    /// <returns>The hash code.</returns>
+    public override int GetHashCode()
+    {
+        var hash = default(HashCode);
+        hash.Add(Kind);
+        hash.Add(_text);
+        hash.Add(_number);
+        hash.Add(_boolean);
+        hash.Add(_date);
+        hash.Add(_index);
+        hash.Add(_integer);
+        hash.Add(_floor);
+        return hash.ToHashCode();
+    }
+
     /// <summary>Gets the boolean when this is a boolean value.</summary>
     /// <param name="value">The boolean, or <see langword="false"/> when this is not a boolean value.</param>
     /// <returns>Whether this is a boolean value.</returns>
@@ -361,7 +445,8 @@ public readonly record struct FieldValue
     /// Formats the value with the invariant culture: <see langword="null"/> for the null value, text as
     /// stored, a number as its exact integer (<c>9007199254740993</c>) when it holds one and otherwise its
     /// double in round-trip form (<c>37.5</c>), <c>true</c> or <c>false</c>, a date as
-    /// <c>yyyy-MM-dd</c>, and an index as an integer.
+    /// <c>yyyy-MM-dd</c>, and an index as an integer. A number's JSON number token
+    /// (<see cref="TryGetJsonNumber"/>) is the wire form only and is not used here.
     /// </summary>
     /// <returns>The formatted value, or <see langword="null"/> for the null value.</returns>
     public string? ToInvariantString() => Kind switch

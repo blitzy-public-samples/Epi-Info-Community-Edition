@@ -3901,6 +3901,333 @@ public sealed class SearchStatementBoundsTests : IAsyncLifetime
 }
 
 /// <summary>
+/// Unit tests of the converter's readers of base-table system columns and of the integers a statement computes:
+/// <see cref="ColumnValueConverter.FromSystemInteger"/>, <see cref="ColumnValueConverter.FromSystemText"/> and
+/// <see cref="ColumnValueConverter.FromComputedInteger"/>. A stored system integer is accepted only with the runtime
+/// type SqlClient returns for its reader-built column, <c>byte</c> for <c>tinyint</c>, <c>short</c> for
+/// <c>smallint</c> and <c>int</c> for <c>int</c>; a computed integer only with the type its builder declares,
+/// <c>long</c> for <c>bigint</c> and <c>int</c> for <c>int</c>; and each is narrowed to the port's <c>int</c>
+/// without wrapping. A system text is returned exactly as stored, trailing spaces included. Every refusal of a read
+/// value is fixed text that names no value.
+/// </summary>
+/// <remarks>
+/// The columns are the reader-built columns of the seeded <c>FoodHistory</c> form, read with
+/// <c>SqlMetadataReader.ReadFormAsync</c>, which sends only <c>SELECT</c>: its base table's <c>UniqueKey</c>
+/// (<c>int</c>), <c>RecStatus</c> (<c>smallint</c>) and <c>GlobalRecordId</c> (<c>nvarchar(255)</c>), and the first
+/// page-table column of each other SQL type a case names. No seeded table has a <c>bigint</c> column and no test
+/// creates a schema object, so the <c>bigint</c> arm, whose exact-type check and narrowing the system reader shares
+/// with the computed one, is pinned through <see cref="DbType.Int64"/> computed integers. The cases read only the
+/// catalogue, which no test changes, so they hold no <see cref="DatabaseWriteLock"/>; every converted value is given
+/// in-process.
+/// </remarks>
+[Collection(DatabaseCollections.Database)]
+[Trait("Category", "Integration")]
+public sealed class SystemValueConversionTests : IAsyncLifetime
+{
+    // The fixed text of each refusal of a read value, naming no value, column or field.
+    private const string MissingValueMessage = "A system column or computed integer was read with no value.";
+    private const string UnexpectedTypeMessage =
+        "A system column or computed integer was not read as its native type.";
+    private const string OutOfRangeMessage = "A system column or computed integer lies outside the int range.";
+
+    // The seeded form whose base and page tables hold every column type the cases name
+    // (testdata/sql/05_data_tables.sql: FoodHistory, FoodHistory2, FoodHistory3).
+    private const string SeededForm = "FoodHistory";
+
+    private FormSchema? _schema;
+
+    public async Task InitializeAsync()
+    {
+        await TestDatabase.EnsureReachableAsync();
+
+        var options = new DatabaseOptions(TestDatabase.ConnectionString);
+        var reader = new SqlMetadataReader(new SqlConnectionFactory(options), options, NullSqlCommandObserver.Instance);
+        FormSummary summary = Assert.Single(
+            await reader.ListFormsAsync(CancellationToken.None),
+            form => string.Equals(form.Name, SeededForm, StringComparison.Ordinal));
+
+        await using SqlConnection connection = await TestDatabase.OpenConnectionAsync();
+        (FormMetadata Form, FormSchema Schema)? read =
+            await reader.ReadFormAsync(connection, transaction: null, summary.ViewId, CancellationToken.None);
+        Assert.True(read is not null, "The seeded form has no metadata.");
+        _schema = read.Value.Schema;
+    }
+
+    public Task DisposeAsync() => Task.CompletedTask;
+
+    // Each stored value is given by its runtime type and invariant text, so every row keeps its exact CLR type and
+    // shows it in the test name.
+    [Theory]
+    [InlineData("UniqueKey", TypeCode.Int32, "2147483647", 2147483647)]
+    [InlineData("UniqueKey", TypeCode.Int32, "1", 1)]
+    [InlineData("RecStatus", TypeCode.Int16, "-32768", -32768)]
+    [InlineData("RecStatus", TypeCode.Int16, "1", 1)]
+    [InlineData("tinyint", TypeCode.Byte, "255", 255)]
+    [InlineData("tinyint", TypeCode.Byte, "0", 0)]
+    public void FromSystemInteger_ValueOfTheColumnsNativeType_IsThatInteger(
+        string column,
+        TypeCode storedType,
+        string storedText,
+        int expected)
+    {
+        Assert.Equal(expected, ColumnValueConverter.FromSystemInteger(Column(column), Stored(storedType, storedText)));
+    }
+
+    // Another integer width, a double, a decimal or text from an integer column did not come from it as stored.
+    [Theory]
+    [InlineData("UniqueKey", TypeCode.Int64, "17")]
+    [InlineData("UniqueKey", TypeCode.Int16, "17")]
+    [InlineData("UniqueKey", TypeCode.Byte, "17")]
+    [InlineData("UniqueKey", TypeCode.Double, "17")]
+    [InlineData("UniqueKey", TypeCode.Decimal, "17")]
+    [InlineData("UniqueKey", TypeCode.String, "17")]
+    [InlineData("RecStatus", TypeCode.Int32, "17")]
+    [InlineData("RecStatus", TypeCode.Int64, "17")]
+    [InlineData("RecStatus", TypeCode.Byte, "17")]
+    [InlineData("RecStatus", TypeCode.Double, "17")]
+    [InlineData("RecStatus", TypeCode.String, "17")]
+    [InlineData("tinyint", TypeCode.Int16, "17")]
+    [InlineData("tinyint", TypeCode.Int32, "17")]
+    [InlineData("tinyint", TypeCode.Int64, "17")]
+    [InlineData("tinyint", TypeCode.SByte, "17")]
+    [InlineData("tinyint", TypeCode.Double, "17")]
+    [InlineData("tinyint", TypeCode.String, "17")]
+    public void FromSystemInteger_ValueOfAnotherRuntimeType_IsRefusedWithFixedText(
+        string column,
+        TypeCode storedType,
+        string storedText)
+    {
+        object stored = Stored(storedType, storedText);
+        Assert.Equal(storedType, Type.GetTypeCode(stored.GetType()));
+
+        InvalidOperationException failure = Assert.Throws<InvalidOperationException>(
+            () => ColumnValueConverter.FromSystemInteger(Column(column), stored));
+
+        Assert.Equal(UnexpectedTypeMessage, failure.Message);
+        Assert.DoesNotContain(storedText, failure.Message, StringComparison.Ordinal);
+    }
+
+    // A system column never reads NULL; DBNull and null are refused alike.
+    [Theory]
+    [InlineData("UniqueKey")]
+    [InlineData("RecStatus")]
+    [InlineData("tinyint")]
+    public void FromSystemInteger_NoValue_IsRefusedWithFixedText(string column)
+    {
+        ColumnSchema schemaColumn = Column(column);
+
+        Assert.Equal(
+            MissingValueMessage,
+            Assert.Throws<InvalidOperationException>(
+                () => ColumnValueConverter.FromSystemInteger(schemaColumn, DBNull.Value)).Message);
+        Assert.Equal(
+            MissingValueMessage,
+            Assert.Throws<InvalidOperationException>(
+                () => ColumnValueConverter.FromSystemInteger(schemaColumn, null)).Message);
+    }
+
+    // The column is checked before the value, so a column that is not an integer type is refused for any value.
+    [Theory]
+    [InlineData("GlobalRecordId")]
+    [InlineData("float")]
+    [InlineData("bit")]
+    [InlineData("datetime")]
+    [InlineData("ntext")]
+    public void FromSystemInteger_ColumnThatIsNotAnIntegerType_IsRefusedWhateverTheValue(string column)
+    {
+        ColumnSchema schemaColumn = Column(column);
+
+        Assert.Throws<ArgumentException>("column", () => ColumnValueConverter.FromSystemInteger(schemaColumn, 1));
+        Assert.Throws<ArgumentException>(
+            "column",
+            () => ColumnValueConverter.FromSystemInteger(schemaColumn, DBNull.Value));
+    }
+
+    // A spelling with trailing or leading spaces, and the empty string, come back exactly as given.
+    [Theory]
+    [InlineData("GlobalRecordId", "3f2504e0-4f89-11d3-9a0c-0305e82c3301")]
+    [InlineData("GlobalRecordId", "3f2504e0-4f89-11d3-9a0c-0305e82c3301   ")]
+    [InlineData("GlobalRecordId", "")]
+    [InlineData("ntext", "  stored text  ")]
+    public void FromSystemText_TextColumn_ReturnsTheTextExactlyAsStored(string column, string stored)
+    {
+        Assert.Equal(stored, ColumnValueConverter.FromSystemText(Column(column), stored));
+    }
+
+    [Theory]
+    [InlineData(TypeCode.Int32, "17")]
+    [InlineData(TypeCode.Int64, "17")]
+    [InlineData(TypeCode.Double, "17")]
+    [InlineData(TypeCode.Char, "x")]
+    [InlineData(TypeCode.Boolean, "True")]
+    public void FromSystemText_ValueThatIsNotAString_IsRefusedWithFixedText(TypeCode storedType, string storedText)
+    {
+        object stored = Stored(storedType, storedText);
+        Assert.Equal(storedType, Type.GetTypeCode(stored.GetType()));
+
+        InvalidOperationException failure = Assert.Throws<InvalidOperationException>(
+            () => ColumnValueConverter.FromSystemText(Column("GlobalRecordId"), stored));
+
+        Assert.Equal(UnexpectedTypeMessage, failure.Message);
+        Assert.DoesNotContain(storedText, failure.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("GlobalRecordId")]
+    [InlineData("ntext")]
+    public void FromSystemText_NoValue_IsRefusedWithFixedText(string column)
+    {
+        ColumnSchema schemaColumn = Column(column);
+
+        Assert.Equal(
+            MissingValueMessage,
+            Assert.Throws<InvalidOperationException>(
+                () => ColumnValueConverter.FromSystemText(schemaColumn, DBNull.Value)).Message);
+        Assert.Equal(
+            MissingValueMessage,
+            Assert.Throws<InvalidOperationException>(
+                () => ColumnValueConverter.FromSystemText(schemaColumn, null)).Message);
+    }
+
+    [Theory]
+    [InlineData("UniqueKey")]
+    [InlineData("RecStatus")]
+    [InlineData("tinyint")]
+    [InlineData("float")]
+    [InlineData("bit")]
+    [InlineData("datetime")]
+    public void FromSystemText_ColumnThatIsNotACharacterType_IsRefusedWhateverTheValue(string column)
+    {
+        ColumnSchema schemaColumn = Column(column);
+
+        Assert.Throws<ArgumentException>("column", () => ColumnValueConverter.FromSystemText(schemaColumn, "text"));
+        Assert.Throws<ArgumentException>(
+            "column",
+            () => ColumnValueConverter.FromSystemText(schemaColumn, DBNull.Value));
+    }
+
+    // COUNT_BIG, ROW_NUMBER and the bigint SUM windows are declared Int64; the list's page flag is declared Int32.
+    [Theory]
+    [InlineData(DbType.Int64, TypeCode.Int64, "2147483647", 2147483647)]
+    [InlineData(DbType.Int64, TypeCode.Int64, "-2147483648", -2147483648)]
+    [InlineData(DbType.Int64, TypeCode.Int64, "0", 0)]
+    [InlineData(DbType.Int32, TypeCode.Int32, "1", 1)]
+    [InlineData(DbType.Int32, TypeCode.Int32, "0", 0)]
+    public void FromComputedInteger_ValueOfTheDeclaredType_IsThatInteger(
+        DbType nativeType,
+        TypeCode storedType,
+        string storedText,
+        int expected)
+    {
+        Assert.Equal(expected, ColumnValueConverter.FromComputedInteger(nativeType, Stored(storedType, storedText)));
+    }
+
+    [Theory]
+    [InlineData(DbType.Int64, TypeCode.Int32, "17")]
+    [InlineData(DbType.Int64, TypeCode.Int16, "17")]
+    [InlineData(DbType.Int64, TypeCode.Byte, "17")]
+    [InlineData(DbType.Int64, TypeCode.Double, "17")]
+    [InlineData(DbType.Int64, TypeCode.Decimal, "17")]
+    [InlineData(DbType.Int64, TypeCode.String, "17")]
+    [InlineData(DbType.Int32, TypeCode.Int64, "17")]
+    [InlineData(DbType.Int32, TypeCode.Int16, "17")]
+    [InlineData(DbType.Int32, TypeCode.Byte, "17")]
+    [InlineData(DbType.Int32, TypeCode.Double, "17")]
+    [InlineData(DbType.Int32, TypeCode.String, "17")]
+    public void FromComputedInteger_ValueOfAnotherRuntimeType_IsRefusedWithFixedText(
+        DbType nativeType,
+        TypeCode storedType,
+        string storedText)
+    {
+        object stored = Stored(storedType, storedText);
+        Assert.Equal(storedType, Type.GetTypeCode(stored.GetType()));
+
+        InvalidOperationException failure = Assert.Throws<InvalidOperationException>(
+            () => ColumnValueConverter.FromComputedInteger(nativeType, stored));
+
+        Assert.Equal(UnexpectedTypeMessage, failure.Message);
+        Assert.DoesNotContain(storedText, failure.Message, StringComparison.Ordinal);
+    }
+
+    // A bigint just beyond each end of the int range, and the bigint extremes, fail rather than wrap.
+    [Theory]
+    [InlineData("2147483648")]
+    [InlineData("-2147483649")]
+    [InlineData("9223372036854775807")]
+    [InlineData("-9223372036854775808")]
+    public void FromComputedInteger_BigintBeyondTheIntRange_IsRefusedWithFixedText(string storedText)
+    {
+        object stored = Stored(TypeCode.Int64, storedText);
+
+        InvalidOperationException failure = Assert.Throws<InvalidOperationException>(
+            () => ColumnValueConverter.FromComputedInteger(DbType.Int64, stored));
+
+        Assert.Equal(OutOfRangeMessage, failure.Message);
+        Assert.DoesNotContain(storedText, failure.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(DbType.Int64)]
+    [InlineData(DbType.Int32)]
+    public void FromComputedInteger_NoValue_IsRefusedWithFixedText(DbType nativeType)
+    {
+        Assert.Equal(
+            MissingValueMessage,
+            Assert.Throws<InvalidOperationException>(
+                () => ColumnValueConverter.FromComputedInteger(nativeType, DBNull.Value)).Message);
+        Assert.Equal(
+            MissingValueMessage,
+            Assert.Throws<InvalidOperationException>(
+                () => ColumnValueConverter.FromComputedInteger(nativeType, null)).Message);
+    }
+
+    // No computed column the builders declare has another type, so any other declaration is a programming error.
+    [Theory]
+    [InlineData(DbType.Byte)]
+    [InlineData(DbType.Int16)]
+    [InlineData(DbType.UInt64)]
+    [InlineData(DbType.Double)]
+    [InlineData(DbType.Decimal)]
+    [InlineData(DbType.String)]
+    public void FromComputedInteger_UndeclaredNativeType_IsRefusedWhateverTheValue(DbType nativeType)
+    {
+        Assert.Throws<ArgumentException>("nativeType", () => ColumnValueConverter.FromComputedInteger(nativeType, 1));
+        Assert.Throws<ArgumentException>(
+            "nativeType",
+            () => ColumnValueConverter.FromComputedInteger(nativeType, DBNull.Value));
+    }
+
+    // A value of the given runtime type, parsed from its invariant text and boxed as a data reader boxes it.
+    private static object Stored(TypeCode type, string text) =>
+        Convert.ChangeType(text, type, CultureInfo.InvariantCulture)
+        ?? throw new ArgumentException("The stored text did not convert to a value.", nameof(text));
+
+    // The reader-built column a case names: a base-table system column by its name, or else the first column of that
+    // SQL type in the form's page tables, in page and column order.
+    private ColumnSchema Column(string name)
+    {
+        FormSchema schema = _schema ?? throw new InvalidOperationException("The seeded form schema was not read.");
+        return name switch
+        {
+            nameof(FormSchema.UniqueKey) => RecordSqlBuilder.Require(schema.UniqueKey),
+            nameof(FormSchema.RecStatus) => RecordSqlBuilder.Require(schema.RecStatus),
+            nameof(FormSchema.GlobalRecordId) => RecordSqlBuilder.Require(schema.GlobalRecordId),
+            _ => PageColumnOfType(schema, name),
+        };
+    }
+
+    private static ColumnSchema PageColumnOfType(FormSchema schema, string sqlType)
+    {
+        ColumnSchema? column = schema.Pages
+            .SelectMany(page => page.Table?.Columns ?? Array.Empty<ColumnSchema>())
+            .FirstOrDefault(candidate =>
+                string.Equals(candidate.SqlTypeName, sqlType, StringComparison.OrdinalIgnoreCase));
+        Assert.True(column is not null, "No page table of the seeded form has a column of the SQL type.");
+        return column;
+    }
+}
+
+/// <summary>
 /// Unit tests of <see cref="ColumnValueConverter.FromDbValue"/>, the read side of the SQL value conversion, on columns
 /// described by <see cref="FieldTypeMapper.DescribeColumn"/> as the metadata reader describes them. A stored number
 /// or option index is accepted only with the runtime type SqlClient returns for its column: <c>byte</c> for
@@ -4047,6 +4374,61 @@ public sealed class StoredValueConversionTests
             "column",
             () => ColumnValueConverter.FromDbValue(column, fieldType, DBNull.Value));
     }
+
+    // SQL Server pads a shorter write to an nchar(n) column's width, and the read returns the stored text as it is, the
+    // padding and an all-space text included, never trimmed.
+    [Theory]
+    [InlineData(FieldType.Text, "abc  ")]
+    [InlineData(FieldType.LegalValues, "U    ")]
+    [InlineData(FieldType.Multiline, "     ")]
+    public void FromDbValue_TextOnNcharColumn_IsTheStoredTextWithItsPadding(FieldType fieldType, string stored)
+    {
+        FieldValue value = ColumnValueConverter.FromDbValue(NcharColumn(5), fieldType, stored);
+
+        Assert.True(
+            value.TryGetText(out string? text) && string.Equals(stored, text, StringComparison.Ordinal),
+            "The stored nchar text did not read back exactly as stored.");
+    }
+
+    // Text longer than nchar(5) cannot be stored, so it is refused before it is bound, trailing spaces counting as
+    // characters.
+    [Theory]
+    [InlineData(FieldType.Text, "abcdef")]
+    [InlineData(FieldType.LegalValues, "U     ")]
+    public void ToParameter_TextLongerThanTheNcharWidth_IsRefusedBeforeBinding(FieldType fieldType, string text)
+    {
+        Assert.Throws<ArgumentException>(
+            "value",
+            () => ColumnValueConverter.ToParameter("@p0", NcharColumn(5), fieldType, FieldValue.FromText(text)));
+    }
+
+    // Shorter and full-width text, trailing spaces included, is bound unchanged as a string the size of the column;
+    // SQL Server pads the shorter text with spaces to five when it stores it.
+    [Theory]
+    [InlineData(FieldType.Text, "abc")]
+    [InlineData(FieldType.Text, "ab ")]
+    [InlineData(FieldType.LegalValues, "U")]
+    [InlineData(FieldType.Text, "abcde")]
+    [InlineData(FieldType.Text, "ab   ")]
+    [InlineData(FieldType.LegalValues, "U    ")]
+    public void ToParameter_TextUpToTheNcharWidth_IsBoundUnchanged(FieldType fieldType, string text)
+    {
+        SqlParameterValue parameter = ColumnValueConverter.ToParameter(
+            "@p0",
+            NcharColumn(5),
+            fieldType,
+            FieldValue.FromText(text));
+
+        Assert.Equal(DbType.String, parameter.DbType);
+        Assert.Equal(5, parameter.Size);
+        Assert.True(
+            parameter.Value is string bound && string.Equals(text, bound, StringComparison.Ordinal),
+            "The nchar text was not bound exactly as given.");
+    }
+
+    // An nchar(n) column as the reader describes it: sys.columns.max_length is 2·n bytes.
+    private static ColumnMetadata NcharColumn(int characters) =>
+        FieldTypeMapper.DescribeColumn("Stored", "nchar", 2 * characters);
 
     // A stored value of the given runtime type, parsed from its invariant text and boxed as a data reader boxes it.
     private static object Stored(TypeCode type, string text) =>

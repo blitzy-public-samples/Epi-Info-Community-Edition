@@ -106,7 +106,7 @@ namespace EpiInfo.Domain.Storage;
 /// </description></item>
 /// <item><description>
 /// <b>Return value:</b> a normal return of <see cref="InsertAsync"/>, a <see cref="RecordWriteStatus.Success"/> from
-/// <see cref="UpdateAsync"/> or <see cref="SoftDeleteResult.Deleted"/> from <see cref="SoftDeleteAsync"/> means the
+/// <see cref="UpdateAsync"/> or <see cref="SoftDeleteStatus.Deleted"/> from <see cref="SoftDeleteAsync"/> means the
 /// transaction committed, and the API's <c>RecordService</c> then records <see cref="WriteOutcome.Written"/> for the
 /// request. Every other result means nothing was written: the transaction rolled back, or no data statement was
 /// sent.
@@ -476,7 +476,8 @@ public interface IDataStore
     /// not those the caller read earlier.
     /// </description></item>
     /// <item><description>
-    /// Set the base <c>LastSaveLogonName</c> and <c>LastSaveTime</c> from <paramref name="stamp"/>.
+    /// Call <paramref name="createStamp"/>, then set the base <c>LastSaveLogonName</c> and <c>LastSaveTime</c> from
+    /// the stamp it returns.
     /// </description></item>
     /// <item><description>
     /// For each page holding a submitted field, in <see cref="PageMetadata.Position"/> order, update only the
@@ -486,11 +487,11 @@ public interface IDataStore
     /// <item><description>Read the response snapshot, then commit.</description></item>
     /// </list>
     /// <para>
-    /// An exception thrown by <paramref name="requiredGate"/> rolls back and surfaces as a
-    /// <see cref="DataStoreWriteException"/> with <see cref="WriteOutcome.NotWritten"/>, no SQL error number and the
-    /// gate's exception as its inner exception. Concurrency is last-writer-wins under the lock: for a field two saves
-    /// both submitted the later commit wins, a field only one save submitted keeps that save's value, and there is no
-    /// row-version check.
+    /// An exception thrown by <paramref name="requiredGate"/> or <paramref name="createStamp"/>, and a
+    /// <see langword="null"/> returned by either, rolls back and surfaces as a <see cref="DataStoreWriteException"/>
+    /// with <see cref="WriteOutcome.NotWritten"/>, no SQL error number and, for an exception, that exception as its
+    /// inner exception. Concurrency is last-writer-wins under the lock: for a field two saves both submitted the later
+    /// commit wins, a field only one save submitted keeps that save's value, and there is no row-version check.
     /// </para>
     /// </remarks>
     /// <param name="form">The form's metadata, as <see cref="GetFormMetadataAsync"/> returned it.</param>
@@ -499,7 +500,13 @@ public interface IDataStore
     /// The validated, normalised values of the writable data fields the request submitted, keyed by canonical name.
     /// It may be empty, which updates only the stamps.
     /// </param>
-    /// <param name="stamp">The save stamp of this write.</param>
+    /// <param name="createStamp">
+    /// Creates the save stamp of this write. It is invoked at most once, inside the transaction, after the locked
+    /// read, the required gate and the permission check have decided that the update writes, and before its first data
+    /// statement. It is never invoked when the update writes nothing: <see cref="RecordWriteStatus.NotFound"/>,
+    /// <see cref="RecordWriteStatus.Deleted"/>, <see cref="RecordWriteStatus.ValidationFailed"/> or
+    /// <see cref="RecordWriteStatus.Forbidden"/>. An exception from it ends the call with nothing written.
+    /// </param>
     /// <param name="requiredGate">
     /// The required-field check of the effective record. The API passes
     /// <c>stored =&gt; validator.CheckRequired(stored, submitted)</c>, which overlays the submitted values on the
@@ -520,7 +527,7 @@ public interface IDataStore
         FormMetadata form,
         string globalRecordId,
         IReadOnlyDictionary<string, FieldValue> submitted,
-        SaveStamp stamp,
+        Func<SaveStamp> createStamp,
         Func<StoredRecord, RecordValidationResult> requiredGate,
         FormPermissions? permissions,
         CancellationToken cancellationToken);
@@ -531,26 +538,43 @@ public interface IDataStore
     /// <remarks>
     /// <list type="number">
     /// <item><description>
-    /// Read the base row's <c>RecStatus</c> <c>WITH (UPDLOCK, ROWLOCK)</c>. A missing row gives
-    /// <see cref="SoftDeleteResult.NotFound"/>; <c>RecStatus</c> 0 gives <see cref="SoftDeleteResult.AlreadyDeleted"/>
-    /// with nothing written, stamps included.
+    /// Read the base row's <c>RecStatus</c> and <c>GlobalRecordId</c> <c>WITH (UPDLOCK, ROWLOCK)</c>. A missing row
+    /// gives <see cref="SoftDeleteStatus.NotFound"/>; <c>RecStatus</c> 0 gives
+    /// <see cref="SoftDeleteStatus.AlreadyDeleted"/> with nothing written, stamps included.
     /// </description></item>
     /// <item><description>
-    /// Otherwise update the base row's <c>RecStatus</c> to 0 and its <c>LastSaveLogonName</c> and <c>LastSaveTime</c>
-    /// from <paramref name="stamp"/>, then commit.
+    /// Otherwise call <paramref name="createStamp"/>, update the base row's <c>RecStatus</c> to 0 and its
+    /// <c>LastSaveLogonName</c> and <c>LastSaveTime</c> from the stamp it returns, then commit.
     /// </description></item>
     /// </list>
     /// <para>Page rows are never touched and nothing cascades to other forms.</para>
+    /// <para>
+    /// For a record the locked read found, the result carries its <c>GlobalRecordId</c> as stored, taken from that
+    /// read, so the caller can name the record as stored after the commit without another database call.
+    /// </para>
+    /// <para>
+    /// An exception thrown by <paramref name="createStamp"/>, and a <see langword="null"/> it returns, rolls back and
+    /// surfaces as a <see cref="DataStoreWriteException"/> with <see cref="WriteOutcome.NotWritten"/>, no SQL error
+    /// number and, for an exception, that exception as its inner exception.
+    /// </para>
     /// </remarks>
     /// <param name="form">The form's metadata, as <see cref="GetFormMetadataAsync"/> returned it.</param>
     /// <param name="globalRecordId">The record's base-table <c>GlobalRecordId</c>.</param>
-    /// <param name="stamp">The save stamp, written only when the record is active.</param>
+    /// <param name="createStamp">
+    /// Creates the save stamp of this soft delete. It is invoked at most once, inside the transaction, after the
+    /// locked read has found an active record, and before the first data statement. It is never invoked when the soft
+    /// delete writes nothing: <see cref="SoftDeleteStatus.NotFound"/> and
+    /// <see cref="SoftDeleteStatus.AlreadyDeleted"/>. An exception from it ends the call with nothing written.
+    /// </param>
     /// <param name="cancellationToken">The request's abort token.</param>
-    /// <returns>What happened to the record.</returns>
+    /// <returns>
+    /// What happened to the record, with the stored <c>GlobalRecordId</c> for
+    /// <see cref="SoftDeleteStatus.Deleted"/> and <see cref="SoftDeleteStatus.AlreadyDeleted"/>.
+    /// </returns>
     Task<SoftDeleteResult> SoftDeleteAsync(
         FormMetadata form,
         string globalRecordId,
-        SaveStamp stamp,
+        Func<SaveStamp> createStamp,
         CancellationToken cancellationToken);
 
     /// <summary>
@@ -689,7 +713,7 @@ public sealed class RecordWriteResult
 }
 
 /// <summary>How <see cref="IDataStore.SoftDeleteAsync"/> ended.</summary>
-public enum SoftDeleteResult
+public enum SoftDeleteStatus
 {
     /// <summary>The record was active and is now deleted; the transaction committed and the API answers 204.</summary>
     Deleted,
@@ -702,4 +726,74 @@ public enum SoftDeleteResult
 
     /// <summary>The <c>GlobalRecordId</c> is not in the base table; the API answers 404.</summary>
     NotFound,
+}
+
+/// <summary>
+/// The result of <see cref="IDataStore.SoftDeleteAsync"/>: its <see cref="Status"/> and, for a record the locked read
+/// found, the base row's <c>GlobalRecordId</c> as stored.
+/// </summary>
+/// <remarks>
+/// The id is the spelling the locked read returned, which can differ in letter case from the one the caller passed
+/// wherever the column's collation ignores letter case. It lets the caller name the record as stored, as an insert or
+/// an update names it, without another database call. The id is carried exactly as the matched row holds it: the
+/// column admits any non-null text, so an empty or whitespace id is carried too, and only a missing one is refused.
+/// The factories are the only way to build one, so <see cref="GlobalRecordId"/> is set exactly for
+/// <see cref="SoftDeleteStatus.Deleted"/> and <see cref="SoftDeleteStatus.AlreadyDeleted"/>. Instances are immutable
+/// and safe to share across threads.
+/// </remarks>
+public sealed class SoftDeleteResult
+{
+    private static readonly SoftDeleteResult NotFoundResult = new(SoftDeleteStatus.NotFound, null);
+
+    private SoftDeleteResult(SoftDeleteStatus status, string? globalRecordId)
+    {
+        Status = status;
+        GlobalRecordId = globalRecordId;
+    }
+
+    /// <summary>How the soft delete ended.</summary>
+    public SoftDeleteStatus Status { get; }
+
+    /// <summary>
+    /// The base row's <c>GlobalRecordId</c> as stored, taken from the locked read; set only when <see cref="Status"/>
+    /// is <see cref="SoftDeleteStatus.Deleted"/> or <see cref="SoftDeleteStatus.AlreadyDeleted"/>.
+    /// </summary>
+    public string? GlobalRecordId { get; }
+
+    /// <summary>Whether the locked read found the record, in which case <see cref="GlobalRecordId"/> is set.</summary>
+    [MemberNotNullWhen(true, nameof(GlobalRecordId))]
+    public bool IsFound => Status != SoftDeleteStatus.NotFound;
+
+    /// <summary>A committed soft delete of an active record.</summary>
+    /// <param name="globalRecordId">
+    /// The base row's <c>GlobalRecordId</c>, as the locked read returned it, carried unchanged.
+    /// </param>
+    /// <returns>A <see cref="SoftDeleteStatus.Deleted"/> result carrying <paramref name="globalRecordId"/>.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="globalRecordId"/> is <see langword="null"/>.</exception>
+    public static SoftDeleteResult Deleted(string globalRecordId) =>
+        new(SoftDeleteStatus.Deleted, RequireStoredId(globalRecordId));
+
+    /// <summary>The record was already deleted, so nothing was written, stamps included.</summary>
+    /// <param name="globalRecordId">
+    /// The base row's <c>GlobalRecordId</c>, as the locked read returned it, carried unchanged.
+    /// </param>
+    /// <returns>
+    /// An <see cref="SoftDeleteStatus.AlreadyDeleted"/> result carrying <paramref name="globalRecordId"/>.
+    /// </returns>
+    /// <exception cref="ArgumentNullException"><paramref name="globalRecordId"/> is <see langword="null"/>.</exception>
+    public static SoftDeleteResult AlreadyDeleted(string globalRecordId) =>
+        new(SoftDeleteStatus.AlreadyDeleted, RequireStoredId(globalRecordId));
+
+    /// <summary>The record is not in the base table.</summary>
+    /// <returns>A <see cref="SoftDeleteStatus.NotFound"/> result, which carries no id.</returns>
+    public static SoftDeleteResult NotFound() => NotFoundResult;
+
+    // A found record always has a stored id, since the column is NOT NULL. Any other value is the matched row's own and
+    // is kept as it is: refusing an empty or whitespace id would turn an already-deleted 204 into a failure, or fail a
+    // delete after its UPDATE had run.
+    private static string RequireStoredId(string globalRecordId)
+    {
+        ArgumentNullException.ThrowIfNull(globalRecordId);
+        return globalRecordId;
+    }
 }

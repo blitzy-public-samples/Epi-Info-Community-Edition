@@ -11,12 +11,14 @@
  *   Fields       .page-fields  .field  .field--protected  .field--disabled
  *                .field-error  .group-section  .label-heading  .unsupported-placeholder
  *   Grid         .record-grid  .record-grid__toggle  .record-grid__toggle--pending
- *                .record-grid__scroll  .record-grid__open  .record-grid__row--deleted
- *                .record-grid__table--pending  .record-grid__paging
+ *                .record-grid__frame  .record-grid__frame--more-start  .record-grid__frame--more-end
+ *                .record-grid__scroll  .record-grid__open  .record-grid__open-text
+ *                .record-grid__row--deleted  .record-grid__table--pending  .record-grid__paging
  *   Messages     .banner  .banner--error  .banner--warning  .banner--info
  *                .banner__actions  .validation-summary
  *   Dialogs      .dialog-backdrop  .dialog  .button--danger  .find-dialog  .find-dialog__fields
  *                .find-dialog__criterion  .find-dialog__results  .find-dialog__results--stale
+ *   Buttons      .button--warning  .button--blocked
  *   Utilities    .visually-hidden
  *
  * State comes from native attributes (disabled, aria-selected, aria-current,
@@ -42,14 +44,18 @@
  * text 15.8:1, muted text 6.0:1 or more, accent 5.2:1, danger 6.1:1 or more,
  * banner texts 9.1:1 or more, control borders 4.3:1 or more (3:1 needed),
  * hover borders 8.4:1 or more, text on the pressed surface 11.6:1, text
- * 11.6:1 and muted text 4.6:1 on the pressed row tint, text 14.8:1 in a
+ * 11.6:1 and muted text 4.6:1 on the pressed row tint, text 12.6:1 and
+ * muted text 5.1:1 on the open row's hover tint (accent subtle hover), with
+ * its accent bar and focus ring 4.1:1 there (3:1 needed), text 14.8:1 in a
  * pressed text-like control, and the invalid choice ring (danger border)
  * 5.4:1 on the page, 4.6:1 on the hover halo and 3.9:1 on the pressed halo
  * (3:1 needed). Selected tab text (accent strong) 6.7:1 on hover (accent
  * subtle) and 5.6:1 pressed (accent muted), its accent top bar 4.6:1 and
  * 3.8:1 there (3:1 needed). White text on the danger button: 6.5:1 at rest
  * (danger), 10.5:1 on hover (danger text) and 13.3:1 pressed (danger
- * active). */
+ * active). Warning text on the warning button: 11.5:1 at rest (warning
+ * subtle), 9.5:1 on hover (warning hover) and 7.4:1 pressed (warning
+ * active); its warning border 4.2:1 on the error banner (3:1 needed). */
 :root {
   color-scheme: light;
 
@@ -72,6 +78,9 @@
   --color-accent: #0969da;
   --color-accent-strong: #0550ae;
   --color-accent-subtle: #ddf4ff;
+  /* Halfway from accent subtle to accent muted: the open row under the
+   * pointer, between its rest and pressed tints. */
+  --color-accent-subtle-hover: #caebff;
   --color-accent-muted: #b6e3ff;
   --color-focus: #0969da;
 
@@ -84,12 +93,17 @@
   --color-warning-border: #9a6700;
   --color-warning-text: #4d2d00;
   --color-warning-subtle: #fff8c5;
+  --color-warning-hover: #fae17d;
+  --color-warning-active: #eac54f;
 
   --color-info-border: #0969da;
   --color-info-text: #0a3069;
   --color-info-subtle: #ddf4ff;
 
   --color-backdrop: rgb(31 35 40 / 0.5);
+  /* The record grid's scroll cue: a shade over the rows, so it shows on
+   * the page, the stripes and the row tints alike. */
+  --color-scroll-cue: rgb(31 35 40 / 0.25);
 
   --space-1: 0.25rem;
   --space-2: 0.5rem;
@@ -112,6 +126,9 @@
   --choice-size: 1.25rem;
   --control-max-inline-size: 40rem;
   --content-max-inline-size: 72rem;
+  /* Starting width of each column of the record grid and the find results;
+   * a table wider than its columns shares the extra width among them. */
+  --table-column-inline-size: 7rem;
 
   --shadow-dialog: 0 8px 24px rgb(31 35 40 / 0.25);
   --transition-fast: 150ms ease-out;
@@ -470,7 +487,8 @@
     color: var(--color-text-muted);
   }
 
-  /* "Saving…" while a save is under way; empty and visually hidden, though still rendered, when idle. */
+  /* "Saving…" while a save is under way, then "Changes saved." until the next edit; empty
+   * and visually hidden, though still rendered, otherwise. */
   .form-toolbar [role="status"] {
     padding-inline: var(--space-2);
     font-weight: 600;
@@ -520,6 +538,22 @@
     border-end-end-radius: 0;
     background-color: transparent;
     color: var(--color-text);
+    /* The label above the zero-height bold copy below, with no gap between. */
+    flex-direction: column;
+    gap: 0;
+  }
+
+  /* A hidden, zero-height bold copy of the tab's text (its data-text) keeps
+   * every tab as wide as its bold selected state, so selecting a tab moves
+   * no neighbour. The empty alternative text, and visibility: hidden, keep
+   * it out of the tab's accessible name. */
+  .page-tabs [role="tab"]::after {
+    content: attr(data-text);
+    content: attr(data-text) / "";
+    block-size: 0;
+    overflow: hidden;
+    visibility: hidden;
+    font-weight: 700;
   }
 
   /* Selected: bold accent text, a top bar and a border joined to the panel,
@@ -741,23 +775,95 @@
   /* Only the table scrolls sideways when it is wider than the screen, so the
    * search box, the toggle and the paging stay in view. min-inline-size: 0
    * lets the box shrink below the table's width instead of widening the
-   * page, and its padding keeps the focus rings of edge cells inside it. */
+   * page, and its padding keeps the focus rings of edge cells inside it.
+   * The negative margin lays that padding over the section's own, so the
+   * table lines up with the search row and the footer. */
   .record-grid__scroll {
     min-inline-size: 0;
+    margin-inline: calc(-1 * var(--focus-ring-room));
     padding: var(--focus-ring-room);
     overflow-x: auto;
     scroll-padding-inline: var(--focus-ring-room);
   }
 
+  /* The grid's scroll box and the find results' wrapper take focus, so a
+   * keyboard can scroll them sideways. Their ring lies inside their padding,
+   * clear of the table, where neither the dialog nor the page clips it. */
+  .record-grid__scroll:focus-visible,
+  .find-dialog__results:focus-visible {
+    outline-offset: calc(-1 * var(--focus-ring-width));
+  }
+
+  /* The scroll box's frame, which does not scroll, draws the scroll cue: a
+   * shade at each side past which columns lie out of view, set by RecordGrid
+   * from the box's measurements. The shades lie over the rows, whose stripes
+   * and tints would hide a shadow under them, and let pointer input through.
+   * They reach the box's edges, which lie the box's padding past the frame's,
+   * but stop at the table's top and bottom, so the focus ring's top and
+   * bottom stay clear and its sides are only darkened. min-inline-size: 0
+   * lets the frame shrink below the table's width. */
+  .record-grid__frame {
+    position: relative;
+    min-inline-size: 0;
+  }
+
+  .record-grid__frame::before,
+  .record-grid__frame::after {
+    content: "";
+    position: absolute;
+    inset-block: var(--focus-ring-room);
+    inline-size: var(--space-4);
+    pointer-events: none;
+    opacity: 0;
+  }
+
+  .record-grid__frame::before {
+    inset-inline-start: calc(-1 * var(--focus-ring-room));
+    background-image: linear-gradient(to right, var(--color-scroll-cue), transparent);
+  }
+
+  .record-grid__frame::after {
+    inset-inline-end: calc(-1 * var(--focus-ring-room));
+    background-image: linear-gradient(to left, var(--color-scroll-cue), transparent);
+  }
+
+  .record-grid__frame--more-start::before,
+  .record-grid__frame--more-end::after {
+    opacity: 1;
+  }
+
   /* Data cells stay on one line, as in a spreadsheet: values such as
    * 1980-05-01 would otherwise break at their hyphens on narrow screens.
-   * Headers still wrap at spaces. */
+   * Headers still wrap at spaces. The header cells alone set the column
+   * widths (fixed layout), so no value widens its column, a bold open row
+   * moves no column and the widths stay the same from page to page. A value
+   * wider than its column ends in an ellipsis; the cell's title holds it in
+   * full. */
+  .record-grid table,
+  .find-dialog table {
+    table-layout: fixed;
+  }
+
+  .record-grid th,
+  .find-dialog th {
+    inline-size: var(--table-column-inline-size);
+  }
+
   .record-grid td,
   .find-dialog td {
+    overflow: hidden;
+    text-overflow: ellipsis;
     white-space: nowrap;
   }
 
-  .record-grid > .record-grid__scroll,
+  /* A find result's position cell holds its Open button and, for a deleted
+   * record, the "(deleted)" note, which wraps under the button instead of
+   * being cut off in a narrow column. */
+  .find-dialog td:first-child {
+    white-space: normal;
+  }
+
+  .record-grid > .record-grid__frame,
   .record-grid > div,
   .record-grid > p,
   .record-grid > footer,
@@ -835,12 +941,11 @@
     background-color: var(--color-surface-muted);
   }
 
-  /* Each row's open action: its first cell's text styled as a link. It fills
-   * the cell and keeps the 44px minimum target in both directions, so a short
-   * or blank value, whose button holds only visually hidden text, still has
-   * a full hover and touch target; the cell's padding sets the rest of the
-   * row height. A pointer click anywhere on the row opens the record as
-   * well. */
+  /* Each row's open action: its first cell's text styled as a link, or
+   * "Open" when that cell is blank. It fills the cell and keeps the 44px
+   * minimum target in both directions, so a short value still has a full
+   * hover and touch target; the cell's padding sets the rest of the row
+   * height. A pointer click anywhere on the row opens the record as well. */
   .record-grid__open {
     /* Block-level, so no inline baseline gap adds to the row's height. */
     display: flex;
@@ -858,6 +963,14 @@
     text-decoration: underline;
     text-underline-offset: 2px;
     white-space: nowrap;
+  }
+
+  /* The open action's visible text, a flex item of the button: it shrinks
+   * with its column and ends in an ellipsis, as the other cells do. */
+  .record-grid__open-text {
+    min-inline-size: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
   /* The open action's cell: the button's target height takes the place of
@@ -889,8 +1002,8 @@
   }
 
   /* Keyboard focus on a row's open action rings the whole row, inset as the
-   * row's own focus ring was, so a blank first cell, whose button shows no
-   * text, still shows which record has focus. The row's ring replaces the
+   * row's own focus ring was, so the ring marks the record, not its first
+   * cell, and no cell's clipping cuts it. The row's ring replaces the
    * button's, so one ring marks the focused record. */
   .record-grid tbody tr:has(.record-grid__open:focus-visible) {
     outline: var(--focus-ring-width) solid var(--color-focus);
@@ -902,17 +1015,17 @@
   }
 
   /* The open record: tinted, bold and marked by a bar on its first cell. */
-  .record-grid tbody td:first-child {
-    border-inline-start: var(--border-width-accent) solid transparent;
-  }
-
   .record-grid tbody tr[aria-current="true"] {
     background-color: var(--color-accent-subtle);
     font-weight: 600;
   }
 
+  /* The bar is an inset shadow, not a border: a collapsed border would sit
+   * half outside the table's edge and take width from the cell. It covers
+   * part of the cell's start padding, so the text does not move. The
+   * client lays out left to right, so the bar's offset is physical. */
   .record-grid tbody tr[aria-current="true"] td:first-child {
-    border-inline-start-color: var(--color-accent);
+    box-shadow: inset var(--border-width-accent) 0 0 var(--color-accent);
   }
 
   /* recStatus 0 rows, listed only while "Show deleted" is on. */
@@ -955,6 +1068,13 @@
     .find-dialog tbody tr:hover:not([aria-disabled="true"]) {
       background-color: var(--color-accent-subtle);
     }
+
+    /* The open row rests on the hover tint, so under the pointer it takes a
+     * darker one. :where() holds the selector at the hover rule's weight,
+     * so it wins by order here and the pressed rule below still beats it. */
+    .record-grid tbody tr:where([aria-current="true"]):hover:not([aria-disabled="true"]) {
+      background-color: var(--color-accent-subtle-hover);
+    }
   }
 
   /* Pressed: a deeper accent tint than hover. Pointer and touch presses
@@ -984,6 +1104,19 @@
    * short one shares the line with the trace id and buttons. */
   .banner > :not(button) {
     flex: 1 1 auto;
+  }
+
+  /* A message can carry the user's own text, such as a URL's record value,
+   * and a flex item's automatic minimum width is its longest unbreakable
+   * word, so one long word would widen the banner past a narrow screen.
+   * min-inline-size: 0 lets the text shrink to the banner's width and
+   * overflow-wrap breaks the word inside it. anywhere, unlike break-word,
+   * also lowers the min-content width, so a banner that is itself a flex
+   * item, as in the record grid, shrinks too. A button group keeps its
+   * buttons whole, so it is left out. */
+  .banner > :not(button):not(.banner__actions) {
+    min-inline-size: 0;
+    overflow-wrap: anywhere;
   }
 
   .banner > button:first-of-type {
@@ -1080,7 +1213,22 @@
 
   /* Modal dialogs: plain elements with role="dialog" and aria-modal="true"
    * (jsdom has no HTMLDialogElement.showModal). Headings, text and forms take
-   * full rows; buttons placed directly in the dialog line up at the end. */
+   * full rows; buttons placed directly in the dialog line up at the end.
+   *
+   * Every dialog component portals its backdrop into <body> and unmounts it on
+   * close, so the page behind is locked exactly while a backdrop is there:
+   * inert blocks the page's controls but not its scrolling. A hidden root
+   * overflow stops wheel, touch and keyboard scrolling of the page and keeps
+   * its scroll position for when the dialog closes; the stable gutter keeps
+   * the room the page scrollbar took, so the page does not shift sideways
+   * when that scrollbar goes. */
+  :root:has(> body > .dialog-backdrop) {
+    overflow: hidden;
+    scrollbar-gutter: stable;
+  }
+
+  /* The backdrop keeps a scroll range only for a dialog taller than the
+   * visible viewport; contain stops a scroll at its end from chaining on. */
   .dialog-backdrop {
     position: fixed;
     inset: 0;
@@ -1090,10 +1238,18 @@
     justify-content: center;
     padding: var(--space-4);
     overflow-y: auto;
+    overscroll-behavior: contain;
     background-color: var(--color-backdrop);
   }
 
+  /* The dialog scrolls its own content. Positioned, it is the containing
+   * block of its absolutely positioned descendants (.visually-hidden text),
+   * which therefore stay inside its scroll area; against the backdrop they
+   * would lengthen the backdrop's scroll range and let the whole dialog,
+   * heading and Close included, scroll off-screen. contain keeps a scroll
+   * that reaches the end of the dialog's content from moving what is behind. */
   .dialog {
+    position: relative;
     display: flex;
     flex-wrap: wrap;
     justify-content: flex-end;
@@ -1103,6 +1259,7 @@
     max-inline-size: 32rem;
     max-block-size: calc(100vh - 2 * var(--space-4));
     overflow-y: auto;
+    overscroll-behavior: contain;
     padding: var(--space-5);
     border: var(--border-width) solid var(--color-border);
     border-radius: var(--radius-large);
@@ -1149,6 +1306,42 @@
   .button--danger:active:not(:disabled):not([aria-disabled="true"]) {
     border-color: var(--color-danger-active);
     background-color: var(--color-danger-active);
+  }
+
+  /* A resend that may repeat a save already applied, such as a banner's Save
+   * again: warning tones set it apart from Retry and Dismiss beside it.
+   * Disabled keeps the base button:disabled look, and focus keeps the base
+   * :focus-visible ring. */
+  .button--warning:not(:disabled) {
+    border-color: var(--color-warning-border);
+    background-color: var(--color-warning-subtle);
+    color: var(--color-warning-text);
+  }
+
+  @media (hover: hover) {
+    .button--warning:hover:not(:disabled) {
+      background-color: var(--color-warning-hover);
+    }
+  }
+
+  /* Pressed: darker than hover; it follows and out-ranks the hover rule. */
+  .button--warning:active:not(:disabled):not([aria-disabled="true"]) {
+    background-color: var(--color-warning-active);
+  }
+
+  /* A control refused while a write of the draft may already have been
+   * applied: Save, and each move that would first save the dirty draft. It
+   * takes the base button:disabled look, and aria-disabled announces it as
+   * unavailable, yet it stays operable, because its press shows the banner
+   * of that write again. The base layer's [aria-disabled="true"] rule blocks
+   * pointer input, so it is lifted here: otherwise a pointer user who
+   * dismissed the banner would have no way back to its Save again. */
+  .button--blocked[aria-disabled="true"] {
+    border-color: var(--color-border);
+    background-color: var(--color-surface-disabled);
+    color: var(--color-text-muted);
+    cursor: not-allowed;
+    pointer-events: auto;
   }
 
   /* Find record: wider panel, field picker, criterion rows, results. */

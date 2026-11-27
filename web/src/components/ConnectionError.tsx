@@ -1,4 +1,11 @@
-import { describeError, errorMessages, isSafeToResend, type ApiError, type ApiMethod } from '../api/errors';
+import {
+  describeError,
+  describeUncertainWrite,
+  errorMessages,
+  isSafeToResend,
+  type ApiError,
+  type ApiMethod,
+} from '../api/errors';
 
 /** The method of the failed request; whether Retry may resend it depends on it. */
 export type ResendMethod = ApiMethod;
@@ -22,13 +29,6 @@ export interface ConnectionErrorProps {
   onDismiss?: () => void;
 }
 
-const UNCERTAIN_WRITE =
-  'The save may already have been applied, and the record list cannot prove whether it was. ' +
-  'Your changes are still on screen.';
-// The risk the create's "Save again" names, also shown as text before the button; the
-// editor's own uncertain-create message ends with the same sentence.
-const DUPLICATE_RISK = 'Saving again may create a duplicate record.';
-
 // The visible text stays "Save again", never the toolbar's exact "Save", and the
 // accessible name starts with it and adds the risk of resending.
 const SAVE_AGAIN_TEXT = 'Save again';
@@ -38,13 +38,15 @@ const SAVE_AGAIN_UPDATE_LABEL = 'Save again (the earlier save may already have b
 /**
  * The text when the caller decided none. A `POST` or `PUT` failed with the draft on
  * screen: when it is safe to resend, describeError's text says the draft is kept;
- * otherwise the save may have been applied, which for a create risks a duplicate. A
- * `GET` or `DELETE` holds no draft, since a read loads nothing the user typed and a
- * delete's confirmation discarded it, so its text says only what cannot be reached.
+ * otherwise describeUncertainWrite's text says what could not be reached and that the save
+ * may have been applied, which for a create risks a duplicate, the risk the create's "Save
+ * again" also names. A `GET` or `DELETE` holds no draft, since a read loads nothing the
+ * user typed and a delete's confirmation discarded it, so its text says only what cannot
+ * be reached.
  */
 function defaultMessage(error: ApiError, method: ResendMethod, safe: boolean, isCreate: boolean): string {
   if (!safe) {
-    return isCreate ? `${UNCERTAIN_WRITE} ${DUPLICATE_RISK}` : UNCERTAIN_WRITE;
+    return describeUncertainWrite(error, isCreate);
   }
   if (method === 'POST' || method === 'PUT') {
     return describeError(error);
@@ -113,9 +115,11 @@ export function ConnectionError({
               Retry
             </button>
           )}
+          {/* The warning tone sets the resend that may duplicate apart from Retry and Dismiss. */}
           {showSaveAgain && (
             <button
               type="button"
+              className="button--warning"
               aria-label={isCreate ? SAVE_AGAIN_CREATE_LABEL : SAVE_AGAIN_UPDATE_LABEL}
               onClick={() => onSaveAgain()}
             >

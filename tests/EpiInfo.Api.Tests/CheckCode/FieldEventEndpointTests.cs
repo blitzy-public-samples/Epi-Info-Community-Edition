@@ -92,6 +92,26 @@ public sealed class FieldEventEndpointTests
 
     private const int OptionTypeId = 12;
 
+    private const int NumberTypeId = 5;
+
+    // A number field on an int column, which stores whole numbers only.
+    private const string IntegerFieldName = "Visits";
+
+    // Two blocks, each assigning Visits a number that is not whole although its nearest double is: the After block of
+    // Age copies the float Age, and the After block of LastName a literal whose nearest double is 2.
+    private const string ExactAssignmentProgram = """
+        Field Age
+            After
+                ASSIGN Visits = Age
+            End-After
+        End-Field
+        Field LastName
+            After
+                ASSIGN Visits = 2.0000000000000001
+            End-After
+        End-Field
+        """;
+
     // The After block of Age assigns LastName only when the Option field arrives as index 2 under its canonical name.
     private const string TypedValuesProgram = """
         Field Age
@@ -896,6 +916,64 @@ public sealed class FieldEventEndpointTests
         Assert.Empty(host.Logs.Find(entry => entry.ExceptionType is not null));
     }
 
+    /// <summary>
+    /// Events whose block assigns the integer-column number field <c>Visits</c> a number that is not whole although
+    /// its nearest double is, as (the event's field, its <c>values</c> JSON, the JSON number expected in
+    /// <c>assigned</c>): a copy of the <c>float</c> number <c>Age</c>, or a check-code literal.
+    /// </summary>
+    public static TheoryData<string, string, string> NonIntegralWholeDoubleAssignments => new()
+    {
+        { "Age", """{"Age":1.0000000000000001}""", "1.0000000000000001" },
+        { "Age", """{"Age":9007199254740992.5}""", "9007199254740992.5" },
+        { "Age", """{"Age":-1E-400}""", "-1e-400" },
+        { "LastName", "{}", "2.0000000000000001" },
+    };
+
+    /// <summary>
+    /// An assigned number that is not whole although its nearest double is, such as <c>1.0000000000000001</c>, is
+    /// returned as that exact JSON number, never as the whole double 1, so the integer column of <c>Visits</c> refuses
+    /// it when it is saved, exactly as it refuses the same number typed in: the save is a 400 keyed by
+    /// <c>Visits</c> and nothing is written.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(NonIntegralWholeDoubleAssignments))]
+    public async Task AssignedNumberWhoseDoubleIsWholeKeepsItsExactNumberAndAnIntegerColumnRefusesIt(
+        string fieldName,
+        string valuesJson,
+        string expectedNumber)
+    {
+        var store = new FakeDataStore(FormWithIntegerColumnNumber());
+        await using var host = EndpointHost.Start(store);
+
+        var body = await SendAcceptedEventAsync(
+            host,
+            FakeForms.CheckCodeViewId,
+            $$"""{"event":"FieldAfter","fieldName":"{{fieldName}}","values":{{valuesJson}}}""");
+
+        var assigned = body.GetProperty("assigned");
+        Assert.Equal([IntegerFieldName], assigned.EnumerateObject().Select(entry => entry.Name));
+        var assignedNumber = assigned.GetProperty(IntegerFieldName);
+        Assert.Equal(JsonValueKind.Number, assignedNumber.ValueKind);
+        Assert.Equal(expectedNumber, assignedNumber.GetRawText());
+        Assert.Empty(body.GetProperty("diagnostics").EnumerateArray());
+
+        // The assigned value saved as the client sends it back: the JSON number exactly as the event returned it.
+        var savedMember = $$"""{"{{IntegerFieldName}}":{{assignedNumber.GetRawText()}}}""";
+        using var content = JsonBody($$"""{"values":{{savedMember}}}""");
+        using var save = await host.Client.PostAsync(
+            $"/api/forms/{FakeForms.CheckCodeViewId}/records",
+            content,
+            host.Timeout);
+        var saveText = await save.Content.ReadAsStringAsync(host.Timeout);
+        Assert.True(
+            save.StatusCode == HttpStatusCode.BadRequest,
+            $"The save returned {(int)save.StatusCode}: {saveText}");
+        Assert.DoesNotContain(expectedNumber, saveText, StringComparison.Ordinal);
+        using var saveDocument = JsonDocument.Parse(saveText);
+        AssertErrors(saveDocument.RootElement, [IntegerFieldName], [ValidationMessages.NumberNotStorable]);
+        Assert.Empty(store.WriteCalls);
+    }
+
     // The After block on Age: from line 3, a call of an unsupported function whose bracketed name is the argument,
     // then on lines 5 and 6 calls of the unsupported functions [GOTO] and FORMAT, a GOTO statement on line 7 and an
     // ASSIGN that still runs; those line numbers hold for a name with one line break. Line breaks are normalised
@@ -959,6 +1037,27 @@ public sealed class FieldEventEndpointTests
         };
 
         return form with { Metadata = form.Metadata with { Fields = [.. form.Metadata.Fields, option] } };
+    }
+
+    // FakeForms.WithCheckCode carrying ExactAssignmentProgram, with the number field Visits on an int column added to
+    // its page, since every fixture number field has a float column.
+    private static FakeForm FormWithIntegerColumnNumber()
+    {
+        var form = FakeForms.WithCheckCode(ExactAssignmentProgram);
+        var page = form.Metadata.Pages[0];
+        var visits = new FieldMetadata
+        {
+            FieldId = (FakeForms.CheckCodeViewId * 1000) + 10,
+            Name = IntegerFieldName,
+            FieldTypeId = NumberTypeId,
+            FieldTypeName = "Number",
+            Prompt = IntegerFieldName,
+            TabIndex = 6m,
+            PageId = page.PageId,
+            Column = FieldTypeMapper.DescribeColumn(IntegerFieldName, "int", 4),
+        };
+
+        return form with { Metadata = form.Metadata with { Fields = [.. form.Metadata.Fields, visits] } };
     }
 
     // FakeForms.TwoPage (Age bounded 0 to 120, Sex with the legal values Male and Female) carrying
