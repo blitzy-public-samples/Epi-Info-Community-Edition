@@ -103,6 +103,63 @@ public static class RecordQueryRules
     public const int MaxSearchFields = 6;
 
     /// <summary>
+    /// The most UTF-16 code units one criterion's string value may hold, measured as received, before trimming:
+    /// 32,767, what one legacy Find text box holds. The legacy dialog creates each value box as a
+    /// <c>MaskedTextBox</c> or a <c>TextBox</c> without setting <c>MaxLength</c>
+    /// (<c>Epi.Windows.Enter/Dialogs/FindRecordDialog.cs</c>, lines 145 and 205), so each takes the Windows Forms
+    /// default of 32,767 characters. The search-criteria parser answers a longer value with a 400 under the field's
+    /// canonical name, before it splits the value. A value that is not text has no length and is not bounded here.
+    /// </summary>
+    /// <remarks>
+    /// One value of this length holds at most 6,554 alternatives: one character each with the four-character
+    /// <c>" or "</c> between them, (32,767 + 4) / 5 rounded down. So one search of <see cref="MaxSearchFields"/>
+    /// criteria holds at most 6 × 6,554 = 39,324 alternatives, and at most 6 × 32,767 = 196,602 code units of value
+    /// text. Equality and <c>IS NULL</c> alternatives are bounded by this alone, so 39,324 is also the most equality
+    /// and <c>IS NULL</c> alternatives one search holds; <see cref="MaxRowComparedAlternatives"/> and
+    /// <see cref="MaxSearchPatternTextLength"/> bound the others across the whole search.
+    /// </remarks>
+    public const int MaxSearchValueLength = 32767;
+
+    /// <summary>
+    /// The most alternatives one search may hold, across all its criteria, that SQL Server compares row by row:
+    /// 6,554, what one legacy Find text box holds at one character per alternative
+    /// (<see cref="MaxSearchValueLength"/>). Every parsed alternative counts except an equality
+    /// (<see cref="Search.SearchOperator.Equal"/>) and a match of no value
+    /// (<see cref="Search.SearchOperator.IsNull"/>): a wildcard pattern (<see cref="Search.SearchOperator.Like"/>), a
+    /// comparison (<c>&lt;&gt;</c>, <c>&lt;</c>, <c>&lt;=</c>, <c>&gt;</c>, <c>&gt;=</c>) and the multiline
+    /// 255-character comparison (<see cref="Search.SearchOperator.PrefixEqual255"/>). The search-criteria parser
+    /// answers a search holding more with one 400 on the criteria list.
+    /// </summary>
+    /// <remarks>
+    /// Legacy took up to <see cref="MaxSearchFields"/> boxes and checked no number of alternatives. The bound is a
+    /// design reconciliation of those boxes with the 30-second command timeout. A Find statement's work per row is the
+    /// alternatives it compares row by row times the text of the value each reads: a <c>LIKE</c>, comparison or prefix
+    /// alternative has no set-based form over page tables that carry no index on their data columns. An equality has
+    /// one: packed, it is matched against the decoded list by one merge or hash semi-join, and scalar it is one
+    /// comparison; and <c>IS NULL</c> is one term whatever its count. So neither counts here. The bound caps the
+    /// alternatives, not the work: a <c>LIKE</c> alternative with a leading wildcard costs time per character of every
+    /// value it reads, so an accepted search's work still grows with the rows and the text it scans, and the command
+    /// timeout bounds each statement. The SQL Server store admits at most two Find statements at once, and a search
+    /// waits for a free slot until one frees or its request is aborted.
+    /// </remarks>
+    public const int MaxRowComparedAlternatives = 6554;
+
+    /// <summary>
+    /// The most UTF-16 code units the wildcard patterns of one search may hold together, across all its criteria:
+    /// 32,767, what one legacy Find text box holds (<see cref="MaxSearchValueLength"/>). Each pattern counts as it
+    /// runs, after the parser strips its prefix, turns <c>*</c> into <c>%</c> and, for one longer than
+    /// <see cref="MaxLikePatternLength"/>, collapses its runs of <c>%</c>. The search-criteria parser answers a search
+    /// holding more with one 400 on the criteria list.
+    /// </summary>
+    /// <remarks>
+    /// A design reconciliation of the legacy dialog's six boxes with the 30-second command timeout: a pattern longer
+    /// than <see cref="MaxLikePatternLength"/> code units is compiled into a long-pattern program whose cold
+    /// compilation grows with its length, about 0.27 ms per code unit measured on SQL Server 2022, so the text the
+    /// patterns of one search hold together bounds that cost. One pattern, like one value, holds at most this much.
+    /// </remarks>
+    public const int MaxSearchPatternTextLength = 32767;
+
+    /// <summary>
     /// SQL Server's <c>LIKE</c> pattern limit, 8,000 bytes, counted in UTF-16 code units of an <c>nvarchar</c>
     /// pattern; <c>LIKE</c>, <c>PATINDEX</c> and <c>CHARINDEX</c> refuse a longer one with error 8152. It bounds no
     /// input. A Find wildcard pattern or a grid filter contains pattern (<see cref="ToContainsPattern"/>) within it is

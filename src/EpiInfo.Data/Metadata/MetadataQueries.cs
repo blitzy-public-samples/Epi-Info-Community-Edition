@@ -20,11 +20,17 @@ internal static class MetadataQueries
     /// <summary>Name of the table-name list parameter: a JSON array of strings, bound as <c>DbType.String</c> with size -1 (<c>nvarchar(max)</c>).</summary>
     public const string NamesParameter = "@names";
 
+    /// <summary>Name of the base-table name parameter of <see cref="TableClaims"/>: the form's one non-blank <c>DataTableName</c>, exactly as the reader holds it, bound as <c>DbType.String</c> with size -1 (<c>nvarchar(max)</c>).</summary>
+    public const string BaseNameParameter = "@baseName";
+
     /// <summary>Name of the session temporary table parameter: the whole session name, including its single leading <c>#</c>, bound as <c>DbType.String</c> and quoted as one identifier part by the statement.</summary>
     public const string TableNameParameter = "@tableName";
 
     /// <summary>Name of the <c>tempdb</c> object id parameter, the id <see cref="TempTableObjectId"/> resolved, bound as <c>DbType.Int32</c>.</summary>
     public const string ObjectIdParameter = "@objectId";
+
+    /// <summary>Name of the check-code length parameter of <see cref="CheckCode"/>, the most UTF-16 code units the statement returns, bound as <c>DbType.Int32</c>.</summary>
+    public const string MaxLengthParameter = "@maxLength";
 
     /// <summary>No parameters; returns <c>ViewId</c>, <c>Name</c>, <c>PageCount</c>, one row per <c>metaViews</c> row ordered by <c>ViewId</c>.</summary>
     /// <remarks>Related views are listed too: legacy does not filter on <c>IsRelatedView</c>.</remarks>
@@ -95,6 +101,73 @@ internal static class MetadataQueries
         INNER JOIN [metaFieldTypes] AS ft ON ft.[FieldTypeId] = f.[FieldTypeId]
         WHERE f.[ViewId] = @viewId
         ORDER BY f.[FieldId];
+        """;
+
+    /// <summary>Takes <c>@viewId</c> and <c>@baseName</c>; returns <c>ViewId</c>, <c>DataTableName</c>, <c>PageId</c>: each table name another form's metadata claims that can name one of this form's tables.</summary>
+    /// <remarks>
+    /// <para>
+    /// The form's own names (<c>[Own]</c>) are <c>@baseName</c> and <c>@baseName</c> followed by each of its
+    /// <c>metaPages.PageId</c> values in decimal digits, the names the reader resolves. Another form claims each of
+    /// its <c>DataTableName</c> values, and that name followed by each of its page ids. A base claim is a distinct
+    /// (<c>ViewId</c>, <c>DataTableName</c>) of another form whose name equals an own name, with <c>PageId</c>
+    /// <c>NULL</c>. A page claim is a distinct (<c>ViewId</c>, <c>DataTableName</c>, <c>PageId</c>) of another form
+    /// whose name followed by the page id equals an own name: each own name is split before each of its last 1 to 11
+    /// UTF-16 code units (<c>[Split]</c>), 11 being the longest decimal <c>int</c>, the suffix is compared with the
+    /// page id's digits under a binary collation and the prefix with the data-table name. Rows of the form itself are
+    /// not returned. A form with several data-table names, which the reader refuses for itself, still claims every
+    /// one, so adding a name to a form never frees the tables of its others.
+    /// </para>
+    /// <para>
+    /// Names are compared under the same explicit case-insensitive collation as <see cref="Columns"/>, so every
+    /// claim that can resolve to one of the form's tables is returned: a claim resolves to one of them only when it
+    /// equals, letter by letter ignoring case, a catalogue table that equals an own name. The reader decides each
+    /// returned claim by resolving it, so a returned row that names no table of the form, such as one equal only
+    /// under trailing-space padding, refuses nothing. Lengths come from <c>DATALENGTH</c>, which counts trailing
+    /// spaces where <c>LEN</c> does not, and the text is cut under a binary collation, so positions count UTF-16
+    /// code units under any database collation. Each claimed spelling is grouped by its binary text and its length,
+    /// so case and trailing-space variants are each returned as stored. The statement uses no <c>TRY_CAST</c>,
+    /// <c>OPENJSON</c> or <c>STRING_SPLIT</c>, so it runs at every compatibility level SQL Server 2022 supports.
+    /// </para>
+    /// </remarks>
+    internal const string TableClaims = """
+        WITH [Own] ([Name]) AS
+        (
+            SELECT @baseName
+            UNION ALL
+            SELECT @baseName + CAST(p.[PageId] AS nvarchar(11))
+            FROM [metaPages] AS p
+            WHERE p.[ViewId] = @viewId
+        ),
+        [Split] ([Prefix], [Suffix]) AS
+        (
+            -- The prefix length is guarded inside the expression, because SQL Server may compute it before the filter.
+            SELECT SUBSTRING(o.[Name] COLLATE Latin1_General_100_BIN2, 1, CASE WHEN n.[Units] > s.[Length] THEN n.[Units] - s.[Length] ELSE 0 END),
+                   SUBSTRING(o.[Name] COLLATE Latin1_General_100_BIN2, n.[Units] - s.[Length] + 1, s.[Length])
+            FROM [Own] AS o
+            CROSS APPLY (SELECT DATALENGTH(o.[Name]) / 2) AS n ([Units])
+            CROSS JOIN (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10), (11)) AS s ([Length])
+            WHERE n.[Units] > s.[Length]
+        )
+        SELECT f.[ViewId] AS ViewId,
+               f.[DataTableName] COLLATE Latin1_General_100_BIN2 AS DataTableName,
+               CAST(NULL AS int) AS PageId
+        FROM [metaFields] AS f
+        INNER JOIN [Own] AS o
+            ON f.[DataTableName] COLLATE Latin1_General_100_CI_AS = o.[Name] COLLATE Latin1_General_100_CI_AS
+        WHERE f.[ViewId] <> @viewId
+        GROUP BY f.[ViewId], f.[DataTableName] COLLATE Latin1_General_100_BIN2, DATALENGTH(f.[DataTableName])
+        UNION ALL
+        SELECT p.[ViewId],
+               f.[DataTableName] COLLATE Latin1_General_100_BIN2,
+               p.[PageId]
+        FROM [Split] AS s
+        INNER JOIN [metaPages] AS p
+            ON CAST(p.[PageId] AS nvarchar(11)) COLLATE Latin1_General_100_BIN2 = s.[Suffix] COLLATE Latin1_General_100_BIN2
+           AND p.[ViewId] <> @viewId
+        INNER JOIN [metaFields] AS f
+            ON f.[ViewId] = p.[ViewId]
+           AND f.[DataTableName] COLLATE Latin1_General_100_CI_AS = s.[Prefix] COLLATE Latin1_General_100_CI_AS
+        GROUP BY p.[ViewId], p.[PageId], f.[DataTableName] COLLATE Latin1_General_100_BIN2, DATALENGTH(f.[DataTableName]);
         """;
 
     /// <summary>Takes <c>@names</c>; returns <c>TableName</c>, <c>ColumnName</c>, <c>TypeName</c>, <c>MaxLengthBytes</c>, <c>IsNullable</c>, <c>IsIdentity</c>, <c>ColumnId</c> for each named table that its unqualified name reaches for the caller, ordered by table, then <c>ColumnId</c>.</summary>
@@ -211,9 +284,17 @@ internal static class MetadataQueries
             OPTION (MAXRECURSION 0);
         """;
 
-    /// <summary>Takes <c>@viewId</c>; returns <c>CheckCode</c> (<c>ntext</c>, possibly <c>NULL</c>) of the form, or no row for an unknown form.</summary>
+    /// <summary>Takes <c>@viewId</c> and <c>@maxLength</c>; returns <c>CheckCode</c> (<c>nvarchar(max)</c>, possibly <c>NULL</c>), the form's program cut to its first <c>@maxLength</c> UTF-16 code units, or no row for an unknown form.</summary>
+    /// <remarks>
+    /// The column is <c>ntext</c>, which <c>LEFT</c> does not take and <c>SUBSTRING</c> returns as
+    /// <c>nvarchar(4000)</c>, cutting any longer program at 4,000 code units, so the text is converted to
+    /// <c>nvarchar(max)</c> first. The binary collation makes <c>LEFT</c> count UTF-16 code units under any column or
+    /// database collation, because a supplementary-character (<c>_SC</c>) collation counts a surrogate pair as one
+    /// character. The server cuts the text, so no more than <c>@maxLength</c> code units of an oversized program ever
+    /// reach the client. A <c>NULL</c> program stays <c>NULL</c>.
+    /// </remarks>
     internal const string CheckCode = """
-        SELECT [CheckCode] AS CheckCode
+        SELECT LEFT(CONVERT(nvarchar(max), [CheckCode]) COLLATE Latin1_General_100_BIN2, @maxLength) AS CheckCode
         FROM [metaViews]
         WHERE [ViewId] = @viewId;
         """;

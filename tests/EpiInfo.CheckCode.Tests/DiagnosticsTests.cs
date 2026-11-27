@@ -1,3 +1,6 @@
+using System.Globalization;
+using EpiInfo.CheckCode.Lexing;
+using EpiInfo.CheckCode.Parsing;
 using EpiInfo.Domain.Diagnostics;
 using EpiInfo.Domain.Events;
 using EpiInfo.Domain.Metadata;
@@ -11,12 +14,15 @@ namespace EpiInfo.CheckCode.Tests;
 /// <see cref="DiagnosticSeverity.Warning"/> naming its form, line and command while the rest of the program still
 /// runs; a <c>GEOCODE</c> statement is an <see cref="DiagnosticSeverity.Info"/>; <see cref="ICheckCodeEngine.Analyze"/>
 /// reports only what the program text reveals; and <see cref="ICheckCodeEngine.Run"/> reports the executed block's
-/// static diagnostics plus its runtime errors, in source order.
+/// static diagnostics plus its runtime errors, in source order. Both stay within the engine's budgets: a program past
+/// <see cref="CheckCodeEngine.MaxProgramLength"/> or <see cref="CheckCodeEngine.MaxTokens"/> is one <c>LIMIT</c>
+/// warning, and no call returns more than <see cref="CheckCodeEngine.MaxDiagnostics"/> diagnostics.
 /// </summary>
 /// <remarks>
 /// Programs are inline raw string literals whose line 1 is the literal's first line, and each test that asserts a
 /// line first checks the program text on that line, so the literal's indentation trimming cannot shift the numbering
-/// unnoticed. Messages are never compared with literal text: only that they are present and carry no field value.
+/// unnoticed. Messages are never compared with literal text: only that they are present and carry no field value, and
+/// that a <c>LIMIT</c> warning's message carries its budget or its count.
 /// </remarks>
 public sealed class DiagnosticsTests
 {
@@ -491,6 +497,169 @@ public sealed class DiagnosticsTests
         Diagnostic geocode = Assert.Single(engine.Analyze(FoodHistoryProgram, FoodHistoryForm));
         AssertDiagnostic(geocode, DiagnosticSeverity.Info, FoodHistoryForm, 12, "GEOCODE");
     }
+
+    // A program exactly at the length or the token budget is parsed, and its block on X runs. The padding after the
+    // block is a comment, which adds no token, or bare names outside every block, which add one warning but nothing
+    // to X's block.
+    [Theory]
+    [InlineData(nameof(CheckCodeEngine.MaxProgramLength))]
+    [InlineData(nameof(CheckCodeEngine.MaxTokens))]
+    public void ProgramAtABudget_IsParsedAndRuns(string budget)
+    {
+        string program = BudgetProgram(budget, overBy: 0);
+
+        Assert.DoesNotContain(
+            engine.Analyze(program, SyntheticForm),
+            diagnostic => diagnostic.Command == Parser.Commands.Limit);
+
+        FieldEventResponse response = engine.Run(program, SyntheticForm, FieldEventKind.FieldAfter, "X", Values());
+
+        AssertOnlyAssigned(response, "Z", FieldValue.FromText("done"));
+        Assert.Empty(response.Diagnostics);
+    }
+
+    // One code unit or one token past its budget, the same program is refused whole: one LIMIT warning at line 1 whose
+    // message names the budget, from Analyze and from Run, and the block on X runs nothing.
+    [Theory]
+    [InlineData(nameof(CheckCodeEngine.MaxProgramLength), CheckCodeEngine.MaxProgramLength)]
+    [InlineData(nameof(CheckCodeEngine.MaxTokens), CheckCodeEngine.MaxTokens)]
+    public void ProgramPastABudget_IsOneLimitWarningAndRunsNothing(string budget, int limit)
+    {
+        string program = BudgetProgram(budget, overBy: 1);
+
+        Diagnostic analyzed = Assert.Single(engine.Analyze(program, SyntheticForm));
+        AssertDiagnostic(analyzed, DiagnosticSeverity.Warning, SyntheticForm, 1, Parser.Commands.Limit);
+        Assert.Contains(limit.ToString(CultureInfo.InvariantCulture), analyzed.Message, StringComparison.Ordinal);
+
+        FieldEventResponse response = engine.Run(program, SyntheticForm, FieldEventKind.FieldAfter, "X", Values());
+
+        AssertNoEffects(response);
+        Assert.Equal(analyzed, Assert.Single(response.Diagnostics));
+    }
+
+    // The length is tested before the blank test: a program past MaxProgramLength is refused although white space leads
+    // it, as one cut by the store to its first MaxProgramLength + 1 code units can be white space only, or as white
+    // space up to the limit can put the block on X past it. From Analyze and from Run it is one LIMIT warning at line 1
+    // naming the budget, never an empty program, and the block runs nothing.
+    [Theory]
+    [InlineData(CheckCodeEngine.MaxProgramLength + 1, false)]
+    [InlineData(CheckCodeEngine.MaxProgramLength, true)]
+    public void ProgramPastTheLengthBudget_IsOneLimitWarningWhenWhiteSpaceLeadsIt(int whiteSpace, bool blockAfter)
+    {
+        string leading = string.Concat(Enumerable.Repeat(" \t\r\n", (whiteSpace / 4) + 1))[..whiteSpace];
+        string program = blockAfter ? leading + UnsupportedStatementProgram("// the block under test") : leading;
+        Assert.True(program.Length > CheckCodeEngine.MaxProgramLength);
+        Assert.True(string.IsNullOrWhiteSpace(program[..CheckCodeEngine.MaxProgramLength]));
+        Assert.Equal(blockAfter, !string.IsNullOrWhiteSpace(program));
+
+        Diagnostic analyzed = Assert.Single(engine.Analyze(program, SyntheticForm));
+        AssertDiagnostic(analyzed, DiagnosticSeverity.Warning, SyntheticForm, 1, Parser.Commands.Limit);
+        Assert.Contains(
+            CheckCodeEngine.MaxProgramLength.ToString(CultureInfo.InvariantCulture),
+            analyzed.Message,
+            StringComparison.Ordinal);
+
+        FieldEventResponse response = engine.Run(program, SyntheticForm, FieldEventKind.FieldAfter, "X", Values());
+
+        AssertNoEffects(response);
+        Assert.Equal(analyzed, Assert.Single(response.Diagnostics));
+    }
+
+    // Exactly MaxDiagnostics warnings are all listed, from Analyze and from Run, with no summary.
+    [Fact]
+    public void DiagnosticsAtTheBudget_AreAllListed()
+    {
+        string program = ManyWarningsProgram(CheckCodeEngine.MaxDiagnostics);
+        AssertProgramLine(program, 3, "GOTO Y");
+        AssertProgramLine(program, 2 + CheckCodeEngine.MaxDiagnostics, "GOTO Y");
+
+        IReadOnlyList<Diagnostic> analyzed = engine.Analyze(program, SyntheticForm);
+        FieldEventResponse response = engine.Run(program, SyntheticForm, FieldEventKind.FieldAfter, "X", Values());
+
+        foreach (IReadOnlyList<Diagnostic> diagnostics in new[] { analyzed, response.Diagnostics })
+        {
+            Assert.Equal(CheckCodeEngine.MaxDiagnostics, diagnostics.Count);
+            for (int i = 0; i < diagnostics.Count; i++)
+            {
+                AssertDiagnostic(diagnostics[i], DiagnosticSeverity.Warning, SyntheticForm, 3 + i, "GOTO");
+            }
+        }
+
+        AssertOnlyAssigned(response, "Z", FieldValue.FromText("done"));
+    }
+
+    // Past MaxDiagnostics, Analyze and Run each return exactly MaxDiagnostics entries: the first warnings in source
+    // order, then one LIMIT warning at the line of the first warning left out, counting those left out. The block's
+    // effects are kept unchanged.
+    [Theory]
+    [InlineData(CheckCodeEngine.MaxDiagnostics + 1)]
+    [InlineData(5_000)]
+    public void DiagnosticsPastTheBudget_EndInOneCountingLimitWarning(int warnings)
+    {
+        string program = ManyWarningsProgram(warnings);
+        const int Listed = CheckCodeEngine.MaxDiagnostics - 1;
+        string omitted = (warnings - Listed).ToString(CultureInfo.InvariantCulture);
+        AssertProgramLine(program, 3, "GOTO Y");
+        AssertProgramLine(program, 3 + Listed, "GOTO Y");
+
+        IReadOnlyList<Diagnostic> analyzed = engine.Analyze(program, SyntheticForm);
+        FieldEventResponse response = engine.Run(program, SyntheticForm, FieldEventKind.FieldAfter, "X", Values());
+
+        foreach (IReadOnlyList<Diagnostic> diagnostics in new[] { analyzed, response.Diagnostics })
+        {
+            Assert.Equal(CheckCodeEngine.MaxDiagnostics, diagnostics.Count);
+            for (int i = 0; i < Listed; i++)
+            {
+                AssertDiagnostic(diagnostics[i], DiagnosticSeverity.Warning, SyntheticForm, 3 + i, "GOTO");
+            }
+
+            Diagnostic summary = diagnostics[Listed];
+            AssertDiagnostic(summary, DiagnosticSeverity.Warning, SyntheticForm, 3 + Listed, Parser.Commands.Limit);
+            Assert.Contains(omitted, summary.Message, StringComparison.Ordinal);
+        }
+
+        AssertOnlyAssigned(response, "Z", FieldValue.FromText("done"));
+    }
+
+    // A cancelled call is no diagnostic: Analyze and Run stop with the cancellation itself on a non-empty program.
+    [Fact]
+    public void CancelledCall_ThrowsInsteadOfReporting()
+    {
+        string program = UnsupportedStatementProgram("GOTO Y");
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+
+        Assert.Throws<OperationCanceledException>(
+            () => engine.Analyze(program, SyntheticForm, cancellation.Token));
+        Assert.Throws<OperationCanceledException>(
+            () => engine.Run(program, SyntheticForm, FieldEventKind.FieldAfter, "X", Values(), cancellation.Token));
+    }
+
+    // UnsupportedStatementProgram's block on X, which only assigns Z, padded to overBy past the budget: to
+    // MaxProgramLength + overBy code units with a trailing comment, or to MaxTokens + overBy tokens with bare names.
+    private static string BudgetProgram(string budget, int overBy)
+    {
+        string block = UnsupportedStatementProgram("// the block under test") + "\n";
+        switch (budget)
+        {
+            case nameof(CheckCodeEngine.MaxProgramLength):
+                int commentLength = CheckCodeEngine.MaxProgramLength + overBy - block.Length;
+                string program = block + "//" + new string('x', commentLength - 2);
+                Assert.Equal(CheckCodeEngine.MaxProgramLength + overBy, program.Length);
+                return program;
+
+            case nameof(CheckCodeEngine.MaxTokens):
+                int nameCount = CheckCodeEngine.MaxTokens + overBy - (Lexer.Tokenize(block).Count - 1);
+                return block + string.Concat(Enumerable.Repeat("a ", nameCount));
+
+            default:
+                throw new ArgumentOutOfRangeException(nameof(budget), budget, "Not a program budget.");
+        }
+    }
+
+    // A block on X with one GOTO per line from line 3, each one warning, then the ASSIGN of Z, which still runs.
+    private static string ManyWarningsProgram(int warnings) =>
+        UnsupportedStatementProgram(string.Join("\n", Enumerable.Repeat("GOTO Y", warnings)));
 
     // Line 3 holds the statement under test; the ASSIGN on line 4 must still run after it is skipped.
     private static string UnsupportedStatementProgram(string statement) => $"""

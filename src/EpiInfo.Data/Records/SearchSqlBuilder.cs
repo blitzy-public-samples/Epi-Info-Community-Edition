@@ -352,9 +352,14 @@ internal static class SearchSqlBuilder
     /// inserted among them, before it returns, and each result's membership in the selected set, its position and its
     /// status describe one committed state even under a concurrent soft delete. That holds too where the plan reads the
     /// reference more than once, as SQL Server may when it expands an <c>OR</c> into separate branches: every read
-    /// holds its locks, so each sees the rows the others hold. Only the base table carries the hint, and every
-    /// application write locks a record's base row before any of its page rows, so the page rows joined to a held base
-    /// row cannot change either.
+    /// holds its locks, so each sees the rows the others hold. Only the base table carries the hint, so each page
+    /// row's shared lock is released once the row is read. While the statement holds a base row, its page rows cannot
+    /// change through a write that locks the base row exclusively before any page row: an update of a base table with
+    /// a last-save column, which stamps the base row first, a create, which inserts the base row first, or a soft
+    /// delete, which writes only the base row. A page-only change can alter a joined page row during the statement: an
+    /// update of a base table with neither last-save column, whose update lock on the base row is compatible with the
+    /// held shared lock, or a writer outside the application. The statement fixes no join order, so a page row the plan
+    /// reads before it holds that row's base row can also change before the base row is held.
     /// </para>
     /// <para>
     /// <b>Result set.</b> The base table is joined with <c>INNER JOIN</c> to every page that has a table, so a record
@@ -802,18 +807,20 @@ internal static class SearchSqlBuilder
     /// record's base row before any of its page rows: an update takes its update lock on the base row, and updates
     /// the base row's last-save columns where the table has them, before its page rows; a create inserts the base row
     /// first; and a soft delete writes the base row alone. Its later reads of other rows take only shared locks. A
-    /// write that holds a page row the list waits for therefore waits on nothing the list holds, and a write that
-    /// waits for a base row the list holds holds none of the page rows the list still has to read, so no application
-    /// write forms a lock cycle with the list.
+    /// write that waits for a base row the list holds therefore holds none of that record's page rows, and the hints
+    /// remove the lock-order inversion between a held page row and its base row: the list and an application write
+    /// never wait for each other through the rows of one record. An application write's page-row insert can still wait
+    /// for a key range the list locked for another record, the residual case described next.
     /// </para>
     /// <para>
     /// <b>Residual deadlocks.</b> Two waits can still end in a deadlock (1205): a writer outside the application that
-    /// changes a page row the list holds while it holds one the list waits for, and a create whose new page key falls
-    /// in the key range a page seek of the list locked for a record with no row on that page, while the list waits for
-    /// that create's base row. The list can also be chosen as the victim of a deadlock between writers whose base-row
-    /// locks it waits behind, a wait its held base-table read alone already allows. SQL Server ends one statement as
-    /// the victim, which the store reports as unavailable: the list answers 503, and an application create 503 with
-    /// nothing written. None of them returns a page and a total from two different states.
+    /// changes a page row the list holds while it holds one the list waits for, and an application write that inserts
+    /// a page row (a create, or an update that repairs a record's missing page row) whose key falls in the key range
+    /// a page seek of the list locked for a record with no row on that page, while the list waits for a row that
+    /// write holds. The list can also be chosen as the victim of a deadlock between writers whose base-row locks it
+    /// waits behind, a wait its held base-table read alone already allows. SQL Server ends one statement as the victim,
+    /// which the store reports as unavailable: the list answers 503, and an application write 503 with nothing
+    /// written. None of them returns a page and a total from two different states.
     /// </para>
     /// <para>
     /// <b>Long filters.</b> A grid filter whose contains pattern is longer than SQL Server's <c>LIKE</c> pattern limit

@@ -28,7 +28,19 @@ namespace EpiInfo.CheckCode;
 /// <item><description>
 /// <b>Never throws</b> for any program text or any values. A construct outside the supported subset, a skipped
 /// <c>GEOCODE</c> statement and a runtime problem each become a <see cref="Diagnostic"/>, and a check-code error
-/// never blocks a save.
+/// never blocks a save. The one exception is cancellation: a call whose <see cref="CancellationToken"/> is cancelled
+/// stops with <see cref="OperationCanceledException"/>, which the API answers as a client abort, with no response.
+/// </description></item>
+/// <item><description>
+/// <b>Bounded.</b> A stored program costs each call at most a fixed budget, the bound the stored text itself does not
+/// give: a program longer than <see cref="CheckCodeEngine.MaxProgramLength"/> UTF-16 code units, or with more than
+/// <see cref="CheckCodeEngine.MaxTokens"/> tokens, is not parsed and runs nothing, and the call reports it as one
+/// <see cref="DiagnosticSeverity.Warning"/> with the command <c>LIMIT</c> at line 1. A <c>Run</c> whose work would pass
+/// <see cref="Evaluation.Evaluator.MaxWork"/> stops there with one <c>LIMIT</c> warning at the line of the statement
+/// that ran out, keeping the effects of the statements before it. A call returns at most
+/// <see cref="CheckCodeEngine.MaxDiagnostics"/> diagnostics: when there are more, the first ones are kept in their
+/// order and the last entry is one <c>LIMIT</c> warning, at the line of the first one left out, that counts those left
+/// out, so none is dropped unreported.
 /// </description></item>
 /// <item><description>
 /// <b>Form metadata.</b> <c>form</c> supplies identifier resolution, case-insensitive to the canonical
@@ -67,10 +79,19 @@ public interface ICheckCodeEngine
     /// program.
     /// </param>
     /// <param name="form">The metadata of the form that owns <paramref name="program"/>.</param>
+    /// <param name="cancellationToken">
+    /// The request's abort token, polled while the program is lexed and parsed.
+    /// </param>
     /// <returns>
-    /// The static diagnostics in source order; an empty list when there is no program or nothing to report.
+    /// The static diagnostics in source order, at most <see cref="CheckCodeEngine.MaxDiagnostics"/> of them; the one
+    /// <c>LIMIT</c> warning for a program over the engine's budget; an empty list when there is no program or nothing
+    /// to report.
     /// </returns>
-    IReadOnlyList<Diagnostic> Analyze(string? program, FormMetadata form);
+    /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> was cancelled.</exception>
+    IReadOnlyList<Diagnostic> Analyze(
+        string? program,
+        FormMetadata form,
+        CancellationToken cancellationToken = default);
 
     /// <summary>
     /// Executes the block of <paramref name="fieldName"/> that <paramref name="fieldEvent"/> selects, against
@@ -106,14 +127,21 @@ public interface ICheckCodeEngine
     /// The record's current values, keyed by canonical <c>metaFields.Name</c>. A field absent from the dictionary
     /// reads as <see cref="FieldValue.Null"/>.
     /// </param>
+    /// <param name="cancellationToken">
+    /// The request's abort token, polled while the program is lexed and parsed and before each statement runs.
+    /// </param>
     /// <returns>
-    /// The effects and diagnostics of the executed block; <see cref="FieldEventResponse.Empty"/>, with every array
-    /// empty, diagnostics included, when there is no program or the field has no block for the event.
+    /// The effects and diagnostics of the executed block, at most <see cref="CheckCodeEngine.MaxDiagnostics"/>
+    /// diagnostics; for a program over the engine's budget, no effects and the one <c>LIMIT</c> warning;
+    /// <see cref="FieldEventResponse.Empty"/>, with every array empty, diagnostics included, when there is no program
+    /// or the field has no block for the event.
     /// </returns>
+    /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> was cancelled.</exception>
     FieldEventResponse Run(
         string? program,
         FormMetadata form,
         FieldEventKind fieldEvent,
         string fieldName,
-        IReadOnlyDictionary<string, FieldValue> values);
+        IReadOnlyDictionary<string, FieldValue> values,
+        CancellationToken cancellationToken = default);
 }

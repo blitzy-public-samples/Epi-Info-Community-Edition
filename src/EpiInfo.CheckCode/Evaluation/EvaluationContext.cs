@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using EpiInfo.Domain.Forms;
 using EpiInfo.Domain.Metadata;
@@ -56,12 +57,22 @@ namespace EpiInfo.CheckCode.Evaluation;
 /// evaluate records whose stored values break the current rules, and validation belongs to the save path.
 /// </para>
 /// <para>
+/// It also meters the run's work against <see cref="Evaluator.MaxWork"/>: the evaluator charges each step, and the
+/// meter polls the cancellation token while the steps add up, so a single long expression or statement stops when the
+/// request is aborted. Each group's members are resolved once per run and kept, so naming a group again costs only its
+/// members.
+/// </para>
+/// <para>
 /// An instance serves one run on one thread and is not thread-safe. It holds no static state, so concurrent runs
 /// never share anything.
 /// </para>
 /// </remarks>
 public sealed class EvaluationContext
 {
+    // Steps of work between two polls of the cancellation tokens. The first poll comes once the run has charged this
+    // much, and a single large charge, such as a long text, polls at once.
+    private const long CancellationPollInterval = 4_096;
+
     // The maps keyed by a metadata row compare it by reference: rows whose names differ only by case are distinct
     // fields, and a value-equality key would hash every property of the row on each lookup.
 
@@ -83,6 +94,24 @@ public sealed class EvaluationContext
     // The types of rows outside the data set, computed on first use.
     private readonly Dictionary<FieldMetadata, FieldType> _otherFieldTypes = new(ReferenceEqualityComparer.Instance);
 
+    // The members of each row whose group expansion was asked for, resolved on first use and kept for the run.
+    private readonly Dictionary<FieldMetadata, IReadOnlyList<FieldMetadata>> _groupMembers =
+        new(ReferenceEqualityComparer.Instance);
+
+    // The token the context was created with, polled by the work meter for every evaluation in it.
+    private readonly CancellationToken _cancellationToken;
+
+    // The token of the Evaluator.Execute call in progress, if any, polled beside _cancellationToken.
+    private CancellationToken _callCancellationToken;
+
+    // The steps of work charged so far, never more than Evaluator.MaxWork, and the total at which the tokens are next
+    // polled.
+    private long _work;
+    private long _nextCancellationPoll = CancellationPollInterval;
+
+    // The line of the statement running, which a run out of work reports.
+    private int _statementLine;
+
     /// <summary>
     /// Creates the scope of one run over <paramref name="form"/>, starting from <paramref name="values"/>.
     /// </summary>
@@ -96,15 +125,24 @@ public sealed class EvaluationContext
     /// wins, and otherwise the first key enumerated. The dictionary is copied: the context keeps no reference to it
     /// and never changes it.
     /// </param>
+    /// <param name="cancellationToken">
+    /// The request's abort token, polled by the work meter as each evaluation in this context adds up its steps, every
+    /// 4,096 steps and on any larger single step, so <see cref="Evaluator.Evaluate"/> of one long expression stops
+    /// with <see cref="OperationCanceledException"/>.
+    /// </param>
     /// <exception cref="ArgumentNullException">
     /// <paramref name="form"/> or <paramref name="values"/> is <see langword="null"/>.
     /// </exception>
-    public EvaluationContext(FormMetadata form, IReadOnlyDictionary<string, FieldValue> values)
+    public EvaluationContext(
+        FormMetadata form,
+        IReadOnlyDictionary<string, FieldValue> values,
+        CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(form);
         ArgumentNullException.ThrowIfNull(values);
 
         Form = form;
+        _cancellationToken = cancellationToken;
         _dataFields = FormDefinitionFactory.GetDataFields(form);
         foreach (DataFieldMetadata dataField in _dataFields)
         {
@@ -348,9 +386,87 @@ public sealed class EvaluationContext
     /// resolved to and the group itself are dropped. A member that is itself a group is returned as it is, not
     /// expanded, as in legacy. The list is empty when <paramref name="group"/> is not a group.
     /// </returns>
+    /// <remarks>
+    /// The members are resolved on the first call for a row and kept for the rest of the run, so later calls for the
+    /// same row return the same list without reading the form's rows again.
+    /// </remarks>
     /// <exception cref="ArgumentNullException"><paramref name="group"/> is <see langword="null"/>.</exception>
-    public IReadOnlyList<FieldMetadata> GetGroupMembers(FieldMetadata group) =>
-        FormDefinitionFactory.GetGroupMembers(Form, group);
+    public IReadOnlyList<FieldMetadata> GetGroupMembers(FieldMetadata group)
+    {
+        ArgumentNullException.ThrowIfNull(group);
+
+        return MembersOf(group, chargeWork: false);
+    }
+
+    /// <summary>
+    /// The members of a group, as <see cref="GetGroupMembers"/> returns them, for a statement that expands the group:
+    /// the run is charged one step per member, and, the first time a group with a <c>List</c> is expanded, the rows
+    /// and pages its resolution reads.
+    /// </summary>
+    /// <exception cref="WorkLimitExceededException">
+    /// The charge takes the run past <see cref="Evaluator.MaxWork"/>.
+    /// </exception>
+    /// <exception cref="OperationCanceledException">A cancellation token the meter polls was cancelled.</exception>
+    internal IReadOnlyList<FieldMetadata> ExpandGroup(FieldMetadata group) => MembersOf(group, chargeWork: true);
+
+    /// <summary>
+    /// Charges one step for the statement that starts at <paramref name="line"/>, which becomes the line a run out of
+    /// work reports until the next statement starts.
+    /// </summary>
+    /// <exception cref="WorkLimitExceededException">
+    /// The step takes the run past <see cref="Evaluator.MaxWork"/>.
+    /// </exception>
+    /// <exception cref="OperationCanceledException">A cancellation token the meter polls was cancelled.</exception>
+    internal void BeginStatement(int line)
+    {
+        _statementLine = line;
+        ChargeWork(1);
+    }
+
+    /// <summary>
+    /// Charges <paramref name="steps"/> steps of work to the statement running, before the work is done. The
+    /// cancellation tokens are polled once the run has charged another 4,096 steps, so the steps of one long
+    /// expression are cancellable, and before a charge that would pass the budget.
+    /// </summary>
+    /// <param name="steps">The steps, zero or more.</param>
+    /// <exception cref="WorkLimitExceededException">
+    /// The steps take the run past <see cref="Evaluator.MaxWork"/>; nothing is charged, and the exception carries the
+    /// line of the statement running.
+    /// </exception>
+    /// <exception cref="OperationCanceledException">A cancellation token the meter polls was cancelled.</exception>
+    internal void ChargeWork(long steps)
+    {
+        Debug.Assert(steps >= 0, "A charge is never negative.");
+
+        long work = _work + steps;
+        if (work >= _nextCancellationPoll || work > Evaluator.MaxWork)
+        {
+            _cancellationToken.ThrowIfCancellationRequested();
+            _callCancellationToken.ThrowIfCancellationRequested();
+            _nextCancellationPoll = work + CancellationPollInterval;
+        }
+
+        if (work > Evaluator.MaxWork)
+        {
+            throw new WorkLimitExceededException(_statementLine);
+        }
+
+        _work = work;
+    }
+
+    /// <summary>
+    /// Makes <paramref name="cancellationToken"/>, an <see cref="Evaluator.Execute"/> call's token, one the work meter
+    /// polls, beside the context's own, until <see cref="ExitCall"/> restores the token this returns.
+    /// </summary>
+    internal CancellationToken EnterCall(CancellationToken cancellationToken)
+    {
+        CancellationToken previous = _callCancellationToken;
+        _callCancellationToken = cancellationToken;
+        return previous;
+    }
+
+    /// <summary>Restores the call token <see cref="EnterCall"/> replaced, once the call is over.</summary>
+    internal void ExitCall(CancellationToken previous) => _callCancellationToken = previous;
 
     /// <summary>
     /// The field's current value: the last value written in this run, otherwise the request's value bound to it.
@@ -413,4 +529,49 @@ public sealed class EvaluationContext
 
     private static CheckCodeRuntimeException UnknownField(string identifier, int line, string command) =>
         new(line, command, $"Unknown field '{identifier.Trim()}'.");
+
+    // The group's members, resolved on first use by FormDefinitionFactory, the rule the form definition's members
+    // follows, and kept for the run. Charged, the first resolution of a group with a List pays for what it reads: each
+    // row of the form once per page and once more, the way the data fields and the listed fields are found, and the
+    // List text; every expansion pays one step per member.
+    private IReadOnlyList<FieldMetadata> MembersOf(FieldMetadata group, bool chargeWork)
+    {
+        if (!_groupMembers.TryGetValue(group, out IReadOnlyList<FieldMetadata>? members))
+        {
+            if (chargeWork && IsGroup(group) && !string.IsNullOrEmpty(group.List))
+            {
+                ChargeWork(((long)Form.Fields.Count * (Form.Pages.Count + 1)) + group.List.Length);
+            }
+
+            members = FormDefinitionFactory.GetGroupMembers(Form, group);
+            _groupMembers.Add(group, members);
+        }
+
+        if (chargeWork)
+        {
+            ChargeWork(members.Count);
+        }
+
+        return members;
+    }
+
+    /// <summary>
+    /// Ends a run whose work would pass <see cref="Evaluator.MaxWork"/>. <c>Evaluator.Run</c> and
+    /// <c>Evaluator.Execute</c> catch it once, around the whole run, and report one <c>LIMIT</c> warning at
+    /// <see cref="Line"/>; the effects and diagnostics of the statements before stand, and the rest of the run is
+    /// skipped.
+    /// </summary>
+    /// <remarks>
+    /// It is neither a <see cref="CheckCodeRuntimeException"/> nor an <see cref="ArgumentOutOfRangeException"/> or
+    /// <see cref="OverflowException"/>, the exceptions each statement's error boundary turns into a diagnostic, so no
+    /// statement, an <c>IF</c> around the one that ran out included, can take it for its own error and carry on. Its
+    /// message is fixed text.
+    /// </remarks>
+    /// <param name="line">The 1-based line of the statement that ran out of work.</param>
+    internal sealed class WorkLimitExceededException(int line)
+        : InvalidOperationException("The check-code work budget is spent.")
+    {
+        /// <summary>The 1-based line of the statement that ran out of work.</summary>
+        public int Line { get; } = line;
+    }
 }

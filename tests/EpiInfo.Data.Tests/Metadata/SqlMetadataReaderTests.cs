@@ -7,6 +7,7 @@ using EpiInfo.Domain.Forms;
 using EpiInfo.Domain.Metadata;
 using EpiInfo.Domain.Records;
 using EpiInfo.Domain.Search;
+using EpiInfo.Domain.Storage;
 using EpiInfo.Domain.Validation;
 using EpiInfo.Domain.Values;
 using EpiInfo.Tests.Shared;
@@ -557,6 +558,55 @@ public sealed class SqlMetadataReaderTests : IAsyncLifetime
         Assert.All(recorder.Commands, command => Assert.False(command.IsWrite));
     }
 
+    /// <summary>
+    /// A Legal Values field whose metadata names a readable character column outside the code-table role, a page
+    /// table's data column, a metadata table's column or a base table's system column, gets no options. The catalogue
+    /// resolves the table and its character column, yet the table is no code table, so no code-table read follows
+    /// the catalogue read and none of its rows is published as an option. <c>metaPages</c>, with its identity
+    /// <c>PageId</c>, and <c>metaDbInfo</c>, with its <c>uniqueidentifier</c> and <c>int</c> columns, are seeded tables
+    /// whose columns, beside their names, keep them from the code-table shape.
+    /// </summary>
+    [Theory]
+    [InlineData("CaseReport1", "LastName")]
+    [InlineData("metaFields", "Name")]
+    [InlineData("FoodHistory", "GlobalRecordId")]
+    [InlineData("metaPages", "Name")]
+    [InlineData("metaDbInfo", "ProjectName")]
+    public async Task ReadOptionsAsync_ColumnOutsideTheCodeTableRole_ReturnsNoOptionsAndReadsNoRow(
+        string sourceTableName,
+        string textColumnName)
+    {
+        using var cancellation = new CancellationTokenSource(TestTimeout);
+        CancellationToken token = cancellation.Token;
+        var recorder = new SqlCommandRecorder();
+        SqlMetadataReader reader = CreateReader(recorder);
+        await using SqlConnection connection = await TestDatabase.OpenConnectionAsync(token);
+
+        // Preconditions: the column is a character column holding rows, and the reader's own catalogue read resolves
+        // it as one, so only the table's role keeps its rows out.
+        Assert.Contains(
+            await CatalogueColumnsAsync(connection, sourceTableName, token),
+            column => column.Name == textColumnName && column.TypeName == "nvarchar");
+        Assert.NotEmpty(await ReadColumnAsync(connection, sourceTableName, textColumnName, token));
+        TableSchema? resolved = Assert.Single(await CreateReader(new SqlCommandRecorder())
+            .ResolveTablesAsync(connection, transaction: null, [sourceTableName], token));
+        Assert.NotNull(resolved);
+        Assert.Equal(ColumnFamily.Character, resolved.FindColumn(textColumnName)?.Metadata.Family);
+
+        IReadOnlyList<FieldOption> options = await reader.ReadOptionsAsync(
+            connection,
+            transaction: null,
+            LooseStoolsField(sourceTableName, sort: false) with { TextColumnName = textColumnName },
+            token);
+
+        Assert.Empty(options);
+        RecordedCommand catalogueRead = Assert.Single(recorder.Commands);
+        Assert.Equal(MetadataQueries.Columns, catalogueRead.CommandText);
+        Assert.True(catalogueRead.Succeeded);
+        Assert.Empty(recorder.Writes());
+        Assert.All(recorder.Commands, command => Assert.False(command.IsWrite));
+    }
+
     /// <summary>A field naming no code table, or only white space, gets no options and sends no command.</summary>
     [Theory]
     [InlineData(null)]
@@ -725,6 +775,89 @@ public sealed class SqlMetadataReaderTests : IAsyncLifetime
         Assert.Equal(form.BaseTableName, viaPort.BaseTableName);
         Assert.Equal(form.Pages.Select(page => page.PageId), viaPort.Pages.Select(page => page.PageId));
         Assert.Equal(form.Fields.Count, viaPort.Fields.Count);
+        AssertSelectOnly(recorder);
+    }
+
+    /// <summary>
+    /// Neither seeded form's metadata claims a table of the other. A direct query that pairs every other form's
+    /// data-table name with each of its page ids finds no claim equal to one of the form's own names, and the claims
+    /// statement, run read-only with the form's id and its stored data-table name, returns no row. The reader then
+    /// reads the form, sending that statement once, after its catalogue read, with the id bound as
+    /// <see cref="DbType.Int32"/> and the name as <see cref="DbType.String"/>; every command is a <c>SELECT</c>.
+    /// </summary>
+    [Theory]
+    [InlineData(1, "CaseReport")]
+    [InlineData(2, "FoodHistory")]
+    public async Task TableClaims_SeededForms_ReturnNoClaimAndTheFormsStillRead(int viewId, string name)
+    {
+        using var cancellation = new CancellationTokenSource(TestTimeout);
+        CancellationToken token = cancellation.Token;
+        var recorder = new SqlCommandRecorder();
+        SqlMetadataReader reader = CreateReader(recorder);
+        await using SqlConnection connection = await TestDatabase.OpenConnectionAsync(token);
+
+        string baseTableName = Assert.Single(await QueryRowsAsync(
+            connection,
+            "SELECT DISTINCT [DataTableName] FROM [metaFields] WHERE [ViewId] = @viewId AND [DataTableName] IS NOT NULL;",
+            row => row.GetString(0),
+            token,
+            ViewIdParameter(viewId)));
+        Assert.Equal(name, baseTableName);
+
+        // Every claim of every other form, name by name and page by page, against the form's base and page names.
+        int pairedClaims = Assert.Single(await QueryRowsAsync(
+            connection,
+            """
+            SELECT COUNT(*)
+            FROM [metaFields] AS f
+            LEFT JOIN [metaPages] AS p ON p.[ViewId] = f.[ViewId]
+            WHERE f.[ViewId] <> @viewId
+              AND f.[DataTableName] IS NOT NULL
+              AND EXISTS (
+                  SELECT 1
+                  FROM (SELECT @name AS [Name]
+                        UNION ALL
+                        SELECT @name + CAST(own.[PageId] AS nvarchar(11)) FROM [metaPages] AS own WHERE own.[ViewId] = @viewId) AS o
+                  WHERE o.[Name] COLLATE Latin1_General_100_CI_AS = f.[DataTableName] COLLATE Latin1_General_100_CI_AS
+                     OR o.[Name] COLLATE Latin1_General_100_CI_AS
+                        = (f.[DataTableName] + CAST(p.[PageId] AS nvarchar(11))) COLLATE Latin1_General_100_CI_AS);
+            """,
+            row => Int(row, 0),
+            token,
+            ViewIdParameter(viewId),
+            new SqlParameter("@name", SqlDbType.NVarChar, 128) { Value = baseTableName }));
+        Assert.Equal(0, pairedClaims);
+
+        IReadOnlyList<int> claims = await QueryRowsAsync(
+            connection,
+            MetadataQueries.TableClaims,
+            row => Int(row, 0),
+            token,
+            ViewIdParameter(viewId),
+            new SqlParameter(MetadataQueries.BaseNameParameter, SqlDbType.NVarChar, -1) { Value = baseTableName });
+        Assert.Empty(claims);
+
+        (FormMetadata Form, FormSchema Schema)? read =
+            await reader.ReadFormAsync(connection, transaction: null, viewId, token);
+
+        Assert.True(read.HasValue, $"ReadFormAsync returned null for seeded view {viewId}.");
+        Assert.Equal(baseTableName, read.Value.Form.BaseTableName);
+        Assert.Equal(SeededForms[viewId].Pages, read.Value.Form.Pages);
+        RecordedCommand claimsRead = Assert.Single(
+            recorder.Commands,
+            command => command.CommandText == MetadataQueries.TableClaims);
+        Assert.True(claimsRead.Succeeded, claimsRead.ToString());
+        Assert.Equal(
+            new (string, DbType, object?)[]
+            {
+                (MetadataQueries.ViewIdParameter, DbType.Int32, viewId),
+                (MetadataQueries.BaseNameParameter, DbType.String, baseTableName),
+            },
+            claimsRead.Parameters.Select(parameter => (parameter.Name, parameter.DbType, parameter.Value)));
+        RecordedCommand catalogueRead = Assert.Single(
+            recorder.Commands,
+            command => command.CommandText == MetadataQueries.Columns);
+        Assert.True(catalogueRead.Sequence < claimsRead.Sequence, claimsRead.ToString());
         AssertSelectOnly(recorder);
     }
 
@@ -1168,7 +1301,12 @@ public sealed class SqlMetadataReaderTests : IAsyncLifetime
         AssertSelectOnly(recorder);
     }
 
-    /// <summary>The check-code program is <c>metaViews.CheckCode</c> returned unchanged, for both seeded forms.</summary>
+    /// <summary>
+    /// The check-code program is <c>metaViews.CheckCode</c> returned unchanged, for both seeded forms, each far shorter
+    /// than <see cref="IDataStore.MaxCheckCodeLength"/>. The read is one command that binds the form's id and a length
+    /// of <see cref="IDataStore.MaxCheckCodeLength"/> + 1 code units, both as <see cref="DbType.Int32"/>, so the server
+    /// never sends more of an oversized program.
+    /// </summary>
     [Fact]
     public async Task GetCheckCodeAsync_ReturnsStoredProgram()
     {
@@ -1187,10 +1325,21 @@ public sealed class SqlMetadataReaderTests : IAsyncLifetime
                 token,
                 ViewIdParameter(seeded.ViewId)));
             Assert.NotEmpty(stored);
+            Assert.True(stored.Length <= IDataStore.MaxCheckCodeLength);
 
+            recorder.Clear();
             string? program = await reader.GetCheckCodeAsync(seeded.ViewId, token);
 
             Assert.Equal(stored, program);
+            RecordedCommand read = Assert.Single(recorder.Commands);
+            Assert.True(read.Succeeded, read.ToString());
+            Assert.Equal(
+                new (string, DbType, object?)[]
+                {
+                    (MetadataQueries.ViewIdParameter, DbType.Int32, seeded.ViewId),
+                    (MetadataQueries.MaxLengthParameter, DbType.Int32, IDataStore.MaxCheckCodeLength + 1),
+                },
+                read.Parameters.Select(parameter => (parameter.Name, parameter.DbType, parameter.Value)));
         }
 
         string? caseReport = await reader.GetCheckCodeAsync(1, token);
@@ -1893,4 +2042,338 @@ public sealed class SqlMetadataReaderTempTableNameTests
         var options = new DatabaseOptions(ConnectionString: null);
         return new SqlMetadataReader(new SqlConnectionFactory(options), options, recorder);
     }
+}
+
+/// <summary>
+/// Unit tests of the object roles <see cref="SqlMetadataReader"/> enforces on what metadata names: which tables a form
+/// is read and written through (<see cref="SqlMetadataReader.ResolveRecordTables"/>,
+/// <see cref="SqlMetadataReader.IsClaimedByAnotherForm"/>, <see cref="SqlMetadataReader.IsRecordBaseTable"/>,
+/// <see cref="SqlMetadataReader.IsRecordPageTable"/>) and which table may serve Legal Values options
+/// (<see cref="SqlMetadataReader.IsCodeTable"/>). They need no database: the claims are synthetic rows and the tables
+/// are built in memory, so no metadata row or schema object is written, which is why poisoned metadata is proved here
+/// rather than stored.
+/// </summary>
+public sealed class SqlMetadataReaderObjectRoleTests
+{
+    private const int ViewId = 1;
+    private const int OtherViewId = 2;
+
+    /// <summary>
+    /// The form's base table, its page ids, the catalogue tables one read returned for its names ("name|shape", as
+    /// <see cref="CatalogueTable"/> builds them, the form's own base table first), another form's data-table name and
+    /// page ids, and whether that form's claims refuse this one.
+    /// </summary>
+    public static TheoryData<string, int[], string[], string?, int[], bool> ClaimCases => new()
+    {
+        // Another form names the base table exactly, or in another letter case that resolves to it.
+        { "FoodHistory", [1], ["FoodHistory|base", "FoodHistory1|page"], "FoodHistory", [2, 3], true },
+        { "Cases", [1], ["Cases|base", "Cases1|page"], "CASES", [2], true },
+        // The base table is one of another form's page tables.
+        { "FoodHistory2", [1], ["FoodHistory2|base", "FoodHistory21|page"], "FoodHistory", [2, 3], true },
+        // A page table is another form's base table, or one of its page tables, exactly or in another letter case;
+        // "Food1" + "2" and "Food" + "12" name the same table.
+        { "CaseReport", [1], ["CaseReport|base", "CaseReport1|page"], "CaseReport1", [], true },
+        { "Survey", [12], ["Survey|base", "Survey12|page"], "Survey1", [2], true },
+        { "Food", [12], ["Food|base", "Food12|page"], "Food1", [2], true },
+        { "Food", [12], ["Food|base", "Food12|page"], "FOOD1", [2], true },
+        { "Food1", [2], ["Food1|base", "Food12|page"], "Food", [12], true },
+        // Two forms that each name only their own tables, as the seeded forms do.
+        { "CaseReport", [1], ["CaseReport|base", "CaseReport1|page"], "FoodHistory", [2, 3], false },
+        // Distinct tables whose names differ only by letter case, in a case-sensitive database: each form owns the one
+        // it names exactly, so neither refuses the other.
+        { "Cases", [1], ["Cases|base", "Cases1|page", "cases|base", "cases2|page"], "cases", [2], false },
+        { "cases", [2], ["cases|base", "cases2|page", "Cases|base", "Cases1|page"], "Cases", [1], false },
+        // A spelling that matches two case variants and neither exactly reaches no table, for either form.
+        { "Food", [1], ["Food|base", "Food1|page", "FOOD|base"], "food", [2], false },
+        // Another form with no data-table name, or a blank one, claims nothing.
+        { "CaseReport", [1], ["CaseReport|base", "CaseReport1|page"], null, [2], false },
+        { "3", [1], ["3|base", "31|page"], "", [3], false },
+        { "\t3", [1], ["\t3|base", "\t31|page"], "\t", [3], false },
+    };
+
+    /// <summary>
+    /// A claimed name aliases the form only when it resolves, as the form resolves its own names, to the very base or
+    /// page table the form bound. The claims hold the form's own rows, which never count, and another form's base
+    /// claim and page claims. The answer does not depend on the order the rows arrive in.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(ClaimCases))]
+    public void IsClaimedByAnotherForm_DecidesByTheTableEachClaimResolvesTo(
+        string baseTableName,
+        int[] pageIds,
+        string[] catalogue,
+        string? otherDataTableName,
+        int[] otherPageIds,
+        bool expected)
+    {
+        TableSchema[] tables = [.. catalogue.Select(CatalogueTable)];
+        (TableSchema baseTable, TableSchema[] pageTables) =
+            SqlMetadataReader.ResolveRecordTables(tables, baseTableName, PageTableNames(baseTableName, pageIds));
+        List<(int ViewId, string? DataTableName, int? PageId)> claims = [(ViewId, baseTableName, null)];
+        claims.AddRange(pageIds.Select(pageId => (ViewId, (string?)baseTableName, (int?)pageId)));
+        claims.Add((OtherViewId, otherDataTableName, null));
+        claims.AddRange(otherPageIds.Select(pageId => (OtherViewId, otherDataTableName, (int?)pageId)));
+
+        TableSchema[] ownTables = [baseTable, .. pageTables];
+        Assert.Equal(expected, SqlMetadataReader.IsClaimedByAnotherForm(ViewId, tables, ownTables, claims));
+        Assert.Equal(
+            expected,
+            SqlMetadataReader.IsClaimedByAnotherForm(ViewId, tables, ownTables, Enumerable.Reverse(claims)));
+    }
+
+    /// <summary>
+    /// A large malformed claim set, 200,000 rows of one other form with as many data-table names as page ids, none
+    /// resolving to the form's tables, is decided in one pass over the rows, each costing one lookup: the rows are
+    /// enumerated exactly once and the answer arrives within seconds, where pairing each name with each page id would
+    /// mean 10^10 candidates. A last row that does alias the base table is still found.
+    /// </summary>
+    [Fact]
+    public void IsClaimedByAnotherForm_DecidesALargeMalformedClaimSetInOnePass()
+    {
+        const int rowsPerKind = 100_000;
+        TableSchema[] tables = [CatalogueTable("CaseReport|base"), CatalogueTable("CaseReport1|page")];
+        (TableSchema baseTable, TableSchema[] pageTables) =
+            SqlMetadataReader.ResolveRecordTables(tables, "CaseReport", PageTableNames("CaseReport", [1]));
+        TableSchema[] ownTables = [baseTable, .. pageTables];
+
+        int enumerated = 0;
+        IEnumerable<(int ViewId, string? DataTableName, int? PageId)> Claims(bool endWithAlias)
+        {
+            for (int index = 0; index < rowsPerKind; index++)
+            {
+                enumerated++;
+                string name = "Malformed" + index.ToString(CultureInfo.InvariantCulture);
+                yield return (OtherViewId, name, null);
+                enumerated++;
+                yield return (OtherViewId, name, index + 2);
+            }
+
+            if (endWithAlias)
+            {
+                enumerated++;
+                yield return (OtherViewId, "CASEREPORT", null);
+            }
+        }
+
+        var timer = System.Diagnostics.Stopwatch.StartNew();
+        bool unrelated = SqlMetadataReader.IsClaimedByAnotherForm(ViewId, tables, ownTables, Claims(endWithAlias: false));
+        timer.Stop();
+
+        Assert.False(unrelated);
+        Assert.Equal(2 * rowsPerKind, enumerated);
+        Assert.True(
+            timer.Elapsed < TimeSpan.FromSeconds(5),
+            $"Deciding {2 * rowsPerKind} claims took {timer.Elapsed}.");
+
+        enumerated = 0;
+        Assert.True(SqlMetadataReader.IsClaimedByAnotherForm(ViewId, tables, ownTables, Claims(endWithAlias: true)));
+        Assert.Equal((2 * rowsPerKind) + 1, enumerated);
+    }
+
+    /// <summary>
+    /// A base table must hold the system columns record SQL addresses: <c>UniqueKey</c> as an identity column,
+    /// <c>RecStatus</c> and <c>GlobalRecordId</c>. The seeded base tables hold all three.
+    /// </summary>
+    [Theory]
+    [InlineData(true, true, true, true, true)]
+    [InlineData(false, false, true, true, false)]
+    [InlineData(true, false, true, true, false)]
+    [InlineData(true, true, false, true, false)]
+    [InlineData(true, true, true, false, false)]
+    public void IsRecordBaseTable_RequiresAnIdentityUniqueKeyRecStatusAndGlobalRecordId(
+        bool hasUniqueKey,
+        bool uniqueKeyIsIdentity,
+        bool hasRecStatus,
+        bool hasGlobalRecordId,
+        bool expected)
+    {
+        var columns = new List<ColumnSchema>();
+        if (hasUniqueKey)
+        {
+            columns.Add(Column("UniqueKey", "int", isIdentity: uniqueKeyIsIdentity));
+        }
+
+        if (hasRecStatus)
+        {
+            columns.Add(Column("RecStatus", "smallint"));
+        }
+
+        if (hasGlobalRecordId)
+        {
+            columns.Add(Column("GlobalRecordId", "nvarchar"));
+        }
+
+        columns.Add(Column("LastSaveTime", "datetime"));
+
+        Assert.Equal(expected, SqlMetadataReader.IsRecordBaseTable(new TableSchema("SyntheticBase", columns)));
+    }
+
+    // The fixed messages of the form refusals ResolveRecordTables raises; they name no table.
+    private const string BaseTableMissingMessage = "The form's data table was not found in the database catalogue.";
+    private const string PageTableMissingMessage = "A page's data table was not found in the database catalogue.";
+    private const string NotRecordTablesMessage = "The form's data tables are not Epi Info record tables.";
+
+    /// <summary>
+    /// Base table, page ids, the catalogue tables one read returned for the form's names (each "name|shape", the
+    /// shape one of <see cref="CatalogueTable"/>'s), and the refusal's message, or null when the form binds.
+    /// </summary>
+    public static TheoryData<string, int[], string[], string?> RecordTableCases => new()
+    {
+        // The seeded shapes: every page has its page table, resolved exactly or ignoring case.
+        { "CaseReport", [1], ["CaseReport|base", "CaseReport1|page"], null },
+        { "FoodHistory", [2, 3], ["FoodHistory|base", "FoodHistory2|page", "FoodHistory3|page"], null },
+        { "foodhistory", [2, 3], ["FoodHistory|base", "FoodHistory2|page", "FoodHistory3|page"], null },
+        // DataTableName swapped between the seeded forms: CaseReport's page 1 needs FoodHistory1, and FoodHistory's
+        // pages 2 and 3 need CaseReport2 and CaseReport3, tables the other form's identity page ids never name.
+        { "FoodHistory", [1], ["FoodHistory|base"], PageTableMissingMessage },
+        { "CaseReport", [2, 3], ["CaseReport|base"], PageTableMissingMessage },
+        // A record-shaped table no form names, with no table for the page id, and a form missing one of two pages.
+        { "Orphan", [7], ["Orphan|base"], PageTableMissingMessage },
+        { "FoodHistory", [2, 3], ["FoodHistory|base", "FoodHistory2|page"], PageTableMissingMessage },
+        // Two case variants of a page table and no exact match, possible only in a case-sensitive database.
+        { "Food", [1], ["Food|base", "FOOD1|page", "food1|page"], PageTableMissingMessage },
+        // A page table without GlobalRecordId, a missing base table, and a base table without the record columns.
+        { "FoodHistory", [2], ["FoodHistory|base", "FoodHistory2|code"], NotRecordTablesMessage },
+        { "CaseReport", [1], ["CaseReport1|page"], BaseTableMissingMessage },
+        { "codestate", [1], ["codestate|code", "codestate1|page"], NotRecordTablesMessage },
+    };
+
+    /// <summary>
+    /// A form binds its base table and the table of every one of its pages, each the very catalogue table its name
+    /// resolves to, or is refused with a fixed message that names no table. A missing page table refuses the form, so
+    /// metadata pointing a form at another form's base table, or at an orphaned record table, fails for want of a
+    /// table for each of its own identity page ids.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(RecordTableCases))]
+    public void ResolveRecordTables_BindsTheBaseAndEveryPageTableOrRefusesTheForm(
+        string baseTableName,
+        int[] pageIds,
+        string[] catalogue,
+        string? expectedMessage)
+    {
+        TableSchema[] tables = [.. catalogue.Select(CatalogueTable)];
+        string[] pageTableNames = PageTableNames(baseTableName, pageIds);
+
+        if (expectedMessage is not null)
+        {
+            InvalidOperationException refusal = Assert.Throws<InvalidOperationException>(() =>
+                SqlMetadataReader.ResolveRecordTables(tables, baseTableName, pageTableNames));
+            Assert.Equal(expectedMessage, refusal.Message);
+            Assert.All(tables, table => Assert.DoesNotContain(table.Name, refusal.Message, StringComparison.Ordinal));
+            return;
+        }
+
+        (TableSchema baseTable, TableSchema[] pageTables) =
+            SqlMetadataReader.ResolveRecordTables(tables, baseTableName, pageTableNames);
+
+        Assert.Same(tables[0], baseTable);
+        Assert.Equal(pageTableNames.Length, pageTables.Length);
+        for (int index = 0; index < pageTables.Length; index++)
+        {
+            Assert.Same(tables[index + 1], pageTables[index]);
+        }
+    }
+
+    /// <summary>
+    /// A page table must hold <c>GlobalRecordId</c>, the key that joins it to its base row, as every seeded page table
+    /// does; a table of data columns alone, such as a code table, is no page table.
+    /// </summary>
+    [Theory]
+    [InlineData(true, true)]
+    [InlineData(false, false)]
+    public void IsRecordPageTable_RequiresGlobalRecordId(bool hasGlobalRecordId, bool expected)
+    {
+        var columns = new List<ColumnSchema>();
+        if (hasGlobalRecordId)
+        {
+            columns.Add(Column("GlobalRecordId", "nvarchar"));
+        }
+
+        columns.Add(Column("LastName", "nvarchar"));
+
+        Assert.Equal(expected, SqlMetadataReader.IsRecordPageTable(new TableSchema("SyntheticPage", columns)));
+    }
+
+    /// <summary>
+    /// A code table has the shape legacy gives every code table: a name with the <c>code</c> prefix, in any letter
+    /// case, and character columns only, none of them an identity column, as every seeded code table has. It holds no
+    /// <c>GlobalRecordId</c>, which every base and page table holds. Beside its <c>State</c> column, one more column
+    /// of the given name, type and identity flag, if any, decides: another character column keeps a code table, while
+    /// an identity, integer or date column, or <c>GlobalRecordId</c>, makes the table some other object. A page table,
+    /// a metadata table or a name with <c>code</c> anywhere but at its start is no code table.
+    /// </summary>
+    [Theory]
+    [InlineData("codestate", null, null, false, true)]
+    [InlineData("CODEx", null, null, false, true)]
+    [InlineData("codecity", "City", "nvarchar", false, true)]
+    [InlineData("codestate", "Notes", "ntext", false, true)]
+    [InlineData("codestate", "GlobalRecordId", "nvarchar", false, false)]
+    [InlineData("codestate", "Id", "int", true, false)]
+    [InlineData("codestate", "Id", "nvarchar", true, false)]
+    [InlineData("codestate", "Rank", "int", false, false)]
+    [InlineData("codestate", "Updated", "datetime", false, false)]
+    [InlineData("CaseReport1", null, null, false, false)]
+    [InlineData("metaFields", null, null, false, false)]
+    [InlineData("xcode", null, null, false, false)]
+    public void IsCodeTable_RequiresTheCodePrefixCharacterColumnsOnlyNoIdentityAndNoGlobalRecordId(
+        string tableName,
+        string? otherColumnName,
+        string? otherColumnType,
+        bool otherColumnIsIdentity,
+        bool expected)
+    {
+        var columns = new List<ColumnSchema>();
+        if (otherColumnName is not null && otherColumnType is not null)
+        {
+            columns.Add(Column(otherColumnName, otherColumnType, otherColumnIsIdentity));
+        }
+
+        columns.Add(Column("State", "nvarchar"));
+
+        Assert.Equal(expected, SqlMetadataReader.IsCodeTable(new TableSchema(tableName, columns)));
+    }
+
+    // Each page's table name, the base table name followed by the page id, as the reader derives it.
+    private static string[] PageTableNames(string baseTableName, int[] pageIds) =>
+        [.. pageIds.Select(pageId => baseTableName + pageId.ToString(CultureInfo.InvariantCulture))];
+
+    // An in-memory catalogue table from "name|shape": a base table as legacy creates one (an identity UniqueKey,
+    // RecStatus, GlobalRecordId and a stamp column), a page table (GlobalRecordId and a data column), or a code table
+    // (one nvarchar(255) column).
+    private static TableSchema CatalogueTable(string entry)
+    {
+        string[] parts = entry.Split('|');
+        ColumnSchema[] columns = parts[1] switch
+        {
+            "base" =>
+            [
+                Column("UniqueKey", "int", isIdentity: true),
+                Column("RecStatus", "smallint"),
+                Column("GlobalRecordId", "nvarchar"),
+                Column("LastSaveTime", "datetime"),
+            ],
+            "page" => [Column("GlobalRecordId", "nvarchar"), Column("LastName", "nvarchar")],
+            "code" => [Column("State", "nvarchar")],
+            _ => throw new ArgumentOutOfRangeException(nameof(entry), entry, "Unknown table shape."),
+        };
+
+        return new TableSchema(parts[0], columns);
+    }
+
+    // An in-memory catalogue column with the max_length sys.columns reports for its type; nvarchar is nvarchar(255).
+    private static ColumnSchema Column(string name, string sqlTypeName, bool isIdentity = false) =>
+        new(
+            name,
+            sqlTypeName,
+            sqlTypeName switch
+            {
+                "nvarchar" => 510,
+                "ntext" => 16,
+                "smallint" => 2,
+                "int" => 4,
+                _ => 8,
+            },
+            isNullable: !isIdentity,
+            isIdentity);
 }

@@ -251,14 +251,20 @@ public sealed partial class RecordService(
     /// </summary>
     /// <remarks>
     /// <see cref="SearchCriteriaParser"/> owns the criteria rules: trimming, the <c>" or "</c> alternatives, comparison
-    /// prefixes, wildcards, the six-field limit and the rejection of a field named twice. A wildcard pattern of any
-    /// length reaches the store, which evaluates one longer than SQL Server's <c>LIKE</c> pattern limit window by
-    /// window; only a pattern holding a <c>[...]</c> set longer than <see cref="RecordQueryRules.MaxLikePatternLength"/>
-    /// code units that is unclosed or that no cut keeping its members divides, which no SQL Server construct can
-    /// evaluate, is a 400, after the form's metadata is read and before any Find statement is sent. Any number of
-    /// alternatives reaches the store, which binds a large set in packed form. The store applies the selected set,
-    /// removes the open record before counting and capping, orders by <c>UniqueKey</c> and caps the items at
-    /// <see cref="RecordQueryRules.SearchCap"/>.
+    /// prefixes, wildcards, the six-field limit, the bound of <see cref="RecordQueryRules.MaxSearchValueLength"/>
+    /// UTF-16 code units on each string value, the search-wide bounds of
+    /// <see cref="RecordQueryRules.MaxRowComparedAlternatives"/> alternatives other than equality and <c>IS NULL</c>
+    /// and of <see cref="RecordQueryRules.MaxSearchPatternTextLength"/> code units of wildcard pattern text, and the
+    /// rejection of a field named twice. A longer value is a field-level 400 on its field, and a list of more than six
+    /// criteria, whatever it holds, or a search past a search-wide bound a field-level 400 on <c>criteria</c>, each
+    /// after the form's metadata is read and before any Find statement is sent. Within the bounds a wildcard pattern
+    /// reaches the store, which evaluates one longer than SQL Server's <c>LIKE</c> pattern limit window by window; only
+    /// a pattern holding a <c>[...]</c> set longer than <see cref="RecordQueryRules.MaxLikePatternLength"/> code units
+    /// that is unclosed or that no cut keeping its members divides, which no SQL Server construct can evaluate, is a
+    /// 400 on its field. Every alternative within the bounds reaches the store, which binds a large set in packed form.
+    /// The store admits at most two Find statements at once, and a search waits for a free slot until one frees or its
+    /// request is aborted, with no 503 of its own. The store applies the selected set, removes the open record before
+    /// counting and capping, orders by <c>UniqueKey</c> and caps the items at <see cref="RecordQueryRules.SearchCap"/>.
     /// </remarks>
     /// <param name="viewId">The form's <c>metaViews.ViewId</c> from the route.</param>
     /// <param name="request">

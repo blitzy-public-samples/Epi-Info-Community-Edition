@@ -47,7 +47,9 @@ namespace EpiInfo.Api.Services;
 /// No read-only, range, length, mask, legal-value, required or empty-record rule applies, so a record whose stored
 /// values break current rules can still be evaluated. A check-code runtime error is an <c>error</c> diagnostic in a
 /// 200 response, never an HTTP error, and never blocks a save. Store exceptions propagate to the exception handler,
-/// which answers 503 or 500; the endpoint writes nothing, so those bodies carry no <c>writeOutcome</c>.
+/// which answers 503 or 500; the endpoint writes nothing, so those bodies carry no <c>writeOutcome</c>. A client abort
+/// stops the store read or the engine with <see cref="OperationCanceledException"/>, which the handler answers with
+/// no response.
 /// </para>
 /// <para>
 /// Each returned diagnostic is logged once through a fixed template holding the form name, severity, line and
@@ -92,7 +94,10 @@ public sealed partial class FieldEventService(
     /// <summary>Validates and evaluates one field event.</summary>
     /// <param name="viewId">The form's <c>metaViews.ViewId</c> from the route.</param>
     /// <param name="request">The bound body, or <see langword="null"/> when the body is the JSON literal <c>null</c>.</param>
-    /// <param name="cancellationToken">The request's abort token, passed to every store call.</param>
+    /// <param name="cancellationToken">
+    /// The request's abort token, passed to every store call and to <see cref="ICheckCodeEngine.Run"/>, so an aborted
+    /// request stops the evaluation with <see cref="OperationCanceledException"/>.
+    /// </param>
     /// <returns>
     /// 200 with the engine's <see cref="FieldEventResponse"/>; 404 for an unknown form; or a request-level or
     /// field-level 400 as the remarks describe.
@@ -163,7 +168,7 @@ public sealed partial class FieldEventService(
         }
 
         var program = await store.GetCheckCodeAsync(viewId, cancellationToken).ConfigureAwait(false);
-        var response = checkCode.Run(program, metadata, fieldEvent, fieldName, typed.Values);
+        var response = checkCode.Run(program, metadata, fieldEvent, fieldName, typed.Values, cancellationToken);
 
         foreach (var diagnostic in response.Diagnostics)
         {

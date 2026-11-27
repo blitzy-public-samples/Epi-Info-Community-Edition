@@ -1,6 +1,7 @@
 using System.Collections.ObjectModel;
 using System.Data;
 using System.Data.Common;
+using System.Diagnostics;
 using System.Globalization;
 using System.Text;
 using EpiInfo.Data.Metadata;
@@ -15,6 +16,7 @@ using EpiInfo.Domain.Validation;
 using EpiInfo.Domain.Values;
 using EpiInfo.Tests.Shared;
 using Microsoft.Data.SqlClient;
+using Xunit.Abstractions;
 
 namespace EpiInfo.Data.Tests.Records;
 
@@ -2523,17 +2525,20 @@ public sealed class ListAndFindSqlTests
 /// database through <see cref="SqlExecution"/>: a search beyond 2,000 alternatives other than <c>IS NULL</c> binds its
 /// values packed and returns exactly the rows the per-alternative statement returns, the statement never exceeds SQL
 /// Server's parameter limit, a <c>LIKE</c> pattern or grid filter past SQL Server's 4,000-code-unit pattern limit runs
-/// a long-pattern program that returns exactly the rows of native <c>LIKE</c>, and a pattern holding a <c>[...]</c> set
-/// that no SQL Server construct evaluates is refused before any SQL is built.
+/// a long-pattern program that returns exactly the rows of native <c>LIKE</c>, a pattern holding a <c>[...]</c> set
+/// that no SQL Server construct evaluates is refused before any SQL is built, and the costliest searches the parser
+/// admits at its bounds run through the repository within the default command timeout.
 /// </summary>
 /// <remarks>
 /// <para>
 /// Criteria are written as a client writes them and parsed by <see cref="SearchCriteriaParser"/> over the form's data
-/// fields; their values are read from the database by direct SQL, from seeded active records with a row on every page,
-/// so each search matches something whatever rows the database holds. Every record a test creates carries a test
-/// marker at the start of <c>LastName</c>, so the samples leave out each record whose <c>LastName</c> starts with
-/// <see cref="TestDatabase.MarkerPrefix"/>: records other tests leave behind, such as a <c>LastName</c> at the
-/// column's full length, never become a criterion, and a rerun draws the same values. No count is hard-coded: every
+/// fields; a threshold search holding more alternatives than the parser admits in one value or one search is parsed in
+/// chunks within its bounds, whose alternatives form the one condition the builder receives, since the builder binds a
+/// condition of any size. Their values are read from the database by direct SQL, from seeded active records with a row
+/// on every page, so each search matches something whatever rows the database holds. Every record a test creates
+/// carries a test marker at the start of <c>LastName</c>, so the samples leave out each record whose <c>LastName</c>
+/// starts with <see cref="TestDatabase.MarkerPrefix"/>: records other tests leave behind, such as a <c>LastName</c> at
+/// the column's full length, never become a criterion, and a rerun draws the same values. No count is hard-coded: every
 /// expected result is another statement's result, the per-alternative statement or the union of per-alternative
 /// statements over chunks of the alternatives.
 /// </para>
@@ -2619,6 +2624,66 @@ public sealed class SearchStatementBoundsTests : IAsyncLifetime
 
     // Chunks of the threshold searches, run per alternative to build the expected union.
     private const int ChunkSize = 500;
+
+    // The legacy separator of a criterion's alternatives, as a client writes it.
+    private const string OrSeparator = " or ";
+
+    // The shapes of the costliest searches at the parser's bounds: one long pattern holding the whole pattern text,
+    // six long patterns sharing it, or the most packed patterns over five fields.
+    private const string LongPatternShape = "long pattern";
+    private const string SixLongPatternsShape = "six long patterns";
+    private const string PackedPatternsShape = "packed patterns";
+
+    // A character no seeded or test-created value holds, which the packed patterns carry so that none matches; the
+    // first of the characters, one per packed pattern, that tell the patterns apart; and the pattern each packed
+    // condition ends with, which matches every value of at least one character.
+    private const string AbsentCharacter = "\u00A7";
+    private const char FirstDistinctCharacter = '\u4E00';
+    private const string AnyTextPattern = "_%";
+
+    // The field of each form's long pattern: a text column of CaseReport and an ntext column of FoodHistory.
+    private static readonly IReadOnlyDictionary<string, string> LongPatternFields = new Dictionary<string, string>
+    {
+        [CaseReport] = "LastName",
+        [FoodHistory] = "BuyLastTenDays",
+    };
+
+    // The six text fields of CaseReport, each holding one of the six long patterns, and a text field of each form that
+    // holds no long pattern of one field.
+    private static readonly string[] SixLongPatternFields =
+        ["LastName", "FirstName", "Address", "City", "State", "County"];
+    private static readonly IReadOnlyDictionary<string, string> OtherTextFields = new Dictionary<string, string>
+    {
+        [CaseReport] = "State",
+        [FoodHistory] = "State",
+    };
+
+    // The five text fields of each form's packed patterns, an ntext field on each page of FoodHistory among them.
+    private static readonly IReadOnlyDictionary<string, string[]> PackedPatternFields =
+        new Dictionary<string, string[]>
+        {
+            [CaseReport] = ["State", "LastName", "FirstName", "Address", "City"],
+            [FoodHistory] = ["State", "LastName", "FirstName", "PatientAddress", "BuyLastTenDays"],
+        };
+
+    // Each packed field's column in the joins of CompleteRecords.
+    private static readonly IReadOnlyDictionary<string, string> PackedPatternColumns = new Dictionary<string, string>
+    {
+        ["State"] = "p1.[State]",
+        ["LastName"] = "p1.[LastName]",
+        ["FirstName"] = "p1.[FirstName]",
+        ["Address"] = "p1.[Address]",
+        ["City"] = "p1.[City]",
+        ["PatientAddress"] = "p1.[PatientAddress]",
+        ["BuyLastTenDays"] = "p2.[BuyLastTenDays]",
+    };
+
+    private readonly ITestOutputHelper output;
+
+    public SearchStatementBoundsTests(ITestOutputHelper output)
+    {
+        this.output = output;
+    }
 
     // The most rows the threshold searches' seeded values may match, so that each chunk's result and the union stay
     // under the 200-row cap and are therefore complete.
@@ -2722,7 +2787,7 @@ public sealed class SearchStatementBoundsTests : IAsyncLifetime
         var seeded = await SeededLastNamesAsync(connection, form, token);
         var excluded = await FirstActiveIdAsync(connection, seeded[0], token);
         var alternatives = ThresholdAlternatives(seeded, size);
-        var condition = Assert.Single(Parse(form, [Text("LastName", string.Join(" or ", alternatives))]));
+        var condition = ParseInChunks(form, "LastName", alternatives);
         Assert.Equal(size, condition.Alternatives.Count);
 
         var bound = SearchSqlBuilder.Search(
@@ -3409,6 +3474,105 @@ public sealed class SearchStatementBoundsTests : IAsyncLifetime
         Assert.Empty(await RunAsync(connection, select, token));
     }
 
+    // The costliest searches the parser admits, written as a client writes them at exactly its bounds, parse and run
+    // through the repository, its Find admission included, within the default 30-second command timeout, and one more
+    // pattern or code unit is the parser's one message for the bound it passes:
+    // - one '%_%_…%' pattern holding the whole 32,767 code units of pattern text one search admits, on a text column
+    //   and on an ntext column, and six such patterns sharing those units on the six text fields of CaseReport. They
+    //   run through the long-pattern program, whose compilation grows with the pattern text, the cost that bound caps;
+    // - the 6,554 alternatives other than equality and IS NULL one search admits, as '%§x%' patterns of four code
+    //   units, x a character that differs between them, spread over five text fields of the form's pages, an ntext
+    //   field on each page of FoodHistory among them. '§' is a character no value holds, and each condition ends in
+    //   '_%', which sorts after every pattern led by '%' under the database collation and matches every value of at
+    //   least one character, so every condition is packed and scans its whole list for every row it reads, and the
+    //   search matches exactly the complete active records whose five columns each hold a character, which direct SQL
+    //   counts.
+    [Theory]
+    [InlineData(CaseReport, LongPatternShape)]
+    [InlineData(FoodHistory, LongPatternShape)]
+    [InlineData(CaseReport, SixLongPatternsShape)]
+    [InlineData(CaseReport, PackedPatternsShape)]
+    [InlineData(FoodHistory, PackedPatternsShape)]
+    public async Task Search_CostliestCriteriaAtTheBounds_RunWithinTheDefaultCommandTimeout(
+        string formName,
+        string shape)
+    {
+        using var cancellation = new CancellationTokenSource(TestTimeout);
+        var token = cancellation.Token;
+        await using var databaseLock = await DatabaseWriteLock.AcquireSharedAsync(token);
+        await using var connection = await TestDatabase.OpenConnectionAsync(token);
+
+        var options = new DatabaseOptions(TestDatabase.ConnectionString);
+        Assert.Equal(DatabaseOptions.DefaultCommandTimeoutSeconds, options.CommandTimeoutSeconds);
+        var connections = new SqlConnectionFactory(options);
+        var recorder = new SqlCommandRecorder();
+        var reader = new SqlMetadataReader(connections, options, recorder);
+        var repository = new SqlRecordRepository(connections, reader, options, recorder);
+        var summary = Assert.Single(await reader.ListFormsAsync(token), form => form.Name == formName);
+        var metadata = await reader.GetFormMetadataAsync(summary.ViewId, token);
+        Assert.NotNull(metadata);
+        var dataFields = FormDefinitionFactory.GetDataFields(metadata);
+
+        string[] fields = shape switch
+        {
+            LongPatternShape => [LongPatternFields[formName]],
+            SixLongPatternsShape => SixLongPatternFields,
+            _ => PackedPatternFields[formName],
+        };
+        var (criteria, overBound, expectedMessage) = shape == PackedPatternsShape
+            ? PackedPatternCriteria(fields)
+            : LongPatternCriteria(fields, OtherTextFields[formName]);
+
+        var refused = SearchCriteriaParser.Parse(dataFields, overBound);
+        var (key, messages) = Assert.Single(refused.FieldErrors);
+        Assert.Equal(SearchCriteriaParser.CriteriaKey, key);
+        Assert.Equal(new[] { expectedMessage }, messages);
+
+        var parsed = SearchCriteriaParser.Parse(dataFields, criteria);
+        Assert.True(parsed.IsSuccess, "The criteria at the bounds did not parse.");
+        Assert.Equal(fields, parsed.Conditions.Select(condition => condition.FieldName));
+        var alternatives = parsed.Conditions.SelectMany(condition => condition.Alternatives).ToArray();
+        Assert.All(alternatives, alternative => Assert.Equal(SearchOperator.Like, alternative.Operator));
+        if (shape == PackedPatternsShape)
+        {
+            Assert.Equal(RecordQueryRules.MaxRowComparedAlternatives, alternatives.Length);
+        }
+        else
+        {
+            Assert.Equal(
+                RecordQueryRules.MaxSearchPatternTextLength,
+                alternatives.Sum(alternative => alternative.Value!.Value.AsText().Length));
+        }
+
+        recorder.Clear();
+        var clock = Stopwatch.StartNew();
+        var response = await repository.SearchAsync(metadata, parsed.Conditions, false, null, token);
+        clock.Stop();
+        output.WriteLine($"{formName} {shape}: {clock.Elapsed.TotalSeconds:F2} s, {response.Total} matches.");
+
+        Assert.True(
+            clock.Elapsed < TimeSpan.FromSeconds(DatabaseOptions.DefaultCommandTimeoutSeconds),
+            $"{formName} {shape} took {clock.Elapsed.TotalSeconds:F2} s.");
+        var find = Assert.Single(recorder.ForOperation(RecordOperations.Search));
+        Assert.Null(find.SqlErrorNumber);
+        if (shape == PackedPatternsShape)
+        {
+            Assert.Contains(PackedListMarker, find.CommandText, StringComparison.Ordinal);
+            Assert.True(
+                alternatives.Length > ScalarParameterBudget,
+                "The patterns at the bound do not take the packed path.");
+            var expected = await CompleteActiveRecordsHoldingTextAsync(
+                connection, formName, fields.Select(field => PackedPatternColumns[field]).ToArray(), token);
+            Assert.True(expected > 0, $"{formName}: no complete active record holds text in all five columns.");
+            Assert.Equal(expected, response.Total);
+        }
+        else
+        {
+            Assert.Contains(LongPatternCte, find.CommandText, StringComparison.Ordinal);
+            Assert.Equal(Math.Min(response.Total, RecordQueryRules.SearchCap), response.Items.Count);
+        }
+    }
+
     // CaseReport: text equality, LIKE and a bare prefix, Phone Number comparisons, fractional and negative number
     // comparisons, date comparisons, Comment Legal text, GlobalRecordId and RecStatus, and three fields at once.
     private static async Task<IReadOnlyList<(string Label, SearchCriterion[] Criteria)>> CaseReportCriteriaAsync(
@@ -3499,6 +3663,102 @@ public sealed class SearchStatementBoundsTests : IAsyncLifetime
                 ]
             ),
         ];
+    }
+
+    // The packed criteria at exactly the bound of alternatives other than equality and IS NULL, as a client writes
+    // them: an equal share of the 6,554 for each field, the first fields taking the remainder, as distinct '%§x%'
+    // patterns of four code units before the closing '_%'; their pattern text, 26,206 units over five fields, stays
+    // within its own bound. Over the bound, the last field holds one pattern more.
+    private static (SearchCriterion[] Criteria, SearchCriterion[] OverBound, string Message) PackedPatternCriteria(
+        IReadOnlyList<string> fields)
+    {
+        var values = new string[fields.Count];
+        var next = 0;
+        for (var index = 0; index < fields.Count; index++)
+        {
+            var count = (RecordQueryRules.MaxRowComparedAlternatives / fields.Count)
+                + (index < RecordQueryRules.MaxRowComparedAlternatives % fields.Count ? 1 : 0);
+            var patterns = Enumerable.Range(0, count - 1).Select(_ => DistinctPattern(next++)).Append(AnyTextPattern);
+            values[index] = Or(patterns);
+        }
+
+        SearchCriterion[] criteria = [.. fields.Select((field, index) => Text(field, values[index]))];
+        var overBound = criteria[..^1]
+            .Append(Text(fields[^1], DistinctPattern(next) + OrSeparator + values[^1]))
+            .ToArray();
+        return (
+            criteria,
+            overBound,
+            "One search can hold at most 6554 wildcard, comparison and multiline alternatives in all.");
+    }
+
+    // A '%§x%' pattern of four code units, x the index-th character from FirstDistinctCharacter, a CJK ideograph no
+    // pattern syntax reads and no other pattern repeats.
+    private static string DistinctPattern(int index) =>
+        "%" + AbsentCharacter + (char)(FirstDistinctCharacter + index) + "%";
+
+    // The long patterns at exactly the bound of pattern text, as a client writes them: '%_%_…', '%' and '_' in turn,
+    // one per field, of an equal share of the 32,767 code units, the first fields taking the remainder, so none
+    // collapses and their text as the patterns run is the whole bound. Over the bound by one unit: beside one pattern,
+    // whose value holds the whole bound of one value, a one-unit pattern on another text field of the form; beside
+    // several, one unit more in the last.
+    private static (SearchCriterion[] Criteria, SearchCriterion[] OverBound, string Message) LongPatternCriteria(
+        IReadOnlyList<string> fields,
+        string otherField)
+    {
+        var lengths = new int[fields.Count];
+        for (var index = 0; index < fields.Count; index++)
+        {
+            lengths[index] = (RecordQueryRules.MaxSearchPatternTextLength / fields.Count)
+                + (index < RecordQueryRules.MaxSearchPatternTextLength % fields.Count ? 1 : 0);
+        }
+
+        SearchCriterion[] criteria =
+            [.. fields.Select((field, index) => Text(field, AlternatingPattern(lengths[index])))];
+        SearchCriterion[] overBound;
+        if (fields.Count == 1)
+        {
+            Assert.NotEqual(otherField, fields[0]);
+            overBound = [.. criteria, Text(otherField, "%")];
+        }
+        else
+        {
+            overBound = [.. criteria[..^1], Text(fields[^1], AlternatingPattern(lengths[^1] + 1))];
+        }
+
+        return (
+            criteria,
+            overBound,
+            "The wildcard patterns of one search can hold at most 32767 characters in all.");
+    }
+
+    // '%' and '_' in turn, starting with '%', for length code units: a pattern with no run of '%' to collapse.
+    private static string AlternatingPattern(int length) =>
+        string.Create(length, 0, (text, _) =>
+        {
+            for (var position = 0; position < text.Length; position++)
+            {
+                text[position] = position % 2 == 0 ? '%' : '_';
+            }
+        });
+
+    // The number of the form's complete active records whose columns each hold at least one character, as
+    // LIKE N'_%' reads them under the column's collation: what a search matches whose every condition ends in '_%'
+    // and whose other patterns hold a character no value holds.
+    private static async Task<long> CompleteActiveRecordsHoldingTextAsync(
+        SqlConnection connection,
+        string formName,
+        IReadOnlyList<string> expressions,
+        CancellationToken token)
+    {
+        var sql = "SELECT COUNT_BIG(*) FROM " + CompleteRecords[formName]
+            + " WHERE b.[RecStatus] = @activeStatus AND "
+            + string.Join(" AND ", expressions.Select(expression => expression + " LIKE @anyText"));
+        await using var command = new SqlCommand(sql, connection);
+        command.Parameters.Add(new SqlParameter("@activeStatus", SqlDbType.SmallInt) { Value = ActiveStatus });
+        command.Parameters.Add(
+            new SqlParameter("@anyText", SqlDbType.NVarChar, AnyTextPattern.Length) { Value = AnyTextPattern });
+        return Assert.IsType<long>(await command.ExecuteScalarAsync(token));
     }
 
     // The threshold searches' LastName alternatives: the seeded values, a trailing and a leading wildcard pattern for
@@ -3998,7 +4258,7 @@ public sealed class SearchStatementBoundsTests : IAsyncLifetime
         Assert.Equal(0, Convert.ToInt32(quotedIdentifier, CultureInfo.InvariantCulture));
     }
 
-    private static string Or(IEnumerable<string> alternatives) => string.Join(" or ", alternatives);
+    private static string Or(IEnumerable<string> alternatives) => string.Join(OrSeparator, alternatives);
 
     private static SearchCriterion Text(string field, string value) => new(field, FieldValue.FromText(value));
 
@@ -4009,6 +4269,43 @@ public sealed class SearchStatementBoundsTests : IAsyncLifetime
             result.IsSuccess,
             "The criteria did not parse; errors under: " + string.Join(", ", result.FieldErrors.Keys));
         return result.Conditions;
+    }
+
+    // One condition on the field holding the alternatives exactly as the parser reads them, for more alternatives than
+    // one value or one search admits: the parser reads them in chunks whose text each fits
+    // RecordQueryRules.MaxSearchValueLength, a value that alone stays within the search-wide bounds, and their
+    // alternatives, in order, form the one condition the search builder receives, which binds a condition of any size.
+    // The alternatives carry no surrounding blanks, so trimming each chunk, as the parser trims a value, reads every
+    // alternative as one value of them all would.
+    private static SearchCondition ParseInChunks(SeededForm form, string fieldName, IReadOnlyList<string> alternatives)
+    {
+        Assert.All(alternatives, alternative => Assert.Equal(alternative.Trim(), alternative));
+
+        var parts = new List<SearchCondition>();
+        var chunk = new List<string>();
+        var length = 0;
+        foreach (var alternative in alternatives)
+        {
+            var separator = chunk.Count == 0 ? 0 : OrSeparator.Length;
+            if (chunk.Count > 0 && length + separator + alternative.Length > RecordQueryRules.MaxSearchValueLength)
+            {
+                parts.Add(Assert.Single(Parse(form, [Text(fieldName, Or(chunk))])));
+                chunk.Clear();
+                length = 0;
+                separator = 0;
+            }
+
+            chunk.Add(alternative);
+            length += separator + alternative.Length;
+        }
+
+        parts.Add(Assert.Single(Parse(form, [Text(fieldName, Or(chunk))])));
+        var first = parts[0];
+        return new SearchCondition(
+            first.FieldName,
+            first.Target,
+            first.FieldType,
+            [.. parts.SelectMany(part => part.Alternatives)]);
     }
 
     // The form as the store reads it: the reader's metadata and catalogue schema, the data fields and grid columns.
@@ -4067,6 +4364,199 @@ public sealed class SearchStatementBoundsTests : IAsyncLifetime
 
     // One Find result as the statement returns it: id, key, status, navigation position and the uncapped total.
     private readonly record struct SearchRow(string Id, long UniqueKey, long RecStatus, long Position, long Total);
+}
+
+/// <summary>
+/// Unit tests of the Find admission of <see cref="SqlRecordRepository.SearchAsync"/>, <see cref="FindAdmission"/>: a
+/// search takes a slot before it opens its connection; while every slot is held it waits, past the command timeout,
+/// with no failure of its own, no connection opened and nothing sent; it is admitted as soon as a slot is given back;
+/// it gives its own back whatever its outcome; and it ends with the request's cancellation, having taken no slot and
+/// sent nothing, when it is cancelled while it waits.
+/// </summary>
+/// <remarks>
+/// <para>
+/// No database is used: the class carries no <c>Integration</c> trait and joins no database collection. The
+/// repository's connection string is malformed, so an admitted search fails at once in the connection factory, as a
+/// <see cref="DataStoreWriteException"/> with no SQL error number, before any connection exists; a search still
+/// running while a case watches it has therefore not reached the factory and has opened no connection. Each case
+/// hands the repository a one-slot admission it holds itself through the repository's internal constructor, the
+/// command recorder shows that no case sends a command, and every wait is bounded by the case's cancellation source
+/// or a prompt deadline, so a regression fails its case instead of hanging the run.
+/// </para>
+/// <para>
+/// The class name ends with <c>SqlRecordRepositoryTests</c>, so a filter on that name selects it with the
+/// repository's integration tests.
+/// </para>
+/// </remarks>
+public sealed class FindAdmissionSqlRecordRepositoryTests
+{
+    // A connection string SqlClient rejects before any connection exists: an admitted search fails there.
+    private const string MalformedConnectionString = "Not A Keyword=1";
+
+    // The shortest command timeout DatabaseOptions admits, which the waiting case outlasts three times over.
+    private const int ShortCommandTimeoutSeconds = 1;
+
+    // How long searches waiting on a held slot are watched: well past the short command timeout.
+    private static readonly TimeSpan PastTheCommandTimeout = TimeSpan.FromSeconds(3 * ShortCommandTimeoutSeconds);
+
+    // How long a waiting search is given to show that it stays waiting while every slot is held.
+    private static readonly TimeSpan StillWaiting = TimeSpan.FromMilliseconds(500);
+
+    // The longest a case waits for a slot it expects free, or for an admitted search to end.
+    private static readonly TimeSpan Prompt = TimeSpan.FromSeconds(10);
+
+    private static readonly TimeSpan TestTimeout = TimeSpan.FromMinutes(2);
+
+    // A synthetic one-page form with one text field. No case gets as far as reading metadata, so no table is named.
+    private static readonly PageMetadata Page = new(1, "Page 1", 0, "AdmissionForm1");
+
+    private static readonly FormMetadata Form = new(
+        1,
+        "AdmissionForm",
+        "AdmissionForm",
+        [Page],
+        [
+            new FieldMetadata
+            {
+                FieldId = 1,
+                Name = "LastName",
+                FieldTypeId = 1,
+                FieldTypeName = "Text",
+                PageId = Page.PageId,
+                TabIndex = 1,
+                Column = FieldTypeMapper.DescribeColumn("LastName", "nvarchar", 8000),
+            },
+        ]);
+
+    private static readonly SearchCondition[] Conditions =
+    [
+        new("LastName", SearchTarget.PageField, FieldType.Text, [new(SearchOperator.Like, FieldValue.FromText("Sm%"))]),
+    ];
+
+    // Every slot held: two searches outlast the command timeout, one second here, three times over and are still
+    // waiting, with no failure of their own; neither reached the connection factory, which fails the malformed
+    // connection string at once, so no connection was opened and nothing was sent. One slot given back admits both in
+    // turn, the second only because the first gave the slot back although it failed in the factory, a failure that is
+    // never the database's unavailability; and the slot is free once both have failed.
+    [Fact]
+    public async Task Search_EverySlotHeld_WaitsPastTheCommandTimeoutUntilASlotIsGivenBack()
+    {
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        var admission = new FindAdmission(1);
+        await TakeFreeSlotAsync(admission, timeout.Token);
+        var (repository, recorder) = CreateRepository(ShortCommandTimeoutSeconds, admission);
+
+        Task<SearchResponse>[] waiting =
+        [
+            repository.SearchAsync(Form, Conditions, includeDeleted: false, null, timeout.Token),
+            repository.SearchAsync(Form, Conditions, includeDeleted: false, null, timeout.Token),
+        ];
+        await Task.Delay(PastTheCommandTimeout, timeout.Token);
+
+        Assert.All(waiting, search => Assert.False(search.IsCompleted, "A search ended while every slot was held."));
+        Assert.Empty(recorder.Commands);
+
+        admission.Release();
+
+        foreach (var search in waiting)
+        {
+            AssertFailedInTheConnectionFactory(
+                await Assert.ThrowsAsync<DataStoreWriteException>(() => search.WaitAsync(Prompt, timeout.Token)));
+        }
+
+        Assert.Empty(recorder.Commands);
+        await TakeFreeSlotAsync(admission, timeout.Token);
+        admission.Release();
+    }
+
+    // A search cancelled while it waits for a slot ends with the request's cancellation, takes no slot, leaves no
+    // waiter behind and sends nothing; a search whose request is already cancelled takes no slot even when one is free.
+    [Fact]
+    public async Task Search_CancelledWhileWaitingForASlot_ThrowsTheRequestsCancellationAndTakesNoSlot()
+    {
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        var admission = new FindAdmission(1);
+        await TakeFreeSlotAsync(admission, timeout.Token);
+        var (repository, recorder) = CreateRepository(DatabaseOptions.DefaultCommandTimeoutSeconds, admission);
+
+        using var request = CancellationTokenSource.CreateLinkedTokenSource(timeout.Token);
+        var waiting = repository.SearchAsync(Form, Conditions, includeDeleted: false, null, request.Token);
+        await Task.Delay(StillWaiting, timeout.Token);
+        Assert.False(waiting.IsCompleted, "The search ended while every slot was held.");
+
+        await request.CancelAsync();
+
+        var cancelled = await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => waiting.WaitAsync(Prompt, timeout.Token));
+        Assert.Equal(request.Token, cancelled.CancellationToken);
+
+        // The slot given back goes to no cancelled waiter, so it is free.
+        admission.Release();
+        await TakeFreeSlotAsync(admission, timeout.Token);
+        admission.Release();
+
+        var early = await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => repository.SearchAsync(Form, Conditions, includeDeleted: false, null, request.Token));
+        Assert.Equal(request.Token, early.CancellationToken);
+
+        Assert.Empty(recorder.Commands);
+        await TakeFreeSlotAsync(admission, timeout.Token);
+        admission.Release();
+    }
+
+    // The admission's own contract: two slots for a production repository, at least one slot, no release of a slot
+    // that was never taken, and no repository without an admission.
+    [Fact]
+    public void Admission_RejectsAnInvalidSlotCountOrRelease()
+    {
+        Assert.Equal(2, FindAdmission.DefaultSlots);
+        Assert.Throws<ArgumentOutOfRangeException>("slotCount", () => new FindAdmission(0));
+
+        var admission = new FindAdmission(1);
+        Assert.Throws<SemaphoreFullException>(admission.Release);
+        Assert.Throws<ArgumentNullException>(
+            "findAdmission",
+            () => new SqlRecordRepository(
+                new SqlConnectionFactory(new DatabaseOptions(MalformedConnectionString)),
+                new SqlMetadataReader(
+                    new SqlConnectionFactory(new DatabaseOptions(MalformedConnectionString)),
+                    new DatabaseOptions(MalformedConnectionString),
+                    NullSqlCommandObserver.Instance),
+                new DatabaseOptions(MalformedConnectionString),
+                NullSqlCommandObserver.Instance,
+                null!));
+    }
+
+    // Takes the one slot of a one-slot admission, failing the case unless the slot is free and taken promptly.
+    private static Task TakeFreeSlotAsync(FindAdmission admission, CancellationToken cancellationToken) =>
+        admission.EnterAsync(cancellationToken).WaitAsync(Prompt, cancellationToken);
+
+    // An admitted search over the malformed connection string fails in the connection factory, for the Find
+    // operation, with NotWritten and no SQL error number.
+    private static void AssertFailedInTheConnectionFactory(DataStoreWriteException failure)
+    {
+        Assert.Equal("records.search", failure.Operation);
+        Assert.Equal(WriteOutcome.NotWritten, failure.Outcome);
+        Assert.Null(failure.SqlErrorNumber);
+    }
+
+    // A repository over the malformed connection string, with the given command timeout and admission, and the
+    // recorder that observes every command it sends.
+    private static (SqlRecordRepository Repository, SqlCommandRecorder Recorder) CreateRepository(
+        int commandTimeoutSeconds,
+        FindAdmission admission)
+    {
+        var options = new DatabaseOptions(MalformedConnectionString, commandTimeoutSeconds);
+        var connections = new SqlConnectionFactory(options);
+        var recorder = new SqlCommandRecorder();
+        var repository = new SqlRecordRepository(
+            connections,
+            new SqlMetadataReader(connections, options, recorder),
+            options,
+            recorder,
+            admission);
+        return (repository, recorder);
+    }
 }
 
 /// <summary>

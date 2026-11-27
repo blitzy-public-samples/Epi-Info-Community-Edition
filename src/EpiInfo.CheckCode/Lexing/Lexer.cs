@@ -12,7 +12,9 @@ namespace EpiInfo.CheckCode.Lexing;
 /// <para>
 /// The lexer never fails and reports no diagnostics: anything the grammar does not admit becomes a
 /// <see cref="TokenKind.Unknown"/> token, which the parser reports with its line. Whitespace and closed comments
-/// produce no token, and the list always ends with exactly one <see cref="TokenKind.EndOfInput"/>.
+/// produce no token, and the list always ends with exactly one <see cref="TokenKind.EndOfInput"/>. Only
+/// <see cref="TryTokenize"/> stops early: it gives up on a text over its token budget and throws when its
+/// cancellation token is cancelled.
 /// </para>
 /// <para>
 /// Each terminal the grammar admits is one token, chosen by the longest match as the grammar's tokenizer chooses it,
@@ -87,13 +89,63 @@ public static class Lexer
     public static IReadOnlySet<string> HyphenatedKeywords => HyphenatedKeywordSet;
 
     /// <summary>Splits check-code program text into tokens.</summary>
+    /// <remarks>
+    /// The scan has no token budget and cannot be cancelled; <see cref="TryTokenize"/> is the bounded form the
+    /// check-code engine uses for stored programs.
+    /// </remarks>
     /// <param name="text">The program text; <see langword="null"/> is treated as empty.</param>
     /// <returns>
     /// Every token in source order, followed by exactly one <see cref="TokenKind.EndOfInput"/> token with empty
     /// text at the line and column just past the last character, which is (1, 1) for empty text. The method never
     /// throws for any input.
     /// </returns>
-    public static IReadOnlyList<Token> Tokenize(string? text) => new Scanner(text ?? string.Empty).Run();
+    public static IReadOnlyList<Token> Tokenize(string? text)
+    {
+        var scanner = new Scanner(text ?? string.Empty, int.MaxValue, CancellationToken.None);
+        scanner.Run();
+        return scanner.Tokens;
+    }
+
+    /// <summary>
+    /// Splits check-code program text into tokens as <see cref="Tokenize"/> does, giving up as soon as the text has
+    /// produced more than <paramref name="maxTokens"/> tokens.
+    /// </summary>
+    /// <remarks>
+    /// The <see cref="TokenKind.EndOfInput"/> token is not counted, so a text of exactly <paramref name="maxTokens"/>
+    /// tokens succeeds. The scan stops at the first token past the budget, so its work and memory are bounded by the
+    /// budget and by the text scanned so far, never by the rest of the text. <paramref name="cancellationToken"/> is
+    /// polled before the first scanning step and every 4,096 steps after it; each step consumes at least one character.
+    /// </remarks>
+    /// <param name="text">The program text; <see langword="null"/> is treated as empty.</param>
+    /// <param name="maxTokens">The most tokens, <see cref="TokenKind.EndOfInput"/> aside, the text may produce.</param>
+    /// <param name="cancellationToken">The request's abort token.</param>
+    /// <param name="tokens">
+    /// On success, the token list <see cref="Tokenize"/> returns for <paramref name="text"/>; otherwise an empty list.
+    /// </param>
+    /// <returns>
+    /// <see langword="true"/> when the text produces at most <paramref name="maxTokens"/> tokens; otherwise
+    /// <see langword="false"/>.
+    /// </returns>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="maxTokens"/> is negative.</exception>
+    /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> was cancelled.</exception>
+    public static bool TryTokenize(
+        string? text,
+        int maxTokens,
+        CancellationToken cancellationToken,
+        out IReadOnlyList<Token> tokens)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(maxTokens);
+
+        var scanner = new Scanner(text ?? string.Empty, maxTokens, cancellationToken);
+        if (scanner.Run())
+        {
+            tokens = scanner.Tokens;
+            return true;
+        }
+
+        tokens = Array.Empty<Token>();
+        return false;
+    }
 
     private static bool IsIdHead(char c) => char.IsLetter(c) || c is '_' or '@';
 
@@ -134,24 +186,52 @@ public static class Lexer
     /// reads out of range; a <c>'\0'</c> inside the text matches no rule but the last and lexes as
     /// <see cref="TokenKind.Unknown"/>, which keeps the two cases equivalent.
     /// </summary>
-    private sealed class Scanner(string text)
+    /// <param name="text">The text to scan.</param>
+    /// <param name="maxTokens">The most tokens, end of input aside, the pass may produce before it gives up.</param>
+    /// <param name="cancellationToken">Polled every <see cref="CancellationPollInterval"/> scanning steps.</param>
+    private sealed class Scanner(string text, int maxTokens, CancellationToken cancellationToken)
     {
+        // Scanning steps between two polls of the cancellation token; a step consumes at least one character.
+        private const int CancellationPollInterval = 4_096;
+
         private readonly List<Token> tokens = [];
         private int index;
         private int line = 1;
         private int column = 1;
 
-        public List<Token> Run()
+        /// <summary>
+        /// The tokens produced so far; after a successful <see cref="Run"/>, ending with the end of input.
+        /// </summary>
+        public List<Token> Tokens => tokens;
+
+        /// <summary>
+        /// Scans the whole text and adds the <see cref="TokenKind.EndOfInput"/> token; stops early, returning
+        /// <see langword="false"/>, as soon as more than <c>maxTokens</c> tokens have been produced.
+        /// </summary>
+        /// <exception cref="OperationCanceledException">The cancellation token was cancelled.</exception>
+        public bool Run()
         {
+            int steps = 0;
             while (index < text.Length)
             {
+                if (steps++ % CancellationPollInterval == 0)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                }
+
                 int start = index;
                 ScanNext();
                 Debug.Assert(index > start, "Every scanning step must consume at least one character.");
+
+                // A step adds at most one token, so the first token past the budget stops the scan.
+                if (tokens.Count > maxTokens)
+                {
+                    return false;
+                }
             }
 
             tokens.Add(new Token(TokenKind.EndOfInput, string.Empty, line, column));
-            return tokens;
+            return true;
         }
 
         /// <summary>Applies the first scanning rule that matches at the current position.</summary>

@@ -66,7 +66,8 @@ namespace EpiInfo.CheckCode.Parsing;
 /// </para>
 /// <para>
 /// Each call works on its own state and the keyword tables are immutable, so the parser is safe to call
-/// concurrently. It never throws for any token list.
+/// concurrently. It never throws for any token list; the one exception is the
+/// <see cref="OperationCanceledException"/> of a cancelled call, which it polls for as it consumes tokens.
 /// </para>
 /// </remarks>
 public static class Parser
@@ -168,7 +169,7 @@ public static class Parser
             Commands.TimeLiteral, Commands.CheckedLiteral, Commands.EnableExcept, Commands.DisableExcept,
             Commands.NotEqual, Commands.Less, Commands.Greater, Commands.LessOrEqual, Commands.GreaterOrEqual,
             Commands.Concatenate, Commands.Plus, Commands.Minus, Commands.Multiply, Commands.Divide, Commands.Power,
-            Commands.Percent, Commands.LibraryCall,
+            Commands.Percent, Commands.LibraryCall, Commands.Limit,
         ]);
 
     /// <summary>Parses the tokens of one form's check-code program.</summary>
@@ -180,22 +181,41 @@ public static class Parser
     /// <param name="formName">
     /// The <see cref="Diagnostic.Form"/> of every diagnostic; <see langword="null"/> is treated as empty.
     /// </param>
+    /// <param name="cancellationToken">
+    /// The request's abort token, polled as the parse consumes tokens: at its first step and every 1,024th after it.
+    /// </param>
     /// <returns>
     /// Every <c>Field</c> block in source order and every static diagnostic in source order, by line and then by
-    /// column, or <see cref="ProgramNode.Empty"/> when there is neither. Never <see langword="null"/>; the method
-    /// never throws.
+    /// column, or <see cref="ProgramNode.Empty"/> when there is neither. Never <see langword="null"/>; for any token
+    /// list the method throws only when <paramref name="cancellationToken"/> is cancelled.
     /// </returns>
-    public static ProgramNode Parse(IReadOnlyList<Token>? tokens, string? formName) =>
-        new ParseRun(tokens, formName ?? string.Empty).Execute();
+    /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> was cancelled.</exception>
+    public static ProgramNode Parse(
+        IReadOnlyList<Token>? tokens,
+        string? formName,
+        CancellationToken cancellationToken = default) =>
+        new ParseRun(tokens, formName ?? string.Empty, cancellationToken).Execute();
 
     /// <summary>Parses the tokens of a form's check-code program, naming the form in each diagnostic.</summary>
-    /// <param name="tokens">The tokens, as for <see cref="Parse(IReadOnlyList{Token}, string)"/>.</param>
+    /// <param name="tokens">
+    /// The tokens, as for <see cref="Parse(IReadOnlyList{Token}, string, CancellationToken)"/>.
+    /// </param>
     /// <param name="form">
     /// The form whose <see cref="FormMetadata.Name"/> becomes the <see cref="Diagnostic.Form"/> of every diagnostic;
     /// <see langword="null"/> gives an empty form name.
     /// </param>
-    /// <returns>The parsed program, as for <see cref="Parse(IReadOnlyList{Token}, string)"/>.</returns>
-    public static ProgramNode Parse(IReadOnlyList<Token>? tokens, FormMetadata? form) => Parse(tokens, form?.Name);
+    /// <param name="cancellationToken">
+    /// The request's abort token, as for <see cref="Parse(IReadOnlyList{Token}, string, CancellationToken)"/>.
+    /// </param>
+    /// <returns>
+    /// The parsed program, as for <see cref="Parse(IReadOnlyList{Token}, string, CancellationToken)"/>.
+    /// </returns>
+    /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> was cancelled.</exception>
+    public static ProgramNode Parse(
+        IReadOnlyList<Token>? tokens,
+        FormMetadata? form,
+        CancellationToken cancellationToken = default) =>
+        Parse(tokens, form?.Name, cancellationToken);
 
     /// <summary>
     /// Whether a <see cref="Diagnostic.Command"/> is fixed language vocabulary: a keyword or reserved word of the
@@ -428,6 +448,13 @@ public static class Parser
 
         /// <summary>The library-call separator <c>!</c> of the DLL form of <c>ASSIGN</c> (line 282).</summary>
         public const string LibraryCall = "!";
+
+        /// <summary>
+        /// A program or a response over one of the check-code engine's budgets: a program too long or with too many
+        /// tokens to parse, which runs nothing, or more diagnostics than one response lists, the rest summarised. The
+        /// engine reports it; the parser does not.
+        /// </summary>
+        public const string Limit = "LIMIT";
     }
 
     /// <summary>The event an event-block keyword selects and the keyword that closes the block.</summary>
@@ -455,11 +482,14 @@ public static class Parser
     }
 
     /// <summary>
-    /// The state of one <see cref="Parse(IReadOnlyList{Token}, string)"/> call: the token cursor, the nesting depth
-    /// and the diagnostic sinks. A new instance per call is what makes the parser thread-safe.
+    /// The state of one <see cref="Parse(IReadOnlyList{Token}, string, CancellationToken)"/> call: the token cursor,
+    /// the nesting depth and the diagnostic sinks. A new instance per call is what makes the parser thread-safe.
     /// </summary>
-    private sealed class ParseRun(IReadOnlyList<Token>? source, string form)
+    private sealed class ParseRun(IReadOnlyList<Token>? source, string form, CancellationToken cancellationToken)
     {
+        // Calls of Advance between two polls of the cancellation token; the first call polls.
+        private const int CancellationPollInterval = 1_024;
+
         private readonly List<FieldBlockNode> fieldBlocks = [];
         private readonly List<PositionedDiagnostic> programDiagnostics = [];
 
@@ -474,6 +504,9 @@ public static class Parser
         private Token end = new(TokenKind.EndOfInput, string.Empty, 1, 1);
         private int position;
         private int depth;
+
+        // The calls of Advance so far, which pace the polls of the cancellation token.
+        private long advances;
 
         // The lookahead of AlwaysOpensBlock, built by AnalyseClosers for the tokens from closerStart up to the
         // statement-list stop at closerStop: entry i - closerStart is the first END or END-IF (nextCloser), or the
@@ -499,10 +532,11 @@ public static class Parser
                 DetachDanglingComment();
                 ParseProgram();
             }
-            catch (Exception ex) when (ex is not OutOfMemoryException)
+            catch (Exception ex) when (ex is not OutOfMemoryException and not OperationCanceledException)
             {
                 // Last-resort net for a defect in this parser; every input it is designed for is handled above.
-                // The blocks completed so far are kept, and the open event block, if any, is abandoned.
+                // The blocks completed so far are kept, and the open event block, if any, is abandoned. A cancelled
+                // call is no defect: its exception reaches the caller, which no longer wants the result.
                 eventDiagnostics = null;
                 Warn(Current, Commands.Syntax, "Check code could not be parsed; rest of the program skipped");
             }
@@ -609,9 +643,18 @@ public static class Parser
             return index < tokens.Length ? tokens[index] : end;
         }
 
-        /// <summary>Consumes the current token and returns it; at the end it returns the end token and stays.</summary>
+        /// <summary>
+        /// Consumes the current token and returns it; at the end it returns the end token and stays. The first call
+        /// and every <see cref="CancellationPollInterval"/>th call after it poll the cancellation token first.
+        /// </summary>
+        /// <exception cref="OperationCanceledException">The call's cancellation token was cancelled.</exception>
         private Token Advance()
         {
+            if (advances++ % CancellationPollInterval == 0)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+            }
+
             Token token = Current;
             if (position < tokens.Length)
             {

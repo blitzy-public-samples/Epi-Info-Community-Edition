@@ -373,8 +373,10 @@ public sealed class ReservedWordIdentifierTests
                 Assert.Null(secondTable.FindColumn("GlobalRecordId"));
             }
 
-            // The second page holds no data field, as the reader leaves a page whose table is missing: the form's
-            // values all belong to the first page, so the empty submission passes the values contract.
+            // The second page holds no data field, as a page without a table has none and the keyless table's column is
+            // left unbound: the form's values all belong to the first page, so the empty submission passes the values
+            // contract. The metadata reader refuses a form whose page table is missing or lacks its record key, so only
+            // a schema built in memory, as here, reaches the store's own guard.
             var secondPage = new PageMetadata(
                 SecondPageId,
                 "Page 2",

@@ -50,6 +50,76 @@ internal static class RecordOperations
 }
 
 /// <summary>
+/// The admission of Find statements to SQL Server: at most a fixed number of searches hold a slot at once, and a
+/// search that finds every slot taken waits, before it opens a connection, until one comes free or its request is
+/// aborted. Each <see cref="SqlRecordRepository"/> holds one, and the store builds one repository, which the API
+/// registers once per process, so the slots bound every Find statement the API process sends.
+/// </summary>
+/// <remarks>
+/// <para>
+/// The search-criteria parser bounds the alternatives and the pattern text of one statement: it admits at most
+/// <see cref="RecordQueryRules.MaxSearchValueLength"/> code units in one value, and in one search at most
+/// <see cref="RecordQueryRules.MaxRowComparedAlternatives"/> alternatives that SQL Server compares row by row and
+/// <see cref="RecordQueryRules.MaxSearchPatternTextLength"/> code units of wildcard pattern text, so a Find's work
+/// grows only with the rows and the text it scans, and the command timeout bounds how long it runs. Those bounds hold
+/// per statement.
+/// The slots bound how many such statements occupy SQL Server workers together, so concurrent searches cannot take
+/// every worker that saves and record reads need. A search holds its slot from before its connection opens until its
+/// statement has completed and the connection is released.
+/// </para>
+/// <para>
+/// The wait has no deadline and no failure of its own, so a busy admission is never reported as an unavailable
+/// database. Every admitted search runs its statements under the command timeout and gives its slot back when it
+/// ends, so slots keep coming free; a waiting search holds no connection and has sent nothing, and it ends without a
+/// slot only when its request is aborted, as when its client gives up.
+/// </para>
+/// <para>
+/// The slots are a <see cref="SemaphoreSlim"/>, which is safe to share across threads and admits waiters in no
+/// promised order. It is never disposed: it lives as long as its repository and its wait handle is never created, so
+/// it holds no unmanaged resource. Nothing here logs or reads request data.
+/// </para>
+/// </remarks>
+internal sealed class FindAdmission
+{
+    /// <summary>
+    /// The Find statements one repository runs at once: two, so one search can still run while another occupies a SQL
+    /// Server worker until its end, and saves and record reads keep every other worker.
+    /// </summary>
+    internal const int DefaultSlots = 2;
+
+    private readonly SemaphoreSlim slots;
+
+    /// <summary>Creates an admission with <paramref name="slotCount"/> slots, all of them free.</summary>
+    /// <param name="slotCount">The searches admitted at once; at least 1.</param>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="slotCount"/> is less than 1.</exception>
+    internal FindAdmission(int slotCount)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThan(slotCount, 1);
+        slots = new SemaphoreSlim(slotCount, slotCount);
+    }
+
+    /// <summary>
+    /// Takes a slot, waiting while every slot is taken until one comes free or <paramref name="cancellationToken"/> is
+    /// cancelled, with no deadline of its own (class remarks).
+    /// </summary>
+    /// <param name="cancellationToken">
+    /// The request's abort token. Once it is cancelled no slot is taken, even one that is free.
+    /// </param>
+    /// <returns>
+    /// A task that completes once a slot is taken, which the caller gives back with <see cref="Release"/> once its
+    /// statement has completed.
+    /// </returns>
+    /// <exception cref="OperationCanceledException">
+    /// <paramref name="cancellationToken"/> was cancelled before a slot was taken; nothing is taken.
+    /// </exception>
+    internal Task EnterAsync(CancellationToken cancellationToken) => slots.WaitAsync(cancellationToken);
+
+    /// <summary>Gives back a slot that <see cref="EnterAsync"/> took.</summary>
+    /// <exception cref="SemaphoreFullException">No slot is taken, so none can be given back.</exception>
+    internal void Release() => slots.Release();
+}
+
+/// <summary>
 /// The record half of the SQL Server store: every record read and every record write of <see cref="IDataStore"/>,
 /// over the statements <see cref="RecordSqlBuilder"/> and <see cref="SearchSqlBuilder"/> build. Each method has the
 /// signature of its <see cref="IDataStore"/> member, so <c>SqlServerDataStore</c> forwards to it unchanged.
@@ -67,6 +137,17 @@ internal static class RecordOperations
 /// <para>
 /// <b>Reads</b> send only <c>SELECT</c> statements, in no transaction. Their failures propagate unchanged for
 /// <c>SqlServerDataStore</c> to classify.
+/// </para>
+/// <para>
+/// <b>Find admission.</b> <see cref="SearchAsync"/> takes one of the repository's <see cref="FindAdmission"/> slots,
+/// <see cref="FindAdmission.DefaultSlots"/> in all, before it opens its connection, and gives it back once its
+/// statement has completed, whatever the outcome. So at most two Find statements of the repository run at once, each
+/// limited by the command timeout, and concurrent searches cannot hold every SQL Server worker that saves and record
+/// reads need. While every slot is taken a search waits, holding no connection and sending nothing, until one comes
+/// free or its request is aborted. The wait has no deadline and no failure of its own, so it gives the search no
+/// response of its own: an admitted search answers as any search does, and one cancelled while it waits ends with the
+/// <see cref="OperationCanceledException"/> of the request's token, having taken no slot and sent nothing. No other
+/// method takes a slot.
 /// </para>
 /// <para>
 /// <b>Writes</b> each run in one <see cref="SqlTransaction"/> at <see cref="IsolationLevel.ReadCommitted"/>, in the
@@ -153,6 +234,31 @@ internal sealed class SqlRecordRepository(
     private readonly DatabaseOptions options = options ?? throw new ArgumentNullException(nameof(options));
 
     private readonly ISqlCommandObserver observer = observer ?? throw new ArgumentNullException(nameof(observer));
+
+    // The Find slots every search of this repository takes before it opens its connection (class remarks).
+    private readonly FindAdmission findAdmission = new(FindAdmission.DefaultSlots);
+
+    /// <summary>
+    /// Creates a repository whose searches take their slots from <paramref name="findAdmission"/> instead of an
+    /// admission of its own: the seam through which a test holds every slot, or shares one admission between
+    /// repositories. Production code uses the four-parameter constructor.
+    /// </summary>
+    /// <param name="connections">Opens the connection of each operation.</param>
+    /// <param name="metadata">Reads the form's metadata and catalogue schema on that connection.</param>
+    /// <param name="options">Supplies the command timeout every statement runs with.</param>
+    /// <param name="observer">Receives every statement this repository sends.</param>
+    /// <param name="findAdmission">The Find slots <see cref="SearchAsync"/> takes.</param>
+    /// <exception cref="ArgumentNullException">An argument is <see langword="null"/>.</exception>
+    internal SqlRecordRepository(
+        SqlConnectionFactory connections,
+        SqlMetadataReader metadata,
+        DatabaseOptions options,
+        ISqlCommandObserver observer,
+        FindAdmission findAdmission)
+        : this(connections, metadata, options, observer)
+    {
+        this.findAdmission = findAdmission ?? throw new ArgumentNullException(nameof(findAdmission));
+    }
 
     /// <summary>Counts the records of the selected set, as <see cref="IDataStore.CountAsync"/>.</summary>
     /// <param name="form">The form's metadata; its view id identifies the form.</param>
@@ -445,6 +551,10 @@ internal sealed class SqlRecordRepository(
     /// A condition names no data field of the form or holds a pattern the builder refuses, raised before any base- or
     /// page-table statement is sent.
     /// </exception>
+    /// <exception cref="OperationCanceledException">
+    /// <paramref name="cancellationToken"/> was cancelled, while the search waited for a Find slot (class remarks), in
+    /// which case it took no slot, opened no connection and sent nothing, or later.
+    /// </exception>
     public async Task<SearchResponse> SearchAsync(
         FormMetadata form,
         IReadOnlyList<SearchCondition> conditions,
@@ -455,6 +565,33 @@ internal sealed class SqlRecordRepository(
         ArgumentNullException.ThrowIfNull(form);
         ArgumentNullException.ThrowIfNull(conditions);
 
+        // The slot is taken before the connection opens, so a search that waits holds no pooled connection and has sent
+        // nothing. The wait ends when an admitted search, whose statements run under the command timeout, gives its
+        // slot back, or when the request is aborted.
+        await findAdmission.EnterAsync(cancellationToken).ConfigureAwait(false);
+
+        try
+        {
+            return await SearchAdmittedAsync(form, conditions, includeDeleted, excludeGlobalRecordId, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        finally
+        {
+            // Given back once the statement has completed or failed and its connection is released, whatever the
+            // outcome, so a failed search never keeps its slot.
+            findAdmission.Release();
+        }
+    }
+
+    // The search itself, run while it holds a Find slot: one connection, the form's metadata and schema, then the one
+    // Find statement, as SearchAsync documents.
+    private async Task<SearchResponse> SearchAdmittedAsync(
+        FormMetadata form,
+        IReadOnlyList<SearchCondition> conditions,
+        bool includeDeleted,
+        string? excludeGlobalRecordId,
+        CancellationToken cancellationToken)
+    {
         SqlConnection connection = await connections
             .OpenAsync(RecordOperations.Search, cancellationToken)
             .ConfigureAwait(false);

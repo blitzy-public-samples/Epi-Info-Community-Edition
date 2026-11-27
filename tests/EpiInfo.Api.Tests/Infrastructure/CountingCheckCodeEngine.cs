@@ -20,8 +20,9 @@ namespace EpiInfo.Api.Tests.Infrastructure;
 /// </para>
 /// <para>
 /// The counters are the only state. The wrapped engine is stateless, and this class caches, alters and reorders
-/// nothing: every argument reaches the inner engine as given and its result, or its exception, reaches the caller as
-/// the inner engine produced it. Responses through the API are therefore the real engine's.
+/// nothing: every argument, the cancellation token included, reaches the inner engine as given and its result, or its
+/// exception, reaches the caller as the inner engine produced it. Responses through the API are therefore the real
+/// engine's.
 /// </para>
 /// <para>
 /// A call is counted before it is forwarded, so a call that throws is still counted.
@@ -46,10 +47,13 @@ public sealed class CountingCheckCodeEngine(ICheckCodeEngine inner) : ICheckCode
     public ICheckCodeEngine Inner => _inner;
 
     /// <inheritdoc />
-    public IReadOnlyList<Diagnostic> Analyze(string? program, FormMetadata form)
+    public IReadOnlyList<Diagnostic> Analyze(
+        string? program,
+        FormMetadata form,
+        CancellationToken cancellationToken = default)
     {
         Interlocked.Increment(ref _analyzeCalls);
-        return _inner.Analyze(program, form);
+        return _inner.Analyze(program, form, cancellationToken);
     }
 
     /// <inheritdoc />
@@ -58,10 +62,11 @@ public sealed class CountingCheckCodeEngine(ICheckCodeEngine inner) : ICheckCode
         FormMetadata form,
         FieldEventKind fieldEvent,
         string fieldName,
-        IReadOnlyDictionary<string, FieldValue> values)
+        IReadOnlyDictionary<string, FieldValue> values,
+        CancellationToken cancellationToken = default)
     {
         Interlocked.Increment(ref _runCalls);
-        return _inner.Run(program, form, fieldEvent, fieldName, values);
+        return _inner.Run(program, form, fieldEvent, fieldName, values, cancellationToken);
     }
 
     /// <summary>

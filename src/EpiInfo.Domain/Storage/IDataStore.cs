@@ -138,6 +138,17 @@ namespace EpiInfo.Domain.Storage;
 public interface IDataStore
 {
     /// <summary>
+    /// The longest check-code program, in UTF-16 code units, that <see cref="GetCheckCodeAsync"/> serves whole and the
+    /// check-code engine parses: 1,048,576, the same bound as the 1 MiB request body cap.
+    /// </summary>
+    /// <remarks>
+    /// <c>metaViews.CheckCode</c> is an unbounded <c>ntext</c> column, and both the form definition and every field
+    /// event read and parse it, so this bound keeps a stored program from costing each of those requests more than a
+    /// request body can. The seeded programs, 443 and 2,428 code units long, are far inside it.
+    /// </remarks>
+    public const int MaxCheckCodeLength = 1_048_576;
+
+    /// <summary>
     /// Lists every form: one entry per <c>metaViews</c> row, ordered by <c>ViewId</c> ascending, with
     /// <see cref="FormSummary.PageCount"/> the number of that view's <c>metaPages</c> rows.
     /// </summary>
@@ -169,8 +180,12 @@ public interface IDataStore
     /// <see cref="FieldMetadata.TextColumnName"/>, each as <c>new FieldOption(FieldValue.FromText(text), text)</c>.
     /// They keep the order in which the unsorted read returns them, as legacy reads code tables, so no order is
     /// promised beyond the database's own; they are sorted by text only when <see cref="FieldMetadata.Sort"/> is set,
-    /// as legacy sorts the list. A field without a usable code table, because either name is missing or the table or
-    /// column is not in the catalogue, gets an empty list.
+    /// as legacy sorts the list. A usable code table is a table of the catalogue with the shape legacy gives code
+    /// tables: its name starts with <c>code</c>, in any letter case, and its columns are all character columns, none
+    /// of them an identity column. It has no <c>GlobalRecordId</c> column, so it is no form's base or page table, and
+    /// it holds a character column of the field's <see cref="FieldMetadata.TextColumnName"/>. A field without a usable
+    /// code table, because either name is missing, the table is not in the catalogue or is no code table, or the
+    /// column is not a character column of it, gets an empty list, so no other table's rows are published as options.
     /// </para>
     /// <para>
     /// Option fields are not served here: their labels come from <c>metaFields.List</c>, which
@@ -188,14 +203,20 @@ public interface IDataStore
         CancellationToken cancellationToken);
 
     /// <summary>
-    /// Reads the check-code program of a form: the <c>metaViews.CheckCode</c> text, unchanged.
+    /// Reads the check-code program of a form: the <c>metaViews.CheckCode</c> text, unchanged when it is at most
+    /// <see cref="MaxCheckCodeLength"/> UTF-16 code units long.
     /// </summary>
+    /// <remarks>
+    /// A longer stored program is returned as its first <see cref="MaxCheckCodeLength"/> + 1 code units, so the caller
+    /// can tell that it is over the limit while the rest of it never reaches the process. The check-code engine
+    /// reports such a program as over its budget and runs none of it.
+    /// </remarks>
     /// <param name="viewId">A <c>metaViews.ViewId</c>.</param>
     /// <param name="cancellationToken">The request's abort token.</param>
     /// <returns>
-    /// The program text, or <see langword="null"/> when the column is <c>NULL</c> or the view is unknown. Callers treat
-    /// <see langword="null"/> as an empty program and resolve an unknown form to 404 through
-    /// <see cref="GetFormMetadataAsync"/> first.
+    /// The program text, at most <see cref="MaxCheckCodeLength"/> + 1 code units long, or <see langword="null"/> when
+    /// the column is <c>NULL</c> or the view is unknown. Callers treat <see langword="null"/> as an empty program and
+    /// resolve an unknown form to 404 through <see cref="GetFormMetadataAsync"/> first.
     /// </returns>
     Task<string?> GetCheckCodeAsync(int viewId, CancellationToken cancellationToken);
 

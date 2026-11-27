@@ -227,8 +227,9 @@ public sealed class PageTableSchema
     public PageMetadata Page { get; }
 
     /// <summary>
-    /// The page table as the catalogue reports it, or <see langword="null"/> when the database holds no table of
-    /// the page's name. A page without a table stores no values and is never named in record SQL.
+    /// The page table as the catalogue reports it, or <see langword="null"/> for a page built without one. The
+    /// metadata reader refuses a form whose page table the catalogue lacks, so a schema it builds holds a table for
+    /// every page. A page without a table stores no values and is never named in record SQL.
     /// </summary>
     public TableSchema? Table { get; }
 }

@@ -207,10 +207,11 @@ public sealed record EventBlockNode(
     /// <summary>
     /// Where each entry of <see cref="Diagnostics"/>, at the same index, stands among <see cref="Statements"/>: the
     /// number of the block's statements that start before it in the source, counted in pre-order (each statement,
-    /// then its <c>THEN</c> branch, then its <c>ELSE</c> branch, as <see cref="PreOrderSize(StatementNode)"/>
-    /// counts them). The evaluator adds a diagnostic just before the first statement it runs whose pre-order index
-    /// is at least the anchor, or after the block when it runs none, so static diagnostics and runtime errors reach
-    /// the response in source order. An immutable snapshot of the value.
+    /// then its <c>THEN</c> branch, then its <c>ELSE</c> branch, as
+    /// <see cref="PreOrderSize(StatementNode, Dictionary{IfStatementNode, int})"/> counts them). The evaluator adds a
+    /// diagnostic just before the first statement it runs whose pre-order index is at least the anchor, or after the
+    /// block when it runs none, so static diagnostics and runtime errors reach the response in source order. An
+    /// immutable snapshot of the value.
     /// </summary>
     /// <remarks>
     /// The parser sets it. A block built without it, or whose anchors do not cover <see cref="Diagnostics"/>, has
@@ -247,29 +248,56 @@ public sealed record EventBlockNode(
     /// <see cref="DiagnosticAnchors"/>: one for itself, plus, for an <c>IF</c>, those of its <c>THEN</c> and
     /// <c>ELSE</c> branches. Counted without recursion, so no depth of nesting can exhaust the call stack.
     /// </summary>
+    /// <param name="statement">The statement.</param>
+    /// <param name="sizes">
+    /// The sizes of <c>IF</c> statements counted before, keyed by reference, which the count takes instead of walking
+    /// those statements' branches again, and to which the size of an <c>IF</c> <paramref name="statement"/> is added;
+    /// a tree never changes, so a size counted once holds. <see langword="null"/> counts every branch.
+    /// </param>
     /// <exception cref="ArgumentNullException"><paramref name="statement"/> is <see langword="null"/>.</exception>
-    internal static int PreOrderSize(StatementNode statement)
+    internal static int PreOrderSize(StatementNode statement, Dictionary<IfStatementNode, int>? sizes = null)
     {
         ArgumentNullException.ThrowIfNull(statement);
-        return statement is IfStatementNode ? CountPreOrder([statement]) : 1;
+        if (statement is not IfStatementNode ifStatement)
+        {
+            return 1;
+        }
+
+        if (sizes is not null && sizes.TryGetValue(ifStatement, out int counted))
+        {
+            return counted;
+        }
+
+        int size = CountPreOrder([statement], sizes);
+        sizes?.TryAdd(ifStatement, size);
+        return size;
     }
 
     /// <summary>
     /// The pre-order size of a statement list: the sum of its statements' sizes. Counted without recursion, so no
     /// depth of nesting can exhaust the call stack.
     /// </summary>
+    /// <param name="statements">The statements.</param>
+    /// <param name="sizes">
+    /// The sizes of <c>IF</c> statements counted before, as for the single-statement overload, which the count takes
+    /// instead of walking their branches again; the list's own size is not added. <see langword="null"/> counts every
+    /// branch.
+    /// </param>
     /// <exception cref="ArgumentNullException">
     /// <paramref name="statements"/> or one of its elements is <see langword="null"/>.
     /// </exception>
-    internal static int PreOrderSize(IReadOnlyList<StatementNode> statements)
+    internal static int PreOrderSize(
+        IReadOnlyList<StatementNode> statements,
+        Dictionary<IfStatementNode, int>? sizes = null)
     {
         ArgumentNullException.ThrowIfNull(statements);
-        return CountPreOrder(statements);
+        return CountPreOrder(statements, sizes);
     }
 
     // Counts every statement of the list and of the THEN and ELSE branches beneath it, keeping the branches still to
     // count on an explicit stack: memory grows with the tree, never the call stack. A count does not depend on order.
-    private static int CountPreOrder(IReadOnlyList<StatementNode> statements)
+    // An IF whose size sizes already holds adds that size, and its branches are not walked again.
+    private static int CountPreOrder(IReadOnlyList<StatementNode> statements, Dictionary<IfStatementNode, int>? sizes)
     {
         var size = 0;
         var pending = new Stack<IReadOnlyList<StatementNode>>();
@@ -279,9 +307,17 @@ public sealed record EventBlockNode(
             foreach (StatementNode statement in list)
             {
                 ArgumentNullException.ThrowIfNull(statement);
-                size++;
-                if (statement is IfStatementNode ifStatement)
+                if (statement is not IfStatementNode ifStatement)
                 {
+                    size++;
+                }
+                else if (sizes is not null && sizes.TryGetValue(ifStatement, out int counted))
+                {
+                    size += counted;
+                }
+                else
+                {
+                    size++;
                     pending.Push(ifStatement.Then);
                     if (ifStatement.Else is { } elseBranch)
                     {

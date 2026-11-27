@@ -934,13 +934,24 @@ public sealed class FakeDataStore : IDataStore
         });
 
     /// <inheritdoc />
+    /// <remarks>
+    /// Honours the store contract as the SQL reader does: a program longer than
+    /// <see cref="IDataStore.MaxCheckCodeLength"/> UTF-16 code units comes back as its first
+    /// <see cref="IDataStore.MaxCheckCodeLength"/> + 1 code units, and any other program unchanged.
+    /// </remarks>
     public Task<string?> GetCheckCodeAsync(int viewId, CancellationToken cancellationToken) =>
         Complete<string?>(() =>
         {
             lock (_gate)
             {
                 BeginRead(nameof(GetCheckCodeAsync), cancellationToken);
-                return _forms.TryGetValue(viewId, out var state) ? state.Form.CheckCode : null;
+                if (!_forms.TryGetValue(viewId, out var state) || state.Form.CheckCode is not { } program)
+                {
+                    return null;
+                }
+
+                const int servedLength = IDataStore.MaxCheckCodeLength + 1;
+                return program.Length > servedLength ? program[..servedLength] : program;
             }
         });
 

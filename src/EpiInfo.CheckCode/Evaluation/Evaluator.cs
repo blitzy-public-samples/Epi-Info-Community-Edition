@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Runtime.CompilerServices;
 using EpiInfo.CheckCode.Functions;
+using EpiInfo.CheckCode.Parsing;
 using EpiInfo.CheckCode.Syntax;
 using EpiInfo.Domain.Diagnostics;
 using EpiInfo.Domain.Events;
@@ -28,6 +29,11 @@ namespace EpiInfo.CheckCode.Evaluation;
 /// <see cref="DiagnosticSeverity.Error"/> diagnostic, keeps the effects of earlier statements and continues with the
 /// next one, so a check-code error never blocks a save. Diagnostic messages name fields, functions and constructs
 /// only, never a value.
+/// </para>
+/// <para>
+/// A run's work is bounded by <see cref="MaxWork"/>, charged to its <see cref="EvaluationContext"/> before each piece
+/// of work is done. Running out is no statement's error: it ends the run with one
+/// <see cref="Parser.Commands.Limit"/> warning, and the statements before keep their effects and diagnostics.
 /// </para>
 /// <para>
 /// The evaluator enforces no read-only, range, length, mask, legal-value or required rule: an <c>ASSIGN</c> to a
@@ -58,6 +64,43 @@ public static class Evaluator
     private const string ExpressionTooDeepMessage = "Expression is nested too deeply to evaluate.";
     private const string MissingConditionValueMessage = "A condition has no value.";
 
+    // Fixed text and the budget, never program text or a value.
+    private static readonly string WorkLimitMessage = string.Create(
+        CultureInfo.InvariantCulture,
+        $"Check code exceeds the {MaxWork}-step work limit; remaining statements skipped");
+
+    /// <summary>
+    /// The most steps of work one run may do: 4,000,000.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The token budget of the engine bounds how many nodes a run can evaluate, but not the work a node does: a
+    /// comparison reads both texts whole, a request value can be as long as the request, and a group name stands for
+    /// all its members. So the run is charged, before the work is done, one step for each statement and each
+    /// expression node it evaluates and each name it resolves; the text length of each comparison's operands, of a
+    /// <c>NOT</c> operand, of a function's text arguments and of each value an <c>ASSIGN</c> stores, with the
+    /// <c>metaFields.List</c> length of an option it assigns; and the member count of each group it expands, with the
+    /// rows the first expansion of a group reads, since a group's members are resolved once per run. The steps of one
+    /// run share this budget, every block and nested statement included. Counting statements to place static
+    /// diagnostics needs no charge: each <c>IF</c> is counted once per run, so that work stays within twice the
+    /// block's statements, which the token budget bounds.
+    /// </para>
+    /// <para>
+    /// A run that would pass it stops before that work: the statements before keep their effects and diagnostics, as
+    /// after a runtime error, the rest of the run is skipped, and one <see cref="DiagnosticSeverity.Warning"/> with
+    /// the command <see cref="Parser.Commands.Limit"/>, at the line of the statement that ran out, says so with a
+    /// fixed message naming this budget.
+    /// </para>
+    /// <para>
+    /// The value keeps the slowest work measured within a run at roughly 0.1 s in a release build: comparing texts
+    /// that differ in case takes the full linguistic collation, about 20 ns a code unit for Thai, the slowest found, so
+    /// comparisons filling the budget take about 80 ms; expanding a group takes about 33 ns a member with its
+    /// de-duplication, so expansions filling it take about 130 ms. The seeded programs charge at most 18 steps an
+    /// event, and the longest flat chains the evaluator is tested with, 60,000 terms, under 500,000.
+    /// </para>
+    /// </remarks>
+    public const int MaxWork = 4_000_000;
+
     /// <summary>
     /// Runs the selected event blocks of one field event over a record's values and returns the response.
     /// </summary>
@@ -79,7 +122,10 @@ public static class Evaluator
     /// </para>
     /// <para>
     /// The blocks run in the given order over one shared <see cref="EvaluationContext"/>, so a later block reads the
-    /// values an earlier block assigned or cleared.
+    /// values an earlier block assigned or cleared, and share its <see cref="MaxWork"/> budget. A run that would pass
+    /// the budget ends with one <see cref="Parser.Commands.Limit"/> warning at the line of the statement that ran out,
+    /// after the effects and diagnostics of the statements before it; no later statement or block runs, and no later
+    /// static diagnostic is added.
     /// </para>
     /// </remarks>
     /// <param name="form">The metadata of the form whose program runs.</param>
@@ -87,6 +133,10 @@ public static class Evaluator
     /// <param name="values">
     /// The record's current values keyed by data-field name, each key bound to its field as the
     /// <see cref="EvaluationContext"/> constructor binds it. Never changed.
+    /// </param>
+    /// <param name="cancellationToken">
+    /// The request's abort token, polled before each statement, nested ones included, and by the run's work meter
+    /// inside each statement.
     /// </param>
     /// <returns>
     /// The accumulated effects and diagnostics, or <see cref="FieldEventResponse.Empty"/> when
@@ -98,10 +148,12 @@ public static class Evaluator
     /// <exception cref="ArgumentException">
     /// <paramref name="blocks"/> contains a <see langword="null"/> element.
     /// </exception>
+    /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> was cancelled.</exception>
     public static FieldEventResponse Run(
         FormMetadata form,
         IReadOnlyList<EventBlockNode> blocks,
-        IReadOnlyDictionary<string, FieldValue> values)
+        IReadOnlyDictionary<string, FieldValue> values,
+        CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(form);
         ArgumentNullException.ThrowIfNull(blocks);
@@ -119,13 +171,21 @@ public static class Evaluator
             throw new ArgumentException("An event block must not be null.", nameof(blocks));
         }
 
-        var context = new EvaluationContext(form, values);
+        var context = new EvaluationContext(form, values, cancellationToken);
         var effects = new EffectAccumulator();
-        foreach (EventBlockNode block in selected)
+        try
         {
-            var feed = new StaticDiagnosticFeed(block, effects);
-            ExecuteList(block.Statements, 0, context, effects, feed);
-            feed.AddRemaining();
+            foreach (EventBlockNode block in selected)
+            {
+                var feed = new StaticDiagnosticFeed(block, effects);
+                ExecuteList(block.Statements, 0, context, effects, feed, cancellationToken);
+                feed.AddRemaining();
+            }
+        }
+        catch (EvaluationContext.WorkLimitExceededException ex)
+        {
+            // The run's one boundary for its work budget: what ran before stands and the rest is skipped.
+            effects.AddDiagnostic(WorkLimitDiagnostic(context, ex.Line));
         }
 
         return effects.ToResponse();
@@ -139,11 +199,18 @@ public static class Evaluator
     /// exception's line and command. An <see cref="ArgumentOutOfRangeException"/> or <see cref="OverflowException"/>
     /// becomes one at the statement's line and command, with a fixed message. Either way the failing statement is
     /// skipped, the effects of earlier statements stand, and the next statement runs. Any other exception is a
-    /// defect and propagates.
+    /// defect and propagates. <paramref name="cancellationToken"/> is polled before each statement, outside its error
+    /// boundary, and by the context's work meter inside each statement, beside the token the context was created with,
+    /// so a cancelled run stops with <see cref="OperationCanceledException"/> and never reports it as a diagnostic.
+    /// The statements charge <paramref name="context"/>'s <see cref="MaxWork"/> budget, which every call on the same
+    /// context shares: a call that would pass it ends with one <see cref="Parser.Commands.Limit"/> warning at the line
+    /// of the statement that ran out, after the effects and diagnostics of the statements before it, and runs no
+    /// later statement.
     /// </remarks>
     /// <param name="statements">The statements in source order.</param>
     /// <param name="context">The run's field scope.</param>
     /// <param name="effects">The run's effect accumulator.</param>
+    /// <param name="cancellationToken">The request's abort token.</param>
     /// <exception cref="ArgumentNullException">
     /// <paramref name="statements"/>, <paramref name="context"/> or <paramref name="effects"/> is
     /// <see langword="null"/>.
@@ -151,16 +218,31 @@ public static class Evaluator
     /// <exception cref="ArgumentException">
     /// <paramref name="statements"/> contains a <see langword="null"/> element.
     /// </exception>
+    /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> was cancelled.</exception>
     public static void Execute(
         IReadOnlyList<StatementNode> statements,
         EvaluationContext context,
-        EffectAccumulator effects)
+        EffectAccumulator effects,
+        CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(statements);
         ArgumentNullException.ThrowIfNull(context);
         ArgumentNullException.ThrowIfNull(effects);
 
-        ExecuteList(statements, 0, context, effects, feed: null);
+        CancellationToken previous = context.EnterCall(cancellationToken);
+        try
+        {
+            ExecuteList(statements, 0, context, effects, feed: null, cancellationToken);
+        }
+        catch (EvaluationContext.WorkLimitExceededException ex)
+        {
+            // The call's one boundary for the context's work budget: what ran before stands and the rest is skipped.
+            effects.AddDiagnostic(WorkLimitDiagnostic(context, ex.Line));
+        }
+        finally
+        {
+            context.ExitCall(previous);
+        }
     }
 
     // Execute's loop. firstIndex is the pre-order index, within its event block, of the first statement (see
@@ -170,24 +252,34 @@ public static class Evaluator
     // for the rest of this list and for every branch this list runs, and firstIndex and index are no longer read.
     // Execute has no feed, a block without diagnostics has nothing to add, and a block without covering anchors adds
     // everything before its first statement, so none of them sizes a subtree, and a skipped branch is never walked.
+    // The cancellation token is polled before each statement, outside its try, and neither catch takes an
+    // OperationCanceledException, so one raised before a statement of a branch also leaves the enclosing IF's
+    // boundary: a cancelled run is never turned into a diagnostic. Each statement is one step of the run's work,
+    // charged after the static diagnostics that precede it are added and outside its try; neither catch takes the
+    // work-limit exception either, so it unwinds every enclosing IF to the run's one boundary. The feed keeps the size
+    // of each IF it has counted, so sizing a statement never walks an IF already sized: however deep the nesting, a
+    // block's statements are walked at most twice, once for a skipped THEN and once for the IF around it.
     private static void ExecuteList(
         IReadOnlyList<StatementNode> statements,
         int firstIndex,
         EvaluationContext context,
         EffectAccumulator effects,
-        StaticDiagnosticFeed? feed)
+        StaticDiagnosticFeed? feed,
+        CancellationToken cancellationToken)
     {
         int index = firstIndex;
         for (var i = 0; i < statements.Count; i++)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             StatementNode statement = statements[i]
                 ?? throw new ArgumentException("A statement must not be null.", nameof(statements));
 
             feed?.AddThrough(index);
             feed = StaticDiagnosticFeed.WhilePending(feed);
+            context.BeginStatement(statement.Line);
             try
             {
-                ExecuteStatement(statement, index, context, effects, feed);
+                ExecuteStatement(statement, index, context, effects, feed, cancellationToken);
             }
             catch (CheckCodeRuntimeException ex)
             {
@@ -210,7 +302,7 @@ public static class Evaluator
             feed = StaticDiagnosticFeed.WhilePending(feed);
             if (feed is not null)
             {
-                index += EventBlockNode.PreOrderSize(statement);
+                index += feed.SizeOf(statement);
             }
         }
     }
@@ -263,6 +355,11 @@ public static class Evaluator
     /// parentheses, <c>NOT</c> or a hand-built tree, is evaluated while stack remains; deeper nesting throws a
     /// <see cref="CheckCodeRuntimeException"/> with a fixed message, which <see cref="Execute"/> reports as one
     /// <see cref="DiagnosticSeverity.Error"/> diagnostic for its statement.
+    /// <para>
+    /// Every node, every name resolved and the text each comparison, <c>NOT</c> or function reads are charged to
+    /// <paramref name="context"/>'s <see cref="MaxWork"/> budget before the work is done, as <see cref="MaxWork"/>
+    /// lists, and the meter polls the token the context was created with as the steps add up.
+    /// </para>
     /// </remarks>
     /// <param name="expression">The expression.</param>
     /// <param name="context">The run's field scope.</param>
@@ -280,6 +377,11 @@ public static class Evaluator
     /// <c>AND</c> has no value, the expression is of a kind outside the subset, or it is nested too deeply for the
     /// remaining stack.
     /// </exception>
+    /// <exception cref="InvalidOperationException">
+    /// The evaluation would take <paramref name="context"/> past its <see cref="MaxWork"/> budget, which
+    /// <see cref="Run"/> and <see cref="Execute"/> report as one <see cref="Parser.Commands.Limit"/> warning instead.
+    /// </exception>
+    /// <exception cref="OperationCanceledException">The token the context was created with was cancelled.</exception>
     public static FieldValue Evaluate(ExpressionNode expression, EvaluationContext context, string command)
     {
         ArgumentNullException.ThrowIfNull(expression);
@@ -293,19 +395,24 @@ public static class Evaluator
             throw new CheckCodeRuntimeException(expression.Line, command, ExpressionTooDeepMessage);
         }
 
+        context.ChargeWork(1);
         switch (expression)
         {
             case LiteralNode literal:
                 return ValueComparer.LiteralToValue(literal);
 
             case IdentifierNode identifier:
+                context.ChargeWork(1);
                 return context.Read(context.Resolve(identifier.Name, identifier.Line, command));
 
             case FunctionCallNode call:
                 return EvaluateCall(call, context, command);
 
             case NotNode not:
-                return FieldValue.FromBoolean(!IsTrueForNot(EvaluateCondition(not.Operand, context, command)));
+                // Its truth is a linguistic comparison that reads the operand's text whole.
+                FieldValue operand = EvaluateCondition(not.Operand, context, command);
+                context.ChargeWork(TextLength(operand));
+                return FieldValue.FromBoolean(!IsTrueForNot(operand));
 
             case AndNode and:
                 return EvaluateAnd(and, context, command);
@@ -320,7 +427,8 @@ public static class Evaluator
 
     // The parser folds a flat chain a AND b AND c to the right, And(a, And(b, c)), so the chain is walked along its
     // right spine in a loop and its length costs no stack. Every operand is evaluated in source order with no short
-    // circuit, as legacy Rule_AndExp evaluated both sides, so an error in any later operand is never hidden.
+    // circuit, as legacy Rule_AndExp evaluated both sides, so an error in any later operand is never hidden. Evaluate
+    // charged the first AND; each further AND of the spine is evaluated here, so it is charged here.
     private static FieldValue EvaluateAnd(AndNode node, EvaluationContext context, string command)
     {
         bool all = true;
@@ -329,6 +437,10 @@ public static class Evaluator
         {
             all &= IsTrue(EvaluateCondition(and.Left, context, command));
             current = and.Right;
+            if (current is AndNode)
+            {
+                context.ChargeWork(1);
+            }
         }
 
         bool last = IsTrue(EvaluateCondition(current, context, command));
@@ -337,6 +449,9 @@ public static class Evaluator
 
     // a = b = c is Eq(a, Eq(b, c)): the operands are evaluated left to right along the right spine, then compared
     // from the right, so the result is that of the right-associated tree and the chain's length costs no stack.
+    // Evaluate charged the first =; each further = of the spine is charged here. A comparison can read both operands'
+    // text whole (a linguistic comparison, a number parse or an upper-casing), so their text length is charged before
+    // each comparison runs.
     private static FieldValue EvaluateEquals(EqualsNode node, EvaluationContext context, string command)
     {
         // Each comparison keeps its own operator line, which a type mismatch reports.
@@ -346,11 +461,16 @@ public static class Evaluator
         {
             lefts.Add((EvaluateComparisonOperand(equals.Left, context, command), equals.Line));
             current = equals.Right;
+            if (current is EqualsNode)
+            {
+                context.ChargeWork(1);
+            }
         }
 
         FieldValue result = EvaluateComparisonOperand(current, context, command);
         for (var i = lefts.Count - 1; i >= 0; i--)
         {
+            context.ChargeWork((long)TextLength(lefts[i].Value) + TextLength(result));
             if (!ValueComparer.TryAreEqual(lefts[i].Value, result, out bool equal))
             {
                 // Legacy throws from its boolean conversion here (Rule_CompareExp.cs:182-185); the statement
@@ -387,12 +507,13 @@ public static class Evaluator
         int index,
         EvaluationContext context,
         EffectAccumulator effects,
-        StaticDiagnosticFeed? feed)
+        StaticDiagnosticFeed? feed,
+        CancellationToken cancellationToken)
     {
         switch (statement)
         {
             case IfStatementNode node:
-                ExecuteIf(node, index, context, effects, feed);
+                ExecuteIf(node, index, context, effects, feed, cancellationToken);
                 break;
 
             case EnableStatementNode node:
@@ -436,24 +557,26 @@ public static class Evaluator
         int index,
         EvaluationContext context,
         EffectAccumulator effects,
-        StaticDiagnosticFeed? feed)
+        StaticDiagnosticFeed? feed,
+        CancellationToken cancellationToken)
     {
         FieldValue condition = EvaluateCondition(node.Condition, context, IfCommand);
         if (IsTrue(condition))
         {
-            ExecuteList(node.Then, index + 1, context, effects, feed);
+            ExecuteList(node.Then, index + 1, context, effects, feed, cancellationToken);
         }
         else if (node.Else is { } elseBranch)
         {
-            int elseIndex = feed is null ? index + 1 : index + 1 + EventBlockNode.PreOrderSize(node.Then);
-            ExecuteList(elseBranch, elseIndex, context, effects, feed);
+            int elseIndex = feed is null ? index + 1 : index + 1 + feed.SizeOf(node.Then);
+            ExecuteList(elseBranch, elseIndex, context, effects, feed, cancellationToken);
         }
     }
 
     // Legacy Enable/Disable: every name, then a group's members, de-duplicated by metadata row keeping the first
     // occurrence, so fields whose names differ only by case stay distinct targets. Any field kind is accepted, labels
     // and groups included, as legacy ChangeIsEnabled is. All names are resolved before the first effect, so an
-    // unknown name fails the statement whole.
+    // unknown name fails the statement whole. Each name's expansion is charged by its member count, and a group's
+    // members are resolved once per run, however often it is named.
     private static void ExecuteEnablement(
         IReadOnlyList<string> names,
         int line,
@@ -468,7 +591,7 @@ public static class Evaluator
         foreach (FieldMetadata field in fields)
         {
             AddOnce(targets, seen, field);
-            foreach (FieldMetadata member in context.GetGroupMembers(field))
+            foreach (FieldMetadata member in context.ExpandGroup(field))
             {
                 AddOnce(targets, seen, member);
             }
@@ -481,7 +604,8 @@ public static class Evaluator
     }
 
     // Legacy Clear: a group stands for its members only, and only input fields are cleared, so labels, groups,
-    // command buttons and unsupported fields are skipped without a diagnostic.
+    // command buttons and unsupported fields are skipped without a diagnostic. A group's expansion is charged by its
+    // member count, and its members are resolved once per run.
     private static void ExecuteClear(ClearStatementNode node, EvaluationContext context, EffectAccumulator effects)
     {
         FieldMetadata[] fields = ResolveAll(node.Names, node.Line, ClearCommand, context);
@@ -490,7 +614,7 @@ public static class Evaluator
         var seen = new HashSet<FieldMetadata>(ReferenceEqualityComparer.Instance);
         foreach (FieldMetadata field in fields)
         {
-            IReadOnlyList<FieldMetadata> expanded = context.IsGroup(field) ? context.GetGroupMembers(field) : [field];
+            IReadOnlyList<FieldMetadata> expanded = context.IsGroup(field) ? context.ExpandGroup(field) : [field];
             foreach (FieldMetadata candidate in expanded)
             {
                 if (context.IsDataField(candidate))
@@ -507,11 +631,21 @@ public static class Evaluator
         }
     }
 
+    // The target's name is one step. An option's items are read from its metaFields.List, charged by its length before
+    // the conversion reads it, and the value stored, which the response carries, is charged by its text length.
     private static void ExecuteAssign(AssignStatementNode node, EvaluationContext context, EffectAccumulator effects)
     {
+        context.ChargeWork(1);
         FieldMetadata target = context.Resolve(node.Target, node.Line, AssignCommand);
         FieldValue value = Evaluate(node.Value, context, AssignCommand);
-        FieldValue coerced = CoerceForAssignment(target, context.GetFieldType(target), value, node.Line);
+        FieldType type = context.GetFieldType(target);
+        if (type == FieldType.Option)
+        {
+            context.ChargeWork(target.List?.Length ?? 0);
+        }
+
+        FieldValue coerced = CoerceForAssignment(target, type, value, node.Line);
+        context.ChargeWork(TextLength(coerced));
 
         context.Write(target, coerced);
         effects.Assign(target.Name, coerced);
@@ -618,13 +752,19 @@ public static class Evaluator
         return FieldValue.FromIndex((int)index);
     }
 
+    // A function may read a text argument whole, as EPIWEEK matches and parses date and first-day text, so the
+    // arguments' text length is charged before the call.
     private static FieldValue EvaluateCall(FunctionCallNode call, EvaluationContext context, string command)
     {
         var arguments = new FieldValue[call.Arguments.Count];
+        long text = 0;
         for (var i = 0; i < arguments.Length; i++)
         {
             arguments[i] = Evaluate(call.Arguments[i], context, command);
+            text += TextLength(arguments[i]);
         }
+
+        context.ChargeWork(text);
 
         // The parser reports an unregistered function and builds no node for it; this guards a hand-built tree.
         if (!FunctionRegistry.TryGet(call.Name, out CheckCodeFunction? function))
@@ -651,16 +791,24 @@ public static class Evaluator
     // throws for a null one before either branch runs, so a value-less operand fails its statement. The one null value
     // let through is that of a text, multiline or legal-values field with no value: legacy Rule_Value read such a
     // field as "", which is simply not true. Every other value-less operand, such as (.), an empty number, date,
-    // checkbox or option field, or a null function result, is a runtime error.
+    // checkbox or option field, or a null function result, is a runtime error. Telling the empty text-family field
+    // resolves the identifier's name once more, one more step.
     private static FieldValue EvaluateCondition(ExpressionNode expression, EvaluationContext context, string command)
     {
         FieldValue value = Evaluate(expression, context, command);
-        if (!value.IsNull
-            || (expression is IdentifierNode identifier
-                && context.TryResolve(identifier.Name, out FieldMetadata? field)
-                && FieldTypeMapper.IsTextFamily(context.GetFieldType(field))))
+        if (!value.IsNull)
         {
             return value;
+        }
+
+        if (expression is IdentifierNode identifier)
+        {
+            context.ChargeWork(1);
+            if (context.TryResolve(identifier.Name, out FieldMetadata? field)
+                && FieldTypeMapper.IsTextFamily(context.GetFieldType(field)))
+            {
+                return value;
+            }
         }
 
         throw new CheckCodeRuntimeException(expression.Line, command, MissingConditionValueMessage);
@@ -690,13 +838,15 @@ public static class Evaluator
                 && CultureInfo.InvariantCulture.CompareInfo.Compare(text, "true", CompareOptions.IgnoreCase) == 0;
 
     // ENABLE, DISABLE and CLEAR designate rows, so their names resolve by the target rule: the exact spelling first,
-    // which keeps a group from being taken for a data field whose name differs from it only by case.
+    // which keeps a group from being taken for a data field whose name differs from it only by case. Each name is one
+    // step, charged before any is resolved.
     private static FieldMetadata[] ResolveAll(
         IReadOnlyList<string> names,
         int line,
         string command,
         EvaluationContext context)
     {
+        context.ChargeWork(names.Count);
         var fields = new FieldMetadata[names.Count];
         for (var i = 0; i < fields.Length; i++)
         {
@@ -705,6 +855,14 @@ public static class Evaluator
 
         return fields;
     }
+
+    // The code units of a text value, which the work it is read whole by is charged with; 0 for every other kind,
+    // whose string form is short.
+    private static int TextLength(FieldValue value) => value.TryGetText(out string? text) ? text.Length : 0;
+
+    // The run's one warning that it ran out of work, at the line of the statement that did.
+    private static Diagnostic WorkLimitDiagnostic(EvaluationContext context, int line) =>
+        new(DiagnosticSeverity.Warning, context.FormName, line, Parser.Commands.Limit, WorkLimitMessage);
 
     // Rows are compared by reference, so two fields whose names differ only by case are both kept.
     private static void AddOnce(List<FieldMetadata> targets, HashSet<FieldMetadata> seen, FieldMetadata field)
@@ -750,6 +908,10 @@ public static class Evaluator
     /// </summary>
     private sealed class StaticDiagnosticFeed(EventBlockNode block, EffectAccumulator effects)
     {
+        // The size of each IF of the block counted so far, by reference: the tree never changes, so a counted IF is
+        // never walked again, and the sizing of a whole run stays linear in the block's statements.
+        private readonly Dictionary<IfStatementNode, int> sizes = new(ReferenceEqualityComparer.Instance);
+
         // The index in block.Diagnostics of the first diagnostic not yet added.
         private int next;
 
@@ -784,5 +946,18 @@ public static class Evaluator
 
         /// <summary>Adds every diagnostic not yet added, once the block has run.</summary>
         public void AddRemaining() => AddThrough(int.MaxValue);
+
+        /// <summary>
+        /// The pre-order size of <paramref name="statement"/>, as
+        /// <see cref="EventBlockNode.PreOrderSize(StatementNode, Dictionary{IfStatementNode, int})"/> counts it,
+        /// reusing the sizes of the block's <c>IF</c> statements already counted.
+        /// </summary>
+        public int SizeOf(StatementNode statement) => EventBlockNode.PreOrderSize(statement, sizes);
+
+        /// <summary>
+        /// The pre-order size of a statement list, reusing the sizes of the block's <c>IF</c> statements already
+        /// counted.
+        /// </summary>
+        public int SizeOf(IReadOnlyList<StatementNode> statements) => EventBlockNode.PreOrderSize(statements, sizes);
     }
 }

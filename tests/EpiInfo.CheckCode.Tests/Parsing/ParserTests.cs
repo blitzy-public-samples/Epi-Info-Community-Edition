@@ -2237,6 +2237,19 @@ public sealed class ParserTests
     public void IsVocabularyCommandRejectsOtherText(string? command) =>
         Assert.False(Parser.IsVocabularyCommand(command));
 
+    // A cancelled parse stops with the cancellation itself, through either overload: the last-resort net for a parser
+    // defect never turns it into a SYNTAX warning.
+    [Fact]
+    public void ParseStopsOnACancelledToken()
+    {
+        IReadOnlyList<Token> tokens = Lexer.Tokenize(InAfterBlock("GOTO Y", "ASSIGN Y = 1"));
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+
+        Assert.Throws<OperationCanceledException>(() => Parser.Parse(tokens, "F", cancellation.Token));
+        Assert.Throws<OperationCanceledException>(() => Parser.Parse(tokens, TextForm("Y"), cancellation.Token));
+    }
+
     // An unsupported function is reported under its name as written, upper-cased: an unregistered name, a field's
     // name, or a bracketed name that keeps its inner whitespace and line breaks. None of those is vocabulary, which
     // is how the API tells that name, program text, from a command it may log.

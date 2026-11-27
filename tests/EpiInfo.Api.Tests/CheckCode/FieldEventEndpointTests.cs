@@ -917,6 +917,132 @@ public sealed class FieldEventEndpointTests
     }
 
     /// <summary>
+    /// A stored program longer than the store serves whole is refused by the engine: the event is a 200 with no
+    /// effects and one <c>LIMIT</c> warning at line 1, logged once, although the program's own <c>Age</c> block would
+    /// have had effects. The store hands over no more than the first <see cref="IDataStore.MaxCheckCodeLength"/> + 1
+    /// code units.
+    /// </summary>
+    [Fact]
+    public async Task OversizedStoredProgramIsOneLimitWarningWithNoEffects()
+    {
+        string program = BasicEffectsProgram + "\n//" + new string('x', IDataStore.MaxCheckCodeLength);
+        var form = FakeForms.WithCheckCode(program);
+        await using var host = EndpointHost.Start(new FakeDataStore(form));
+
+        var body = await SendAcceptedEventAsync(
+            host,
+            FakeForms.CheckCodeViewId,
+            """{"event":"FieldAfter","fieldName":"Age","values":{"Age":37}}""");
+
+        AssertJsonEqual(
+            """
+            {
+              "enabled": [], "disabled": [], "cleared": [], "assigned": {}, "dialogs": [],
+              "diagnostics": [
+                {"severity": "warning", "form": "FakeCheckCode", "line": 1, "command": "LIMIT",
+                 "message": "Check code exceeds the 1048576-character limit; program skipped"}
+              ]
+            }
+            """,
+            body);
+        AssertDiagnosticLogged(host, LogLevel.Warning, form.Metadata.Name, line: 1, command: "LIMIT");
+        Assert.Single(host.Logs.Find(entry => entry.Category == typeof(FieldEventService).FullName));
+        Assert.Equal(1, host.Engine.RunCalls);
+
+        string? served = await host.Store.GetCheckCodeAsync(FakeForms.CheckCodeViewId, host.Timeout);
+        Assert.Equal(program[..(IDataStore.MaxCheckCodeLength + 1)], served);
+    }
+
+    /// <summary>
+    /// A block with more diagnostics than one response lists returns exactly
+    /// <see cref="CheckCodeEngine.MaxDiagnostics"/> of them, the last one <c>LIMIT</c> warning at the line of the first
+    /// one left out, with the block's effects kept, and the service writes one log line per listed diagnostic.
+    /// </summary>
+    [Fact]
+    public async Task DiagnosticsPastTheBudgetAreBoundedInTheResponseAndTheLog()
+    {
+        const int Gotos = 1_000;
+        const int Listed = CheckCodeEngine.MaxDiagnostics - 1;
+        string program = UnsupportedCommandProgram.ReplaceLineEndings("\n").Replace(
+            "GOTO DOB",
+            string.Join("\n", Enumerable.Repeat("GOTO DOB", Gotos)),
+            StringComparison.Ordinal);
+        var form = FakeForms.WithCheckCode(program);
+        await using var host = EndpointHost.Start(new FakeDataStore(form));
+
+        var body = await SendAcceptedEventAsync(
+            host,
+            FakeForms.CheckCodeViewId,
+            """{"event":"FieldAfter","fieldName":"Age","values":{"Age":37}}""");
+
+        var diagnostics = body.GetProperty("diagnostics").EnumerateArray().ToArray();
+        Assert.Equal(CheckCodeEngine.MaxDiagnostics, diagnostics.Length);
+        for (var i = 0; i < Listed; i++)
+        {
+            AssertDiagnostic(diagnostics[i], "warning", form.Metadata.Name, line: 3 + i, command: "GOTO");
+        }
+
+        AssertDiagnostic(diagnostics[Listed], "warning", form.Metadata.Name, line: 3 + Listed, command: "LIMIT");
+        Assert.Contains(
+            (Gotos - Listed).ToString(CultureInfo.InvariantCulture),
+            diagnostics[Listed].GetProperty("message").GetString(),
+            StringComparison.Ordinal);
+        Assert.Equal("after-goto", body.GetProperty("assigned").GetProperty("LastName").GetString());
+
+        Assert.Equal(
+            CheckCodeEngine.MaxDiagnostics,
+            host.Logs.Find(entry => entry.Category == typeof(FieldEventService).FullName).Count);
+        AssertDiagnosticLogged(host, LogLevel.Warning, form.Metadata.Name, line: 3 + Listed, command: "LIMIT");
+    }
+
+    /// <summary>
+    /// A block whose comparisons read a long request value past the evaluator's work budget, 100 comparisons of two
+    /// 100,000-character texts against the 4,000,000 steps of
+    /// <see cref="EpiInfo.CheckCode.Evaluation.Evaluator.MaxWork"/>, is a 200 that keeps the effect of the statement
+    /// before the <c>IF</c> that ran out, runs nothing after it, and holds one <c>LIMIT</c> warning at that <c>IF</c>'s
+    /// line with a fixed message, logged once with its form, severity, line and command.
+    /// </summary>
+    [Fact]
+    public async Task WorkPastTheBudgetIsOneLimitWarningAfterTheEarlierEffects()
+    {
+        string comparisons = string.Join(" AND ", Enumerable.Repeat("LastName = LastName", 100));
+        string program = $"""
+            Field Age
+                After
+                    ENABLE DOB
+                    IF {comparisons} THEN
+                        DISABLE Asian
+                    END-IF
+                    ASSIGN LastName = "after"
+                End-After
+            End-Field
+            """;
+        var form = FakeForms.WithCheckCode(program);
+        await using var host = EndpointHost.Start(new FakeDataStore(form));
+        string lastName = new('x', 100_000);
+
+        var body = await SendAcceptedEventAsync(
+            host,
+            FakeForms.CheckCodeViewId,
+            $$$"""{"event":"FieldAfter","fieldName":"Age","values":{"LastName":"{{{lastName}}}"}}""");
+
+        AssertJsonEqual(
+            """
+            {
+              "enabled": ["DOB"], "disabled": [], "cleared": [], "assigned": {}, "dialogs": [],
+              "diagnostics": [
+                {"severity": "warning", "form": "FakeCheckCode", "line": 4, "command": "LIMIT",
+                 "message": "Check code exceeds the 4000000-step work limit; remaining statements skipped"}
+              ]
+            }
+            """,
+            body);
+        AssertDiagnosticLogged(host, LogLevel.Warning, form.Metadata.Name, line: 4, command: "LIMIT");
+        Assert.Single(host.Logs.Find(entry => entry.Category == typeof(FieldEventService).FullName));
+        Assert.Equal(1, host.Engine.RunCalls);
+    }
+
+    /// <summary>
     /// Events whose block assigns the integer-column number field <c>Visits</c> a number that is not whole although
     /// its nearest double is, as (the event's field, its <c>values</c> JSON, the JSON number expected in
     /// <c>assigned</c>): a copy of the <c>float</c> number <c>Age</c>, or a check-code literal.

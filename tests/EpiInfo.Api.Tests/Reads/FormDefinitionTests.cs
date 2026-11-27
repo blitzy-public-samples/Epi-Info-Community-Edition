@@ -1550,6 +1550,9 @@ public sealed class FormDefinitionCheckCodeTests
 
     private const string GeocodeCommand = "GEOCODE";
 
+    // The command of a program or a response over one of the check-code engine's budgets.
+    private const string LimitCommand = "LIMIT";
+
     private const string DiagnosticEventName = "CheckCodeDiagnostic";
 
     private const int DiagnosticEventId = 1;
@@ -1736,6 +1739,95 @@ public sealed class FormDefinitionCheckCodeTests
             logs.Find(captured => captured.Category == typeof(FormService).FullName)
                 .Select(entry => StateValue(entry, "Command")));
         Assert.Empty(logs.Find(captured => captured.ExceptionType is not null));
+    }
+
+    // A stored program longer than the store serves whole: the store hands over its first MaxCheckCodeLength + 1 code
+    // units, and the definition is still a 200 whose unsupportedCheckCode is one LIMIT warning at line 1, logged once
+    // under LIMIT. The program is analysed, never run, and none of its text reaches the log.
+    [Theory]
+    [InlineData("Production")]
+    [InlineData("Development")]
+    public async Task OversizedProgramIsOneLimitWarning(string environment)
+    {
+        string sentinel = "Sentinel-Limit-" + Guid.NewGuid().ToString("N");
+        string program = SyntheticProgram(sentinel) + "\n//" + new string('x', IDataStore.MaxCheckCodeLength);
+
+        var store = new FakeDataStore(FakeForms.WithCheckCode(program));
+        await using var factory = new ApiFactory(ApiFactoryOptions.ForFake(store, environment));
+        CountingCheckCodeEngine engine = factory.Engine;
+        CapturingLoggerProvider logs = factory.Logs;
+
+        // Creating the client builds and starts the host through Program.cs; only the request below is counted.
+        using HttpClient client = factory.CreateClient();
+        engine.Reset();
+        logs.Clear();
+
+        using HttpResponseMessage response = await client.GetAsync(DefinitionPath);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        JsonElement definition = await ApiTestClient.ReadJsonElementAsync(response);
+        Assert.Equal(FakeForms.CheckCodeViewId, definition.GetProperty("viewId").GetInt32());
+        Assert.Equal(
+            new (string?, string?, int)[] { ("warning", LimitCommand, 1) },
+            Summaries(definition.GetProperty("unsupportedCheckCode")));
+        Assert.Equal(1, engine.AnalyzeCalls);
+        Assert.Equal(0, engine.RunCalls);
+
+        CapturedLogEntry entry = Assert.Single(
+            logs.Find(captured => captured.Category == typeof(FormService).FullName));
+        Assert.Equal(LogLevel.Warning, entry.Level);
+        Assert.Equal(1, StateValue(entry, "Line"));
+        Assert.Equal(LimitCommand, StateValue(entry, "Command"));
+        Assert.False(logs.ContainsText(sentinel), "A captured log entry holds program text.");
+
+        // The store honours its contract: the first MaxCheckCodeLength + 1 code units, and no more.
+        string? served = await store.GetCheckCodeAsync(FakeForms.CheckCodeViewId, CancellationToken.None);
+        Assert.Equal(program[..(IDataStore.MaxCheckCodeLength + 1)], served);
+    }
+
+    // More diagnostics than one definition lists: 500 GOTO warnings and the GEOCODE notice. unsupportedCheckCode holds
+    // exactly MaxDiagnostics entries, the listed warnings in source order and then one LIMIT warning at the line of the
+    // first one left out, and the service writes one log line per listed entry, not one per diagnostic found.
+    [Theory]
+    [InlineData("Production")]
+    [InlineData("Development")]
+    public async Task DiagnosticsPastTheBudgetAreListedAndLoggedUpToIt(string environment)
+    {
+        const int Gotos = 500;
+        const int Listed = CheckCodeEngine.MaxDiagnostics - 1;
+        string program = TwoDiagnosticsProgram(string.Join("\n", Enumerable.Repeat("GOTO LastName", Gotos)));
+
+        var store = new FakeDataStore(FakeForms.WithCheckCode(program));
+        await using var factory = new ApiFactory(ApiFactoryOptions.ForFake(store, environment));
+        CapturingLoggerProvider logs = factory.Logs;
+
+        // Creating the client builds and starts the host through Program.cs; only the request below is captured.
+        using HttpClient client = factory.CreateClient();
+        logs.Clear();
+
+        using HttpResponseMessage response = await client.GetAsync(DefinitionPath);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        JsonElement definition = await ApiTestClient.ReadJsonElementAsync(response);
+        JsonElement unsupported = definition.GetProperty("unsupportedCheckCode");
+        (string?, string?, int)[] expected =
+        [
+            .. Enumerable.Range(0, Listed).Select(index => ("warning", "GOTO", StatementLine + index)),
+            ("warning", LimitCommand, StatementLine + Listed),
+        ];
+        Assert.Equal(expected, Summaries(unsupported));
+
+        // The GEOCODE notice is among those left out: 500 warnings and 1 notice, of which 99 are listed.
+        string omitted = (Gotos + 1 - Listed).ToString(CultureInfo.InvariantCulture);
+        string? summary = unsupported[Listed].GetProperty("message").GetString();
+        Assert.NotNull(summary);
+        Assert.Contains(omitted, summary, StringComparison.Ordinal);
+
+        object?[] loggedCommands = [.. Enumerable.Repeat<object?>("GOTO", Listed), LimitCommand];
+        Assert.Equal(
+            loggedCommands,
+            logs.Find(captured => captured.Category == typeof(FormService).FullName)
+                .Select(entry => StateValue(entry, "Command")));
     }
 
     // One Click block on LastName: the statement text from line 3, one statement or several, then the program's one

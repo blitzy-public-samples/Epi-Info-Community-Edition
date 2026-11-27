@@ -64,14 +64,18 @@ namespace EpiInfo.Api.Contracts;
 /// a longer array, however many of its items have a problem.
 /// </para>
 /// <para>
-/// The interpretation per field type, trimming, the six-field limit, the rejection of a field named twice and of an
-/// unknown or unsearchable field all belong to SearchCriteriaParser, each answered with a 400; a longer array whose
-/// items all pass the member check reaches the parser. A missing or <c>null</c> <c>criteria</c>, or an empty array, is
-/// the request-level 400 "criteria must not be empty", which RecordService raises; neither the member check nor
-/// deserialisation rejects it. The serializer materialises the list as a <see cref="List{T}"/>. It leaves
-/// <see cref="SearchCriterion.Field"/> <see langword="null"/> for a criterion that omits <c>field</c>, because it
-/// does not enforce required constructor parameters, and for <c>"field": null</c>, because it does not enforce
-/// nullable annotations; the parser rejects a null name as unknown.
+/// The interpretation per field type, trimming, the six-field limit, the bound of 32,767 UTF-16 code units on each
+/// string <c>value</c>, the search-wide bounds of 6,554 alternatives other than equality and <c>IS NULL</c> and of
+/// 32,767 code units of wildcard pattern text, and the rejection of a field named twice and of an unknown or
+/// unsearchable field all belong to SearchCriteriaParser, each answered with a 400. A longer value is one fixed
+/// message under its field's canonical name. A longer array whose items all pass the member check reaches the parser,
+/// which answers it with one fixed message under <c>criteria</c> before it reads any entry, as it answers a search
+/// past a search-wide bound. A missing or <c>null</c> <c>criteria</c>, or an empty array, is the request-level 400
+/// "criteria must not be empty", which RecordService raises; neither the member check nor deserialisation rejects it.
+/// The serializer materialises the list as a <see cref="List{T}"/>. It leaves <see cref="SearchCriterion.Field"/>
+/// <see langword="null"/> for a criterion that omits <c>field</c>, because it does not enforce required constructor
+/// parameters, and for <c>"field": null</c>, because it does not enforce nullable annotations; the parser rejects a
+/// null name as unknown.
 /// </para>
 /// </param>
 /// <param name="IncludeDeleted">

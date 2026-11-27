@@ -973,6 +973,56 @@ public sealed class LexerTests
     }
 
     /// <summary>
+    /// Texts for the token budget, each with at least one token: a seeded program, plain words, and an unterminated
+    /// comment, whose one token is added when the scan reaches the end of the text.
+    /// </summary>
+    public static TheoryData<string> BudgetTexts => new()
+    {
+        FoodHistoryProgram,
+        "a b c",
+        "ASSIGN X = 1 /* never closed",
+    };
+
+    // The budget counts the tokens before the end of input: a text of exactly the budget gives the very list Tokenize
+    // gives, and the same text against one token less, so one token over, gives an empty list.
+    [Theory]
+    [MemberData(nameof(BudgetTexts))]
+    public void TryTokenizeAcceptsExactlyTheBudgetAndRejectsOneTokenOver(string text)
+    {
+        IReadOnlyList<Token> expected = Lex(text);
+        int count = expected.Count - 1;
+
+        Assert.True(Lexer.TryTokenize(text, count, CancellationToken.None, out IReadOnlyList<Token> within));
+        Assert.Equal(expected, within);
+
+        Assert.False(Lexer.TryTokenize(text, count - 1, CancellationToken.None, out IReadOnlyList<Token> over));
+        Assert.Empty(over);
+    }
+
+    // A text with no token fits a budget of 0, and a negative budget is refused before any scanning.
+    [Fact]
+    public void TryTokenizeTakesAZeroBudgetAndRefusesANegativeOne()
+    {
+        Assert.True(
+            Lexer.TryTokenize("  // only a comment", 0, CancellationToken.None, out IReadOnlyList<Token> tokens));
+        Assert.Equal(TokenKind.EndOfInput, Assert.Single(tokens).Kind);
+
+        Assert.Throws<ArgumentOutOfRangeException>(
+            () => Lexer.TryTokenize("a", -1, CancellationToken.None, out IReadOnlyList<Token> _));
+    }
+
+    // A cancelled scan stops with the cancellation itself, before its first token.
+    [Fact]
+    public void TryTokenizeStopsOnACancelledToken()
+    {
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+
+        Assert.Throws<OperationCanceledException>(
+            () => Lexer.TryTokenize(FoodHistoryProgram, int.MaxValue, cancellation.Token, out IReadOnlyList<Token> _));
+    }
+
+    /// <summary>
     /// Tokenizes <paramref name="text"/> and checks the invariant every token list keeps: it ends with exactly one
     /// <see cref="TokenKind.EndOfInput"/>.
     /// </summary>

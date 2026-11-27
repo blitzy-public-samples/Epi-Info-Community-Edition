@@ -119,8 +119,10 @@ public sealed partial class FormService(IDataStore store, ICheckCodeEngine check
     /// <summary>Builds the form definition for <c>GET /api/forms/{viewId}</c>.</summary>
     /// <remarks>
     /// The check-code program is analysed and never run, so <c>unsupportedCheckCode</c> holds only what the program
-    /// text reveals, and each of those diagnostics is logged once. The permission flags are <see langword="null"/>
-    /// when the store reports no permissions; otherwise <see cref="FormPermissions"/> derives them.
+    /// text reveals, at most <see cref="CheckCodeEngine.MaxDiagnostics"/> entries, and each of those diagnostics is
+    /// logged once. The analysis takes the request's abort token, so an aborted request stops it with
+    /// <see cref="OperationCanceledException"/>. The permission flags are <see langword="null"/> when the store reports
+    /// no permissions; otherwise <see cref="FormPermissions"/> derives them.
     /// </remarks>
     /// <param name="viewId">A <c>metaViews.ViewId</c>.</param>
     /// <param name="cancellationToken">The request's abort token.</param>
@@ -137,7 +139,7 @@ public sealed partial class FormService(IDataStore store, ICheckCodeEngine check
             await ReadLegalValueOptionsAsync(metadata, cancellationToken).ConfigureAwait(false);
 
         string? program = await store.GetCheckCodeAsync(metadata.ViewId, cancellationToken).ConfigureAwait(false);
-        IReadOnlyList<Diagnostic> diagnostics = checkCode.Analyze(program, metadata);
+        IReadOnlyList<Diagnostic> diagnostics = checkCode.Analyze(program, metadata, cancellationToken);
 
         FormPermissions? permissions =
             await store.GetPermissionsAsync(metadata, cancellationToken).ConfigureAwait(false);

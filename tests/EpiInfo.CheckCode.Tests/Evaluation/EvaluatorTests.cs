@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Globalization;
 using EpiInfo.CheckCode;
 using EpiInfo.CheckCode.Evaluation;
@@ -17,7 +18,8 @@ namespace EpiInfo.CheckCode.Tests.Evaluation;
 /// values of <c>Rule_CompareExp</c> and <c>Rule_Value</c>, <c>NOT</c> and <c>AND</c>, <c>IF/ELSE</c>,
 /// <c>ENABLE</c>, <c>DISABLE</c> and <c>CLEAR</c> with group expansion, typed <c>ASSIGN</c> with its conversions,
 /// option bounds and rejected targets, <c>YEARS</c> and <c>EPIWEEK</c>, <c>DIALOG</c>, case-insensitive identifiers,
-/// runtime-error recovery, bounded stack use for long chains and deep nesting, and statelessness.
+/// runtime-error recovery, bounded stack use for long chains and deep nesting, the work budget and the cancellation its
+/// meter polls, and statelessness.
 /// </summary>
 /// <remarks>
 /// Scenario values from <c>testdata/scenarios/check_code_scenarios.json</c> are restated inline and the file is never
@@ -31,8 +33,10 @@ public sealed class EvaluatorTests
     private const string FeverDialogMessage =
         "Warning: A fever temperature has been entered, but 'fever' was not selected as a symptom.";
 
-    // Far past the roughly 9,000 terms at which evaluation that recursed once per term overflowed a pool thread.
-    private const int LongChainTerms = 100_000;
+    // Far past the roughly 9,000 terms at which evaluation that recursed once per term overflowed a pool thread, and
+    // even, as the (-) = (-) cases need. An AND chain of it, four tokens a term, stays inside
+    // CheckCodeEngine.MaxTokens, so the engine parses and runs it instead of refusing the program.
+    private const int LongChainTerms = 60_000;
 
     // An explicit stack for the long-chain cases, so their outcome never depends on the host's default thread size.
     private const int SmallStackBytes = 1024 * 1024;
@@ -1493,6 +1497,196 @@ public sealed class EvaluatorTests
         AssertNoFieldEffects(response);
     }
 
+    // A cancelled run stops before its first statement with the cancellation itself, through Run and Execute alike:
+    // the token is polled outside each statement's error boundary, so it never becomes an error diagnostic.
+    [Theory]
+    [InlineData("Run")]
+    [InlineData("Execute")]
+    public void CancelledRun_StopsBeforeAnyStatement(string path)
+    {
+        StatementNode[] statements = [new DialogStatementNode("Never shown", null, 3)];
+        var values = new Dictionary<string, FieldValue>();
+        var effects = new EffectAccumulator();
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+
+        Action run = path switch
+        {
+            "Run" => () => Evaluator.Run(
+                CaseReportForm,
+                new[] { new EventBlockNode(FieldEventKind.FieldAfter, 2, statements, []) },
+                values,
+                cancellation.Token),
+            "Execute" => () => Evaluator.Execute(
+                statements,
+                new EvaluationContext(CaseReportForm, values),
+                effects,
+                cancellation.Token),
+            _ => throw new ArgumentOutOfRangeException(nameof(path), path, "Not an evaluator entry point."),
+        };
+
+        Assert.Throws<OperationCanceledException>(run);
+        FieldEventResponse accumulated = effects.ToResponse();
+        Assert.Empty(accumulated.Dialogs);
+        Assert.Empty(accumulated.Diagnostics);
+    }
+
+    // The work meter polls the token the context was created with inside a statement, once the run has charged 4,096
+    // steps, so one long expression is cancellable. With that token cancelled and Execute's own not, the short first
+    // statement runs, the long condition of the IF stops with the cancellation itself, never a diagnostic, and
+    // nothing after it runs.
+    [Fact]
+    public void CancellationInsideOneLongExpression_StopsItWithoutADiagnostic()
+    {
+        string program = WorkProgram(
+            $"IF {Chain("Sex = \"1\"", " AND ", "Sex = \"1\"", 20_000)} THEN\nASSIGN City = \"then\"\nEND-IF");
+        IReadOnlyList<StatementNode> statements = Assert.Single(
+            Assert.Single(Parser.Parse(Lexer.Tokenize(program), CaseReportForm).FieldBlocks).Events).Statements;
+        var values = new Dictionary<string, FieldValue> { ["Sex"] = Text("1") };
+        var effects = new EffectAccumulator();
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+
+        var context = new EvaluationContext(CaseReportForm, values, cancellation.Token);
+
+        Assert.Throws<OperationCanceledException>(() => Evaluator.Execute(statements, context, effects));
+
+        FieldEventResponse accumulated = effects.ToResponse();
+        Assert.Equal(new[] { ("Age", N(1)) }, accumulated.Assigned.Select(entry => (entry.Key, entry.Value)));
+        Assert.Empty(accumulated.Diagnostics);
+        Assert.Empty(accumulated.Dialogs);
+    }
+
+    // Comparisons read both texts whole, and texts that differ in case take the full linguistic collation, so 10,000
+    // comparisons of two 500,000-code-unit texts, all in a stored program inside the length and token budgets, would
+    // take seconds. The run stops at the work budget instead: the IF that ran out reports one LIMIT warning naming the
+    // budget, the statements before it keep their effects, and nothing after it runs.
+    [Fact]
+    public void ComparisonHeavyProgram_EndsInOneWorkLimitWarningQuickly_AndEarlierEffectsStand()
+    {
+        const int TextLength = 250_000;
+        string lower = string.Concat(Enumerable.Repeat("aA", TextLength / 2));
+        string upper = string.Concat(Enumerable.Repeat("Aa", TextLength / 2));
+        string comparisons = Chain("FirstName = City", " AND ", "FirstName = City", 10_000);
+        string program = WorkProgram(
+            $"ASSIGN FirstName = \"{lower}\"\nASSIGN City = \"{upper}\"\n"
+            + $"IF {comparisons} THEN\nASSIGN Sex = \"then\"\nEND-IF");
+        Assert.InRange(program.Length, 0, CheckCodeEngine.MaxProgramLength);
+        Assert.InRange(Lexer.Tokenize(program).Count - 1, 0, CheckCodeEngine.MaxTokens);
+        Assert.StartsWith("IF FirstName = City AND", ProgramLine(program, 6), StringComparison.Ordinal);
+
+        var stopwatch = Stopwatch.StartNew();
+        FieldEventResponse response = Run(program, CaseReportForm, FieldEventKind.FieldAfter, "LastName");
+        stopwatch.Stop();
+
+        Assert.InRange(stopwatch.Elapsed, TimeSpan.Zero, TimeSpan.FromSeconds(5));
+        AssertWorkLimit(Assert.Single(response.Diagnostics), "CaseReport", 6);
+        Assert.Equal(
+            new[] { ("Age", N(1)), ("FirstName", Text(lower)), ("City", Text(upper)) },
+            response.Assigned.Select(entry => (entry.Key, entry.Value)));
+        Assert.Empty(response.Enabled);
+        Assert.Empty(response.Dialogs);
+    }
+
+    // A group name stands for all its members, so 50,000 names of a 2,000-member group in one ENABLE would expand to
+    // 100,000,000 members, and rebuilt the group each time from the form's rows. The members are resolved once and
+    // each expansion is charged by its member count, so the statement stops at the work budget quickly with one LIMIT
+    // warning, before recording any target; the statement before it keeps its effect.
+    [Fact]
+    public void GroupHeavyProgram_EndsInOneWorkLimitWarningQuickly_AndEarlierEffectsStand()
+    {
+        const int Members = 2_000;
+        FieldMetadata[] members =
+        [
+            .. Enumerable.Range(0, Members).Select(i => F(10 + i, $"M{i}", 1, "Text", 1, 10 + i, "nvarchar", 8000)),
+        ];
+        var form = new FormMetadata(
+            ViewId: 98,
+            Name: "GroupHeavy",
+            BaseTableName: "GroupHeavy",
+            Pages: [new PageMetadata(1, "Page 1", 0, "GroupHeavy1")],
+            Fields:
+            [
+                F(1, "Trigger", 1, "Text", 1, 1, "nvarchar", 8000),
+                F(2, "G", 21, "Group", 1, 2, null, 0, list: string.Join(",", members.Select(member => member.Name))),
+                .. members,
+            ]);
+        string program = $"""
+            Field Trigger
+                After
+                    ASSIGN M0 = "before"
+                    ENABLE {string.Join(" ", Enumerable.Repeat("G", 50_000))}
+                    ASSIGN M1 = "after"
+                End-After
+            End-Field
+            """;
+        Assert.StartsWith("ENABLE G G", ProgramLine(program, 4), StringComparison.Ordinal);
+
+        var stopwatch = Stopwatch.StartNew();
+        FieldEventResponse response = Run(program, form, FieldEventKind.FieldAfter, "Trigger");
+        stopwatch.Stop();
+
+        Assert.InRange(stopwatch.Elapsed, TimeSpan.Zero, TimeSpan.FromSeconds(5));
+        AssertWorkLimit(Assert.Single(response.Diagnostics), "GroupHeavy", 4);
+        Assert.Equal(new[] { ("M0", Text("before")) }, response.Assigned.Select(entry => (entry.Key, entry.Value)));
+        Assert.Empty(response.Enabled);
+    }
+
+    // A group's members are resolved on the first request and kept for the context, in List order.
+    [Fact]
+    public void GetGroupMembers_IsResolvedOncePerContext()
+    {
+        var context = new EvaluationContext(GroupForm, new Dictionary<string, FieldValue>());
+        FieldMetadata group = GroupForm.Fields[0];
+
+        IReadOnlyList<FieldMetadata> first = context.GetGroupMembers(group);
+
+        Assert.Same(first, context.GetGroupMembers(group));
+        Assert.Equal(new[] { "Fever", "Chills" }, first.Select(member => member.Name));
+    }
+
+    // The budget is inclusive: DIALOG is one step, and ASSIGN FirstName = LastName is one for the statement, one for
+    // its target's name, one for the identifier and one for its name, plus the stored text's length. A LastName that
+    // brings the run to exactly MaxWork runs both statements; one code unit more stops the ASSIGN with one LIMIT
+    // warning at its line, after the dialog.
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    public void ProgramAtTheWorkBudget_RunsFully_AndOneStepMoreEndsInOneLimitWarning(int overBy)
+    {
+        const int FixedSteps = 5;
+        const string Program = """
+            Field Sex
+                After
+                    DIALOG "first"
+                    ASSIGN FirstName = LastName
+                End-After
+            End-Field
+            """;
+        string lastName = new('x', Evaluator.MaxWork - FixedSteps + overBy);
+
+        FieldEventResponse response = Run(
+            Program,
+            CaseReportForm,
+            FieldEventKind.FieldAfter,
+            "Sex",
+            ("LastName", Text(lastName)));
+
+        Assert.Equal("first", Assert.Single(response.Dialogs).Message);
+        if (overBy == 0)
+        {
+            KeyValuePair<string, FieldValue> assigned = Assert.Single(response.Assigned);
+            Assert.Equal("FirstName", assigned.Key);
+            Assert.Equal(Text(lastName), assigned.Value);
+            Assert.Empty(response.Diagnostics);
+        }
+        else
+        {
+            Assert.Empty(response.Assigned);
+            AssertWorkLimit(Assert.Single(response.Diagnostics), "CaseReport", 4);
+        }
+    }
+
     [Theory]
     [MemberData(nameof(TypedAssignments), DisableDiscoveryEnumeration = true)]
     public void Assign_StoresTheValueTypedByTheTargetField(
@@ -2527,6 +2721,31 @@ public sealed class EvaluatorTests
             End-After
         End-Field
         """;
+
+    // A CaseReport LastName After block: ASSIGN Age = 1 on line 3, the body from line 4, then an ASSIGN of Pregnant
+    // that runs only when the body runs to its end.
+    private static string WorkProgram(string body) => $"""
+        Field LastName
+            After
+                ASSIGN Age = 1
+                {body}
+                ASSIGN Pregnant = "after"
+            End-After
+        End-Field
+        """;
+
+    // The run's one work-limit warning: at the line of the statement that ran out, naming the budget.
+    private static void AssertWorkLimit(Diagnostic diagnostic, string form, int line)
+    {
+        Assert.Equal(DiagnosticSeverity.Warning, diagnostic.Severity);
+        Assert.Equal(form, diagnostic.Form);
+        Assert.Equal(line, diagnostic.Line);
+        Assert.Equal(Parser.Commands.Limit, diagnostic.Command);
+        Assert.Contains(
+            Evaluator.MaxWork.ToString(CultureInfo.InvariantCulture),
+            diagnostic.Message,
+            StringComparison.Ordinal);
+    }
 
     private static void AssertMissingConditionValueError(FieldEventResponse response, int line)
     {

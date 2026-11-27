@@ -154,10 +154,13 @@ public sealed class SearchParseResult
 /// <b>Kept from legacy</b> (<c>Epi.Windows.Enter/Dialogs/FindRecordDialog.cs</c>, lines 103-120, 293-374, 404-646
 /// and 708-771; <c>Epi.Core/Data/Services/CollectedDataProvider.cs</c>, lines 1973-2249): the searchable fields
 /// (data fields plus the system fields <c>GlobalRecordId</c> and <c>RecStatus</c>); at most
-/// <see cref="RecordQueryRules.MaxSearchFields"/> fields; the trimmed value split on exactly <c>" or "</c>,
-/// <c>" OR "</c>, <c>" Or "</c> or <c>" oR "</c> into alternatives that are not trimmed again; the leading
-/// <c>&lt;=</c>, <c>&gt;=</c>, <c>&lt;&gt;</c>, <c>&gt;</c> or <c>&lt;</c>, tested in that order; the per-type use of
-/// that prefix; the wildcard and 255-character multiline comparisons; and the Phone Number path without wildcards.
+/// <see cref="RecordQueryRules.MaxSearchFields"/> fields; at most <see cref="RecordQueryRules.MaxSearchValueLength"/>
+/// UTF-16 code units in each value as received, before trimming, the Windows Forms default length of the dialog's
+/// text boxes (lines 145 and 205), a longer value being a 400 on its field; the trimmed value split on exactly
+/// <c>" or "</c>, <c>" OR "</c>, <c>" Or "</c> or <c>" oR "</c> into alternatives that are not trimmed again; the
+/// leading <c>&lt;=</c>, <c>&gt;=</c>, <c>&lt;&gt;</c>, <c>&gt;</c> or <c>&lt;</c>, tested in that order; the per-type
+/// use of that prefix; the wildcard and 255-character multiline comparisons; and the Phone Number path without
+/// wildcards.
 /// Alternatives of one field combine with OR and conditions with AND.
 /// </para>
 /// <para>
@@ -186,9 +189,19 @@ public sealed class SearchParseResult
 /// the same text. The one pattern no SQL Server construct can evaluate, one holding a <c>[...]</c> set longer than
 /// <see cref="RecordQueryRules.MaxLikePatternLength"/> code units that is unclosed or that
 /// <see cref="LikePatternSyntax.TrySplitSet"/> cannot cut into shorter sets
-/// (<see cref="LikePatternSyntax.HoldsUnsearchableSet"/>), is a 400 on the field. Any number of alternatives is
-/// accepted, as in legacy, and equality and the 255-character multiline comparison have no length
-/// bound.</description></item>
+/// (<see cref="LikePatternSyntax.HoldsUnsearchableSet"/>), is a 400 on the field. Equality and the 255-character
+/// multiline comparison have no length bound but the value's own.</description></item>
+/// <item><description>Two bounds span the whole search, which legacy left unbounded, each a design reconciliation of
+/// the dialog's six boxes with the 30-second command timeout: at most
+/// <see cref="RecordQueryRules.MaxRowComparedAlternatives"/> alternatives that SQL Server compares row by row, every
+/// one but an equality and a match of no value, and at most <see cref="RecordQueryRules.MaxSearchPatternTextLength"/>
+/// UTF-16 code units of wildcard pattern text, counted as each pattern runs. A search past either is one fixed 400 on
+/// the criteria list for each bound it exceeds. Equality and <c>IS NULL</c> alternatives count toward neither, since
+/// SQL Server matches them as a set or as one term, so they are bounded only by the value that holds
+/// them.</description></item>
+/// <item><description>A list of more than <see cref="RecordQueryRules.MaxSearchFields"/> criteria is one 400 on the
+/// criteria list, answered before any criterion is read, so the work and the answer stay the same size whatever the
+/// list holds.</description></item>
 /// </list>
 /// </para>
 /// <para>
@@ -233,6 +246,16 @@ public static class SearchCriteriaParser
     private static readonly string FieldLimitMessage = string.Create(
         CultureInfo.InvariantCulture,
         $"At most {RecordQueryRules.MaxSearchFields} fields can be searched at once.");
+
+    private static readonly string RowComparedLimitMessage = string.Create(
+        CultureInfo.InvariantCulture,
+        $"One search can hold at most {RecordQueryRules.MaxRowComparedAlternatives} wildcard, comparison and " +
+        $"multiline alternatives in all.");
+
+    private static readonly string PatternTextLimitMessage = string.Create(
+        CultureInfo.InvariantCulture,
+        $"The wildcard patterns of one search can hold at most {RecordQueryRules.MaxSearchPatternTextLength} " +
+        $"characters in all.");
 
     // Legacy's default representations of a checked and an unchecked box; the new application has no legacy
     // configuration file that could change them.
@@ -285,12 +308,22 @@ public static class SearchCriteriaParser
     /// <list type="bullet">
     /// <item><description>A request-level failure with <see cref="EmptyCriteriaMessage"/> when
     /// <paramref name="criteria"/> is null or empty.</description></item>
-    /// <item><description>A field-level failure holding every error found in one pass: under
-    /// <see cref="CriteriaKey"/>, one message per null entry, unknown or unsearchable name and repeated field, and
-    /// one for exceeding <see cref="RecordQueryRules.MaxSearchFields"/> distinct fields, whose excess criteria are not
-    /// parsed; and under each field's canonical name, the error in its value, a wildcard pattern holding a
-    /// <c>[...]</c> set that <see cref="LikePatternSyntax.HoldsUnsearchableSet"/> finds no SQL Server construct can
-    /// evaluate included.</description></item>
+    /// <item><description>A field-level failure with exactly one fixed message under <see cref="CriteriaKey"/>, the
+    /// field-limit message, and no other key, before any entry is read, when <paramref name="criteria"/> holds more
+    /// than <see cref="RecordQueryRules.MaxSearchFields"/> entries, whatever they hold, since such a list can only name
+    /// a field past the limit, repeat one or hold an entry that names none.</description></item>
+    /// <item><description>Otherwise a field-level failure holding every error found in one pass over the at most
+    /// <see cref="RecordQueryRules.MaxSearchFields"/> entries. Under <see cref="CriteriaKey"/>: one message per null
+    /// entry, unknown or unsearchable name and repeated field; and, over the conditions that parsed, one fixed message
+    /// for each search-wide bound they exceed together, more than
+    /// <see cref="RecordQueryRules.MaxRowComparedAlternatives"/> alternatives other than equality and
+    /// <c>IS NULL</c>, or more than <see cref="RecordQueryRules.MaxSearchPatternTextLength"/> UTF-16 code units of
+    /// wildcard patterns as they run. Under each field's canonical name: a string value longer than
+    /// <see cref="RecordQueryRules.MaxSearchValueLength"/> UTF-16 code units as received, before trimming, which is not
+    /// split; or else the error in its value, a wildcard pattern holding a <c>[...]</c> set that
+    /// <see cref="LikePatternSyntax.HoldsUnsearchableSet"/> finds no SQL Server construct can evaluate included. One
+    /// value within its bound exceeds neither search-wide bound, so a failure holds at most
+    /// <see cref="RecordQueryRules.MaxSearchFields"/> messages.</description></item>
     /// <item><description>Otherwise a success with one condition per criterion, in criteria order.</description></item>
     /// </list>
     /// </returns>
@@ -306,10 +339,17 @@ public static class SearchCriteriaParser
             return SearchParseResult.RequestFailure(EmptyCriteriaMessage);
         }
 
+        // A list longer than the field limit can only name a field past the limit, repeat one or hold an entry that
+        // names none, each a 400, so it is answered with the one limit message before any entry is read: neither the
+        // work done nor the size of the answer grows with the list.
+        if (criteria.Count > RecordQueryRules.MaxSearchFields)
+        {
+            return CriteriaFailure(FieldLimitMessage);
+        }
+
         var errors = new Dictionary<string, List<string>>(StringComparer.Ordinal);
-        var conditions = new List<SearchCondition>(Math.Min(criteria.Count, RecordQueryRules.MaxSearchFields));
+        var conditions = new List<SearchCondition>(criteria.Count);
         var namedFields = new HashSet<string>(StringComparer.Ordinal);
-        var limitReported = false;
 
         for (var index = 0; index < criteria.Count; index++)
         {
@@ -332,14 +372,11 @@ public static class SearchCriteriaParser
                 continue;
             }
 
-            if (namedFields.Count > RecordQueryRules.MaxSearchFields)
+            // The legacy text box held at most this much as typed, before the dialog trimmed it; a longer value is
+            // refused before it is split, so no alternative or pattern of it is ever built.
+            if (criterion.Value.TryGetText(out var text) && text.Length > RecordQueryRules.MaxSearchValueLength)
             {
-                if (!limitReported)
-                {
-                    AddError(errors, CriteriaKey, FieldLimitMessage);
-                    limitReported = true;
-                }
-
+                AddError(errors, field.Name, ValueLengthMessage(field));
                 continue;
             }
 
@@ -360,6 +397,8 @@ public static class SearchCriteriaParser
                     break;
             }
         }
+
+        AddSearchWideErrors(errors, conditions);
 
         if (errors.Count > 0)
         {
@@ -803,6 +842,55 @@ public static class SearchCriteriaParser
     // Names the criterion by its 0-based position only, because the caller's raw name is never echoed.
     private static string CriteriaMessage(int index, string problem) =>
         string.Create(CultureInfo.InvariantCulture, $"criteria[{index}] {problem}");
+
+    // The one field-level failure about the criteria list as a whole: a single fixed message under CriteriaKey.
+    private static SearchParseResult CriteriaFailure(string message) =>
+        SearchParseResult.FieldFailure(
+            new Dictionary<string, string[]>(StringComparer.Ordinal) { [CriteriaKey] = [message] });
+
+    // Fixed text naming the canonical field and the legacy text box's length; never the submitted value.
+    private static string ValueLengthMessage(ResolvedField field) =>
+        string.Create(
+            CultureInfo.InvariantCulture,
+            $"{field.Name} search values can hold at most {RecordQueryRules.MaxSearchValueLength} characters.");
+
+    // Adds one fixed message under CriteriaKey for each search-wide bound the parsed conditions exceed together: the
+    // alternatives SQL Server compares row by row, every one but an equality and a match of no value, and the code
+    // units of the wildcard patterns as they run. Each condition comes from a value within its own bound, so neither
+    // total can wrap.
+    private static void AddSearchWideErrors(Dictionary<string, List<string>> errors, List<SearchCondition> conditions)
+    {
+        var rowCompared = 0;
+        var patternText = 0;
+        foreach (var condition in conditions)
+        {
+            foreach (var alternative in condition.Alternatives)
+            {
+                if (alternative.Operator is SearchOperator.Equal or SearchOperator.IsNull)
+                {
+                    continue;
+                }
+
+                rowCompared++;
+                if (alternative.Operator == SearchOperator.Like
+                    && alternative.Value is { } value
+                    && value.TryGetText(out var pattern))
+                {
+                    patternText += pattern.Length;
+                }
+            }
+        }
+
+        if (rowCompared > RecordQueryRules.MaxRowComparedAlternatives)
+        {
+            AddError(errors, CriteriaKey, RowComparedLimitMessage);
+        }
+
+        if (patternText > RecordQueryRules.MaxSearchPatternTextLength)
+        {
+            AddError(errors, CriteriaKey, PatternTextLimitMessage);
+        }
+    }
 
     private static void AddError(Dictionary<string, List<string>> errors, string key, string message)
     {

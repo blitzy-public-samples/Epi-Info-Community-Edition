@@ -425,12 +425,16 @@ public sealed class SearchRequestBindingTests
 }
 
 /// <summary>
-/// The records-list filter and Find have no length bound (AAP 0.3.4.1, 0.3.4.2, 0.3.4.4): a filter or a wildcard
-/// pattern past SQL Server's 4,000-code-unit <c>LIKE</c> pattern limit coerces and reaches the store, which matches it
-/// as the SQL builders do, whatever the number of alternatives, a <c>[...]</c> set longer than that limit included.
-/// The one 400 left is a pattern holding such a set that is unclosed or that no cut keeping its members and negation
-/// divides, which no SQL Server construct can evaluate, and the in-memory store keeps the SQL builders' argument
-/// contract for it.
+/// The bounds of the records-list filter and of Find (AAP 0.3.4.1, 0.3.4.2, 0.3.4.4). The filter has no length bound.
+/// Find has four, each one fixed message before the store is asked to search, whatever the request holds: at most six
+/// criteria and, over the whole search, at most 6,554 alternatives other than equality and <c>IS NULL</c> and at most
+/// 32,767 UTF-16 code units of wildcard pattern text, each under <c>criteria</c>; and at most 32,767 code units in each
+/// string value, one legacy Find text box, under the field. Within them, a filter or a wildcard pattern past SQL
+/// Server's 4,000-code-unit <c>LIKE</c> pattern limit coerces and reaches the store, which matches it as the SQL
+/// builders do, a <c>[...]</c> set longer than that limit included, and so does every alternative, equality text of
+/// several values together included. The one other 400 is a pattern holding such a set that is unclosed or that no cut
+/// keeping its members and negation divides, which no SQL Server construct can evaluate, and the in-memory store keeps
+/// the SQL builders' argument contract for it.
 /// </summary>
 /// <remarks>
 /// The class needs no database: it carries no <c>Integration</c> trait and joins no database collection, so
@@ -456,6 +460,9 @@ public sealed class ListAndSearchBoundsTests
     private const string UnclosedSetKind = "unclosed set";
 
     private const string RangeChainSetKind = "range chain set";
+
+    // The view id of TwoMultilineForm, which collides with no seeded or other synthetic form.
+    private const int TwoMultilineViewId = 9120;
 
     // A LastName value of 4,000 characters, the most its nvarchar(4000) column stores, for the filter cases.
     private static readonly string LongLastName = "Q" + new string('x', 3998) + "Z";
@@ -507,21 +514,23 @@ public sealed class ListAndSearchBoundsTests
         Assert.Equal("page", Assert.Single(ValidationErrors(problem).Keys));
     }
 
-    // Any number of alternatives reaches the store, which binds a large set packed, and so does a wildcard pattern of
-    // any length: 4,000 characters, the longest SQL Server matches in one LIKE, and longer ones with no run of '*',
-    // with a run of '*', with a set before a run of '*', which the parser leaves as written, or with a set of 4,000
-    // characters or more, which the search builder cuts into shorter sets.
+    // Every alternative within the bounds reaches the store, which binds a large set packed, 1,500 sentinel
+    // alternatives (30,386 code units) among them, and so does a wildcard pattern of any length the bounds admit:
+    // 4,000 characters, the longest SQL Server matches in one LIKE, and longer ones up to the whole bound of one value
+    // with no run of '*', with a run of '*', with a set before a run of '*', which the parser leaves as written, or
+    // with a set of 4,000 characters or more, which the search builder cuts into shorter sets.
     [Theory]
-    [InlineData(AlternativesKind, 5000)]
+    [InlineData(AlternativesKind, 1500)]
     [InlineData(PatternKind, 4000)]
     [InlineData(PatternKind, 4001)]
     [InlineData(PatternKind, 9000)]
+    [InlineData(PatternKind, RecordQueryRules.MaxSearchValueLength)]
     [InlineData(RunKind, 4001)]
     [InlineData(BracketKind, 4001)]
     [InlineData(SetKind, 4000)]
     [InlineData(SetKind, 4001)]
     [InlineData(SetKind, 9000)]
-    public async Task Search_OfAnyLength_ReachesTheStore(string kind, int size)
+    public async Task Search_WithinTheBounds_ReachesTheStore(string kind, int size)
     {
         var store = FakeDataStore.WithStandardForms();
 
@@ -553,6 +562,142 @@ public sealed class ListAndSearchBoundsTests
             + " that cannot be cut into sets of at most 3998 characters that keep its members and negation.",
             Assert.Single(errors["LastName"]));
         Assert.DoesNotContain(store.Calls, call => call.Method == nameof(IDataStore.SearchAsync));
+    }
+
+    // Over HTTP, each bound of Find is one fixed message, whatever the request holds, before the store is asked to
+    // search: a criteria list longer than six, of 7 or 100,000 null entries or of 20,000 unknown names (a body of about
+    // 900 KB, within the 1 MiB cap), under criteria; a string value one code unit past the 32,767 of one value, under
+    // the field; and, under criteria, 6,555 patterns over two fields, one past the 6,554 alternatives other than
+    // equality and IS NULL, and two patterns of 32,768 code units together, one past the bound of pattern text. The
+    // body stays under 512 bytes, it echoes nothing, and the store is never asked to search.
+    [Theory]
+    [InlineData("null entries", 7)]
+    [InlineData("null entries", 100_000)]
+    [InlineData("unknown names", 20_000)]
+    [InlineData("value past its bound", RecordQueryRules.MaxSearchValueLength + 1)]
+    [InlineData("alternatives past the bound", RecordQueryRules.MaxRowComparedAlternatives + 1)]
+    [InlineData("patterns past the bound", RecordQueryRules.MaxSearchPatternTextLength + 1)]
+    public async Task Search_PastABound_IsOneFixedMessageBeforeTheStore(string shape, int count)
+    {
+        const int MaxProblemBodyBytes = 512;
+        var store = FakeDataStore.WithStandardForms();
+        await using var factory = new ApiFactory(ApiFactoryOptions.ForFake(store));
+        using HttpClient client = factory.CreateClient();
+
+        // The share of count the first of two fields takes, the second taking the rest.
+        var first = (count / 2) + (count % 2);
+        var json = shape switch
+        {
+            "null entries" => "{\"criteria\":[" + string.Join(",", Enumerable.Repeat("null", count)) + "]}",
+            "unknown names" => JsonSerializer.Serialize(new
+            {
+                criteria = Enumerable.Range(0, count).Select(index => new
+                {
+                    field = Sentinel + index.ToString(CultureInfo.InvariantCulture),
+                    value = "x",
+                }),
+            }),
+            "value past its bound" => JsonSerializer.Serialize(new
+            {
+                criteria = new[]
+                {
+                    new { field = "LastName", value = Sentinel + new string('x', count - Sentinel.Length) },
+                },
+            }),
+            "alternatives past the bound" => JsonSerializer.Serialize(new
+            {
+                criteria = new[]
+                {
+                    new { field = "LastName", value = string.Join(" or ", Enumerable.Repeat("%", first)) },
+                    new { field = "Notes", value = string.Join(" or ", Enumerable.Repeat("%", count - first)) },
+                },
+            }),
+            "patterns past the bound" => JsonSerializer.Serialize(new
+            {
+                criteria = new[]
+                {
+                    new { field = "LastName", value = Sentinel + "*" + new string('x', first - Sentinel.Length - 1) },
+                    new
+                    {
+                        field = "Notes",
+                        value = Sentinel + "*" + new string('x', count - first - Sentinel.Length - 1),
+                    },
+                },
+            }),
+            _ => throw new ArgumentOutOfRangeException(nameof(shape), shape, "Unknown request shape."),
+        };
+        var (expectedKey, expectedMessage) = shape switch
+        {
+            "value past its bound" => ("LastName", "LastName search values can hold at most 32767 characters."),
+            "alternatives past the bound" => (
+                SearchCriteriaParser.CriteriaKey,
+                "One search can hold at most 6554 wildcard, comparison and multiline alternatives in all."),
+            "patterns past the bound" => (
+                SearchCriteriaParser.CriteriaKey,
+                "The wildcard patterns of one search can hold at most 32767 characters in all."),
+            _ => (SearchCriteriaParser.CriteriaKey, "At most 6 fields can be searched at once."),
+        };
+        using var body = JsonDocument.Parse(json);
+
+        using HttpResponseMessage response = await ApiTestClient.PostJsonAsync(
+            client,
+            string.Create(CultureInfo.InvariantCulture, $"/api/forms/{FakeForms.TwoPageViewId}/records/search"),
+            body.RootElement);
+        byte[] answer = await response.Content.ReadAsByteArrayAsync();
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.InRange(answer.Length, 1, MaxProblemBodyBytes);
+        Assert.DoesNotContain(Sentinel, System.Text.Encoding.UTF8.GetString(answer), StringComparison.Ordinal);
+        using var parsed = JsonDocument.Parse(answer);
+        var problem = ApiTestClient.AssertProblemDetails(parsed.RootElement, StatusCodes.Status400BadRequest);
+        var errors = problem.GetProperty("errors");
+        var error = Assert.Single(errors.EnumerateObject());
+        Assert.Equal(expectedKey, error.Name);
+        Assert.Equal(expectedMessage, Assert.Single(error.Value.EnumerateArray()).GetString());
+        Assert.DoesNotContain(store.Calls, call => call.Method == nameof(IDataStore.SearchAsync));
+    }
+
+    // Over HTTP, the verifier's search reaches the store and answers 200: two plain multiline values of 17,000 code
+    // units each, on two pages, each within one legacy text box and both more than one together, each compared on its
+    // first 255 characters. A record whose two values share those characters with them is found.
+    [Fact]
+    public async Task Search_TwoLongPlainMultilineValues_ReachTheStore()
+    {
+        var form = TwoMultilineForm();
+        var store = new FakeDataStore(new FakeForm(
+            form, new Dictionary<string, IReadOnlyList<FieldOption>>(StringComparer.OrdinalIgnoreCase), null));
+        var address = Sentinel + new string('a', 17_000 - Sentinel.Length);
+        var purchases = Sentinel + new string('b', 17_000 - Sentinel.Length);
+        var id = store.SeedRecord(
+            TwoMultilineViewId,
+            new Dictionary<string, FieldValue>(StringComparer.Ordinal)
+            {
+                ["PatientAddress"] = FieldValue.FromText(address[..300]),
+                ["BuyLastTenDays"] = FieldValue.FromText(purchases[..255]),
+            });
+        await using var factory = new ApiFactory(ApiFactoryOptions.ForFake(store));
+        using HttpClient client = factory.CreateClient();
+        using var body = JsonDocument.Parse(JsonSerializer.Serialize(new
+        {
+            criteria = new[]
+            {
+                new { field = "PatientAddress", value = address },
+                new { field = "BuyLastTenDays", value = purchases },
+            },
+        }));
+
+        using HttpResponseMessage response = await ApiTestClient.PostJsonAsync(
+            client,
+            string.Create(CultureInfo.InvariantCulture, $"/api/forms/{TwoMultilineViewId}/records/search"),
+            body.RootElement);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        JsonElement result = await ApiTestClient.ReadJsonElementAsync(response);
+        Assert.Equal(1, result.GetProperty("total").GetInt64());
+        Assert.Equal(
+            id,
+            Assert.Single(result.GetProperty("items").EnumerateArray()).GetProperty("globalRecordId").GetString());
+        Assert.Contains(store.Calls, call => call.Method == nameof(IDataStore.SearchAsync));
     }
 
     // The fake keeps the search builder's contract: a LIKE pattern holding a set longer than 4,000 characters that is
@@ -671,6 +816,53 @@ public sealed class ListAndSearchBoundsTests
         var form = await store.GetFormMetadataAsync(FakeForms.TwoPageViewId, CancellationToken.None);
         Assert.NotNull(form);
         return form;
+    }
+
+    // A synthetic form, view 9120 on the unseeded base table FakeTwoMultiline, holding the Multiline PatientAddress on
+    // its first page and the Multiline BuyLastTenDays on its second, each on ntext as FoodHistory seeds them, with the
+    // seeded system rows and field-type ids.
+    private static FormMetadata TwoMultilineForm()
+    {
+        const string baseTable = "FakeTwoMultiline";
+        PageMetadata[] pages = [Page(1, "Page 1", 0), Page(2, "Page 2", 1)];
+        FieldMetadata[] fields =
+        [
+            SystemRow(1, "UniqueKey", 23),
+            SystemRow(2, "RecStatus", 22),
+            SystemRow(3, "GlobalRecordId", 26),
+            MultilineField(4, pages[0], "PatientAddress"),
+            MultilineField(5, pages[1], "BuyLastTenDays"),
+        ];
+        return new FormMetadata(
+            TwoMultilineViewId, baseTable, baseTable, Array.AsReadOnly(pages), Array.AsReadOnly(fields));
+
+        // Page ids are <viewId>01 and <viewId>02, and each page table is the base table name plus its page id.
+        static PageMetadata Page(int ordinal, string name, int position)
+        {
+            var pageId = (TwoMultilineViewId * 100) + ordinal;
+            return new PageMetadata(pageId, name, position, baseTable + pageId.ToString(CultureInfo.InvariantCulture));
+        }
+
+        static FieldMetadata SystemRow(int ordinal, string name, int fieldTypeId) => new()
+        {
+            FieldId = (TwoMultilineViewId * 1000) + ordinal,
+            Name = name,
+            FieldTypeId = fieldTypeId,
+            FieldTypeName = name,
+            TabIndex = 0m,
+        };
+
+        static FieldMetadata MultilineField(int ordinal, PageMetadata page, string name) => new()
+        {
+            FieldId = (TwoMultilineViewId * 1000) + ordinal,
+            Name = name,
+            FieldTypeId = 4,
+            FieldTypeName = "Multiline",
+            Prompt = name,
+            TabIndex = 1m,
+            PageId = page.PageId,
+            Column = FieldTypeMapper.DescribeColumn(name, "ntext", 16),
+        };
     }
 
     // The errors map of a field-level 400 as ApiProblems builds it.

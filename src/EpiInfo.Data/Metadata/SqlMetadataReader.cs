@@ -5,6 +5,7 @@ using System.Text.Json;
 using EpiInfo.Data.Sql;
 using EpiInfo.Domain.Forms;
 using EpiInfo.Domain.Metadata;
+using EpiInfo.Domain.Storage;
 using EpiInfo.Domain.Values;
 using Microsoft.Data.SqlClient;
 
@@ -26,7 +27,16 @@ namespace EpiInfo.Data.Metadata;
 /// <c>SELECT</c>, runs through <see cref="SqlExecution"/> with the configured command timeout and the command
 /// observer, and binds every value as a typed parameter. The one command with dynamic text, the code-table read, holds
 /// one <c>SELECT</c> per distinct code-table column a request needs, and names only tables and columns this class built
-/// from the catalogue.
+/// from the catalogue and admitted as code tables.
+/// </para>
+/// <para>
+/// Metadata names an object only in its role. A form is read and written only through its own record tables
+/// (<see cref="ReadFormAsync"/>): its base table and a table for every one of its pages, whose names end in the pages'
+/// identity <c>metaPages.PageId</c> values, must exist with the Epi Info record-table columns, and no name another
+/// form's metadata claims may resolve to any of them, compared by the resolved catalogue table rather than by
+/// spelling. A Legal Values field's options come only from a table of the shape legacy gives every code table: a name
+/// that starts with <c>code</c>, character columns only, no identity column and no <c>GlobalRecordId</c> column
+/// (<see cref="IsCodeTable"/>).
 /// </para>
 /// <para>
 /// Failures to open a connection or to run a command are not caught here: <see cref="SqlConnectionFactory"/> and the
@@ -54,6 +64,9 @@ internal sealed class SqlMetadataReader(
     // Fixed messages: the redaction policy keeps identifiers, values and SQL out of exception text.
     private const string DataTableNameMessage = "The form metadata does not name exactly one data table.";
     private const string BaseTableMissingMessage = "The form's data table was not found in the database catalogue.";
+    private const string PageTableMissingMessage = "A page's data table was not found in the database catalogue.";
+    private const string TablesClaimedMessage = "The form's data tables are also named by another form's metadata.";
+    private const string NotRecordTablesMessage = "The form's data tables are not Epi Info record tables.";
     private const string CodeTableResultsMessage = "The code-table read returned fewer result sets than it requested.";
     private const string TempTableMissingMessage = "The temporary table was not found.";
     private const string ConnectionNotOpenMessage = "The connection must be open before a temporary table is read.";
@@ -63,6 +76,17 @@ internal sealed class SqlMetadataReader(
 
     // SQL Server's length limit for a local temporary table name, its '#' included.
     private const int MaxTempTableNameLength = 116;
+
+    // Catalogue lookup keys of the columns every Epi Info record table holds, matched through TableSchema.FindColumn as
+    // FormSchema matches them. They are never placed in SQL text.
+    private const string UniqueKeyColumn = "UniqueKey";
+    private const string RecStatusColumn = "RecStatus";
+    private const string GlobalRecordIdColumn = "GlobalRecordId";
+
+    // The prefix legacy gives every code table: Make View adds it to a new code table's name and lists only the tables
+    // that carry it (Epi.Windows.MakeView/Dialogs/FieldDefinitionDialogs/CodeTableDefinition.cs:39-40,
+    // Epi.Data.SqlServer/SqlDatabase.cs:2065-2070).
+    private const string CodeTablePrefix = "code";
 
     private static readonly IReadOnlyList<FieldOption> NoOptions = Array.AsReadOnly(Array.Empty<FieldOption>());
     private static readonly IReadOnlyList<SqlParameterValue> NoParameters =
@@ -115,13 +139,18 @@ internal sealed class SqlMetadataReader(
     /// Every call opens a connection and sends the commands of <see cref="ReadFormAsync"/>; nothing is answered from
     /// an earlier call. The catalogue schema built by the same read stays attached to the returned instance alone, so
     /// a record read given that instance takes it through <see cref="ReuseOrReadFormAsync"/> without a command. The
-    /// attachment ends when the instance is no longer referenced, which for the API is the end of the request.
+    /// attachment ends when the instance is no longer referenced, which for the API is the end of the request. A form
+    /// is returned only when its tables are its own record tables, as <see cref="ReadFormAsync"/> decides: its base
+    /// table and a table for every one of its pages exist with the record-table columns, and no other form's metadata
+    /// resolves to any of them.
     /// </remarks>
     /// <param name="viewId">The form's <c>metaViews.ViewId</c>.</param>
     /// <param name="cancellationToken">The request's abort token.</param>
     /// <returns>The form's metadata, or <see langword="null"/> when <paramref name="viewId"/> is not in <c>metaViews</c>.</returns>
     /// <exception cref="InvalidOperationException">
-    /// The form's fields do not name exactly one data table, or that table is not in the catalogue.
+    /// The form's fields do not name exactly one data table; its base table or one of its page tables is not in the
+    /// catalogue; one of them lacks the record-table columns; or a name another form's metadata claims resolves to one
+    /// of them.
     /// </exception>
     public async Task<FormMetadata?> GetFormMetadataAsync(int viewId, CancellationToken cancellationToken)
     {
@@ -149,7 +178,10 @@ internal sealed class SqlMetadataReader(
     /// <remarks>
     /// At most two commands are sent, whatever the number of fields: one catalogue read resolves every code table
     /// the fields name, then one batch holds a <c>SELECT</c> of each distinct resolved table and column, so fields
-    /// sharing a code table read it once. Nothing is kept for a later call.
+    /// sharing a code table read it once. Only a usable code table is read: a table that <see cref="IsCodeTable"/>
+    /// admits by its name and its all-character, non-identity columns, with a character column of the field's
+    /// <c>TextColumnName</c>. The catalogue read that resolves the tables already carries every column, so the shape
+    /// check sends no command of its own. Nothing is kept for a later call.
     /// </remarks>
     /// <param name="form">The form's metadata, as <see cref="GetFormMetadataAsync"/> returned it.</param>
     /// <param name="cancellationToken">The request's abort token.</param>
@@ -159,8 +191,11 @@ internal sealed class SqlMetadataReader(
     /// <see cref="FormDefinitionFactory.GetDataFields"/>, so a row repeating a data field's name exactly, which the
     /// form definition lists as unsupported, neither supplies the entry of that name nor has its code table read. Each
     /// list is in the order SQL Server returned the rows, or sorted by text when the field's
-    /// <see cref="FieldMetadata.Sort"/> is set. A field without a usable code table has an empty list. No connection
-    /// is opened when no Legal Values data field names both a code table and a column.
+    /// <see cref="FieldMetadata.Sort"/> is set. A field without a usable code table has an empty list: either name is
+    /// missing, the table is not in the catalogue or is no code table (its name does not start with <c>code</c>, it
+    /// has a column outside <see cref="ColumnFamily.Character"/> or an identity column, or it has a
+    /// <c>GlobalRecordId</c> column), or it has no character column of that name. No connection is opened when no
+    /// Legal Values data field names both a code table and a column.
     /// </returns>
     /// <exception cref="ArgumentNullException"><paramref name="form"/> is null.</exception>
     /// <exception cref="InvalidOperationException">The code-table batch returned fewer result sets than it holds.</exception>
@@ -213,10 +248,17 @@ internal sealed class SqlMetadataReader(
     }
 
     /// <summary>Reads a form's check-code program, <c>metaViews.CheckCode</c>.</summary>
+    /// <remarks>
+    /// The statement asks the server for at most <see cref="IDataStore.MaxCheckCodeLength"/> + 1 UTF-16 code units, so
+    /// a program over the limit arrives one code unit longer than the limit, which the check-code engine reports, and
+    /// the rest of it is never sent.
+    /// </remarks>
     /// <param name="viewId">The form's <c>metaViews.ViewId</c>.</param>
     /// <param name="cancellationToken">The request's abort token.</param>
     /// <returns>
-    /// The program text unchanged, or <see langword="null"/> for an unknown form or a <c>NULL</c> program.
+    /// The program text unchanged when it is at most <see cref="IDataStore.MaxCheckCodeLength"/> code units long,
+    /// otherwise its first <see cref="IDataStore.MaxCheckCodeLength"/> + 1 code units; <see langword="null"/> for an
+    /// unknown form or a <c>NULL</c> program.
     /// </returns>
     public async Task<string?> GetCheckCodeAsync(int viewId, CancellationToken cancellationToken)
     {
@@ -229,7 +271,14 @@ internal sealed class SqlMetadataReader(
                     connection,
                     transaction: null,
                     ReadCheckCodeOperation,
-                    ViewIdStatement(MetadataQueries.CheckCode, viewId),
+                    new SqlStatement(
+                        MetadataQueries.CheckCode,
+                        [
+                            ColumnValueConverter.Int32(MetadataQueries.ViewIdParameter, viewId),
+                            ColumnValueConverter.Int32(
+                                MetadataQueries.MaxLengthParameter,
+                                IDataStore.MaxCheckCodeLength + 1),
+                        ]),
                     options.CommandTimeoutSeconds,
                     observer,
                     cancellationToken)
@@ -243,6 +292,22 @@ internal sealed class SqlMetadataReader(
     /// schema as it stands, and through <see cref="ReuseOrReadFormAsync"/> for a read whose form instance this reader
     /// did not return.
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A form's tables must be its own record tables, decided on the same connection and transaction before any record
+    /// SQL names them. After the catalogue read, <see cref="ResolveRecordTables"/> binds the base table and the table
+    /// of every page: each must be in the catalogue, the base table must hold an identity <c>UniqueKey</c>,
+    /// <c>RecStatus</c> and <c>GlobalRecordId</c>, and each page table must hold <c>GlobalRecordId</c>. A page whose
+    /// table is missing refuses the form, so the binding rests on the form's identity <c>metaPages.PageId</c> values,
+    /// which end its page table names.
+    /// </para>
+    /// <para>
+    /// Then <see cref="MetadataQueries.TableClaims"/> reads the claims of the other forms' metadata that can name one
+    /// of this form's tables, and the form is refused when one of them resolves to the very base or page table this
+    /// form bound (<see cref="IsClaimedByAnotherForm"/>). A refused form is broken metadata, so no record read,
+    /// permission check or write reaches its tables.
+    /// </para>
+    /// </remarks>
     /// <param name="connection">An open connection; this method neither opens nor closes it.</param>
     /// <param name="transaction">The transaction every command joins, or <see langword="null"/>.</param>
     /// <param name="viewId">The form's <c>metaViews.ViewId</c>.</param>
@@ -254,7 +319,9 @@ internal sealed class SqlMetadataReader(
     /// </returns>
     /// <exception cref="ArgumentNullException"><paramref name="connection"/> is null.</exception>
     /// <exception cref="InvalidOperationException">
-    /// The form's fields do not name exactly one non-blank data table, or that table is not in the catalogue.
+    /// The form's fields do not name exactly one non-blank data table; its base table or one of its page tables is not
+    /// in the catalogue; one of them lacks the record-table columns; or a name another form's metadata claims resolves
+    /// to one of them.
     /// </exception>
     internal async Task<(FormMetadata Form, FormSchema Schema)?> ReadFormAsync(
         SqlConnection connection,
@@ -329,8 +396,33 @@ internal sealed class SqlMetadataReader(
                 cancellationToken)
             .ConfigureAwait(false);
 
-        TableSchema baseTable = MatchTable(tables, baseTableName)
-            ?? throw new InvalidOperationException(BaseTableMissingMessage);
+        (TableSchema baseTable, TableSchema[] pageTables) = ResolveRecordTables(tables, baseTableName, pageTableNames);
+
+        // Legacy addresses whatever table DataTableName names (MetadataDbProvider.GetDataTableName), so metadata naming
+        // another form's base or page table would have this form read that form's records and soft-delete them. A
+        // form is therefore read and written only through tables no other form's metadata resolves to, as that
+        // metadata stands on this connection and transaction, so a write checks it inside its own transaction before
+        // any record SQL. The statement returns only the other forms' claims that can name one of this form's tables.
+        IReadOnlyList<TableClaimRow> claims = await QueryAsync<TableClaimRow>(
+                connection,
+                transaction,
+                ReadFormOperation,
+                new SqlStatement(
+                    MetadataQueries.TableClaims,
+                    [
+                        ColumnValueConverter.Int32(MetadataQueries.ViewIdParameter, viewId),
+                        ColumnValueConverter.Text(MetadataQueries.BaseNameParameter, baseTableName),
+                    ]),
+                cancellationToken)
+            .ConfigureAwait(false);
+        if (IsClaimedByAnotherForm(
+                viewId,
+                tables,
+                [baseTable, .. pageTables],
+                claims.Select(claim => (claim.ViewId, claim.DataTableName, claim.PageId))))
+        {
+            throw new InvalidOperationException(TablesClaimedMessage);
+        }
 
         var pages = new PageMetadata[pageRows.Count];
         var pageSchemas = new PageTableSchema[pageRows.Count];
@@ -338,12 +430,12 @@ internal sealed class SqlMetadataReader(
         for (int index = 0; index < pages.Length; index++)
         {
             PageRow row = pageRows[index];
-            TableSchema? pageTable = MatchTable(tables, pageTableNames[index]);
+            TableSchema pageTable = pageTables[index];
             pages[index] = new PageMetadata(
                 row.PageId,
                 row.Name,
                 row.Position,
-                pageTable?.Name ?? pageTableNames[index]);
+                pageTable.Name);
             pageSchemas[index] = new PageTableSchema(pages[index], pageTable);
             tablesByPageId.TryAdd(row.PageId, pageTable);
         }
@@ -401,7 +493,8 @@ internal sealed class SqlMetadataReader(
     /// <paramref name="form"/> is the very instance <see cref="GetFormMetadataAsync"/> returned, the schema that read
     /// built is returned with it and no command is sent; any other instance, a <see langword="with"/> copy or one
     /// built in memory included, is read again with <see cref="ReadFormAsync"/> on <paramref name="connection"/> by
-    /// <see cref="FormMetadata.ViewId"/>. Either way the schema was built by this reader from the catalogue.
+    /// <see cref="FormMetadata.ViewId"/>. Either way the schema was built by this reader from the catalogue, from tables
+    /// that <see cref="ReadFormAsync"/> found to be the form's own record tables.
     /// </summary>
     /// <param name="connection">An open connection; this method neither opens nor closes it.</param>
     /// <param name="form">The form's metadata, as the caller was given it for this request.</param>
@@ -412,8 +505,9 @@ internal sealed class SqlMetadataReader(
     /// </returns>
     /// <exception cref="ArgumentNullException"><paramref name="connection"/> or <paramref name="form"/> is null.</exception>
     /// <exception cref="InvalidOperationException">
-    /// A read finds that the form's fields do not name exactly one non-blank data table, or that table is not in the
-    /// catalogue.
+    /// A read finds that the form's fields do not name exactly one non-blank data table; that its base table or one of
+    /// its page tables is not in the catalogue; that one of them lacks the record-table columns; or that a name another
+    /// form's metadata claims resolves to one of them.
     /// </exception>
     internal async Task<(FormMetadata Form, FormSchema Schema)?> ReuseOrReadFormAsync(
         SqlConnection connection,
@@ -444,7 +538,8 @@ internal sealed class SqlMetadataReader(
     /// The code-table column's texts as <see cref="ToOptions"/> builds them: every distinct non-null text exactly as
     /// stored, empty and white-space texts included, in the order SQL Server returned them, or sorted by text under
     /// <see cref="CultureInfo.CurrentCulture"/> when <see cref="FieldMetadata.Sort"/> is set. An empty list when either
-    /// name is missing, or the table, or a character column of that name, is not in the catalogue.
+    /// name is missing, the table is not in the catalogue, the table is no code table as <see cref="IsCodeTable"/>
+    /// decides from its name and its columns, or a character column of that name is not in it.
     /// </returns>
     /// <exception cref="ArgumentNullException"><paramref name="connection"/> or <paramref name="field"/> is null.</exception>
     internal async Task<IReadOnlyList<FieldOption>> ReadOptionsAsync(
@@ -690,6 +785,214 @@ internal sealed class SqlMetadataReader(
         return caseInsensitiveCount == 1 ? caseInsensitiveMatch : null;
     }
 
+    /// <summary>
+    /// Decides whether another form's metadata resolves to one of a form's own tables, the ownership rule
+    /// <see cref="ReadFormAsync"/> applies once it has resolved them.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Another form claims each of its non-blank data-table names and, for each of its pages, that name followed by the
+    /// page id in invariant digits, the rule a form's own page tables follow. A claimed name is resolved as the form
+    /// resolves its own names, with <c>MatchTable</c> among <paramref name="tables"/>: the exact ordinal match, else the
+    /// one match ignoring case. It aliases the form when it resolves to the very instance of one of
+    /// <paramref name="ownTables"/>. So two distinct tables whose names differ only by letter case, possible in a
+    /// case-sensitive database, each belong to the form that names it exactly, while any spelling another form uses
+    /// to reach one of this form's tables refuses this form.
+    /// </para>
+    /// <para>
+    /// The catalogue read returns every table whose name equals a requested name under the case-insensitive collation
+    /// of <see cref="MetadataQueries.Columns"/>, so every table a claimed name can resolve to, if it resolves to one of
+    /// this form's tables, is in <paramref name="tables"/>, and the resolution here is the one the claiming form
+    /// would make. Each claim costs one lookup, so the decision is linear in the claims. Blank names, and the rows of
+    /// the form itself, claim nothing.
+    /// </para>
+    /// </remarks>
+    /// <param name="viewId">The form's <c>metaViews.ViewId</c>.</param>
+    /// <param name="tables">The catalogue tables one read returned for the form's base and page table names.</param>
+    /// <param name="ownTables">The form's base table and page tables, as <see cref="ResolveRecordTables"/> bound them.</param>
+    /// <param name="claims">
+    /// The rows of <see cref="MetadataQueries.TableClaims"/>: a row's non-blank <c>DataTableName</c> claims that name
+    /// when its <c>PageId</c> is null, and that name followed by the page id otherwise.
+    /// </param>
+    /// <returns>
+    /// <see langword="true"/> when a name another form claims resolves to one of <paramref name="ownTables"/>;
+    /// otherwise <see langword="false"/>.
+    /// </returns>
+    /// <exception cref="ArgumentNullException">
+    /// <paramref name="tables"/>, <paramref name="ownTables"/> or <paramref name="claims"/> is null.
+    /// </exception>
+    internal static bool IsClaimedByAnotherForm(
+        int viewId,
+        IReadOnlyList<TableSchema> tables,
+        IReadOnlyCollection<TableSchema> ownTables,
+        IEnumerable<(int ViewId, string? DataTableName, int? PageId)> claims)
+    {
+        ArgumentNullException.ThrowIfNull(tables);
+        ArgumentNullException.ThrowIfNull(ownTables);
+        ArgumentNullException.ThrowIfNull(claims);
+
+        var own = new HashSet<TableSchema>(ownTables, ReferenceEqualityComparer.Instance);
+
+        // The tables each claimed name can resolve to are exactly those equal to it ignoring case, so grouping them
+        // by that key once lets every claim run MatchTable over its own group instead of over every table.
+        var tablesByName = new Dictionary<string, List<TableSchema>>(StringComparer.OrdinalIgnoreCase);
+        foreach (TableSchema table in tables)
+        {
+            if (!tablesByName.TryGetValue(table.Name, out List<TableSchema>? sameName))
+            {
+                sameName = [];
+                tablesByName.Add(table.Name, sameName);
+            }
+
+            sameName.Add(table);
+        }
+
+        foreach ((int claimViewId, string? dataTableName, int? pageId) in claims)
+        {
+            if (claimViewId == viewId || string.IsNullOrWhiteSpace(dataTableName))
+            {
+                continue;
+            }
+
+            string claimedName = pageId is int claimPageId
+                ? dataTableName + claimPageId.ToString(CultureInfo.InvariantCulture)
+                : dataTableName;
+            if (tablesByName.TryGetValue(claimedName, out List<TableSchema>? candidates)
+                && MatchTable(candidates, claimedName) is { } resolved
+                && own.Contains(resolved))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Binds a form's base table and the table of each of its pages to the catalogue tables their names resolve to,
+    /// the binding <see cref="ReadFormAsync"/> applies before any record SQL can name them.
+    /// </summary>
+    /// <remarks>
+    /// Each name resolves as <see cref="ReadTablesAsync"/> and <c>MatchTable</c> resolve every name: the exact ordinal
+    /// match, else the one match ignoring case. Every page must have its table. Legacy creates the base table and one
+    /// table per page together (<c>Epi.Core/Data/Services/CollectedDataProvider.cs:2568-2638</c>), and a page table
+    /// name ends in its <c>metaPages.PageId</c>, an identity value metadata DML cannot set. A form whose page table
+    /// is missing is therefore refused rather than read without it, so a form whose <c>DataTableName</c> names
+    /// another form's base table, or an orphaned record table, also needs a table for each of its own page ids.
+    /// </remarks>
+    /// <param name="tables">The catalogue tables one read returned for the form's base and page table names.</param>
+    /// <param name="baseTableName">The form's one non-blank <c>DataTableName</c>.</param>
+    /// <param name="pageTableNames">Each page's table name, the base table name followed by the page id, in page order.</param>
+    /// <returns>
+    /// The base table and one table per page, in the order of <paramref name="pageTableNames"/>, each the very
+    /// instance of <paramref name="tables"/> its name resolved to.
+    /// </returns>
+    /// <exception cref="ArgumentNullException">
+    /// <paramref name="tables"/>, <paramref name="baseTableName"/> or <paramref name="pageTableNames"/> is null.
+    /// </exception>
+    /// <exception cref="InvalidOperationException">
+    /// The base table or a page table resolves to no table; the base table lacks an identity <c>UniqueKey</c>, a
+    /// <c>RecStatus</c> or a <c>GlobalRecordId</c> (<see cref="IsRecordBaseTable"/>); or a page table lacks
+    /// <c>GlobalRecordId</c> (<see cref="IsRecordPageTable"/>). The message is fixed and names no table.
+    /// </exception>
+    internal static (TableSchema BaseTable, TableSchema[] PageTables) ResolveRecordTables(
+        IReadOnlyList<TableSchema> tables,
+        string baseTableName,
+        IReadOnlyList<string> pageTableNames)
+    {
+        ArgumentNullException.ThrowIfNull(tables);
+        ArgumentNullException.ThrowIfNull(baseTableName);
+        ArgumentNullException.ThrowIfNull(pageTableNames);
+
+        TableSchema baseTable = MatchTable(tables, baseTableName)
+            ?? throw new InvalidOperationException(BaseTableMissingMessage);
+        if (!IsRecordBaseTable(baseTable))
+        {
+            throw new InvalidOperationException(NotRecordTablesMessage);
+        }
+
+        var pageTables = new TableSchema[pageTableNames.Count];
+        for (int index = 0; index < pageTables.Length; index++)
+        {
+            TableSchema pageTable = MatchTable(tables, pageTableNames[index])
+                ?? throw new InvalidOperationException(PageTableMissingMessage);
+            if (!IsRecordPageTable(pageTable))
+            {
+                throw new InvalidOperationException(NotRecordTablesMessage);
+            }
+
+            pageTables[index] = pageTable;
+        }
+
+        return (baseTable, pageTables);
+    }
+
+    /// <summary>
+    /// Decides whether a catalogue table has the shape of an Epi Info base table: an identity <c>UniqueKey</c>, a
+    /// <c>RecStatus</c> and a <c>GlobalRecordId</c> column, the system columns record SQL addresses.
+    /// </summary>
+    /// <param name="table">The table the form's data-table name resolved to.</param>
+    /// <returns>
+    /// <see langword="true"/> when <see cref="TableSchema.FindColumn"/> finds all three columns and <c>UniqueKey</c>
+    /// is an identity column; otherwise <see langword="false"/>.
+    /// </returns>
+    /// <exception cref="ArgumentNullException"><paramref name="table"/> is null.</exception>
+    internal static bool IsRecordBaseTable(TableSchema table)
+    {
+        ArgumentNullException.ThrowIfNull(table);
+
+        return table.FindColumn(UniqueKeyColumn) is { IsIdentity: true }
+            && table.FindColumn(RecStatusColumn) is not null
+            && table.FindColumn(GlobalRecordIdColumn) is not null;
+    }
+
+    /// <summary>
+    /// Decides whether a catalogue table has the shape of an Epi Info page table: a <c>GlobalRecordId</c> column, the
+    /// key that joins it to its base row.
+    /// </summary>
+    /// <param name="table">The table a page's table name resolved to.</param>
+    /// <returns>
+    /// <see langword="true"/> when <see cref="TableSchema.FindColumn"/> finds <c>GlobalRecordId</c>; otherwise
+    /// <see langword="false"/>.
+    /// </returns>
+    /// <exception cref="ArgumentNullException"><paramref name="table"/> is null.</exception>
+    internal static bool IsRecordPageTable(TableSchema table)
+    {
+        ArgumentNullException.ThrowIfNull(table);
+
+        return table.FindColumn(GlobalRecordIdColumn) is not null;
+    }
+
+    /// <summary>
+    /// Decides whether a catalogue table may serve a Legal Values field's options: it has the shape legacy gives every
+    /// code table, a name starting with <c>code</c> in any letter case and character columns only, none of them an
+    /// identity column, and it is no form's record table, so it has no <c>GlobalRecordId</c> column.
+    /// </summary>
+    /// <remarks>
+    /// Legacy reads whatever <c>SourceTableName</c> names, routing a name without the prefix to the collected data
+    /// (<c>Epi.Core/Project.cs:1315-1325</c>), while Make View lists and creates code tables only with it. Legacy creates
+    /// a code table only through <c>MetadataDbProvider.CreateCodeTable</c>, whose every column is a 255-character
+    /// string (<c>Epi.Core/Data/Services/MetadataDbProvider.cs:6083-6178, 6185-6199</c>), so a table with a numeric,
+    /// date, binary or identity column is some other object that only its name makes look like a code table. Every
+    /// Epi Info base and page table holds <c>GlobalRecordId</c>, a character column, so the last condition keeps out a
+    /// record table whose form name starts with <c>code</c>, or whose form no longer exists.
+    /// </remarks>
+    /// <param name="table">The table a field's <c>SourceTableName</c> resolved to.</param>
+    /// <returns>
+    /// <see langword="true"/> when the catalogue name starts with <c>code</c> ignoring case, every column is in
+    /// <see cref="ColumnFamily.Character"/> and none is an identity column, and <see cref="TableSchema.FindColumn"/>
+    /// finds no <c>GlobalRecordId</c>; otherwise <see langword="false"/>.
+    /// </returns>
+    /// <exception cref="ArgumentNullException"><paramref name="table"/> is null.</exception>
+    internal static bool IsCodeTable(TableSchema table)
+    {
+        ArgumentNullException.ThrowIfNull(table);
+
+        return table.Name.StartsWith(CodeTablePrefix, StringComparison.OrdinalIgnoreCase)
+            && table.Columns.All(column => column.Metadata.Family == ColumnFamily.Character && !column.IsIdentity)
+            && table.FindColumn(GlobalRecordIdColumn) is null;
+    }
+
     // The code table and text column a Legal Values field names, or null when either is missing or blank. Legacy looks
     // the table up by SourceTableName exactly as stored and trims only TextColumnName (ControlFactory.GetControls), so
     // a padded table name is kept as it is and matches no catalogue table, rather than reaching the unpadded one.
@@ -746,10 +1049,13 @@ internal sealed class SqlMetadataReader(
         {
             if (references[index] is not { } reference
                 || MatchTable(tables, reference.Table) is not { } table
+                || !IsCodeTable(table)
                 || table.FindColumn(reference.Column) is not { } column
                 || column.Metadata.Family != ColumnFamily.Character)
             {
-                // Includes legacy's "<form> - <page>" references to a form used as a code table, which are not supported.
+                // Includes legacy's "<form> - <page>" references to a form used as a code table, which are not
+                // supported, and any table outside the code-table role, such as a form's record table or a meta table,
+                // whose rows the form definition would otherwise publish as options.
                 continue;
             }
 
@@ -989,6 +1295,17 @@ internal sealed class SqlMetadataReader(
         public int FieldTypeId { get; set; }
 
         public string FieldTypeName { get; set; } = string.Empty;
+    }
+
+    private sealed class TableClaimRow
+    {
+        public int ViewId { get; set; }
+
+        // The claiming form's data-table name, spelled as stored; nullable as its metaFields column is.
+        public string? DataTableName { get; set; }
+
+        // Null on a base claim; the claiming form's page id on a page claim.
+        public int? PageId { get; set; }
     }
 
     private sealed class ColumnRow

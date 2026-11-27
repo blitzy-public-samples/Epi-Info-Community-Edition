@@ -39,6 +39,14 @@ namespace EpiInfo.Data;
 /// Every identifier in record SQL comes from a schema the reader built from the catalogue.
 /// </para>
 /// <para>
+/// <b>Find admission.</b> <see cref="SearchAsync"/> first takes one of the record repository's two Find slots, and
+/// opens its connection only then. The store builds one repository and the API registers one store per process, so at
+/// most two Find statements of the process run at once. While both slots are taken a search waits, holding no
+/// connection and sending nothing, until one comes free or its request is aborted; the wait has no deadline and no
+/// response of its own, because every admitted search runs its statements under the command timeout and gives its
+/// slot back when it ends. A search whose request is aborted while it waits ends as the client's cancellation.
+/// </para>
+/// <para>
 /// <b>Failures.</b> Every member runs inside the same boundary, which lets exactly three kinds of failure through
 /// unchanged and turns everything else into a store exception:
 /// </para>

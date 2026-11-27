@@ -67,6 +67,9 @@ public sealed class RecordQueryRulesTests
         Assert.Equal(200, RecordQueryRules.MaxPageSize);
         Assert.Equal(200, RecordQueryRules.SearchCap);
         Assert.Equal(6, RecordQueryRules.MaxSearchFields);
+        Assert.Equal(32767, RecordQueryRules.MaxSearchValueLength);
+        Assert.Equal(6554, RecordQueryRules.MaxRowComparedAlternatives);
+        Assert.Equal(32767, RecordQueryRules.MaxSearchPatternTextLength);
         Assert.Equal(4000, RecordQueryRules.MaxLikePatternLength);
         Assert.Equal('\\', RecordQueryRules.ContainsPatternEscape);
         Assert.Equal(6, RecordQueryRules.GridColumnCount);

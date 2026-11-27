@@ -28,6 +28,9 @@ public sealed class SearchCriteriaParserTests
 
     private static readonly DataFieldSet Fields = FormDefinitionFactory.GetDataFields(BuildForm());
 
+    private static readonly DataFieldSet TwoMultilineFields =
+        FormDefinitionFactory.GetDataFields(BuildTwoMultilineForm());
+
     private static readonly string[] ExpectedDataFieldNames =
     [
         "LastName", "FirstName", "City", "State", "PhoneNumber", "Notes", "Sex", "Age", "Choice", "DOB", "Asian",
@@ -66,6 +69,25 @@ public sealed class SearchCriteriaParserTests
         ];
 
         return new FormMetadata(1, "SearchForm", "SearchForm", [page1, page2], fields);
+    }
+
+    // A second synthetic form whose two multiline fields sit on two pages, on ntext columns, as FoodHistory's seeded
+    // PatientAddress and BuyLastTenDays do.
+    private static FormMetadata BuildTwoMultilineForm()
+    {
+        PageMetadata page1 = new(1, "Page 1", 0, "MultilineForm1");
+        PageMetadata page2 = new(2, "Page 2", 1, "MultilineForm2");
+
+        FieldMetadata[] fields =
+        [
+            PageField(1, "PatientAddress", 4, "Multiline", page1, "ntext", 16),
+            PageField(2, "BuyLastTenDays", 4, "Multiline", page2, "ntext", 16),
+            SystemField(3, "UniqueKey", 23),
+            SystemField(4, "RecStatus", 22),
+            SystemField(5, "GlobalRecordId", 26),
+        ];
+
+        return new FormMetadata(2, "MultilineForm", "MultilineForm", [page1, page2], fields);
     }
 
     // A page-bound row. Labels and groups own no page-table column, so they pass no SQL type.
@@ -1000,11 +1022,21 @@ public sealed class SearchCriteriaParserTests
             result.Conditions.Select(condition => condition.FieldName).ToArray());
     }
 
-    // The limit is reported once, and criteria past it are not parsed, so their bad values add no error.
-    [Fact]
-    public void Criteria_LimitIsReportedOnceAndExcessCriteriaAreNotParsed()
+    // A list of more than six criteria can only name a seventh field, repeat one or hold an entry that names none, so
+    // it is the one field-limit message under criteria, with no other key, before any entry is read: a seventh field,
+    // six fields and a repeat, bad values past the sixth, a seventh value also past the bound of one value, and 100,000
+    // null entries or unknown names, which would otherwise each add a message of their own.
+    [Theory]
+    [InlineData("seven distinct fields", 7)]
+    [InlineData("six fields and a repeat", 7)]
+    [InlineData("bad values past the sixth", 8)]
+    [InlineData("a value past its bound", 7)]
+    [InlineData("null entries", 100_000)]
+    [InlineData("unknown names", 100_000)]
+    public void Criteria_MoreThanSixEntries_AreOneCriteriaMessageBeforeAnyEntryIsRead(string shape, int count)
     {
-        SearchParseResult result = Parse(
+        SearchCriterion[] distinct =
+        [
             Text("LastName", "Smith"),
             Text("FirstName", "Ann"),
             Text("City", "Atlanta"),
@@ -1012,11 +1044,29 @@ public sealed class SearchCriteriaParserTests
             Text("PhoneNumber", "555"),
             Text("Notes", "abc"),
             Text("Age", "abc"),
-            Text("DOB", "abc"));
+            Text("DOB", "abc"),
+        ];
+        SearchCriterion[] criteria = shape switch
+        {
+            "seven distinct fields" => distinct[..7],
+            "six fields and a repeat" => [.. distinct[..6], Text("lastname", "Jones")],
+            "bad values past the sixth" => distinct,
+            "a value past its bound" =>
+                [.. distinct[..6], Text("Sex", Sentinel + new string('x', RecordQueryRules.MaxSearchValueLength))],
+            "null entries" => new SearchCriterion[count],
+            "unknown names" =>
+                [.. Enumerable.Range(0, count).Select(index => Text(AlternativeText(index), "x"))],
+            _ => throw new ArgumentOutOfRangeException(nameof(shape), shape, "Unknown list shape."),
+        };
+        Assert.Equal(count, criteria.Length);
+
+        SearchParseResult result = SearchCriteriaParser.Parse(Fields, criteria);
 
         AssertFieldError(result, SearchCriteriaParser.CriteriaKey);
-        Assert.Single(result.FieldErrors);
-        Assert.Single(result.FieldErrors[SearchCriteriaParser.CriteriaKey]);
+        var (key, messages) = Assert.Single(result.FieldErrors);
+        Assert.Equal(SearchCriteriaParser.CriteriaKey, key);
+        Assert.Equal(new[] { "At most 6 fields can be searched at once." }, messages);
+        AssertCarriesNoSubmittedText(result);
     }
 
     // Every error is found in one pass, each under its own key.
@@ -1036,11 +1086,16 @@ public sealed class SearchCriteriaParserTests
     #region SQL Server limits
 
     // Legacy Find capped fields, never alternatives, and the SQL Server store packs a large set into a few parameters,
-    // so every alternative the body carries is kept, in order, on one field or spread over several.
+    // so every equality alternative within the bound of its value is kept, in order, on one field or spread over
+    // several: 1,500 sentinel alternatives are 30,386 code units, two sets of 750 are 29,772, and two sets of 1,500,
+    // 60,772 units together, each fit one value.
     [Theory]
-    [InlineData(5000, 0)]
-    [InlineData(2500, 2500)]
-    public void Limits_AnyNumberOfAlternatives_ParsesWithEveryAlternativeKept(int lastNameCount, int firstNameCount)
+    [InlineData(1500, 0)]
+    [InlineData(750, 750)]
+    [InlineData(1500, 1500)]
+    public void Limits_EqualityAlternativesWithinTheirValuesBound_ParseWithEveryAlternativeKept(
+        int lastNameCount,
+        int firstNameCount)
     {
         SearchCriterion[] criteria = firstNameCount == 0
             ? [Text("LastName", Alternatives(lastNameCount))]
@@ -1059,6 +1114,341 @@ public sealed class SearchCriteriaParserTests
                 .ToArray();
             AssertAlternatives(result.Conditions[index], expected);
         }
+    }
+
+    /// <summary>
+    /// A field of every searchable kind, as submitted and by its canonical name, with the head of a value it parses
+    /// and the character that fills the value to its length: blanks, which trimming removes, or text that stays.
+    /// </summary>
+    public static TheoryData<string, string, string, char, int> ValueLengthCases
+    {
+        get
+        {
+            (string Submitted, string Canonical, string Head, char Fill)[] fields =
+            [
+                ("lastname", "LastName", Sentinel, 'x'),
+                ("LastName", "LastName", Sentinel + "*", ' '),
+                ("Notes", "Notes", Sentinel, 'x'),
+                ("PhoneNumber", "PhoneNumber", ">" + Sentinel, 'x'),
+                ("Sex", "Sex", Sentinel, ' '),
+                ("Age", "Age", "<=18", ' '),
+                ("Choice", "Choice", "2", ' '),
+                ("DOB", "DOB", "2011-01-15", ' '),
+                ("Asian", "Asian", "Yes", ' '),
+                ("globalrecordid", SearchCriteriaParser.GlobalRecordIdFieldName, Sentinel, 'x'),
+                ("RecStatus", SearchCriteriaParser.RecStatusFieldName, "1", ' '),
+            ];
+            var data = new TheoryData<string, string, string, char, int>();
+            foreach (var (submitted, canonical, head, fill) in fields)
+            {
+                data.Add(submitted, canonical, head, fill, RecordQueryRules.MaxSearchValueLength);
+                data.Add(submitted, canonical, head, fill, RecordQueryRules.MaxSearchValueLength + 1);
+            }
+
+            return data;
+        }
+    }
+
+    // One string value holds at most 32,767 UTF-16 code units as received, before trimming, what one legacy Find text
+    // box holds: on every kind of field, a value of exactly that many units parses, blanks that trimming removes
+    // included, and one unit more is the one fixed message under the field's canonical name, however the name was
+    // written, before the value is read, so a number or a date padded past the bound is refused for its length, with no
+    // other key and echoing nothing.
+    [Theory]
+    [MemberData(nameof(ValueLengthCases))]
+    public void Limits_EachValue_HoldsAtMostOneLegacyTextBox(
+        string submitted,
+        string canonical,
+        string head,
+        char fill,
+        int length)
+    {
+        var value = head + new string(fill, length - head.Length);
+        Assert.Equal(length, value.Length);
+
+        SearchParseResult result = Parse(Text(submitted, value));
+
+        if (length <= RecordQueryRules.MaxSearchValueLength)
+        {
+            Assert.Equal(canonical, SingleCondition(result).FieldName);
+        }
+        else
+        {
+            AssertFieldError(result, canonical);
+            var (key, messages) = Assert.Single(result.FieldErrors);
+            Assert.Equal(canonical, key);
+            Assert.Equal(new[] { canonical + " search values can hold at most 32767 characters." }, messages);
+            AssertCarriesNoSubmittedText(result);
+        }
+    }
+
+    // Equality and IS NULL alternatives count toward no search-wide bound, so they are bounded only by the value that
+    // holds them: one value holds at most 6,554 one-character alternatives with " or " between them, 32,766 code units,
+    // and six fields at most 6 x 6,554 = 39,324, which parse with every one kept; a 6,555th on any one field makes its
+    // value 32,771 units, the one value-length message under that field. The fields hold text equality, a bare prefix
+    // that matches no value, and number, option, legal-values and GlobalRecordId equality.
+    [Theory]
+    [InlineData(-1)]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(5)]
+    public void Limits_EqualityAndNullAlternatives_AreBoundedOnlyByTheirValue(int longerField)
+    {
+        const int MostPerValue = 6554;
+        const int MostPerSearch = 39_324;
+        Assert.Equal(
+            MostPerValue,
+            (RecordQueryRules.MaxSearchValueLength + " or ".Length) / ("a".Length + " or ".Length));
+        Assert.Equal(MostPerSearch, RecordQueryRules.MaxSearchFields * MostPerValue);
+
+        (string Field, string Alternative, (SearchOperator Op, FieldValue? Value) Expected)[] fields =
+        [
+            ("LastName", "a", EqualText("a")),
+            ("FirstName", ">", IsNull),
+            ("Age", "1", EqualNumber(1)),
+            ("Choice", "2", (SearchOperator.Equal, FieldValue.FromIndex(2))),
+            ("Sex", "M", EqualText("M")),
+            (SearchCriteriaParser.GlobalRecordIdFieldName, "g", EqualText("g")),
+        ];
+        SearchCriterion[] criteria =
+        [
+            .. fields.Select((entry, index) => Text(
+                entry.Field,
+                string.Join(
+                    " or ",
+                    Enumerable.Repeat(entry.Alternative, MostPerValue + (index == longerField ? 1 : 0))))),
+        ];
+
+        SearchParseResult result = Parse(criteria);
+
+        if (longerField < 0)
+        {
+            Assert.True(result.IsSuccess);
+            Assert.Equal(MostPerSearch, result.Conditions.Sum(condition => condition.Alternatives.Count));
+            for (var index = 0; index < fields.Length; index++)
+            {
+                AssertAlternatives(
+                    result.Conditions[index],
+                    [.. Enumerable.Repeat(fields[index].Expected, MostPerValue)]);
+            }
+        }
+        else
+        {
+            var field = fields[longerField].Field;
+            var (key, messages) = Assert.Single(result.FieldErrors);
+            Assert.Equal(field, key);
+            Assert.Equal(new[] { field + " search values can hold at most 32767 characters." }, messages);
+        }
+    }
+
+    // The verifier's search: two plain multiline values on two pages, of 17,000 code units each or of the whole 32,767
+    // of one text box each, more than one text box together, parse as one 255-character comparison each that carries
+    // the whole value, as two legacy Find boxes held them.
+    [Theory]
+    [InlineData(17_000)]
+    [InlineData(RecordQueryRules.MaxSearchValueLength)]
+    public void Limits_PlainMultilineValuesOfTwoFields_ParseWhateverTheyHoldTogether(int length)
+    {
+        var address = Sentinel + new string('a', length - Sentinel.Length);
+        var purchases = Sentinel + new string('b', length - Sentinel.Length);
+
+        SearchParseResult result = SearchCriteriaParser.Parse(
+            TwoMultilineFields,
+            [Text("PatientAddress", address), Text("BuyLastTenDays", purchases)]);
+
+        Assert.True(result.IsSuccess);
+        Assert.Equal(
+            new[] { "PatientAddress", "BuyLastTenDays" },
+            result.Conditions.Select(condition => condition.FieldName));
+        AssertAlternatives(result.Conditions[0], (SearchOperator.PrefixEqual255, FieldValue.FromText(address)));
+        AssertAlternatives(result.Conditions[1], (SearchOperator.PrefixEqual255, FieldValue.FromText(purchases)));
+    }
+
+    // Alternatives that SQL Server compares row by row, every one but an equality and a match of no value, number at
+    // most 6,554 across the search: patterns, the multiline 255-character comparison and the five comparisons, spread
+    // over five fields beside equality and IS NULL alternatives, which count nothing, parse at 6,554 and are the one
+    // fixed message under criteria at 6,555, with no other key and echoing nothing.
+    [Theory]
+    [InlineData(6554)]
+    [InlineData(6555)]
+    public void Limits_RowComparedAlternativesAcrossTheSearch_AreBounded(int total)
+    {
+        (string Field, string[] Cycle)[] rowCompared =
+        [
+            ("LastName", ["%"]),
+            ("Notes", ["a", "*"]),
+            ("PhoneNumber", ["<a", ">a", "<>a"]),
+            (SearchCriteriaParser.GlobalRecordIdFieldName, ["<=a", ">=a"]),
+            ("Age", ["<1"]),
+        ];
+        var share = total / rowCompared.Length;
+        var criteria = new List<SearchCriterion>();
+        for (var index = 0; index < rowCompared.Length; index++)
+        {
+            var (field, cycle) = rowCompared[index];
+            var count = share + (index == 0 ? total % rowCompared.Length : 0);
+            IEnumerable<string> alternatives =
+                Enumerable.Range(0, count).Select(alternative => cycle[alternative % cycle.Length]);
+            if (field == "LastName")
+            {
+                alternatives = alternatives.Append("a").Append(">");
+            }
+            else if (field == "Age")
+            {
+                alternatives = alternatives.Append("1");
+            }
+
+            criteria.Add(Text(field, string.Join(" or ", alternatives)));
+        }
+
+        criteria.Add(Text("City", Alternatives(1000)));
+
+        SearchParseResult result = Parse([.. criteria]);
+
+        if (total <= RecordQueryRules.MaxRowComparedAlternatives)
+        {
+            Assert.True(result.IsSuccess);
+            var counted = result.Conditions
+                .SelectMany(condition => condition.Alternatives)
+                .Where(alternative => alternative.Operator is not (SearchOperator.Equal or SearchOperator.IsNull))
+                .ToArray();
+            Assert.Equal(total, counted.Length);
+            Assert.Equal(
+                new[]
+                {
+                    SearchOperator.NotEqual, SearchOperator.Less, SearchOperator.LessOrEqual, SearchOperator.Greater,
+                    SearchOperator.GreaterOrEqual, SearchOperator.Like, SearchOperator.PrefixEqual255,
+                },
+                counted.Select(alternative => alternative.Operator).Distinct().Order().ToArray());
+        }
+        else
+        {
+            AssertCriteriaLimitError(
+                result,
+                "One search can hold at most 6554 wildcard, comparison and multiline alternatives in all.");
+        }
+    }
+
+    // Wildcard patterns hold at most 32,767 UTF-16 code units across the search, counted as each runs: without its
+    // stripped prefix, with '*' as '%' and, past 4,000 units, with each run of '%' collapsed to one. Over two fields or
+    // six, patterns of exactly that many units parse, though their values hold 2,002 units more, and one unit more is
+    // the one fixed message under criteria, with no other key and echoing nothing.
+    [Theory]
+    [InlineData(2, 0)]
+    [InlineData(2, 1)]
+    [InlineData(6, 0)]
+    [InlineData(6, 1)]
+    public void Limits_PatternTextAcrossTheSearch_IsBoundedAsThePatternsRun(int fieldCount, int excess)
+    {
+        string[] patternFields = ["LastName", "Notes", "FirstName", "City", "State", "Sex"];
+        var total = RecordQueryRules.MaxSearchPatternTextLength + excess;
+        var criteria = new SearchCriterion[fieldCount];
+        var expected = new string[fieldCount];
+        for (var index = 0; index < fieldCount; index++)
+        {
+            var length = (total / fieldCount) + (index == 0 ? total % fieldCount : 0);
+            expected[index] = Sentinel + "%" + new string('_', length - Sentinel.Length - 1);
+
+            // The first value leads with a prefix, which is stripped, and holds a run of 2,001 '*', which collapses.
+            criteria[index] = Text(
+                patternFields[index],
+                index == 0
+                    ? ">=" + Sentinel + new string('*', 2001) + expected[index][(Sentinel.Length + 1)..]
+                    : expected[index].Replace('%', '*'));
+        }
+
+        Assert.Equal(total + 2002, criteria.Sum(criterion => criterion.Value.AsText().Length));
+
+        SearchParseResult result = Parse(criteria);
+
+        if (excess == 0)
+        {
+            Assert.True(result.IsSuccess);
+            for (var index = 0; index < fieldCount; index++)
+            {
+                AssertAlternatives(result.Conditions[index], LikeText(expected[index]));
+            }
+
+            Assert.Equal(total, expected.Sum(pattern => pattern.Length));
+        }
+        else
+        {
+            AssertCriteriaLimitError(
+                result,
+                "The wildcard patterns of one search can hold at most 32767 characters in all.");
+        }
+    }
+
+    // A search past both search-wide bounds holds one message for each, and nothing else: 6,554 one-character patterns
+    // over two fields and one long pattern on a third, 6,555 patterns of 32,768 units together.
+    [Fact]
+    public void Limits_SearchPastBothBounds_HoldsOneMessageForEach()
+    {
+        const int LastNamePatterns = 3278;
+        const int NotesPatterns = 3276;
+        var longPattern = Sentinel + "*" + new string(
+            '_',
+            RecordQueryRules.MaxSearchPatternTextLength + 1 - LastNamePatterns - NotesPatterns - Sentinel.Length - 1);
+
+        SearchParseResult result = Parse(
+            Text("LastName", string.Join(" or ", Enumerable.Repeat("%", LastNamePatterns))),
+            Text("Notes", string.Join(" or ", Enumerable.Repeat("%", NotesPatterns))),
+            Text("FirstName", longPattern));
+
+        AssertFieldError(result, SearchCriteriaParser.CriteriaKey);
+        var (key, messages) = Assert.Single(result.FieldErrors);
+        Assert.Equal(SearchCriteriaParser.CriteriaKey, key);
+        Assert.Equal(
+            new[]
+            {
+                "One search can hold at most 6554 wildcard, comparison and multiline alternatives in all.",
+                "The wildcard patterns of one search can hold at most 32767 characters in all.",
+            },
+            messages);
+        AssertCarriesNoSubmittedText(result);
+    }
+
+    // Values that are not text have no length and parse as equality or IS NULL: a JSON number, a JSON boolean and JSON
+    // null beside a 32,767-unit pattern and 6,553 multiline comparisons, which reach both search-wide bounds exactly,
+    // still parse, and a null entry beside those two is reported as the null entry it is.
+    [Fact]
+    public void Limits_ValuesThatAreNotText_CountNothingTowardAnyBound()
+    {
+        var pattern = Text(
+            "LastName",
+            "%" + string.Concat(Enumerable.Repeat("_%", RecordQueryRules.MaxSearchPatternTextLength / 2)));
+        var comparisons = Text(
+            "Notes",
+            string.Join(" or ", Enumerable.Repeat("a", RecordQueryRules.MaxRowComparedAlternatives - 1)));
+
+        SearchParseResult typed = Parse(
+            pattern,
+            comparisons,
+            Value("Age", FieldValue.FromNumber(18)),
+            Value("Asian", FieldValue.FromBoolean(true)),
+            Value("DOB", FieldValue.Null));
+        SearchParseResult withNullEntry = SearchCriteriaParser.Parse(Fields, [pattern, comparisons, null!]);
+
+        Assert.True(typed.IsSuccess);
+        Assert.Equal(5, typed.Conditions.Count);
+        Assert.Equal(
+            RecordQueryRules.MaxSearchPatternTextLength,
+            Assert.Single(typed.Conditions[0].Alternatives).Value!.Value.AsText().Length);
+        AssertFieldError(withNullEntry, SearchCriteriaParser.CriteriaKey);
+        Assert.Equal(
+            new[] { "criteria[2] must name a field and a value." },
+            Assert.Single(withNullEntry.FieldErrors).Value);
+    }
+
+    // The one failure of a search-wide bound: the single fixed message under criteria, no other key, carrying no
+    // submitted text.
+    private static void AssertCriteriaLimitError(SearchParseResult result, string message)
+    {
+        AssertFieldError(result, SearchCriteriaParser.CriteriaKey);
+        var (key, messages) = Assert.Single(result.FieldErrors);
+        Assert.Equal(SearchCriteriaParser.CriteriaKey, key);
+        Assert.Equal(new[] { message }, messages);
+        AssertCarriesNoSubmittedText(result);
     }
 
     // SQL Server's LIKE pattern limit is 8,000 bytes, 4,000 UTF-16 code units; the stripped prefix does not count. A
@@ -1195,7 +1585,7 @@ public sealed class SearchCriteriaParserTests
     }
 
     // Equality, the 255-character multiline comparison and the comparisons without a wildcard path bind a value
-    // that no LIKE pattern limit applies to.
+    // that no LIKE pattern limit applies to, so a value of the whole bound of one value is one comparison.
     [Theory]
     [InlineData("LastName", 'x', SearchOperator.Equal)]
     [InlineData("Sex", 'x', SearchOperator.Equal)]
@@ -1203,9 +1593,12 @@ public sealed class SearchCriteriaParserTests
     [InlineData("PhoneNumber", 'x', SearchOperator.Equal)]
     [InlineData("PhoneNumber", '*', SearchOperator.Equal)]
     [InlineData(SearchCriteriaParser.GlobalRecordIdFieldName, '*', SearchOperator.Equal)]
-    public void Limits_TextWithoutAPattern_HasNoLengthBound(string field, char fill, SearchOperator expected)
+    public void Limits_TextWithoutAPattern_HasNoLengthBoundButItsValues(
+        string field,
+        char fill,
+        SearchOperator expected)
     {
-        var value = Sentinel + new string(fill, 20000 - Sentinel.Length);
+        var value = Sentinel + new string(fill, RecordQueryRules.MaxSearchValueLength - Sentinel.Length);
 
         AssertAlternatives(SingleCondition(Parse(Text(field, value))), (expected, FieldValue.FromText(value)));
     }
