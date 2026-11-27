@@ -10,7 +10,7 @@ import { resolveConnectionString } from './e2e/support/connection';
 // Names the variable and the requirement only: the value may be anything, so it is never echoed.
 const EXTERNAL_BASE_URL_REQUIREMENT =
   'E2E_BASE_URL must be unset or an absolute URL that starts with http:// or https:// followed by a host, such as ' +
-  'http://127.0.0.1:5000, with no user name, password, control character or backslash.';
+  'http://127.0.0.1:5000, with no user name, password, query, fragment, control character or backslash.';
 
 // The scheme, '//' and a non-empty authority, which ends at the first '/', '?' or '#'.
 const HTTP_URL_PREFIX = /^https?:\/\/([^/?#]+)/i;
@@ -32,11 +32,15 @@ function hasControlCharacterOrBackslash(value: string): boolean {
 // it would carry the value.
 function checkExternalBaseUrl(value: string): string {
   const authority = HTTP_URL_PREFIX.exec(value)?.[1];
-  // The API has no authentication, so a user name or password in the authority has no use there, and in baseURL it
-  // would put a secret into every report and trace that shows the configuration.
+  // The API has no authentication, so a user name or password in the authority has no use there, and the smoke test
+  // requests root-relative paths only, so a query or fragment has none either. In baseURL any of them would put a
+  // secret into every report that shows the configuration, and into every retained trace, which serializes the
+  // whole baseURL. '?' and '#' are refused in the text itself, because the parser drops an empty query or fragment.
   if (
     authority === undefined ||
     authority.includes('@') ||
+    value.includes('?') ||
+    value.includes('#') ||
     hasControlCharacterOrBackslash(value) ||
     !URL.canParse(value)
   ) {

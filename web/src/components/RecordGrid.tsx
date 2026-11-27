@@ -13,7 +13,7 @@ import {
 } from 'react';
 
 import { isBlankQuery, isExactDecimal, type ApiClient } from '../api/client';
-import { describeError, isAbortError, networkError, type ApiError } from '../api/errors';
+import { describeError, isAbortError, isConnectionFailure, networkError, type ApiError } from '../api/errors';
 import type { FieldDefinition, FieldValue, FormDefinition, RecordPage, RecordSummary } from '../api/types';
 import { ConnectionError } from './ConnectionError';
 import { forgetGroupFocus, keepFocusOffDisabled } from './RecordNavigator';
@@ -41,7 +41,12 @@ export interface RecordGridProps {
    * caller's form-not-found handling decides what happens to the open record.
    */
   onFormNotFound: () => void;
-  /** Makes every control inert, for example while a save is in flight. */
+  /**
+   * Suspends the grid's actions, for example while a save is in flight: the search box, the
+   * "Show deleted" toggle and the paging buttons are disabled, and the rows are marked
+   * aria-disabled and open no record. Retry stays actionable, because it only repeats the
+   * list GET, and the scroll region stays focusable, so the table can still be scrolled.
+   */
   disabled?: boolean;
 }
 
@@ -117,7 +122,8 @@ function cellText(value: FieldValue | undefined): string {
   if (typeof value === 'string') {
     return value;
   }
-  // An exact decimal is a typed number, shown as its JSON literal; no response carries one.
+  // An exact decimal is a fraction whose nearest double is whole, which a row's values can
+  // hold; it is shown as its JSON literal.
   if (isExactDecimal(value)) {
     return value.literal;
   }
@@ -159,10 +165,6 @@ function filterText(text: string): string {
 
 function countText(total: number): string {
   return total === 1 ? '1 record' : `${total} records`;
-}
-
-function isConnectionFailure(error: ApiError): boolean {
-  return error.kind === 'unavailable' || error.kind === 'network';
 }
 
 // A field-level 400 is about the list's own query parameters, never a form field, so
@@ -673,7 +675,7 @@ export const RecordGrid = memo(function RecordGrid({
   }
 
   // Measured before paint, and again whenever the box scrolls or it or its table changes
-  // size. Without ResizeObserver (jsdom) the box keeps its first measurement.
+  // size. Without ResizeObserver (jsdom) a size change is not remeasured; a scroll still is.
   const showsTable = table !== null;
   useLayoutEffect(() => {
     const box = scrollRef.current;

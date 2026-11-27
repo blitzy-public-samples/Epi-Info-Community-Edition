@@ -209,6 +209,12 @@ interface Exchange<D> {
 // exchange with the very Response the fetch wrapper returned, so settle recognises them.
 const unreadableResponses = new WeakSet<Response>();
 
+// The copies readingJsonExactly returns for a response that fetch reached by following a
+// redirect, which a copy cannot carry as `Response.redirected`. Such a reply answers the
+// request redirected to, not the one this client sent, so settle reads no write outcome
+// from it.
+const redirectedResponses = new WeakSet<Response>();
+
 // Settles one call. `read` turns an OK response's body into the result's data, returning
 // `undefined` when the body is missing or is not the shape the endpoint's contract
 // returns. Such a response settles as a failure of its own status, which parseProblem
@@ -219,11 +225,15 @@ const unreadableResponses = new WeakSet<Response>();
 // something other than the API proves neither that the write was applied nor that it was not.
 // A response marked unreadable (readingJsonExactly), OK or not, also settles as a failure
 // of its own status with no write outcome: a 2xx as `server`, an error status by its kind.
+// With `writesRecord`, set for a record create, update or delete, an error response that is
+// the direct reply to that request, not one marked redirected, is parsed for the outcome its
+// WriteProblemDetails states; every other error response states none.
 async function settle<D, T>(
   signal: AbortSignal | undefined,
   send: () => Promise<Exchange<D>>,
   read: (data: D | undefined) => T | undefined,
   successStatus?: number,
+  writesRecord = false,
 ): Promise<ApiResult<T>> {
   let exchange: Exchange<D>;
   try {
@@ -249,7 +259,11 @@ async function settle<D, T>(
   // openapi-fetch reports an empty error body as `error: undefined`, so only the status
   // decides between success and failure.
   if (!response.ok) {
-    return { ok: false, error: parseProblem(response.status, error) };
+    const writeReply =
+      writesRecord && !redirectedResponses.has(response)
+        ? { contentType: response.headers.get('Content-Type') }
+        : undefined;
+    return { ok: false, error: parseProblem(response.status, error, writeReply) };
   }
 
   if (successStatus !== undefined && response.status !== successStatus) {
@@ -269,23 +283,27 @@ async function settle<D, T>(
  * `isBody` holds for it; any other OK body settles as a failure.
  * @param successStatus The one status that acknowledges the call, as a record create
  *   (201) and update (200) have; without it any OK status does.
+ * @param writesRecord The call creates or updates a record, so its direct 500 or 503
+ *   reply may state a write outcome; every other call's reply states none.
  */
 function withBody<D>(
   signal: AbortSignal | undefined,
   send: () => Promise<Exchange<D>>,
   isBody: (body: unknown) => body is D,
   successStatus?: number,
+  writesRecord = false,
 ): Promise<ApiResult<D>> {
-  return settle(signal, send, (data) => (isBody(data) ? data : undefined), successStatus);
+  return settle(signal, send, (data) => (isBody(data) ? data : undefined), successStatus, writesRecord);
 }
 
 /**
  * Settles a call whose one success is a bodyless 204, as a record delete has. Any other
  * OK status, a 205 or a 200 with a body included, acknowledges nothing and settles as a
- * failure of its own status.
+ * failure of its own status. The call writes a record, so its direct 500 or 503 reply may
+ * state a write outcome.
  */
 function withoutBody(signal: AbortSignal | undefined, send: () => Promise<Exchange<unknown>>): Promise<ApiResult<null>> {
-  return settle(signal, send, () => null, 204);
+  return settle(signal, send, () => null, 204, true);
 }
 
 // Success bodies. Each guard reads a parsed body as `unknown` and holds only when every
@@ -1248,7 +1266,8 @@ const NULL_BODY_STATUSES: ReadonlySet<number> = new Set([101, 103, 204, 205, 304
 
 // A copy of `response` with `body` as its body, held whole, so it is neither encoded nor
 // chunked and carries its Content-Length: decoded text, or the bytes received; with `null`,
-// a copy with no body, whose Content-Length of 0 tells openapi-fetch to read none.
+// a copy with no body, whose Content-Length of 0 tells openapi-fetch to read none. The copy
+// of a response reached through a redirect is marked redirected for settle.
 function copyWithBody(response: Response, body: string | ArrayBuffer | null): Response {
   let length = 0;
   if (typeof body === 'string') {
@@ -1260,7 +1279,11 @@ function copyWithBody(response: Response, body: string | ArrayBuffer | null): Re
   headers.delete('Content-Encoding');
   headers.delete('Transfer-Encoding');
   headers.set('Content-Length', String(length));
-  return new Response(body, { status: response.status, statusText: response.statusText, headers });
+  const copy = new Response(body, { status: response.status, statusText: response.statusText, headers });
+  if (response.redirected) {
+    redirectedResponses.add(copy);
+  }
+  return copy;
 }
 
 // The body-less copy of a response whose body cannot be used, marked for settle.
@@ -1428,6 +1451,7 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
           }),
         isRecordDto,
         201,
+        true,
       ),
 
     updateRecord: (viewId, globalRecordId, values, signal) =>
@@ -1442,6 +1466,7 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
           }),
         isRecordDto,
         200,
+        true,
       ),
 
     deleteRecord: (viewId, globalRecordId, signal) =>

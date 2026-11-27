@@ -578,7 +578,8 @@ describe('App URL parameters', () => {
     { name: 'a 503', failure: unavailable, text: 'The database cannot be reached.', traceId: '00-test-unavailable-00' },
     { name: 'a 500', failure: serverError, text: 'An unexpected error occurred.', traceId: '00-test-server-error-00' },
     { name: 'no response', failure: () => 'noResponse', text: 'The server could not be reached.', traceId: null },
-    // An OK body the lookup cannot read is the unexpected failure, not "not found".
+    // An OK body that is not a forms list is the unexpected failure, not "not found": the
+    // shared client's form-list schema rejects the malformed JSON before the lookup reads it.
     {
       name: 'a 200 whose body is not a list',
       failure: () => ok({}),
@@ -588,6 +589,12 @@ describe('App URL parameters', () => {
     {
       name: 'a 200 whose entry has no name',
       failure: () => ok([{ viewId: FORM.viewId, pageCount: 2 }]),
+      text: 'An unexpected error occurred.',
+      traceId: null,
+    },
+    {
+      name: 'a 200 whose entry has no pageCount',
+      failure: () => ok([{ viewId: FORM.viewId, name: FORM.name }]),
       text: 'An unexpected error occurred.',
       traceId: null,
     },
@@ -602,6 +609,9 @@ describe('App URL parameters', () => {
       const alert = await screen.findByRole('alert');
       expect(screen.getByText("Form 'CaseReport' could not be opened.")).toBeDefined();
       expect(alert.textContent).toContain(text);
+      // No form is open, so no failure speaks of a draft; a 503 or no response gets the
+      // connection banner's text.
+      expect(alert.textContent).not.toContain('still on screen');
       if (traceId !== null) {
         expect(alert.textContent).toContain(traceId);
       }

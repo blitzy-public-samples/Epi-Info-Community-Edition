@@ -3113,10 +3113,10 @@ describe('FormView connection banners', () => {
   /** A 503, carrying `writeOutcome` as a record write's does when one is given. */
   function unavailable(writeOutcome?: WriteOutcome): Response {
     if (writeOutcome === undefined) {
-      return jsonResponse(503, UNAVAILABLE_PROBLEM);
+      return problemResponse(UNAVAILABLE_PROBLEM);
     }
     const body: WriteProblemDetails = { ...UNAVAILABLE_PROBLEM, writeOutcome };
-    return jsonResponse(503, body);
+    return problemResponse(body);
   }
 
   /** A fetch that answers through `answer` first, then the read routes, recording every request. */
@@ -3188,6 +3188,59 @@ describe('FormView connection banners', () => {
 
     await loaded();
     expect(linesOf('GET').filter((line) => line === `GET ${FORM_PATH}`)).toHaveLength(2);
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+
+  // The navigator's count and the grid's list page are reads, so their connection banner
+  // holds no draft and its Retry repeats the read.
+  it.each<{ label: string; read: string; path: string; failure: () => Answer; text: string }>([
+    {
+      label: 'a 503',
+      read: 'the record count',
+      path: `${FORM_PATH}/records/count`,
+      failure: () => unavailable(),
+      text: 'The database cannot be reached.',
+    },
+    {
+      label: 'no response',
+      read: 'the record count',
+      path: `${FORM_PATH}/records/count`,
+      failure: () => 'no response',
+      text: 'The server could not be reached.',
+    },
+    {
+      label: 'a 503',
+      read: 'the record list',
+      path: `${FORM_PATH}/records`,
+      failure: () => unavailable(),
+      text: 'The database cannot be reached.',
+    },
+    {
+      label: 'no response',
+      read: 'the record list',
+      path: `${FORM_PATH}/records`,
+      failure: () => 'no response',
+      text: 'The server could not be reached.',
+    },
+  ])('says only what cannot be reached, with Retry, when $read gets $label', async ({ path, failure, text }) => {
+    let failed = false;
+    renderWith((call) => {
+      if (!failed && call.method === 'GET' && call.url.pathname === path) {
+        failed = true;
+        return failure();
+      }
+      return undefined;
+    });
+
+    const alert = await screen.findByRole('alert');
+    expect(within(alert).getByText(text)).toBeTruthy();
+    expect(alert.textContent).not.toContain('still on screen');
+
+    fireEvent.click(within(alert).getByRole('button', { name: 'Retry' }));
+
+    await loaded();
+    await within(screen.getByRole('region', { name: 'Records' })).findByText('1 record');
+    expect(calls.filter((call) => call.method === 'GET' && call.url.pathname === path)).toHaveLength(2);
     expect(screen.queryByRole('alert')).toBeNull();
   });
 
@@ -3266,7 +3319,7 @@ describe('FormView connection banners', () => {
       traceId: firstTrace,
       writeOutcome: 'written',
     };
-    const updates = [jsonResponse(500, written), unavailable('notWritten')];
+    const updates = [problemResponse(written), unavailable('notWritten')];
     renderWith((call) => (call.method === 'PUT' && call.url.pathname === RECORD_PATH ? updates.shift() : undefined));
     await loaded();
     const saveAgainName = 'Save again (the earlier save may already have been applied)';
@@ -6230,6 +6283,41 @@ describe('FormView Find record', () => {
     } finally {
       Reflect.deleteProperty(Element.prototype, 'scrollIntoView');
     }
+  });
+
+  // A search is a read, so its connection banner holds no draft and its Retry repeats it.
+  it.each<{ label: string; failure: () => Response | Promise<Response>; text: string }>([
+    {
+      label: 'a 503',
+      failure: () =>
+        jsonResponse(503, {
+          type: 'https://tools.ietf.org/html/rfc9110#section-15.6.4',
+          title: 'Service Unavailable',
+          status: 503,
+          detail: 'The database is unavailable.',
+          traceId: '00-test-search-03',
+        }),
+      text: 'The database cannot be reached.',
+    },
+    {
+      label: 'no response',
+      failure: () => Promise.reject(new TypeError('Failed to fetch')),
+      text: 'The server could not be reached.',
+    },
+  ])('says only what cannot be reached, with Retry, when a search gets $label', async ({ failure, text }) => {
+    await renderForm(undefined, { route: searchRoute(failure, () => matches(MATCH)) });
+    const dialog = openFind();
+    searchFromButton(dialog);
+
+    const alert = await within(dialog).findByRole('alert');
+    expect(within(alert).getByText(text)).toBeTruthy();
+    expect(alert.textContent).not.toContain('still on screen');
+
+    fireEvent.click(within(alert).getByRole('button', { name: 'Retry' }));
+
+    expect(await within(dialog).findByRole('table', { name: 'Matching records' })).toBeTruthy();
+    expect(within(dialog).queryByRole('alert')).toBeNull();
+    expect(calls.filter(isSearch)).toHaveLength(2);
   });
 });
 

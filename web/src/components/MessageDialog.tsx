@@ -105,8 +105,11 @@ function handleDialogKey(
  * Like ConfirmDialog it is a plain role="dialog" element (jsdom has no
  * <dialog>.showModal()) rendered into <body>, so that, while a message is
  * shown, every other child of <body> can be made inert. Focus moves to OK when
- * the first message appears, and returns to the element focused before it once
- * the last one is dismissed.
+ * the first message appears. Once the last one is dismissed, focus returns to
+ * the element focused before it only while that element is still in the
+ * document and only if focus would otherwise be lost: unplaced (no element,
+ * <body> or the document element); focus another control or a newer dialog
+ * took meanwhile stays where it is.
  */
 export function MessageDialog({ dialogs, onDismiss }: MessageDialogProps) {
   const headingId = useId();

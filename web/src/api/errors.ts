@@ -5,9 +5,11 @@
 //
 // Every /api error body is an RFC 7807 ProblemDetails (type, title, status, detail,
 // traceId). A field-level 400 adds `errors`, keyed by canonical field or parameter name;
-// the 500 and 503 of a record create, update or delete add `writeOutcome`. Parsing reads
-// the body as `unknown` through type guards only, so a non-JSON or unexpected body (the
-// /health 503, a proxy's HTML page) degrades to nulls rather than to a wrong type.
+// the 500 and 503 of a record create, update or delete add `writeOutcome`, which is read
+// only from such a reply received directly, never through a redirect, and from no other
+// response. Parsing reads the body as `unknown` through type guards only, so a non-JSON
+// or unexpected body (the /health 503, a proxy's HTML page) degrades to nulls rather than
+// to a wrong type.
 //
 // Banner text is fixed: it is never built from a submitted value or anything else the
 // client sent, only from the fixed texts below, the server's own fixed request-level
@@ -15,7 +17,11 @@
 // text may name a field by its prompt: form metadata, never the field's value.
 import type { WriteOutcome } from './types';
 
-/** What a failed request means to the user, decided by its HTTP status. */
+/**
+ * What a failed request means to the user, decided by its HTTP status, `network` when no
+ * response arrived. A 400 alone also reads its body: it is `validation` when the body's
+ * field-level `errors` map holds a message, and `badRequest` otherwise.
+ */
 export type ApiErrorKind =
   | 'validation'
   | 'badRequest'
@@ -54,15 +60,20 @@ export interface ApiError {
   /** The server's trace id for the failed request, or `null` when absent. */
   readonly traceId: string | null;
   /**
-   * Field-level 400 messages keyed exactly as the server sent them (canonical field
-   * name, or parameter name for route and query input); empty otherwise. The map has
-   * no prototype, so a field named like an Object member (`constructor`) reads only
-   * its own messages.
+   * The string messages of the body's `errors` map, read from any object body and keyed
+   * exactly as the server sent them (canonical field name, or parameter name for route and
+   * query input); empty when the body has no such map or none of its entries holds a
+   * string message. Only a 400 with a non-empty map is `validation`. The map has no
+   * prototype, so a field named like an Object member (`constructor`) reads only its own
+   * messages.
    */
   readonly fieldErrors: Record<string, string[]>;
   /**
-   * What a failed record write is known to have done; `null` when the body carries no
-   * recognised `writeOutcome`, which is treated as unsafe to resend.
+   * What a failed record write is known to have done; `null`, which is treated as unsafe
+   * to resend, unless the response is the direct reply to a record create, update or
+   * delete, not one reached through a redirect, and is a WriteProblemDetails carrying a
+   * recognised `writeOutcome`: a 500 or 503 served as `application/problem+json` whose body
+   * is a ProblemDetails for that status with string `type`, `detail` and `traceId`.
    */
   readonly writeOutcome: WriteOutcome | null;
 }
@@ -160,6 +171,35 @@ function isProblemDetailsFor(problem: Record<string, unknown>, status: number): 
   return isString(problem.title) && Number.isInteger(problem.status) && problem.status === status;
 }
 
+// The statuses and media type of the one response that states a write outcome: the
+// WriteProblemDetails of a record create, update or delete that failed.
+const WRITE_PROBLEM_STATUSES: ReadonlySet<number> = new Set([500, 503]);
+const PROBLEM_MEDIA_TYPE = 'application/problem+json';
+
+// The media type of a Content-Type value: the text before its parameters, lower-cased.
+function mediaTypeOf(contentType: string): string {
+  const parameters = contentType.indexOf(';');
+  return (parameters === -1 ? contentType : contentType.slice(0, parameters)).trim().toLowerCase();
+}
+
+// Whether `problem` is a WriteProblemDetails answering the response with `status`: a 500 or
+// 503 served as `application/problem+json` whose body is a ProblemDetails for that status
+// with every member the schema requires. Only such a body's `writeOutcome` is trusted. An
+// intermediary's 502 or 504, a 500 or 503 another server wrote, or a body missing a member
+// states nothing about the write, whatever `writeOutcome` it carries, since `notWritten`
+// read from it could offer Retry for a save the API committed.
+function isWriteProblemFor(problem: Record<string, unknown>, status: number, contentType: string | null): boolean {
+  return (
+    WRITE_PROBLEM_STATUSES.has(status) &&
+    isString(contentType) &&
+    mediaTypeOf(contentType) === PROBLEM_MEDIA_TYPE &&
+    isProblemDetailsFor(problem, status) &&
+    isString(problem.type) &&
+    isString(problem.detail) &&
+    isString(problem.traceId)
+  );
+}
+
 // Null prototype: a parsed key such as "__proto__" or "constructor" becomes an own
 // entry, never an inherited member or a prototype change.
 function emptyFieldErrors(): Record<string, string[]> {
@@ -221,16 +261,33 @@ function kindOf(status: number, hasFieldErrors: boolean): ApiErrorKind {
   return 'server';
 }
 
+/** What parseProblem needs of the direct reply to a record create, update or delete. */
+export interface WriteReply {
+  /**
+   * The response's Content-Type header, `null` when it has none. Its parameters, such as
+   * `charset`, are ignored.
+   */
+  readonly contentType: string | null;
+}
+
 /**
- * Parses a failed response. The HTTP status alone decides `kind`. The body's own `status`
- * member serves only to recognise a ProblemDetails: `type` is kept only from a body that
- * has a string `title` and whose integer `status` is the HTTP status, while `title`,
- * `detail`, `traceId`, `errors` and `writeOutcome` are read from any object body.
+ * Parses a failed response. The HTTP status decides `kind`, with one branch on the body:
+ * a 400 is `validation` when the body's `errors` map holds a message, and `badRequest`
+ * otherwise. The body's own `status` member serves only to recognise a ProblemDetails:
+ * `type` is kept only from a body that has a string `title` and whose integer `status` is
+ * the HTTP status. `title`, `detail`, `traceId` and `errors` are read from any object
+ * body. `writeOutcome` is read only when `writeReply` is given and the response is a
+ * WriteProblemDetails, a 500 or 503 served as `application/problem+json` whose body is a
+ * ProblemDetails for that status with string `type`, `detail` and `traceId`; otherwise it
+ * is `null`.
  * @param status The response's HTTP status.
  * @param body The parsed JSON body, the raw text of a non-JSON body, or `undefined` for
  *   an empty one.
+ * @param writeReply Given only for the direct reply to a record create, update or delete;
+ *   omitted for every other response, a reply reached through a redirect included, since
+ *   such a response states nothing about a write.
  */
-export function parseProblem(status: number, body: unknown): ApiError {
+export function parseProblem(status: number, body: unknown, writeReply?: WriteReply): ApiError {
   const problem: Record<string, unknown> = isRecord(body) ? body : {};
   const fieldErrors = readFieldErrors(problem.errors);
 
@@ -242,7 +299,12 @@ export function parseProblem(status: number, body: unknown): ApiError {
     detail: readText(problem.detail),
     traceId: readText(problem.traceId),
     fieldErrors,
-    writeOutcome: isWriteOutcome(problem.writeOutcome) ? problem.writeOutcome : null,
+    writeOutcome:
+      writeReply !== undefined &&
+      isWriteProblemFor(problem, status, writeReply.contentType) &&
+      isWriteOutcome(problem.writeOutcome)
+        ? problem.writeOutcome
+        : null,
   };
 }
 
@@ -269,6 +331,15 @@ export function networkError(): ApiError {
  */
 export function isAbortError(e: unknown): boolean {
   return typeof e === 'object' && e !== null && 'name' in e && e.name === 'AbortError';
+}
+
+/**
+ * Whether the API or its database could not be reached: a 503 (or the development
+ * proxy's 502 or 504), or no response at all. Consumers show such a failure with the
+ * ConnectionError banner, whose Retry follows isSafeToResend.
+ */
+export function isConnectionFailure(error: ApiError): boolean {
+  return error.kind === 'unavailable' || error.kind === 'network';
 }
 
 /**

@@ -6,7 +6,11 @@
  * `SELECT` statements, `sp_getapplock` and `sp_releaseapplock`, and a transaction begin and rollback. Every
  * value is a typed parameter. Every table name comes from the fixed seeded names below, the tables
  * `tests/Shared/SqlSnapshot.cs` reads, and is checked at runtime before it is quoted, so a caller's string never
- * reaches the command text.
+ * reaches the command text. Besides them the verifier reads one fixed system function,
+ * `sys.dm_db_index_operational_stats`, for the base table of a seeded form, and the permission it needs there,
+ * `CONTROL` on that table or `VIEW DATABASE STATE`: equal record counts cannot tell two fresh rehearsal databases
+ * apart, so the smoke test proves that an API it did not start uses this database by seeing the activity of that
+ * API's write path in this database's base table.
  *
  * Importing the module opens no connection: each pool belongs to the function that creates it. The connection
  * is resolved by `connection.ts`, exactly as the .NET tests resolve it. Nothing is written to the console, and
@@ -112,6 +116,25 @@ export interface SqlVerifier {
   /** Every column of the page row with this `GlobalRecordId`, or `null` when there is none. */
   pageRow(table: PageTable, globalRecordId: string): Promise<PageRow | null>;
 
+  /**
+   * Whether the verifier's login may read the access counters of the base table of `form` through
+   * `sys.dm_db_index_operational_stats`: it needs `CONTROL` on that table or `VIEW DATABASE STATE`, the permissions
+   * the function requires for one object, both scoped to this database. Without them
+   * {@link SqlVerifier.tableActivity} cannot show the table's activity.
+   */
+  canReadTableActivity(form: SeededForm): Promise<boolean>;
+
+  /**
+   * A fingerprint of the access counters SQL Server keeps for the base table of `form`, as
+   * `sys.dm_db_index_operational_stats` reports them for each of its indexes and partitions: range scans, singleton
+   * lookups, forwarded fetches, row and page locks, and leaf-level row inserts, updates and deletes; `''` when the
+   * function reports no row. Two equal fingerprints mean no statement touched the table in between. The counters
+   * belong to the table, not to a session, so they count the work of every client whether its connections are pooled
+   * or not, and reading them changes none of them. SQL Server keeps them only while the table's metadata stays
+   * cached, so a reset also reads as a change.
+   */
+  tableActivity(form: SeededForm): Promise<string>;
+
   /** Closes the pool. Later calls return the first call's promise. */
   close(): Promise<void>;
 }
@@ -159,6 +182,27 @@ const BASE_ROW_COLUMNS =
   'b.[UniqueKey] AS uniqueKey, b.[RecStatus] AS recStatus, b.[GlobalRecordId] AS globalRecordId, ' +
   'b.[FirstSaveLogonName] AS firstSaveLogonName, b.[FirstSaveTime] AS firstSaveTime, ' +
   'b.[LastSaveLogonName] AS lastSaveLogonName, b.[LastSaveTime] AS lastSaveTime, b.[FKEY] AS fkey';
+
+// The quoted base-table name, bound as a value: HAS_PERMS_BY_NAME declares its securable as sysname, nvarchar(128).
+const TABLE_PARAMETER = 'table';
+const SECURABLE_NAME_LENGTH = 128;
+
+// The permissions sys.dm_db_index_operational_stats requires for one object: CONTROL on it, or VIEW DATABASE STATE.
+// HAS_PERMS_BY_NAME answers 1, 0, or NULL for a permission the server does not know, which counts as not granted.
+const TABLE_ACTIVITY_PERMISSION_STATEMENT =
+  "SELECT CAST(CASE WHEN HAS_PERMS_BY_NAME(@table, N'OBJECT', N'CONTROL') = 1 " +
+  "OR HAS_PERMS_BY_NAME(DB_NAME(), N'DATABASE', N'VIEW DATABASE STATE') = 1 THEN 1 ELSE 0 END AS int) AS granted;";
+
+// The access counters of each index and partition of one table, in that order; STRING_AGG answers NULL for no row.
+// The function reports every object of the database when its object id is NULL, so the filter keeps a table
+// OBJECT_ID cannot find from reading as the whole database.
+const TABLE_ACTIVITY_STATEMENT =
+  "SELECT STRING_AGG(CONCAT(s.[index_id], N'.', s.[partition_number], N':', s.[range_scan_count], N',', " +
+  "s.[singleton_lookup_count], N',', s.[forwarded_fetch_count], N',', s.[row_lock_count], N',', " +
+  "s.[page_lock_count], N',', s.[leaf_insert_count], N',', s.[leaf_update_count], N',', s.[leaf_delete_count]), " +
+  "N';') WITHIN GROUP (ORDER BY s.[index_id], s.[partition_number]) AS activity " +
+  'FROM sys.dm_db_index_operational_stats(DB_ID(), OBJECT_ID(@table), NULL, NULL) AS s ' +
+  'WHERE s.[object_id] = OBJECT_ID(@table);';
 
 // mssql codes for a call the library refused before it reached the server, which a fresh request may avoid.
 const LIBRARY_USAGE_CODES: ReadonlySet<string> = new Set(['EREQINPROG', 'ENOCONN', 'EARGS', 'EINJECT']);
@@ -289,6 +333,28 @@ export async function openSqlVerifier(): Promise<SqlVerifier> {
       );
       const row = result.recordset.at(0);
       return row === undefined ? null : Object.freeze({ ...row });
+    },
+
+    async canReadTableActivity(form: SeededForm): Promise<boolean> {
+      assertSeededForm(form);
+      const result = await driverCall(VERIFIER_PART, `reading the permission to see the activity of ${form}`, () =>
+        pool
+          .request()
+          .input(TABLE_PARAMETER, sql.NVarChar(SECURABLE_NAME_LENGTH), quoteTable(form))
+          .query<{ granted: number }>(TABLE_ACTIVITY_PERMISSION_STATEMENT),
+      );
+      return result.recordset.at(0)?.granted === 1;
+    },
+
+    async tableActivity(form: SeededForm): Promise<string> {
+      assertSeededForm(form);
+      const result = await driverCall(VERIFIER_PART, `reading the activity of ${form}`, () =>
+        pool
+          .request()
+          .input(TABLE_PARAMETER, sql.NVarChar(SECURABLE_NAME_LENGTH), quoteTable(form))
+          .query<{ activity: string | null }>(TABLE_ACTIVITY_STATEMENT),
+      );
+      return result.recordset.at(0)?.activity ?? '';
     },
 
     close(): Promise<void> {

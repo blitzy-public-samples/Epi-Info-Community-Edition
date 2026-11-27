@@ -6,7 +6,7 @@
 import { useCallback, useEffect, useId, useRef, useState } from 'react';
 
 import { apiClient, type ApiClient } from '../api/client';
-import { describeError, isAbortError, networkError, type ApiError } from '../api/errors';
+import { describeError, isAbortError, isConnectionFailure, networkError, type ApiError } from '../api/errors';
 import type { FormSummary } from '../api/types';
 import { ConnectionError } from './ConnectionError';
 
@@ -150,7 +150,7 @@ function FormsListBody({ state, onOpen, onRetry }: FormsListBodyProps) {
 }
 
 function LoadFailure({ error, onRetry }: { error: ApiError; onRetry: () => void }) {
-  if (error.kind === 'unavailable' || error.kind === 'network') {
+  if (isConnectionFailure(error)) {
     return <ConnectionError error={error} method="GET" onRetry={onRetry} />;
   }
 

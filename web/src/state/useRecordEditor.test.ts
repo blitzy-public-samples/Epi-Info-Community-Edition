@@ -6,9 +6,12 @@
 // - Leaving a dirty record saves it first; a failed save, a 404 included, cancels the
 //   move and keeps the draft, and Discard edits alone replaces it (0.3.6, 0.3.4.2).
 // - The write-outcome table of 0.3.4.2: Retry resends a POST or PUT only on
-//   `notWritten`; `unknown`, `written`, a missing or unrecognised outcome and no
-//   response offer Save again only, for a create and an update alike. A DELETE is
-//   always safe to resend.
+//   `notWritten` from the API's WriteProblemDetails, a 500 or 503 served as
+//   `application/problem+json` with every member its schema requires, received as the
+//   direct reply to that write; `unknown`, `written`, a missing or unrecognised outcome, a
+//   `notWritten` in any other response, one reached through a redirect included, and no
+//   response offer Save again only, for a create and an update alike. A DELETE is always
+//   safe to resend. A reply to a call that writes no record states no write outcome.
 // - A write is acknowledged only by its contracted status (201 for POST, 200 for PUT)
 //   with its complete Record DTO; any other 2xx offers Save again only, as no response does.
 //   A DELETE is acknowledged by its bodyless 204 alone; any other 2xx offers Retry.
@@ -17,10 +20,12 @@
 // - C-6: Delete asks first; Cancel sends nothing, Confirm sends exactly one DELETE.
 // - P2 permissions (0.2.4): a save the definition's flags deny sends no request; a known
 //   denial or a 403 keeps the draft and offers Discard edits, which reverts it in place.
-// - Exact numbers: the client reads a field value that is an integer beyond
-//   ±Number.MAX_SAFE_INTEGER, which a `bigint` column admits, as its bigint and saves it
-//   digit for digit, and reads every other number, such as a `tabIndex`, `uniqueKey` or
-//   `count`, and every other JSON body, as JSON.parse does. A `values` map is written as a
+// - Exact numbers: a field value keeps what a double would lose. An integer beyond
+//   ±Number.MAX_SAFE_INTEGER that a `bigint` column admits is its bigint, saved digit for
+//   digit; a number that is not whole although its nearest double is, such as
+//   9007199254740992.5 or 2.0000000000000001, typed or read, is an ExactDecimal, saved as its
+//   JSON number token. Everything else, every other number included, such as a `tabIndex`,
+//   `uniqueKey` or `count`, is read as JSON.parse reads it. A `values` map is written as a
 //   map whatever its fields are named, `kind` and `literal` included. Client feedback compares a
 //   number with its bounds only where the server compares alike on every column, and
 //   leaves the rest to its 400.
@@ -41,6 +46,7 @@ import type {
   FormDefinition,
   RecordDto,
   Values,
+  WriteOutcome,
 } from '../api/types';
 import {
   allFields,
@@ -328,6 +334,8 @@ interface ProblemExtra {
   readonly writeOutcome?: string;
   /** The failed request's trace id; TRACE_ID when absent. */
   readonly traceId?: string;
+  /** The response's Content-Type; `application/problem+json`, as the API serves it, when absent. */
+  readonly contentType?: string;
 }
 
 /** A ProblemDetails response, with a field-level `errors` map or a `writeOutcome` when given. */
@@ -343,7 +351,7 @@ function problem(status: ProblemStatus, extra: ProblemExtra = {}): Response {
   };
   return new Response(JSON.stringify(body), {
     status,
-    headers: { 'content-type': 'application/problem+json' },
+    headers: { 'content-type': extra.contentType ?? 'application/problem+json' },
   });
 }
 
@@ -1614,22 +1622,110 @@ function mountDirtyDraft(method: RecordWriteMethod, deadlineMs?: number): DirtyD
   };
 }
 
-/** notWritten, the one outcome Retry resends; the banner follows the status, and both say the draft is kept. */
-const NOT_WRITTEN_CASES = RECORD_WRITE_METHODS.flatMap((method) => [
-  // The generic error banner; its trace id is the banner's own.
-  { method, status: 500 as const, kind: 'server', says: errorMessages.serverWithDraft },
-  // The connection banner.
-  { method, status: 503 as const, kind: 'unavailable', says: errorMessages.unavailable },
-]);
+/** The Content-Type values the API's WriteProblemDetails is recognised by; a parameter is ignored. */
+const WRITE_PROBLEM_CONTENT_TYPES = ['application/problem+json', 'application/problem+json; charset=utf-8'] as const;
 
-/** The 500 and 503 bodies that do not prove the save was not applied. */
-const UNPROVEN_OUTCOMES: readonly { readonly name: string; readonly extra: ProblemExtra }[] = [
-  { name: 'writeOutcome unknown', extra: { writeOutcome: 'unknown' } },
-  { name: 'writeOutcome written', extra: { writeOutcome: 'written' } },
-  { name: 'no writeOutcome', extra: {} },
+/** notWritten, the one outcome Retry resends; the banner follows the status, and both say the draft is kept. */
+const NOT_WRITTEN_CASES = RECORD_WRITE_METHODS.flatMap((method) =>
+  WRITE_PROBLEM_CONTENT_TYPES.flatMap((contentType) => [
+    // The generic error banner; its trace id is the banner's own.
+    { method, contentType, status: 500 as const, kind: 'server', says: errorMessages.serverWithDraft },
+    // The connection banner.
+    { method, contentType, status: 503 as const, kind: 'unavailable', says: errorMessages.unavailable },
+  ]),
+);
+
+/** The 500 and 503 bodies that do not prove the save was not applied, and the outcome each parses as. */
+const UNPROVEN_OUTCOMES: readonly {
+  readonly name: string;
+  readonly extra: ProblemExtra;
+  readonly outcome: WriteOutcome | null;
+}[] = [
+  { name: 'writeOutcome unknown', extra: { writeOutcome: 'unknown' }, outcome: 'unknown' },
+  { name: 'writeOutcome written', extra: { writeOutcome: 'written' }, outcome: 'written' },
+  { name: 'no writeOutcome', extra: {}, outcome: null },
   // A value outside the contract, such as a newer server's, proves nothing either.
-  { name: 'an unrecognised outcome', extra: { writeOutcome: 'partiallyWritten' } },
+  { name: 'an unrecognised outcome', extra: { writeOutcome: 'partiallyWritten' }, outcome: null },
 ];
+
+/**
+ * Responses whose JSON body says `notWritten` but that are not the API's WriteProblemDetails
+ * (a 500 or 503 served as `application/problem+json`, a ProblemDetails of that status with
+ * every member the schema requires) received as the direct reply to the save, so they prove
+ * nothing: the save may have been applied.
+ */
+const UNTRUSTED_NOT_WRITTEN: readonly {
+  readonly name: string;
+  readonly status: 500 | 502 | 503 | 504;
+  readonly contentType: string;
+  /** Laid over the conforming body; an `undefined` member is left out. */
+  readonly members: Readonly<Record<string, unknown>>;
+  readonly traceId: string | null;
+  /** The response arrived through a redirect that fetch followed. */
+  readonly redirected?: true;
+}[] = [
+  // An intermediary's answer, such as the development proxy's, when the API did not answer.
+  { name: "an intermediary's 502", status: 502, contentType: 'application/problem+json', members: {}, traceId: TRACE_ID },
+  { name: "an intermediary's 504", status: 504, contentType: 'application/problem+json', members: {}, traceId: TRACE_ID },
+  { name: 'a 500 served as application/json', status: 500, contentType: 'application/json', members: {}, traceId: TRACE_ID },
+  {
+    name: 'a 503 whose body status is 500',
+    status: 503,
+    contentType: 'application/problem+json',
+    members: { status: 500 },
+    traceId: TRACE_ID,
+  },
+  {
+    name: 'a 503 without traceId',
+    status: 503,
+    contentType: 'application/problem+json',
+    members: { traceId: undefined },
+    traceId: null,
+  },
+  {
+    name: 'a 503 without type',
+    status: 503,
+    contentType: 'application/problem+json',
+    members: { type: undefined },
+    traceId: TRACE_ID,
+  },
+  {
+    name: 'a 503 without detail',
+    status: 503,
+    contentType: 'application/problem+json',
+    members: { detail: undefined },
+    traceId: TRACE_ID,
+  },
+  // A conforming body that answers the request a redirect led to, not the save.
+  ...OUTCOME_STATUSES.map((status) => ({
+    name: `a redirected ${String(status)}`,
+    status,
+    contentType: 'application/problem+json',
+    members: {},
+    traceId: TRACE_ID,
+    redirected: true as const,
+  })),
+];
+
+/** A `status` response served as `contentType` whose body is a notWritten write problem with `members` laid over it. */
+function notWrittenAnswer(status: number, contentType: string, members: Readonly<Record<string, unknown>>): Response {
+  const body = {
+    type: 'about:blank',
+    title: 'A fixed title.',
+    status,
+    detail: 'A fixed server sentence.',
+    traceId: TRACE_ID,
+    writeOutcome: 'notWritten',
+    ...members,
+  };
+  return new Response(JSON.stringify(body), { status, headers: { 'content-type': contentType } });
+}
+
+/** `response` as fetch returns one it reached by following a redirect. */
+function redirectedResponse(response: Response): Response {
+  Object.defineProperty(response, 'redirected', { value: true });
+  return response;
+}
 
 interface UnsafeCase {
   readonly method: RecordWriteMethod;
@@ -1640,20 +1736,39 @@ interface UnsafeCase {
   readonly traceId: string | null;
   /** What failed, which the banner names first. */
   readonly cause: string;
+  /** The write outcome the failure is parsed as; never `notWritten`. */
+  readonly outcome: WriteOutcome | null;
 }
 
-/** Every failed save that Retry must not resend: each unproven 500 and 503, and no response. */
+/**
+ * Every failed save that Retry must not resend: each unproven 500 and 503, each untrusted
+ * notWritten, and no response.
+ */
 const UNSAFE_CASES: readonly UnsafeCase[] = RECORD_WRITE_METHODS.flatMap((method): UnsafeCase[] => [
   ...OUTCOME_STATUSES.flatMap((status) =>
     UNPROVEN_OUTCOMES.map(
-      ({ name, extra }): UnsafeCase => ({
+      ({ name, extra, outcome }): UnsafeCase => ({
         method,
         failure: `a ${String(status)} with ${name}`,
         reply: () => problem(status, extra),
         traceId: TRACE_ID,
         cause: status === 500 ? errorMessages.server : errorMessages.unavailableWithoutDraft,
+        outcome,
       }),
     ),
+  ),
+  ...UNTRUSTED_NOT_WRITTEN.map(
+    ({ name, status, contentType, members, traceId, redirected }): UnsafeCase => ({
+      method,
+      failure: `${name} saying notWritten`,
+      reply: () => {
+        const answer = notWrittenAnswer(status, contentType, members);
+        return redirected === true ? redirectedResponse(answer) : answer;
+      },
+      traceId,
+      cause: status === 500 ? errorMessages.server : errorMessages.unavailableWithoutDraft,
+      outcome: null,
+    }),
   ),
   {
     method,
@@ -1661,18 +1776,20 @@ const UNSAFE_CASES: readonly UnsafeCase[] = RECORD_WRITE_METHODS.flatMap((method
     reply: () => networkFailure,
     traceId: null,
     cause: errorMessages.networkWithoutDraft,
+    outcome: null,
   },
 ]);
 
 describe('write outcomes and Retry (0.3.4.2)', () => {
-  it.each(NOT_WRITTEN_CASES)('retries a $method that a $status reports notWritten', async (row) => {
+  it.each(NOT_WRITTEN_CASES)('retries a $method that a $status served as $contentType reports notWritten', async (row) => {
     const draft = mountDirtyDraft(row.method);
     const { api, result, onSaved } = draft;
-    api.reply(problem(row.status, { writeOutcome: 'notWritten' }));
+    api.reply(problem(row.status, { writeOutcome: 'notWritten', contentType: row.contentType }));
 
     expect(await perform(() => result.current.save())).toBe(false);
 
     const banner = bannerOf(result.current);
+    expect(banner.error.writeOutcome).toBe('notWritten');
     expect(banner.kind).toBe(row.kind);
     expect(banner.method).toBe(row.method);
     expect(banner.actions).toEqual(['retry']);
@@ -1692,7 +1809,7 @@ describe('write outcomes and Retry (0.3.4.2)', () => {
     expect(result.current.banner).toBeNull();
   });
 
-  it.each(UNSAFE_CASES)('offers only Save again on a $method after $failure', async ({ method, reply, traceId, cause }) => {
+  it.each(UNSAFE_CASES)('offers only Save again on a $method after $failure', async ({ method, reply, traceId, cause, outcome }) => {
     const draft = mountDirtyDraft(method);
     const { api, result, onSaved } = draft;
     api.reply(reply());
@@ -1700,6 +1817,8 @@ describe('write outcomes and Retry (0.3.4.2)', () => {
     expect(await perform(() => result.current.save())).toBe(false);
 
     const banner = bannerOf(result.current);
+    expect(banner.error.writeOutcome).toBe(outcome);
+    expect(isSafeToResend(banner.error, method)).toBe(false);
     expect(banner.kind).toBe('uncertainWrite');
     expect(banner.method).toBe(method);
     expect(banner.isCreate).toBe(method === 'POST');
@@ -1765,6 +1884,61 @@ describe('write outcomes and Retry (0.3.4.2)', () => {
     expect(onDeleted).toHaveBeenCalledTimes(1);
     expect(result.current.banner).toBeNull();
   });
+
+  // Only the direct reply to a record create, update or delete is a WriteProblemDetails
+  // (0.3.4.1): the same conforming notWritten reply to any other call, or reached through a
+  // redirect, states no write outcome. Keyed by every member of ApiClient, so an operation
+  // the client gains fails tsc until it is listed.
+  const OUTCOME_OF_DIRECT_REPLY: Readonly<
+    Record<
+      keyof ApiClient,
+      { readonly call: (client: ApiClient) => Promise<ApiResult<unknown>>; readonly outcome: WriteOutcome | null }
+    >
+  > = {
+    listForms: { call: (client) => client.listForms(), outcome: null },
+    getForm: { call: (client) => client.getForm(VIEW_ID), outcome: null },
+    listRecords: { call: (client) => client.listRecords(VIEW_ID), outcome: null },
+    countRecords: { call: (client) => client.countRecords(VIEW_ID), outcome: null },
+    getRecordAt: { call: (client) => client.getRecordAt(VIEW_ID, 1), outcome: null },
+    getRecord: { call: (client) => client.getRecord(VIEW_ID, NEW_RECORD_ID), outcome: null },
+    getRecordPosition: { call: (client) => client.getRecordPosition(VIEW_ID, NEW_RECORD_ID), outcome: null },
+    createRecord: { call: (client) => client.createRecord(VIEW_ID, { [TEXT]: 'Smith' }), outcome: 'notWritten' },
+    updateRecord: {
+      call: (client) => client.updateRecord(VIEW_ID, NEW_RECORD_ID, { [TEXT]: 'Jones' }),
+      outcome: 'notWritten',
+    },
+    deleteRecord: { call: (client) => client.deleteRecord(VIEW_ID, NEW_RECORD_ID), outcome: 'notWritten' },
+    searchRecords: { call: (client) => client.searchRecords(VIEW_ID, { criteria: [] }), outcome: null },
+    raiseFieldEvent: {
+      call: (client) => client.raiseFieldEvent(VIEW_ID, { event: 'FieldAfter', fieldName: TEXT, values: {} }),
+      outcome: null,
+    },
+    getHealth: { call: (client) => client.getHealth(), outcome: null },
+  };
+
+  it.each(
+    Object.entries(OUTCOME_OF_DIRECT_REPLY).flatMap(([name, { call, outcome }]) =>
+      OUTCOME_STATUSES.flatMap((status) => [
+        { name, call, status, via: 'directly', redirected: false, outcome },
+        // A reply that would state an outcome directly states none through a redirect.
+        ...(outcome === null ? [] : [{ name, call, status, via: 'through a redirect', redirected: true, outcome: null }]),
+      ]),
+    ),
+  )(
+    'reads writeOutcome $outcome from a conforming $status notWritten answering $name $via',
+    async ({ call, status, redirected, outcome }) => {
+      const api = createFakeApi();
+      // The raiseFieldEvent row sends the one field event itself.
+      apisRaisingEvents.add(api);
+      const answer = problem(status, { writeOutcome: 'notWritten' });
+      api.reply(redirected ? redirectedResponse(answer) : answer);
+
+      const result = await call(createApiClient({ baseUrl: 'http://localhost', fetch: api.fetch }));
+
+      expect(api.calls).toHaveLength(1);
+      expect(result.ok ? null : result.error).toMatchObject({ status, traceId: TRACE_ID, writeOutcome: outcome });
+    },
+  );
 });
 
 // The client's request deadline: a request whose whole response has not arrived by then is

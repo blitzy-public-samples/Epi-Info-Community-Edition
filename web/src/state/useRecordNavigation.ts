@@ -383,9 +383,6 @@ interface SetView {
   readonly fresh: boolean;
 }
 
-/** RecStatus of an active record; the active set is RecStatus = 1 (C-16). */
-const ACTIVE_STATUS = 1;
-
 /** The 1-based position nearest to `anchor` in a set of `count` records. */
 function nearest(anchor: number, count: number): number {
   return Math.min(Math.max(anchor, 1), count);
@@ -471,6 +468,11 @@ function createController(host: ControllerHost): Controller {
    * conflict cannot trust a position that still places the open record in that set.
    */
   let conflicts = 0;
+  /**
+   * +1 on every afterSave. A toggle whose leave or reads overlap a save reads the set
+   * again, since the save may have moved the open record into or out of it.
+   */
+  let saves = 0;
 
   const api = (): ApiClient => host.options().client;
   const viewId = (): number => host.options().viewId;
@@ -998,21 +1000,17 @@ function createController(host: ControllerHost): Controller {
         return;
       }
 
-      // Switching to the active set while a deleted record is open leaves that record.
-      let left = !value && record.recStatus !== ACTIVE_STATUS;
-      if (left) {
-        claimTransition(token);
-        if (!(await leave(token))) {
-          return;
-        }
-      }
+      // The record is left only once the position endpoint places it outside the selected
+      // set, the server's answer to whether the toggle hides it.
+      let left = false;
       host.update({ goToError: null, notice: null });
       const anchor = before.n ?? 1;
       const run = async (): Promise<boolean> => {
         // Results apply only on success, so includeDeleted is still the old value when
-        // Retry repeats the whole toggle, with its leave where the record must be left.
+        // Retry repeats the whole toggle, whose reads again decide whether the record is left.
         const load = begin(() => setIncludeDeleted(value));
         const conflictsBefore = conflicts;
+        const savesBefore = saves;
         const results = await settleAll(load, [
           readCount(load, value),
           readPosition(load, record.globalRecordId, value),
@@ -1061,15 +1059,20 @@ function createController(host: ControllerHost): Controller {
           return true;
         }
         if (!left) {
-          // Deleted elsewhere since it was opened: leave it like any other transition, then
-          // read the set again, since the save may have run its own refresh.
+          // Outside the selected set: the nearest record replaces it, so it is left like any
+          // other transition, its draft drained and saved.
           host.update({ loading: false });
           claimTransition(token);
           if (!(await leave(token))) {
             return false;
           }
           left = true;
-          return run();
+          if (saves !== savesBefore || conflicts !== conflictsBefore) {
+            // A save or a conflict since these reads were sent may have moved the record, so
+            // the set is read again.
+            return run();
+          }
+          host.update({ loading: true });
         }
         // The deleted record is hidden now: the nearest active record, or New, replaces it, with the notice.
         return openOrNew(load, nearest(anchor, set.count), set, false, DELETED_HIDDEN_TEXT);
@@ -1081,6 +1084,7 @@ function createController(host: ControllerHost): Controller {
   }
 
   function afterSave(record: RecordDto): void {
+    saves += 1;
     const before = host.state();
     countStale = true;
     // The same on-screen record, so the generation stays and the editor keeps its state.

@@ -20,7 +20,7 @@ import {
 } from 'react';
 
 import { apiClient, type ApiClient } from '../api/client';
-import { describeError, isAbortError, networkError, type ApiError } from '../api/errors';
+import { describeError, isAbortError, isConnectionFailure, networkError, type ApiError } from '../api/errors';
 import type { DialogMessage, FieldDefinition, FormDefinition, PageDefinition } from '../api/types';
 import { useRecordEditor, type BannerAction, type EditorBanner } from '../state/useRecordEditor';
 import { useRecordNavigation, type RecordNavigation } from '../state/useRecordNavigation';
@@ -123,10 +123,6 @@ function bannerKeyOf(banner: EditorBanner): number {
 /** "Trace id: …" when the message does not already end with it, as describeError's 500 text does. */
 function traceLineOf(message: string, traceId: string | null): string | null {
   return traceId !== null && !message.includes(traceId) ? `Trace id: ${traceId}` : null;
-}
-
-function isConnectionFailure(error: ApiError): boolean {
-  return error.kind === 'unavailable' || error.kind === 'network';
 }
 
 /**

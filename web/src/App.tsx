@@ -22,7 +22,7 @@
 import { useCallback, useEffect, useRef, useState, type FocusEvent, type ReactNode } from 'react';
 
 import { apiClient, type ApiClient, type ApiResult } from './api/client';
-import { describeError, networkError, parseProblem, type ApiError } from './api/errors';
+import { describeError, isConnectionFailure, networkError, type ApiError } from './api/errors';
 import type { FormSummary } from './api/types';
 import { ConnectionError } from './components/ConnectionError';
 import { FormView } from './components/FormView';
@@ -93,27 +93,6 @@ function readUrlSwitches(search: string): UrlSwitches | null {
     record !== null && POSITION_PATTERN.test(record) ? Math.min(Number(record), MAX_POSITION) : undefined;
   const deleted = DELETED_ON.has(params.get(DELETED_PARAM)?.trim().toLowerCase() ?? '');
   return { view, record: position, recordText: record ?? undefined, deleted };
-}
-
-/**
- * Whether an OK body holds what the lookup reads: a list whose every entry has an integer
- * `viewId` and a string `name`. The client accepts any JSON as a success, so the body is
- * checked as `unknown` before findForm reads it.
- */
-function isFormList(value: unknown): value is readonly Pick<FormSummary, 'viewId' | 'name'>[] {
-  if (!Array.isArray(value)) {
-    return false;
-  }
-  const items: readonly unknown[] = value;
-  return items.every(
-    (item) =>
-      typeof item === 'object' &&
-      item !== null &&
-      'viewId' in item &&
-      Number.isInteger(item.viewId) &&
-      'name' in item &&
-      typeof item.name === 'string',
-  );
 }
 
 /** The form whose name is `view`: the exact spelling first, then ignoring case. */
@@ -200,7 +179,7 @@ interface LookupFailureProps {
 /** The URL's form could not be looked up: the request is kept, so Retry repeats the open. */
 function LookupFailure({ view, error, onRetry, onShowList }: LookupFailureProps) {
   let banner: ReactNode;
-  if (error.kind === 'unavailable' || error.kind === 'network') {
+  if (isConnectionFailure(error)) {
     banner = <ConnectionError error={error} method="GET" onRetry={onRetry} />;
   } else {
     const message = describeError(error);
@@ -304,14 +283,8 @@ export default function App({ client = apiClient }: AppProps) {
       }
       if (!result.ok) {
         // Whether the form exists is still unknown: the request and its URL stay for Retry.
+        // The client settles an OK answer that is not a forms list as this failure too.
         setLookupFailure(result.error);
-        return;
-      }
-      if (!isFormList(result.data)) {
-        // An OK answer that is not a forms list proves nothing either. The shared parser
-        // makes it the unexpected failure it makes of an OK answer without a body, and the
-        // request and its URL stay for Retry.
-        setLookupFailure(parseProblem(result.status, undefined));
         return;
       }
       setSwitches(null);

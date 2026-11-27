@@ -7,12 +7,15 @@
  * through without touching a field, so no save can reach them, and its last step leaves a FoodHistory draft unsaved.
  * The exclusive test lock is held for the whole workflow, so no .NET integration test writes while it counts and places
  * records, and the positions it expects come from SQL counts at run time. Before it waits for that lock, it checks,
- * without a database, that `support/connection.ts` reads connection settings as SqlClient does.
+ * without a database, that `support/connection.ts` reads connection settings as SqlClient does. With E2E_BASE_URL
+ * naming an API it did not start, it writes nothing until that API's counts equal the SQL counts and SQL Server shows
+ * that API's write path reaching the CaseReport base table of the database it verifies; until then it sends that API
+ * requests only through Node's fetch, which the trace does not record.
  *
  * Locators use roles, accessible names and labels as `web/src` renders them. A name is matched exactly wherever it
  * is a prefix of another ("Save" and "Save again", "Delete" and "Delete record", "New" and "New record").
  */
-import { randomUUID } from 'node:crypto';
+import { randomInt, randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
@@ -73,7 +76,17 @@ const RECORD_AT_PATH = /^\/api\/forms\/\d+\/records\/at\/\d+$/;
 const SEARCH_PATH = /^\/api\/forms\/\d+\/records\/search$/;
 const FIELD_EVENT_PATH_SUFFIX = '/checkcode/field-event';
 
+// The rounds of the external API's binding probe: in a request round the API is sent one update of a record id no
+// record holds, in a pause round nothing. The CaseReport base table's activity must change in every request round and
+// in no pause round.
+const BINDING_REQUEST_ROUNDS = 6;
+const BINDING_PAUSE_ROUNDS = 6;
+
+// The limit on each request of the external API's untraced preflight, from sending it to the last byte of its answer.
+const PREFLIGHT_TIMEOUT_MS = 30_000;
+
 type ActionName = 'Back to forms' | 'Save' | 'Delete' | 'Find';
+type BindingRound = 'request' | 'pause';
 type NavigatorButtonName = 'First' | 'Previous' | 'Next' | 'Last' | 'New';
 
 /** A form as `GET /api/forms` lists it. */
@@ -82,6 +95,15 @@ interface FormSummary {
   readonly name: string;
   readonly pageCount: number;
 }
+
+/** A response's status and its body parsed as JSON, whichever transport carried it. */
+interface JsonResponse {
+  readonly status: number;
+  body(): Promise<unknown>;
+}
+
+/** Sends `GET` of a root-relative path to the API under test. */
+type JsonGet = (path: string) => Promise<JsonResponse>;
 
 /** A request the page sent: its method and path, never its query string. */
 interface SentRequest {
@@ -218,11 +240,68 @@ function toFormSummary(value: unknown): FormSummary | null {
   return isCount(viewId) && typeof name === 'string' && isCount(pageCount) ? { viewId, name, pageCount } : null;
 }
 
+/** {@link JsonGet} through Playwright's request context, whose requests and responses the trace records. */
+function tracedGet(request: APIRequestContext): JsonGet {
+  return async (path) => {
+    const response = await request.get(path);
+    return {
+      status: response.status(),
+      body: async () => {
+        const body: unknown = await response.json();
+        return body;
+      },
+    };
+  };
+}
+
+/**
+ * Sends one request of the external API's preflight through Node's own fetch, which Playwright's tracing does not
+ * record, and reads its whole answer within {@link PREFLIGHT_TIMEOUT_MS}. A redirect is refused, so the request reaches
+ * E2E_BASE_URL only. `label` names the request in failure messages, which are fixed text: the driver's error, which
+ * can name the host, and a body that is not JSON, which may be anything, are never repeated.
+ */
+async function untracedRequest(
+  baseURL: string,
+  method: 'GET' | 'PUT',
+  path: string,
+  label: string,
+  json?: unknown,
+): Promise<JsonResponse> {
+  let status: number;
+  let text: string;
+  try {
+    const response = await fetch(new URL(path, baseURL), {
+      method,
+      redirect: 'error',
+      signal: AbortSignal.timeout(PREFLIGHT_TIMEOUT_MS),
+      ...(json === undefined ? {} : { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(json) }),
+    });
+    status = response.status;
+    text = await response.text();
+  } catch {
+    throw new Error(
+      `${label} to the API at E2E_BASE_URL got no whole answer: the request failed, was redirected or took longer ` +
+        `than ${PREFLIGHT_TIMEOUT_MS / 1000} s.`,
+    );
+  }
+  return {
+    status,
+    body: () => {
+      try {
+        const body: unknown = JSON.parse(text);
+        return Promise.resolve(body);
+      } catch {
+        return Promise.reject(new Error(`The answer to ${label} from the API at E2E_BASE_URL is not JSON.`));
+      }
+    },
+  };
+}
+
 /** `GET /api/forms`, validated. */
-async function readForms(request: APIRequestContext): Promise<FormSummary[]> {
-  const response = await request.get('/api/forms');
-  expect(response.status(), 'GET /api/forms').toBe(200);
-  const body: unknown = await response.json();
+async function readForms(get: JsonGet): Promise<FormSummary[]> {
+  const response = await get('/api/forms');
+  expect(response.status, 'GET /api/forms').toBe(200);
+  const body = await response.body();
   if (!isArray(body)) {
     throw new Error('GET /api/forms did not return a JSON array.');
   }
@@ -246,11 +325,11 @@ function formNamed(forms: readonly FormSummary[], name: SeededForm): FormSummary
 }
 
 /** `GET /api/forms/{viewId}/records/count` over the active set, or every record with `includeDeleted`. */
-async function apiCount(request: APIRequestContext, viewId: number, includeDeleted: boolean): Promise<number> {
+async function apiCount(get: JsonGet, viewId: number, includeDeleted: boolean): Promise<number> {
   const path = `/api/forms/${viewId}/records/count${includeDeleted ? '?includeDeleted=true' : ''}`;
-  const response = await request.get(path);
-  expect(response.status(), `GET ${path}`).toBe(200);
-  const body: unknown = await response.json();
+  const response = await get(path);
+  expect(response.status, `GET ${path}`).toBe(200);
+  const body = await response.body();
   const count = isObject(body) ? body.count : undefined;
   if (!isCount(count)) {
     throw new Error(`GET ${path} did not return {count} as a non-negative integer.`);
@@ -373,16 +452,85 @@ async function backToForms(page: Page): Promise<void> {
   }
 }
 
+/** `items` in an order drawn with node:crypto's randomInt by a Fisher–Yates shuffle. */
+function shuffled<T>(items: readonly T[]): T[] {
+  const order = [...items];
+  for (let index = order.length - 1; index > 0; index -= 1) {
+    const other = randomInt(index + 1);
+    [order[index], order[other]] = [order[other], order[index]];
+  }
+  return order;
+}
+
 /**
- * With E2E_BASE_URL naming an API this run did not start, its counts must equal the SQL counts of the database the
- * settings name, before anything is written; otherwise every SQL check would read another database.
+ * Sends the API at E2E_BASE_URL, untraced, an update of the CaseReport record `randomUUID()` names, which no record
+ * holds, and requires its 404. The update runs the API's write path: its write transaction takes the form's write
+ * lock and runs the locked read of the base row, which finds no row, so it answers 404 and writes nothing in any
+ * database. It edits no record, through the UI or otherwise. A create itself cannot be probed without writing a row,
+ * and the API serves creates and updates from one store over one connection string.
  */
-async function checkExternalApiDatabase(request: APIRequestContext, db: SqlVerifier): Promise<void> {
-  const forms = await readForms(request);
+async function updateMissingRecord(baseURL: string, viewId: number): Promise<void> {
+  const label = 'PUT of a CaseReport record id no record holds';
+  const response = await untracedRequest(baseURL, 'PUT', `/api/forms/${viewId}/records/${randomUUID()}`, label, {
+    values: { City: CITY_TEXT },
+  });
+  if (response.status !== 404) {
+    throw new Error(
+      `The API at E2E_BASE_URL answered ${response.status} to a ${label}, where 404 shows that its write path ` +
+        'found no such record and wrote nothing.',
+    );
+  }
+}
+
+/**
+ * Whether SQL Server shows the write path of the API at E2E_BASE_URL reaching the CaseReport base table of the
+ * database `db` reads: the table's activity ({@link SqlVerifier.tableActivity}) must change in every round in which
+ * the API is sent an update of a missing record ({@link updateMissingRecord}), and in no round in which nothing is
+ * sent. The pause rounds show that nothing else changes the table meanwhile, the verifier's own reads included, and
+ * the random order, drawn by node:crypto, keeps a client that touches the table on a schedule of its own from matching
+ * the request rounds. Both kinds of round span only the time between their two readings, so no fixed wait is needed.
+ * Through SQL it only reads.
+ */
+async function apiWritesReachDatabase(baseURL: string, db: SqlVerifier, viewId: number): Promise<boolean> {
+  const rounds = shuffled<BindingRound>([
+    ...Array.from({ length: BINDING_REQUEST_ROUNDS }, (): BindingRound => 'request'),
+    ...Array.from({ length: BINDING_PAUSE_ROUNDS }, (): BindingRound => 'pause'),
+  ]);
+  for (const round of rounds) {
+    const before = await db.tableActivity('CaseReport');
+    if (round === 'request') {
+      await updateMissingRecord(baseURL, viewId);
+    }
+    const changed = (await db.tableActivity('CaseReport')) !== before;
+    if (changed !== (round === 'request')) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * With E2E_BASE_URL naming an API this run did not start, proves before anything is written that the API uses the
+ * database the settings name. Otherwise every SQL check would read another database, and the create would commit
+ * outside the database whose test lock this run holds.
+ *
+ * The API's counts must first equal the SQL counts. Equal counts cannot tell two fresh rehearsal databases apart,
+ * so SQL Server must then also show the API's write path reaching that database's CaseReport base table
+ * ({@link apiWritesReachDatabase}), which needs a login with `CONTROL` on that table or `VIEW DATABASE STATE`.
+ * Every request until then goes through {@link untracedRequest} to `baseURL`, the E2E_BASE_URL the configuration
+ * checked, so a retained trace holds data of the verified rehearsal database only. Every failure message is fixed
+ * text that names no host or setting value.
+ */
+async function checkExternalApiDatabase(baseURL: string | undefined, db: SqlVerifier): Promise<void> {
+  if (baseURL === undefined) {
+    throw new Error('playwright.config.ts set no baseURL, so the API at E2E_BASE_URL cannot be checked.');
+  }
+  const get: JsonGet = (path) => untracedRequest(baseURL, 'GET', path, `GET ${path}`);
+  const forms = await readForms(get);
   for (const form of SEEDED_FORMS) {
     const { viewId } = formNamed(forms, form);
     for (const includeDeleted of [false, true]) {
-      const fromApi = await apiCount(request, viewId, includeDeleted);
+      const fromApi = await apiCount(get, viewId, includeDeleted);
       const fromSql = await db.countRecords(form, includeDeleted);
       const set = includeDeleted ? 'all records' : 'active records';
       expect(
@@ -393,6 +541,21 @@ async function checkExternalApiDatabase(request: APIRequestContext, db: SqlVerif
       ).toBe(fromSql);
     }
   }
+
+  // Without CONTROL on the table or VIEW DATABASE STATE the table's activity cannot be read, so the probe could
+  // never pass; the run fails closed with what it needs instead.
+  expect(
+    await db.canReadTableActivity('CaseReport'),
+    'Proving that the API at E2E_BASE_URL uses the rehearsal database needs a SQL login that can read the activity ' +
+      'of the CaseReport base table (CONTROL on it, or VIEW DATABASE STATE), such as sa, in ' +
+      `${CONNECTION_STRING_VARIABLE}, or ${SQL_HOST_VARIABLE} and ${PASSWORD_VARIABLE}.`,
+  ).toBe(true);
+  expect(
+    await apiWritesReachDatabase(baseURL, db, formNamed(forms, 'CaseReport').viewId),
+    'SQL Server shows the write path of the API at E2E_BASE_URL not reaching the CaseReport table of the rehearsal ' +
+      `database that ${CONNECTION_STRING_VARIABLE}, or ${SQL_HOST_VARIABLE} and ${PASSWORD_VARIABLE}, name, so ` +
+      'that API is not using it.',
+  ).toBe(true);
 }
 
 /** SC-1 over HTTP: the API is healthy and lists both seeded forms with their page counts. */
@@ -402,7 +565,7 @@ async function checkHealthAndForms(request: APIRequestContext): Promise<void> {
   const healthBody: unknown = await health.json();
   expect(healthBody).toEqual({ status: 'healthy' });
 
-  const forms = await readForms(request);
+  const forms = await readForms(tracedGet(request));
   for (const form of SEEDED_FORMS) {
     expect(formNamed(forms, form).pageCount, `pageCount of ${form}`).toBe(SEEDED_PAGES[form].length);
   }
@@ -502,7 +665,7 @@ async function reportCleanupFailures(failures: readonly string[]): Promise<void>
   }
 }
 
-test('data entry smoke: forms, create, edit, navigate, find, delete', async ({ page, request }) => {
+test('data entry smoke: forms, create, edit, navigate, find, delete', async ({ page, request, baseURL }) => {
   // The lock may wait up to 300 s for the .NET integration tests to finish; the workflow needs the rest.
   test.setTimeout(600_000);
 
@@ -524,7 +687,7 @@ test('data entry smoke: forms, create, edit, navigate, find, delete', async ({ p
   let workflowFailure: { readonly thrown: unknown } | undefined;
   try {
     db = await openSqlVerifier();
-    await runWorkflow(page, request, db, externalApi);
+    await runWorkflow(page, request, baseURL, db, externalApi);
   } catch (thrown: unknown) {
     workflowFailure = { thrown };
   }
@@ -541,15 +704,19 @@ test('data entry smoke: forms, create, edit, navigate, find, delete', async ({ p
   }
 });
 
-/** Every step after the lock is held, in order. `db` reads the database the API writes. */
+/**
+ * Every step after the lock is held, in order. `db` reads the database the API writes. `baseURL` is the fixture's,
+ * the E2E_BASE_URL the configuration checked when `externalApi` is true.
+ */
 async function runWorkflow(
   page: Page,
   request: APIRequestContext,
+  baseURL: string | undefined,
   db: SqlVerifier,
   externalApi: boolean,
 ): Promise<void> {
   if (externalApi) {
-    await test.step('the external API uses the rehearsal database', () => checkExternalApiDatabase(request, db));
+    await test.step('the external API uses the rehearsal database', () => checkExternalApiDatabase(baseURL, db));
   }
   await test.step('health and forms over HTTP', () => checkHealthAndForms(request));
 

@@ -961,67 +961,158 @@ describe('useRecordNavigation', () => {
   });
 
   describe('the deleted toggle with a deleted record open', () => {
-    it('switching it off leaves the record and opens at/{min(n, count)} of the active set', async () => {
+    // The open record's DTO and the server disagree once another session deletes or
+    // restores it, so only the position endpoint's answer decides whether it is left.
+    const switchedOff: readonly {
+      readonly name: string;
+      readonly outcome: string;
+      /** The record opened with deleted records shown. */
+      readonly open: Row;
+      /** Its n and N with deleted records shown. */
+      readonly opened: { readonly n: number; readonly count: number };
+      /** The opened DTO: its recStatus and its intrinsic coordinates. */
+      readonly dto: { readonly recStatus: number; readonly position: number; readonly count: number };
+      /** The open record's status on the server when the toggle switches off. */
+      readonly serverStatus: number;
+      /** The log after the toggle's two parallel reads. */
+      readonly after: readonly string[];
+      /** The record open afterwards. */
+      readonly landed: Row;
+      readonly n: number;
+      readonly count: number;
+      readonly statusText: string;
+      /** The record is replaced: a new generation, with the notice. */
+      readonly replaced: boolean;
+    }[] = [
+      {
+        name: 'the DTO and the server deleted',
+        outcome: 'left, then at/{min(n, count)}',
+        open: D,
+        opened: { n: 2, count: 4 },
+        // A deleted record's own coordinates are over every row.
+        dto: { recStatus: DELETED, position: 2, count: 4 },
+        serverStatus: DELETED,
+        after: ['beforeLeave', atRequest(2)],
+        landed: B,
+        n: 2,
+        count: 3,
+        statusText: '2 of 3',
+        replaced: true,
+      },
+      {
+        name: 'an active DTO the server deleted',
+        outcome: 'left, then at/{min(n, count)}',
+        open: B,
+        opened: { n: 3, count: 4 },
+        dto: { recStatus: ACTIVE, position: 2, count: 3 },
+        // Another session soft-deletes B after it was opened.
+        serverStatus: DELETED,
+        // Nothing was saved, so the reads in hand place the landing: the set is not read
+        // again. The active set is A, C: position min(3, 2).
+        after: ['beforeLeave', atRequest(2)],
+        landed: C,
+        n: 2,
+        count: 2,
+        statusText: '2 of 2',
+        replaced: true,
+      },
+      {
+        name: 'a deleted DTO the server restored',
+        outcome: 'stays at its active-set n, never left',
+        open: D,
+        opened: { n: 2, count: 4 },
+        dto: { recStatus: DELETED, position: 2, count: 4 },
+        // Another session restores D after it was opened; its DTO still says deleted.
+        serverStatus: ACTIVE,
+        after: [],
+        landed: D,
+        n: 2,
+        count: 4,
+        statusText: '2 of 4',
+        replaced: false,
+      },
+    ];
+
+    it.each(switchedOff)(
+      'switching it off with $name decides from the position endpoint: $outcome',
+      async ({ open, opened, dto, serverStatus, after, landed, n, count, statusText, replaced }) => {
+        const { api, result, beforeLeave } = await mount(mixedRows());
+        await perform(() => result.current.setIncludeDeleted(true));
+        await perform(() => result.current.openById(open.globalRecordId));
+        expect(result.current.n).toBe(opened.n);
+        expect(result.current.count).toBe(opened.count);
+        expect(result.current.record?.recStatus).toBe(dto.recStatus);
+        expect(result.current.record?.position).toBe(dto.position);
+        expect(result.current.record?.count).toBe(dto.count);
+        api.setStatus(open.globalRecordId, serverStatus);
+        const leaves = beforeLeave.mock.calls.length;
+        const { record, recordGeneration, listVersion } = result.current;
+        const mark = api.mark();
+
+        await perform(() => result.current.setIncludeDeleted(false));
+
+        // The reads come first: a leave, where there is one, waits for the position response.
+        const log = api.logSince(mark);
+        expect(sorted(log.slice(0, 2))).toEqual(sorted([countRequest(), positionRequest(open.globalRecordId)]));
+        expect(log.slice(2)).toEqual(after);
+        expect(beforeLeave).toHaveBeenCalledTimes(leaves + (replaced ? 1 : 0));
+        expect(result.current.includeDeleted).toBe(false);
+        expect(result.current.n).toBe(n);
+        expect(result.current.count).toBe(count);
+        expect(result.current.statusText).toBe(statusText);
+        expect(result.current.record?.globalRecordId).toBe(landed.globalRecordId);
+        if (replaced) {
+          expect(result.current.recordGeneration).toBe(recordGeneration + 1);
+          expect(result.current.notice).toMatch(DELETED_HIDDEN);
+        } else {
+          // The same record stays: neither the DTO nor the generation changes.
+          expect(result.current.record).toBe(record);
+          expect(result.current.recordGeneration).toBe(recordGeneration);
+          expect(result.current.notice).toBeNull();
+        }
+        // The grid reloads for the toggle change itself, so the list version stays.
+        expect(result.current.listVersion).toBe(listVersion);
+        expect(result.current.loadError).toBeNull();
+      },
+    );
+
+    it('switching it off reads the set again when its leave saves, and keeps a record the second reads place in the active set', async () => {
       const { api, result, beforeLeave } = await mount(mixedRows());
       await perform(() => result.current.setIncludeDeleted(true));
-      await perform(() => result.current.openById(D.globalRecordId));
-      expect(result.current.n).toBe(2);
-      expect(result.current.count).toBe(4);
-      // A deleted record's own coordinates are over every row.
-      expect(result.current.record?.recStatus).toBe(DELETED);
-      expect(result.current.record?.position).toBe(2);
-      expect(result.current.record?.count).toBe(4);
+      await perform(() => result.current.openById(B.globalRecordId));
+      expect(result.current.statusText).toBe('3 of 4');
+      // Another session soft-deletes B, so the toggle's reads place it outside the active set.
+      api.setStatus(B.globalRecordId, DELETED);
+      // The leave saves the draft; B was restored elsewhere meanwhile, so the save succeeds.
+      beforeLeave.mockImplementation(() => {
+        api.note('beforeLeave');
+        api.setStatus(B.globalRecordId, ACTIVE);
+        result.current.afterSave(api.dto(B.globalRecordId));
+        return Promise.resolve(true);
+      });
       const leaves = beforeLeave.mock.calls.length;
       const { recordGeneration } = result.current;
       const mark = api.mark();
 
       await perform(() => result.current.setIncludeDeleted(false));
 
-      const requests = api.requestsSince(mark);
-      expect(sorted(requests.slice(0, 2))).toEqual(sorted([countRequest(), positionRequest(D.globalRecordId)]));
-      expect(requests.slice(2)).toEqual([atRequest(2)]);
-      expect(beforeLeave).toHaveBeenCalledTimes(leaves + 1);
-      expect(result.current.includeDeleted).toBe(false);
-      expect(result.current.n).toBe(2);
-      expect(result.current.count).toBe(3);
-      expect(result.current.record?.globalRecordId).toBe(B.globalRecordId);
-      expect(result.current.recordGeneration).toBe(recordGeneration + 1);
-      expect(result.current.notice).toMatch(DELETED_HIDDEN);
-    });
-
-    it('switching it off after another session deleted the open record leaves it, reads the set again and opens at/{min(n, count)}', async () => {
-      const { api, result, beforeLeave } = await mount(mixedRows());
-      await perform(() => result.current.setIncludeDeleted(true));
-      await perform(() => result.current.openById(B.globalRecordId));
-      expect(result.current.n).toBe(3);
-      expect(result.current.count).toBe(4);
-      // B's DTO still says active when another session soft-deletes it.
-      api.setStatus(B.globalRecordId, DELETED);
-      const leaves = beforeLeave.mock.calls.length;
-      const { recordGeneration, listVersion } = result.current;
-      const mark = api.mark();
-
-      await perform(() => result.current.setIncludeDeleted(false));
-
-      // The toggle's reads find B outside the active set, so B is left and the set read again.
+      // The save may have moved B, so the set is read again, which places B in it: nothing follows.
       const log = api.logSince(mark);
       const toggleReads = sorted([countRequest(), positionRequest(B.globalRecordId)]);
       expect(sorted(log.slice(0, 2))).toEqual(toggleReads);
       expect(log[2]).toBe('beforeLeave');
-      expect(sorted(log.slice(3, 5))).toEqual(toggleReads);
-      // The active set is A, C: position min(3, 2).
-      expect(log.slice(5)).toEqual([atRequest(2)]);
+      expect(sorted(log.slice(3))).toEqual(toggleReads);
       expect(beforeLeave).toHaveBeenCalledTimes(leaves + 1);
+      expect(result.current.record?.globalRecordId).toBe(B.globalRecordId);
+      expect(result.current.recordGeneration).toBe(recordGeneration);
       expect(result.current.includeDeleted).toBe(false);
       expect(result.current.n).toBe(2);
-      expect(result.current.count).toBe(2);
-      expect(result.current.statusText).toBe('2 of 2');
-      expect(result.current.record?.globalRecordId).toBe(C.globalRecordId);
-      expect(result.current.recordGeneration).toBe(recordGeneration + 1);
-      expect(result.current.notice).toMatch(DELETED_HIDDEN);
-      // The grid reloads for the toggle change itself, so the list version stays.
-      expect(result.current.listVersion).toBe(listVersion);
+      expect(result.current.count).toBe(3);
+      expect(result.current.statusText).toBe('2 of 3');
+      expect(result.current.notice).toBeNull();
       expect(result.current.loadError).toBeNull();
+      expect(result.current.loading).toBe(false);
+      expect(result.current.transitioning).toBe(false);
     });
 
     it('switching it off shows New when every record is deleted', async () => {

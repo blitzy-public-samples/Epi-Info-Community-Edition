@@ -1,4 +1,4 @@
-// Find record: the web counterpart of legacy Epi.Windows.Enter/Dialogs/FindRecordDialog.
+// Find record: the web counterpart of legacy Epi.Windows.Enter/Dialogs/FindRecordDialog.cs.
 // It keeps the legacy dialog's field list (every field that holds a searchable value,
 // then the GlobalRecordId and RecStatus system fields), its six-field limit and its
 // free-text criteria in the legacy syntax (`a or b`, `>=5`, `Sm*`, `>`). Each value is
@@ -18,7 +18,7 @@ import {
 } from 'react';
 import { createPortal } from 'react-dom';
 import { isExactDecimal, type ApiClient } from '../api/client';
-import { describeError, isAbortError, networkError, type ApiError } from '../api/errors';
+import { describeError, isAbortError, isConnectionFailure, networkError, type ApiError } from '../api/errors';
 import type {
   FieldDefinition,
   FieldOption,
@@ -294,7 +294,8 @@ function cellText(value: FieldValue | undefined): string {
   if (typeof value === 'boolean') {
     return value ? 'Yes' : 'No';
   }
-  // An exact decimal is a typed number, shown as its JSON literal; no response carries one.
+  // An exact decimal is a fraction whose nearest double is whole, which a result's values
+  // can hold; it is shown as its JSON literal.
   if (isExactDecimal(value)) {
     return value.literal;
   }
@@ -397,11 +398,6 @@ function splitFieldErrors(
   return { byField, other };
 }
 
-/** A 503, or no response at all: the connection banner with Retry, since a search is a read. */
-function isConnectionFailure(error: ApiError): boolean {
-  return error.kind === 'unavailable' || error.kind === 'network';
-}
-
 /** Banner lines of an error the connection banner does not show. */
 function bannerLines(error: ApiError, otherFieldErrors: readonly string[], hasCriterionErrors: boolean): string[] {
   if (error.kind === 'validation') {
@@ -492,11 +488,14 @@ function trapTab(event: KeyboardEvent, dialog: HTMLElement): void {
  *
  * Like ConfirmDialog it is a plain role="dialog" element (jsdom has no
  * <dialog>.showModal()) rendered into <body>, so that, while it is open, every other
- * child of <body> can be made inert. Focus moves to the first field checkbox on open,
- * to a field's value box when its checkbox is checked, and returns to the element
- * focused before the dialog on close. Picked fields and their values outlive a close;
- * results and errors do not, unless `keepResults` holds them while a chosen result is
- * being opened.
+ * child of <body> can be made inert. On open, focus moves to the first enabled field
+ * checkbox, or to the dialog itself when none is enabled; checking a field moves it to
+ * that field's value box. On close, focus returns to the element focused before the
+ * dialog only while that element is still in the document and only if focus would
+ * otherwise be lost: still inside the dialog, or unplaced (no element, <body> or the
+ * document element); focus already moved elsewhere stays where it is. Picked fields
+ * and their values outlive a close; results and errors do not, unless `keepResults`
+ * holds them while a chosen result is being opened.
  */
 export function FindRecordDialog({
   open,
@@ -941,6 +940,7 @@ export function FindRecordDialog({
   const summaryHolds = error?.kind === 'validation' && byField.size > 0;
   if (error !== null && (current || summaryHolds)) {
     if (isConnectionFailure(error)) {
+      // A search is a read, so the connection banner's Retry repeats it like a GET.
       banner = <ConnectionError error={error} method="GET" onRetry={runSearch} />;
     } else {
       const lines = bannerLines(error, current ? other : [], byField.size > 0);
