@@ -209,8 +209,10 @@ public abstract class ApiFactoryBase : WebApplicationFactory<Program>
         ArgumentNullException.ThrowIfNull(builder);
         base.ConfigureWebHost(builder);
 
-        // The committed appsettings.json and appsettings.Development.json supply the binding, the body limit and the
-        // Logging:LogLevel filters, so every test runs under the production configuration.
+        // The content root is the API project directory, so the host loads the committed appsettings.json (the binding,
+        // the body limit and the Logging:LogLevel filters) and the committed file of the selected environment,
+        // Options.EnvironmentName (Production unless a test sets it): appsettings.Development.json under Development;
+        // no Production file is committed. The test settings applied below take precedence over both.
         builder.UseContentRoot(RepositoryPaths.ApiProjectDirectory);
         builder.UseEnvironment(Options.EnvironmentName);
 

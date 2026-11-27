@@ -523,7 +523,6 @@ public sealed class EvaluatorTests
         { "LastName AND Fever", [("LastName", Text("1"))] },
     };
 
-    // Whitespace-only text is deliberately absent: legacy treats it as non-empty and the plan does not decide it.
     public static TheoryData<FieldValue, bool> EmptinessCases => new()
     {
         { FieldValue.Null, true },

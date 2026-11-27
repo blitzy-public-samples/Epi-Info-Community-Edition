@@ -38,8 +38,9 @@ public sealed record DatabaseOptions(
 
     /// <summary>
     /// Whether a usable connection string is configured: <see langword="false"/> when it is absent,
-    /// empty or whitespace. The store reports itself unavailable, before creating any connection,
-    /// whenever this is <see langword="false"/>.
+    /// empty or whitespace. Whenever this is <see langword="false"/>, each store call that needs a
+    /// connection reports the database unavailable, throwing <c>DataStoreUnavailableException</c>
+    /// before any connection object is created, and a call that needs none still succeeds.
     /// </summary>
     public bool HasConnectionString => !string.IsNullOrWhiteSpace(ConnectionString);
 

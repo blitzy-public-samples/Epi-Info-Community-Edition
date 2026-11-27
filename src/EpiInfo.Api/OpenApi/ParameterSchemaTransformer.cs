@@ -36,23 +36,27 @@ namespace EpiInfo.Api.OpenApi;
 /// </list>
 /// <para>
 /// A parameter is matched by its location and by name ignoring case, and a name that differs only by case is
-/// normalised to the wire spelling. Its description is kept. <c>q</c>, <c>viewId</c>, <c>globalRecordId</c> and every
-/// other parameter are left as generated, and so is a parameter reference, which has no schema of its own to replace.
+/// normalised to the wire spelling, unless the same location already holds a parameter with the exact wire spelling:
+/// renaming the variant would publish that name twice, so it is left as generated. Its description is kept. <c>q</c>,
+/// <c>viewId</c>, <c>globalRecordId</c> and every other parameter are left as generated, and so is a parameter
+/// reference, which has no schema of its own to replace.
 /// </para>
 /// <para>
-/// <b>Backstop.</b> On the four record reads that take these parameters, any of them that binding no longer surfaces
-/// is appended with the same wire schema, so the generated client never loses one: the records list takes <c>q</c>,
-/// <c>includeDeleted</c>, <c>page</c> and <c>pageSize</c>; <c>count</c> and a record's <c>position</c> take
-/// <c>includeDeleted</c>; <c>at/{position}</c> takes <c>position</c> and <c>includeDeleted</c>. A parameter already
-/// present, matched by location and by name ignoring case, is never added again, and existing parameters keep their
-/// order.
+/// <b>Backstop.</b> On the four <c>GET</c> record reads, each parameter listed for the route that the generated
+/// operation does not carry is appended with its required flag and a fresh schema of its wire type, so the generated
+/// client keeps each listed parameter. An operation with no parameter list is given one holding only the appended
+/// parameters; the <c>viewId</c> and <c>globalRecordId</c> route parameters are never added. The records list takes
+/// <c>q</c>, <c>includeDeleted</c>, <c>page</c> and <c>pageSize</c>; <c>count</c> and a record's <c>position</c>
+/// take <c>includeDeleted</c>; <c>at/{position}</c> takes <c>position</c> and <c>includeDeleted</c>. A parameter
+/// already present, matched by location and by name ignoring case, is never added again, and existing parameters keep
+/// their order.
 /// </para>
 /// <para>
 /// The committed document and the client generated from it are compared byte for byte by <c>npm run lint</c>, so the
 /// output depends only on the operation: every list here is static and ordered, numbers are written with the
-/// invariant culture, and nothing reads the clock or the environment. An unexpected shape, such as a missing name,
-/// location or parameter list, is skipped, never thrown on. The class is stateless and safe to share across documents
-/// and threads.
+/// invariant culture, and nothing reads the clock or the environment. A parameter without a name or location is
+/// skipped, and a missing parameter list is skipped by the rewrite and created on a backstop route; neither is thrown
+/// on. The class is stateless and safe to share across documents and threads.
 /// </para>
 /// </remarks>
 public sealed class ParameterSchemaTransformer : IOpenApiOperationTransformer
@@ -94,8 +98,8 @@ public sealed class ParameterSchemaTransformer : IOpenApiOperationTransformer
     ];
 
     /// <summary>
-    /// Rewrites the coerced parameters of one operation to their wire schemas and, on the record reads, appends any of
-    /// their parameters that binding did not surface.
+    /// Rewrites the operation's coerced parameters to their wire schemas and, on the four <c>GET</c> record reads,
+    /// appends each of the route's listed backstop parameters that the operation does not carry.
     /// </summary>
     /// <param name="operation">The operation to rewrite in place.</param>
     /// <param name="context">The endpoint description, whose method and relative path select the backstop.</param>

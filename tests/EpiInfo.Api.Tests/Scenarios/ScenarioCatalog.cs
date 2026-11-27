@@ -49,16 +49,18 @@ public static class ScenarioCatalog
     /// skipped case.
     /// </summary>
     /// <remarks>
-    /// <list type="bullet">
-    /// <item>It lists every P1 scenario id, from <see cref="P1Ids"/>, whose feature is not delivered.</item>
-    /// <item>It is empty once P1 is complete.</item>
-    /// <item>It never names a P0 scenario (<c>EC-VAL-*</c>, <c>DATA-*</c>).</item>
-    /// <item>
-    /// Every id in it appears literally under <c>## Undelivered items</c> in <c>docs/parity-notes.md</c>.
-    /// </item>
-    /// </list>
-    /// <see cref="ScenarioCatalogTests.PendingIdsAreP1Only"/> enforces the first, third and fourth rules; the second
-    /// is kept by removing each id once its feature passes.
+    /// <para>
+    /// <see cref="ScenarioCatalogTests.PendingIdsAreP1Only"/> asserts that the array repeats no id, names no P0
+    /// scenario (<c>EC-VAL-*</c>, <c>DATA-*</c>) and holds only ids from <see cref="P1Ids"/>; that the
+    /// <see cref="RunnableIds"/> and <see cref="PendingIds"/> rows are disjoint and together are exactly
+    /// <see cref="P1Ids"/>; and that every id in it appears literally under <c>## Undelivered items</c> in
+    /// <c>docs/parity-notes.md</c>.
+    /// </para>
+    /// <para>
+    /// That test cannot tell which features are delivered, so keeping the array complete is the maintainers' duty: it
+    /// names every P1 id whose feature is not delivered, each id is removed once its feature passes, and the array is
+    /// empty once P1 is complete.
+    /// </para>
     /// </remarks>
     public static readonly string[] PendingP1Ids = [];
 

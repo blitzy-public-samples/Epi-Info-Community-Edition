@@ -8,7 +8,9 @@ namespace EpiInfo.Api.Hosting;
 /// </summary>
 /// <param name="ConnectionString">
 /// The <c>ConnectionStrings:EpiInfo</c> value, or <see langword="null"/> when it is absent or blank. Its absence is
-/// not a startup error: the data store reports the database unavailable on each call.
+/// not a startup error: each data store call that needs a connection then reports the database unavailable, throwing
+/// <c>DataStoreUnavailableException</c> before any connection object is created, and a call that needs none still
+/// succeeds.
 /// </param>
 /// <param name="CommandTimeoutSeconds">The SQL command timeout, at least 1 second.</param>
 /// <param name="ClientPath">

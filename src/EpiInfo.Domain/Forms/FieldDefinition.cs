@@ -64,9 +64,16 @@ namespace EpiInfo.Domain.Forms;
 /// empty when the code table has no rows; <see langword="null"/> for every other kind.
 /// </param>
 /// <param name="Members">
-/// For a <see cref="FieldType.Group"/> field, the field names of its <c>metaFields.List</c>, split on commas with
-/// empty entries removed as legacy Epi Info reads the list, in stored order, which is not tab-index order;
-/// <see langword="null"/> for every other kind. The client renders the group as a section holding these fields.
+/// For a <see cref="FieldType.Group"/> field, the members <c>FormDefinitionFactory</c> resolves from its
+/// <c>metaFields.List</c>; <see langword="null"/> for every other kind. The list is split on commas and empty entries
+/// dropped, as legacy Epi Info reads it; the factory also trims each entry, which legacy does not, and drops an entry
+/// that trimming leaves empty. Each entry resolves to a field the definition lists on any page: the one spelled exactly
+/// so, otherwise the first equal to it ignoring case, unless the form's data fields leave that name ambiguous. Entries
+/// naming no listed field (a system row among them), ambiguous names, repeats of a field already resolved and the group
+/// itself are left out. Each member is given as that field's canonical <paramref name="Name"/>, in <c>List</c> order,
+/// which is not tab-index order; a group whose list resolves to no field has an empty list. The client renders the
+/// group as a section holding the members on the group's page, sorted by tab index; a member on another page renders at
+/// its own place.
 /// </param>
 public sealed record FieldDefinition(
     string Name,

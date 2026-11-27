@@ -121,7 +121,9 @@ public sealed class KestrelApiFactory : ApiFactoryBase
     /// </summary>
     /// <returns>The client.</returns>
     /// <exception cref="InvalidOperationException">
-    /// The server reports no bound address, or it is bound to a host other than <c>127.0.0.1</c>.
+    /// The server reports no bound address, or the first address it reports, <see cref="BaseAddress"/>, has a host
+    /// other than <c>127.0.0.1</c>. Other bound addresses are not checked here;
+    /// <c>LoopbackBindingTests.KestrelBindsOnlyIpv4Loopback</c> asserts every one.
     /// </exception>
     public HttpClient CreateKestrelClient()
     {

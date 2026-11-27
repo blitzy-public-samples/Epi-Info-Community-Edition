@@ -16,10 +16,12 @@ namespace EpiInfo.Api.Hosting;
 /// the registered observer, so a replacement observer sees every command the store executes.
 /// </para>
 /// <para>
-/// Nothing is read until first resolution, so settings a test host applies during <c>Build</c> are honoured. A
-/// missing connection string is not a registration or startup error: the store reports itself unavailable on each
-/// call, before any connection is created, so database-backed endpoints and <c>/health</c> answer 503 and the process
-/// keeps serving. Nothing here logs, formats or stores the connection string anywhere but in the options records.
+/// The options and the store this class registers are created only on first resolution, from the built configuration,
+/// so settings a test host applies during <c>Build</c> are honoured. A missing connection string is not a registration
+/// or startup error: each store call that needs a connection then throws <see cref="DataStoreUnavailableException"/>
+/// before any connection object is created, so database-backed endpoints and <c>/health</c> answer 503 and the process
+/// keeps serving. A call that needs no connection, such as an options lookup for a form with no code table to read,
+/// still succeeds. Nothing here logs, formats or stores the connection string anywhere but in the options records.
 /// </para>
 /// </remarks>
 public static class DataStoreRegistration
