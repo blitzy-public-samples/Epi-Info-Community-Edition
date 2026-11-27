@@ -2,10 +2,54 @@
 // record number box and New, replacing the navigation toolstrip of legacy EnterMainForm.
 // Positions, the set the deleted toggle selects, the edge rules and every request belong
 // to useRecordNavigation, whose transitions first await the editor's leave() (save before
-// leaving). This component renders that state and calls its actions, nothing more.
-import { useId, useState, type KeyboardEvent } from 'react';
+// leaving). This component renders that state and calls its actions, and keeps focus in
+// the toolbar when an edge disables the move that held it.
+import { useId, useLayoutEffect, useRef, useState, type FocusEvent, type KeyboardEvent } from 'react';
 
 import type { RecordNavigation } from '../state/useRecordNavigation';
+
+/**
+ * Keeps focus inside a control group when its focused `button` has just been disabled by an
+ * edge of its range, such as Next on the last record or "Earlier records" on the first page.
+ * The browser would drop that focus to the page body, where the next key press does nothing,
+ * and App's focus return gives focus back only to a button that is enabled again, which an
+ * edge never does. Focus moves to the first of `candidates` that can take it, but only while
+ * it is still on the button, or fell to the page body from it: `lastFocused` is the group's
+ * element that last held focus. Focus the user moved anywhere else stays there. RecordGrid's
+ * paging buttons use it as well.
+ */
+export function keepFocusOffDisabled(
+  button: HTMLButtonElement | null,
+  lastFocused: Element | null,
+  candidates: readonly (HTMLElement | null)[],
+): void {
+  if (button === null || !button.disabled) {
+    return;
+  }
+  const active = document.activeElement;
+  const held = active === button || ((active === null || active === document.body) && lastFocused === button);
+  if (!held) {
+    return;
+  }
+  for (const candidate of candidates) {
+    if (candidate !== null && candidate.isConnected && !(candidate instanceof HTMLButtonElement && candidate.disabled)) {
+      candidate.focus();
+      return;
+    }
+  }
+}
+
+/**
+ * The blur handler of a group whose focus handler records, in `lastFocused`, the element that
+ * last held focus. Focus moved elsewhere, or put down while the element is enabled, clears
+ * it; a button that loses focus because it was disabled stays named, so
+ * {@link keepFocusOffDisabled} can tell that the focus on the page body came from it.
+ */
+export function forgetGroupFocus(lastFocused: { current: Element | null }, event: FocusEvent<HTMLElement>): void {
+  if (event.relatedTarget !== null || !(event.target instanceof HTMLButtonElement && event.target.disabled)) {
+    lastFocused.current = null;
+  }
+}
 
 /** The navigation members the toolbar reads and the actions it calls. */
 type NavigatorState = Pick<
@@ -14,6 +58,7 @@ type NavigatorState = Pick<
   | 'statusText'
   | 'goToError'
   | 'loading'
+  | 'transitioning'
   | 'recordGeneration'
   | 'canFirst'
   | 'canPrevious'
@@ -105,6 +150,33 @@ export function RecordNavigator({ navigation, busy = false, blocked = false, can
       : null;
   const error = standing === null ? null : (standing.message ?? navigation.goToError);
 
+  // Next reaching the last record, or Previous the first, is disabled for good while it holds
+  // focus: focus goes to the move the other way, else to Last or First, which stay enabled
+  // while the set holds a record. Moved in the layout phase of the commit that disables the
+  // button, before the browser paints. A save disables every control only while it runs, and
+  // App's focus return gives that focus back, so nothing moves while busy. Nor while a move is
+  // in flight: Previous and Next count from its target, so a move its leave then refuses would
+  // look like an edge for a render. Once it has landed, `lastFocusedRef` still names the
+  // button whose focus fell to the page body, so a move that did reach the edge is handled then.
+  const firstRef = useRef<HTMLButtonElement>(null);
+  const previousRef = useRef<HTMLButtonElement>(null);
+  const nextRef = useRef<HTMLButtonElement>(null);
+  const lastRef = useRef<HTMLButtonElement>(null);
+  const lastFocusedRef = useRef<Element | null>(null);
+  const { canNext, canPrevious, transitioning } = navigation;
+  useLayoutEffect(() => {
+    if (busy || transitioning) {
+      return;
+    }
+    const lastFocused = lastFocusedRef.current;
+    if (!canNext) {
+      keepFocusOffDisabled(nextRef.current, lastFocused, [previousRef.current, lastRef.current]);
+    }
+    if (!canPrevious) {
+      keepFocusOffDisabled(previousRef.current, lastFocused, [nextRef.current, firstRef.current]);
+    }
+  });
+
   function submitGoTo(): void {
     if (goToDisabled) {
       return;
@@ -142,6 +214,12 @@ export function RecordNavigator({ navigation, busy = false, blocked = false, can
         role="toolbar"
         aria-label="Record navigation"
         aria-busy={pending || busy ? true : undefined}
+        onFocus={(event) => {
+          lastFocusedRef.current = event.target;
+        }}
+        onBlur={(event) => {
+          forgetGroupFocus(lastFocusedRef, event);
+        }}
       >
         {/* The toolbar wraps only between these groups, in reading order: First and
             Previous, the status, Next and Last, then the go-to entry with New after it. The
@@ -149,6 +227,7 @@ export function RecordNavigator({ navigation, busy = false, blocked = false, can
             control's own. */}
         <div className="record-navigator__moves">
           <button
+            ref={firstRef}
             type="button"
             disabled={firstDisabled}
             {...blockedMarking(firstDisabled)}
@@ -159,6 +238,7 @@ export function RecordNavigator({ navigation, busy = false, blocked = false, can
             First
           </button>
           <button
+            ref={previousRef}
             type="button"
             disabled={previousDisabled}
             {...blockedMarking(previousDisabled)}
@@ -176,6 +256,7 @@ export function RecordNavigator({ navigation, busy = false, blocked = false, can
         </span>
         <div className="record-navigator__moves">
           <button
+            ref={nextRef}
             type="button"
             disabled={nextDisabled}
             {...blockedMarking(nextDisabled)}
@@ -186,6 +267,7 @@ export function RecordNavigator({ navigation, busy = false, blocked = false, can
             Next
           </button>
           <button
+            ref={lastRef}
             type="button"
             disabled={lastDisabled}
             {...blockedMarking(lastDisabled)}

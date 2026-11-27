@@ -16,6 +16,7 @@ import { isBlankQuery, isExactDecimal, type ApiClient } from '../api/client';
 import { describeError, isAbortError, networkError, type ApiError } from '../api/errors';
 import type { FieldDefinition, FieldValue, FormDefinition, RecordPage, RecordSummary } from '../api/types';
 import { ConnectionError } from './ConnectionError';
+import { forgetGroupFocus, keepFocusOffDisabled } from './RecordNavigator';
 
 export interface RecordGridProps {
   client: ApiClient;
@@ -506,6 +507,26 @@ export const RecordGrid = memo(function RecordGrid({
   }, [items]);
   const lastPage = result === null ? 1 : pageCountOf(result);
 
+  // "Earlier records" reaching page 1, or "Later records" the last page, is disabled for good
+  // while it holds focus: focus goes to the other paging button, else to the list's status
+  // line. Moved in the layout phase of the commit that disables the button, before the browser
+  // paints. A save disables both only while it runs, and App's focus return gives that back.
+  const earlierRef = useRef<HTMLButtonElement>(null);
+  const laterRef = useRef<HTMLButtonElement>(null);
+  const pagingFocusRef = useRef<Element | null>(null);
+  useLayoutEffect(() => {
+    if (disabled) {
+      return;
+    }
+    const lastFocused = pagingFocusRef.current;
+    if (page <= 1) {
+      keepFocusOffDisabled(earlierRef.current, lastFocused, [laterRef.current, statusRef.current]);
+    }
+    if (page >= lastPage) {
+      keepFocusOffDisabled(laterRef.current, lastFocused, [earlierRef.current, statusRef.current]);
+    }
+  });
+
   const open = (globalRecordId: string) => {
     if (!rowsInert) {
       onOpen(globalRecordId);
@@ -754,13 +775,23 @@ export const RecordGrid = memo(function RecordGrid({
       {/* Rendered with the paging only: an empty footer would add a row and a gap. */}
       {table !== null && result !== null && (
         <footer>
-          <nav className="record-grid__paging" aria-label="Record list pages">
+          <nav
+            className="record-grid__paging"
+            aria-label="Record list pages"
+            onFocus={(event) => {
+              pagingFocusRef.current = event.target;
+            }}
+            onBlur={(event) => {
+              forgetGroupFocus(pagingFocusRef, event);
+            }}
+          >
             {/* The requested page; its page count is known again once that page arrives. */}
             <p>{settled ? `Page ${page} of ${lastPage}` : `Page ${page}`}</p>
             {/* One group, so the two buttons wrap as a pair and keep their reading order. */}
             <div className="record-grid__paging-actions">
               {/* Pending: aria-disabled rather than disabled, so a pressed button keeps focus. */}
               <button
+                ref={earlierRef}
                 type="button"
                 disabled={disabled || page <= 1}
                 aria-disabled={settled ? undefined : 'true'}
@@ -773,6 +804,7 @@ export const RecordGrid = memo(function RecordGrid({
                 {EARLIER_TEXT}
               </button>
               <button
+                ref={laterRef}
                 type="button"
                 disabled={disabled || page >= lastPage}
                 aria-disabled={settled ? undefined : 'true'}

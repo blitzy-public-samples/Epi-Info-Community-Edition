@@ -2663,6 +2663,7 @@ describe('FormView sticky header and page tabs', () => {
   // sizes it publishes for styles.css, the scroll a focused control needs and the scroll a
   // tab's selection requests. That the header and the strip stick is a browser check.
   const HEADER_HEIGHT = 140;
+  const NOTICE_HEIGHT = 58;
   const TABS_HEIGHT = 44;
   const TABS_BOTTOM = HEADER_HEIGHT + TABS_HEIGHT;
 
@@ -2671,13 +2672,16 @@ describe('FormView sticky header and page tabs', () => {
   });
 
   /**
-   * Gives the workspace header, `headerHeight()` tall, and the tab strip their boxes; other
-   * elements keep jsdom's empty box.
+   * Gives the workspace header, `headerHeight()` tall, the check-code notice, `noticeHeight()`
+   * tall, and the tab strip their boxes; other elements keep jsdom's empty box.
    */
-  function layOutStickyParts(headerHeight: () => number): void {
+  function layOutStickyParts(headerHeight: () => number, noticeHeight: () => number = () => NOTICE_HEIGHT): void {
     vi.spyOn(Element.prototype, 'getBoundingClientRect').mockImplementation(function (this: Element) {
       if (this.classList.contains('form-view__header')) {
         return new DOMRect(0, 0, 1000, headerHeight());
+      }
+      if (this.classList.contains('banner--sticky')) {
+        return new DOMRect(0, headerHeight(), 1000, noticeHeight());
       }
       return this.getAttribute('role') === 'tablist' ? new DOMRect(0, HEADER_HEIGHT, 1000, TABS_HEIGHT) : new DOMRect();
     });
@@ -2762,6 +2766,155 @@ describe('FormView sticky header and page tabs', () => {
     expect(observer.disconnected).toBe(false);
     cleanup();
     expect(observer.disconnected).toBe(true);
+  });
+
+  // The check-code notice sticks below the header, and the strip and the scroll margins count
+  // it, so its size is published while it shows and 0px otherwise. Where there is no
+  // ResizeObserver (jsdom) the size measured as it appears stays.
+  it.each<{ environment: string; observes: boolean }>([
+    { environment: 'with a ResizeObserver, again on each resize', observes: true },
+    { environment: 'without a ResizeObserver, as measured when it appears', observes: false },
+  ])('publishes the check-code notice block size while it shows $environment, and 0px once it is gone', async ({
+    observes,
+  }) => {
+    RecordingResizeObserver.instances.length = 0;
+    if (observes) {
+      vi.stubGlobal('ResizeObserver', RecordingResizeObserver);
+    }
+    let noticeHeight = NOTICE_HEIGHT;
+    layOutStickyParts(() => HEADER_HEIGHT, () => noticeHeight);
+    // Last Name's first FieldBefore fails, which shows the notice; every later event is
+    // applied, and Last Name's next FieldBefore resolves the failure, which removes it.
+    let fieldEvents = 0;
+    const { definition } = await renderForm(createFormDefinitionFixture(), {
+      route: (call) => {
+        if (call.method !== 'POST' || !call.url.pathname.endsWith('/checkcode/field-event')) {
+          return null;
+        }
+        fieldEvents += 1;
+        return fieldEvents === 1 ? jsonResponse(500, UNROUTED_PROBLEM) : jsonResponse(200, NO_EFFECTS);
+      },
+    });
+    const header = present(
+      screen.getByRole('toolbar', { name: 'Form actions' }).parentElement,
+      'the container of the form actions',
+    );
+    const formView = present(header.parentElement, 'the form view');
+    const noticeSize = (): string => formView.style.getPropertyValue('--form-view-notice-block-size');
+    const shownNotice = (): HTMLElement | undefined =>
+      screen.queryAllByRole('status').find((status) => (status.textContent ?? '').startsWith('Check code could not run'));
+    expect(noticeSize()).toBe('0px');
+
+    const lastName = controlOf(definition, 'LastName');
+    act(() => {
+      lastName.focus();
+    });
+    const notice = await waitFor(() => present(shownNotice(), 'the check-code notice'));
+    expect(notice.parentElement).toBe(formView);
+    expect(noticeSize()).toBe(`${NOTICE_HEIGHT}px`);
+
+    const noticeObservers = RecordingResizeObserver.instances.filter((instance) => instance.observed.includes(notice));
+    expect(noticeObservers).toHaveLength(observes ? 1 : 0);
+    if (observes) {
+      const [observer] = noticeObservers;
+      expect(observer.observed).toEqual([notice]);
+      // Its text wraps onto a second line.
+      noticeHeight = 2 * NOTICE_HEIGHT;
+      act(() => {
+        observer.resize();
+      });
+      expect(noticeSize()).toBe(`${2 * NOTICE_HEIGHT}px`);
+    }
+
+    act(() => {
+      lastName.blur();
+    });
+    act(() => {
+      lastName.focus();
+    });
+    await waitFor(() => {
+      expect(shownNotice()).toBeUndefined();
+    });
+    expect(noticeSize()).toBe('0px');
+    expect(noticeObservers.every((observer) => observer.disconnected)).toBe(true);
+    // The notice took no focus on its way in or out.
+    expect(document.activeElement).toBe(lastName);
+    await flush();
+  });
+
+  // The notice of a field's own failed event appears after focus has scrolled the field into
+  // view, and pushes the strip down over it. styles.css makes the field's margin the header,
+  // the notice, the strip and the ring room, which here Last Name gets from the published
+  // notice size: 188px before the notice and 246px with it. A field left inside the deeper
+  // margin is scrolled back below it as the notice's size is taken, on the observer's report
+  // where there is one; a field clear of it, or one the user has scrolled above the viewport,
+  // stays.
+  it.each<{ environment: string; observes: boolean; top: number; scrolledBy: number | null }>([
+    { environment: 'without a ResizeObserver', observes: false, top: 200, scrolledBy: 200 - 246 },
+    { environment: 'with a ResizeObserver', observes: true, top: 200, scrolledBy: 200 - 246 },
+    { environment: 'without a ResizeObserver', observes: false, top: 246, scrolledBy: null },
+    { environment: 'without a ResizeObserver', observes: false, top: -400, scrolledBy: null },
+  ])('scrolls the focused field at $top px by $scrolledBy px (null: not at all) when a check-code notice appears $environment', async ({
+    observes,
+    top,
+    scrolledBy,
+  }) => {
+    RecordingResizeObserver.instances.length = 0;
+    if (observes) {
+      vi.stubGlobal('ResizeObserver', RecordingResizeObserver);
+    }
+    const { definition } = await renderForm(createFormDefinitionFixture(), {
+      route: (call) =>
+        call.method === 'POST' && call.url.pathname.endsWith('/checkcode/field-event')
+          ? jsonResponse(500, UNROUTED_PROBLEM)
+          : null,
+    });
+    const lastName = controlOf(definition, 'LastName');
+    const formView = present(lastName.closest<HTMLElement>('.form-view'), 'the form view');
+    const realComputedStyle = window.getComputedStyle.bind(window);
+    vi.spyOn(window, 'getComputedStyle').mockImplementation((element, pseudoElement) => {
+      const style = realComputedStyle(element, pseudoElement);
+      if (element === lastName) {
+        const notice = Number.parseFloat(formView.style.getPropertyValue('--form-view-notice-block-size') || '0');
+        Object.defineProperty(style, 'scrollMarginBlockStart', { value: `${TABS_BOTTOM + notice + 4}px` });
+      }
+      return style;
+    });
+    // Focus finds Last Name clear of its 188px margin; then it stands at `top`.
+    let lastNameTop = 200;
+    vi.spyOn(Element.prototype, 'getBoundingClientRect').mockImplementation(function (this: Element) {
+      if (this === lastName) {
+        return new DOMRect(0, lastNameTop, 600, 44);
+      }
+      return this.classList.contains('banner--sticky') ? new DOMRect(0, HEADER_HEIGHT, 1000, NOTICE_HEIGHT) : new DOMRect();
+    });
+    vi.spyOn(Element.prototype, 'clientHeight', 'get').mockReturnValue(800);
+    const scrollBy = vi.spyOn(window, 'scrollBy').mockImplementation(() => undefined);
+
+    act(() => {
+      lastName.focus();
+    });
+    expect(scrollBy).not.toHaveBeenCalled();
+    lastNameTop = top;
+    const notice = await waitFor(() =>
+      present(
+        screen.queryAllByRole('status').find((status) => (status.textContent ?? '').startsWith('Check code could not run')),
+        'the check-code notice',
+      ),
+    );
+    expect(formView.style.getPropertyValue('--form-view-notice-block-size')).toBe(`${NOTICE_HEIGHT}px`);
+    if (observes) {
+      // Published at once, but focus waits for the observer's report, after layout.
+      expect(scrollBy).not.toHaveBeenCalled();
+      const [observer] = RecordingResizeObserver.instances.filter((instance) => instance.observed.includes(notice));
+      act(() => {
+        present(observer, 'the observer of the notice').resize();
+      });
+    }
+
+    expect(scrollBy.mock.calls).toEqual(scrolledBy === null ? [] : [[0, scrolledBy]]);
+    expect(document.activeElement).toBe(lastName);
+    await flush();
   });
 
   // styles.css gives the controls below the sticky parts a scroll margin; here Last Name gets
@@ -3779,7 +3932,8 @@ describe('FormView banner action focus', () => {
     const records = screen.getByRole('region', { name: 'Records' });
     fireEvent.click(within(records).getByRole('row', { name: new RegExp(B_LAST_NAME) }));
 
-    // The open lands on the nearest record with a notice that offers Dismiss, and moves no focus.
+    // The open lands on the nearest record with a notice that offers Dismiss. The grid sits far
+    // below it, so the open ends on the heading, which the notice sits under.
     const notice = await waitFor(() =>
       present(
         screen
@@ -3790,7 +3944,7 @@ describe('FormView banner action focus', () => {
     );
     await flush();
     expect(navigatorStatus()).toBe('1 of 2');
-    expect(document.activeElement).toBe(document.body);
+    expect(document.activeElement).toBe(headingOf(definition));
 
     press(within(notice).getByRole('button', { name: 'Dismiss' }));
 
@@ -3830,6 +3984,592 @@ describe('FormView banner action focus', () => {
     expect(document.activeElement).toBe(heading);
     expect(readsOf(AT_2_PATH)).toHaveLength(2);
     expect(writeCalls()).toEqual([]);
+  });
+});
+
+describe('FormView focus and feedback after actions', () => {
+  // An action's outcome is brought to the user: a confirmed delete lands on the next record
+  // with no deleted banner in between, says "Record deleted." and focuses the heading.
+
+  const A_PATH = `${FORM_PATH}/records/${RECORD_A.globalRecordId}`;
+  const DELETED_BANNER_TEXT = 'This record is deleted and is read-only.';
+  const RECORD_DELETED = 'Record deleted.';
+
+  function headingOf(definition: FormDefinition): HTMLElement {
+    return screen.getByRole('heading', { level: 2, name: definition.name });
+  }
+
+  function toolbarStatus(): HTMLElement {
+    return within(screen.getByRole('toolbar', { name: 'Form actions' })).getByRole('status');
+  }
+
+  /** Answers the DELETE of A with 204; from then on the active set holds B alone, at position 1. */
+  function deletingA(): Route {
+    let deleted = false;
+    return (call) => {
+      if (call.method === 'DELETE' && call.url.pathname === A_PATH) {
+        deleted = true;
+        return new Response(null, { status: 204 });
+      }
+      if (!deleted || call.method !== 'GET') {
+        return null;
+      }
+      if (call.url.pathname === `${FORM_PATH}/records/count`) {
+        return jsonResponse(200, { count: 1 });
+      }
+      if (call.url.pathname === `${FORM_PATH}/records/at/1`) {
+        return jsonResponse(200, { ...RECORD_B, position: 1, count: 1 });
+      }
+      return null;
+    };
+  }
+
+  /** Deletes the open record A through the toolbar and its confirmation, and waits for B to open. */
+  async function deleteA(definition: FormDefinition): Promise<void> {
+    fireEvent.click(formActionButton('Delete'));
+    fireEvent.click(within(await screen.findByRole('dialog')).getByRole('button', { name: 'Delete record' }));
+    await waitFor(() => {
+      expect(navigatorStatus()).toBe('1 of 1');
+      expect(controlValue(controlOf(definition, 'LastName'))).toBe(B_LAST_NAME);
+    });
+    await flush();
+  }
+
+  it('lands on the next record after a confirmed delete with no deleted banner, focuses the heading and says "Record deleted."', async () => {
+    /** The DOM at the end of each commit from the confirmation on. */
+    const commits: { readonly banner: boolean; readonly protectedLastName: boolean }[] = [];
+    let recording = false;
+    const { definition } = await renderForm(createFormDefinitionFixture(), {
+      records: [RECORD_A, RECORD_B],
+      route: deletingA(),
+      onCommit: () => {
+        if (recording) {
+          commits.push({
+            banner: (document.body.textContent ?? '').includes(DELETED_BANNER_TEXT),
+            protectedLastName: Array.from(
+              document.querySelectorAll<HTMLElement>('[data-field-name].field--protected'),
+            ).some((wrapper) => wrapper.dataset.fieldName === 'LastName'),
+          });
+        }
+      },
+    });
+    const deleteButton = formActionButton('Delete');
+    expect(toolbarStatus().textContent).toBe('');
+
+    recording = true;
+    await deleteA(definition);
+
+    expect(writeCalls().map(requestLine)).toEqual([`DELETE ${A_PATH}`]);
+    // No commit showed the record just deleted as deleted, read-only or protected.
+    expect(commits.length).toBeGreaterThan(0);
+    expect(commits.filter((commit) => commit.banner || commit.protectedLastName)).toEqual([]);
+    expect(document.activeElement).toBe(headingOf(definition));
+    expect(toolbarStatus().textContent).toBe(RECORD_DELETED);
+    expect(toolbarStatus().className).not.toContain('visually-hidden');
+    expect(isDisabled(formActionButton('Save'))).toBe(false);
+    expect(isDisabled(deleteButton)).toBe(false);
+
+    // Asking to delete again ends the report, and Cancel returns focus to Delete.
+    fireEvent.click(deleteButton);
+    const again = await screen.findByRole('dialog', { name: 'Delete record' });
+    expect(toolbarStatus().textContent).toBe('');
+    fireEvent.click(within(again).getByRole('button', { name: 'Cancel' }));
+    await waitFor(() => {
+      expect(screen.queryByRole('dialog')).toBeNull();
+    });
+    expect(document.activeElement).toBe(deleteButton);
+    expect(writeCalls().map(requestLine)).toEqual([`DELETE ${A_PATH}`]);
+  });
+
+  it('keeps "Record deleted." on the record navigation landed on, and ends it with the next move', async () => {
+    const { definition } = await renderForm(createFormDefinitionFixture(), {
+      records: [RECORD_A, RECORD_B],
+      route: deletingA(),
+    });
+    await deleteA(definition);
+    expect(toolbarStatus().textContent).toBe(RECORD_DELETED);
+
+    fireEvent.click(navigatorButton('First'));
+
+    await waitFor(() => {
+      expect(toolbarStatus().textContent).toBe('');
+    });
+    expect(toolbarStatus().className).toContain('visually-hidden');
+  });
+
+  it.each<{ label: string; startAtLast: boolean; press: string; lands: string; focus: string }>([
+    { label: 'Next reaching the last record', startAtLast: false, press: 'Next', lands: '2 of 2', focus: 'Previous' },
+    { label: 'Previous reaching the first record', startAtLast: true, press: 'Previous', lands: '1 of 2', focus: 'Next' },
+  ])('moves the focus of $label, which disables it, to $focus', async ({ startAtLast, press, lands, focus }) => {
+    await renderForm(createFormDefinitionFixture(), { records: [RECORD_A, RECORD_B] });
+    if (startAtLast) {
+      fireEvent.click(navigatorButton('Last'));
+      await waitFor(() => {
+        expect(navigatorStatus()).toBe('2 of 2');
+      });
+    }
+    const pressed = navigatorButton(press);
+    // Pressed from the keyboard, so the button holds focus as it is activated.
+    pressed.focus();
+    fireEvent.click(pressed);
+
+    await waitFor(() => {
+      expect(navigatorStatus()).toBe(lands);
+    });
+    await flush();
+    expect(isDisabled(pressed)).toBe(true);
+    expect(document.activeElement).toBe(navigatorButton(focus));
+    expect(writeCalls()).toEqual([]);
+  });
+
+  it.each<{ label: string; press: string; lands: string; focus: string }>([
+    { label: '"Earlier records" reaching the first page', press: 'Earlier records', lands: 'Page 1 of 3', focus: 'Later records' },
+    { label: '"Later records" reaching the last page', press: 'Later records', lands: 'Page 3 of 3', focus: 'Earlier records' },
+  ])('moves the focus of $label, which disables it, to "$focus"', async ({ press, lands, focus }) => {
+    const definition = createFormDefinitionFixture();
+    // A list of three pages of 50, answering the page asked for with one row.
+    mountForm(definition, {
+      route: (call) => {
+        if (call.method !== 'GET' || call.url.pathname !== `${FORM_PATH}/records`) {
+          return null;
+        }
+        const page = Number(call.url.searchParams.get('page') ?? '1');
+        const body: RecordPage = { items: [recordSummaryFixture(RECORD, definition)], total: 150, page, pageSize: 50 };
+        return jsonResponse(200, body);
+      },
+    });
+    const records = await screen.findByRole('region', { name: 'Records' });
+    await within(records).findByText('Page 1 of 3');
+    fireEvent.click(within(records).getByRole('button', { name: 'Later records' }));
+    await within(records).findByText('Page 2 of 3');
+
+    const pressed = within(records).getByRole('button', { name: press });
+    pressed.focus();
+    fireEvent.click(pressed);
+
+    await within(records).findByText(lands);
+    await flush();
+    expect(isDisabled(pressed)).toBe(true);
+    expect(document.activeElement).toBe(within(records).getByRole('button', { name: focus }));
+  });
+
+  // A save or move stopped by field errors focuses the summary, which scrolls it into view,
+  // and its first line says what did not happen; a repeated attempt is a new line.
+
+  /** Age's upper bound is 120, so client validation stops every save of this value. */
+  const AGE_TOO_HIGH = '121';
+  const NOT_FOUND: ProblemDetails = {
+    type: 'https://tools.ietf.org/html/rfc9110#section-15.5.5',
+    title: 'Not Found',
+    status: 404,
+    detail: 'The test server has no such resource.',
+    traceId: '00-test-outcome-not-found-00',
+  };
+
+  /** Presses `button` as a keyboard user does: it holds focus as it is activated. */
+  function press(button: HTMLElement): void {
+    button.focus();
+    fireEvent.click(button);
+  }
+
+  /** The open action of B's grid row, the row's one button. */
+  function openButtonOfB(): HTMLElement {
+    const records = screen.getByRole('region', { name: 'Records' });
+    return within(within(records).getByRole('row', { name: new RegExp(B_LAST_NAME) })).getByRole('button');
+  }
+
+  it.each<{ label: string; start: () => void; line: string }>([
+    {
+      label: 'Save',
+      start: () => press(formActionButton('Save')),
+      line: 'The record was not saved: correct the fields below.',
+    },
+    {
+      label: 'Next',
+      start: () => press(navigatorButton('Next')),
+      line: 'Could not move to the next record: correct the fields below.',
+    },
+    {
+      label: 'Last',
+      start: () => press(navigatorButton('Last')),
+      line: 'Could not move to the last record: correct the fields below.',
+    },
+    {
+      label: 'Go to record 2',
+      start: () => {
+        fireEvent.change(screen.getByLabelText('Go to record'), { target: { value: '2' } });
+        press(navigatorButton('Go'));
+      },
+      line: 'Could not go to record 2: correct the fields below.',
+    },
+    {
+      label: 'New',
+      start: () => press(navigatorButton('New')),
+      line: 'Could not start a new record: correct the fields below.',
+    },
+    {
+      label: 'Back to forms',
+      start: () => press(formActionButton('Back to forms')),
+      line: 'Could not return to the forms list: correct the fields below.',
+    },
+    {
+      label: 'a grid open',
+      start: () => press(openButtonOfB()),
+      line: 'Could not open the record: correct the fields below.',
+    },
+  ])('focuses the summary and says what $label did not do, anew on every attempt', async ({ start, line }) => {
+    const { definition, onExit } = await renderForm(createFormDefinitionFixture(), { records: [RECORD_A, RECORD_B] });
+    edit(definition, 'Age', AGE_TOO_HIGH);
+
+    start();
+    const summary = await findValidationSummary();
+    const first = await within(summary).findByText(line);
+    await flush();
+    expect(document.activeElement).toBe(summary);
+    expect(summary.getAttribute('tabindex')).toBe('-1');
+    // The line heads the summary, above its heading and the field's message.
+    expect(summary.firstElementChild?.textContent).toBe(line);
+    expect(summaryItemsFor(summary, 'Age')).toHaveLength(1);
+
+    start();
+    await waitFor(() => {
+      expect(first.isConnected).toBe(false);
+    });
+    await flush();
+    // A new line with the same text, which the alert announces again, and the focus back on the summary.
+    expect(within(summary).getByText(line)).not.toBe(first);
+    expect(document.activeElement).toBe(summary);
+    // The user stayed on the record, which nothing was sent for.
+    expect(writeCalls()).toEqual([]);
+    expect(navigatorStatus()).toBe('1 of 2');
+    expect(controlValue(controlOf(definition, 'Age'))).toBe(AGE_TOO_HIGH);
+    expect(onExit).not.toHaveBeenCalled();
+  });
+
+  it('leaves focus in the field it rests in when Save is blocked, so no FieldAfter is raised', async () => {
+    const { definition } = await renderForm(createFormDefinitionFixture(), { answersFieldEvents: true });
+    // Past the tick in which installing the record suppresses field events.
+    await flush();
+    const age = controlOf(definition, 'Age');
+    act(() => {
+      age.focus();
+    });
+    edit(definition, 'Age', AGE_TOO_HIGH);
+
+    fireEvent.click(formActionButton('Save'));
+
+    const summary = await findValidationSummary();
+    await within(summary).findByText('The record was not saved: correct the fields below.');
+    await flush();
+    expect(document.activeElement).toBe(age);
+    // The FieldBefore of the focus only: focus never left the field.
+    expect(calls.filter((call) => call.url.pathname.endsWith('/checkcode/field-event'))).toHaveLength(1);
+    expect(writeCalls().filter((call) => !call.url.pathname.endsWith('/checkcode/field-event'))).toEqual([]);
+  });
+
+  it('keeps the Find results across a refused open, and drops them once Close is pressed or a result opens', async () => {
+    const match: SearchResult = {
+      globalRecordId: RECORD_B.globalRecordId,
+      uniqueKey: RECORD_B.uniqueKey,
+      recStatus: RECORD_B.recStatus,
+      position: 2,
+      values: { LastName: B_LAST_NAME },
+    };
+    const found: SearchResponse = { items: [match], total: 1, truncated: false };
+    const { definition } = await renderForm(createFormDefinitionFixture(), {
+      records: [RECORD_A, RECORD_B],
+      route: (call) => (isSearch(call) ? jsonResponse(200, found) : null),
+    });
+    const findButton = formActionButton('Find');
+    const openName = 'Open record at position 2';
+    /** Opens Find and returns its dialog. */
+    function openFind(): HTMLElement {
+      fireEvent.click(findButton);
+      return screen.getByRole('dialog', { name: 'Find record' });
+    }
+    /** Searches LastName for B in the dialog and waits for the one match. */
+    async function searchForB(dialog: HTMLElement): Promise<void> {
+      const picker = within(dialog).getByRole('checkbox', { name: 'LastName' });
+      if (!(picker instanceof HTMLInputElement) || !picker.checked) {
+        fireEvent.click(picker);
+      }
+      fireEvent.change(within(dialog).getByRole('textbox', { name: 'Last Name (LastName)' }), {
+        target: { value: B_LAST_NAME },
+      });
+      fireEvent.click(within(dialog).getByRole('button', { name: 'Search' }));
+      await within(dialog).findByText('1 record matches.');
+    }
+
+    edit(definition, 'Age', AGE_TOO_HIGH);
+    let dialog = openFind();
+    await searchForB(dialog);
+    fireEvent.click(within(dialog).getByRole('button', { name: openName }));
+    expect(screen.queryByRole('dialog', { name: 'Find record' })).toBeNull();
+
+    // The open is refused: the summary says so and takes focus from the Find button.
+    const summary = await findValidationSummary();
+    await within(summary).findByText('Could not open the record: correct the fields below.');
+    await flush();
+    expect(document.activeElement).toBe(summary);
+    expect(navigatorStatus()).toBe('1 of 2');
+
+    // Find shows the same results again, ready to open, with no new search.
+    dialog = openFind();
+    expect(within(dialog).getByText('1 record matches.')).toBeTruthy();
+    expect(within(dialog).getByRole('button', { name: openName }).getAttribute('aria-disabled')).toBeNull();
+    expect(calls.filter(isSearch)).toHaveLength(1);
+
+    // Close drops them.
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Close' }));
+    await flush();
+    dialog = openFind();
+    expect(within(dialog).queryByRole('table', { name: 'Matching records' })).toBeNull();
+
+    // With Age corrected, the chosen result opens once the draft is saved, and its results go with the open.
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Close' }));
+    // 32, not A's stored 31: an edit back to the stored value would leave the draft clean.
+    edit(definition, 'Age', '32');
+    replyToWrite({ kind: 'saved', record: savedWith(RECORD_A, { Age: 32 }) });
+    dialog = openFind();
+    await searchForB(dialog);
+    fireEvent.click(within(dialog).getByRole('button', { name: openName }));
+    await waitFor(() => {
+      expect(navigatorStatus()).toBe('2 of 2');
+    });
+    await flush();
+    expect(writeCalls().filter((call) => !isSearch(call)).map(requestLine)).toEqual([`PUT ${A_PATH}`]);
+    dialog = openFind();
+    expect(within(dialog).queryByRole('table', { name: 'Matching records' })).toBeNull();
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Close' }));
+  });
+
+  const READ_FAILED: ProblemDetails = {
+    type: 'https://tools.ietf.org/html/rfc9110#section-15.6.1',
+    title: 'An error occurred while processing your request.',
+    status: 500,
+    detail: 'The test server failed this read.',
+    traceId: '00-test-outcome-read-failed-00',
+  };
+
+  it.each<{
+    label: string;
+    record: RecordDto;
+    /** The answer to the read of B by id; `null` leaves it to the read routes. */
+    answer: (() => Response) | null;
+    /** Text on screen once the open has run its course. */
+    shown: string;
+    saveEnabled: boolean;
+  }>([
+    { label: 'an active record', record: RECORD_B, answer: null, shown: B_LAST_NAME, saveEnabled: true },
+    {
+      label: 'a deleted record, under its deleted banner',
+      record: { ...RECORD_B, recStatus: 0 },
+      answer: null,
+      shown: DELETED_BANNER_TEXT,
+      saveEnabled: false,
+    },
+    {
+      label: 'a record whose read fails, under its banner',
+      record: RECORD_B,
+      answer: () => problemResponse(READ_FAILED),
+      shown: READ_FAILED.traceId,
+      saveEnabled: true,
+    },
+  ])('ends an open from the grid of $label on the heading', async ({ record, answer, shown, saveEnabled }) => {
+    const { definition } = await renderForm(createFormDefinitionFixture(), {
+      records: [RECORD_A, record],
+      answerRead: (path) =>
+        answer !== null && path === `${FORM_PATH}/records/${RECORD_B.globalRecordId}` ? answer() : undefined,
+    });
+
+    press(openButtonOfB());
+
+    await waitFor(() => {
+      expect(document.body.textContent).toContain(shown);
+    });
+    await flush();
+    expect(document.activeElement).toBe(headingOf(definition));
+    expect(isDisabled(formActionButton('Save'))).toBe(!saveEnabled);
+    expect(writeCalls()).toEqual([]);
+  });
+
+  // A Save refused with a banner, Save enabled again, leaves focus on Save: the stopped-action
+  // outcome moves focus only to a validation summary. A 409, which disables Save, is
+  // 'FormView record found deleted by its save (409)'.
+  it.each<{
+    label: string;
+    /** The PUT's answer: a problem the server refuses it with, or no response at all. */
+    reply: WriteReply | 'no response';
+    /** Text on screen once the refusal is shown. */
+    shown: string;
+  }>([
+    {
+      label: 'a 503, under the connection banner',
+      reply: {
+        kind: 'problem',
+        problem: {
+          type: 'https://tools.ietf.org/html/rfc9110#section-15.6.4',
+          title: 'Service Unavailable',
+          status: 503,
+          detail: 'The test database is unavailable.',
+          traceId: '00-test-outcome-unavailable-00',
+          writeOutcome: 'notWritten',
+        },
+      },
+      shown: 'The database cannot be reached. Your changes are still on screen.',
+    },
+    {
+      label: 'no response, under the banner offering Save again',
+      reply: 'no response',
+      shown: 'The save may already have been applied',
+    },
+  ])('keeps focus on Save when a Save is refused with $label', async ({ reply, shown }) => {
+    const { definition } = await renderForm(createFormDefinitionFixture(), {
+      records: [RECORD_A, RECORD_B],
+      route: (call) =>
+        reply === 'no response' && call.method === 'PUT' ? Promise.reject(new TypeError('Failed to fetch')) : null,
+    });
+    if (reply !== 'no response') {
+      replyToWrite(reply);
+    }
+    edit(definition, 'FirstName', 'Adah');
+    const save = formActionButton('Save');
+
+    press(save);
+
+    await waitFor(() => {
+      expect(document.body.textContent).toContain(shown);
+    });
+    await flush();
+    expect(isDisabled(save)).toBe(false);
+    expect(isDisabled(formActionButton('Delete'))).toBe(false);
+    expect(document.activeElement).toBe(save);
+    expect(writeCalls().map(requestLine)).toEqual([`PUT ${A_PATH}`]);
+    expect(navigatorStatus()).toBe('1 of 2');
+  });
+
+  // Focusing the element that already holds focus does nothing, scrolling included. An attempt
+  // made while its outcome still holds focus, after a script's click or a mouse click that
+  // focuses no button, scrolls the outcome into view instead.
+  it.each<{
+    label: string;
+    target: string;
+    /** Whether Age holds a value client validation stops every save of. */
+    invalid: boolean;
+    /** The control each of the two attempts clicks. */
+    controls: readonly [() => HTMLElement, () => HTMLElement];
+    /** The element the attempts' outcome is brought to, once the first attempt shows it. */
+    outcome: (definition: FormDefinition) => Promise<HTMLElement>;
+  }>([
+    {
+      label: 'a Save stopped by field errors',
+      target: 'the summary',
+      invalid: true,
+      controls: [() => formActionButton('Save'), () => formActionButton('Save')],
+      outcome: () => findValidationSummary(),
+    },
+    {
+      // B opens first, then A, the record whose LastName is Lovelace.
+      label: 'an open from the grid',
+      target: 'the heading',
+      invalid: false,
+      controls: [
+        openButtonOfB,
+        () =>
+          within(
+            within(screen.getByRole('region', { name: 'Records' })).getByRole('row', { name: /Lovelace/ }),
+          ).getByRole('button'),
+      ],
+      outcome: (definition) => Promise.resolve(headingOf(definition)),
+    },
+  ])(
+    'scrolls $target into view when $label is repeated while it holds focus, and focuses it the first time',
+    async ({ invalid, controls, outcome }) => {
+      const { definition } = await renderForm(createFormDefinitionFixture(), { records: [RECORD_A, RECORD_B] });
+      if (invalid) {
+        edit(definition, 'Age', AGE_TOO_HIGH);
+      }
+      const focus = vi.spyOn(HTMLElement.prototype, 'focus');
+      const scroll = vi.spyOn(Element.prototype, 'scrollIntoView');
+      const [first, second] = controls;
+
+      // The first attempt, pressed from the keyboard, moves focus to the outcome.
+      press(first());
+      const target = await outcome(definition);
+      await waitFor(() => {
+        expect(document.activeElement).toBe(target);
+      });
+      await flush();
+      expect(focus.mock.contexts).toContain(target);
+      expect(scroll).not.toHaveBeenCalled();
+
+      // The second leaves focus on the outcome as it starts, so focusing it again would not scroll.
+      focus.mockClear();
+      fireEvent.click(second());
+      await waitFor(() => {
+        expect(scroll.mock.contexts).toEqual([target]);
+      });
+      await flush();
+      expect(scroll.mock.contexts).toEqual([target]);
+      expect(scroll).toHaveBeenCalledWith({ block: 'center' });
+      expect(focus.mock.contexts).not.toContain(target);
+      expect(document.activeElement).toBe(target);
+      // The stopped Save stays on A, and the second open opens A.
+      expect(navigatorStatus()).toBe('1 of 2');
+      expect(writeCalls()).toEqual([]);
+    },
+  );
+
+  it('brings the form-gone banner and its "Discard edits" to a dirty draft whose grid search finds the form gone', async () => {
+    const { definition, onFormNotFound } = await renderForm(createFormDefinitionFixture(), {
+      route: (call) =>
+        call.method === 'GET' && call.url.pathname === `${FORM_PATH}/records` && call.url.searchParams.has('q')
+          ? jsonResponse(404, NOT_FOUND)
+          : null,
+    });
+    edit(definition, 'FirstName', 'Adah');
+    const search = within(screen.getByRole('region', { name: 'Records' })).getByRole('searchbox', {
+      name: 'Search records',
+    });
+    act(() => {
+      search.focus();
+    });
+    fireEvent.change(search, { target: { value: 'Ada' } });
+
+    const banner = await findAlertContaining('This form no longer exists.');
+    await waitFor(() => {
+      expect(document.activeElement).toBe(banner);
+    });
+    expect(banner.getAttribute('tabindex')).toBe('-1');
+    expect(within(banner).getByRole('button', { name: 'Discard edits' })).toBeTruthy();
+    expect(onFormNotFound).not.toHaveBeenCalled();
+    expect(controlValue(controlOf(definition, 'FirstName'))).toBe('Adah');
+  });
+
+  it('shows a check-code failure as a sticky notice that takes no focus', async () => {
+    const { definition } = await renderForm(createFormDefinitionFixture(), {
+      route: (call) =>
+        call.method === 'POST' && call.url.pathname.endsWith('/checkcode/field-event')
+          ? jsonResponse(500, UNROUTED_PROBLEM)
+          : null,
+    });
+    await flush();
+    const lastName = controlOf(definition, 'LastName');
+    act(() => {
+      lastName.focus();
+    });
+
+    const notice = await waitFor(() =>
+      present(
+        screen
+          .queryAllByRole('status')
+          .find((status) => (status.textContent ?? '').startsWith('Check code could not run')),
+        'the check-code notice',
+      ),
+    );
+    await flush();
+    expect(notice.classList.contains('banner--sticky')).toBe(true);
+    expect(document.activeElement).toBe(lastName);
   });
 });
 
@@ -4549,6 +5289,7 @@ describe('RecordNavigator pending and busy states', () => {
       statusText: '2 of 3',
       goToError: null,
       loading: false,
+      transitioning: false,
       recordGeneration: 1,
       canFirst: true,
       canPrevious: true,

@@ -55,6 +55,13 @@ export interface FindRecordDialogProps {
   onOpen: (globalRecordId: string) => void;
   onClose: () => void;
   /**
+   * Keeps the results, the failure shown and the criteria they answer across a close. The
+   * form view sets it while the result chosen last is being opened, so an open refused
+   * because the record on screen could not be left finds the same results when Find is
+   * opened again. Absent or `false`, a closed dialog drops them.
+   */
+  keepResults?: boolean;
+  /**
    * Called when a search answers 404, which means the form itself no longer exists; the
    * form view's form-not-found handling closes the dialog and decides what follows.
    */
@@ -488,7 +495,8 @@ function trapTab(event: KeyboardEvent, dialog: HTMLElement): void {
  * child of <body> can be made inert. Focus moves to the first field checkbox on open,
  * to a field's value box when its checkbox is checked, and returns to the element
  * focused before the dialog on close. Picked fields and their values outlive a close;
- * results and errors do not.
+ * results and errors do not, unless `keepResults` holds them while a chosen result is
+ * being opened.
  */
 export function FindRecordDialog({
   open,
@@ -500,6 +508,7 @@ export function FindRecordDialog({
   onOpen,
   onClose,
   onFormNotFound,
+  keepResults = false,
 }: FindRecordDialogProps) {
   const baseId = useId();
   const headingId = `${baseId}-heading`;
@@ -572,7 +581,8 @@ export function FindRecordDialog({
   // first checkbox takes focus before the page is made inert, so the page's blur names
   // it as the related target. Content added to <body> while open is made inert too;
   // focus that still lands outside is pulled back; Escape and Tab pressed outside the
-  // dialog still act on it. Closing abandons a running search and drops its outcome.
+  // dialog still act on it. Closing abandons a running search and drops its outcome; the
+  // results already shown are dropped by the effect below.
   useEffect(() => {
     const backdrop = backdropRef.current;
     const dialog = dialogRef.current;
@@ -666,9 +676,6 @@ export function FindRecordDialog({
       controllerRef.current?.abort();
       controllerRef.current = null;
       setLoading(false);
-      setResponse(null);
-      setError(null);
-      setSubmitted(null);
 
       // Focus returns only when it has nowhere else to be: it was inside the dialog,
       // or on <body> once the dialog left the page.
@@ -685,6 +692,16 @@ export function FindRecordDialog({
       }
     };
   }, [open]);
+
+  // A closed dialog drops its results, the failure shown and the criteria they answer, as
+  // soon as nothing keeps them: at its close, or once the form view lets kept results go.
+  useEffect(() => {
+    if (!open && !keepResults) {
+      setResponse(null);
+      setError(null);
+      setSubmitted(null);
+    }
+  }, [open, keepResults]);
 
   // Search disables itself while a search runs, which drops the focus it held, or the
   // Retry button's, which the outcome removes, to <body>. It takes that focus back once

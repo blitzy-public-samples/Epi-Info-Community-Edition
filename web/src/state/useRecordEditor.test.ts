@@ -28,6 +28,7 @@
 // The hook runs against the real client and error parsing; createApiClient's fetch seam
 // is a fake that records every request and answers from a per-test reply queue.
 import { act, renderHook } from '@testing-library/react';
+import { useState } from 'react';
 import { afterEach, describe, expect, it, vi, type Mock } from 'vitest';
 
 import { createApiClient, isExactDecimal, numberFromText, type ApiClient, type ApiResult } from '../api/client';
@@ -2874,6 +2875,100 @@ describe('delete (C-6)', () => {
     expect(result.current.isDirty).toBe(false);
     expect(result.current.deleteDialogOpen).toBe(false);
     expect(result.current.deletedReadOnly).toBe(true);
+  });
+
+  it('never marks a record just deleted read-only while navigation replaces it, and does once a failed landing leaves it on screen', async () => {
+    const definition = createFormDefinitionFixture();
+    const api = createFakeApi();
+    const client = createApiClient({ baseUrl: 'http://localhost', fetch: api.fetch });
+    const record = storedRecord();
+    const next = recordFixture({
+      globalRecordId: '3f2b8c1e-5d4a-4c1b-9e7f-000000000002',
+      uniqueKey: 2,
+      position: 1,
+      values: { [TEXT]: 'Next' },
+    });
+    /** `deletedReadOnly` of every render from the confirmation on. */
+    const shownDeleted: boolean[] = [];
+    let recording = false;
+    const { result } = renderHook(() => {
+      // Navigation's part, as FormView wires it: afterDelete starts the landing on the next
+      // record in the same update as the 204, and that landing installs a new generation.
+      const [navigation, setNavigation] = useState({ record, recordGeneration: 1, transitioning: false });
+      const editor = useRecordEditor({
+        client,
+        viewId: definition.viewId,
+        definition,
+        record: navigation.record,
+        isNew: false,
+        recordGeneration: navigation.recordGeneration,
+        transitioning: navigation.transitioning,
+        onSaved: () => undefined,
+        onDeleted: () => {
+          setNavigation((current) => ({ ...current, transitioning: true }));
+        },
+        onConflict: () => undefined,
+        onDiscardToNearest: () => undefined,
+      });
+      if (recording) {
+        shownDeleted.push(editor.deletedReadOnly);
+      }
+      return { editor, setNavigation };
+    });
+    /** Every guarded action of the record just deleted: none sends a request or changes the draft. */
+    async function expectClosed(): Promise<void> {
+      expect(await perform(() => result.current.editor.save())).toBe(true);
+      run(() => {
+        result.current.editor.setValue(TEXT, 'Brown');
+        result.current.editor.requestDelete();
+      });
+      expect(result.current.editor.values).toEqual(record.values);
+      expect(result.current.editor.isDirty).toBe(false);
+      expect(result.current.editor.deleteDialogOpen).toBe(false);
+    }
+
+    run(() => {
+      result.current.editor.setValue(TEXT, 'Jones');
+      result.current.editor.requestDelete();
+    });
+    api.reply(noContent());
+    recording = true;
+    await perform(() => result.current.editor.confirmDelete());
+
+    // During the landing the draft is frozen, never protected, and never shown as deleted.
+    expect(shownDeleted.length).toBeGreaterThan(0);
+    expect(shownDeleted).not.toContain(true);
+    expect(result.current.editor.frozen).toBe(true);
+    for (const field of allFields().filter(isWritableDataField)) {
+      expect(result.current.editor.isProtected(field.name), field.name).toBe(false);
+      expect(result.current.editor.isDisabled(field.name), field.name).toBe(true);
+    }
+    await expectClosed();
+
+    // The landing failed and the record stays on screen: it is deleted and read-only.
+    run(() => {
+      result.current.setNavigation((current) => ({ ...current, transitioning: false }));
+    });
+    expect(result.current.editor.deletedReadOnly).toBe(true);
+    for (const field of allFields()) {
+      expect(result.current.editor.isProtected(field.name), field.name).toBe(true);
+    }
+    await expectClosed();
+
+    // The next record installed by navigation is a clean draft that can be edited and deleted.
+    run(() => {
+      result.current.setNavigation({ record: next, recordGeneration: 2, transitioning: false });
+    });
+    expect(result.current.editor.deletedReadOnly).toBe(false);
+    expect(result.current.editor.values).toEqual(next.values);
+    for (const field of allFields().filter(isWritableDataField)) {
+      expect(result.current.editor.isProtected(field.name), field.name).toBe(false);
+    }
+    run(() => {
+      result.current.editor.requestDelete();
+    });
+    expect(result.current.editor.deleteDialogOpen).toBe(true);
+    expect(api.lines()).toEqual([`DELETE ${recordPath(record)}`]);
   });
 
   it.each<[string, readonly (readonly [string, FieldValue])[]]>([

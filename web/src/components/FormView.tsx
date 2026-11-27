@@ -23,8 +23,8 @@ import { apiClient, type ApiClient } from '../api/client';
 import { describeError, isAbortError, networkError, type ApiError } from '../api/errors';
 import type { DialogMessage, FieldDefinition, FormDefinition, PageDefinition } from '../api/types';
 import { useRecordEditor, type BannerAction, type EditorBanner } from '../state/useRecordEditor';
-import { useRecordNavigation } from '../state/useRecordNavigation';
-import { isDataField } from '../validation/clientValidation';
+import { useRecordNavigation, type RecordNavigation } from '../state/useRecordNavigation';
+import { hasFieldErrors, isDataField } from '../validation/clientValidation';
 import { ConfirmDialog } from './ConfirmDialog';
 import { ConnectionError } from './ConnectionError';
 import { FieldRenderer } from './FieldRenderer';
@@ -33,7 +33,7 @@ import { MessageDialog } from './MessageDialog';
 import { PageTabs, pageTabId, pageTabPanelId } from './PageTabs';
 import { RecordGrid } from './RecordGrid';
 import { RecordNavigator } from './RecordNavigator';
-import { ValidationSummary } from './ValidationSummary';
+import { ValidationSummary, type BlockedAction } from './ValidationSummary';
 import { fieldControlId } from './fields/fieldComponents';
 
 export interface FormViewProps {
@@ -87,6 +87,7 @@ const FORM_NOT_FOUND_TEXT = 'This form no longer exists.';
 const DELETED_TEXT = 'This record is deleted and is read-only.';
 // Statuses, not controls, so the toolbar-name rule above does not reach them.
 const SAVING_TEXT = 'Saving…';
+const RECORD_DELETED_TEXT = 'Record deleted.';
 const SAVED_TEXT = 'Changes saved.';
 const RETRY = 'Retry';
 const DISMISS = 'Dismiss';
@@ -504,18 +505,20 @@ function usePageSelection(definition: FormDefinition): PageSelection {
   return { selectedPageId, selectPage, selectField };
 }
 
-// Custom properties on the workspace root that styles.css reads for the sticky header and
-// page tab strip: each part's border-box block size, in px.
+// Custom properties on the workspace root that styles.css reads for the sticky header, the
+// sticky check-code notice and the page tab strip: each part's border-box block size, in px.
 const HEADER_BLOCK_SIZE_PROPERTY = '--form-view-header-block-size';
+const NOTICE_BLOCK_SIZE_PROPERTY = '--form-view-notice-block-size';
 const TABS_BLOCK_SIZE_PROPERTY = '--form-view-tabs-block-size';
 
 /**
  * Publishes the block sizes of the workspace header and of the page tab strip on the
- * workspace root, where styles.css reads them: the strip sticks just below the header, and
- * the scroll margins of the controls below keep a control that focus scrolls into view
- * clear of both. Both sizes change as their controls wrap with the viewport width or the
- * text size, so a ResizeObserver republishes them; where there is none (jsdom), the sizes
- * measured at mount stay. A form with no pages has no tab strip, whose size is then 0.
+ * workspace root, where styles.css reads them: the strip sticks just below the header and
+ * any check-code notice stuck under it (useStickyNoticeBlockSize), and the scroll margins
+ * of the controls below keep a control that focus scrolls into view clear of all of them.
+ * Both sizes change as their controls wrap with the viewport width or the text size, so a
+ * ResizeObserver republishes them; where there is none (jsdom), the sizes measured at mount
+ * stay. A form with no pages has no tab strip, whose size is then 0.
  */
 function useStickyBlockSizes(rootRef: RefObject<HTMLElement>, headerRef: RefObject<HTMLElement>): void {
   useLayoutEffect(() => {
@@ -545,15 +548,89 @@ function useStickyBlockSizes(rootRef: RefObject<HTMLElement>, headerRef: RefObje
 }
 
 /**
- * Keeps a control that takes focus in the workspace clear of the sticky header and tab
- * strip, so focus is never hidden under them. styles.css gives each control a scroll
- * margin as deep as the stuck parts above it, which the browser keeps clear when focus
- * scrolls a control into view, but not when focus lands on a part inside a native control,
- * such as the day, month or year of a date input: Shift+Tab would leave that date under the
- * header. So a focused control that still starts inside its scroll margin is scrolled to
- * start just below it. A control taller than the room below its margin, such as a tab panel
- * that a click on its background focuses, is left where it is, and so is one with no
- * margin: the header's controls, or any control where the header is not sticky.
+ * Scrolls a focused control that starts inside its scroll margin to start just below it.
+ * styles.css gives each control a scroll margin as deep as the parts stuck above it, so a
+ * control starting inside it is hidden, wholly or in part, under them. A control taller than
+ * the room below its margin, such as a tab panel that a click on its background focuses, is
+ * left where it is, and so is one with no margin: the header's controls, or any control
+ * where nothing sticks above it. With `inViewOnly`, so is a control starting above the
+ * viewport, which the user has scrolled away from.
+ */
+function keepClearOfStickyParts(control: Element, inViewOnly: boolean): void {
+  const margin = Number.parseFloat(getComputedStyle(control).scrollMarginBlockStart);
+  // NaN where no style sheet sets it (jsdom); 0 where nothing sticks above the control.
+  if (!(margin > 0)) {
+    return;
+  }
+  const { top, height } = control.getBoundingClientRect();
+  // A sliver under a pixel is layout rounding, not a hidden control.
+  if (top <= margin - 1 && (!inViewOnly || top > -1) && height <= document.documentElement.clientHeight - margin) {
+    window.scrollBy(0, top - margin);
+  }
+}
+
+/**
+ * Publishes the block size of the sticky check-code notice on the workspace root, where
+ * styles.css reads it: where the header sticks, the notice sticks just below it and the tab
+ * strip below the notice, and the scroll margins of the controls below count it too, so
+ * neither the notice nor a control that focus scrolls into view is hidden under another
+ * stuck part. The notice comes and goes with the failures it reports, so the returned
+ * callback ref, set on the notice, follows it: its size is published while it is mounted
+ * and 0px once it is gone. Its lines wrap with the viewport width and grow with each field
+ * that fails, so a ResizeObserver republishes it; where there is none (jsdom), the size
+ * measured at its mount stays.
+ *
+ * A notice that appears or grows moves the tab strip stuck below it down and deepens the
+ * scroll margins, but the browser scrolls nothing for that, so the control that holds focus,
+ * such as the field whose own event has just failed, would be left under the notice or the
+ * strip. Each time the size grows, a focused control in view is brought back clear of them.
+ * Where an observer reports the notice, that is done on its report, which comes after the
+ * layout that places the notice and the control, scroll anchoring included, and before the
+ * paint; the size itself is published at once all the same.
+ */
+function useStickyNoticeBlockSize(rootRef: RefObject<HTMLElement>): (notice: HTMLElement | null) => void {
+  const [notice, setNotice] = useState<HTMLElement | null>(null);
+  // The size focus was last kept clear of: a notice that shrinks or goes covers nothing new.
+  const clearedSizeRef = useRef(0);
+  useLayoutEffect(() => {
+    const root = rootRef.current;
+    if (root === null) {
+      return undefined;
+    }
+    const publish = (keepFocusClear: boolean): void => {
+      const size = notice?.getBoundingClientRect().height ?? 0;
+      root.style.setProperty(NOTICE_BLOCK_SIZE_PROPERTY, `${size}px`);
+      if (!keepFocusClear) {
+        return;
+      }
+      const grew = size > clearedSizeRef.current;
+      clearedSizeRef.current = size;
+      const focused = document.activeElement;
+      if (grew && focused !== null && root.contains(focused)) {
+        keepClearOfStickyParts(focused, true);
+      }
+    };
+    if (notice === null || typeof ResizeObserver === 'undefined') {
+      publish(true);
+      return undefined;
+    }
+    publish(false);
+    const observer = new ResizeObserver(() => publish(true));
+    observer.observe(notice, { box: 'border-box' });
+    return () => {
+      observer.disconnect();
+    };
+  }, [rootRef, notice]);
+  return setNotice;
+}
+
+/**
+ * Keeps a control that takes focus in the workspace clear of the sticky header, check-code
+ * notice and tab strip, so focus is never hidden under them. The browser keeps a control
+ * clear of its scroll margin when focus scrolls it into view, but not when focus lands on a
+ * part inside a native control, such as the day, month or year of a date input: Shift+Tab
+ * would leave that date under the header. So a focused control that still starts inside its
+ * scroll margin is scrolled to start just below it (keepClearOfStickyParts).
  */
 function useFocusClearOfStickyParts(rootRef: RefObject<HTMLElement>): void {
   useEffect(() => {
@@ -562,18 +639,8 @@ function useFocusClearOfStickyParts(rootRef: RefObject<HTMLElement>): void {
       return undefined;
     }
     const handleFocusIn = (event: FocusEvent): void => {
-      if (!(event.target instanceof Element)) {
-        return;
-      }
-      const margin = Number.parseFloat(getComputedStyle(event.target).scrollMarginBlockStart);
-      // NaN where no style sheet sets it (jsdom); 0 where nothing sticks above the control.
-      if (!(margin > 0)) {
-        return;
-      }
-      const { top, height } = event.target.getBoundingClientRect();
-      // A sliver under a pixel is layout rounding, not a hidden control.
-      if (top <= margin - 1 && height <= document.documentElement.clientHeight - margin) {
-        window.scrollBy(0, top - margin);
+      if (event.target instanceof Element) {
+        keepClearOfStickyParts(event.target, false);
       }
     };
     root.addEventListener('focusin', handleFocusIn);
@@ -652,6 +719,140 @@ function usePositionReport(
   }, [n, includeDeleted]);
 }
 
+/**
+ * A user action a failed save can stop: Save itself, or one that leaves the open record
+ * (`leave` stands for a leave no user action of the workspace asked for, such as Retry's).
+ */
+type RecordAction =
+  | { readonly kind: 'save' | 'first' | 'previous' | 'next' | 'last' | 'new' | 'open' | 'back' | 'leave' }
+  | { readonly kind: 'goTo'; readonly position: number };
+
+const CORRECT_THE_FIELDS = 'correct the fields below.';
+
+/** The line that says what a blocked action did not do; plain text, never a control's name. */
+function blockedText(action: RecordAction): string {
+  switch (action.kind) {
+    case 'save':
+      return `The record was not saved: ${CORRECT_THE_FIELDS}`;
+    case 'first':
+    case 'previous':
+    case 'next':
+    case 'last':
+      return `Could not move to the ${action.kind} record: ${CORRECT_THE_FIELDS}`;
+    case 'goTo':
+      return `Could not go to record ${action.position}: ${CORRECT_THE_FIELDS}`;
+    case 'new':
+      return `Could not start a new record: ${CORRECT_THE_FIELDS}`;
+    case 'open':
+      return `Could not open the record: ${CORRECT_THE_FIELDS}`;
+    case 'back':
+      return `Could not return to the forms list: ${CORRECT_THE_FIELDS}`;
+    case 'leave':
+      return `Could not leave this record: ${CORRECT_THE_FIELDS}`;
+  }
+}
+
+/** Where the workspace moves focus to show the outcome of an action. */
+type OutcomeTarget = 'summary' | 'heading' | 'formGone';
+
+/** A user action that may be stopped by a failed save, as it was started. */
+interface ActionAttempt {
+  readonly action: RecordAction;
+  /**
+   * The element focused as the action started. Its outcome takes focus only from it or
+   * from the page body; `null` lets the outcome take focus from anywhere but a field.
+   */
+  readonly origin: Element | null;
+  /** Where focus goes when the action is stopped and no validation summary says why. */
+  readonly fallback?: OutcomeTarget;
+  /** Told whether the leave the action asked for was granted. */
+  readonly onLeave?: (left: boolean) => void;
+}
+
+/** A request to focus an outcome; `sequence` makes a repeated request a new one. */
+interface OutcomeFocusRequest {
+  readonly target: OutcomeTarget;
+  /** Taken when `target` is not on the page, such as the summary of a save that failed with a banner. */
+  readonly fallback: OutcomeTarget | null;
+  readonly origin: Element | null;
+  readonly sequence: number;
+}
+
+/** The elements an outcome can take focus on, each with tabIndex -1. */
+interface OutcomeTargets {
+  readonly heading: RefObject<HTMLElement>;
+  readonly summary: RefObject<HTMLElement>;
+  readonly formGone: RefObject<HTMLElement>;
+}
+
+/**
+ * Whether an outcome may take focus now. Never from a field, whose focus and blur raise
+ * check-code events, nor from inside a dialog. From anywhere else only when focus rests on
+ * the page body or still on `origin`, the element focused as the action started (`null`
+ * stands for any): focus the user has moved on stays where it is.
+ */
+function mayTakeFocus(origin: Element | null): boolean {
+  const active = document.activeElement;
+  if (active === null || active === document.body || active === document.documentElement) {
+    return true;
+  }
+  if (active.closest('[role="tabpanel"], [aria-modal="true"]') !== null) {
+    return false;
+  }
+  return origin === null || active === origin;
+}
+
+/**
+ * Brings an action's outcome to the user where the action started out of its sight: a save
+ * or move stopped by field errors focuses the validation summary, an open from the grid
+ * focuses the heading the opened record's banners sit under, and a list 404 focuses the
+ * form-gone banner and its "Discard edits". Focusing an element scrolls it into view, but
+ * focusing the element that already holds focus does nothing, so a target still focused by
+ * an earlier outcome (a repeated stopped save, a second open from the grid, after a click
+ * that focused no button) is scrolled into view instead. It is centred, where focusing puts
+ * an element out of view, so it lands clear of the check-code notice pinned at the top.
+ * A 409 that disables Save is not an outcome here: its banner's own effect focuses the heading.
+ *
+ * The focus moves in a passive effect of the commit that shows the outcome: a dialog closed
+ * in that commit (Find, after a result was chosen) releases the page from `inert` and returns
+ * its focus in its own effect cleanup, which runs first, so the outcome's target can take
+ * focus. The returned function is stable.
+ */
+function useOutcomeFocus(
+  targets: OutcomeTargets,
+): (target: OutcomeTarget, origin: Element | null, fallback?: OutcomeTarget | null) => void {
+  const [request, setRequest] = useState<OutcomeFocusRequest | null>(null);
+  const { heading, summary, formGone } = targets;
+  useEffect(() => {
+    if (request === null) {
+      return;
+    }
+    const elementOf = (target: OutcomeTarget | null): HTMLElement | null => {
+      switch (target) {
+        case 'heading':
+          return heading.current;
+        case 'summary':
+          return summary.current;
+        case 'formGone':
+          return formGone.current;
+        case null:
+          return null;
+      }
+    };
+    const element = elementOf(request.target) ?? elementOf(request.fallback);
+    if (element !== null && mayTakeFocus(request.origin)) {
+      if (element === document.activeElement) {
+        element.scrollIntoView({ block: 'center' });
+      } else {
+        element.focus();
+      }
+    }
+  }, [request, heading, summary, formGone]);
+  return useCallback((target: OutcomeTarget, origin: Element | null, fallback: OutcomeTarget | null = null) => {
+    setRequest((previous) => ({ target, fallback, origin, sequence: (previous?.sequence ?? 0) + 1 }));
+  }, []);
+}
+
 /** The workspace of a loaded form: composes navigation and the editor and renders them. */
 function FormWorkspace({
   client,
@@ -669,6 +870,45 @@ function FormWorkspace({
   // navigator's record and callbacks; the ref breaks that cycle. Until the editor's leave
   // is installed nothing is open, so there is nothing to save.
   const leaveRef = useRef<() => Promise<boolean>>(() => Promise.resolve(true));
+
+  // Outcomes of the user's actions. The summary and the form-gone banner take focus (both
+  // have tabIndex -1) when an action that started out of their sight is stopped or finds
+  // the form gone.
+  const summaryRef = useRef<HTMLDivElement>(null);
+  const formGoneRef = useRef<HTMLDivElement>(null);
+  const focusOutcome = useOutcomeFocus({ heading: headingRef, summary: summaryRef, formGone: formGoneRef });
+  // The record generation on screen, for a refusal reported after the render that started it.
+  const generationRef = useRef(0);
+  // The action a failed save stopped, while the field errors that stopped it are shown on
+  // the record it was stopped on. `attempt` grows with every stopped action, so a repeated
+  // one is announced again.
+  const [blocked, setBlocked] = useState<(BlockedAction & { readonly generation: number }) | null>(null);
+  const blockedAttemptsRef = useRef(0);
+  const noteBlocked = useCallback(
+    (attempt: ActionAttempt) => {
+      blockedAttemptsRef.current += 1;
+      setBlocked({
+        message: blockedText(attempt.action),
+        attempt: blockedAttemptsRef.current,
+        generation: generationRef.current,
+      });
+      focusOutcome('summary', attempt.origin, attempt.fallback ?? null);
+    },
+    [focusOutcome],
+  );
+  // The user action whose beforeLeave is about to run. Every navigation action calls
+  // beforeLeave before its first await, so the attempt noted as the action starts is the
+  // one asking; a leave no action asked for, such as Retry's, is reported as a plain leave.
+  const attemptRef = useRef<ActionAttempt | null>(null);
+  const attempting = useCallback(<T,>(attempt: ActionAttempt, run: () => Promise<T>): Promise<T> => {
+    attemptRef.current = attempt;
+    try {
+      return run();
+    } finally {
+      attemptRef.current = null;
+    }
+  }, []);
+
   // Successful saves of this workspace, counted so Back to forms can tell whether its leave saved.
   const savesRef = useRef(0);
   const navigation = useRecordNavigation({
@@ -677,8 +917,34 @@ function FormWorkspace({
     initialPosition,
     initialPositionText,
     initialIncludeDeleted,
-    beforeLeave: () => leaveRef.current(),
+    beforeLeave: () => {
+      const attempt: ActionAttempt = attemptRef.current ?? {
+        action: { kind: 'leave' },
+        origin: document.activeElement,
+      };
+      attemptRef.current = null;
+      return leaveRef.current().then((left) => {
+        attempt.onLeave?.(left);
+        if (!left) {
+          noteBlocked(attempt);
+        }
+        return left;
+      });
+    },
   });
+  useLayoutEffect(() => {
+    generationRef.current = navigation.recordGeneration;
+  });
+  // The control the delete confirmation returns focus to as it closes. A confirmed delete
+  // points it at the heading before the dialog's close is committed, so focus stays on the
+  // form, whose next record is opening, rather than falling to Back to forms; so does a
+  // confirmation that discards a new draft. Cancel and a failed delete leave it unset, and
+  // focus goes back to Delete.
+  const deleteFocusRef = useRef<HTMLElement | null>(null);
+  // The record generation a confirmed delete removed its record from. The toolbar status says
+  // "Record deleted." until the user moves past the record navigation lands on, edits, saves
+  // or asks to delete again.
+  const [deletedIn, setDeletedIn] = useState<number | null>(null);
   const editor = useRecordEditor({
     client,
     viewId,
@@ -690,11 +956,29 @@ function FormWorkspace({
       savesRef.current += 1;
       navigation.afterSave(record);
     },
-    onDeleted: navigation.afterDelete,
+    // The editor reads its options when the DELETE answers, so this render's closure sees
+    // the generation of the record just deleted.
+    onDeleted: () => {
+      deleteFocusRef.current = headingRef.current;
+      setDeletedIn(navigation.recordGeneration);
+      navigation.afterDelete();
+    },
     onConflict: navigation.afterConflict,
     onDiscardToNearest: navigation.openNearest,
     transitioning: navigation.transitioning,
   });
+  // Adjusted during render, so the status never outlives what it reports for a frame.
+  if (
+    deletedIn !== null &&
+    (navigation.recordGeneration > deletedIn + 1 || editor.isDirty || editor.savePending || editor.deleteDialogOpen)
+  ) {
+    setDeletedIn(null);
+  }
+  // Also adjusted during render: the line explains the errors on screen, so it goes with them,
+  // and with the record they were stopped on.
+  if (blocked !== null && (blocked.generation !== navigation.recordGeneration || !hasFieldErrors(editor.fieldErrors))) {
+    setBlocked(null);
+  }
   const { leave } = editor;
   useLayoutEffect(() => {
     leaveRef.current = leave;
@@ -709,9 +993,13 @@ function FormWorkspace({
   const rootRef = useRef<HTMLDivElement>(null);
   const headerRef = useRef<HTMLDivElement>(null);
   useStickyBlockSizes(rootRef, headerRef);
+  const eventNoticeRef = useStickyNoticeBlockSize(rootRef);
   useFocusClearOfStickyParts(rootRef);
 
   const [findOpen, setFindOpen] = useState(false);
+  // Find closes as a result is chosen, and keeps its results until the record on screen has
+  // been left for it: an open refused because the draft could not be saved finds them again.
+  const [keepFindResults, setKeepFindResults] = useState(false);
 
   // One form-not-found path for every 404 that means the form itself is gone: the count's,
   // the grid's list and Find's search. It closes Find. A clean draft hands over to the
@@ -728,12 +1016,22 @@ function FormWorkspace({
   const draftClean = !editor.isDirty;
   const handleFormNotFound = useCallback(() => {
     setFindOpen(false);
+    setKeepFindResults(false);
     setFormGone(true);
   }, []);
+  // The grid sits far below the form-gone banner, whose "Discard edits" is the way on for a
+  // dirty draft, so a list 404 brings the banner to the user. Find's search 404 closes Find,
+  // whose focus returns to the toolbar beside the banner, so that path moves no focus.
+  const handleGridFormNotFound = useCallback(() => {
+    const origin = document.activeElement;
+    handleFormNotFound();
+    focusOutcome('formGone', origin);
+  }, [handleFormNotFound, focusOutcome]);
   // Adjusted during render, so the count's 404 stays recorded after a later navigation
   // action clears navigation's load error.
   if (navigation.loadError?.kind === 'notFound' && !formGone) {
     setFindOpen(false);
+    setKeepFindResults(false);
     setFormGone(true);
   }
   // Also adjusted during render: a drain that answered for a clean draft no longer speaks
@@ -767,14 +1065,44 @@ function FormWorkspace({
   );
 
   // The grid is memoised and every edit of the draft re-renders this workspace, so it gets
-  // stable callbacks only: navigation's actions keep their identity, and so does this one.
+  // stable callbacks only: navigation's actions keep their identity, and so do these. The
+  // grid sits far below the form, so its open ends on the heading, under which the opened
+  // record's banners sit (deleted, no longer exists, a failed read). An open stopped by a
+  // failed save focuses the summary of its field errors, or the heading when a banner says
+  // why instead.
   const { openById } = navigation;
   const openFromGrid = useCallback(
     (id: string) => {
-      void openById(id);
+      const origin = document.activeElement;
+      let refused = false;
+      const attempt: ActionAttempt = {
+        action: { kind: 'open' },
+        origin,
+        fallback: 'heading',
+        onLeave: (left) => {
+          refused = !left;
+        },
+      };
+      void attempting(attempt, () => openById(id)).then(() => {
+        if (!refused) {
+          focusOutcome('heading', origin);
+        }
+      });
     },
-    [openById],
+    [openById, attempting, focusOutcome],
   );
+
+  // The navigator's moves, each noted as the action that asks the editor to leave the record.
+  const attemptOf = (action: RecordAction): ActionAttempt => ({ action, origin: document.activeElement });
+  const navigatorActions: RecordNavigation = {
+    ...navigation,
+    first: () => attempting(attemptOf({ kind: 'first' }), navigation.first),
+    previous: () => attempting(attemptOf({ kind: 'previous' }), navigation.previous),
+    next: () => attempting(attemptOf({ kind: 'next' }), navigation.next),
+    last: () => attempting(attemptOf({ kind: 'last' }), navigation.last),
+    goTo: (position) => attempting(attemptOf({ kind: 'goTo', position }), () => navigation.goTo(position)),
+    newRecord: () => attempting(attemptOf({ kind: 'new' }), navigation.newRecord),
+  };
 
   // Back to forms is a leave like any move: a dirty draft is saved first, and a failed
   // save keeps the user on the record. A second press while the first is pending is ignored.
@@ -784,6 +1112,7 @@ function FormWorkspace({
       return;
     }
     exitingRef.current = true;
+    const attempt = attemptOf({ kind: 'back' });
     const savesBefore = savesRef.current;
     void editor.leave().then(
       (left) => {
@@ -791,6 +1120,8 @@ function FormWorkspace({
         if (left) {
           // The form, and the toolbar's confirmation with it, unmounts: the caller confirms the save.
           onExit(savesRef.current > savesBefore);
+        } else {
+          noteBlocked(attempt);
         }
       },
       () => {
@@ -890,19 +1221,18 @@ function FormWorkspace({
   };
   const openRecordId = navigation.record?.globalRecordId ?? null;
 
-  // Where the delete dialog returns focus first. Confirming on a new draft discards it, which
-  // leaves Delete disabled on the empty draft, so the dialog would fall back to the toolbar's
-  // first button, Back to forms, where a keyboard user's next Enter would leave the form: the
-  // heading takes focus instead. Every other close returns it to Delete, as the dialog does.
-  const deleteReturnFocusRef = useRef<HTMLElement | null>(null);
+  // Where the delete dialog returns focus first (deleteFocusRef). Confirming on a new draft
+  // discards it, which leaves Delete disabled on the empty draft, so the dialog would fall back
+  // to the toolbar's first button, Back to forms, where a keyboard user's next Enter would leave
+  // the form: the heading takes focus instead, as it does after a confirmed delete's 204.
   const { requestDelete, confirmDelete } = editor;
   const openDeleteDialog = (): void => {
-    deleteReturnFocusRef.current = null;
+    deleteFocusRef.current = null;
     requestDelete();
   };
   const confirmDeleteDialog = (): Promise<void> => {
     if (navigation.isNew) {
-      deleteReturnFocusRef.current = headingRef.current;
+      deleteFocusRef.current = headingRef.current;
     }
     return confirmDelete();
   };
@@ -915,7 +1245,8 @@ function FormWorkspace({
 
       {/* The workspace header, sticky where the viewport has room (styles.css), so Save and
           "[n] of N" stay in reach on a long page and a dialog returns focus to an opener in
-          view. It holds the two toolbars only: notices and the summary scroll with the page. */}
+          view. It holds the two toolbars only: the check-code notice sticks just below it, and
+          the other notices and the summary scroll with the page. */}
       <div ref={headerRef} className="form-view__header">
         <WorkspaceToolbar
           saveDisabled={saveDisabled}
@@ -923,16 +1254,22 @@ function FormWorkspace({
           backBlocked={movesBlocked}
           saving={editor.savePending}
           saved={editor.saved}
+          deleteConfirmed={deletedIn !== null}
           deleteDisabled={deleteDisabled}
           onBackToForms={backToForms}
           onSave={() => {
-            void editor.save();
+            const attempt = attemptOf({ kind: 'save' });
+            void editor.save().then((saved) => {
+              if (!saved) {
+                noteBlocked(attempt);
+              }
+            });
           }}
           onDelete={openDeleteDialog}
           onFind={() => setFindOpen(true)}
         />
 
-        <RecordNavigator navigation={navigation} busy={busy} blocked={movesBlocked} canInsert={canInsert} />
+        <RecordNavigator navigation={navigatorActions} busy={busy} blocked={movesBlocked} canInsert={canInsert} />
       </div>
 
       <WorkspaceNotices
@@ -946,11 +1283,13 @@ function FormWorkspace({
           })
         }
         formGone={formGone}
+        formGoneRef={formGoneRef}
         offerDiscard={editor.isDirty && !discardChosen}
         onDiscardFormGone={() => runBannerAction(() => setDiscardChosen(true))}
         editorBanner={editor.banner}
         bannerHandlers={bannerHandlers}
         eventNotices={editor.eventNotices}
+        eventNoticeRef={eventNoticeRef}
       />
 
       {/* A request-level 400 is the editor banner's text, so the summary shows field messages only. */}
@@ -959,6 +1298,8 @@ function FormWorkspace({
         fieldErrors={editor.fieldErrors}
         onSelectField={selectField}
         canSelectField={canSelectField}
+        blocked={blocked}
+        containerRef={summaryRef}
       />
 
       <PageTabs
@@ -977,7 +1318,7 @@ function FormWorkspace({
         listVersion={navigation.listVersion}
         openRecordId={openRecordId}
         onOpen={openFromGrid}
-        onFormNotFound={handleFormNotFound}
+        onFormNotFound={handleGridFormNotFound}
         disabled={busy}
       />
 
@@ -988,19 +1329,37 @@ function FormWorkspace({
         busy={editor.saving}
         isNew={navigation.isNew}
         deleteDialogOpen={editor.deleteDialogOpen}
-        deleteReturnFocusRef={deleteReturnFocusRef}
+        deleteFocusRef={deleteFocusRef}
         onConfirmDelete={confirmDeleteDialog}
         onCancelDelete={editor.cancelDelete}
         dialogs={editor.dialogs}
         onDismissDialog={editor.dismissDialog}
         findOpen={findOpen}
+        keepFindResults={keepFindResults}
         includeDeleted={navigation.includeDeleted}
         openRecordId={openRecordId}
         onFindResult={(id) => {
           setFindOpen(false);
-          void navigation.openById(id);
+          setKeepFindResults(true);
+          // The dialog has closed and returned its focus to Find, so the outcome of a refused
+          // open takes focus from wherever it rests outside a field.
+          void attempting(
+            {
+              action: { kind: 'open' },
+              origin: null,
+              onLeave: (left) => {
+                if (left) {
+                  setKeepFindResults(false);
+                }
+              },
+            },
+            () => navigation.openById(id),
+          );
         }}
-        onFindClose={() => setFindOpen(false)}
+        onFindClose={() => {
+          setFindOpen(false);
+          setKeepFindResults(false);
+        }}
         onFindFormNotFound={handleFormNotFound}
       />
     </div>
@@ -1017,6 +1376,11 @@ interface WorkspaceToolbarProps {
   readonly saving: boolean;
   /** The last save of the draft succeeded and nothing has changed since. */
   readonly saved: boolean;
+  /**
+   * A confirmed delete removed the record, and the user has not moved on since. Saving… takes
+   * precedence, and this takes precedence over the confirmation of an earlier save.
+   */
+  readonly deleteConfirmed: boolean;
   readonly deleteDisabled: boolean;
   readonly onBackToForms: () => void;
   readonly onSave: () => void;
@@ -1031,13 +1395,21 @@ function WorkspaceToolbar({
   backBlocked,
   saving,
   saved,
+  deleteConfirmed,
   deleteDisabled,
   onBackToForms,
   onSave,
   onDelete,
   onFind,
 }: WorkspaceToolbarProps) {
-  const statusText = saving ? SAVING_TEXT : saved ? SAVED_TEXT : '';
+  let statusText = '';
+  if (saving) {
+    statusText = SAVING_TEXT;
+  } else if (deleteConfirmed) {
+    statusText = RECORD_DELETED_TEXT;
+  } else if (saved) {
+    statusText = SAVED_TEXT;
+  }
   return (
     <div className="form-toolbar" role="toolbar" aria-label="Form actions">
       {/* A blocked control is marked, not disabled: its press shows the banner again. */}
@@ -1066,7 +1438,8 @@ function WorkspaceToolbar({
       </button>
       {/* Always rendered, so the status text is announced when it appears; it tells a save
           under way apart from a Save disabled by permission or protection, and confirms a
-          save that succeeded until the next edit. Visually hidden only while empty. */}
+          save that succeeded until the next edit, and a delete, whose record the navigator has
+          already replaced. Visually hidden only while empty. */}
       <span role="status" className={statusText === '' ? 'visually-hidden' : undefined}>
         {statusText}
       </span>
@@ -1085,6 +1458,8 @@ interface WorkspaceNoticesProps {
   readonly onRetryLoad: () => void;
   /** A 404 said the form itself no longer exists. */
   readonly formGone: boolean;
+  /** The form-gone banner, which takes focus when the grid far below it found the form gone. */
+  readonly formGoneRef: RefObject<HTMLDivElement>;
   /** The draft has unsaved edits the user has not yet chosen to discard. */
   readonly offerDiscard: boolean;
   /** "Discard edits" on the form-gone banner: the draft may be dropped and the forms list shown. */
@@ -1095,6 +1470,8 @@ interface WorkspaceNoticesProps {
   readonly bannerHandlers: EditorBannerHandlers;
   /** The non-blocking notices of the fields whose field events could not be evaluated. */
   readonly eventNotices: readonly string[];
+  /** Set on the field-event notice while it is shown, whose block size the sticky parts below it clear. */
+  readonly eventNoticeRef: (notice: HTMLElement | null) => void;
 }
 
 /**
@@ -1108,11 +1485,13 @@ function WorkspaceNotices({
   loadError,
   onRetryLoad,
   formGone,
+  formGoneRef,
   offerDiscard,
   onDiscardFormGone,
   editorBanner,
   bannerHandlers,
   eventNotices,
+  eventNoticeRef,
 }: WorkspaceNoticesProps) {
   const shownEventNotices = useHeldWhilePointerPressed(eventNotices);
   return (
@@ -1138,7 +1517,7 @@ function WorkspaceNotices({
       )}
 
       {formGone && (
-        <div className="banner banner--error" role="alert">
+        <div ref={formGoneRef} className="banner banner--error" role="alert" tabIndex={-1}>
           <p>{FORM_NOT_FOUND_TEXT}</p>
           {offerDiscard && (
             <button type="button" onClick={() => onDiscardFormGone()}>
@@ -1153,8 +1532,11 @@ function WorkspaceNotices({
         <EditorBannerView key={bannerKeyOf(editorBanner)} banner={editorBanner} handlers={bannerHandlers} />
       )}
 
+      {/* Raised by work on a field, which may sit far below; it sticks to the top of the
+          viewport, or just below the header where that sticks, while its place is scrolled
+          past, and takes no focus, as it blocks nothing. */}
       {shownEventNotices.length > 0 && (
-        <div className="banner banner--info" role="status">
+        <div ref={eventNoticeRef} className="banner banner--info banner--sticky" role="status">
           {/* One block, so each notice takes its own line instead of sharing one
               with another short notice as a flex item of the banner. */}
           <div className="banner__messages">
@@ -1235,14 +1617,16 @@ interface WorkspaceDialogsProps {
   readonly busy: boolean;
   readonly isNew: boolean;
   readonly deleteDialogOpen: boolean;
-  /** Focused first when the delete dialog closes; `null` leaves the dialog's own return. */
-  readonly deleteReturnFocusRef: RefObject<HTMLElement>;
+  /** Where the delete confirmation returns focus first as it closes; unset, it returns to Delete. */
+  readonly deleteFocusRef: RefObject<HTMLElement>;
   readonly onConfirmDelete: () => Promise<void>;
   readonly onCancelDelete: () => void;
   /** Check-code DIALOG messages in execution order. */
   readonly dialogs: readonly DialogMessage[];
   readonly onDismissDialog: () => void;
   readonly findOpen: boolean;
+  /** Find keeps its results across its close while the result chosen last is being opened. */
+  readonly keepFindResults: boolean;
   readonly includeDeleted: boolean;
   /** The record on screen; `null` while nothing is open. */
   readonly openRecordId: string | null;
@@ -1261,12 +1645,13 @@ function WorkspaceDialogs({
   busy,
   isNew,
   deleteDialogOpen,
-  deleteReturnFocusRef,
+  deleteFocusRef,
   onConfirmDelete,
   onCancelDelete,
   dialogs,
   onDismissDialog,
   findOpen,
+  keepFindResults,
   includeDeleted,
   openRecordId,
   onFindResult,
@@ -1279,7 +1664,7 @@ function WorkspaceDialogs({
         open={deleteDialogOpen}
         busy={busy}
         isNew={isNew}
-        returnFocusRef={deleteReturnFocusRef}
+        returnFocusRef={deleteFocusRef}
         onConfirm={onConfirmDelete}
         onCancel={onCancelDelete}
       />
@@ -1296,6 +1681,7 @@ function WorkspaceDialogs({
         onOpen={onFindResult}
         onClose={onFindClose}
         onFormNotFound={onFindFormNotFound}
+        keepResults={keepFindResults}
       />
     </>
   );

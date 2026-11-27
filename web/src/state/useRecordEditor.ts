@@ -158,7 +158,12 @@ export interface RecordEditor {
    * save. A delete is not a save.
    */
   readonly savePending: boolean;
-  /** The record was found deleted (409) or was just deleted; every field is protected. */
+  /**
+   * The record was found deleted (409), or was deleted here and is still on screen because
+   * navigation did not replace it (its landing failed); every field is protected. It stays
+   * `false` while navigation replaces a record just deleted: that draft is only frozen, and
+   * takes no edit, save, delete or field event, so the next record shows directly.
+   */
   readonly deletedReadOnly: boolean;
   /** Fields check code disabled; protection is kept apart, so ENABLE never unlocks a protected field. */
   readonly checkCodeDisabled: ReadonlySet<string>;
@@ -247,6 +252,12 @@ interface EditorState {
   readonly saving: boolean;
   readonly savePending: boolean;
   readonly deletedReadOnly: boolean;
+  /**
+   * The DELETE of this draft's record returned 204. Nothing may be saved to the record,
+   * deleted again or raised on it until navigation installs the next one; it shows as
+   * deleted and read-only only once navigation has settled without replacing it.
+   */
+  readonly deleted: boolean;
   readonly deleteDialogOpen: boolean;
   readonly dialogs: readonly DialogMessage[];
   readonly eventNotices: readonly string[];
@@ -440,6 +451,14 @@ function recordProtected(state: EditorState): boolean {
   return state.deletedReadOnly || state.record?.recStatus === 0 || (state.record === null && !state.isNew);
 }
 
+/**
+ * Nothing may be written to the draft or raised on it: its record is protected, or was just
+ * deleted here and awaits the record navigation installs in its place.
+ */
+function recordClosed(state: EditorState): boolean {
+  return state.deleted || recordProtected(state);
+}
+
 function isProtectedIn(state: EditorState, index: FieldIndex, name: string): boolean {
   const field = index.byName.get(name);
   if (field === undefined) {
@@ -452,7 +471,7 @@ function isDraftDirty(state: EditorState, index: FieldIndex): boolean {
   if (state.isNew) {
     return !isEmptyNewDraft(index, state.values);
   }
-  return !recordProtected(state) && hasWritableDirty(state, index);
+  return !recordClosed(state) && hasWritableDirty(state, index);
 }
 
 function freshDraft(index: FieldIndex, record: RecordDto | null, isNew: boolean, generation: number): EditorState {
@@ -468,6 +487,7 @@ function freshDraft(index: FieldIndex, record: RecordDto | null, isNew: boolean,
     saving: false,
     savePending: false,
     deletedReadOnly: false,
+    deleted: false,
     deleteDialogOpen: false,
     dialogs: [],
     eventNotices: [],
@@ -779,7 +799,7 @@ function createController(host: ControllerHost): Controller {
         return;
       }
       const current = host.state();
-      if (recordProtected(current)) {
+      if (recordClosed(current)) {
         // A deleted record keeps its values: only the check-code flags change.
         host.update({ checkCodeDisabled: next.checkCodeDisabled });
         return;
@@ -1063,7 +1083,8 @@ function createController(host: ControllerHost): Controller {
       }
       write = { method: 'POST', generation: s.generation, sentSeq: changeSeq, values: createBody(idx, s.values) };
     } else {
-      if (s.record === null || recordProtected(s)) {
+      // A record just deleted takes no write: nothing is left to save.
+      if (s.record === null || recordClosed(s)) {
         return true;
       }
       const values = updateBody(idx, s.values, s.dirty);
@@ -1168,8 +1189,10 @@ function createController(host: ControllerHost): Controller {
       return;
     }
     if (result.ok) {
-      // Protected until navigation replaces the record, so nothing can be saved to it.
-      host.update({ deletedReadOnly: true });
+      // Closed until navigation replaces the record, so nothing can be saved to it. It is not
+      // marked deleted-read-only here: navigation's landing on the next record starts in this
+      // same update, and the record shows deleted only if that landing leaves it on screen.
+      host.update({ deleted: true });
       host.options().onDeleted();
       return;
     }
@@ -1188,7 +1211,7 @@ function createController(host: ControllerHost): Controller {
     const s = host.state();
     // An empty new draft holds nothing to discard, so it asks nothing; one with entries is
     // still asked about, and its confirmation discards it without a request.
-    if (recordProtected(s) || s.deleteDialogOpen || (s.isNew && isEmptyNewDraft(index(), s.values))) {
+    if (recordClosed(s) || s.deleteDialogOpen || (s.isNew && isEmptyNewDraft(index(), s.values))) {
       return;
     }
     host.update({ deleteDialogOpen: true });
@@ -1287,7 +1310,7 @@ function createController(host: ControllerHost): Controller {
     const s = host.state();
     const idx = index();
     const field = idx.byName.get(name);
-    if (field === undefined || !isDataField(field) || isProtectedIn(s, idx, name) || frozen()) {
+    if (field === undefined || !isDataField(field) || isProtectedIn(s, idx, name) || s.deleted || frozen()) {
       return;
     }
     const value = normalizeValue(field, raw);
@@ -1312,7 +1335,8 @@ function createController(host: ControllerHost): Controller {
   }
 
   function canRaise(name: string): boolean {
-    return active && !isProtectedIn(host.state(), index(), name);
+    const s = host.state();
+    return active && !s.deleted && !isProtectedIn(s, index(), name);
   }
 
   // Raising changes no notice: the layout stays as it is while focus moves, and a failure
@@ -1454,11 +1478,22 @@ function createController(host: ControllerHost): Controller {
   };
 }
 
-function present(state: EditorState, index: FieldIndex, actions: EditorActions, frozen: boolean): RecordEditor {
+/**
+ * @param frozen The draft is being left or replaced.
+ * @param deletedShown The draft's record was deleted here and navigation has settled
+ *   without replacing it, so it shows as deleted and read-only.
+ */
+function present(
+  state: EditorState,
+  index: FieldIndex,
+  actions: EditorActions,
+  frozen: boolean,
+  deletedShown: boolean,
+): RecordEditor {
   // A frozen draft disables every field, so no control accepts input meanwhile, but
   // protects none: protection stays read-only metadata, an unsupported field, a deleted
   // record or none open, and only it takes the protected styling.
-  const isProtected = (name: string): boolean => isProtectedIn(state, index, name);
+  const isProtected = (name: string): boolean => deletedShown || isProtectedIn(state, index, name);
   const isDirty = isDraftDirty(state, index);
   return {
     values: state.values,
@@ -1472,7 +1507,7 @@ function present(state: EditorState, index: FieldIndex, actions: EditorActions, 
     // A leave of a dirty draft saves it once its drain ends, so the save is under way from
     // the drain's start; one a write of unknown outcome refuses never starts.
     savePending: state.savePending || (state.leaving && isDirty && !state.uncertain),
-    deletedReadOnly: state.deletedReadOnly,
+    deletedReadOnly: state.deletedReadOnly || deletedShown,
     checkCodeDisabled: state.checkCodeDisabled,
     frozen,
     isProtected,
@@ -1544,7 +1579,16 @@ export function useRecordEditor(options: UseRecordEditorOptions): RecordEditor {
 
   const index = controller.indexOf(options.definition);
   const frozen = state.leaving || options.transitioning === true;
-  const editor = useMemo(() => present(state, index, controller.actions, frozen), [state, index, controller, frozen]);
+  // Read from this render's options, never from the ref the layout effect updates: the
+  // render that commits a delete's 204 already carries navigation's `transitioning`, and the
+  // render whose generation moved on precedes the commit in which sync() installs the next
+  // record. In neither does the record just deleted show as deleted.
+  const deletedShown =
+    state.deleted && state.generation === options.recordGeneration && options.transitioning !== true;
+  const editor = useMemo(
+    () => present(state, index, controller.actions, frozen, deletedShown),
+    [state, index, controller, frozen, deletedShown],
+  );
 
   const { isDirty } = editor;
   useEffect(() => {

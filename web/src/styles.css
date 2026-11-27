@@ -17,7 +17,7 @@
  *                .record-grid__open-text  .record-grid__row--deleted  .record-grid__table--pending
  *                .record-grid__paging  .record-grid__paging-actions
  *   Messages     .banner  .banner--error  .banner--warning  .banner--info
- *                .banner__actions  .banner__messages  .validation-summary
+ *                .banner--sticky  .banner__actions  .banner__messages  .validation-summary
  *   Dialogs      .dialog-backdrop  .dialog  .button--danger  .find-dialog  .find-dialog__fields
  *                .find-dialog__options  .find-dialog__criterion  .find-dialog__footer
  *                .find-dialog__actions  .find-dialog__results  .find-dialog__results--stale
@@ -695,13 +695,16 @@
    * would otherwise scroll Save, the "[n] of N" position and the page tabs
    * thousands of pixels out of reach, and a dialog returning focus to its
    * toolbar opener would scroll the page back up to it. The header sticks to
-   * the top of the viewport and the tab strip just below it, at the header's
-   * block size, which FormView measures and publishes on the form view as
-   * --form-view-header-block-size (and the strip's as
-   * --form-view-tabs-block-size). The strip releases where its page ends.
-   * Both take the page background, so content scrolled under them does not
-   * show through. They stack above the fields, the header above the strip it
-   * meets once the strip releases, and below the dialog backdrop (1000).
+   * the top of the viewport, a check-code notice (.banner--sticky) just below
+   * it, at the header's block size, and the tab strip below both. FormView
+   * measures and publishes each block size on the form view: the header's as
+   * --form-view-header-block-size, the notice's as
+   * --form-view-notice-block-size (0px while none is shown) and the strip's
+   * as --form-view-tabs-block-size. The strip releases where its page ends.
+   * Header and strip take the page background, so content scrolled under
+   * them does not show through. They stack above the fields, the header
+   * above the notice and the strip it meets once the strip releases, and
+   * below the dialog backdrop (1000).
    *
    * Only where the viewport has room for them: at least 48rem wide, where the
    * header takes two or three rows, about 140-190px, and at least 37.5rem
@@ -709,6 +712,18 @@
    * or shorter viewports, such as phones or a desktop window zoomed to 200%
    * or 400% (about 640 or 320 CSS px wide), keep normal flow, so nothing
    * fixed crowds out reflowed content (WCAG 1.4.10). */
+
+  /* Where the header does not stick, the check-code notice still sticks,
+   * --space-2 below the top of the viewport, so the controls after it keep
+   * clear of it, as all controls keep clear of the stuck parts in the wide
+   * layout below, whose rules come later at the same zero specificity and
+   * take over there. Nothing sticks above the controls before the notice,
+   * and while no notice is shown nothing matches. */
+  :where(.form-view > .banner--sticky ~ *),
+  :where(.form-view > .banner--sticky ~ *) * {
+    scroll-margin-block-start: calc(var(--space-2) + var(--form-view-notice-block-size, 0px) + var(--focus-ring-room));
+  }
+
   @media (min-width: 48rem) and (min-height: 37.5rem) {
     .form-view__header {
       position: sticky;
@@ -717,9 +732,17 @@
       background-color: var(--color-page);
     }
 
+    /* Below the header rather than under it, where the notice would be
+     * hidden again. Like a tab, it clears only the header, below which it
+     * sticks, when a keyboard user reaches a notice that scrolls. */
+    .form-view > .banner--sticky {
+      inset-block-start: var(--form-view-header-block-size, 0px);
+      scroll-margin-block-start: var(--form-view-header-block-size, 0px);
+    }
+
     .page-tabs [role="tablist"] {
       position: sticky;
-      inset-block-start: var(--form-view-header-block-size, 0px);
+      inset-block-start: calc(var(--form-view-header-block-size, 0px) + var(--form-view-notice-block-size, 0px));
       z-index: 1;
       background-color: var(--color-page);
     }
@@ -727,28 +750,33 @@
     /* Focus scrolls a control into view clear of its scroll margin, so after
      * Tab, Shift+Tab, the validation summary's jump or a dialog returning
      * focus, the control and its focus ring sit below the stuck parts rather
-     * than under them: below the header outside the page tabs, and below the
-     * header and the strip inside a tab panel. A tab clears only the header,
-     * below which it sticks, and the header's own controls clear nothing:
-     * stuck in view, they never scroll the page when focused, as Delete is
-     * when its dialog closes. A scroll padding on the page would count them
-     * as hidden under it and scroll to them, and so would clicking or typing
-     * in the navigator's go-to box. FormView applies the margin itself where
-     * the browser does not, as for a date input's inner fields.
+     * than under them: below the header and any check-code notice outside
+     * the page tabs, and below the header, the notice and the strip inside a
+     * tab panel. A tab clears only the header and the notice, below which it
+     * sticks, and the header's own controls clear nothing: stuck in view,
+     * they never scroll the page when focused, as Delete is when its dialog
+     * closes. A scroll padding on the page would count them as hidden under
+     * it and scroll to them, and so would clicking or typing in the
+     * navigator's go-to box. FormView applies the margin itself where the
+     * browser does not, as for a date input's inner fields, or as a notice
+     * grows over the control that holds focus.
      * :where() keeps the first rule at zero specificity, so the others win. */
     :where(.form-view > :not(.form-view__header)),
     :where(.form-view > :not(.form-view__header)) * {
-      scroll-margin-block-start: calc(var(--form-view-header-block-size, 0px) + var(--focus-ring-room));
+      scroll-margin-block-start: calc(
+        var(--form-view-header-block-size, 0px) + var(--form-view-notice-block-size, 0px) + var(--focus-ring-room)
+      );
     }
 
     .page-tabs [role="tab"] {
-      scroll-margin-block-start: var(--form-view-header-block-size, 0px);
+      scroll-margin-block-start: calc(var(--form-view-header-block-size, 0px) + var(--form-view-notice-block-size, 0px));
     }
 
     .page-tabs [role="tabpanel"],
     .page-tabs [role="tabpanel"] * {
       scroll-margin-block-start: calc(
-        var(--form-view-header-block-size, 0px) + var(--form-view-tabs-block-size, 0px) + var(--focus-ring-room)
+        var(--form-view-header-block-size, 0px) + var(--form-view-notice-block-size, 0px) +
+          var(--form-view-tabs-block-size, 0px) + var(--focus-ring-room)
       );
     }
   }
@@ -1361,6 +1389,25 @@
     --banner-border: var(--color-info-border);
     --banner-background: var(--color-info-subtle);
     --banner-text: var(--color-info-text);
+  }
+
+  /* A non-blocking notice raised by work far down the page (a check-code
+   * event that could not run): it keeps its place in the flow and, once that
+   * place is scrolled past, sticks to the top of the viewport over the
+   * content, lifted by the dialog shadow, so it is seen without taking focus.
+   * Where the workspace header sticks, the notice sticks just below it
+   * instead (see "Sticky header and tab strip"). It lists one line or more
+   * per field whose event failed, so with the server out of reach it would
+   * grow over the whole viewport as the user moves through the form: past a
+   * quarter of the viewport's height it scrolls, which browsers that make a
+   * scroll container keyboard-focusable let a keyboard user do. */
+  .banner--sticky {
+    position: sticky;
+    inset-block-start: var(--space-2);
+    z-index: 1;
+    max-block-size: 25vh;
+    overflow-y: auto;
+    box-shadow: var(--shadow-dialog);
   }
 
   /* Field and request-level errors after a rejected save. */

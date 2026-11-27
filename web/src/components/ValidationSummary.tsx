@@ -2,9 +2,17 @@
 // and a request-level `detail`. It lists every message it is given, every missing required field
 // included, where legacy's required check showed a message box for the first missing field only.
 // Render-only: no state, no effects and no rule about what counts as an error.
-import { useId, useMemo } from 'react';
+import { useId, useMemo, type RefObject } from 'react';
 import type { FieldDefinition, FormDefinition, PageDefinition } from '../api/types';
 import { formatRequiredMessage, isDataField, type FieldErrors } from '../validation/clientValidation';
+
+/** The action an error list stopped, as {@link ValidationSummaryProps.blocked} takes it. */
+export interface BlockedAction {
+  /** One line saying what did not happen, such as "Could not move to the next record: correct the fields below." */
+  readonly message: string;
+  /** Counts the blocked attempts; each new value is a new line, which the alert announces again. */
+  readonly attempt: number;
+}
 
 export interface ValidationSummaryProps {
   /** The open form: maps a field name to its prompt and orders the messages by the field's place. */
@@ -33,6 +41,18 @@ export interface ValidationSummaryProps {
    * as the answer changes, so focus on it is kept. Omitted, every field can.
    */
   canSelectField?: (fieldName: string) => boolean;
+  /**
+   * The save or move these errors stopped, shown as a line above the heading, so the user
+   * learns why they are still on the record. The line is keyed by `attempt`, so a repeated
+   * attempt replaces it with a new line, announced again although its text is the same.
+   * Shown only while the summary lists a message or a detail; `null` or omitted shows none.
+   */
+  blocked?: BlockedAction | null;
+  /**
+   * The summary's root, which can take focus (tabIndex -1): the form focuses it when a blocked
+   * action leaves the first error out of view, and focusing it scrolls it into view.
+   */
+  containerRef?: RefObject<HTMLDivElement>;
 }
 
 const DEFAULT_TITLE = 'Please correct the following';
@@ -192,7 +212,8 @@ function separatorAfter(label: string): string {
  * the form, then messages under keys that name no field, after the request-level `detail`. Each
  * message is shown verbatim after its label, except the required-field message, which already
  * opens with the prompt and names the page: it is shown once, verbatim, its opening prompt being
- * the label. Renders nothing when there is no message and no detail.
+ * the label. The action the errors stopped, when given, heads the list. Renders nothing when
+ * there is no message and no detail.
  */
 export function ValidationSummary({
   definition,
@@ -201,6 +222,8 @@ export function ValidationSummary({
   title = DEFAULT_TITLE,
   onSelectField,
   canSelectField,
+  blocked = null,
+  containerRef,
 }: ValidationSummaryProps) {
   // The form re-renders on every keystroke while the definition and the error map keep their
   // identity until either changes, so the ordered items are computed once per change. Whether a
@@ -215,7 +238,12 @@ export function ValidationSummary({
   }
 
   return (
-    <div className="validation-summary" role="alert">
+    <div ref={containerRef} className="validation-summary" role="alert" tabIndex={-1}>
+      {blocked !== null && (
+        <p key={`blocked-${String(blocked.attempt)}`}>
+          <strong>{blocked.message}</strong>
+        </p>
+      )}
       <h3>{title}</h3>
       {detailText !== null && <p>{detailText}</p>}
       {items.length > 0 && (
