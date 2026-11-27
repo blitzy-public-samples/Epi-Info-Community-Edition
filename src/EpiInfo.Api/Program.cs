@@ -1,18 +1,4 @@
-// Composition root of the EpiInfo web API. It builds the ASP.NET Core host, refuses every listen setting that does
-// not bind 127.0.0.1 exactly and answers every request whose Host is not 127.0.0.1 or localhost with a 400
-// (LoopbackBindingGuard), loads the Kestrel endpoints with configuration reload off and applies the configured
-// request body limit, logs through the JSON console provider only, with UTC timestamps and without scopes, under
-// minimum levels for the protected framework categories that no logging configuration can lower (ProtectedLogLevels),
-// and warns at startup when the database connection string is not configured. It registers the wire JSON settings
-// (JsonSetup), the OpenAPI document v1 with its schema transformers, the SQL Server data store
-// (DataStoreRegistration), the check-code engine, the save stamp, the form, record and field-event services, the
-// database health check, and the routing policy that settles route constraints before the HTTP-method and content-type
-// policies (RouteConstraintMatcherPolicy), so a path no route matches is the 404 whatever its method or media type.
-// Its pipeline answers every failure through the API's error contract (ApiExceptionHandler and its exception
-// boundary), turns every empty error response into the API's fixed ProblemDetails (ApiProblems),
-// enforces the body limit and the JSON media type on the body endpoints after routing, maps /openapi/v1.json, the /api
-// form, record and field-event routes and /health, and serves the built web client with its index.html fallback
-// (ClientAppHosting) last.
+using EpiInfo.Api;
 using EpiInfo.Api.Endpoints;
 using EpiInfo.Api.Errors;
 using EpiInfo.Api.Health;
@@ -23,6 +9,7 @@ using EpiInfo.Api.Services;
 using EpiInfo.CheckCode;
 using Microsoft.AspNetCore.Routing.Matching;
 using Microsoft.AspNetCore.Routing.Patterns;
+using Microsoft.AspNetCore.Routing.Template;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -41,6 +28,9 @@ builder.WebHost.ConfigureKestrel((context, options) =>
 
     // Loading the Kestrel section binds endpoints, not limits, so the body cap is applied from configuration here.
     options.Limits.MaxRequestBodySize = ApiOptions.FromConfiguration(context.Configuration).MaxRequestBodySize;
+
+    // No Server header: it names the server software to every client and serves none of them.
+    options.AddServerHeader = false;
 });
 
 builder.Logging.ClearProviders();
@@ -64,8 +54,8 @@ builder.Logging.AddJsonConsole(options =>
 // framework floor (ProtectedLogLevels); a configured level above a floor still applies.
 builder.Services.PostConfigure<LoggerFilterOptions>(ProtectedLogLevels.Apply);
 
-// Bodies framework writers produce through the ProblemDetails service, such as the Development exception page, keep
-// only the API's fixed texts and traceId.
+// Any body a framework writer produces through the ProblemDetails service keeps only the API's fixed texts and
+// traceId.
 builder.Services.AddProblemDetails(options => options.CustomizeProblemDetails = ApiProblems.Customize);
 builder.Services.AddExceptionHandler<ApiExceptionHandler>();
 builder.Services.Configure<RouteHandlerOptions>(options => options.ThrowOnBadRequest = true);
@@ -111,6 +101,16 @@ if (!DataStoreRegistration.HasConnectionString(app.Configuration))
         ApiOptions.ConnectionStringKey);
 }
 
+// First, so no exception leaves the pipeline. The exception handler rethrows a failure it could not answer, such as
+// one whose handler threw; past this boundary it would reach the Development exception page, which CreateBuilder
+// installs ahead of this pipeline and which renders the exception and the request headers, or the server, which logs
+// the exception object.
+app.UseApiOutermostExceptionBoundary();
+
+// Ahead of everything else that writes a response, so every response carries the API's response headers, an error
+// body written after the response is cleared included.
+app.Use(ResponseHeaderPolicy.ApplyAsync);
+
 app.UseExceptionHandler();
 
 // Inside the exception handler, which would otherwise settle a client abort or a failure after the response started
@@ -135,7 +135,11 @@ app.UseRouting();
 app.UseRequestBodyLimit();
 app.UseJsonContentTypeGuard();
 
-app.MapOpenApi();
+// Only the v1 document's own name matches, so any other name is a route miss, which status-code pages answer with the
+// fixed 404 ProblemDetails; the OpenAPI handler would answer a text/plain 404 quoting the name. The name is a route
+// parameter because a pattern without one lets the handler bind it from the query string instead. \z, unlike $,
+// does not match before a final newline, so v1 followed by an encoded newline is a miss too.
+app.MapOpenApi(@"/openapi/{documentName:regex(^v1\z)}.json");
 app.MapFormEndpoints();
 app.MapRecordEndpoints();
 app.MapCheckCodeEndpoints();
@@ -149,422 +153,102 @@ app.Run();
 /// <summary>The API entry point, public so <c>WebApplicationFactory&lt;Program&gt;</c> can host it in tests.</summary>
 public partial class Program;
 
-/// <summary>
-/// Minimum levels for the framework log categories whose lower-level events carry request or configuration values,
-/// enforced beneath every configured logging rule, so no <c>Logging</c> setting can lower them.
-/// </summary>
-/// <remarks>
-/// <para>
-/// <see cref="Apply"/> runs as a post-configuration of <see cref="LoggerFilterOptions"/>, after the rules bound from
-/// <c>Logging:LogLevel</c> and <c>Logging:{Provider}:LogLevel</c>. For each provider and category the logger factory
-/// chooses one rule, preferring a provider-specific rule and then the longest matching category, and lets an event
-/// through only when it passes that rule's level and filter. Every rule therefore gets the floors added to its filter,
-/// and a rule carrying only the floors stands first for the categories no configured rule matches, so the floors hold
-/// whichever rule is chosen.
-/// </para>
-/// <para>
-/// A floor is a minimum: a configured level above it still applies, and every category outside the floors keeps its
-/// configured level. A category falls under a floor when it starts with the floor's prefix, ignoring case, as a
-/// configured category rule matches.
-/// </para>
-/// </remarks>
-internal static class ProtectedLogLevels
-{
-    // Each category prefix with the lowest level it lets through.
-    private static readonly (string CategoryPrefix, LogLevel MinimumLevel)[] Floors =
-    [
-        // The hosting request lines carry the path and query string; the routing, parameter-binding and Kestrel debug
-        // lines carry route values and connection details.
-        ("Microsoft.AspNetCore", LogLevel.Warning),
-
-        // The startup lines carry the listen address, the environment name and the content root. The warning about a
-        // missing connection string is the API's own category and is not affected.
-        ("Microsoft.Hosting.Lifetime", LogLevel.Warning),
-
-        // Its per-check result line repeats, at Error, the one failure line SqlServerHealthCheck writes for the same
-        // Unhealthy result, and its debug lines would write a result's data. Its error line for a check that throws
-        // never occurs: the one registered check catches every failure and rethrows only the caller's cancellation,
-        // which this service does not log.
-        ("Microsoft.Extensions.Diagnostics.HealthChecks.DefaultHealthCheckService", LogLevel.None),
-    ];
-
-    /// <summary>
-    /// Adds the floors to the filter of every rule in <paramref name="options"/> and puts a rule carrying only the
-    /// floors first.
-    /// </summary>
-    /// <param name="options">The filter options, after every configuration source has been applied.</param>
-    /// <exception cref="ArgumentNullException"><paramref name="options"/> is <see langword="null"/>.</exception>
-    public static void Apply(LoggerFilterOptions options)
-    {
-        ArgumentNullException.ThrowIfNull(options);
-
-        for (int index = 0; index < options.Rules.Count; index++)
-        {
-            LoggerFilterRule rule = options.Rules[index];
-            Func<string?, string?, LogLevel, bool>? filter = rule.Filter;
-            options.Rules[index] = new LoggerFilterRule(
-                rule.ProviderName,
-                rule.CategoryName,
-                rule.LogLevel,
-                filter is null
-                    ? (_, category, level) => IsAllowed(category, level)
-                    : (provider, category, level) => IsAllowed(category, level) && filter(provider, category, level));
-        }
-
-        // Any configured rule that matches is chosen over this one; where none matches, it applies the global minimum
-        // level the factory would otherwise use, with the floors.
-        options.Rules.Insert(
-            0,
-            new LoggerFilterRule(null, null, options.MinLevel, (_, category, level) => IsAllowed(category, level)));
-    }
-
-    /// <summary>Whether an event of <paramref name="level"/> in <paramref name="category"/> clears its floor.</summary>
-    /// <param name="category">The logger category; a <see langword="null"/> category falls under no floor.</param>
-    /// <param name="level">The level of the event.</param>
-    /// <returns>
-    /// <see langword="false"/> when the category starts with a floor's prefix and the level is below that floor;
-    /// otherwise <see langword="true"/>.
-    /// </returns>
-    public static bool IsAllowed(string? category, LogLevel level)
-    {
-        if (category is null)
-        {
-            return true;
-        }
-
-        foreach ((string prefix, LogLevel minimum) in Floors)
-        {
-            if (level < minimum && category.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
-            {
-                return false;
-            }
-        }
-
-        return true;
-    }
-}
-
-/// <summary>
-/// A routing policy that settles the route constraints of a route-table node before the HTTP-method and content-type
-/// policies choose among its endpoints, so a request the constraints of every constrained route reject is the route
-/// miss 404 instead of one of those policies' 405 or 415 answers.
-/// </summary>
-/// <remarks>
-/// <para>
-/// Routing walks the request path to the node holding every endpoint whose literal segments the path matches, then
-/// lets each node policy, in <see cref="Order"/>, split that set: the HTTP-method policy by method, the content-type
-/// policy by <c>Content-Type</c>. Constraints such as <c>{viewId:int}</c> run only on the endpoints left at the end,
-/// and the 405 and 415 endpoints those policies add carry none. Left to themselves, they would answer a
-/// <c>text/plain</c> <c>POST</c> to <c>/api/forms/abc/records/search</c> with 415 and a <c>PATCH</c> of
-/// <c>/api/forms/abc/records/x</c> with 405, although no route matches a non-integer form id, and <c>HEAD /health</c>
-/// with 404 while every other method's 405 listed <c>HEAD</c>, taken from the client fallback, whose constraint
-/// excludes <c>health</c>.
-/// </para>
-/// <para>
-/// Running first, it gives each node holding a constrained route two branches: every endpoint of the node, taken when
-/// the constraints of at least one constrained route accept the request, and only the node's unconstrained endpoints,
-/// taken otherwise. The later policies split whichever branch is taken, so their 405 lists only methods of routes the
-/// path can match, and a request no route matches reaches an empty branch, which status-code pages answer with the
-/// 404 ProblemDetails. Routing still runs every constraint on the branch taken, so the policy removes only candidates
-/// their constraints reject and never admits one; endpoint metadata, and so the OpenAPI document, is unchanged.
-/// </para>
-/// <para>
-/// A constrained route's values are the ones routing gives its constraints. The request path is split into segments as
-/// routing splits it, an empty segment between two slashes included and a trailing slash adding none; the values start
-/// from the pattern's defaults, to which a parameter they do not name adds its required value; a parameter with a
-/// required value captures nothing; a catch-all takes the path from its segment to the end; and any other parameter
-/// takes its segment when that segment exists and is not empty. A path such as <c>/health//</c> therefore reaches the
-/// client route's constraint with the same values routing passes it, and is the route miss for every method as it is
-/// for GET. A route with a complex segment, such as <c>{name}.{extension}</c>, counts as accepted, because routing
-/// fills that segment's values through a matcher it does not expose; the node is then left to routing's own handling,
-/// so the policy can never turn a match into a miss. Nodes holding dynamic endpoints are left alone, as the
-/// framework's policies leave them. Everything a jump table holds is built with the route table and never changes, and
-/// each request's values are its own, so one table serves concurrent requests. Nothing here logs, so no path or route
-/// value reaches a log.
-/// </para>
-/// </remarks>
-/// <param name="parameterPolicyFactory">
-/// Resolves a route pattern's parameter policy references, inline names such as <c>int</c> included, to the policy
-/// instances routing itself evaluates.
-/// </param>
-internal sealed class RouteConstraintMatcherPolicy(ParameterPolicyFactory parameterPolicyFactory)
-    : MatcherPolicy, INodeBuilderPolicy
+namespace EpiInfo.Api
 {
     /// <summary>
-    /// Ahead of the HTTP-method policy (-1000) and the content-type policy (-100), whose rejection endpoints would
-    /// otherwise answer before any constraint runs.
+    /// Minimum levels for the framework log categories whose lower-level events carry request or configuration values,
+    /// enforced beneath every configured logging rule, so no <c>Logging</c> setting can lower them.
     /// </summary>
-    public override int Order => -1001;
-
-    /// <summary>Whether <paramref name="endpoints"/>, one node's set, holds a route with a route constraint.</summary>
-    /// <param name="endpoints">The endpoints of a route-table node.</param>
-    /// <returns>
-    /// <see langword="true"/> when at least one is a route endpoint with a route constraint and none is dynamic;
-    /// otherwise <see langword="false"/>.
-    /// </returns>
-    /// <exception cref="ArgumentNullException"><paramref name="endpoints"/> is <see langword="null"/>.</exception>
-    public bool AppliesToEndpoints(IReadOnlyList<Endpoint> endpoints)
+    /// <remarks>
+    /// <para>
+    /// <see cref="Apply"/> runs as a post-configuration of <see cref="LoggerFilterOptions"/>, after the rules bound
+    /// from <c>Logging:LogLevel</c> and <c>Logging:{Provider}:LogLevel</c>. For each provider and category the logger
+    /// factory chooses one rule, preferring a provider-specific rule and then the longest matching category, and lets
+    /// an event through only when it passes that rule's level and filter. Every rule therefore gets the floors added to
+    /// its filter, and a rule carrying only the floors stands first for the categories no configured rule matches, so
+    /// the floors hold whichever rule is chosen.
+    /// </para>
+    /// <para>
+    /// A floor is a minimum: a configured level above it still applies, and every category outside the floors keeps its
+    /// configured level. A category falls under a floor when it starts with the floor's prefix, ignoring case, as a
+    /// configured category rule matches.
+    /// </para>
+    /// </remarks>
+    internal static class ProtectedLogLevels
     {
-        ArgumentNullException.ThrowIfNull(endpoints);
-
-        if (ContainsDynamicEndpoints(endpoints))
-        {
-            return false;
-        }
-
-        foreach (Endpoint endpoint in endpoints)
-        {
-            if (RouteConstraints(endpoint).Length > 0)
-            {
-                return true;
-            }
-        }
-
-        return false;
-    }
-
-    /// <summary>
-    /// Splits one node's set into the branch taken when a constrained route accepts the request, holding every
-    /// endpoint, and the branch taken when none does, holding only the endpoints without a route constraint, each in
-    /// the given order.
-    /// </summary>
-    /// <param name="endpoints">The endpoints of a node this policy applies to.</param>
-    /// <returns>The accepted and the rejected edge, each with a state object of its own.</returns>
-    /// <exception cref="ArgumentNullException"><paramref name="endpoints"/> is <see langword="null"/>.</exception>
-    public IReadOnlyList<PolicyNodeEdge> GetEdges(IReadOnlyList<Endpoint> endpoints)
-    {
-        ArgumentNullException.ThrowIfNull(endpoints);
-
-        var routes = new List<ConstrainedRoute>();
-        var unconstrained = new List<Endpoint>();
-        foreach (Endpoint endpoint in endpoints)
-        {
-            KeyValuePair<string, IRouteConstraint>[] constraints = RouteConstraints(endpoint);
-            if (constraints.Length == 0)
-            {
-                unconstrained.Add(endpoint);
-                continue;
-            }
-
-            // Only a route endpoint yields constraints.
-            routes.Add(new ConstrainedRoute(((RouteEndpoint)endpoint).RoutePattern, constraints));
-        }
-
-        ConstrainedRoute[] constrained = [.. routes];
-        return
+        // Each category prefix with the lowest level it lets through.
+        private static readonly (string CategoryPrefix, LogLevel MinimumLevel)[] Floors =
         [
-            new PolicyNodeEdge(new ConstraintBranch(accepted: true, constrained), endpoints.ToArray()),
-            new PolicyNodeEdge(new ConstraintBranch(accepted: false, constrained), unconstrained.ToArray()),
+            // The hosting request lines carry the path and query string; the routing, parameter-binding and Kestrel
+            // debug lines carry route values and connection details.
+            ("Microsoft.AspNetCore", LogLevel.Warning),
+
+            // The startup lines carry the listen address, the environment name and the content root. The warning about
+            // a missing connection string is the API's own category and is not affected.
+            ("Microsoft.Hosting.Lifetime", LogLevel.Warning),
+
+            // Its per-check result line repeats, at Error, the one failure line SqlServerHealthCheck writes for the
+            // same Unhealthy result, and its debug lines would write a result's data. Its error line for a check that
+            // throws never occurs: the one registered check catches every failure and rethrows only the caller's
+            // cancellation, which this service does not log.
+            ("Microsoft.Extensions.Diagnostics.HealthChecks.DefaultHealthCheckService", LogLevel.None),
+
+            // .NET 10 already keeps an exception a handler reports handled out of its log. Its remaining lines, for an
+            // exception no handler answers or a handler that throws, carry the exception object, whose message can
+            // hold SQL text or values; the API's exception boundaries write the one redacted line for that failure.
+            ("Microsoft.AspNetCore.Diagnostics.ExceptionHandlerMiddleware", LogLevel.None),
         ];
-    }
 
-    /// <summary>Builds the per-request choice between the two branches <see cref="GetEdges"/> created.</summary>
-    /// <param name="exitDestination">The destination routing uses when no edge applies.</param>
-    /// <param name="edges">The edges of one node, each carrying a state object <see cref="GetEdges"/> created.</param>
-    /// <returns>The node's jump table.</returns>
-    /// <exception cref="ArgumentNullException"><paramref name="edges"/> is <see langword="null"/>.</exception>
-    /// <exception cref="ArgumentException">An edge carries a state this policy did not create.</exception>
-    public PolicyJumpTable BuildJumpTable(int exitDestination, IReadOnlyList<PolicyJumpTableEdge> edges)
-    {
-        ArgumentNullException.ThrowIfNull(edges);
-
-        int acceptedDestination = exitDestination;
-        int rejectedDestination = exitDestination;
-        ConstrainedRoute[] routes = [];
-        foreach (PolicyJumpTableEdge edge in edges)
+        /// <summary>
+        /// Adds the floors to the filter of every rule in <paramref name="options"/> and puts a rule carrying only the
+        /// floors first.
+        /// </summary>
+        /// <param name="options">The filter options, after every configuration source has been applied.</param>
+        /// <exception cref="ArgumentNullException"><paramref name="options"/> is <see langword="null"/>.</exception>
+        public static void Apply(LoggerFilterOptions options)
         {
-            if (edge.State is not ConstraintBranch branch)
+            ArgumentNullException.ThrowIfNull(options);
+
+            for (int index = 0; index < options.Rules.Count; index++)
             {
-                throw new ArgumentException("An edge carries a state this policy did not create.", nameof(edges));
+                LoggerFilterRule rule = options.Rules[index];
+                Func<string?, string?, LogLevel, bool>? filter = rule.Filter;
+                options.Rules[index] = new LoggerFilterRule(
+                    rule.ProviderName,
+                    rule.CategoryName,
+                    rule.LogLevel,
+                    filter is null
+                        ? (_, category, level) => IsAllowed(category, level)
+                        : (provider, category, level) =>
+                            IsAllowed(category, level) && filter(provider, category, level));
             }
 
-            routes = branch.Routes;
-            if (branch.Accepted)
-            {
-                acceptedDestination = edge.Destination;
-            }
-            else
-            {
-                rejectedDestination = edge.Destination;
-            }
-        }
-
-        return new ConstraintJumpTable(routes, acceptedDestination, rejectedDestination);
-    }
-
-    // Each route constraint of a route endpoint, keyed by its parameter name, resolved as routing resolves them when it
-    // builds its candidates; empty for any other endpoint. A parameter policy that is not a constraint, such as an
-    // outbound transformer, is skipped, as routing skips it when matching.
-    private KeyValuePair<string, IRouteConstraint>[] RouteConstraints(Endpoint endpoint)
-    {
-        if (endpoint is not RouteEndpoint routeEndpoint)
-        {
-            return [];
-        }
-
-        RoutePattern pattern = routeEndpoint.RoutePattern;
-        List<KeyValuePair<string, IRouteConstraint>>? constraints = null;
-        foreach ((string name, IReadOnlyList<RoutePatternParameterPolicyReference> references)
-            in pattern.ParameterPolicies)
-        {
-            // Null for a policy keyed by a name the pattern has no parameter for, which the factory accepts.
-            RoutePatternParameterPart? parameter = pattern.GetParameter(name);
-            foreach (RoutePatternParameterPolicyReference reference in references)
-            {
-                if (parameterPolicyFactory.Create(parameter, reference) is IRouteConstraint constraint)
-                {
-                    (constraints ??= []).Add(new KeyValuePair<string, IRouteConstraint>(name, constraint));
-                }
-            }
-        }
-
-        return constraints is null ? [] : [.. constraints];
-    }
-
-    /// <summary>
-    /// One constrained route of a node: where routing takes each of its route values from, laid out as routing lays
-    /// them out when it builds the route's candidate, and its route constraints.
-    /// </summary>
-    private sealed class ConstrainedRoute
-    {
-        // Patterns with up to this many segments read the path through a stack buffer.
-        private const int StackSegmentLimit = 32;
-
-        // The values before capture: the pattern's defaults, then one slot per parameter of a simple segment that the
-        // defaults do not name, holding its required value, the catch-all's default (null when it has none), or
-        // nothing. An empty slot, whose key is null, is dropped when the values are built.
-        private readonly KeyValuePair<string, object?>[] slots;
-
-        // Each parameter that takes one whole segment: its name, the index of that segment and its slot.
-        private readonly (string Name, int SegmentIndex, int SlotIndex)[] captures;
-
-        // The catch-all parameter, which takes the path from its segment to the end; the name is null when there is
-        // none.
-        private readonly (string? Name, int SegmentIndex, int SlotIndex) catchAll;
-
-        // How many leading segments of the path the captures and the catch-all read.
-        private readonly int segmentsRead;
-
-        // Whether the pattern has a complex segment, one of more than a single part, such as {name}.{extension}.
-        private readonly bool hasComplexSegment;
-
-        private readonly KeyValuePair<string, IRouteConstraint>[] constraints;
-
-        /// <summary>Lays out the route values of <paramref name="pattern"/> as routing does.</summary>
-        /// <param name="pattern">The route's pattern.</param>
-        /// <param name="constraints">The route's constraints, keyed by parameter name.</param>
-        public ConstrainedRoute(RoutePattern pattern, KeyValuePair<string, IRouteConstraint>[] constraints)
-        {
-            this.constraints = constraints;
-
-            // Parameter names compare as routing compares them, ignoring case.
-            var slotIndexes = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-            var slotList = new List<KeyValuePair<string, object?>>();
-            foreach (KeyValuePair<string, object?> value in pattern.Defaults)
-            {
-                slotIndexes.Add(value.Key, slotList.Count);
-                slotList.Add(value);
-            }
-
-            var captureList = new List<(string Name, int SegmentIndex, int SlotIndex)>();
-            for (int segmentIndex = 0; segmentIndex < pattern.PathSegments.Count; segmentIndex++)
-            {
-                RoutePatternPathSegment segment = pattern.PathSegments[segmentIndex];
-                if (!segment.IsSimple)
-                {
-                    hasComplexSegment = true;
-                    continue;
-                }
-
-                if (segment.Parts[0] is not RoutePatternParameterPart parameter)
-                {
-                    continue;
-                }
-
-                bool hasRequiredValue = TryGetRequiredValue(pattern, parameter, out object? requiredValue);
-                if (!slotIndexes.TryGetValue(parameter.Name, out int slotIndex))
-                {
-                    slotIndex = slotList.Count;
-                    slotIndexes.Add(parameter.Name, slotIndex);
-                    slotList.Add(
-                        hasRequiredValue ? new KeyValuePair<string, object?>(parameter.Name, requiredValue)
-                        : parameter.Default is not null || parameter.IsCatchAll
-                            ? new KeyValuePair<string, object?>(parameter.Name, parameter.Default)
-                            : default);
-                }
-
-                // Routing matches a parameter with a required value as that value's literal and captures nothing.
-                if (hasRequiredValue)
-                {
-                    continue;
-                }
-
-                if (parameter.IsCatchAll)
-                {
-                    catchAll = (parameter.Name, segmentIndex, slotIndex);
-                }
-                else
-                {
-                    captureList.Add((parameter.Name, segmentIndex, slotIndex));
-                }
-
-                segmentsRead = segmentIndex + 1;
-            }
-
-            slots = [.. slotList];
-            captures = [.. captureList];
+            // Any configured rule that matches is chosen over this one; where none matches, it applies the global
+            // minimum level the factory would otherwise use, with the floors.
+            options.Rules.Insert(
+                0,
+                new LoggerFilterRule(null, null, options.MinLevel, (_, category, level) => IsAllowed(category, level)));
         }
 
         /// <summary>
-        /// Whether the route's constraints accept the route values routing captures from the request path for this
-        /// route.
+        /// Whether an event of <paramref name="level"/> in <paramref name="category"/> clears its floor.
         /// </summary>
-        /// <param name="httpContext">The request, whose path supplies the route values.</param>
+        /// <param name="category">The logger category; a <see langword="null"/> category falls under no floor.</param>
+        /// <param name="level">The level of the event.</param>
         /// <returns>
-        /// <see langword="false"/> when a constraint rejects those values; <see langword="true"/> when every constraint
-        /// accepts them, and for a pattern with a complex segment.
+        /// <see langword="false"/> when the category starts with a floor's prefix and the level is below that floor;
+        /// otherwise <see langword="true"/>.
         /// </returns>
-        public bool Accepts(HttpContext httpContext)
+        public static bool IsAllowed(string? category, LogLevel level)
         {
-            // Routing fills a complex segment's values through its own matcher, which it does not expose. Without them
-            // a constraint could reject what routing accepts, so such a route is left to routing, and the policy never
-            // turns a match into a miss.
-            if (hasComplexSegment)
+            if (category is null)
             {
                 return true;
             }
 
-            // The path routing reads; a missing one has no segments.
-            string path = httpContext.Request.Path.Value ?? string.Empty;
-            Span<PathSegment> buffer = segmentsRead <= StackSegmentLimit
-                ? stackalloc PathSegment[segmentsRead]
-                : new PathSegment[segmentsRead];
-            int count = Tokenize(path, buffer);
-
-            // An array of its own per call: route values are request data, and the layout is shared by every request.
-            KeyValuePair<string, object?>[] values = [.. slots];
-            foreach ((string name, int segmentIndex, int slotIndex) in captures)
+            foreach ((string prefix, LogLevel minimum) in Floors)
             {
-                // An empty segment captures nothing, so the slot keeps its default or stays empty.
-                if (segmentIndex < count && buffer[segmentIndex].Length > 0)
-                {
-                    PathSegment segment = buffer[segmentIndex];
-                    values[slotIndex] =
-                        new KeyValuePair<string, object?>(name, path.Substring(segment.Start, segment.Length));
-                }
-            }
-
-            if (catchAll.Name is not null && catchAll.SegmentIndex < count)
-            {
-                values[catchAll.SlotIndex] = new KeyValuePair<string, object?>(
-                    catchAll.Name,
-                    path.Substring(buffer[catchAll.SegmentIndex].Start));
-            }
-
-            RouteValueDictionary routeValues = RouteValueDictionary.FromArray(values);
-            foreach ((string parameterName, IRouteConstraint constraint) in constraints)
-            {
-                if (!constraint.Match(httpContext, null, parameterName, routeValues, RouteDirection.IncomingRequest))
+                if (level < minimum && category.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
                 {
                     return false;
                 }
@@ -572,86 +256,548 @@ internal sealed class RouteConstraintMatcherPolicy(ParameterPolicyFactory parame
 
             return true;
         }
-
-        // Routing's own rule: a required value stands for its literal unless it is null or empty.
-        private static bool TryGetRequiredValue(
-            RoutePattern pattern,
-            RoutePatternParameterPart parameter,
-            out object? value) =>
-            pattern.RequiredValues.TryGetValue(parameter.Name, out value)
-            && !RouteValueEqualityComparer.Default.Equals(value, string.Empty);
-
-        // Splits path into segments as routing does: after the leading slash, each piece that ends in a slash is a
-        // segment, an empty piece between two slashes included, and the text after the last slash is one more only
-        // when it is not empty, so a trailing slash adds none. It stops once segments is full; the segments before
-        // that point are the ones routing finds.
-        private static int Tokenize(string path, Span<PathSegment> segments)
-        {
-            if (path.Length == 0)
-            {
-                return 0;
-            }
-
-            int count = 0;
-            int start = 1;
-            ReadOnlySpan<char> rest = path.AsSpan(start);
-            int end;
-            while (count < segments.Length && (end = rest.IndexOf('/')) >= 0)
-            {
-                segments[count++] = new PathSegment(start, end);
-                start += end + 1;
-                rest = path.AsSpan(start);
-            }
-
-            if (rest.Length > 0 && count < segments.Length)
-            {
-                segments[count++] = new PathSegment(start, rest.Length);
-            }
-
-            return count;
-        }
-    }
-
-    /// <summary>One segment of a request path: where it starts in the path and how many characters it holds.</summary>
-    private readonly record struct PathSegment(int Start, int Length);
-
-    /// <summary>
-    /// The state of one of a node's two edges. Each edge has an instance of its own, because routing keys a node's
-    /// edges by their states; both carry the node's constrained routes for <see cref="BuildJumpTable"/>.
-    /// </summary>
-    private sealed class ConstraintBranch(bool accepted, ConstrainedRoute[] routes)
-    {
-        /// <summary>Whether this is the branch taken when a constrained route accepts the request.</summary>
-        public bool Accepted { get; } = accepted;
-
-        /// <summary>The node's constrained routes.</summary>
-        public ConstrainedRoute[] Routes { get; } = routes;
-
-        /// <summary>The edge's label in routing's graph diagnostics.</summary>
-        public override string ToString() =>
-            Accepted ? "route constraints: accepted" : "route constraints: rejected";
     }
 
     /// <summary>
-    /// Takes the accepted branch as soon as one constrained route accepts the request, and the rejected branch when
-    /// none does.
+    /// A routing policy that settles the route constraints of a route-table node before the HTTP-method and
+    /// content-type policies choose among its endpoints, so a request the constraints of every constrained route reject
+    /// is the route miss 404 instead of one of those policies' 405 or 415 answers.
     /// </summary>
-    private sealed class ConstraintJumpTable(
-        ConstrainedRoute[] routes,
-        int acceptedDestination,
-        int rejectedDestination) : PolicyJumpTable
+    /// <remarks>
+    /// <para>
+    /// Routing walks the request path to the node holding every endpoint whose literal segments the path matches, then
+    /// lets each node policy, in <see cref="Order"/>, split that set: the HTTP-method policy by method, the
+    /// content-type policy by <c>Content-Type</c>. Constraints such as <c>{viewId:int}</c> run only on the endpoints
+    /// left at the end, and the 405 and 415 endpoints those policies add carry none. Left to themselves, they would
+    /// answer a <c>text/plain</c> <c>POST</c> to <c>/api/forms/abc/records/search</c> with 415 and a <c>PATCH</c> of
+    /// <c>/api/forms/abc/records/x</c> with 405, although no route matches a non-integer form id, and
+    /// <c>HEAD /health</c> with 404 while every other method's 405 listed <c>HEAD</c>, taken from the client fallback,
+    /// whose constraint excludes <c>health</c>.
+    /// </para>
+    /// <para>
+    /// Running first, it gives each node holding a constrained route two branches: every endpoint of the node, taken
+    /// when the constraints of at least one constrained route accept the request, and only the node's unconstrained
+    /// endpoints, taken otherwise. The later policies split whichever branch is taken, so their 405 lists only methods
+    /// of routes the path can match, and a request no route matches reaches an empty branch, which status-code pages
+    /// answer with the 404 ProblemDetails. Routing still runs every constraint on the branch taken, so the policy
+    /// removes only candidates their constraints reject and never admits one; endpoint metadata, and so the OpenAPI
+    /// document, is unchanged.
+    /// </para>
+    /// <para>
+    /// A constrained route's values are the ones routing gives its constraints. The request path is split into segments
+    /// as routing splits it, an empty segment between two slashes included and a trailing slash adding none; the values
+    /// start from the pattern's defaults, to which a parameter they do not name adds its required value; a parameter
+    /// with a required value captures nothing; a catch-all takes the path from its segment to the end; any other
+    /// parameter of a simple segment takes its segment when that segment exists and is not empty; and each complex
+    /// segment, such as <c>{name}.{extension}</c>, is then matched against its path segment by a
+    /// <see cref="TemplateMatcher"/> over that segment alone, which runs routing's own complex-segment matching and
+    /// adds the segment's parameters, so a path segment it cannot match, an empty one included, rejects the route as
+    /// routing drops it. A path such as <c>/health//</c> therefore reaches the client route's constraint with the same
+    /// values routing passes it, and is the route miss for every method as it is for GET; so is every method on an
+    /// OpenAPI document name the route's constraint rejects, such as <c>/openapi/v2.json</c>, while
+    /// <c>POST /openapi/v1.json</c> keeps the 405 that lists <c>GET</c>. A route the policy rejects is one routing
+    /// rejects, so the policy never turns a match into a miss.
+    /// Nodes holding dynamic endpoints are left alone, as the framework's policies leave them. Everything a jump table
+    /// holds is built with the route table and never changes, and each request's values are its own, so one table
+    /// serves concurrent requests. Nothing here logs, so no path or route value reaches a log.
+    /// </para>
+    /// </remarks>
+    /// <param name="parameterPolicyFactory">
+    /// Resolves a route pattern's parameter policy references, inline names such as <c>int</c> included, to the policy
+    /// instances routing itself evaluates.
+    /// </param>
+    internal sealed class RouteConstraintMatcherPolicy(ParameterPolicyFactory parameterPolicyFactory)
+        : MatcherPolicy, INodeBuilderPolicy
     {
-        public override int GetDestination(HttpContext httpContext)
+        /// <summary>
+        /// Ahead of the HTTP-method policy (-1000) and the content-type policy (-100), whose rejection endpoints would
+        /// otherwise answer before any constraint runs.
+        /// </summary>
+        public override int Order => -1001;
+
+        /// <summary>
+        /// Whether <paramref name="endpoints"/>, one node's set, holds a route with a route constraint.
+        /// </summary>
+        /// <param name="endpoints">The endpoints of a route-table node.</param>
+        /// <returns>
+        /// <see langword="true"/> when at least one is a route endpoint with a route constraint and none is dynamic;
+        /// otherwise <see langword="false"/>.
+        /// </returns>
+        /// <exception cref="ArgumentNullException"><paramref name="endpoints"/> is <see langword="null"/>.</exception>
+        public bool AppliesToEndpoints(IReadOnlyList<Endpoint> endpoints)
         {
-            foreach (ConstrainedRoute route in routes)
+            ArgumentNullException.ThrowIfNull(endpoints);
+
+            if (ContainsDynamicEndpoints(endpoints))
             {
-                if (route.Accepts(httpContext))
+                return false;
+            }
+
+            foreach (Endpoint endpoint in endpoints)
+            {
+                if (RouteConstraints(endpoint).Length > 0)
                 {
-                    return acceptedDestination;
+                    return true;
                 }
             }
 
-            return rejectedDestination;
+            return false;
+        }
+
+        /// <summary>
+        /// Splits one node's set into the branch taken when a constrained route accepts the request, holding every
+        /// endpoint, and the branch taken when none does, holding only the endpoints without a route constraint, each
+        /// in the given order.
+        /// </summary>
+        /// <param name="endpoints">The endpoints of a node this policy applies to.</param>
+        /// <returns>The accepted and the rejected edge, each with a state object of its own.</returns>
+        /// <exception cref="ArgumentNullException"><paramref name="endpoints"/> is <see langword="null"/>.</exception>
+        public IReadOnlyList<PolicyNodeEdge> GetEdges(IReadOnlyList<Endpoint> endpoints)
+        {
+            ArgumentNullException.ThrowIfNull(endpoints);
+
+            var routes = new List<ConstrainedRoute>();
+            var unconstrained = new List<Endpoint>();
+            foreach (Endpoint endpoint in endpoints)
+            {
+                KeyValuePair<string, IRouteConstraint>[] constraints = RouteConstraints(endpoint);
+                if (constraints.Length == 0)
+                {
+                    unconstrained.Add(endpoint);
+                    continue;
+                }
+
+                // Only a route endpoint yields constraints.
+                routes.Add(new ConstrainedRoute(((RouteEndpoint)endpoint).RoutePattern, constraints));
+            }
+
+            ConstrainedRoute[] constrained = [.. routes];
+            return
+            [
+                new PolicyNodeEdge(new ConstraintBranch(accepted: true, constrained), endpoints.ToArray()),
+                new PolicyNodeEdge(new ConstraintBranch(accepted: false, constrained), unconstrained.ToArray()),
+            ];
+        }
+
+        /// <summary>Builds the per-request choice between the two branches <see cref="GetEdges"/> created.</summary>
+        /// <param name="exitDestination">The destination routing uses when no edge applies.</param>
+        /// <param name="edges">
+        /// The edges of one node, each carrying a state object <see cref="GetEdges"/> created.
+        /// </param>
+        /// <returns>The node's jump table.</returns>
+        /// <exception cref="ArgumentNullException"><paramref name="edges"/> is <see langword="null"/>.</exception>
+        /// <exception cref="ArgumentException">An edge carries a state this policy did not create.</exception>
+        public PolicyJumpTable BuildJumpTable(int exitDestination, IReadOnlyList<PolicyJumpTableEdge> edges)
+        {
+            ArgumentNullException.ThrowIfNull(edges);
+
+            int acceptedDestination = exitDestination;
+            int rejectedDestination = exitDestination;
+            ConstrainedRoute[] routes = [];
+            foreach (PolicyJumpTableEdge edge in edges)
+            {
+                if (edge.State is not ConstraintBranch branch)
+                {
+                    throw new ArgumentException("An edge carries a state this policy did not create.", nameof(edges));
+                }
+
+                routes = branch.Routes;
+                if (branch.Accepted)
+                {
+                    acceptedDestination = edge.Destination;
+                }
+                else
+                {
+                    rejectedDestination = edge.Destination;
+                }
+            }
+
+            return new ConstraintJumpTable(routes, acceptedDestination, rejectedDestination);
+        }
+
+        // Each route constraint of a route endpoint, keyed by its parameter name, resolved as routing resolves them
+        // when it builds its candidates; empty for any other endpoint. A parameter policy that is not a constraint,
+        // such as an outbound transformer, is skipped, as routing skips it when matching.
+        private KeyValuePair<string, IRouteConstraint>[] RouteConstraints(Endpoint endpoint)
+        {
+            if (endpoint is not RouteEndpoint routeEndpoint)
+            {
+                return [];
+            }
+
+            RoutePattern pattern = routeEndpoint.RoutePattern;
+            List<KeyValuePair<string, IRouteConstraint>>? constraints = null;
+            foreach ((string name, IReadOnlyList<RoutePatternParameterPolicyReference> references)
+                in pattern.ParameterPolicies)
+            {
+                // Null for a policy keyed by a name the pattern has no parameter for, which the factory accepts.
+                RoutePatternParameterPart? parameter = pattern.GetParameter(name);
+                foreach (RoutePatternParameterPolicyReference reference in references)
+                {
+                    if (parameterPolicyFactory.Create(parameter, reference) is IRouteConstraint constraint)
+                    {
+                        (constraints ??= []).Add(new KeyValuePair<string, IRouteConstraint>(name, constraint));
+                    }
+                }
+            }
+
+            return constraints is null ? [] : [.. constraints];
+        }
+
+        /// <summary>
+        /// One constrained route of a node: where routing takes each of its route values from, laid out as routing lays
+        /// them out when it builds the route's candidate, and its route constraints.
+        /// </summary>
+        private sealed class ConstrainedRoute
+        {
+            // Patterns with up to this many segments read the path through a stack buffer.
+            private const int StackSegmentLimit = 32;
+
+            // The values before capture: the pattern's defaults, then one slot per parameter of a simple segment that
+            // the defaults do not name, holding its required value, the catch-all's default (null when it has none), or
+            // nothing. An empty slot, whose key is null, is dropped when the values are built.
+            private readonly KeyValuePair<string, object?>[] slots;
+
+            // Each parameter that takes one whole segment: its name, the index of that segment and its slot.
+            private readonly (string Name, int SegmentIndex, int SlotIndex)[] captures;
+
+            // The catch-all parameter, which takes the path from its segment to the end; the name is null when there is
+            // none.
+            private readonly (string? Name, int SegmentIndex, int SlotIndex) catchAll;
+
+            // How many leading segments of the path the captures, the catch-all and the complex segments read.
+            private readonly int segmentsRead;
+
+            // Each complex segment, one of more than a single part such as {name}.{extension}: its index and a matcher
+            // over that segment alone, which adds the segment's parameters to the values.
+            private readonly (int SegmentIndex, TemplateMatcher Matcher)[] complexSegments;
+
+            private readonly KeyValuePair<string, IRouteConstraint>[] constraints;
+
+            /// <summary>Lays out the route values of <paramref name="pattern"/> as routing does.</summary>
+            /// <param name="pattern">The route's pattern.</param>
+            /// <param name="constraints">The route's constraints, keyed by parameter name.</param>
+            public ConstrainedRoute(RoutePattern pattern, KeyValuePair<string, IRouteConstraint>[] constraints)
+            {
+                this.constraints = constraints;
+
+                // Parameter names compare as routing compares them, ignoring case.
+                var slotIndexes = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+                var slotList = new List<KeyValuePair<string, object?>>();
+                foreach (KeyValuePair<string, object?> value in pattern.Defaults)
+                {
+                    slotIndexes.Add(value.Key, slotList.Count);
+                    slotList.Add(value);
+                }
+
+                var captureList = new List<(string Name, int SegmentIndex, int SlotIndex)>();
+                var complexList = new List<(int SegmentIndex, TemplateMatcher Matcher)>();
+                for (int segmentIndex = 0; segmentIndex < pattern.PathSegments.Count; segmentIndex++)
+                {
+                    RoutePatternPathSegment segment = pattern.PathSegments[segmentIndex];
+                    if (!segment.IsSimple)
+                    {
+                        complexList.Add((segmentIndex, SegmentMatcher(segment)));
+                        segmentsRead = segmentIndex + 1;
+                        continue;
+                    }
+
+                    if (segment.Parts[0] is not RoutePatternParameterPart parameter)
+                    {
+                        continue;
+                    }
+
+                    bool hasRequiredValue = TryGetRequiredValue(pattern, parameter, out object? requiredValue);
+                    if (!slotIndexes.TryGetValue(parameter.Name, out int slotIndex))
+                    {
+                        slotIndex = slotList.Count;
+                        slotIndexes.Add(parameter.Name, slotIndex);
+                        slotList.Add(
+                            hasRequiredValue ? new KeyValuePair<string, object?>(parameter.Name, requiredValue)
+                            : parameter.Default is not null || parameter.IsCatchAll
+                                ? new KeyValuePair<string, object?>(parameter.Name, parameter.Default)
+                                : default);
+                    }
+
+                    // Routing matches a parameter with a required value as that value's literal and captures nothing.
+                    if (hasRequiredValue)
+                    {
+                        continue;
+                    }
+
+                    if (parameter.IsCatchAll)
+                    {
+                        catchAll = (parameter.Name, segmentIndex, slotIndex);
+                    }
+                    else
+                    {
+                        captureList.Add((parameter.Name, segmentIndex, slotIndex));
+                    }
+
+                    segmentsRead = segmentIndex + 1;
+                }
+
+                slots = [.. slotList];
+                captures = [.. captureList];
+                complexSegments = [.. complexList];
+            }
+
+            /// <summary>
+            /// Whether the route's constraints accept the route values routing captures from the request path for this
+            /// route.
+            /// </summary>
+            /// <param name="httpContext">The request, whose path supplies the route values.</param>
+            /// <returns>
+            /// <see langword="false"/> when a complex segment does not match its path segment, where routing drops the
+            /// route, or when a constraint rejects those values; <see langword="true"/> when every constraint accepts
+            /// them.
+            /// </returns>
+            public bool Accepts(HttpContext httpContext)
+            {
+                // The path routing reads; a missing one has no segments.
+                string path = httpContext.Request.Path.Value ?? string.Empty;
+                Span<PathSegment> buffer = segmentsRead <= StackSegmentLimit
+                    ? stackalloc PathSegment[segmentsRead]
+                    : new PathSegment[segmentsRead];
+                int count = Tokenize(path, buffer);
+
+                // An array of its own per call: route values are request data, and the layout is shared by every
+                // request.
+                KeyValuePair<string, object?>[] values = [.. slots];
+                foreach ((string name, int segmentIndex, int slotIndex) in captures)
+                {
+                    // An empty segment captures nothing, so the slot keeps its default or stays empty.
+                    if (segmentIndex < count && buffer[segmentIndex].Length > 0)
+                    {
+                        PathSegment segment = buffer[segmentIndex];
+                        values[slotIndex] =
+                            new KeyValuePair<string, object?>(name, path.Substring(segment.Start, segment.Length));
+                    }
+                }
+
+                if (catchAll.Name is not null && catchAll.SegmentIndex < count)
+                {
+                    values[catchAll.SlotIndex] = new KeyValuePair<string, object?>(
+                        catchAll.Name,
+                        path.Substring(buffer[catchAll.SegmentIndex].Start));
+                }
+
+                RouteValueDictionary routeValues = RouteValueDictionary.FromArray(values);
+
+                // Routing matches each complex segment once the other values are in place and drops the route when one
+                // does not match. An empty segment never matches, because each parameter of a complex segment needs a
+                // value. The matcher reads the segment, with the slash before it, as a path of one segment; the
+                // PathString constructor keeps the text as routing reads it, where the string conversion would
+                // unescape it.
+                foreach ((int segmentIndex, TemplateMatcher matcher) in complexSegments)
+                {
+                    if (segmentIndex >= count || buffer[segmentIndex].Length == 0)
+                    {
+                        return false;
+                    }
+
+                    PathSegment segment = buffer[segmentIndex];
+                    var segmentPath = new PathString(path.Substring(segment.Start - 1, segment.Length + 1));
+                    if (!matcher.TryMatch(segmentPath, routeValues))
+                    {
+                        return false;
+                    }
+                }
+
+                foreach ((string parameterName, IRouteConstraint constraint) in constraints)
+                {
+                    if (!constraint.Match(
+                            httpContext,
+                            null,
+                            parameterName,
+                            routeValues,
+                            RouteDirection.IncomingRequest))
+                    {
+                        return false;
+                    }
+                }
+
+                return true;
+            }
+
+            // Routing's own rule: a required value stands for its literal unless it is null or empty.
+            private static bool TryGetRequiredValue(
+                RoutePattern pattern,
+                RoutePatternParameterPart parameter,
+                out object? value) =>
+                pattern.RequiredValues.TryGetValue(parameter.Name, out value)
+                && !RouteValueEqualityComparer.Default.Equals(value, string.Empty);
+
+            // A matcher over segment alone, which runs routing's own complex-segment matching: it compares the literals
+            // ignoring case, divides the rest of the text among the parameters, adds their values to the ones it is
+            // given and leaves the others as they are. Its parameters carry no policies and no defaults, because the
+            // constraints run afterwards and the defaults are already among the values.
+            private static TemplateMatcher SegmentMatcher(RoutePatternPathSegment segment)
+            {
+                RoutePatternPart[] parts =
+                [
+                    .. segment.Parts.Select(part => part is RoutePatternParameterPart parameter
+                        ? RoutePatternFactory.ParameterPart(parameter.Name, null, parameter.ParameterKind)
+                        : part),
+                ];
+                RoutePattern segmentPattern = RoutePatternFactory.Pattern(RoutePatternFactory.Segment(parts));
+                return new TemplateMatcher(new RouteTemplate(segmentPattern), new RouteValueDictionary());
+            }
+
+            // Splits path into segments as routing does: after the leading slash, each piece that ends in a slash is a
+            // segment, an empty piece between two slashes included, and the text after the last slash is one more only
+            // when it is not empty, so a trailing slash adds none. It stops once segments is full; the segments before
+            // that point are the ones routing finds.
+            private static int Tokenize(string path, Span<PathSegment> segments)
+            {
+                if (path.Length == 0)
+                {
+                    return 0;
+                }
+
+                int count = 0;
+                int start = 1;
+                ReadOnlySpan<char> rest = path.AsSpan(start);
+                int end;
+                while (count < segments.Length && (end = rest.IndexOf('/')) >= 0)
+                {
+                    segments[count++] = new PathSegment(start, end);
+                    start += end + 1;
+                    rest = path.AsSpan(start);
+                }
+
+                if (rest.Length > 0 && count < segments.Length)
+                {
+                    segments[count++] = new PathSegment(start, rest.Length);
+                }
+
+                return count;
+            }
+        }
+
+        /// <summary>
+        /// One segment of a request path: where it starts in the path and how many characters it holds.
+        /// </summary>
+        private readonly record struct PathSegment(int Start, int Length);
+
+        /// <summary>
+        /// The state of one of a node's two edges. Each edge has an instance of its own, because routing keys a node's
+        /// edges by their states; both carry the node's constrained routes for <see cref="BuildJumpTable"/>.
+        /// </summary>
+        private sealed class ConstraintBranch(bool accepted, ConstrainedRoute[] routes)
+        {
+            /// <summary>Whether this is the branch taken when a constrained route accepts the request.</summary>
+            public bool Accepted { get; } = accepted;
+
+            /// <summary>The node's constrained routes.</summary>
+            public ConstrainedRoute[] Routes { get; } = routes;
+
+            /// <summary>The edge's label in routing's graph diagnostics.</summary>
+            public override string ToString() =>
+                Accepted ? "route constraints: accepted" : "route constraints: rejected";
+        }
+
+        /// <summary>
+        /// Takes the accepted branch as soon as one constrained route accepts the request, and the rejected branch when
+        /// none does.
+        /// </summary>
+        private sealed class ConstraintJumpTable(
+            ConstrainedRoute[] routes,
+            int acceptedDestination,
+            int rejectedDestination) : PolicyJumpTable
+        {
+            public override int GetDestination(HttpContext httpContext)
+            {
+                foreach (ConstrainedRoute route in routes)
+                {
+                    if (route.Accepts(httpContext))
+                    {
+                        return acceptedDestination;
+                    }
+                }
+
+                return rejectedDestination;
+            }
+        }
+    }
+
+    /// <summary>
+    /// The headers the API sets on every response it sends, whichever part of the pipeline writes it: the endpoints,
+    /// OpenAPI, <c>/health</c>, the static client and its <c>index.html</c> fallback, the error handling and the
+    /// status-code pages. Every response carries <c>X-Content-Type-Options: nosniff</c>, so a browser never reads a
+    /// body as a type other than the one it is sent as, and <c>X-Frame-Options: DENY</c> with
+    /// <c>Content-Security-Policy: frame-ancestors 'none'</c>, so no page can frame the client. A response to a
+    /// request under <c>/api</c>, success and error alike, also carries <c>Cache-Control: no-store</c>: record, list
+    /// and search bodies hold the records' field values, which no browser cache may keep.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <see cref="ApplyAsync"/> runs ahead of every middleware that writes a response and registers the headers through
+    /// <see cref="HttpResponse.OnStarting(Func{object, Task}, object)"/>, so they are set as the response starts. They
+    /// therefore survive the exception handler and the API's exception boundaries clearing the response before an
+    /// error body, and, because start callbacks run in the reverse order of their registration, they are applied after
+    /// any callback registered later, such as the exception handler's cache headers, whose <c>Cache-Control</c> an
+    /// <c>/api</c> response replaces. Whether a request is under <c>/api</c> is decided on its path at entry, by whole
+    /// segment and ignoring case, as routing matches the <c>api</c> literal.
+    /// </para>
+    /// <para>
+    /// Nothing else is set or changed. The Content-Security-Policy holds the one directive <c>frame-ancestors</c>,
+    /// which restricts nothing the client itself loads. Caching outside <c>/api</c> stays with its owners: the hashed
+    /// client bundles keep the static-file defaults and <c>index.html</c> its <c>no-cache</c>. No HSTS header is sent,
+    /// because the API listens on plain HTTP on the loopback address only, and no CORS header, because the client is
+    /// same-origin.
+    /// </para>
+    /// </remarks>
+    internal static class ResponseHeaderPolicy
+    {
+        private const string NoSniff = "nosniff";
+
+        private const string DenyFraming = "DENY";
+
+        private const string NoFrameAncestors = "frame-ancestors 'none'";
+
+        private const string NoStore = "no-store";
+
+        private static readonly PathString ApiPath = new("/api");
+
+        // One delegate each, shared by every request; the state each start callback receives is its response.
+        private static readonly Func<object, Task> SetHeaders = response => Apply((HttpResponse)response, api: false);
+
+        private static readonly Func<object, Task> SetApiHeaders = response => Apply((HttpResponse)response, api: true);
+
+        /// <summary>
+        /// Registers the headers of the response to <paramref name="httpContext"/>, then calls the rest of the
+        /// pipeline. <c>Program.cs</c> adds it with <c>app.Use(ResponseHeaderPolicy.ApplyAsync)</c>.
+        /// </summary>
+        /// <param name="httpContext">The current request, whose response has not started.</param>
+        /// <param name="next">The rest of the pipeline.</param>
+        /// <returns>The rest of the pipeline's task.</returns>
+        /// <exception cref="ArgumentNullException">
+        /// <paramref name="httpContext"/> or <paramref name="next"/> is <see langword="null"/>.
+        /// </exception>
+        public static Task ApplyAsync(HttpContext httpContext, RequestDelegate next)
+        {
+            ArgumentNullException.ThrowIfNull(httpContext);
+            ArgumentNullException.ThrowIfNull(next);
+
+            HttpResponse response = httpContext.Response;
+            bool api = httpContext.Request.Path.StartsWithSegments(ApiPath, StringComparison.OrdinalIgnoreCase);
+            response.OnStarting(api ? SetApiHeaders : SetHeaders, response);
+            return next(httpContext);
+        }
+
+        private static Task Apply(HttpResponse response, bool api)
+        {
+            IHeaderDictionary headers = response.Headers;
+            headers.XContentTypeOptions = NoSniff;
+            headers.XFrameOptions = DenyFraming;
+            headers.ContentSecurityPolicy = NoFrameAncestors;
+            if (api)
+            {
+                headers.CacheControl = NoStore;
+            }
+
+            return Task.CompletedTask;
         }
     }
 }

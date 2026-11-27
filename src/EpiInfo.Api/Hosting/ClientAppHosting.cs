@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Runtime.Versioning;
 using System.Security;
 using Microsoft.AspNetCore.Routing.Constraints;
 using Microsoft.AspNetCore.Routing.Matching;
@@ -6,6 +7,7 @@ using Microsoft.AspNetCore.Routing.Patterns;
 using Microsoft.AspNetCore.StaticFiles;
 using Microsoft.Extensions.FileProviders;
 using Microsoft.Extensions.Primitives;
+using Microsoft.Win32.SafeHandles;
 
 namespace EpiInfo.Api.Hosting;
 
@@ -25,11 +27,31 @@ namespace EpiInfo.Api.Hosting;
 /// so every concrete route wins and a missing asset or an unknown API route stays a 404.
 /// </para>
 /// <para>
-/// Assets and the fallback's <c>index.html</c> are read through one provider with the same exclusions: a file under
-/// <c>api/</c> or <c>openapi/</c>, compared case-insensitively, or a file named <c>health</c> is never served, so a
-/// request under a server path stays the route miss. That provider also refuses a file whose path below the client
-/// folder passes through a symbolic link or junction, so nothing outside the folder is served. The folder itself may
-/// be a link.
+/// Assets and the fallback's <c>index.html</c> are served from one in-memory copy of the client folder, which
+/// <see cref="UseClientApp"/> reads once, at startup. Requests never reach the file system, so nothing done to the
+/// folder afterwards, a link added included, changes what is served, and the API is restarted after a rebuild. The
+/// copy leaves out a file under <c>api/</c> or <c>openapi/</c>, compared case-insensitively, and a root file named
+/// <c>health</c>, so a request under a server path stays the route miss; the files a <see cref="PhysicalFileProvider"/>
+/// excludes by default, whose name starts with a dot or which are hidden or system files; and every symbolic link,
+/// junction or other reparse point below the folder, with everything beneath it, so nothing outside the folder is
+/// served. The folder itself may be a link.
+/// </para>
+/// <para>
+/// Each file is read through one handle and confirmed to be the entry the listing found. On Linux the handle's own
+/// path must be the file's real path. On every system, once the read ends, neither the entry nor a folder above it may
+/// have become a link, and the entry's length and write time must be the handle's. A folder that changes while it is
+/// read, that cannot be confirmed, or that exceeds <see cref="MaxClientEntries"/> or <see cref="MaxClientBytes"/> is
+/// not served at all. On other systems the comparison finds a concurrent rebuild, not a writer who restores a file's
+/// length and write time, so the folder must be writable only by the account that runs the API or by an
+/// administrator, as the Docker image's root-owned <c>/app/client</c> is.
+/// </para>
+/// <para>
+/// Outside Windows part of that precondition is enforced: a client folder whose mode grants other users write
+/// permission, judged on the folder it resolves to when it is a link, is not served at all, and neither is one holding
+/// a folder the read enters or a file the copy keeps whose mode grants it. Each mode is read from the entry the listing
+/// found. Group write is allowed, because where each user has a private group the default umask leaves every build
+/// output group-writable, and neither the folders above the client folder nor the owner of an entry is checked. On
+/// Windows, whose access control lists the mode does not describe, the precondition stands as stated.
 /// </para>
 /// </remarks>
 public static partial class ClientAppHosting
@@ -39,6 +61,15 @@ public static partial class ClientAppHosting
 
     /// <summary>The page every client route is answered with.</summary>
     public const string IndexFileName = "index.html";
+
+    // Bounds on the copy read at startup, so a wrong or swollen folder can neither exhaust memory nor stall startup:
+    // the built client is a few files, well under 1 MB. Every listed entry counts, links and left-out entries included.
+    internal const int MaxClientEntries = 10_000;
+
+    internal const long MaxClientBytes = 64L * 1024 * 1024;
+
+    // The most symbolic links one path may pass through, as on Linux.
+    private const int MaxLinkHops = 40;
 
     private const string FallbackDisplayName = "Client fallback";
 
@@ -65,14 +96,27 @@ public static partial class ClientAppHosting
         $"The folder configured by {ApiOptions.ClientPathKey} is not a usable path; only /api, /health and /openapi " +
         "are served. Set it to the folder npm run build writes.";
 
+    // Fixed text with no arguments, for the same reason. The copy is read once, so a restart is part of the remedy.
+    private const string ClientUnconfirmedMessage =
+        $"The client application in the folder configured by {ApiOptions.ClientPathKey} changed while it was read, " +
+        "could not be confirmed or exceeds the size limits; only /api, /health and /openapi are served. Rebuild it " +
+        "with npm run build in web/, then restart the API.";
+
+    // Fixed text with no arguments, for the same reason: it names no folder, no entry and no file mode.
+    private const string ClientUntrustedMessage =
+        $"The client application in the folder configured by {ApiOptions.ClientPathKey} can be changed by every user " +
+        "of this computer; only /api, /health and /openapi are served. Remove other users' write permission from the " +
+        "folder and from every folder and file in it, then restart the API.";
+
     private static readonly string[] FallbackMethods = [HttpMethods.Get, HttpMethods.Head];
 
     /// <summary>
-    /// Serves the client folder that <see cref="ApiOptions.ClientPath"/> names, resolved against the content root,
-    /// and maps the <c>index.html</c> fallback. When the folder or its <c>index.html</c> is missing, an
-    /// <c>index.html</c> reached through a link included, or the configured path is not a usable path, logs one
-    /// warning that names the configuration key but not its value, and registers nothing, so <c>/api</c>,
-    /// <c>/health</c> and <c>/openapi</c> keep serving.
+    /// Reads the client folder that <see cref="ApiOptions.ClientPath"/> names, resolved against the content root,
+    /// into memory once, serves that copy and maps the <c>index.html</c> fallback. When the folder or its
+    /// <c>index.html</c> is missing, an <c>index.html</c> that is a link included, when the configured path is not a
+    /// usable path, when the copy could not be confirmed or exceeds the limits, or when, outside Windows, other users
+    /// can write to the folder or to a folder or file the copy keeps, logs one warning that names the configuration
+    /// key but not its value, and registers nothing, so <c>/api</c>, <c>/health</c> and <c>/openapi</c> keep serving.
     /// </summary>
     /// <param name="app">The application, after routing and every endpoint have been added.</param>
     /// <returns>The same application, for chaining.</returns>
@@ -85,12 +129,13 @@ public static partial class ClientAppHosting
         ILogger logger = app.Services.GetRequiredService<ILoggerFactory>().CreateLogger(LoggerCategory);
 
         // The client is optional, so a configured path the file system rejects leaves the API serving. Only the
-        // failures of resolving and opening a path are caught; the exception is not logged, because its message
-        // carries the path.
+        // failures of resolving a path and reading the folder are caught; the exception is not logged, because its
+        // message carries the path.
         ClientFileProvider? fileProvider;
+        ClientFolderRefusal refusal;
         try
         {
-            fileProvider = OpenClientFolder(app.Environment.ContentRootPath, options.ClientPath);
+            fileProvider = ReadClientFolder(app.Environment.ContentRootPath, options.ClientPath, out refusal);
         }
         catch (ArgumentException)
         {
@@ -120,14 +165,24 @@ public static partial class ClientAppHosting
             return app;
         }
 
+        if (refusal == ClientFolderRefusal.Unconfirmed)
+        {
+            LogClientUnconfirmed(logger);
+            return app;
+        }
+
+        if (refusal == ClientFolderRefusal.Untrusted)
+        {
+            LogClientUntrusted(logger);
+            return app;
+        }
+
         if (fileProvider is null)
         {
             // A warning, not a startup failure: dotnet test runs before npm run build in the documented sequence.
             LogClientMissing(logger);
             return app;
         }
-
-        app.Lifetime.ApplicationStopped.Register(fileProvider.Dispose);
 
         var staticOptions = new StaticFileOptions
         {
@@ -160,34 +215,140 @@ public static partial class ClientAppHosting
         return Path.GetFullPath(Path.Combine(contentRootPath, clientPath));
     }
 
-    // Returns null when the folder or its index.html is missing. The index is looked up through the same provider
-    // that serves it, so an index.html reached through a link counts as missing.
-    private static ClientFileProvider? OpenClientFolder(string contentRootPath, string clientPath)
+    /// <summary>
+    /// Whether the file <paramref name="handle"/> has open is the file at <paramref name="realPath"/>. Linux names an
+    /// open file's path at <c>/proc/self/fd</c> with every link resolved, so a handle opened through a link reports
+    /// the link's target, never the path that was opened. Without <c>/proc</c> nothing is confirmed.
+    /// </summary>
+    /// <param name="handle">An open file handle.</param>
+    /// <param name="realPath">
+    /// The path the file must have, every link resolved, as <see cref="ResolveRealPath"/> gives it.
+    /// </param>
+    /// <returns><see langword="true"/> when the open file's path is exactly <paramref name="realPath"/>.</returns>
+    [SupportedOSPlatform("linux")]
+    internal static bool IsOpenedAt(SafeFileHandle handle, string realPath)
     {
+        ArgumentNullException.ThrowIfNull(handle);
+        ArgumentNullException.ThrowIfNull(realPath);
+
+        // The reference keeps the descriptor from being closed and reused for another file while its path is read.
+        bool added = false;
+        try
+        {
+            handle.DangerousAddRef(ref added);
+            long descriptor = handle.DangerousGetHandle().ToInt64();
+            string? opened = new FileInfo(
+                string.Create(CultureInfo.InvariantCulture, $"/proc/self/fd/{descriptor}")).LinkTarget;
+            return string.Equals(opened, realPath, StringComparison.Ordinal);
+        }
+        finally
+        {
+            if (added)
+            {
+                handle.DangerousRelease();
+            }
+        }
+    }
+
+    /// <summary>
+    /// The full path of <paramref name="path"/> with the symbolic link of every component resolved, as Linux reports
+    /// the path of an open file: each component in turn, so a <c>..</c> that follows a link climbs from the link's
+    /// target, not from the link.
+    /// </summary>
+    /// <param name="path">The path to resolve; a relative one is taken from the current directory.</param>
+    /// <returns>The resolved full path.</returns>
+    /// <exception cref="IOException">The path passes through more than 40 links, as a link loop does.</exception>
+    [SupportedOSPlatform("linux")]
+    internal static string ResolveRealPath(string path)
+    {
+        ArgumentNullException.ThrowIfNull(path);
+
+        // Not Path.GetFullPath, which would remove a ".." against the link before it instead of the link's target.
+        var pending = new Stack<string>();
+        PushSegments(pending, Path.IsPathRooted(path) ? path : Path.Join(Environment.CurrentDirectory, path));
+
+        string resolved = "/";
+        int hops = 0;
+        while (pending.TryPop(out string? segment))
+        {
+            if (segment.Length == 0 || segment == ".")
+            {
+                continue;
+            }
+
+            if (segment == "..")
+            {
+                resolved = Path.GetDirectoryName(resolved) ?? "/";
+                continue;
+            }
+
+            string candidate = Path.Join(resolved, segment);
+            string? target = new FileInfo(candidate).LinkTarget;
+            if (target is null)
+            {
+                resolved = candidate;
+                continue;
+            }
+
+            if (++hops > MaxLinkHops)
+            {
+                throw new IOException("A path passes through too many symbolic links.");
+            }
+
+            // A relative target continues from the folder holding the link, which is where resolution stands.
+            if (Path.IsPathRooted(target))
+            {
+                resolved = "/";
+            }
+
+            PushSegments(pending, target);
+        }
+
+        return resolved;
+    }
+
+    private static void PushSegments(Stack<string> pending, string path)
+    {
+        string[] segments = path.Split('/');
+        for (int i = segments.Length - 1; i >= 0; i--)
+        {
+            pending.Push(segments[i]);
+        }
+    }
+
+    // Returns null when the folder or its index.html is missing, an index.html that is a link included, because the
+    // copy leaves links out. Sets refusal, and returns null, when the copy exceeds the limits or a file in it could not
+    // be confirmed, or when other users can write to the folder or to a folder or file the copy keeps.
+    private static ClientFileProvider? ReadClientFolder(
+        string contentRootPath,
+        string clientPath,
+        out ClientFolderRefusal refusal)
+    {
+        refusal = ClientFolderRefusal.None;
         string folder = ResolveClientPath(contentRootPath, clientPath);
         if (!Directory.Exists(folder))
         {
             return null;
         }
 
-        ClientFileProvider fileProvider;
+        ClientFolderReader reader;
         try
         {
-            fileProvider = new ClientFileProvider(folder);
+            reader = new ClientFolderReader(folder);
+            refusal = reader.Read();
+            if (refusal != ClientFolderRefusal.None)
+            {
+                return null;
+            }
         }
-        catch (DirectoryNotFoundException)
+        catch (DirectoryNotFoundException) when (!Directory.Exists(folder))
         {
-            // Removed between the existence check and the provider's own: missing, not unusable.
+            // Removed between the existence check and the read: missing, not unusable.
             return null;
         }
 
-        if (fileProvider.GetFileInfo(IndexFileName).Exists)
-        {
-            return fileProvider;
-        }
-
-        fileProvider.Dispose();
-        return null;
+        ClientFileProvider fileProvider = reader.CreateProvider();
+        return fileProvider.GetFileInfo(IndexFileName).Exists ? fileProvider : null;
     }
 
     [LoggerMessage(
@@ -203,6 +364,20 @@ public static partial class ClientAppHosting
         Level = LogLevel.Warning,
         Message = ClientPathInvalidMessage)]
     private static partial void LogClientPathInvalid(ILogger logger);
+
+    [LoggerMessage(
+        EventId = 3,
+        EventName = "ClientAppUnconfirmed",
+        Level = LogLevel.Warning,
+        Message = ClientUnconfirmedMessage)]
+    private static partial void LogClientUnconfirmed(ILogger logger);
+
+    [LoggerMessage(
+        EventId = 4,
+        EventName = "ClientAppUntrusted",
+        Level = LogLevel.Warning,
+        Message = ClientUntrustedMessage)]
+    private static partial void LogClientUntrusted(ILogger logger);
 
     // The page names the current hashed bundles, so browsers must revalidate it; the bundles themselves are
     // content-addressed and keep the default caching.
@@ -313,85 +488,337 @@ public static partial class ClientAppHosting
     }
 
     /// <summary>
-    /// The one provider both serving paths read, the root static-file middleware and the <c>index.html</c> fallback.
-    /// It wraps a <see cref="PhysicalFileProvider"/>, whose containment check is lexical and which follows links, and
-    /// reports as not found a file under <c>api/</c> or <c>openapi/</c>, a file named <c>health</c>, and a file whose
-    /// path below the root passes through a symbolic link or junction.
+    /// The one provider both serving paths read, the root static-file middleware and the <c>index.html</c> fallback:
+    /// the in-memory copy <see cref="ClientFolderReader"/> took at startup. It never touches the file system, lists no
+    /// folder and reports no change.
     /// </summary>
-    private sealed class ClientFileProvider : IFileProvider, IDisposable
+    private sealed class ClientFileProvider : IFileProvider
     {
         private static readonly char[] Separators = [Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar];
 
-        private readonly PhysicalFileProvider inner;
+        private readonly Dictionary<string, ClientFile> files;
 
-        /// <exception cref="DirectoryNotFoundException"><paramref name="root"/> does not exist.</exception>
-        public ClientFileProvider(string root) => inner = new PhysicalFileProvider(root);
+        // Names are compared as the default file system of the operating system compares them, as serving from the
+        // folder did: NTFS and APFS ignore case, Linux file systems do not. Two names that differ only in case prove
+        // that the folder's file system tells them apart, so lookups then stay exact.
+        public ClientFileProvider(Dictionary<string, ClientFile> exactFiles)
+        {
+            files = exactFiles;
+            if (!OperatingSystem.IsWindows() && !OperatingSystem.IsMacOS())
+            {
+                return;
+            }
+
+            var ignoringCase = new Dictionary<string, ClientFile>(exactFiles.Count, StringComparer.OrdinalIgnoreCase);
+            foreach ((string relativePath, ClientFile file) in exactFiles)
+            {
+                if (!ignoringCase.TryAdd(relativePath, file))
+                {
+                    return;
+                }
+            }
+
+            files = ignoringCase;
+        }
 
         public IFileInfo GetFileInfo(string subpath)
         {
-            IFileInfo file = inner.GetFileInfo(subpath);
-            if (!file.Exists || file.PhysicalPath is null)
-            {
-                return file;
-            }
-
-            // Judged on the resolved path, not the request path: the inner provider drops leading separators, so
-            // //api/x.json names api/x.json, and the operating system's path normalisation has already been applied.
-            string relativePath = Path.GetRelativePath(inner.Root, file.PhysicalPath);
-            string[] segments = relativePath.Split(Separators);
-
-            bool refused = IsOutsideRoot(relativePath, segments)
-                || IsServerPrefix(segments[0])
-                || IsHealthPath(relativePath)
-                || PassesThroughLink(segments);
-
-            return refused ? new NotFoundFileInfo(subpath) : file;
+            string? relativePath = ToRelativePath(subpath);
+            return relativePath is not null && files.TryGetValue(relativePath, out ClientFile? file)
+                ? file
+                : new NotFoundFileInfo(subpath);
         }
 
         // The client host serves files only: it registers neither default files nor directory browsing, so nothing
-        // lists a folder, and a listing would bypass the per-file checks of GetFileInfo.
+        // lists a folder.
         public IDirectoryContents GetDirectoryContents(string subpath) => NotFoundDirectoryContents.Singleton;
 
-        public IChangeToken Watch(string filter) => inner.Watch(filter);
+        // The copy never changes.
+        public IChangeToken Watch(string filter) => NullChangeToken.Singleton;
 
-        public void Dispose() => inner.Dispose();
-
-        // The inner provider already refuses a path above its root; checked again so a surprise fails closed.
-        private static bool IsOutsideRoot(string relativePath, string[] segments) =>
-            Path.IsPathRooted(relativePath) || segments[0] == "..";
-
-        // Every entry below the root, each folder and the file itself, is checked on every request, so a link added
-        // after startup is refused too. A link whose target stays inside the root is refused as well: the built client
-        // contains none. The root and its parents are not checked, because the configured folder may itself be a
-        // link, such as a deployment's current-release folder. An entry that cannot be inspected counts as a link.
-        // The check runs before the static-file middleware opens the file by path, and .NET offers neither a
-        // no-follow open nor the path of an open handle, so the client folder must be writable only by the account
-        // that runs the API: a writer racing a link in between could otherwise redirect that open.
-        private bool PassesThroughLink(string[] segments)
+        // The request path as a key of the copy: leading separators dropped and the segments joined with '/'. An
+        // empty, "." or ".." segment names nothing, because the copy holds plain relative names only.
+        private static string? ToRelativePath(string subpath)
         {
-            string path = inner.Root;
-            try
+            string[] segments = subpath.TrimStart(Separators).Split(Separators);
+            foreach (string segment in segments)
             {
-                for (int i = 0; i < segments.Length; i++)
+                if (segment.Length == 0 || segment == "." || segment == "..")
                 {
-                    path = Path.Join(path, segments[i]);
-                    FileSystemInfo entry = i == segments.Length - 1 ? new FileInfo(path) : new DirectoryInfo(path);
-                    if (entry.LinkTarget is not null)
-                    {
-                        return true;
-                    }
+                    return null;
                 }
+            }
 
-                return false;
-            }
-            catch (IOException)
+            return string.Join('/', segments);
+        }
+    }
+
+    /// <summary>Why a client folder that exists is not served.</summary>
+    private enum ClientFolderRefusal
+    {
+        /// <summary>Nothing refused the folder.</summary>
+        None,
+
+        /// <summary>The folder changed while it was read, could not be confirmed or exceeds the limits.</summary>
+        Unconfirmed,
+
+        /// <summary>Other users can write to the folder, or to a folder or file the copy keeps.</summary>
+        Untrusted,
+    }
+
+    /// <summary>
+    /// Reads the client folder into memory, once: every file below it except the ones the copy leaves out, each
+    /// confirmed to be the entry the listing found. Outside Windows, the folder, every folder below it that the read
+    /// enters and every file the copy keeps must deny other users write permission. The first failure of that check,
+    /// a confirmation or a limit ends the read, and nothing of the folder is served.
+    /// </summary>
+    private sealed class ClientFolderReader
+    {
+        // Everything is listed, hidden and system entries included, so the exclusions are decided here, and a folder
+        // that cannot be read fails the read instead of being skipped.
+        private static readonly EnumerationOptions Listing = new()
+        {
+            AttributesToSkip = 0,
+            IgnoreInaccessible = false,
+            RecurseSubdirectories = false,
+            ReturnSpecialDirectories = false,
+        };
+
+        private readonly string root;
+
+        // The root with every link resolved, against which Linux confirms each handle; null elsewhere.
+        private readonly string? realRoot;
+
+        private readonly Dictionary<string, ClientFile> files = new(StringComparer.Ordinal);
+
+        private int entries;
+
+        private long bytes;
+
+        public ClientFolderReader(string root)
+        {
+            this.root = root;
+            if (OperatingSystem.IsLinux())
             {
-                return true;
-            }
-            catch (UnauthorizedAccessException)
-            {
-                return true;
+                realRoot = ResolveRealPath(root);
             }
         }
+
+        // Returns Unconfirmed when the folder exceeds the limits or a file could not be confirmed, and Untrusted when
+        // other users can write to the folder or to a folder or file the copy keeps.
+        public ClientFolderRefusal Read()
+        {
+            // The root as the listing opens it: a root that is a link reports the mode of the folder it resolves to.
+            var rootFolder = new DirectoryInfo(root);
+            if (IsWritableByOthers(rootFolder))
+            {
+                return ClientFolderRefusal.Untrusted;
+            }
+
+            var pending = new Stack<(DirectoryInfo Folder, string RelativePath)>();
+            pending.Push((rootFolder, string.Empty));
+            while (pending.TryPop(out (DirectoryInfo Folder, string RelativePath) current))
+            {
+                bool atRoot = current.RelativePath.Length == 0;
+                foreach (FileSystemInfo entry in current.Folder.EnumerateFileSystemInfos("*", Listing))
+                {
+                    if (++entries > MaxClientEntries)
+                    {
+                        return ClientFolderRefusal.Unconfirmed;
+                    }
+
+                    // A link is left out with everything beneath it, wherever its target lies: the built client holds
+                    // none, and only the root may be one.
+                    if (IsLink(entry) || (atRoot && IsReservedForServer(entry)))
+                    {
+                        continue;
+                    }
+
+                    string relativePath = atRoot ? entry.Name : current.RelativePath + "/" + entry.Name;
+                    if (entry is DirectoryInfo folder)
+                    {
+                        if (IsWritableByOthers(folder))
+                        {
+                            return ClientFolderRefusal.Untrusted;
+                        }
+
+                        pending.Push((folder, relativePath));
+                    }
+                    else if (entry is FileInfo file && !IsSensitive(file))
+                    {
+                        if (IsWritableByOthers(file))
+                        {
+                            return ClientFolderRefusal.Untrusted;
+                        }
+
+                        if (!TryReadFile(file, relativePath))
+                        {
+                            return ClientFolderRefusal.Unconfirmed;
+                        }
+                    }
+                }
+            }
+
+            return ClientFolderRefusal.None;
+        }
+
+        public ClientFileProvider CreateProvider() => new(files);
+
+        private static bool IsLink(FileSystemInfo entry) =>
+            entry.LinkTarget is not null || (entry.Attributes & FileAttributes.ReparsePoint) != 0;
+
+        // Whether the mode of the entry, as the listing described it, lets other users write to it. Group write is
+        // allowed: where each user has a private group, the default umask 002 leaves every build output group-writable
+        // by a group holding only its owner. Windows keeps access in control lists, which the mode does not describe,
+        // so nothing is refused there. An entry gone since it was listed reports no mode and is left to the read.
+        private static bool IsWritableByOthers(FileSystemInfo entry) =>
+            !OperatingSystem.IsWindows() && entry.Exists && (entry.UnixFileMode & UnixFileMode.OtherWrite) != 0;
+
+        // The server's own paths: everything under api/ or openapi/, and a root file named health.
+        private static bool IsReservedForServer(FileSystemInfo entry) =>
+            IsServerPrefix(entry.Name) || (entry is FileInfo && IsHealthPath(entry.Name));
+
+        // The files PhysicalFileProvider leaves out by default (ExclusionFilters.Sensitive), judged on the file alone.
+        private static bool IsSensitive(FileInfo file) =>
+            file.Name.StartsWith('.') || (file.Attributes & (FileAttributes.Hidden | FileAttributes.System)) != 0;
+
+        // The entry at path as the file system describes it now, or null unless it is a file that is not a link.
+        // FileInfo describes a link itself, not its target, so a link's length and time never stand in for a file's.
+        private static FileInfo? StatPlainFile(string path)
+        {
+            var file = new FileInfo(path);
+            return file.Exists && !IsLink(file) ? file : null;
+        }
+
+        // Fills content from the start of the file and confirms that the file ends there, neither shorter nor longer.
+        private static bool ReadToEnd(SafeFileHandle handle, byte[] content)
+        {
+            int read = 0;
+            while (read < content.Length)
+            {
+                int count = RandomAccess.Read(handle, content.AsSpan(read), read);
+                if (count == 0)
+                {
+                    return false;
+                }
+
+                read += count;
+            }
+
+            Span<byte> beyond = stackalloc byte[1];
+            return RandomAccess.Read(handle, beyond, read) == 0 && RandomAccess.GetLength(handle) == content.Length;
+        }
+
+        // Reads one file through one handle and confirms it is the entry the listing found: on Linux the handle's own
+        // path must be the file's real path, and on every system, once the read ends, the entry must still be a file
+        // that is not a link, with the handle's length and write time, below folders that are not links either.
+        private bool TryReadFile(FileInfo listed, string relativePath)
+        {
+            string path = listed.FullName;
+            FileInfo? before = StatPlainFile(path);
+            if (before is null)
+            {
+                return false;
+            }
+
+            byte[] content;
+            DateTime modified;
+            if (before.Length == 0)
+            {
+                // Nothing to read, so nothing is opened: a FIFO or another special file lists as an empty file, and
+                // opening one would block startup.
+                content = [];
+                modified = before.LastWriteTimeUtc;
+            }
+            else
+            {
+                if (before.Length > MaxClientBytes - bytes)
+                {
+                    return false;
+                }
+
+                using SafeFileHandle handle = File.OpenHandle(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+                if (OperatingSystem.IsLinux() && !IsOpenedAt(handle, Path.Join(realRoot, relativePath)))
+                {
+                    return false;
+                }
+
+                long length = RandomAccess.GetLength(handle);
+                if (length > MaxClientBytes - bytes)
+                {
+                    return false;
+                }
+
+                content = new byte[length];
+                if (!ReadToEnd(handle, content))
+                {
+                    return false;
+                }
+
+                modified = File.GetLastWriteTimeUtc(handle);
+            }
+
+            FileInfo? after = StatPlainFile(path);
+            if (after is null
+                || after.Length != content.LongLength
+                || after.LastWriteTimeUtc != modified
+                || FolderPassesThroughLink(relativePath))
+            {
+                return false;
+            }
+
+            bytes += content.LongLength;
+            files.Add(relativePath, new ClientFile(listed.Name, content, new DateTimeOffset(modified)));
+            return true;
+        }
+
+        // Each folder between the root and the file, checked again once the file is read, so a folder that became a
+        // link while the read was inside it is found.
+        private bool FolderPassesThroughLink(string relativePath)
+        {
+            string[] segments = relativePath.Split('/');
+            string path = root;
+            for (int i = 0; i < segments.Length - 1; i++)
+            {
+                path = Path.Join(path, segments[i]);
+                var folder = new DirectoryInfo(path);
+                if (!folder.Exists || IsLink(folder))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// One file of the copy. It has no physical path, so the static-file middleware streams it from memory, ranges and
+    /// <c>HEAD</c> included, and never opens a path.
+    /// </summary>
+    private sealed class ClientFile : IFileInfo
+    {
+        private readonly byte[] content;
+
+        public ClientFile(string name, byte[] content, DateTimeOffset lastModified)
+        {
+            Name = name;
+            this.content = content;
+            LastModified = lastModified;
+        }
+
+        public bool Exists => true;
+
+        public long Length => content.LongLength;
+
+        public string? PhysicalPath => null;
+
+        public string Name { get; }
+
+        public DateTimeOffset LastModified { get; }
+
+        public bool IsDirectory => false;
+
+        public Stream CreateReadStream() => new MemoryStream(content, writable: false);
     }
 }

@@ -49,8 +49,8 @@ namespace EpiInfo.Api.Tests.Errors;
 /// The error contract of AAP 0.3.4.2: every error response under <c>/api</c> is a ProblemDetails with <c>type</c>,
 /// <c>title</c>, <c>status</c>, <c>detail</c> and <c>traceId</c>, a 500's <c>detail</c> is the fixed generic sentence
 /// plus that <c>traceId</c>, and the 500 and 503 of a record write carry its <c>writeOutcome</c>; the CORS row of AAP
-/// 0.7.6; and the redaction policy of AAP 0.9.3, proved through the API's error pipeline with the committed
-/// <c>appsettings*.json</c> logging configuration.
+/// 0.7.6 and the API's response headers; and the redaction policy of AAP 0.9.3, proved through the API's error
+/// pipeline with the committed <c>appsettings*.json</c> logging configuration.
 /// </summary>
 /// <remarks>
 /// <para>
@@ -285,6 +285,110 @@ public sealed class ErrorContractTests
                 {
                     data.Add(environment, accept);
                 }
+            }
+
+            return data;
+        }
+    }
+
+    /// <summary>
+    /// Each environment with each OpenAPI document request, the text its response must not hold, and whether it serves
+    /// the v1 document: names other than <c>v1</c>, each with that name decoded, and the v1 document with a
+    /// <c>documentName</c> query value, with that value decoded.
+    /// </summary>
+    public static TheoryData<string, string, string, bool> EnvironmentsAndOpenApiRequests
+    {
+        get
+        {
+            (string Path, string Echo, bool Served)[] requests =
+            [
+                ("/openapi/v2.json", "v2", false),
+                ("/openapi/%3Cscript%3Ealert(1)%3C%2Fscript%3E.json", "<script>alert(1)</script>", false),
+                ("/openapi/%3Cimg%20src%3Dx%20onerror%3Dalert(1)%3E.json", "<img src=x onerror=alert(1)>", false),
+                ("/openapi/Password%3DRehearsal.json", "Password=Rehearsal", false),
+                ("/openapi/v1%0A.json", "v1\n", false),
+                ("/openapi/v1.json?documentName=%3Cb%3Ex", "<b>x", true),
+            ];
+            var data = new TheoryData<string, string, string, bool>();
+            foreach (string environment in EnvironmentNames)
+            {
+                foreach ((string path, string echo, bool served) in requests)
+                {
+                    data.Add(environment, path, echo, served);
+                }
+            }
+
+            return data;
+        }
+    }
+
+    /// <summary>
+    /// Each environment, on TestServer (<see langword="false"/>) and on Kestrel (<see langword="true"/>), with each
+    /// OpenAPI document request whose method is not GET, the text its response must not hold and the status it gets:
+    /// every other method on names other than <c>v1</c>, each with that name decoded, which are the route miss; and
+    /// methods other than GET on the v1 document, in either case, which are the method mismatch.
+    /// </summary>
+    public static TheoryData<string, bool, string, string, string, HttpStatusCode> EnvironmentsAndOpenApiMethodRequests
+    {
+        get
+        {
+            (string Path, string Echo)[] otherNames =
+            [
+                ("/openapi/v2.json", "v2"),
+                ("/openapi/%3Cscript%3Ealert(1)%3C%2Fscript%3E.json", "<script>alert(1)</script>"),
+                ("/openapi/Password%3DRehearsal.json", "Password=Rehearsal"),
+            ];
+            string[] missMethods = ["POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"];
+            (string Method, string Path)[] mismatches =
+            [
+                ("POST", "/openapi/v1.json"),
+                ("POST", "/openapi/V1.JSON"),
+                ("OPTIONS", "/openapi/v1.json"),
+            ];
+
+            var data = new TheoryData<string, bool, string, string, string, HttpStatusCode>();
+            foreach (string environment in EnvironmentNames)
+            {
+                foreach (bool kestrel in new[] { false, true })
+                {
+                    foreach ((string path, string echo) in otherNames)
+                    {
+                        foreach (string method in missMethods)
+                        {
+                            data.Add(environment, kestrel, method, path, echo, HttpStatusCode.NotFound);
+                        }
+                    }
+
+                    foreach ((string method, string path) in mismatches)
+                    {
+                        data.Add(environment, kestrel, method, path, "v1", HttpStatusCode.MethodNotAllowed);
+                    }
+                }
+            }
+
+            return data;
+        }
+    }
+
+    /// <summary>
+    /// The failures the exception-handler middleware cannot answer: in each environment, a records list with no
+    /// <c>Accept</c> header (<see langword="null"/>) and with each non-JSON value, and a record create with a browser
+    /// navigation's <c>Accept</c>.
+    /// </summary>
+    public static TheoryData<string, string?, string> OuterPathFaults
+    {
+        get
+        {
+            var data = new TheoryData<string, string?, string>();
+            foreach (string environment in EnvironmentNames)
+            {
+                data.Add(environment, null, RecordsListEndpoint);
+                foreach (string accept in NonJsonAcceptHeaders)
+                {
+                    data.Add(environment, accept, RecordsListEndpoint);
+                }
+
+                data.Add(environment, NonJsonAcceptHeaders[^1], CreateRoute);
             }
 
             return data;
@@ -687,6 +791,136 @@ public sealed class ErrorContractTests
             NotFoundType,
             "Not Found",
             ExpectedResourceNotFoundDetail);
+    }
+
+    // AAP 0.3.4.7, 0.3.4.2 and 0.9.3: only the v1 document is served. Any other name, markup and credential-like text
+    // included, is the route miss, so its answer is the fixed 404 ProblemDetails and never the OpenAPI handler's
+    // text/plain 404, which quotes the name; so is v1 followed by an encoded newline, which a $ anchor would admit. The
+    // name is a route value, so a documentName query value neither selects nor reaches another document. The client is
+    // served, as in production, and its fallback never answers these paths.
+    [Theory]
+    [MemberData(nameof(EnvironmentsAndOpenApiRequests))]
+    public async Task OnlyTheV1OpenApiDocumentIsServedAndAnyOtherNameIsTheRouteMiss(
+        string environment,
+        string path,
+        string echo,
+        bool served)
+    {
+        DirectoryInfo clientFolder = await CreateClientFolderAsync();
+        try
+        {
+            await using ApiFactory factory = CreateFactory(environment, clientFolder.FullName);
+            using HttpClient client = factory.CreateClient();
+
+            using HttpResponseMessage response = await client.GetAsync(path);
+            string body = await response.Content.ReadAsStringAsync();
+
+            Assert.False(
+                body.Contains(echo, StringComparison.OrdinalIgnoreCase),
+                "The response quotes the document name or query value it was asked for.");
+            if (served)
+            {
+                Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+                Assert.Equal(ApiTestClient.JsonMediaType, response.Content.Headers.ContentType?.MediaType);
+                using JsonDocument document = JsonDocument.Parse(body);
+                Assert.True(
+                    document.RootElement.TryGetProperty("info", out JsonElement info)
+                    && info.ValueKind == JsonValueKind.Object
+                    && string.Equals("EpiInfo.Api | v1", StringMember(info, "title"), StringComparison.Ordinal),
+                    "The response is not the v1 document.");
+            }
+            else
+            {
+                await AssertFixedProblemAsync(
+                    response,
+                    HttpStatusCode.NotFound,
+                    NotFoundType,
+                    "Not Found",
+                    ExpectedResourceNotFoundDetail);
+            }
+        }
+        finally
+        {
+            clientFolder.Delete(recursive: true);
+        }
+    }
+
+    // AAP 0.3.4.7, 0.3.4.2 and 0.9.3: the route's constraint, not the method, decides a document name. Every method on
+    // a name other than v1 is the route miss: the fixed 404 ProblemDetails, or no body for HEAD, with no Allow header,
+    // never a 405 that lists the v1 route's GET. A method other than GET on the v1 document, in either case, stays the
+    // fixed 405 ProblemDetails with the Allow header routing sets. Neither quotes the name. The routing policy decides
+    // before the server writes anything, so both TestServer and real Kestrel run; the client is served, as in
+    // production.
+    [Theory]
+    [MemberData(nameof(EnvironmentsAndOpenApiMethodRequests))]
+    public async Task OpenApiDocumentNamesKeepTheRouteMissAndTheMethodMismatchForEveryMethod(
+        string environment,
+        bool kestrel,
+        string method,
+        string path,
+        string echo,
+        HttpStatusCode expected)
+    {
+        DirectoryInfo clientFolder = await CreateClientFolderAsync();
+        try
+        {
+            var options = new ApiFactoryOptions
+            {
+                EnvironmentName = environment,
+                ConnectionMode = ApiConnectionMode.None,
+                ExtraSettings = ClientPathSetting(clientFolder.FullName),
+            };
+            await using ApiFactoryBase factory = kestrel ? new KestrelApiFactory(options) : new ApiFactory(options);
+            using HttpClient client = factory is KestrelApiFactory kestrelFactory
+                ? kestrelFactory.CreateKestrelClient()
+                : factory.CreateClient();
+            using var request = new HttpRequestMessage(new HttpMethod(method), path);
+
+            using HttpResponseMessage response = await client.SendAsync(request);
+            string body = await response.Content.ReadAsStringAsync();
+
+            Assert.False(
+                body.Contains(echo, StringComparison.OrdinalIgnoreCase),
+                "The response quotes the document name it was asked for.");
+            switch (expected)
+            {
+                // Kestrel sends a HEAD response without a body; TestServer passes on the body the pipeline wrote, which
+                // the next case checks.
+                case HttpStatusCode.NotFound when kestrel && method == HttpMethods.Head:
+                    Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+                    Assert.True(body.Length == 0, "The HEAD response carries a body.");
+                    Assert.Empty(response.Content.Headers.Allow);
+                    break;
+
+                case HttpStatusCode.NotFound:
+                    await AssertFixedProblemAsync(
+                        response,
+                        HttpStatusCode.NotFound,
+                        NotFoundType,
+                        "Not Found",
+                        ExpectedResourceNotFoundDetail);
+                    Assert.Empty(response.Content.Headers.Allow);
+                    break;
+
+                case HttpStatusCode.MethodNotAllowed:
+                    await AssertFixedProblemAsync(
+                        response,
+                        HttpStatusCode.MethodNotAllowed,
+                        MethodNotAllowedType,
+                        "Method Not Allowed",
+                        ExpectedMethodNotAllowedDetail);
+                    Assert.Equal(new[] { HttpMethods.Get }, response.Content.Headers.Allow);
+                    break;
+
+                default:
+                    Assert.Fail("The case expects a status this test does not check.");
+                    break;
+            }
+        }
+        finally
+        {
+            clientFolder.Delete(recursive: true);
+        }
     }
 
     // AAP 0.7.6: a text/plain POST to an unknown /api route is the route miss, never a 415, and with a non-JSON Accept
@@ -1844,6 +2078,11 @@ public sealed class ErrorContractTests
     private const string HealthCheckServiceCategory =
         "Microsoft.Extensions.Diagnostics.HealthChecks.DefaultHealthCheckService";
 
+    // The category of the exception-handler middleware, whose lines about an exception it could not answer carry the
+    // exception object.
+    private const string ExceptionHandlerMiddlewareCategory =
+        "Microsoft.AspNetCore.Diagnostics.ExceptionHandlerMiddleware";
+
     // The floors the API keeps framework categories at, written out here rather than read from the product: each
     // category prefix, a category under it to probe, and the lowest level it may log at, where None means nothing.
     private static readonly (string CategoryPrefix, string ProbeCategory, LogLevel Floor)[] ProtectedFloors =
@@ -1851,10 +2090,55 @@ public sealed class ErrorContractTests
         ("Microsoft.AspNetCore", HostingDiagnosticsCategory, LogLevel.Warning),
         (HostingLifetimeCategory, HostingLifetimeCategory, LogLevel.Warning),
         (HealthCheckServiceCategory, HealthCheckServiceCategory, LogLevel.None),
+        (ExceptionHandlerMiddlewareCategory, ExceptionHandlerMiddlewareCategory, LogLevel.None),
     ];
 
     // The cross-origin request of the CORS cases.
     private const string ForeignOrigin = "http://example.test";
+
+    // The responses the header cases request: the client, the /api reads and writes, an /api error of each kind, and
+    // the endpoints outside /api.
+    private const string ClientRootSurface = "GET / (client index)";
+
+    private const string ClientRouteSurface = "GET of a client route (index fallback)";
+
+    private const string ClientAssetSurface = "GET of a client asset";
+
+    private const string FormsListSurface = "GET of the forms list";
+
+    private const string FormDefinitionSurface = "GET of a form definition";
+
+    private const string RecordsListSurface = "GET of a records list";
+
+    private const string RecordAtSurface = "GET records/at/1";
+
+    private const string RecordByIdSurface = "GET of a record by id";
+
+    private const string SearchSurface = "POST records/search";
+
+    private const string CreateSurface = "POST of a record";
+
+    private const string UpdateSurface = "PUT of a record";
+
+    private const string ApiRouteMissSurface = "GET of an unknown /api route (404)";
+
+    private const string ApiBadRequestSurface = "GET records with page=0 (400)";
+
+    private const string ApiServerErrorSurface = "GET records/count whose store fails (500)";
+
+    private const string HealthSurface = "GET /health";
+
+    private const string OpenApiSurface = "GET /openapi/v1.json";
+
+    private const string MissingAssetSurface = "GET of a missing client asset (404)";
+
+    // The client the header cases serve: its index and one asset.
+    private const string ClientIndexDocument = "<!doctype html><title>client</title>";
+
+    private const string ClientAssetPath = "/assets/app.js";
+
+    // A request header holding a sentinel, which the Development exception page would render.
+    private const string SentinelHeaderName = "X-Test-Sentinel";
 
     // The keyword that introduces a password in a SQL Server connection string.
     private const string PasswordKeyword = "Password=";
@@ -1969,6 +2253,39 @@ public sealed class ErrorContractTests
             return data;
         }
     }
+
+    /// <summary>Each environment with each response the header policy covers.</summary>
+    public static TheoryData<string, string> EnvironmentsAndResponseSurfaces =>
+        EnvironmentsWith(
+            ClientRootSurface,
+            ClientRouteSurface,
+            ClientAssetSurface,
+            FormsListSurface,
+            FormDefinitionSurface,
+            RecordsListSurface,
+            RecordAtSurface,
+            RecordByIdSurface,
+            SearchSurface,
+            CreateSurface,
+            UpdateSurface,
+            ApiRouteMissSurface,
+            ApiBadRequestSurface,
+            ApiServerErrorSurface,
+            HealthSurface,
+            OpenApiSurface,
+            MissingAssetSurface);
+
+    /// <summary>
+    /// Each environment with the client, an /api read, <c>/health</c>, an /api error status-code pages write and one
+    /// the exception handler writes, for the real-Kestrel header cases.
+    /// </summary>
+    public static TheoryData<string, string> EnvironmentsAndKestrelSurfaces =>
+        EnvironmentsWith(
+            ClientRootSurface,
+            FormsListSurface,
+            HealthSurface,
+            ApiRouteMissSurface,
+            ApiServerErrorSurface);
 
     /// <summary>Each environment with each query-string placement of a sentinel.</summary>
     public static TheoryData<string, string> EnvironmentsAndQueryPlacements =>
@@ -2369,6 +2686,58 @@ public sealed class ErrorContractTests
         Assert.True(corsHeaders.Length == 0, "The response carries CORS headers: " + string.Join(", ", corsHeaders));
     }
 
+    // The API's response headers: every response, whichever part of the pipeline writes it, carries
+    // X-Content-Type-Options nosniff, X-Frame-Options DENY and a Content-Security-Policy of exactly frame-ancestors
+    // 'none'. Every /api response, success and error alike, is exactly no-store, the 500 the exception handler writes
+    // with its own cache headers included. Outside /api caching stays with its owners: index.html keeps no-cache, and
+    // the asset, /health, OpenAPI and a missing asset are never no-store. The client is served from a temporary folder.
+    [Theory]
+    [MemberData(nameof(EnvironmentsAndResponseSurfaces))]
+    public async Task EveryResponseCarriesTheHardeningHeadersAndApiResponsesAreNoStore(
+        string environment,
+        string surface)
+    {
+        DirectoryInfo clientFolder = await CreateClientFolderAsync();
+        try
+        {
+            (FakeDataStore store, string recordId) = CreateSurfaceStore(surface);
+            await using ApiFactory factory = new(SurfaceOptions(environment, store, clientFolder));
+            using HttpClient client = factory.CreateClient();
+
+            using HttpResponseMessage response = await SendSurfaceAsync(client, surface, recordId);
+
+            AssertSurfaceHeaders(response, surface);
+        }
+        finally
+        {
+            clientFolder.Delete(recursive: true);
+        }
+    }
+
+    // On real Kestrel, which alone would add one, no response names its server in a Server header, and the API's
+    // response headers arrive over the socket as the header policy sets them.
+    [Theory]
+    [MemberData(nameof(EnvironmentsAndKestrelSurfaces))]
+    public async Task KestrelResponsesCarryNoServerHeader(string environment, string surface)
+    {
+        DirectoryInfo clientFolder = await CreateClientFolderAsync();
+        try
+        {
+            (FakeDataStore store, string recordId) = CreateSurfaceStore(surface);
+            await using KestrelApiFactory factory = new(SurfaceOptions(environment, store, clientFolder));
+            using HttpClient client = factory.CreateKestrelClient();
+
+            using HttpResponseMessage response = await SendSurfaceAsync(client, surface, recordId);
+
+            AssertSurfaceHeaders(response, surface);
+            Assert.True(HeaderValues(response, "Server").Length == 0, "The response carries a Server header.");
+        }
+        finally
+        {
+            clientFolder.Delete(recursive: true);
+        }
+    }
+
     // AAP 0.9.3: a value sent in the query string reaches neither the error body nor any log line: not the 500 of a
     // records list whose store fails, nor the 400 of a page that is not an integer, whose errors entry is the fixed
     // coercion message. The hosting request lines, which carry the URL, are dropped by the committed Warning floor on
@@ -2554,6 +2923,84 @@ public sealed class ErrorContractTests
         Assert.Equal(typeof(InvalidOperationException).FullName, StateValue(line, "ExceptionType"));
         Assert.Empty(factory.Logs.Find(IsFrameworkExceptionLine));
         AssertRedacted(factory, body, sentinel, SecretSqlText);
+    }
+
+    // AAP 0.3.4.2 and 0.9.3: a failure the exception-handler middleware cannot answer, because an exception handler
+    // registered ahead of the API's throws and the middleware rethrows the original failure, is still the API's fixed
+    // 500 in every environment and whatever the Accept header: never the Development exception page, which renders the
+    // exception and the request's headers as HTML, and never an exception the server reports. A record write keeps its
+    // writeOutcome, the response keeps the API's headers, and the handler's one redacted line is the only line about
+    // it: no framework line, and neither message, the SQL text nor the request header's value reaches a log or the
+    // body.
+    [Theory]
+    [MemberData(nameof(OuterPathFaults))]
+    public async Task FailureTheExceptionHandlerCannotAnswerIsStillTheFixedRedacted500(
+        string environment,
+        string? accept,
+        string route)
+    {
+        string storeSentinel = NewSentinel();
+        string handlerSentinel = NewSentinel();
+        string headerSentinel = NewSentinel();
+        bool write = route == CreateRoute;
+        FakeDataStore store = FakeDataStore.WithStandardForms();
+        store.ThrowOn(
+            write ? nameof(IDataStore.InsertAsync) : nameof(IDataStore.ListAsync),
+            new InvalidOperationException($"{SecretSqlText} WHERE x = '{storeSentinel}'"));
+        await using ApiFactory factory = CreateFactory(environment, store);
+        await using WebApplicationFactory<Program> host = factory.WithWebHostBuilder(builder =>
+            builder.ConfigureTestServices(services => services.Insert(
+                0,
+                ServiceDescriptor.Singleton<IExceptionHandler>(new ThrowingExceptionHandler(handlerSentinel)))));
+        using HttpClient client = host.CreateClient();
+        using var request = write
+            ? new HttpRequestMessage(HttpMethod.Post, TwoPageRecordsPath)
+            {
+                Content = JsonBody("""{"values":{"LastName":"Created"}}"""),
+            }
+            : new HttpRequestMessage(HttpMethod.Get, TwoPageRecordsPath);
+        AddAccept(request, accept);
+        Assert.True(
+            request.Headers.TryAddWithoutValidation(SentinelHeaderName, headerSentinel),
+            "The sentinel request header was not added.");
+
+        using HttpResponseMessage response = await client.SendAsync(request);
+        string body = await response.Content.ReadAsStringAsync();
+
+        JsonElement problem = AssertProblemDetails(response, body, HttpStatusCode.InternalServerError);
+        string? traceId = StringMember(problem, TraceIdMember);
+        AssertUnexpectedDetail(StringMember(problem, "detail"), traceId);
+        Assert.False(
+            body.Contains("<html", StringComparison.OrdinalIgnoreCase)
+            || body.Contains("<!doctype", StringComparison.OrdinalIgnoreCase),
+            "The error response is an HTML page.");
+        Assert.False(
+            body.Contains(nameof(InvalidOperationException), StringComparison.Ordinal),
+            "The error body names the exception type.");
+        if (write)
+        {
+            Assert.Equal(ExpectedUnknown, StringMember(problem, "writeOutcome"));
+        }
+        else
+        {
+            Assert.False(problem.TryGetProperty("writeOutcome", out _), "The 500 of a read carries writeOutcome.");
+        }
+
+        AssertHardeningHeaders(response);
+        Assert.True(
+            string.Equals(
+                "no-store",
+                string.Join(", ", HeaderValues(response, "Cache-Control")),
+                StringComparison.Ordinal),
+            "The /api error's Cache-Control is not exactly no-store.");
+
+        CapturedLogEntry line = AssertOneHandlerLine(factory, HttpStatusCode.InternalServerError);
+        Assert.Equal(RequestFailedEvent, line.EventId.Name);
+        Assert.Null(line.ExceptionType);
+        Assert.Equal(traceId, StateValue(line, "TraceId"));
+        Assert.Equal<object?>(write ? ExpectedUnknown : null, StateValue(line, "WriteOutcome"));
+        Assert.Empty(factory.Logs.Find(IsFrameworkExceptionLine));
+        AssertRedacted(factory, body, storeSentinel, handlerSentinel, headerSentinel, SecretSqlText);
     }
 
     // AAP 0.3.4.7 and 0.9.3: /health answers a server that refuses connections with exactly {"status":"unhealthy"},
@@ -2909,6 +3356,134 @@ public sealed class ErrorContractTests
         {
             Assert.True(request.Headers.TryAddWithoutValidation("Accept", accept), "The Accept header was not added.");
         }
+    }
+
+    // A temporary client folder holding index.html and one asset; the caller deletes it.
+    private static async Task<DirectoryInfo> CreateClientFolderAsync()
+    {
+        DirectoryInfo folder = Directory.CreateTempSubdirectory("epiinfo-error-contract-");
+        await File.WriteAllTextAsync(
+            Path.Combine(folder.FullName, ClientAppHosting.IndexFileName),
+            ClientIndexDocument);
+        DirectoryInfo assets = folder.CreateSubdirectory("assets");
+        await File.WriteAllTextAsync(Path.Combine(assets.FullName, "app.js"), "console.log('client');");
+        return folder;
+    }
+
+    // A host over store, with no connection string, serving the client in clientFolder.
+    private static ApiFactoryOptions SurfaceOptions(
+        string environment,
+        FakeDataStore store,
+        DirectoryInfo clientFolder) =>
+        new()
+        {
+            EnvironmentName = environment,
+            DataStore = store,
+            ConnectionMode = ApiConnectionMode.None,
+            ExtraSettings = ClientPathSetting(clientFolder.FullName),
+        };
+
+    // The standard fake forms with one active two-page record, whose id the record surfaces use; for the server-error
+    // surface the count fails with SQL text.
+    private static (FakeDataStore Store, string RecordId) CreateSurfaceStore(string surface)
+    {
+        FakeDataStore store = FakeDataStore.WithStandardForms();
+        string recordId = store.SeedRecord(
+            FakeForms.TwoPageViewId,
+            new Dictionary<string, FieldValue> { ["LastName"] = FieldValue.FromText("Original") });
+        if (surface == ApiServerErrorSurface)
+        {
+            store.ThrowOn(nameof(IDataStore.CountAsync), FakeDataStore.SqlTextException(NewSentinel()));
+        }
+
+        return (store, recordId);
+    }
+
+    // The request of each surface; the record surfaces address recordId on the two-page form.
+    private static Task<HttpResponseMessage> SendSurfaceAsync(HttpClient client, string surface, string recordId) =>
+        surface switch
+        {
+            ClientRootSurface => client.GetAsync("/"),
+            ClientRouteSurface => client.GetAsync("/client/route"),
+            ClientAssetSurface => client.GetAsync(ClientAssetPath),
+            FormsListSurface => SendReadAsync(client, FormsListEndpoint),
+            FormDefinitionSurface => client.GetAsync(
+                string.Create(CultureInfo.InvariantCulture, $"/api/forms/{FakeForms.TwoPageViewId}")),
+            RecordsListSurface => SendReadAsync(client, RecordsListEndpoint),
+            RecordAtSurface => client.GetAsync($"{TwoPageRecordsPath}/at/1"),
+            RecordByIdSurface => client.GetAsync($"{TwoPageRecordsPath}/{recordId}"),
+            SearchSurface => SendReadAsync(client, SearchEndpoint),
+            CreateSurface => SendWriteAsync(client, CreateRoute, recordId: null, "Created"),
+            UpdateSurface => SendWriteAsync(client, UpdateRoute, recordId, "Changed"),
+            ApiRouteMissSurface => client.GetAsync("/api/nope"),
+            ApiBadRequestSurface => client.GetAsync($"{TwoPageRecordsPath}?{RequestParameters.Page}=0"),
+            ApiServerErrorSurface => SendReadAsync(client, CountEndpoint),
+            HealthSurface => client.GetAsync("/health"),
+            OpenApiSurface => client.GetAsync("/openapi/v1.json"),
+            MissingAssetSurface => client.GetAsync("/assets/missing.js"),
+            _ => throw new ArgumentOutOfRangeException(nameof(surface), surface, "Unknown response surface."),
+        };
+
+    // Each surface's status, and the Cache-Control it must carry exactly: no-store under /api, no-cache for the index,
+    // and, where null, any value other than no-store.
+    private static void AssertSurfaceHeaders(HttpResponseMessage response, string surface)
+    {
+        (HttpStatusCode status, string? cacheControl) = surface switch
+        {
+            ClientRootSurface or ClientRouteSurface => (HttpStatusCode.OK, "no-cache"),
+            ClientAssetSurface or HealthSurface or OpenApiSurface => (HttpStatusCode.OK, null),
+            MissingAssetSurface => (HttpStatusCode.NotFound, null),
+            CreateSurface => (HttpStatusCode.Created, "no-store"),
+            ApiRouteMissSurface => (HttpStatusCode.NotFound, "no-store"),
+            ApiBadRequestSurface => (HttpStatusCode.BadRequest, "no-store"),
+            ApiServerErrorSurface => (HttpStatusCode.InternalServerError, "no-store"),
+            FormsListSurface or FormDefinitionSurface or RecordsListSurface or RecordAtSurface or RecordByIdSurface
+                or SearchSurface or UpdateSurface => (HttpStatusCode.OK, "no-store"),
+            _ => throw new ArgumentOutOfRangeException(nameof(surface), surface, "Unknown response surface."),
+        };
+
+        Assert.Equal(status, response.StatusCode);
+        AssertHardeningHeaders(response);
+        string[] cache = HeaderValues(response, "Cache-Control");
+        if (cacheControl is null)
+        {
+            Assert.False(
+                cache.Any(value => value.Contains("no-store", StringComparison.OrdinalIgnoreCase)),
+                "A response outside /api is no-store.");
+        }
+        else
+        {
+            Assert.True(
+                string.Equals(cacheControl, string.Join(", ", cache), StringComparison.Ordinal),
+                "The response's Cache-Control is not exactly the value its path calls for.");
+        }
+    }
+
+    // The anti-sniffing and anti-framing headers every response carries, each exactly once with its exact value.
+    private static void AssertHardeningHeaders(HttpResponseMessage response)
+    {
+        Assert.True(
+            HeaderValues(response, "X-Content-Type-Options").SequenceEqual(["nosniff"], StringComparer.Ordinal),
+            "The response does not carry X-Content-Type-Options: nosniff exactly once.");
+        Assert.True(
+            HeaderValues(response, "X-Frame-Options").SequenceEqual(["DENY"], StringComparer.Ordinal),
+            "The response does not carry X-Frame-Options: DENY exactly once.");
+        Assert.True(
+            HeaderValues(response, "Content-Security-Policy")
+                .SequenceEqual(["frame-ancestors 'none'"], StringComparer.Ordinal),
+            "The response does not carry a Content-Security-Policy of exactly frame-ancestors 'none'.");
+    }
+
+    // The values of a response or content header, empty when the response has none.
+    private static string[] HeaderValues(HttpResponseMessage response, string name)
+    {
+        if (response.Headers.TryGetValues(name, out IEnumerable<string>? values)
+            || response.Content.Headers.TryGetValues(name, out values))
+        {
+            return [.. values];
+        }
+
+        return [];
     }
 
     private static async Task AssertFixedProblemAsync(
@@ -3648,6 +4223,20 @@ public sealed class ErrorContractTests
 
         public Task<FormPermissions?> GetPermissionsAsync(FormMetadata form, CancellationToken cancellationToken) =>
             inner.GetPermissionsAsync(form, cancellationToken);
+    }
+
+    /// <summary>
+    /// An exception handler that throws, with <paramref name="sentinel"/> as its message, for every failure. Registered
+    /// ahead of <see cref="ApiExceptionHandler"/>, it leaves the exception-handler middleware unable to answer, so that
+    /// middleware rethrows the original failure.
+    /// </summary>
+    private sealed class ThrowingExceptionHandler(string sentinel) : IExceptionHandler
+    {
+        public ValueTask<bool> TryHandleAsync(
+            HttpContext httpContext,
+            Exception exception,
+            CancellationToken cancellationToken) =>
+            throw new InvalidOperationException(sentinel);
     }
 
     /// <summary>
@@ -4691,8 +5280,10 @@ internal sealed record ErrorPipelineHostOptions
 
 /// <summary>
 /// A host of the API's error pipeline for the tests that need a hook the real composition cannot be given, a failing
-/// JSON converter or an endpoint the API does not have, and no database: the real <see cref="ApiExceptionHandler"/>,
-/// its <see cref="ApiExceptionBoundaryMiddleware"/>, <see cref="ApiProblems.Customize"/>, the status-code pages of
+/// JSON converter or an endpoint the API does not have, and no database: the outermost
+/// <see cref="ApiOutermostExceptionBoundaryMiddleware"/>, the <see cref="ResponseHeaderPolicy"/>, the real
+/// <see cref="ApiExceptionHandler"/>, its <see cref="ApiExceptionBoundaryMiddleware"/>,
+/// <see cref="ApiProblems.Customize"/>, the status-code pages of
 /// <see cref="ApiProblems.WriteStatusCodePageAsync"/>, the request <c>Host</c> guard, the request guards, endpoints and
 /// services, composed in the order <c>Program.cs</c> uses, over a <see cref="FakeDataStore"/>,
 /// with the committed configuration of the API project and its logging as <c>Program.cs</c> composes it: the JSON
@@ -4712,10 +5303,10 @@ internal sealed record ErrorPipelineHostOptions
 /// <see cref="LoopbackBindingGuard.Validate"/> checks every effective listen setting before the host is built and
 /// again on the built configuration, on TestServer and on Kestrel. On Kestrel the server loads the fixed copy of the
 /// verified <c>Kestrel</c> section that <see cref="LoopbackBindingGuard.FreezeListenSettings"/> returns, with reload
-/// off, and applies the committed body cap. Once started, the address the server reports is checked without the
-/// guard's predicate: exactly one, an <c>http</c> URL whose host parses as the IPv4 <see cref="IPAddress.Loopback"/>,
-/// on a port other than 0. A host that fails to build, start or prove its address is disposed before the failure
-/// reaches the test.
+/// off, applies the committed body cap and sends no <c>Server</c> header. Once started, the address the server reports
+/// is checked without the guard's predicate: exactly one, an <c>http</c> URL whose host parses as the IPv4
+/// <see cref="IPAddress.Loopback"/>, on a port other than 0. A host that fails to build, start or prove its address is
+/// disposed before the failure reaches the test.
 /// </para>
 /// <para>Each host is independent: create one per test and dispose it, so captured logs never mix.</para>
 /// </remarks>
@@ -4775,7 +5366,7 @@ internal sealed class ErrorPipelineHost : IAsyncDisposable
             {
                 // As Program.cs does: Kestrel loads the guard's frozen copy of the verified Kestrel section with reload
                 // off, the host's urls and ports keys are pinned to that copy, and, because loading the section binds
-                // endpoints and not limits, the body cap is applied from configuration here.
+                // endpoints and not limits, the body cap is applied from configuration here; no Server header is sent.
                 builder.WebHost.ConfigureKestrel((context, kestrel) =>
                 {
                     kestrel.Configure(
@@ -4783,6 +5374,7 @@ internal sealed class ErrorPipelineHost : IAsyncDisposable
                         reloadOnChange: false);
                     kestrel.Limits.MaxRequestBodySize =
                         ApiOptions.FromConfiguration(context.Configuration).MaxRequestBodySize;
+                    kestrel.AddServerHeader = false;
                 });
             }
             else
@@ -4829,6 +5421,8 @@ internal sealed class ErrorPipelineHost : IAsyncDisposable
             // As Program.cs does: checked again on the built configuration, which holds the sources added during Build.
             LoopbackBindingGuard.Validate(app.Configuration);
 
+            app.UseApiOutermostExceptionBoundary();
+            app.Use(ResponseHeaderPolicy.ApplyAsync);
             app.UseExceptionHandler();
             app.UseApiExceptionBoundary();
             app.UseStatusCodePages(ApiProblems.WriteStatusCodePageAsync);

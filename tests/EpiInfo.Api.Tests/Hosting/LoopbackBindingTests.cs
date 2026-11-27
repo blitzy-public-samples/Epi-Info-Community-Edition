@@ -1,5 +1,8 @@
+using System.Globalization;
 using System.Net;
+using System.Net.Http.Headers;
 using System.Net.Sockets;
+using System.Runtime.Versioning;
 using System.Text.Json;
 using EpiInfo.Api.Errors;
 using EpiInfo.Api.Hosting;
@@ -8,6 +11,8 @@ using EpiInfo.Domain.Storage;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
+using Microsoft.Win32.SafeHandles;
 
 namespace EpiInfo.Api.Tests.Hosting;
 
@@ -530,6 +535,513 @@ public sealed class LoopbackHostGuardTests : IDisposable
 
     // What a case reads from a response, taken before the response is disposed.
     private sealed record ReceivedResponse(HttpStatusCode Status, string? MediaType, string Text);
+}
+
+/// <summary>
+/// The client copy of <see cref="ClientAppHosting"/>: the host reads its client folder into memory once, at startup,
+/// and serves only that copy, so no link, edit, addition or deletion made afterwards changes what is served. Links
+/// below the folder, the server's own paths and the files a physical provider hides are left out, and a folder over
+/// the limits, or outside Windows a folder that every user can write or that holds a folder or file every user can
+/// write, serves no client and logs one fixed warning.
+/// </summary>
+/// <remarks>
+/// The class needs no database: it carries no <c>Integration</c> trait and joins no database collection, and each case
+/// hosts the API over a <see cref="FakeDataStore"/> on TestServer. Each case has its own temporary directory holding
+/// the client folder and, beside it, a folder outside the client that holds a secret. A case that needs a symbolic
+/// link returns early where the operating system refuses to create one for want of the privilege, as Windows does
+/// outside Developer Mode; the cases of the Linux handle check return early on other systems, which report no
+/// handle's path; and the cases of file modes return early on Windows, which the host does not check.
+/// </remarks>
+public sealed class ClientAppSnapshotTests : IDisposable
+{
+    private const string AssetPath = "assets/app.js";
+
+    private const string ImagePath = "assets/logo.png";
+
+    private const string IndexContent = "<!doctype html><title>snapshot client</title>";
+
+    private const string AssetContent = "console.log('snapshot client');";
+
+    private const string SecretContent = "secret outside the client folder";
+
+    private const string SecretFile = "secret.js";
+
+    // 0775 and 0664: the owner and the group may write, and other users may only read and enter a folder.
+    private const UnixFileMode GroupWritableFileMode =
+        UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.GroupRead | UnixFileMode.GroupWrite
+        | UnixFileMode.OtherRead;
+
+    private const UnixFileMode GroupWritableFolderMode =
+        GroupWritableFileMode | UnixFileMode.UserExecute | UnixFileMode.GroupExecute | UnixFileMode.OtherExecute;
+
+    // Bytes that are not valid UTF-8, so an exact match shows that nothing decoded or re-encoded the file.
+    private static readonly byte[] ImageContent = [0x89, 0x50, 0x4E, 0x47, 0x00, 0xFF, 0xFE, 0x80, 0x0D, 0x0A];
+
+    private readonly DirectoryInfo _temp;
+
+    private readonly string _client;
+
+    private readonly string _outside;
+
+    /// <summary>Writes the client folder and the outside folder, in a new temporary directory.</summary>
+    public ClientAppSnapshotTests()
+    {
+        _temp = Directory.CreateTempSubdirectory("epiinfo-client-copy-");
+        _client = Path.Join(_temp.FullName, "client");
+        _outside = Path.Join(_temp.FullName, "outside");
+        WriteFile(_client, ClientAppHosting.IndexFileName, IndexContent);
+        WriteFile(_client, AssetPath, AssetContent);
+        File.WriteAllBytes(Path.Join(_client, ImagePath), ImageContent);
+        WriteFile(_outside, SecretFile, SecretContent);
+    }
+
+    /// <summary>Removes the temporary directory; a recursive delete removes each link itself, never its target.</summary>
+    public void Dispose() => _temp.Delete(recursive: true);
+
+    // The page, a client route answered with it, a script and a binary image: each response is exactly the file's
+    // bytes as they were at startup.
+    [Theory]
+    [InlineData("/", ClientAppHosting.IndexFileName)]
+    [InlineData("/" + ClientAppHosting.IndexFileName, ClientAppHosting.IndexFileName)]
+    [InlineData("/forms/1", ClientAppHosting.IndexFileName)]
+    [InlineData("/" + AssetPath, AssetPath)]
+    [InlineData("/" + ImagePath, ImagePath)]
+    public async Task ServesTheExactBytesOfTheFile(string path, string file)
+    {
+        byte[] expected = await File.ReadAllBytesAsync(Path.Join(_client, file));
+        await using ApiFactory factory = CreateFactory();
+        using HttpClient client = factory.CreateClient();
+
+        using HttpResponseMessage response = await client.GetAsync(path);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Equal(expected, await response.Content.ReadAsByteArrayAsync());
+    }
+
+    // Links present at startup: a file link and a folder link to the outside folder, a link inside assets/, and a link
+    // whose target stays inside the client folder. None is served, and the rest of the client still is.
+    [Theory]
+    [InlineData("linked.js", "outside/" + SecretFile, false, "/linked.js")]
+    [InlineData("linked", "outside", true, "/linked/" + SecretFile)]
+    [InlineData("assets/linked.js", "outside/" + SecretFile, false, "/assets/linked.js")]
+    [InlineData("assets/alias.js", "client/" + AssetPath, false, "/assets/alias.js")]
+    public async Task LinkPresentAtStartupIsNotServed(string link, string target, bool linksFolder, string path)
+    {
+        if (!TryCreateSymbolicLink(Path.Join(_client, link), Path.Join(_temp.FullName, target), linksFolder))
+        {
+            return;
+        }
+
+        await using ApiFactory factory = CreateFactory();
+        using HttpClient client = factory.CreateClient();
+
+        ReceivedResponse linked = await GetAsync(client, path);
+        Assert.Equal(HttpStatusCode.NotFound, linked.Status);
+        Assert.DoesNotContain(SecretContent, linked.Text, StringComparison.Ordinal);
+        Assert.DoesNotContain(AssetContent, linked.Text, StringComparison.Ordinal);
+
+        ReceivedResponse asset = await GetAsync(client, "/" + AssetPath);
+        Assert.Equal(HttpStatusCode.OK, asset.Status);
+        Assert.Equal(AssetContent, asset.Text);
+    }
+
+    // The copy leaves links out, so an index.html that is one leaves the folder without its page: the missing-client
+    // warning, and no client, as for a folder never built.
+    [Fact]
+    public async Task IndexThatIsALinkCountsAsMissing()
+    {
+        string index = Path.Join(_client, ClientAppHosting.IndexFileName);
+        string outsideIndex = Path.Join(_outside, ClientAppHosting.IndexFileName);
+        File.Move(index, outsideIndex);
+        if (!TryCreateSymbolicLink(index, outsideIndex, linksFolder: false))
+        {
+            return;
+        }
+
+        await using ApiFactory factory = CreateFactory();
+        using HttpClient client = factory.CreateClient();
+
+        Assert.Equal(HttpStatusCode.NotFound, (await GetAsync(client, "/")).Status);
+        Assert.Equal(HttpStatusCode.NotFound, (await GetAsync(client, "/" + AssetPath)).Status);
+        CapturedLogEntry warning = AssertOneClientWarning(factory);
+        Assert.Equal(1, warning.EventId.Id);
+        Assert.Equal("ClientAppMissing", warning.EventId.Name);
+    }
+
+    // After startup the folder is never read again: an asset replaced by a link to a secret outside, its folder
+    // replaced by a link to the outside folder, an asset edited, a file added and an asset deleted. The asset keeps its
+    // startup bytes, and a file that was not in the folder at startup stays a 404.
+    [Theory]
+    [InlineData("asset replaced by a link")]
+    [InlineData("folder replaced by a link")]
+    [InlineData("asset edited")]
+    [InlineData("file added")]
+    [InlineData("asset deleted")]
+    public async Task ChangeAfterStartupChangesNothingServed(string change)
+    {
+        await using ApiFactory factory = CreateFactory();
+        using HttpClient client = factory.CreateClient();
+        Assert.Equal(AssetContent, (await GetAsync(client, "/" + AssetPath)).Text);
+
+        string assets = Path.Join(_client, "assets");
+        string asset = Path.Join(_client, AssetPath);
+        switch (change)
+        {
+            case "asset replaced by a link":
+                File.Delete(asset);
+                if (!TryCreateSymbolicLink(asset, Path.Join(_outside, SecretFile), linksFolder: false))
+                {
+                    return;
+                }
+
+                break;
+
+            case "folder replaced by a link":
+                Directory.Move(assets, Path.Join(_temp.FullName, "moved-assets"));
+                WriteFile(_outside, "app.js", SecretContent);
+                if (!TryCreateSymbolicLink(assets, _outside, linksFolder: true))
+                {
+                    return;
+                }
+
+                break;
+
+            case "asset edited":
+                await File.WriteAllTextAsync(asset, SecretContent);
+                break;
+
+            case "file added":
+                await File.WriteAllTextAsync(Path.Join(assets, SecretFile), SecretContent);
+                break;
+
+            case "asset deleted":
+                File.Delete(asset);
+                break;
+
+            default:
+                throw new ArgumentOutOfRangeException(nameof(change), change, "Not a change this case makes.");
+        }
+
+        ReceivedResponse served = await GetAsync(client, "/" + AssetPath);
+        Assert.Equal(HttpStatusCode.OK, served.Status);
+        Assert.Equal(AssetContent, served.Text);
+
+        ReceivedResponse added = await GetAsync(client, "/assets/" + SecretFile);
+        Assert.Equal(HttpStatusCode.NotFound, added.Status);
+        Assert.DoesNotContain(SecretContent, added.Text, StringComparison.Ordinal);
+    }
+
+    // The server's own paths, in any case, and the files a physical provider hides: a file under api/ or openapi/, a
+    // root file named health, a dot-file at the root and one in a folder. None is served: the health check answers
+    // /health as it does without the file, and every other path is the 404 it is without the file.
+    [Theory]
+    [InlineData("api/forms.json", "/api/forms.json", HttpStatusCode.NotFound)]
+    [InlineData("API/forms.json", "/API/forms.json", HttpStatusCode.NotFound)]
+    [InlineData("openapi/client.json", "/openapi/client.json", HttpStatusCode.NotFound)]
+    [InlineData("health", "/health", HttpStatusCode.OK)]
+    [InlineData("Health", "/Health", HttpStatusCode.OK)]
+    [InlineData(".env", "/.env", HttpStatusCode.NotFound)]
+    [InlineData("assets/.hidden.js", "/assets/.hidden.js", HttpStatusCode.NotFound)]
+    public async Task ServerPathOrHiddenFileIsNotServed(string file, string path, HttpStatusCode expected)
+    {
+        const string Marker = "a client-folder file that must not be served";
+        WriteFile(_client, file, Marker);
+        await using ApiFactory factory = CreateFactory();
+        using HttpClient client = factory.CreateClient();
+
+        ReceivedResponse response = await GetAsync(client, path);
+
+        Assert.Equal(expected, response.Status);
+        Assert.DoesNotContain(Marker, response.Text, StringComparison.Ordinal);
+        Assert.Equal(AssetContent, (await GetAsync(client, "/" + AssetPath)).Text);
+    }
+
+    // The middleware streams a file of the copy from memory, so HEAD answers its length without a body and a range
+    // request answers exactly the bytes asked for.
+    [Fact]
+    public async Task HeadAndRangeRequestsAreAnsweredFromTheCopy()
+    {
+        await using ApiFactory factory = CreateFactory();
+        using HttpClient client = factory.CreateClient();
+
+        using (var head = new HttpRequestMessage(HttpMethod.Head, "/" + AssetPath))
+        using (HttpResponseMessage response = await client.SendAsync(head))
+        {
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            Assert.Equal<long?>(AssetContent.Length, response.Content.Headers.ContentLength);
+            Assert.Empty(await response.Content.ReadAsByteArrayAsync());
+        }
+
+        using var range = new HttpRequestMessage(HttpMethod.Get, "/" + AssetPath);
+        range.Headers.Range = new RangeHeaderValue(8, 11);
+        using HttpResponseMessage partial = await client.SendAsync(range);
+
+        Assert.Equal(HttpStatusCode.PartialContent, partial.StatusCode);
+        Assert.Equal(new ContentRangeHeaderValue(8, 11, AssetContent.Length), partial.Content.Headers.ContentRange);
+        Assert.Equal(AssetContent.Substring(8, 4), await partial.Content.ReadAsStringAsync());
+    }
+
+    // One entry past the entry limit, or one file past the byte limit: the folder is not served at all, and the host
+    // logs one warning, the fixed text naming the configuration key and never the folder.
+    [Theory]
+    [InlineData("entries")]
+    [InlineData("bytes")]
+    public async Task FolderOverTheLimitsServesNoClientAndLogsOneFixedWarning(string limit)
+    {
+        if (limit == "entries")
+        {
+            string many = Path.Join(_client, "many");
+            Directory.CreateDirectory(many);
+            for (int i = 0; i < ClientAppHosting.MaxClientEntries; i++)
+            {
+                File.WriteAllBytes(Path.Join(many, i.ToString(CultureInfo.InvariantCulture)), []);
+            }
+        }
+        else
+        {
+            // Sparse where the file system allows, so the case writes no 64 MiB; the read refuses it from its length.
+            using FileStream large = File.Create(Path.Join(_client, "assets", "large.js"));
+            large.SetLength(ClientAppHosting.MaxClientBytes + 1);
+        }
+
+        await using ApiFactory factory = CreateFactory();
+        using HttpClient client = factory.CreateClient();
+
+        Assert.Equal(HttpStatusCode.NotFound, (await GetAsync(client, "/")).Status);
+        Assert.Equal(HttpStatusCode.NotFound, (await GetAsync(client, "/" + AssetPath)).Status);
+        CapturedLogEntry warning = AssertOneClientWarning(factory);
+        Assert.Equal(3, warning.EventId.Id);
+        Assert.Equal("ClientAppUnconfirmed", warning.EventId.Name);
+        Assert.Contains(ApiOptions.ClientPathKey, warning.Message, StringComparison.Ordinal);
+        Assert.Equal("{OriginalFormat}", Assert.Single(warning.State).Key);
+        Assert.Null(warning.ExceptionType);
+        Assert.DoesNotContain(_temp.Name, warning.Message, StringComparison.Ordinal);
+    }
+
+    // Outside Windows, a client folder every user can write, judged through a configured link on the folder it
+    // resolves to, or a folder, an asset or the page in it that every user can write: the folder is not served at all,
+    // the API answers as it does without a client, and the host logs one warning, the fixed text naming the
+    // configuration key and never the folder, the entry or its mode. Every other entry is group-writable only.
+    [Theory]
+    [InlineData("", false)]
+    [InlineData("", true)]
+    [InlineData("assets", false)]
+    [InlineData(AssetPath, false)]
+    [InlineData(ClientAppHosting.IndexFileName, false)]
+    public async Task FolderEveryUserCanWriteServesNoClientAndLogsOneFixedWarning(string entry, bool throughLink)
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        SetModes(GroupWritableFolderMode, GroupWritableFileMode);
+        string path = Path.Join(_client, entry);
+        File.SetUnixFileMode(path, File.GetUnixFileMode(path) | UnixFileMode.OtherWrite);
+
+        await using ApiFactory factory = CreateFactory(throughLink ? LinkToClient() : _client);
+        using HttpClient client = factory.CreateClient();
+
+        Assert.Equal(HttpStatusCode.NotFound, (await GetAsync(client, "/")).Status);
+        Assert.Equal(HttpStatusCode.NotFound, (await GetAsync(client, "/" + AssetPath)).Status);
+        Assert.Equal(HttpStatusCode.OK, (await GetAsync(client, "/api/forms")).Status);
+        CapturedLogEntry warning = AssertOneClientWarning(factory);
+        Assert.Equal(4, warning.EventId.Id);
+        Assert.Equal("ClientAppUntrusted", warning.EventId.Name);
+        Assert.Contains(ApiOptions.ClientPathKey, warning.Message, StringComparison.Ordinal);
+        Assert.Null(warning.ExceptionType);
+
+        // The state is the template alone, which is the message, so neither holds anything the message does not.
+        KeyValuePair<string, object?> state = Assert.Single(warning.State);
+        Assert.Equal("{OriginalFormat}", state.Key);
+        Assert.Equal(warning.Message, state.Value);
+        Assert.Null(warning.StateMessage);
+        Assert.DoesNotContain(_temp.Name, warning.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(nameof(UnixFileMode.OtherWrite), warning.Message, StringComparison.Ordinal);
+        if (entry.Length > 0)
+        {
+            Assert.DoesNotContain(Path.GetFileName(entry), warning.Message, StringComparison.Ordinal);
+        }
+    }
+
+    // Outside Windows, group write is allowed, because where each user has a private group the default umask 002 leaves
+    // every build group-writable, and a configured link, whose own mode lets every user write, is judged on the folder
+    // it resolves to: each file is served exactly as it was at startup, and the host logs nothing.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task FolderOnlyItsOwnerAndGroupCanWriteIsServed(bool throughLink)
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        SetModes(GroupWritableFolderMode, GroupWritableFileMode);
+        await using ApiFactory factory = CreateFactory(throughLink ? LinkToClient() : _client);
+        using HttpClient client = factory.CreateClient();
+
+        foreach ((string path, string file) in new[]
+                 {
+                     ("/", ClientAppHosting.IndexFileName),
+                     ("/" + AssetPath, AssetPath),
+                     ("/" + ImagePath, ImagePath),
+                 })
+        {
+            using HttpResponseMessage response = await client.GetAsync(path);
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            Assert.Equal(
+                await File.ReadAllBytesAsync(Path.Join(_client, file)),
+                await response.Content.ReadAsByteArrayAsync());
+        }
+
+        Assert.Empty(factory.Logs.Find(entry => entry.Category == ClientAppHosting.LoggerCategory));
+    }
+
+
+    // The Linux confirmation: a handle's own path, every link resolved, is compared with the real path of the file the
+    // listing found, so a handle opened through a folder link or a file link is refused, and one opened at the file's
+    // real path is accepted.
+    [Theory]
+    [InlineData(AssetPath, true)]
+    [InlineData("linked-folder/app.js", false)]
+    [InlineData("linked-file.js", false)]
+    public void HandleIsConfirmedOnlyAtTheRealPathOfTheEntryItWasOpenedFor(string relativePath, bool confirmed)
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            return;
+        }
+
+        Directory.CreateSymbolicLink(Path.Join(_client, "linked-folder"), Path.Join(_client, "assets"));
+        File.CreateSymbolicLink(Path.Join(_client, "linked-file.js"), Path.Join(_outside, SecretFile));
+        string realPath = Path.Join(ClientAppHosting.ResolveRealPath(_client), relativePath);
+
+        using SafeFileHandle handle = File.OpenHandle(Path.Join(_client, relativePath));
+
+        Assert.Equal(confirmed, ClientAppHosting.IsOpenedAt(handle, realPath));
+    }
+
+    // The real path the Linux confirmation expects: a relative and an absolute link are both followed, a ".." after a
+    // link climbs from its target, and a loop of links is refused instead of followed for ever.
+    [Fact]
+    public void ResolveRealPathFollowsEveryLinkAndRefusesALoop()
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            return;
+        }
+
+        string realTemp = ClientAppHosting.ResolveRealPath(_temp.FullName);
+        Directory.CreateSymbolicLink(Path.Join(_client, "up"), "..");
+        Directory.CreateSymbolicLink(Path.Join(_outside, "to-assets"), Path.Join(_client, "assets"));
+        string linked = Path.Join(_client, "up", "outside", "to-assets", "..", AssetPath);
+
+        Assert.Equal(Path.Join(realTemp, "client", AssetPath), ClientAppHosting.ResolveRealPath(linked));
+
+        File.CreateSymbolicLink(Path.Join(_temp.FullName, "loop-a"), Path.Join(_temp.FullName, "loop-b"));
+        File.CreateSymbolicLink(Path.Join(_temp.FullName, "loop-b"), Path.Join(_temp.FullName, "loop-a"));
+
+        // Caught here rather than by Assert.Throws, whose lambda the platform guard above would not cover.
+        IOException? refusal = null;
+        try
+        {
+            _ = ClientAppHosting.ResolveRealPath(Path.Join(_temp.FullName, "loop-a"));
+        }
+        catch (IOException exception)
+        {
+            refusal = exception;
+        }
+
+        Assert.IsType<IOException>(refusal);
+    }
+
+    // Creates a symbolic link, or returns false after asserting that the operating system refused it for want of the
+    // privilege to create one, as ForbiddenReferenceTests does: Windows lets an unprivileged process create a symbolic
+    // link only in Developer Mode. Any other failure still fails the case.
+    private static bool TryCreateSymbolicLink(string path, string target, bool linksFolder)
+    {
+        const int PrivilegeNotHeld = unchecked((int)0x80070522);
+        try
+        {
+            if (linksFolder)
+            {
+                Directory.CreateSymbolicLink(path, target);
+            }
+            else
+            {
+                File.CreateSymbolicLink(path, target);
+            }
+
+            return true;
+        }
+        catch (Exception refusal) when (OperatingSystem.IsWindows() &&
+                                        refusal is UnauthorizedAccessException or IOException)
+        {
+            Assert.True(
+                refusal is UnauthorizedAccessException || refusal.HResult == PrivilegeNotHeld,
+                $"Creating a symbolic link failed for a reason other than the missing privilege: {refusal}");
+            return false;
+        }
+    }
+
+    private static void WriteFile(string folder, string relativePath, string content)
+    {
+        string path = Path.Join(folder, relativePath);
+        Directory.CreateDirectory(
+            Path.GetDirectoryName(path) ?? throw new InvalidOperationException($"'{path}' has no parent directory."));
+        File.WriteAllText(path, content);
+    }
+
+    private static async Task<ReceivedResponse> GetAsync(HttpClient client, string path)
+    {
+        using HttpResponseMessage response = await client.GetAsync(path);
+        return new ReceivedResponse(response.StatusCode, await response.Content.ReadAsStringAsync());
+    }
+
+    // The one entry the client host logged; only its warnings use that category.
+    private static CapturedLogEntry AssertOneClientWarning(ApiFactory factory)
+    {
+        CapturedLogEntry warning = Assert.Single(
+            factory.Logs.Entries,
+            entry => entry.Category == ClientAppHosting.LoggerCategory);
+        Assert.Equal(LogLevel.Warning, warning.Level);
+        return warning;
+    }
+
+    // Gives the client folder and every folder below it folderMode, and every file in it fileMode, so a case does not
+    // depend on the umask the test run inherits.
+    [UnsupportedOSPlatform("windows")]
+    private void SetModes(UnixFileMode folderMode, UnixFileMode fileMode)
+    {
+        File.SetUnixFileMode(_client, folderMode);
+        foreach (string folder in Directory.EnumerateDirectories(_client, "*", SearchOption.AllDirectories))
+        {
+            File.SetUnixFileMode(folder, folderMode);
+        }
+
+        foreach (string file in Directory.EnumerateFiles(_client, "*", SearchOption.AllDirectories))
+        {
+            File.SetUnixFileMode(file, fileMode);
+        }
+    }
+
+    // A link beside the client folder to it, for a case that configures the link in the folder's place.
+    private string LinkToClient()
+    {
+        string link = Path.Join(_temp.FullName, "client-link");
+        Directory.CreateSymbolicLink(link, _client);
+        return link;
+    }
+
+    private ApiFactory CreateFactory(string? clientPath = null) =>
+        new(ApiFactoryOptions.ForFake(new FakeDataStore()) with
+        {
+            ExtraSettings = new Dictionary<string, string?> { [ApiOptions.ClientPathKey] = clientPath ?? _client },
+        });
+
+    // What a case reads from a response, taken before the response is disposed.
+    private sealed record ReceivedResponse(HttpStatusCode Status, string Text);
 }
 
 /// <summary>The assertions every listen-setting case shares.</summary>

@@ -12,6 +12,8 @@ namespace EpiInfo.Api.Errors;
 /// The one mapping from an exception that escapes an endpoint to the API's error response. <c>Program.cs</c> registers
 /// it with <c>AddExceptionHandler&lt;ApiExceptionHandler&gt;()</c> behind <c>UseExceptionHandler()</c>, and
 /// <c>RouteHandlerOptions.ThrowOnBadRequest</c> is on, so binder failures arrive here with their own status.
+/// <see cref="ApiOutermostExceptionBoundaryMiddleware"/> answers through it an exception that exception-handler
+/// middleware rethrew because it could not answer it.
 /// </summary>
 /// <remarks>
 /// <para>Classification, first match wins; the response is the same in every environment:</para>
@@ -254,9 +256,10 @@ internal sealed partial class ApiExceptionHandler(ILogger<ApiExceptionHandler> l
     internal static string TraceId(HttpContext httpContext) => Activity.Current?.Id ?? httpContext.TraceIdentifier;
 
     // UseExceptionHandler clears the request's endpoint before it calls any handler and keeps the matched one on
-    // IExceptionHandlerFeature, so GetEndpoint() alone would never see WriteEndpointMetadata there. It still answers
-    // for a handler invoked outside that middleware.
-    private static Endpoint? MatchedEndpoint(HttpContext httpContext) =>
+    // IExceptionHandlerFeature, so GetEndpoint() alone would never see WriteEndpointMetadata there, nor in the
+    // outermost boundary once that middleware has rethrown. GetEndpoint() still answers for a handler invoked outside
+    // that middleware and for the inner boundary, which runs before it.
+    internal static Endpoint? MatchedEndpoint(HttpContext httpContext) =>
         httpContext.Features.Get<IExceptionHandlerFeature>()?.Endpoint ?? httpContext.GetEndpoint();
 
     internal static string ResolveOperation(Exception exception, Endpoint? endpoint) =>
@@ -358,7 +361,7 @@ internal sealed partial class ApiExceptionHandler(ILogger<ApiExceptionHandler> l
         EventName = "ErrorBodyWriteFailed",
         Level = LogLevel.Error,
         Message = "Writing the error response failed with {ExceptionType}; TraceId {TraceId}")]
-    private static partial void LogErrorBodyWriteFailed(ILogger logger, string exceptionType, string traceId);
+    internal static partial void LogErrorBodyWriteFailed(ILogger logger, string exceptionType, string traceId);
 
     /// <summary>The status, log level and body chosen for one failure.</summary>
     private readonly record struct HandledFailure(int StatusCode, LogLevel Level, IResult Body);
@@ -389,6 +392,8 @@ internal sealed partial class ApiExceptionHandler(ILogger<ApiExceptionHandler> l
 /// never given to the logger and its message is never read. They are written best effort, so a failing log provider
 /// never prevents the 499 status or the abort. The matched endpoint is still on the request here,
 /// because the exception-handler middleware clears it only once it handles an exception itself.
+/// <see cref="ApiOutermostExceptionBoundaryMiddleware"/> answers both cases the same way, through
+/// <see cref="Settles"/> and <see cref="Settle"/>.
 /// </para>
 /// </remarks>
 internal sealed partial class ApiExceptionBoundaryMiddleware
@@ -425,12 +430,38 @@ internal sealed partial class ApiExceptionBoundaryMiddleware
         {
             await _next(httpContext);
         }
-        catch (Exception exception) when (ApiExceptionHandler.IsClientAbort(exception, httpContext))
+        catch (Exception exception) when (Settles(exception, httpContext))
         {
-            var (rollbackExceptionType, rollbackSqlErrorNumber) = ApiExceptionHandler.RollbackFailure(exception);
+            Settle(httpContext, exception, _logger);
+        }
+    }
+
+    /// <summary>
+    /// Whether <paramref name="exception"/> is one of the two failures a boundary answers itself: a client abort, or a
+    /// failure after the response started.
+    /// </summary>
+    /// <param name="exception">The failure that escaped the rest of the pipeline.</param>
+    /// <param name="httpContext">The current request.</param>
+    /// <returns><see langword="true"/> for either failure; otherwise <see langword="false"/>.</returns>
+    internal static bool Settles(Exception exception, HttpContext httpContext) =>
+        ApiExceptionHandler.IsClientAbort(exception, httpContext) || httpContext.Response.HasStarted;
+
+    /// <summary>
+    /// Answers a failure <see cref="Settles"/> accepts: a client abort with one Information line and, before the
+    /// response started, status 499; any other failure with one Error line and an aborted response. Nothing is thrown.
+    /// </summary>
+    /// <param name="httpContext">The current request.</param>
+    /// <param name="exception">The failure.</param>
+    /// <param name="logger">The exception handler's logger.</param>
+    internal static void Settle(HttpContext httpContext, Exception exception, ILogger<ApiExceptionHandler> logger)
+    {
+        var endpoint = ApiExceptionHandler.MatchedEndpoint(httpContext);
+        var (rollbackExceptionType, rollbackSqlErrorNumber) = ApiExceptionHandler.RollbackFailure(exception);
+        if (ApiExceptionHandler.IsClientAbort(exception, httpContext))
+        {
             ApiExceptionHandler.LogBestEffort(() => ApiExceptionHandler.LogClientAbort(
-                _logger,
-                ApiExceptionHandler.ResolveOperation(exception, httpContext.GetEndpoint()),
+                logger,
+                ApiExceptionHandler.ResolveOperation(exception, endpoint),
                 ApiExceptionHandler.TypeName(exception),
                 ApiExceptionHandler.StoreSqlErrorNumber(exception),
                 rollbackExceptionType,
@@ -442,29 +473,27 @@ internal sealed partial class ApiExceptionBoundaryMiddleware
             {
                 httpContext.Response.StatusCode = StatusCodes.Status499ClientClosedRequest;
             }
-        }
-        catch (Exception exception) when (httpContext.Response.HasStarted)
-        {
-            var endpoint = httpContext.GetEndpoint();
-            var writeOutcome = endpoint?.Metadata.GetMetadata<WriteEndpointMetadata>() is null
-                ? null
-                : ApiExceptionHandler.ResolveWriteOutcome(WriteOutcomeFeature.Get(httpContext), exception).ToWireValue();
-            var (rollbackExceptionType, rollbackSqlErrorNumber) = ApiExceptionHandler.RollbackFailure(exception);
-            ApiExceptionHandler.LogBestEffort(() => LogResponseAborted(
-                _logger,
-                httpContext.Response.StatusCode,
-                ApiExceptionHandler.TypeName(exception),
-                ApiExceptionHandler.ResolveOperation(exception, endpoint),
-                ApiExceptionHandler.StoreSqlErrorNumber(exception),
-                writeOutcome,
-                rollbackExceptionType,
-                rollbackSqlErrorNumber,
-                ApiExceptionHandler.TraceId(httpContext)));
 
-            // The client already holds a status and part of a body. Aborting the connection, which withholds the final
-            // chunk, keeps it from reading the incomplete response as a whole one.
-            httpContext.Abort();
+            return;
         }
+
+        var writeOutcome = endpoint?.Metadata.GetMetadata<WriteEndpointMetadata>() is null
+            ? null
+            : ApiExceptionHandler.ResolveWriteOutcome(WriteOutcomeFeature.Get(httpContext), exception).ToWireValue();
+        ApiExceptionHandler.LogBestEffort(() => LogResponseAborted(
+            logger,
+            httpContext.Response.StatusCode,
+            ApiExceptionHandler.TypeName(exception),
+            ApiExceptionHandler.ResolveOperation(exception, endpoint),
+            ApiExceptionHandler.StoreSqlErrorNumber(exception),
+            writeOutcome,
+            rollbackExceptionType,
+            rollbackSqlErrorNumber,
+            ApiExceptionHandler.TraceId(httpContext)));
+
+        // The client already holds a status and part of a body. Aborting the connection, which withholds the final
+        // chunk, keeps it from reading the incomplete response as a whole one.
+        httpContext.Abort();
     }
 
     // Event id 4 continues the numbering of ApiExceptionHandler's events, whose category this line shares.
@@ -487,9 +516,122 @@ internal sealed partial class ApiExceptionBoundaryMiddleware
         string traceId);
 }
 
-/// <summary>Pipeline registration for <see cref="ApiExceptionBoundaryMiddleware"/>.</summary>
+/// <summary>
+/// The API's outermost exception boundary, the first middleware of the pipeline <c>Program.cs</c> composes, outside
+/// <c>UseExceptionHandler()</c>. It answers every exception that leaves the rest of the pipeline, so none reaches what
+/// the host runs around that pipeline: in Development the exception page <c>WebApplication.CreateBuilder</c> installs
+/// ahead of it, which renders the exception and the request's headers for a client that does not ask for JSON, and
+/// the server, which logs the exception object.
+/// </summary>
+/// <remarks>
+/// <para>
+/// An exception leaves the exception-handler middleware only when that middleware could not answer it, as when an
+/// <see cref="IExceptionHandler"/> throws: the middleware then rethrows the original failure. The boundary answers:
+/// </para>
+/// <list type="bullet">
+/// <item><description>
+/// a client abort, or any failure after the response started, exactly as <see cref="ApiExceptionBoundaryMiddleware"/>
+/// does;
+/// </description></item>
+/// <item><description>
+/// any other failure through <see cref="ApiExceptionHandler"/>, the one mapping, on a cleared response: the status,
+/// fixed body and single log line that handler gives the failure, and for a record write its <c>writeOutcome</c>,
+/// because the handler reads the matched endpoint the exception-handler middleware kept on
+/// <see cref="IExceptionHandlerFeature"/>. Clearing the response drops whatever status and headers the failed attempt
+/// left; the response's start callbacks stay registered, so the API's response headers still apply.
+/// </description></item>
+/// </list>
+/// <para>
+/// Nothing is rethrown. Should that answer itself fail, the boundary writes the handler's best-effort
+/// <c>ErrorBodyWriteFailed</c> line, unless the client aborted, and aborts the response, so the client never reads an
+/// incomplete one as whole.
+/// </para>
+/// </remarks>
+internal sealed class ApiOutermostExceptionBoundaryMiddleware
+{
+    private readonly RequestDelegate _next;
+
+    private readonly ILogger<ApiExceptionHandler> _logger;
+
+    /// <summary>Creates the boundary in front of <paramref name="next"/>.</summary>
+    /// <param name="next">The rest of the pipeline.</param>
+    /// <param name="logger">The exception handler's logger, so every failure line of a request has one category.</param>
+    /// <exception cref="ArgumentNullException">
+    /// <paramref name="next"/> or <paramref name="logger"/> is <see langword="null"/>.
+    /// </exception>
+    public ApiOutermostExceptionBoundaryMiddleware(RequestDelegate next, ILogger<ApiExceptionHandler> logger)
+    {
+        ArgumentNullException.ThrowIfNull(next);
+        ArgumentNullException.ThrowIfNull(logger);
+        _next = next;
+        _logger = logger;
+    }
+
+    /// <summary>Calls the rest of the pipeline and answers every exception that escapes it.</summary>
+    /// <param name="httpContext">The current request.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="httpContext"/> is <see langword="null"/>.</exception>
+    public async Task InvokeAsync(HttpContext httpContext)
+    {
+        ArgumentNullException.ThrowIfNull(httpContext);
+
+        try
+        {
+            await _next(httpContext);
+        }
+        catch (Exception exception) when (ApiExceptionBoundaryMiddleware.Settles(exception, httpContext))
+        {
+            ApiExceptionBoundaryMiddleware.Settle(httpContext, exception, _logger);
+        }
+        catch (Exception exception)
+        {
+            await AnswerAsync(httpContext, exception);
+        }
+    }
+
+    // The response has not started, so it can still be cleared and answered.
+    private async Task AnswerAsync(HttpContext httpContext, Exception exception)
+    {
+        try
+        {
+            httpContext.Response.Clear();
+            await new ApiExceptionHandler(_logger).TryHandleAsync(httpContext, exception, httpContext.RequestAborted);
+        }
+        catch (Exception answerFailure)
+        {
+            // Not rethrown: past this boundary the failure would reach the Development exception page or the server's
+            // own log line, either of which reports the exception object.
+            if (!ApiExceptionHandler.IsClientAbort(answerFailure, httpContext))
+            {
+                ApiExceptionHandler.LogBestEffort(() => ApiExceptionHandler.LogErrorBodyWriteFailed(
+                    _logger,
+                    ApiExceptionHandler.TypeName(answerFailure),
+                    ApiExceptionHandler.TraceId(httpContext)));
+            }
+
+            httpContext.Abort();
+        }
+    }
+}
+
+/// <summary>
+/// Pipeline registration for <see cref="ApiOutermostExceptionBoundaryMiddleware"/> and
+/// <see cref="ApiExceptionBoundaryMiddleware"/>.
+/// </summary>
 internal static class ApiExceptionBoundaryExtensions
 {
+    /// <summary>
+    /// Adds <see cref="ApiOutermostExceptionBoundaryMiddleware"/>. Call it first, before every other middleware and so
+    /// outside <c>UseExceptionHandler()</c>, so no exception leaves the application's pipeline.
+    /// </summary>
+    /// <param name="app">The application builder.</param>
+    /// <returns>The same builder, for chaining.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="app"/> is <see langword="null"/>.</exception>
+    public static IApplicationBuilder UseApiOutermostExceptionBoundary(this IApplicationBuilder app)
+    {
+        ArgumentNullException.ThrowIfNull(app);
+        return app.UseMiddleware<ApiOutermostExceptionBoundaryMiddleware>();
+    }
+
     /// <summary>
     /// Adds <see cref="ApiExceptionBoundaryMiddleware"/>. Call it right after <c>UseExceptionHandler()</c> and before
     /// <c>UseStatusCodePages()</c>: inside the exception-handler middleware, so that middleware never settles a client
