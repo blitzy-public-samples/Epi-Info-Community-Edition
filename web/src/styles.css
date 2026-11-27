@@ -3,26 +3,7 @@
  *
  * The client renders native HTML elements only (no component library, no
  * CSS framework, no CSS-in-JS), so this file is the one place visual styling
- * lives. Components use exactly the class names below; renaming one breaks
- * the components that rely on it.
- *
- *   Shell        .app  .forms-list  .form-view  .form-view__header  .form-toolbar  .record-navigator
- *                .record-navigator__moves  .record-navigator__entry  .record-navigator__go-to
- *   Pages        .page-tabs with [role="tablist"], [role="tab"], [role="tabpanel"]
- *   Fields       .page-fields  .field  .field--protected  .field--disabled
- *                .field-error  .group-section  .label-heading  .unsupported-placeholder
- *   Grid         .record-grid  .record-grid__toggle  .record-grid__toggle--pending
- *                .record-grid__status  .record-grid__frame  .record-grid__frame--more-start
- *                .record-grid__frame--more-end  .record-grid__scroll  .record-grid__open
- *                .record-grid__open-text  .record-grid__row--deleted  .record-grid__table--pending
- *                .record-grid__paging  .record-grid__paging-actions
- *   Messages     .banner  .banner--error  .banner--warning  .banner--info
- *                .banner--sticky  .banner__actions  .banner__messages  .validation-summary
- *   Dialogs      .dialog-backdrop  .dialog  .button--danger  .find-dialog  .find-dialog__fields
- *                .find-dialog__options  .find-dialog__criterion  .find-dialog__footer
- *                .find-dialog__actions  .find-dialog__results  .find-dialog__results--stale
- *   Buttons      .button--warning  .button--blocked
- *   Utilities    .visually-hidden
+ * lives.
  *
  * State comes from native attributes (disabled, aria-selected, aria-current,
  * aria-invalid, aria-disabled, hidden), and no rule hides a control because
@@ -39,9 +20,7 @@
 
 @layer base, components, utilities;
 
-/* ------------------------------------------------------------------ */
-/* Design tokens                                                       */
-/* ------------------------------------------------------------------ */
+/* Design tokens */
 
 /* Contrast against the background each colour is used on (WCAG AA):
  * text 15.8:1, muted text 6.0:1 or more, accent 5.2:1, danger 6.1:1 or more,
@@ -151,9 +130,7 @@
   --transition-fast: 150ms ease-out;
 }
 
-/* ------------------------------------------------------------------ */
-/* Base: element defaults                                              */
-/* ------------------------------------------------------------------ */
+/* Base: element defaults */
 
 @layer base {
   *,
@@ -476,9 +453,7 @@
   }
 }
 
-/* ------------------------------------------------------------------ */
-/* Components                                                          */
-/* ------------------------------------------------------------------ */
+/* Components */
 
 @layer components {
   /* Application shell: one centred column, top to bottom. */
@@ -1432,13 +1407,15 @@
     padding-inline-start: var(--space-5);
   }
 
-  /* A field label that jumps to the field: styled as a link. It keeps the
-   * base button's 44px minimum target in both directions, so a short label
-   * such as "Age" is still a full target; its text starts where the other
-   * items' labels do, and any extra width trails it. */
+  /* A field label that jumps to the field: styled as a link. Its box is
+   * exactly as wide as its text, so the separator and message follow the
+   * label directly. It keeps the base button's 44px minimum height, and the
+   * invisible ::after, as tall as the button and at least 44px wide, keeps
+   * the target 44px wide: it starts at the label and, for a short label
+   * such as "Age", trails it over the separator. */
   .validation-summary li button {
-    justify-content: flex-start;
-    min-inline-size: var(--target-size);
+    position: relative;
+    min-inline-size: 0;
     padding: 0;
     border: 0;
     background-color: transparent;
@@ -1446,6 +1423,15 @@
     font-weight: 700;
     text-decoration: underline;
     text-underline-offset: 2px;
+  }
+
+  .validation-summary li button::after {
+    content: "";
+    position: absolute;
+    inset-block: 0;
+    inset-inline-start: 0;
+    inline-size: 100%;
+    min-inline-size: var(--target-size);
   }
 
   /* The label of a field that cannot be edited now: plain bold text, still
@@ -1873,9 +1859,7 @@
   }
 }
 
-/* ------------------------------------------------------------------ */
-/* Utilities                                                           */
-/* ------------------------------------------------------------------ */
+/* Utilities */
 
 @layer utilities {
   /* Author display rules (flex on banners, dialogs, rows) would otherwise

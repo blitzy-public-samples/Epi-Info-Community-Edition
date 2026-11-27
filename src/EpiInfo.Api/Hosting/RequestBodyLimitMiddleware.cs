@@ -10,8 +10,12 @@ namespace EpiInfo.Api.Hosting;
 /// <see cref="ApiOptions.MaxRequestBodySize"/> fails with a <see cref="BadHttpRequestException"/> whose status is 413,
 /// whether the size is declared by <c>Content-Length</c> or only found while the body is streamed. A body of exactly
 /// the limit passes on TestServer, and with <c>Content-Length</c> on every host; on Kestrel a chunked body of exactly
-/// the limit passes when its framing fits the budget stated in the remarks. Every other request passes through
-/// unchanged.
+/// the limit passes when its framing fits the budget stated in the remarks. When the server's body stream fails a read
+/// of a chunked body with an <see cref="IOException"/> that is not a <see cref="BadHttpRequestException"/> and whose
+/// inner exception is an <see cref="OverflowException"/>, as Kestrel does for a chunk-size line whose value overflows,
+/// the read fails with a <see cref="BadHttpRequestException"/> whose status is 400 instead, unless the client has
+/// aborted the request; every other failure of that stream leaves the read unchanged. Every other request passes
+/// through unchanged.
 /// </summary>
 /// <remarks>
 /// <para>
@@ -52,18 +56,38 @@ namespace EpiInfo.Api.Hosting;
 /// No response is written and nothing is logged here: each failure reaches the API's exception boundary and handler,
 /// which keep its status, write the fixed ProblemDetails and log the one failure line, so a 413 is answered and
 /// correlated the same way however the body is framed. A declared length over the limit throws before the endpoint
-/// runs, and a failed read the endpoint does not catch propagates as it is. JSON binding, however, catches a
-/// <see cref="BadHttpRequestException"/> from its body read and ends the request with that exception's status and no
-/// body. The counting stream therefore records, without catching it, the first such exception to leave any of its
-/// reads: its own 413, or one the server's body stream raised, such as Kestrel's own limit. When the rest of the
-/// pipeline returns without starting the response and with that exception's status, the guard rethrows the same
-/// instance with its original stack trace; a response the endpoint started, or a status it chose itself, is left as it
-/// is. The exception message is fixed and never states a size.
+/// runs. A read of the counting stream past the limit fails with the guard's own 413, and a
+/// <see cref="BadHttpRequestException"/> the server's body stream raises, such as Kestrel's own 413 or its 400 for a
+/// chunk size that is not hexadecimal, leaves the read as it is. Kestrel raises one client framing error of a chunked
+/// body as a plain <see cref="IOException"/> instead: a chunk-size line whose value overflows, with the
+/// <see cref="OverflowException"/> as its inner exception. A body is chunked when the request has a
+/// <c>Transfer-Encoding</c> and no <c>Content-Length</c>, the same test that decides its framing allowance, and on
+/// such a body an <see cref="IOException"/> of that stream that is not a <see cref="BadHttpRequestException"/> and
+/// whose inner exception is an <see cref="OverflowException"/> fails the read instead with the guard's 400, whose
+/// inner exception is the original. On a request the client has aborted, that exception leaves the read as it is, and
+/// the exception boundary answers it as the abort. Every other exception of that stream, including any
+/// <see cref="IOException"/> on a body with <c>Content-Length</c> and any with another inner exception, leaves the
+/// read as it is, the same instance with its own stack trace, so the API's exception handler answers it as the server
+/// fault or the abort it is.
+/// </para>
+/// <para>
+/// JSON binding, however, catches a <see cref="BadHttpRequestException"/> from its body read and ends the request with
+/// that exception's status and no body. The counting stream therefore records, without catching it, the first such
+/// exception to leave any of its reads, whether the guard created it or the server's body stream raised it. When the
+/// rest of the pipeline returns without starting the response and with that exception's status, the guard rethrows
+/// the same instance with its original stack trace; a response the endpoint started, or a status it chose itself, is
+/// left as it is. The exceptions the guard creates, its 413 and its 400, carry fixed messages that never state a size
+/// or quote the body. An exception the server's body stream raised and the guard leaves as it is, a
+/// <see cref="BadHttpRequestException"/> it records and rethrows included, keeps its own message; the API's exception
+/// boundary and handler never read that message, and the only body they write for either source is their fixed
+/// ProblemDetails.
 /// </para>
 /// </remarks>
 public sealed class RequestBodyLimitMiddleware
 {
     private const string TooLargeMessage = "Request body too large.";
+
+    private const string UnreadableBodyMessage = "The request body could not be read.";
 
     // A one-byte chunk costs five framing bytes: its "1\r\n" size line and the "\r\n" after its data.
     private const long OneByteChunkFramingBytes = 5;
@@ -109,10 +133,14 @@ public sealed class RequestBodyLimitMiddleware
     /// <exception cref="ArgumentNullException"><paramref name="context"/> is <see langword="null"/>.</exception>
     /// <exception cref="BadHttpRequestException">
     /// With status 413, when <c>Content-Length</c> exceeds the limit; the counting stream throws the same exception
-    /// from a read that takes the body past the limit. When a body read failed with a
-    /// <see cref="BadHttpRequestException"/> that the rest of the pipeline caught, and it returned without starting the
-    /// response and with that exception's status, as JSON binding does, the first such exception is rethrown, the same
-    /// instance with its original stack trace.
+    /// from a read that takes the body past the limit. With status 400 from a counting-stream read of a chunked body,
+    /// one with a <c>Transfer-Encoding</c> and no <c>Content-Length</c>, that the server's body stream failed with an
+    /// <see cref="IOException"/> that is not a <see cref="BadHttpRequestException"/> and whose inner exception is an
+    /// <see cref="OverflowException"/>, on a request the client has not aborted, the original as its inner exception;
+    /// every other failure of the server's body stream leaves the read unchanged. When a body read failed with a
+    /// <see cref="BadHttpRequestException"/> that the rest of the pipeline caught, and it returned without starting
+    /// the response and with that exception's status, as JSON binding does, the first such exception is rethrown, the
+    /// same instance with its original stack trace.
     /// </exception>
     public Task InvokeAsync(HttpContext context)
     {
@@ -135,11 +163,17 @@ public sealed class RequestBodyLimitMiddleware
 
         if (CanHaveBody(context))
         {
-            AllowChunkFraming(context);
+            // Decided once from the headers: the framing allowance and the counting stream's chunk-size failure rule
+            // both apply to exactly the chunked bodies.
+            bool chunked = IsChunked(request);
+            if (chunked)
+            {
+                AllowChunkFraming(context);
+            }
 
             // Wrapped even under a declared length within the limit: in-process hosts do not hold a body to its
             // Content-Length, and the counter costs one addition per read.
-            var stream = new LimitedReadStream(request.Body, _limit);
+            var stream = new LimitedReadStream(request.Body, _limit, chunked, context.RequestAborted);
             request.Body = stream;
 
             // The endpoint's body reads leave their state here, so the exception handler can tell a body that ended
@@ -179,19 +213,17 @@ public sealed class RequestBodyLimitMiddleware
             : (limit * bytesPerPayloadByte) + LastChunkFramingBytes;
     }
 
-    // Kestrel counts the framing of an HTTP/1.1 chunked body against its own limit, so this request's server limit is
-    // raised to the framing allowance while the counting stream holds the decoded bytes to the limit. Only a body with
-    // a Transfer-Encoding and no Content-Length is chunked; HTTP/2 and HTTP/3 forbid Transfer-Encoding and frame their
-    // bodies themselves. The server limit is raised before the first read, while the feature is writable, and never
-    // lowered or removed.
+    // Only a body with a Transfer-Encoding and no Content-Length is chunked; HTTP/2 and HTTP/3 forbid
+    // Transfer-Encoding and frame their bodies themselves.
+    private static bool IsChunked(HttpRequest request) =>
+        request.ContentLength is null && request.Headers.ContainsKey(HeaderNames.TransferEncoding);
+
+    // Kestrel counts the framing of an HTTP/1.1 chunked body against its own limit, so the server limit of a request
+    // whose body is chunked is raised to the framing allowance while the counting stream holds the decoded bytes to
+    // the limit. The server limit is raised before the first read, while the feature is writable, and never lowered or
+    // removed.
     private void AllowChunkFraming(HttpContext context)
     {
-        var request = context.Request;
-        if (request.ContentLength is not null || !request.Headers.ContainsKey(HeaderNames.TransferEncoding))
-        {
-            return;
-        }
-
         if (context.Features.Get<IHttpMaxRequestBodySizeFeature>() is { IsReadOnly: false } feature
             && feature.MaxRequestBodySize is long serverLimit
             && serverLimit < _chunkedServerLimit)
@@ -205,6 +237,12 @@ public sealed class RequestBodyLimitMiddleware
     private static BadHttpRequestException TooLarge() =>
         new(TooLargeMessage, StatusCodes.Status413PayloadTooLarge);
 
+    // The 400 that replaces the server's body-stream failure for a chunk-size line whose value overflows, a client
+    // framing error rather than a server fault, with that failure as its inner exception; its message never copies
+    // the failure's.
+    private static BadHttpRequestException UnreadableBody(IOException failure) =>
+        new(UnreadableBodyMessage, StatusCodes.Status400BadRequest, failure);
+
     // Decided from headers and server features only, like the media-type guard. A host that does not expose the
     // body-detection feature gets the counting stream, which is harmless on an empty body.
     private static bool CanHaveBody(HttpContext context) =>
@@ -215,8 +253,13 @@ public sealed class RequestBodyLimitMiddleware
     /// A read-only, forward-only view of the request body that counts the bytes read and fails every read once the
     /// count exceeds the limit, never taking more than one byte past the limit from the inner stream, and the
     /// request's <see cref="IRequestBodyReadFeature"/>. A body of exactly the limit ends with an ordinary zero-byte
-    /// read. It also records, without catching it, the first <see cref="BadHttpRequestException"/> that leaves a read.
-    /// It is used by one request at a time, as the body stream it wraps is.
+    /// read. On a chunked body, an <see cref="IOException"/> from the inner stream's read that is not a
+    /// <see cref="BadHttpRequestException"/> and whose inner exception is an <see cref="OverflowException"/>, the
+    /// server's failure for a chunk-size line whose value overflows, fails that read with the guard's 400 instead, the
+    /// original as its inner exception, unless the request is aborted; every other exception of the inner stream
+    /// leaves the read unchanged. It also records, without catching it, the first
+    /// <see cref="BadHttpRequestException"/> that leaves a read. It is used by one request at a time, as the body
+    /// stream it wraps is.
     /// </summary>
     private sealed class LimitedReadStream : Stream, IRequestBodyReadFeature
     {
@@ -224,12 +267,18 @@ public sealed class RequestBodyLimitMiddleware
 
         private readonly long _limit;
 
+        private readonly bool _chunked;
+
+        private readonly CancellationToken _requestAborted;
+
         private long _total;
 
-        public LimitedReadStream(Stream inner, long limit)
+        public LimitedReadStream(Stream inner, long limit, bool chunked, CancellationToken requestAborted)
         {
             _inner = inner;
             _limit = limit;
+            _chunked = chunked;
+            _requestAborted = requestAborted;
         }
 
         public long BytesRead => _total;
@@ -250,13 +299,16 @@ public sealed class RequestBodyLimitMiddleware
             set => throw new NotSupportedException();
         }
 
-        // The first BadHttpRequestException that left any read, or null: this stream's own 413, or a failure the
+        // The first BadHttpRequestException that left any read, or null: this stream's own 413 or 400, or one the
         // server's body stream raised, such as Kestrel's own limit. The guard rethrows it when binding swallowed it.
         internal BadHttpRequestException? ReadFailure { get; private set; }
 
         // Synchronous reads forward to the inner stream's synchronous read, so the server's AllowSynchronousIO policy
         // still applies to it. Each read records a BadHttpRequestException leaving it through a filter that never
-        // matches, so its catch block is never entered and the exception unwinds unchanged, stack trace included.
+        // matches, so its catch block is never entered and the exception unwinds unchanged, stack trace included. A
+        // BadHttpRequestException the first filter declines is offered to the second clause, so that clause's filter
+        // excludes it; any other IOException here can come only from the inner stream's read, and the second filter
+        // matches only the chunk-size overflow, so every other exception unwinds unchanged as well.
         public override int Read(byte[] buffer, int offset, int count)
         {
             ValidateBufferArguments(buffer, offset, count);
@@ -269,6 +321,10 @@ public sealed class RequestBodyLimitMiddleware
             catch (BadHttpRequestException failure) when (Remember(failure))
             {
                 throw;
+            }
+            catch (IOException failure) when (IsChunkSizeOverflow(failure))
+            {
+                throw Unreadable(failure);
             }
         }
 
@@ -283,6 +339,10 @@ public sealed class RequestBodyLimitMiddleware
             catch (BadHttpRequestException failure) when (Remember(failure))
             {
                 throw;
+            }
+            catch (IOException failure) when (IsChunkSizeOverflow(failure))
+            {
+                throw Unreadable(failure);
             }
         }
 
@@ -305,6 +365,10 @@ public sealed class RequestBodyLimitMiddleware
             {
                 throw;
             }
+            catch (IOException failure) when (IsChunkSizeOverflow(failure))
+            {
+                throw Unreadable(failure);
+            }
         }
 
         public override async ValueTask<int> ReadAsync(
@@ -322,6 +386,10 @@ public sealed class RequestBodyLimitMiddleware
             catch (BadHttpRequestException failure) when (Remember(failure))
             {
                 throw;
+            }
+            catch (IOException failure) when (IsChunkSizeOverflow(failure))
+            {
+                throw Unreadable(failure);
             }
         }
 
@@ -378,6 +446,27 @@ public sealed class RequestBodyLimitMiddleware
         {
             ReadFailure ??= failure;
             return false;
+        }
+
+        // The one client framing error the server's body stream raises as a plain IOException rather than as a
+        // BadHttpRequestException: on a chunked body, Kestrel's failure for a chunk-size line whose value overflows,
+        // which carries the OverflowException as its inner exception. On an aborted request it is the abort, and it
+        // leaves the read unchanged, so the exception boundary logs the abort with the server's own exception type.
+        // Every other IOException, on a body with Content-Length or with another cause, is not the client's framing:
+        // it leaves the read unchanged, so the exception handler answers it as the server fault or the abort it is.
+        private bool IsChunkSizeOverflow(IOException failure) =>
+            _chunked
+            && failure is not BadHttpRequestException
+            && failure.InnerException is OverflowException
+            && !_requestAborted.IsCancellationRequested;
+
+        // Replaces such a failure with the guard's 400, recorded like every other failure that leaves a read, so the
+        // guard also rethrows it when binding swallowed it.
+        private BadHttpRequestException Unreadable(IOException failure)
+        {
+            BadHttpRequestException unreadable = UnreadableBody(failure);
+            Remember(unreadable);
+            return unreadable;
         }
     }
 }

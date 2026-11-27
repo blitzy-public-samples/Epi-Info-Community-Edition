@@ -38,7 +38,9 @@ namespace EpiInfo.Api.Services;
 /// insert, an update, and a soft delete of an active record. Each is refused with nothing written, and the API answers
 /// it as a 500 whose <c>writeOutcome</c> is <c>notWritten</c>. A request that writes nothing keeps its usual answer:
 /// the 404 of an unknown record, the 409 of an update of a deleted record, the 400 of a failed required gate, the 403
-/// of a denied permission, and the 204 of a <c>DELETE</c> of an already-deleted record.
+/// of a denied permission, and the 204 of a <c>DELETE</c> of an already-deleted record. The one exception is the 403 of
+/// an insert the store's own permission read refuses inside its transaction: an insert takes its stamp before the store
+/// call, so in such a process it never reaches the store and is the stamp's 500 with nothing written.
 /// </para>
 /// <para>
 /// The time comes only from the registered <see cref="TimeProvider"/>, never from the system clock directly, so a test

@@ -537,7 +537,12 @@ public sealed class IdentifierProvenanceIntegrationTests
                 (unknownKey, FieldValue.FromText(UnknownKeyValue)));
 
             ArgumentException rejected = await Assert.ThrowsAsync<ArgumentException>(
-                () => path.Repository.InsertAsync(form.Metadata, values, NewStamp(), cancellationToken));
+                () => path.Repository.InsertAsync(
+                    form.Metadata,
+                    values,
+                    NewStamp(),
+                    permissions: null,
+                    cancellationToken));
 
             AssertRefusedBeforeRecordSql(rejected, "values", unknownKey, path.Recorder, form);
         }
@@ -609,7 +614,7 @@ public sealed class IdentifierProvenanceIntegrationTests
         int gateCalls = 0;
 
         Task Insert(FormMetadata callerForm) =>
-            path.Repository.InsertAsync(callerForm, values, NewStamp(), cancellationToken);
+            path.Repository.InsertAsync(callerForm, values, NewStamp(), permissions: null, cancellationToken);
         Task Update(FormMetadata callerForm) => path.Repository.UpdateAsync(
             callerForm,
             unstoredId,
@@ -688,7 +693,12 @@ public sealed class IdentifierProvenanceIntegrationTests
         path.Recorder.Clear();
         AssertNotWrittenBeforeRecordSql(
             await Assert.ThrowsAsync<DataStoreWriteException>(
-                () => path.Repository.InsertAsync(removedForm, values, NewStamp(), cancellationToken)),
+                () => path.Repository.InsertAsync(
+                    removedForm,
+                    values,
+                    NewStamp(),
+                    permissions: null,
+                    cancellationToken)),
             RecordOperations.Insert,
             path.Recorder,
             form);
@@ -710,8 +720,12 @@ public sealed class IdentifierProvenanceIntegrationTests
         AssertNoRecordSql(path.Recorder, form);
 
         path.Recorder.Clear();
-        SoftDeleteResult delete =
-            await path.Repository.SoftDeleteAsync(removedForm, unstoredId, NewStamp, cancellationToken);
+        SoftDeleteResult delete = await path.Repository.SoftDeleteAsync(
+            removedForm,
+            unstoredId,
+            NewStamp,
+            permissions: null,
+            cancellationToken);
         Assert.Equal(SoftDeleteStatus.NotFound, delete.Status);
         Assert.Null(delete.GlobalRecordId);
         AssertNoRecordSql(path.Recorder, form);

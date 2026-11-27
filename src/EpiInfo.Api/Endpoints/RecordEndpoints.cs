@@ -39,11 +39,14 @@ namespace EpiInfo.Api.Endpoints;
 /// request-level 400 for an empty body; the body limit gives 413. Each handler reads its body through
 /// <see cref="JsonRequestBody"/> rather than by parameter binding, so the whole body is parsed before its kind is
 /// judged: content that is not valid JSON surfaces as a <c>BadHttpRequestException</c> that the exception handler maps
-/// to "malformed JSON", a valid value that is not an object is answered with "request body must be a JSON object"
-/// before any service call, and a JSON <c>null</c> body reaches the service's request-level 400. Each body is declared
-/// by its <c>Accepts</c> metadata alone, and the OpenAPI document publishes each body as required and non-null, and
-/// each body route's 400 as either shape: the request-level ProblemDetails or the field-level
-/// <see cref="HttpValidationProblemDetails"/>. The query routes' 400 is the field-level shape only.
+/// to "malformed JSON"; a valid value that is not an object is answered with "request body must be a JSON object",
+/// and an object that names a member more than once, ignoring letter case, with "request body names a member more
+/// than once", both before any service call; and a JSON <c>null</c> body reaches the service's request-level 400.
+/// Search also passes <see cref="SearchRequestShape.Check"/>, so a search member of the wrong JSON kind is the
+/// field-level 400 naming it, before any service call. Each body is declared by its <c>Accepts</c> metadata alone,
+/// and the OpenAPI document publishes each body as required and non-null, and each body route's 400 as either shape:
+/// the request-level ProblemDetails or the field-level <see cref="HttpValidationProblemDetails"/>. The query routes'
+/// 400 is the field-level shape only.
 /// </para>
 /// <para>
 /// <b>Write failures.</b> Create, update and delete declare the 403 ProblemDetails the service returns when the
@@ -290,8 +293,8 @@ public static class RecordEndpoints
     /// <param name="service">The record service.</param>
     /// <param name="cancellationToken">The request's abort token.</param>
     /// <returns>
-    /// 201 with the new record and its <c>Location</c>, the request-level 400 for a body that is not a JSON object, or
-    /// the service's 400, 403 or 404.
+    /// 201 with the new record and its <c>Location</c>, the request-level 400 for a body that is not a JSON object or
+    /// that names a member more than once, or the service's 400, 403 or 404.
     /// </returns>
     private static async Task<IResult> CreateRecordAsync(
         HttpContext httpContext,
@@ -313,8 +316,8 @@ public static class RecordEndpoints
     /// <param name="service">The record service.</param>
     /// <param name="cancellationToken">The request's abort token.</param>
     /// <returns>
-    /// 200 with the updated record, the request-level 400 for a body that is not a JSON object, or the service's 400,
-    /// 403, 404 or 409.
+    /// 200 with the updated record, the request-level 400 for a body that is not a JSON object or that names a member
+    /// more than once, or the service's 400, 403, 404 or 409.
     /// </returns>
     private static async Task<IResult> UpdateRecordAsync(
         HttpContext httpContext,
@@ -344,12 +347,16 @@ public static class RecordEndpoints
         service.DeleteAsync(httpContext, viewId, globalRecordId, cancellationToken);
 
     /// <summary>Handles <c>POST /api/forms/{viewId}/records/search</c>.</summary>
-    /// <param name="httpContext">The current request, whose body is read as a <see cref="SearchRequest"/>.</param>
+    /// <param name="httpContext">
+    /// The current request, whose body <see cref="SearchRequestShape.Check"/> judges before it is read as a
+    /// <see cref="SearchRequest"/>.
+    /// </param>
     /// <param name="viewId">The form's <c>metaViews.ViewId</c>, already an integer by its route constraint.</param>
     /// <param name="service">The record service.</param>
     /// <param name="cancellationToken">The request's abort token.</param>
     /// <returns>
-    /// 200 with the matches, the request-level 400 for a body that is not a JSON object, or the service's 400 or 404.
+    /// 200 with the matches; the request-level 400 for a body that is not a JSON object or that names a member more
+    /// than once; the field-level 400 for a member of the wrong JSON kind; or the service's 400 or 404.
     /// </returns>
     private static async Task<IResult> SearchRecordsAsync(
         HttpContext httpContext,
@@ -357,7 +364,10 @@ public static class RecordEndpoints
         [FromServices] RecordService service,
         CancellationToken cancellationToken)
     {
-        var body = await JsonRequestBody.ReadObjectAsync<SearchRequest>(httpContext, cancellationToken);
+        var body = await JsonRequestBody.ReadObjectAsync<SearchRequest>(
+            httpContext,
+            SearchRequestShape.Check,
+            cancellationToken);
         return body.Problem ?? await service.SearchAsync(viewId, body.Value, cancellationToken);
     }
 

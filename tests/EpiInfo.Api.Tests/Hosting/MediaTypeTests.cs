@@ -475,11 +475,11 @@ public sealed class MediaTypeFixture : IAsyncLifetime
 /// <para>
 /// Only <c>application/json</c>, case-insensitive, with no parameter or exactly one <c>charset=utf-8</c> (quoted or
 /// not), reaches a handler, and each such request gets that handler's exact success. Every other media type, a
-/// missing <c>Content-Type</c>, <c>+json</c> types, another or empty charset, and any extra or repeated parameter is
-/// the fixed 415 ProblemDetails, with or without a body and ahead of the empty-body 400, and nothing is written.
-/// Malformed JSON and an empty body are two distinct request-level 400s. Outside the body endpoints a route miss
-/// stays 404 and a method mismatch 405, and a form id the <c>int</c> constraint rejects is the route miss whatever
-/// the method or media type.
+/// missing <c>Content-Type</c>, <c>+json</c> types, whitespace inside the media type, another or empty charset, and
+/// any extra or repeated parameter is the fixed 415 ProblemDetails, with or without a body and ahead of the
+/// empty-body 400, and nothing is written. Malformed JSON and an empty body are two distinct request-level 400s.
+/// Outside the body endpoints a route miss stays 404 and a method mismatch 405, and a form id the <c>int</c>
+/// constraint rejects is the route miss whatever the method or media type.
 /// </para>
 /// <para>
 /// Every body-endpoint case runs on the API's own composition root through <see cref="KestrelApiFactory"/>, where the
@@ -558,7 +558,10 @@ public sealed class MediaTypeTests : IClassFixture<MediaTypeFixture>
         Malformed,
     }
 
-    /// <summary>Each endpoint with each non-JSON or missing media type, with its valid body and with an empty one.</summary>
+    /// <summary>
+    /// Each endpoint with each non-JSON or missing media type, and <c>application/json</c> with whitespace inside the
+    /// media type, with its valid body and with an empty one.
+    /// </summary>
     public static TheoryData<BodyEndpoint, string?, BodyShape> UnsupportedMediaTypeCases
     {
         get
@@ -569,6 +572,9 @@ public sealed class MediaTypeTests : IClassFixture<MediaTypeFixture>
                 "application/merge-patch+json",
                 "application/vnd.x+json",
                 "application/problem+json",
+                "application/ json",
+                "application /json",
+                "application/\tjson",
                 null,
             ];
 
@@ -598,14 +604,20 @@ public sealed class MediaTypeTests : IClassFixture<MediaTypeFixture>
         "application/json; charset=utf-8; charset=utf-8",
         "application/json; charset=utf-8; charset=utf-16");
 
-    /// <summary>Each endpoint with each spelling of <c>application/json</c> the rule accepts.</summary>
+    /// <summary>
+    /// Each endpoint with each spelling of <c>application/json</c> the rule accepts, including optional whitespace
+    /// before the parameters' <c>;</c> and an empty parameter list.
+    /// </summary>
     public static TheoryData<BodyEndpoint, string> AcceptedMediaTypeCases => ForEachEndpoint(
         "application/json",
         "application/json; charset=utf-8",
         "APPLICATION/JSON",
         "Application/Json; Charset=UTF-8",
         QuotedUtf8JsonMediaType,
-        "application/json;charset=utf-8");
+        "application/json;charset=utf-8",
+        "application/json ; charset=utf-8",
+        "application/json\t;charset=utf-8",
+        "application/json;");
 
     /// <summary>Each endpoint with a malformed body and with an empty one.</summary>
     public static TheoryData<BodyEndpoint, BodyShape> RequestLevelBodyCases
@@ -681,8 +693,9 @@ public sealed class MediaTypeTests : IClassFixture<MediaTypeFixture>
 
     private HttpClient Client => _fixture.Client;
 
-    // AAP 0.7.6: text/plain, +json types and a missing Content-Type are a 415 with or without a body; the media type is
-    // checked before the body, so an empty body still gets the 415, never the 400 (AAP 0.3.4.7).
+    // AAP 0.7.6: text/plain, +json types, whitespace inside the media type and a missing Content-Type are a 415 with or
+    // without a body; the media type is checked before the body, so an empty body still gets the 415, never the 400
+    // (AAP 0.3.4.7).
     [Theory]
     [MemberData(nameof(UnsupportedMediaTypeCases))]
     public async Task NonJsonMediaTypeIsUnsupportedWithOrWithoutBody(

@@ -41,8 +41,11 @@ namespace EpiInfo.Api.Json;
 /// </list>
 /// <para>
 /// The web defaults left in place are part of the contract: <c>null</c> members are written, not omitted; duplicate
-/// properties are allowed, so a <c>values</c> key repeated exactly reaches the record validator, while keys that
-/// differ only by case are distinct names whatever this setting; and unknown members are skipped.
+/// properties are allowed, so a <c>values</c> key repeated exactly reaches the values reader and the record validator,
+/// while keys that differ only by case are distinct names whatever this setting; and unknown members are skipped. The
+/// serializer would let the last of two members that match one name, exactly or by case, replace the first, so the
+/// body reader <c>JsonRequestBody</c> refuses a body object, and the search body check a criterion object, that names
+/// a member more than once before either is bound.
 /// <c>RespectRequiredConstructorParameters</c> stays off, so a request member the caller omits
 /// binds as <see langword="null"/> and reaches its documented 400 instead of failing binding.
 /// <c>RespectNullableAnnotations</c> stays off, so an explicit <c>null</c> binds even into a non-nullable reference
@@ -53,14 +56,16 @@ namespace EpiInfo.Api.Json;
 /// The one presence check is a criterion's <c>value</c>, which <see cref="Apply"/> marks required on
 /// <see cref="SearchCriterion"/> alone. <c>null</c> is a legal value there, the blank criterion, so only presence
 /// tells it from an omission. A criterion without <c>value</c> fails deserialisation with a
-/// <see cref="JsonException"/>, which the body reader <c>JsonRequestBody</c> reports as a 400
-/// <c>BadHttpRequestException</c> and the exception handler answers with "malformed JSON"; <c>"value": null</c> still
-/// reaches <see cref="FieldValueJsonConverter"/> and becomes <see cref="EpiInfo.Domain.Values.FieldValue.Null"/>.
+/// <see cref="JsonException"/>, so it never binds as the blank criterion. The search endpoint's member check,
+/// <c>SearchRequestShape</c>, answers such a body first, with a field-level 400 under <c>errors["criteria"]</c>;
+/// <c>"value": null</c> still reaches <see cref="FieldValueJsonConverter"/> and becomes
+/// <see cref="EpiInfo.Domain.Values.FieldValue.Null"/>.
 /// </para>
 /// <para>
 /// The four body endpoints read their body with these options as one JSON value before they read the request type:
 /// content that is not valid JSON is "malformed JSON", a valid value that is not an object is "request body must be
-/// a JSON object", and JSON <c>null</c> or an empty body is "request body is required".
+/// a JSON object", an object that names a member more than once is "request body names a member more than once",
+/// and JSON <c>null</c> or an empty body is "request body is required".
 /// </para>
 /// </remarks>
 public static class JsonSetup

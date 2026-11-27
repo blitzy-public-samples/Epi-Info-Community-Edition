@@ -31,9 +31,10 @@ namespace EpiInfo.Data.Permissions;
 /// <para>
 /// <see cref="ReadResolvedAsync"/> sends the same permission statements, and builds the same entries, for tables a
 /// caller already resolved, on that caller's connection and inside its transaction, and sends no catalogue read. The
-/// record repository uses it within an update, for the base table and every page table, so the UPDATE and
-/// missing-page INSERT it requires are decided inside the update's own transaction, on the tables that transaction's
-/// schema read confirmed.
+/// record repository uses it within each write given permissions: an insert and an update, for the base table and
+/// every page table, and a soft delete, for the base table alone. So the INSERT an insert requires, the UPDATE and
+/// missing-page INSERT an update requires and the base-table UPDATE a soft delete requires are each decided inside
+/// the write's own transaction, on the tables that transaction's schema read confirmed.
 /// </para>
 /// <para>
 /// Each entry carries the catalogue spelling of its table, and <see cref="FormPermissions.ResolvedTableNames"/> maps
@@ -179,10 +180,11 @@ internal sealed class SqlPermissionReader(
     /// connection and, when one is given, inside the caller's transaction. No catalogue read is sent.
     /// </summary>
     /// <remarks>
-    /// The record repository calls it inside an update, after the locked read and the required gate, for the base
-    /// table and every page table, so the UPDATE on each of them and the INSERT on each page whose row is missing are
-    /// decided by the grants in force at that point of the transaction, on tables that transaction's own schema read
-    /// confirmed.
+    /// The record repository calls it inside each write given permissions, before the write's first data statement:
+    /// inside an insert, after the form's exclusive write lock, for the base table and every page table; inside an
+    /// update, after the locked read and the required gate, for the base table and every page table; and inside a soft
+    /// delete, after the locked read, for the base table alone. So the permissions each write requires are decided by
+    /// the grants in force at that point of its transaction, on tables that transaction's own schema read confirmed.
     /// </remarks>
     /// <param name="connection">An open connection; this method neither opens nor closes it.</param>
     /// <param name="transaction">The transaction the statements join, or <see langword="null"/> for none.</param>

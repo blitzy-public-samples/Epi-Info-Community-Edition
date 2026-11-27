@@ -37,7 +37,8 @@ namespace EpiInfo.Api.Tests.Records;
 
 /// <summary>
 /// The binding contract of the Find search body, <c>POST /api/forms/{viewId}/records/search</c> (AAP 0.3.4.1),
-/// under the API's own JSON settings.
+/// under the API's own JSON settings, and the member check <see cref="SearchRequestShape"/> that judges the body's
+/// members before binding.
 /// </summary>
 /// <remarks>
 /// The class needs no database: it carries no <c>Integration</c> trait and joins no database collection, so
@@ -81,6 +82,317 @@ public sealed class SearchRequestBindingTests
         Assert.Null(nameless.Field);
         Assert.Equal("Sm*", nameless.Value.AsText());
         Assert.Null(Deserialize("{}", options).Criteria);
+    }
+
+    // The placeholder a body holds where its case puts a fresh sentinel.
+    private const string SentinelToken = "%SENTINEL%";
+
+    // The detail of a request-level 400 for a repeated member, written out rather than read from the product.
+    private const string ExpectedRepeatsMemberDetail = "request body names a member more than once";
+
+    // The one criteria message of an array of more than six items of which any has a problem, written out the same way.
+    private const string ExpectedOverLongCriteriaEntry =
+        "criteria: criteria must be an array of at most 6 {field, value} objects.";
+
+    // The most bytes the serialized field-level 400 for an over-long criteria array may take, whatever the body's size.
+    private const int MaxOverLongCriteriaProblemBytes = 512;
+
+    // The largest body the API reads, Kestrel:Limits:MaxRequestBodySize.
+    private const int BodyLimitBytes = 1_048_576;
+
+    /// <summary>
+    /// Search bodies whose every member has a JSON kind the request binds, as a caller may send them: absent,
+    /// <c>null</c> and empty members, criteria left to the parser, case variants of every member name, and unknown
+    /// members of any kind.
+    /// </summary>
+    public static TheoryData<string> BodiesWithBindableMembers => new()
+    {
+        "{}",
+        """{"criteria":null,"includeDeleted":null,"excludeGlobalRecordId":null}""",
+        """{"criteria":[],"includeDeleted":true,"excludeGlobalRecordId":""}""",
+        """{"criteria":[null,{"value":null},{"field":null,"value":"x"}],"includeDeleted":false}""",
+        """{"criteria":[{"field":"Age","value":-1.5e3},{"field":"Ill","value":true},{"field":"LastName","value":""}]}""",
+        """{"Criteria":[{"FIELD":"LastName","Value":"Sm*"}],"INCLUDEDELETED":true,"ExcludeGlobalRecordID":"id"}""",
+        """{"other":{"a":[1e400]},"criteria":[{"field":"x","value":"y","extra":{"z":[]},"EXTRA2":1e400}]}""",
+
+        // More than six items, all of a bindable kind, a repeated field included: the field limit is the parser's.
+        """{"criteria":[{"field":"A","value":1},{"field":"B","value":"x"},{"field":"C","value":true},{"field":"D","value":null},null,{"value":"y"},{"field":null,"value":-2},{"field":"A","value":"again"}]}""",
+    };
+
+    /// <summary>
+    /// Search bodies with members of the wrong JSON kind, each with every <c>errors</c> entry it must get, in order,
+    /// as <c>key: message</c>. Where a body holds <c>%SENTINEL%</c>, each case puts a fresh sentinel there.
+    /// </summary>
+    public static TheoryData<string, string[]> BodiesWithWronglyTypedMembers => new()
+    {
+        {
+            """{"criteria":[{"field":"RecStatus","value":"1"}],"includeDeleted":"true"}""",
+            ["includeDeleted: includeDeleted must be true, false or null."]
+        },
+        {
+            """{"includeDeleted":1}""",
+            ["includeDeleted: includeDeleted must be true, false or null."]
+        },
+        {
+            """{"IncludeDeleted":"' OR 1=1-- %SENTINEL%"}""",
+            ["includeDeleted: includeDeleted must be true, false or null."]
+        },
+        {
+            """{"includeDeleted":{"%SENTINEL%":true}}""",
+            ["includeDeleted: includeDeleted must be true, false or null."]
+        },
+        {
+            """{"excludeGlobalRecordId":1}""",
+            ["excludeGlobalRecordId: excludeGlobalRecordId must be a string or null."]
+        },
+        {
+            """{"EXCLUDEGLOBALRECORDID":["%SENTINEL%"]}""",
+            ["excludeGlobalRecordId: excludeGlobalRecordId must be a string or null."]
+        },
+        {
+            """{"excludeGlobalRecordId":false}""",
+            ["excludeGlobalRecordId: excludeGlobalRecordId must be a string or null."]
+        },
+        {
+            """{"criteria":{"field":"LastName","value":"%SENTINEL%"}}""",
+            ["criteria: criteria must be an array of {field, value} objects."]
+        },
+        {
+            """{"criteria":"%SENTINEL%"}""",
+            ["criteria: criteria must be an array of {field, value} objects."]
+        },
+        {
+            """{"criteria":[{"field":5,"value":"%SENTINEL%"}]}""",
+            ["criteria: criteria[0] field must be a string."]
+        },
+        {
+            """{"criteria":[{"Field":["%SENTINEL%"],"value":"x"}]}""",
+            ["criteria: criteria[0] field must be a string."]
+        },
+        {
+            """{"criteria":[{"field":"LastName","value":{"%SENTINEL%":1}}]}""",
+            ["criteria: criteria[0] value must be a string, number, boolean or null."]
+        },
+        {
+            """{"criteria":[{"field":"LastName","VALUE":["%SENTINEL%"]}]}""",
+            ["criteria: criteria[0] value must be a string, number, boolean or null."]
+        },
+        {
+            """{"criteria":[{"field":"Age","value":1e400}]}""",
+            ["criteria: criteria[0] value must be a finite number."]
+        },
+        {
+            """{"criteria":[{"field":"Age","value":-1e400}]}""",
+            ["criteria: criteria[0] value must be a finite number."]
+        },
+        {
+            """{"criteria":[{"field":"LastName"}]}""",
+            ["criteria: criteria[0] needs a value, which may be null."]
+        },
+        {
+            """{"criteria":[{"field":"LastName","value":"x"},"%SENTINEL%",7]}""",
+            [
+                "criteria: criteria[1] must be an object with field and value.",
+                "criteria: criteria[2] must be an object with field and value.",
+            ]
+        },
+
+        // Every error of one body, members in body order and criteria in criterion order; a null criterion and a
+        // null or absent field are the parser's, so they add nothing here.
+        {
+            """{"excludeGlobalRecordId":1,"criteria":[[1],{"value":[2],"field":3},null,{"field":null},{"field":"Age","value":1e999}],"includeDeleted":"%SENTINEL%"}""",
+            [
+                "excludeGlobalRecordId: excludeGlobalRecordId must be a string or null.",
+                "criteria: criteria[0] must be an object with field and value.",
+                "criteria: criteria[1] value must be a string, number, boolean or null.",
+                "criteria: criteria[1] field must be a string.",
+                "criteria: criteria[3] needs a value, which may be null.",
+                "criteria: criteria[4] value must be a finite number.",
+                "includeDeleted: includeDeleted must be true, false or null.",
+            ]
+        },
+
+        // Six items, the field limit, keep a message per problem by its item's index.
+        {
+            """{"criteria":[{"field":"A","value":1},"%SENTINEL%",{"field":"B"},{"field":"C","value":"x"},{"field":[],"value":{}},{"field":"D","value":1e400}]}""",
+            [
+                "criteria: criteria[1] must be an object with field and value.",
+                "criteria: criteria[2] needs a value, which may be null.",
+                "criteria: criteria[4] field must be a string.",
+                "criteria: criteria[4] value must be a string, number, boolean or null.",
+                "criteria: criteria[5] value must be a finite number.",
+            ]
+        },
+
+        // Past six items every item is still checked, and any problem among them is the one fixed message, in the
+        // criteria member's place among the body's errors.
+        {
+            """{"criteria":[{"field":"A","value":1},{"field":"B","value":2},{"field":"C","value":3},{"field":"D","value":4},{"field":"E","value":5},{"field":"F","value":6},{"field":"G","value":["%SENTINEL%"]}]}""",
+            [ExpectedOverLongCriteriaEntry]
+        },
+        {
+            """{"criteria":["%SENTINEL%",null,null,null,null,null,null]}""",
+            [ExpectedOverLongCriteriaEntry]
+        },
+        {
+            """{"criteria":[null,null,null,null,null,null,{"field":"LastName"}]}""",
+            [ExpectedOverLongCriteriaEntry]
+        },
+        {
+            """{"includeDeleted":0,"criteria":[1,{"field":2},[3],{"value":{}},5,6,7,{"field":"x","value":-1e400}],"excludeGlobalRecordId":{"%SENTINEL%":1}}""",
+            [
+                "includeDeleted: includeDeleted must be true, false or null.",
+                ExpectedOverLongCriteriaEntry,
+                "excludeGlobalRecordId: excludeGlobalRecordId must be a string or null.",
+            ]
+        },
+    };
+
+    /// <summary>
+    /// Search bodies in which a criterion object names a member more than once, exactly or differing only by letter
+    /// case, with errors found earlier in the body or none.
+    /// </summary>
+    public static TheoryData<string> BodiesWithARepeatedCriterionMember => new()
+    {
+        """{"criteria":[{"field":"LastName","field":"Age","value":"%SENTINEL%"}]}""",
+        """{"criteria":[{"field":"LastName","value":"%SENTINEL%","Value":"b"}]}""",
+        """{"criteria":[{"field":"Age","value":1},{"other":"%SENTINEL%","OTHER":2,"field":"LastName","value":null}]}""",
+        """{"includeDeleted":"x","criteria":[{"field":5,"value":[1]},{"FIELD":"a","field":"%SENTINEL%","value":1}]}""",
+
+        // Past six items, with problems found before the repeat or none.
+        """{"criteria":[1,2,3,4,5,6,7,{"field":"a","FIELD":"%SENTINEL%","value":1},8]}""",
+        """{"criteria":[{"field":"A","value":1},{"field":"B","value":2},{"field":"C","value":3},{"field":"D","value":4},{"field":"E","value":5},{"field":"F","value":6},{"value":"%SENTINEL%","Value":7,"field":"G"}]}""",
+    };
+
+    // The member check accepts every body binding can read, and the body the API's own options write for a request,
+    // so the wire names it matches are the ones binding uses.
+    [Theory]
+    [MemberData(nameof(BodiesWithBindableMembers))]
+    public void MemberCheckAcceptsEveryBindableBody(string json)
+    {
+        using var document = JsonDocument.Parse(json);
+
+        Assert.Null(SearchRequestShape.Check(document.RootElement));
+    }
+
+    [Theory]
+    [MemberData(nameof(SerializerOptionSources))]
+    public void MemberCheckAcceptsTheBodyTheApiOptionsWrite(string source)
+    {
+        var options = CreateOptions(source);
+        var request = new SearchRequest(
+            [new SearchCriterion("LastName", FieldValue.FromText("Sm*")), new SearchCriterion("Age", FieldValue.Null)],
+            IncludeDeleted: true,
+            ExcludeGlobalRecordId: "id");
+        using var document = JsonDocument.Parse(JsonSerializer.Serialize(request, options));
+
+        Assert.Null(SearchRequestShape.Check(document.RootElement));
+    }
+
+    // A well-formed body whose members have the wrong JSON kind is one field-level 400 that names each problem under
+    // its member's wire name, in body order, with fixed messages that quote nothing submitted.
+    [Theory]
+    [MemberData(nameof(BodiesWithWronglyTypedMembers))]
+    public void MemberCheckReportsEveryWronglyTypedMember(string template, string[] expected)
+    {
+        var sentinel = "SENTINEL-" + Guid.NewGuid().ToString("N");
+        using var document = JsonDocument.Parse(template.Replace(SentinelToken, sentinel, StringComparison.Ordinal));
+
+        var problem = ProblemOf(SearchRequestShape.Check(document.RootElement));
+
+        var validation = Assert.IsType<HttpValidationProblemDetails>(problem);
+        Assert.Equal(StatusCodes.Status400BadRequest, validation.Status);
+        Assert.Equal("one or more values are invalid", validation.Detail);
+        var entries = validation.Errors
+            .SelectMany(entry => entry.Value.Select(message => $"{entry.Key}: {message}"))
+            .ToArray();
+        Assert.Equal(expected, entries);
+        Assert.False(
+            entries.Any(entry => entry.Contains(sentinel, StringComparison.Ordinal)),
+            "A member message quotes the submitted body.");
+    }
+
+    // A criteria array of more than six items, each item the one given, up to a body just under the body limit: the
+    // check judges every item and answers the one fixed criteria message, so the serialized 400 stays within a fixed
+    // size however many items have a problem.
+    [Theory]
+    [InlineData("1", 7)]
+    [InlineData("1", 10_000)]
+    [InlineData("1", 524_000)]
+    [InlineData("""{"field":5,"value":[1]}""", 43_000)]
+    [InlineData("""{"field":"LastName"}""", 49_000)]
+    public void OverLongCriteriaWithProblemsAreOneBoundedMessage(string item, int count)
+    {
+        var json = "{\"criteria\":[" + string.Join(',', Enumerable.Repeat(item, count)) + "]}";
+        Assert.InRange(json.Length, 1, BodyLimitBytes);
+        using var document = JsonDocument.Parse(json);
+
+        var problem = ProblemOf(SearchRequestShape.Check(document.RootElement));
+
+        var validation = Assert.IsType<HttpValidationProblemDetails>(problem);
+        Assert.Equal(StatusCodes.Status400BadRequest, validation.Status);
+        var entries = validation.Errors
+            .SelectMany(entry => entry.Value.Select(message => $"{entry.Key}: {message}"))
+            .ToArray();
+        Assert.Equal(new[] { ExpectedOverLongCriteriaEntry }, entries);
+        var serialized = JsonSerializer.SerializeToUtf8Bytes(validation, JsonSetup.CreateSerializerOptions());
+        Assert.InRange(serialized.Length, 1, MaxOverLongCriteriaProblemBytes);
+    }
+
+    // A criterion object that names a member more than once is the request-level 400 of a repeated member at once,
+    // whatever errors the check found before it, with no errors map and nothing quoted.
+    [Theory]
+    [MemberData(nameof(BodiesWithARepeatedCriterionMember))]
+    public void RepeatedCriterionMemberIsTheRequestLevelRepeatProblem(string template)
+    {
+        var sentinel = "SENTINEL-" + Guid.NewGuid().ToString("N");
+        using var document = JsonDocument.Parse(template.Replace(SentinelToken, sentinel, StringComparison.Ordinal));
+
+        var problem = ProblemOf(SearchRequestShape.Check(document.RootElement));
+
+        Assert.IsNotType<HttpValidationProblemDetails>(problem);
+        Assert.Equal(StatusCodes.Status400BadRequest, problem.Status);
+        Assert.Equal(ExpectedRepeatsMemberDetail, problem.Detail);
+    }
+
+    // A criterion member name that cannot be decoded is "malformed JSON": the 400 BadHttpRequestException whose inner
+    // exception is a JsonException, with a fixed message.
+    [Theory]
+    [InlineData("""{"criteria":[{"field":"LastName","value":"x","\uD800":1}]}""")]
+    [InlineData("""{"criteria":[{"\uDC00":1,"value":"x"}]}""")]
+    [InlineData("""{"criteria":[1,1,1,1,1,1,1,{"value":"x","\uD800":1}]}""")]
+    public void UndecodableCriterionMemberNameIsMalformedJson(string json)
+    {
+        using var document = JsonDocument.Parse(json);
+        var root = document.RootElement;
+
+        var exception = Assert.Throws<BadHttpRequestException>(() => SearchRequestShape.Check(root));
+
+        Assert.Equal(StatusCodes.Status400BadRequest, exception.StatusCode);
+        var inner = Assert.IsType<JsonException>(exception.InnerException);
+        Assert.DoesNotContain(@"\u", exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(@"\u", inner.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("[]")]
+    [InlineData("null")]
+    [InlineData("\"x\"")]
+    public void MemberCheckRefusesABodyThatIsNotAnObject(string json)
+    {
+        using var document = JsonDocument.Parse(json);
+        var root = document.RootElement;
+
+        Assert.Throws<ArgumentException>(() => SearchRequestShape.Check(root));
+    }
+
+    // The body a problem result writes. ProblemDetails is named in full: the MVC namespace also holds a JsonOptions.
+    private static Microsoft.AspNetCore.Mvc.ProblemDetails ProblemOf(IResult? result)
+    {
+        Assert.NotNull(result);
+        var problem = Assert.IsAssignableFrom<IValueHttpResult<Microsoft.AspNetCore.Mvc.ProblemDetails>>(result).Value;
+        Assert.NotNull(problem);
+        return problem;
     }
 
     private static JsonSerializerOptions CreateOptions(string source)
@@ -781,11 +1093,14 @@ public sealed class FakeDataStoreFindTests
         var store = CreateStore();
         var stamp = new SaveStamp("tester", new DateTime(2024, 1, 2, 3, 4, 5, DateTimeKind.Utc));
         var partial = Seed(store, NameField, FieldValue.FromText("partial"), missingPageIds: [SecondPageId]);
-        var inserted = await store.InsertAsync(
+        var insertResult = await store.InsertAsync(
             Form,
             new Dictionary<string, FieldValue> { [NameField] = FieldValue.FromText("inserted") },
             stamp,
+            permissions: null,
             CancellationToken.None);
+        Assert.True(insertResult.IsSuccess);
+        var inserted = insertResult.Record;
         var criteria = Parse(NameField, "partial or inserted");
 
         Assert.Equal(new[] { inserted.GlobalRecordId }, await SearchIdsAsync(store, criteria));
@@ -806,7 +1121,12 @@ public sealed class FakeDataStoreFindTests
         Assert.Equal(stamp, state.LastSave);
         Assert.Equal(new[] { partial, inserted.GlobalRecordId }, await SearchIdsAsync(store, criteria));
 
-        var deleted = await store.SoftDeleteAsync(Form, inserted.GlobalRecordId, () => stamp, CancellationToken.None);
+        var deleted = await store.SoftDeleteAsync(
+            Form,
+            inserted.GlobalRecordId,
+            () => stamp,
+            permissions: null,
+            CancellationToken.None);
         Assert.Equal(
             (SoftDeleteStatus.Deleted, inserted.GlobalRecordId),
             (deleted.Status, deleted.GlobalRecordId));
@@ -837,6 +1157,7 @@ public sealed class FakeDataStoreFindTests
             Form,
             new Dictionary<string, FieldValue> { [ChoiceField] = value },
             new SaveStamp("tester", new DateTime(2024, 1, 2, 3, 4, 5, DateTimeKind.Utc)),
+            permissions: null,
             CancellationToken.None));
 
         if (admitted)
@@ -899,7 +1220,7 @@ public sealed class FakeDataStoreFindTests
                 _ => RecordValidationResult.Success(new Dictionary<string, FieldValue>()),
                 permissions: null,
                 CancellationToken.None)
-            : store.InsertAsync(form.Metadata, values, stamp, CancellationToken.None));
+            : store.InsertAsync(form.Metadata, values, stamp, permissions: null, CancellationToken.None));
 
         var argument = Assert.IsType<ArgumentException>(failure);
         Assert.Equal(paramName, argument.ParamName);

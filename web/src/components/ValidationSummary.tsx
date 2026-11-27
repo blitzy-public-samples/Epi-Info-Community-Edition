@@ -4,7 +4,7 @@
 // Render-only: no state, no effects and no rule about what counts as an error.
 import { useId, useMemo, type RefObject } from 'react';
 import type { FieldDefinition, FormDefinition, PageDefinition } from '../api/types';
-import { formatRequiredMessage, isDataField, type FieldErrors } from '../validation/clientValidation';
+import { isDataField, type FieldErrors } from '../validation/clientValidation';
 
 /** The action an error list stopped, as {@link ValidationSummaryProps.blocked} takes it. */
 export interface BlockedAction {
@@ -68,8 +68,10 @@ interface SummaryItem {
   readonly isField: boolean;
   readonly message: string;
   /**
-   * Whether the message opens with the label itself, as the field's required-field message does:
-   * the label is then shown as the message's opening words, not ahead of it.
+   * Whether the message is the server's required-field message of a required field, which opens
+   * with the field's prompt and names its page: the label, that prompt, is then shown as the
+   * message's opening words, not ahead of it. `false` for every other message, the client's own
+   * included, and for a key that names no field.
    */
   readonly leadsWithLabel: boolean;
 }
@@ -126,15 +128,36 @@ function fieldLabel(field: FieldDefinition): string {
   return typeof prompt === 'string' && prompt.trim() !== '' ? prompt : field.name;
 }
 
+// Whitespace at the start of the text that follows a label.
+const LEADING_WHITESPACE = /^\s/;
+
 /**
- * The field's required-field message on its page when that message opens with `label`, the
- * field's label: always for a field with a prompt, which the message opens with. `null` for a
- * field whose prompt is missing or blank, since its message opens with that blank prompt and not
- * with the field name its label falls back to.
+ * Whether `message` opens with `label` as its own words: it starts with the non-empty label and
+ * whitespace follows it, so a label that is only the start of a longer word ("Age" before
+ * "Agency") does not count. The label of a field whose prompt is missing or blank is its name, so
+ * a message opening with that blank prompt does not open with the label. One of the conditions of
+ * {@link isServerRequiredMessage}.
  */
-function requiredMessageLedBy(field: FieldDefinition, label: string, pageName: string): string | null {
-  const message = formatRequiredMessage(field.prompt, pageName);
-  return label !== '' && message.startsWith(label) ? message : null;
+function opensWithLabel(message: string, label: string): boolean {
+  return label !== '' && message.startsWith(label) && LEADING_WHITESPACE.test(message.slice(label.length));
+}
+
+/**
+ * Whether `message` is the server's required-field message of the placed field, recognised by its
+ * shape and never by its wording. It rests on one invariant: the server's required-field message
+ * of a required field opens with its prompt and names its page. So the field is required, the
+ * message opens with `label`, the field's label, as its own words ({@link opensWithLabel}), and the
+ * text after the label contains the name of the field's page, which is not blank. The client's own
+ * messages name no page, so none qualifies; a blank page name, which any text contains, qualifies
+ * none.
+ */
+function isServerRequiredMessage({ field, pageName }: PlacedField, label: string, message: string): boolean {
+  return (
+    field.validation.required &&
+    pageName.trim() !== '' &&
+    opensWithLabel(message, label) &&
+    message.slice(label.length).includes(pageName)
+  );
 }
 
 const NO_ITEMS: readonly SummaryItem[] = [];
@@ -157,42 +180,36 @@ function summaryItems(
   const items: SummaryItem[] = [];
   const listed = new Set<string>();
 
-  // `ledMessage` is the one message, if any, that opens with `label`.
-  const add = (
-    name: string,
-    label: string,
-    isField: boolean,
-    messages: readonly string[],
-    ledMessage: string | null,
-  ) => {
+  // `placed` is the field that owns `name`, or `null` for a key that names no field.
+  const add = (name: string, label: string, placed: PlacedField | null, messages: readonly string[]) => {
     listed.add(name);
     messages.forEach((message, index) => {
       items.push({
-        key: `${isField ? 'field' : 'other'}:${name}:${String(index)}`,
+        key: `${placed !== null ? 'field' : 'other'}:${name}:${String(index)}`,
         name,
         label,
-        isField,
+        isField: placed !== null,
         message,
-        leadsWithLabel: message === ledMessage,
+        leadsWithLabel: placed !== null && isServerRequiredMessage(placed, label, message),
       });
     });
   };
 
   const { fields, dataFieldNames } = formOrderOf(definition);
 
-  for (const { field, pageName } of fields) {
+  for (const placed of fields) {
+    const { field } = placed;
     if (!isDataField(field) && dataFieldNames.has(field.name)) {
       continue;
     }
     if (!listed.has(field.name) && Object.hasOwn(fieldErrors, field.name)) {
-      const label = fieldLabel(field);
-      add(field.name, label, true, fieldErrors[field.name], requiredMessageLedBy(field, label, pageName));
+      add(field.name, fieldLabel(field), placed, fieldErrors[field.name]);
     }
   }
 
   for (const [name, messages] of Object.entries(fieldErrors)) {
     if (!listed.has(name)) {
-      add(name, name, false, messages, null);
+      add(name, name, null, messages);
     }
   }
 
@@ -209,11 +226,11 @@ function separatorAfter(label: string): string {
 
 /**
  * Lists every message of `fieldErrors` under its field's prompt, in the order the fields appear in
- * the form, then messages under keys that name no field, after the request-level `detail`. Each
- * message is shown verbatim after its label, except the required-field message, which already
- * opens with the prompt and names the page: it is shown once, verbatim, its opening prompt being
- * the label. The action the errors stopped, when given, heads the list. Renders nothing when
- * there is no message and no detail.
+ * the form, then messages under keys that name no field, after the request-level `detail`. The
+ * server's required-field message of a required field opens with its prompt and names its page:
+ * it is shown once, verbatim, with the prompt, its opening words, as its jump button. Every other
+ * message, the client's own included, is shown verbatim after its label. The action the errors
+ * stopped, when given, heads the list. Renders nothing when there is no message and no detail.
  */
 export function ValidationSummary({
   definition,

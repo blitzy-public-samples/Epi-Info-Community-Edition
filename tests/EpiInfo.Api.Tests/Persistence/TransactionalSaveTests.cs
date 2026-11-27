@@ -770,12 +770,13 @@ public sealed partial class TransactionalSaveTests : IAsyncLifetime
 
         public Task<bool> PingAsync(CancellationToken cancellationToken) => real.PingAsync(cancellationToken);
 
-        public Task<RecordDto> InsertAsync(
+        public Task<RecordWriteResult> InsertAsync(
             FormMetadata form,
             IReadOnlyDictionary<string, FieldValue> values,
             SaveStamp stamp,
+            FormPermissions? permissions,
             CancellationToken cancellationToken) =>
-            real.InsertAsync(form, values, stamp, cancellationToken);
+            real.InsertAsync(form, values, stamp, permissions, cancellationToken);
 
         public Task<RecordWriteResult> UpdateAsync(
             FormMetadata form,
@@ -798,8 +799,9 @@ public sealed partial class TransactionalSaveTests : IAsyncLifetime
             FormMetadata form,
             string globalRecordId,
             Func<SaveStamp> createStamp,
+            FormPermissions? permissions,
             CancellationToken cancellationToken) =>
-            real.SoftDeleteAsync(form, globalRecordId, createStamp, cancellationToken);
+            real.SoftDeleteAsync(form, globalRecordId, createStamp, permissions, cancellationToken);
 
         public Task<FormPermissions?> GetPermissionsAsync(FormMetadata form, CancellationToken cancellationToken) =>
             real.GetPermissionsAsync(form, cancellationToken);

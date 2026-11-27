@@ -2,16 +2,20 @@
 // module; nothing else in web/src builds an API URL, calls fetch or imports openapi-fetch.
 // Paths, parameters and bodies are typed by the generated `paths` of ./schema, so a call
 // that no longer matches the OpenAPI document fails `tsc`. Every call settles into an
-// ApiResult here, and every failure is parsed by ./errors.
+// ApiResult here, every failure parsed by ./errors, except two, which reject (ApiClient):
+// a call its caller aborts rejects with the caller's abort reason, and a call whose
+// transport rejects with an error named AbortError rejects with that error as given,
+// even when the caller's signal is not aborted.
 //
-// A success body is checked against its contract shape before it is reported: callers
-// receive only well-formed data, and an OK response whose body is malformed or is not
-// JSON settles as a failure of its own status, as does a record create, update or delete
-// answered by any status but its contracted 201, 200 or 204, and a health check answered
-// by any but its 200. So does a response, OK or
-// not, whose body could not be read to its end: its status arrived, so only a request
-// that received no response at all settles as networkError(). For a POST or PUT such a
-// failure states no outcome, so the save may have been applied and is never resent
+// Every success body, the field-event answer included, is checked against its contract
+// shape before it is reported: callers receive only well-formed data, and an OK response
+// whose body is malformed or is not JSON settles as a failure of its own status, as does a
+// record create, update or delete answered by any status but its contracted 201, 200 or
+// 204, and a health check answered by any but its 200. So does a response, OK or not,
+// whose body could not be read to its end, since its status arrived. A request that
+// received no response at all, or was answered by a redirect, which the client refuses
+// rather than follows (withinDeadline), settles as networkError(). For a POST or PUT such
+// a failure states no outcome, so the save may have been applied and is never resent
 // without the user's explicit consent.
 //
 // The client keeps no state, caching or retries; its one timer is each request's deadline
@@ -35,6 +39,7 @@ import type { components, paths } from './schema';
 import type {
   Diagnostic,
   DiagnosticSeverity,
+  DialogMessage,
   ExactDecimal,
   FieldDefinition,
   FieldEventRequest,
@@ -65,9 +70,17 @@ import type {
 export type ApiResult<T> = { ok: true; data: T; status: number } | { ok: false; error: ApiError };
 
 export interface ApiClientOptions {
-  /** Absolute origin the API paths are appended to; defaults to the page's own origin. */
+  /**
+   * Absolute origin the API paths are appended to; defaults to the page's own origin.
+   * Requests are same-origin, so fetch refuses any other origin; only a replacement
+   * `fetch`, as tests give, can serve one.
+   */
   baseUrl?: string;
-  /** Replaces the global fetch, as tests do; it receives the built `Request`. */
+  /**
+   * Replaces the global fetch, as tests do; it receives the built `Request`, in mode
+   * 'same-origin' with redirect 'error'. A redirect it follows or returns is refused all the
+   * same, as no response.
+   */
   fetch?: typeof fetch;
   /**
    * How long one request may take to complete, in milliseconds; REQUEST_DEADLINE_MS unless
@@ -87,8 +100,13 @@ export type HealthyResponse = paths['/health']['get']['responses'][200]['content
 
 /**
  * Typed calls of every API endpoint. The last parameter of each is an optional
- * `AbortSignal`; an aborted call rejects with an AbortError, which callers recognise with
- * `isAbortError`, and every other outcome resolves to an `ApiResult`.
+ * `AbortSignal`. A call its caller aborts rejects with the signal's reason, as fetch rejects
+ * an aborted request: an AbortError when the caller aborted without a reason of its own
+ * (`AbortController.abort()`), which `isAbortError` recognises by its name. A reason the
+ * caller gave is rethrown as given, and `isAbortError` recognises it only when it is named
+ * AbortError, so a caller that gives one tells its abort apart by its own signal's
+ * `aborted`. A transport's own rejection named AbortError, which fetch gives only for an
+ * aborted request, rejects the call as well. Every other outcome resolves to an `ApiResult`.
  *
  * A call whose request and whole response have not completed within the client's deadline
  * (REQUEST_DEADLINE_MS) is cancelled and settles as a failure with no response, kind
@@ -209,12 +227,6 @@ interface Exchange<D> {
 // exchange with the very Response the fetch wrapper returned, so settle recognises them.
 const unreadableResponses = new WeakSet<Response>();
 
-// The copies readingJsonExactly returns for a response that fetch reached by following a
-// redirect, which a copy cannot carry as `Response.redirected`. Such a reply answers the
-// request redirected to, not the one this client sent, so settle reads no write outcome
-// from it.
-const redirectedResponses = new WeakSet<Response>();
-
 // Settles one call. `read` turns an OK response's body into the result's data, returning
 // `undefined` when the body is missing or is not the shape the endpoint's contract
 // returns. Such a response settles as a failure of its own status, which parseProblem
@@ -225,9 +237,11 @@ const redirectedResponses = new WeakSet<Response>();
 // something other than the API proves neither that the write was applied nor that it was not.
 // A response marked unreadable (readingJsonExactly), OK or not, also settles as a failure
 // of its own status with no write outcome: a 2xx as `server`, an error status by its kind.
-// With `writesRecord`, set for a record create, update or delete, an error response that is
-// the direct reply to that request, not one marked redirected, is parsed for the outcome its
-// WriteProblemDetails states; every other error response states none.
+// With `writesRecord`, set for a record create, update or delete, an error response is
+// parsed for the outcome its WriteProblemDetails states; every other call's error response
+// states none. Such a response is always the direct reply to that request, because
+// withinDeadline refuses a redirect, and whatever it leads to, as no response
+// (refusingRedirects), so no reply to another request can state the outcome of this one.
 async function settle<D, T>(
   signal: AbortSignal | undefined,
   send: () => Promise<Exchange<D>>,
@@ -259,10 +273,7 @@ async function settle<D, T>(
   // openapi-fetch reports an empty error body as `error: undefined`, so only the status
   // decides between success and failure.
   if (!response.ok) {
-    const writeReply =
-      writesRecord && !redirectedResponses.has(response)
-        ? { contentType: response.headers.get('Content-Type') }
-        : undefined;
+    const writeReply = writesRecord ? { contentType: response.headers.get('Content-Type') } : undefined;
     return { ok: false, error: parseProblem(response.status, error, writeReply) };
   }
 
@@ -314,9 +325,9 @@ function withoutBody(signal: AbortSignal | undefined, send: () => Promise<Exchan
 // index on an `option` field and the label text on a `legalValues` field, and a bound is a
 // number on a `number` field and a `YYYY-MM-DD` date on a `date` field. Likewise a field's
 // `options` are a list on an `option` or `legalValues` field and `null` on a field of every
-// other published type. Two parts are left to their one reader: a field's `fieldType` is
+// other published type. One part is left to its one reader: a field's `fieldType` is
 // checked as a string, because FieldRenderer shows a field of a type it does not know as a
-// protected placeholder, and the field-event response is passed on as parsed (raiseFieldEvent).
+// protected placeholder.
 
 function isObject(value: unknown): value is Readonly<Record<string, unknown>> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -363,10 +374,10 @@ function isArrayOf<T>(value: unknown, isItem: (item: unknown) => item is T): val
  * Whether `value` is a field value as this client reads and holds one: `null`, a string, a
  * boolean, a finite number, a bigint, which is a whole number beyond the safe range kept
  * exact (FIELD_VALUE_PATHS), or an {@link ExactDecimal} this module made. It is the one check
- * of a scalar field value in a parsed response, so a reader of a body that is passed on
- * unchecked, such as a field-event answer, accepts every value the client decodes.
+ * of a scalar field value in a parsed response, so a record's `values` and a field-event
+ * answer's `assigned` accept every value the client decodes.
  */
-export function isFieldValue(value: unknown): value is FieldValue {
+function isFieldValue(value: unknown): value is FieldValue {
   return (
     value === null ||
     isString(value) ||
@@ -461,18 +472,24 @@ function isOptionIndex(value: unknown): value is number {
   return isInteger(value) && value >= 0 && value <= MAX_INT32;
 }
 
-// A bound's `date` format: YYYY-MM-DD with ASCII digits; without the m flag, `$` matches
+// The wire's `date` format: YYYY-MM-DD with ASCII digits; without the m flag, `$` matches
 // only at the end of the text.
-const ISO_DATE = /^(\d{4})-(\d{2})-(\d{2})$/;
+const WIRE_DATE = /^(\d{4})-(\d{2})-(\d{2})$/;
 
-// A YYYY-MM-DD text naming a real day, by integer arithmetic, so 2011-02-30 and 2011-13-45
-// are not dates. Year 0000 is not one either: the server writes a bound from a .NET
-// DateOnly, whose years start at 0001.
-function isCalendarDate(value: unknown): value is string {
+/**
+ * Whether `value` is a wire date: a YYYY-MM-DD text naming a real Gregorian day of the years
+ * 0001 to 9999, as the server's exact `yyyy-MM-dd` DateOnly parse reads one and as it writes
+ * a date. It is the one check of that format, for a date bound, a date field's value and an
+ * event value alike. It uses integer arithmetic only, because Date.parse and new Date(y, …)
+ * shift years 0-99 and roll overflowing days into the next month, so 2011-02-30, 2011-13-45
+ * and 0000-01-01 are not dates. The narrower range a `datetime` column stores is a save
+ * rule, not part of the format.
+ */
+export function isWireDate(value: unknown): value is string {
   if (!isString(value)) {
     return false;
   }
-  const match = ISO_DATE.exec(value);
+  const match = WIRE_DATE.exec(value);
   if (match === null) {
     return false;
   }
@@ -545,7 +562,7 @@ function isFieldOptions(value: unknown, fieldType: string): value is FieldDefini
 
 /**
  * A `lower` or `upper` bound of a field of `fieldType`: `null` when unset, else a finite
- * number on a `number` field, a calendar date on a `date` field, and either on a field of
+ * number on a `number` field, a wire date on a `date` field, and either on a field of
  * any other type. A bound is no field value, so parseJson reads it as JSON.parse does,
  * never as a bigint.
  */
@@ -557,9 +574,9 @@ function isBound(value: unknown, fieldType: string): value is FieldValidation['l
     case NUMBER_FIELD:
       return isFiniteNumber(value);
     case DATE_FIELD:
-      return isCalendarDate(value);
+      return isWireDate(value);
     default:
-      return isFiniteNumber(value) || isCalendarDate(value);
+      return isFiniteNumber(value) || isWireDate(value);
   }
 }
 
@@ -606,12 +623,21 @@ function isPageDefinition(body: unknown): body is PageDefinition {
   );
 }
 
+/** A diagnostic's `line`: 1-based in the form's program text, so a whole number of at least 1. */
+function isDiagnosticLine(value: unknown): value is number {
+  return isInteger(value) && value >= 1;
+}
+
+/**
+ * A diagnostic, the one shape of both a form definition's `unsupportedCheckCode` and a
+ * field-event answer's `diagnostics`.
+ */
 function isDiagnostic(body: unknown): body is Diagnostic {
   return (
     isObject(body) &&
     isDiagnosticSeverity(body.severity) &&
     isString(body.form) &&
-    isInteger(body.line) &&
+    isDiagnosticLine(body.line) &&
     isString(body.command) &&
     isString(body.message)
   );
@@ -627,6 +653,27 @@ function isFormDefinition(body: unknown): body is FormDefinition {
     isBooleanOrNull(body.canInsert) &&
     isBooleanOrNull(body.canUpdate) &&
     isBooleanOrNull(body.canDelete)
+  );
+}
+
+/** A check-code `DIALOG`: its text, and its `TITLETEXT` or `null` when the program gives none. */
+function isDialogMessage(body: unknown): body is DialogMessage {
+  return isObject(body) && isString(body.message) && isStringOrNull(body.title);
+}
+
+// A field-event answer: all six members, none of them nullable, so an answer missing one, or
+// holding one of another type, is no answer and none of its effects reaches the editor.
+// `assigned` is a `values` map, so a value decoded exactly, such as the bigint of
+// 9007199254740993, is an assignment like any other.
+function isFieldEventResponse(body: unknown): body is FieldEventResponse {
+  return (
+    isObject(body) &&
+    isArrayOf(body.enabled, isString) &&
+    isArrayOf(body.disabled, isString) &&
+    isArrayOf(body.cleared, isString) &&
+    isValues(body.assigned) &&
+    isArrayOf(body.dialogs, isDialogMessage) &&
+    isArrayOf(body.diagnostics, isDiagnostic)
   );
 }
 
@@ -652,11 +699,15 @@ const acceptHeaders: Record<string, string> = { Accept: 'application/json, appli
 
 /**
  * How long one request may take, in milliseconds: one bound per attempt, from sending the
- * request to receiving the whole response, headers and body. It is twice the API's default
- * `Database:CommandTimeoutSeconds` (30 s), so when one database command stalls, the
- * server's own 503 and its write outcome (a lock wait, for instance, answers `notWritten`,
- * which Retry may resend) arrive before the client gives up. A request that never
- * completes therefore cannot hold the editor's save or a record transition.
+ * request to receiving the whole response, headers and body. A request that never
+ * completes therefore cannot hold the editor's save or a record transition, and the
+ * deadline ends it without resending it. It is twice the API's default
+ * `Database:CommandTimeoutSeconds` (30 s), a margin that allows time for the typical answer
+ * to a database command that times out: the server's own 503 and its write outcome (a lock
+ * wait, for instance, answers `notWritten`, which Retry may resend). It does not guarantee
+ * that answer arrives first: that timeout bounds each database command, not the request,
+ * which may run several, and this timer starts before the request is sent. A request the
+ * deadline ends settles with no response, so a create or update counts as possibly applied.
  */
 export const REQUEST_DEADLINE_MS = 60_000;
 
@@ -690,15 +741,35 @@ interface Stopped {
   readonly stoppedBy: unknown;
 }
 
+// The Fetch standard's redirect statuses, each of which fetch turns into a network error for
+// a request whose redirect mode is 'error'.
+const REDIRECT_STATUSES: ReadonlySet<number> = new Set([301, 302, 303, 307, 308]);
+
+// Refuses what fetch never returns for a request sent with redirect 'error': a response that
+// followed a redirect, an opaque redirect, or a redirect status itself, which a replacement
+// transport that does not honour the request's redirect mode may return. Each is refused as
+// fetch refuses a redirect, with a TypeError, so settle reports a request that received no
+// response: wherever the redirect leads is never taken for the API's answer, and a create or
+// update counts as possibly applied. The refused response's body is cancelled unread.
+function refusingRedirects(response: Response): Response {
+  if (response.redirected || response.type === 'opaqueredirect' || REDIRECT_STATUSES.has(response.status)) {
+    response.body?.cancel().catch(() => undefined);
+    throw new TypeError('The response is a redirect, which the client does not follow.');
+  }
+  return response;
+}
+
 /**
  * Sends `request` through `send` and reads its whole response within `deadlineMs`; the body
  * is read by readingJsonExactly, so nothing openapi-fetch reads after this returns can wait
  * on the network. The caller's signal is the one openapi-fetch put on `request`. When it is
  * already aborted, nothing is sent and the call rejects at once with the caller's reason, as
- * fetch rejects such a request. Otherwise the request sent is a copy whose signal the
- * caller's abort and the deadline both abort, and the call settles at the first of three
- * things: the whole response; the caller's abort, which
- * rejects it with the caller's reason; or the deadline, which rejects it with a TimeoutError.
+ * fetch rejects such a request. Otherwise the request sent is a copy in mode 'same-origin'
+ * with redirect 'error', whose signal the caller's abort and the deadline both abort, and a
+ * response that is or followed a redirect is refused as no response (refusingRedirects).
+ * The call settles at the first of three things: the whole response; the caller's abort,
+ * which rejects it with the caller's reason; or the deadline, which rejects it with a
+ * TimeoutError.
  * An abort or the deadline settles the call at once, independently of the transport, and
  * only then cancels the transport with the same reason. So a transport that ignores its
  * signal or never settles cannot hold the call, and one that rejects as soon as it is
@@ -734,8 +805,11 @@ async function withinDeadline(
       stop(deadlineExceeded());
     }, deadlineMs);
   });
-  const sent = new Request(request, { signal: controller.signal });
-  const exchange = async (): Promise<Response> => readingJsonExactly(sent, await send(sent));
+  // Same-origin mode and redirect 'error' keep every exchange on the API's origin and paths:
+  // fetch refuses a cross-origin URL and a redirect with a network error rather than following
+  // it, so no redirect can carry the request, or a record body, anywhere else.
+  const sent = new Request(request, { signal: controller.signal, mode: 'same-origin', redirect: 'error' });
+  const exchange = async (): Promise<Response> => readingJsonExactly(sent, refusingRedirects(await send(sent)));
 
   try {
     const outcome = await Promise.race([exchange(), stopped]);
@@ -1266,8 +1340,7 @@ const NULL_BODY_STATUSES: ReadonlySet<number> = new Set([101, 103, 204, 205, 304
 
 // A copy of `response` with `body` as its body, held whole, so it is neither encoded nor
 // chunked and carries its Content-Length: decoded text, or the bytes received; with `null`,
-// a copy with no body, whose Content-Length of 0 tells openapi-fetch to read none. The copy
-// of a response reached through a redirect is marked redirected for settle.
+// a copy with no body, whose Content-Length of 0 tells openapi-fetch to read none.
 function copyWithBody(response: Response, body: string | ArrayBuffer | null): Response {
   let length = 0;
   if (typeof body === 'string') {
@@ -1279,11 +1352,7 @@ function copyWithBody(response: Response, body: string | ArrayBuffer | null): Re
   headers.delete('Content-Encoding');
   headers.delete('Transfer-Encoding');
   headers.set('Content-Length', String(length));
-  const copy = new Response(body, { status: response.status, statusText: response.statusText, headers });
-  if (response.redirected) {
-    redirectedResponses.add(copy);
-  }
-  return copy;
+  return new Response(body, { status: response.status, statusText: response.statusText, headers });
 }
 
 // The body-less copy of a response whose body cannot be used, marked for settle.
@@ -1354,7 +1423,12 @@ type WireSchemas = components['schemas'];
 /**
  * Builds a client for the API at `baseUrl`, by default the page's own origin: the API
  * serves the built client, and the development server proxies `/api` and `/health`, so
- * every request is same-origin.
+ * every request is same-origin. Every request is sent in mode 'same-origin' with redirect
+ * 'error', so it reaches only the API's own origin and paths: fetch refuses a request to
+ * another origin, and a redirect, an intermediary's included, rather than following it. A
+ * redirect settles as a failure with no response, as does one that a replacement `fetch`
+ * follows or returns all the same: a read offers Retry, and a create or update counts as
+ * possibly applied, so only the user's explicit Save again resends it.
  * @throws Error when no `baseUrl` is given outside a browser.
  */
 export function createApiClient(options: ApiClientOptions = {}): ApiClient {
@@ -1490,10 +1564,8 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
         isSearchResponse,
       ),
 
-    // The body is passed on as parsed: the field-event queue reads it as `unknown` and
-    // reports an answer it cannot read, so no shape is decided here.
     raiseFieldEvent: (viewId, request, signal) =>
-      settle(
+      withBody(
         signal,
         () =>
           http.POST('/api/forms/{viewId}/checkcode/field-event', {
@@ -1502,7 +1574,7 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
             headers: jsonHeaders,
             ...abortable(signal),
           }),
-        (data) => data,
+        isFieldEventResponse,
       ),
 
     getHealth: (signal) => withBody(signal, () => http.GET('/health', abortable(signal)), isHealthyResponse, 200),

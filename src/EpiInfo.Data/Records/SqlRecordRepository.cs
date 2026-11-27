@@ -83,9 +83,18 @@ internal static class RecordOperations
 /// write lock exclusive and an update takes it shared (<see cref="RecordSqlBuilder.AcquireFormWriteLock"/>), both
 /// owned by the transaction. Creates of a form run one at a time and never beside an update of it, so neither forms
 /// a lock cycle with the other; updates still run together and serialise per record on the update lock of the
-/// locked read. A soft delete takes no form lock, because it sends nothing after its exclusive base-row lock. A wait
-/// for the form's lock is bounded by the command timeout, and one that SQL Server ends without the lock is reported
-/// as unavailable with nothing written.
+/// locked read. A soft delete takes no form lock: between its locked read and its UPDATE it sends at most the
+/// permission read, which touches no record table, and it sends nothing after its exclusive base-row lock, so while it
+/// holds a record lock it waits on no other writer. A wait for the form's lock is bounded by the command timeout, and
+/// one that SQL Server ends without the lock is reported as unavailable with nothing written.
+/// </para>
+/// <para>
+/// <b>Permissions.</b> A write given non-null permissions reads them again on its own connection and inside its
+/// transaction, through <see cref="SqlPermissionReader.ReadResolvedAsync"/>, for the tables its schema read resolved,
+/// and decides from that read alone: an insert after the form's exclusive lock, on the base table and every page
+/// table; an update after the required gate, on the base table and every page table; a soft delete after its locked
+/// read, on the base table only. Each read comes before the write's first data statement, so a refusal rolls back
+/// with nothing written and the caller's earlier read never decides it.
 /// </para>
 /// <para>
 /// <b>Contract violations.</b> A <c>values</c> key that names no writable data field, a repeated field, or a value
@@ -131,6 +140,7 @@ internal sealed class SqlRecordRepository(
     private const string GateResultMessage = "The required gate returned no result.";
     private const string FormWriteLockRefusedMessage = "SQL Server refused the form's write lock.";
     private const string StampResultMessage = "The save stamp source returned no stamp.";
+    private const string UnexpectedInsertResultMessage = "An insert given no permissions returned no committed record.";
 
     // The name a submitted value is bound under to test it against its column; that parameter is never sent.
     private const string ProbeParameterName = "@p0";
@@ -509,17 +519,27 @@ internal sealed class SqlRecordRepository(
 
 
     /// <summary>
-    /// Inserts a new active record, as <see cref="IDataStore.InsertAsync"/>: the form's exclusive write lock, then the
-    /// base row with one save stamp for both stamp pairs, one row on every page in page order holding every writable
-    /// data column (<c>NULL</c> when absent), then the response snapshot, all in one transaction that then commits.
-    /// The exclusive lock runs creates of the form one at a time and never beside an update of it, so concurrent
-    /// creates all commit rather than deadlock in their snapshot reads (class remarks).
+    /// Inserts a new active record, as <see cref="IDataStore.InsertAsync"/>: the form's exclusive write lock; when
+    /// <paramref name="permissions"/> is not <see langword="null"/>, one permission read inside this transaction for
+    /// the base table and every page table, which must grant INSERT on each of them (<c>Forbidden</c>); then the base
+    /// row with one save stamp for both stamp pairs, one row on every page in page order holding every writable data
+    /// column (<c>NULL</c> when absent), then the response snapshot, all in one transaction that then commits. The
+    /// exclusive lock runs inserts of the form one at a time and never beside an update of it, so concurrent inserts
+    /// all commit rather than deadlock in their snapshot reads (class remarks).
     /// </summary>
     /// <param name="form">The form's metadata, as the store's metadata read returned it.</param>
     /// <param name="values">The validated values of writable data fields, keyed by canonical name.</param>
     /// <param name="stamp">The save stamp of this write.</param>
+    /// <param name="permissions">
+    /// Non-null turns on the INSERT check, which this transaction decides from its own permission read; the caller's
+    /// earlier read passed here never decides it. <see langword="null"/> means no check and no permission statement.
+    /// </param>
     /// <param name="cancellationToken">The request's abort token.</param>
-    /// <returns>The new record as committed, with its intrinsic position and count.</returns>
+    /// <returns>
+    /// <see cref="RecordWriteStatus.Success"/> with the new record as committed, with its intrinsic position and
+    /// count; or <see cref="RecordWriteStatus.Forbidden"/> when this transaction's permission read denied the insert
+    /// and it rolled back with nothing written.
+    /// </returns>
     /// <exception cref="ArgumentException">
     /// <paramref name="values"/> breaks the contract against <paramref name="form"/> (class remarks); raised before
     /// any base- or page-table statement is sent.
@@ -531,10 +551,11 @@ internal sealed class SqlRecordRepository(
     /// the transaction's metadata read no longer finds and values that read refuses although <paramref name="form"/>
     /// accepts them (class remarks).
     /// </exception>
-    public async Task<RecordDto> InsertAsync(
+    public async Task<RecordWriteResult> InsertAsync(
         FormMetadata form,
         IReadOnlyDictionary<string, FieldValue> values,
         SaveStamp stamp,
+        FormPermissions? permissions,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(form);
@@ -565,6 +586,7 @@ internal sealed class SqlRecordRepository(
                             callerForm: form,
                             values,
                             stamp,
+                            permissions,
                             cancellationToken)
                         .ConfigureAwait(false);
                 },
@@ -668,9 +690,14 @@ internal sealed class SqlRecordRepository(
 
     /// <summary>
     /// Soft-deletes a record on its base row only, as <see cref="IDataStore.SoftDeleteAsync"/>: <c>RecStatus</c> 0
-    /// with the last-save stamp, in one transaction. Page rows are never touched and nothing cascades. It takes no form
-    /// write lock: it sends nothing after its exclusive lock on the base row, so it closes no lock cycle with a create
-    /// or an update (class remarks).
+    /// with the last-save stamp, in one transaction. Page rows are never touched and nothing cascades. In order: the
+    /// locked base read (<c>NotFound</c>, or <c>AlreadyDeleted</c> for <c>RecStatus</c> 0); when
+    /// <paramref name="permissions"/> is not <see langword="null"/>, one permission read inside this transaction for
+    /// the base table alone, which must grant UPDATE on it (<c>Forbidden</c>); the one call of
+    /// <paramref name="createStamp"/>; the base UPDATE; the commit. It takes no form write lock: between its locked
+    /// read and its UPDATE it sends at most that permission read, which touches no record table, and it sends nothing
+    /// after its exclusive lock on the base row, so it closes no lock cycle with an insert or an update (class
+    /// remarks).
     /// </summary>
     /// <param name="form">The form's metadata, as the store's metadata read returned it.</param>
     /// <param name="globalRecordId">
@@ -678,8 +705,13 @@ internal sealed class SqlRecordRepository(
     /// letter case follows the column's collation, and the byte length must be equal.
     /// </param>
     /// <param name="createStamp">
-    /// Creates the save stamp; called once, only when the locked read found an active record and before the soft
-    /// delete's data statement, never for an unknown or already-deleted record.
+    /// Supplies the save stamp; called once, only when the locked read found an active record and the permission check
+    /// passed, and before the soft delete's data statement; never for an unknown, already-deleted or refused record.
+    /// </param>
+    /// <param name="permissions">
+    /// Non-null turns on the base-table UPDATE check, which this transaction decides from its own permission read; the
+    /// caller's earlier read passed here never decides it. <see langword="null"/> means no check and no permission
+    /// statement.
     /// </param>
     /// <param name="cancellationToken">The request's abort token.</param>
     /// <returns>
@@ -687,6 +719,8 @@ internal sealed class SqlRecordRepository(
     /// <see cref="SoftDeleteStatus.AlreadyDeleted"/> with nothing written, stamps included, for a record with
     /// <c>RecStatus</c> 0; each with the base row's <c>GlobalRecordId</c> as the locked read returned it, the stored
     /// spelling. <see cref="SoftDeleteStatus.NotFound"/>, with no id, for an unknown id or a form no longer present.
+    /// <see cref="SoftDeleteStatus.Forbidden"/>, with no id and nothing written, when this transaction's permission
+    /// read denied the soft delete of an active record.
     /// </returns>
     /// <exception cref="DataStoreUnavailableException">The database was unavailable; the outcome says what is known.</exception>
     /// <exception cref="DataStoreWriteException">
@@ -697,6 +731,7 @@ internal sealed class SqlRecordRepository(
         FormMetadata form,
         string globalRecordId,
         Func<SaveStamp> createStamp,
+        FormPermissions? permissions,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(form);
@@ -719,7 +754,14 @@ internal sealed class SqlRecordRepository(
                         return WriteDecision<SoftDeleteResult>.RolledBack(SoftDeleteResult.NotFound());
                     }
 
-                    return await SoftDeleteCoreAsync(scope, read.Schema, globalRecordId, createStamp, cancellationToken)
+                    return await SoftDeleteCoreAsync(
+                            scope,
+                            read.Form,
+                            read.Schema,
+                            globalRecordId,
+                            createStamp,
+                            permissions,
+                            cancellationToken)
                         .ConfigureAwait(false);
                 },
                 cancellationToken)
@@ -732,8 +774,10 @@ internal sealed class SqlRecordRepository(
     /// </summary>
     /// <remarks>
     /// It skips the connection open and the metadata read and runs the same transaction, statements, stage tracking
-    /// and observer as <see cref="InsertAsync(FormMetadata, IReadOnlyDictionary{string, FieldValue}, SaveStamp, CancellationToken)"/>.
-    /// With no metadata read of its own, a refused value is always the caller's broken argument, an unwrapped
+    /// and observer as
+    /// <see cref="InsertAsync(FormMetadata, IReadOnlyDictionary{string, FieldValue}, SaveStamp, FormPermissions?, CancellationToken)"/>
+    /// given no permissions, so it sends no permission statement and always commits or throws. With no metadata read
+    /// of its own, a refused value is always the caller's broken argument, an unwrapped
     /// <see cref="ArgumentException"/>. The connection is never disposed here.
     /// </remarks>
     /// <param name="connection">An open connection with no pending transaction.</param>
@@ -758,13 +802,24 @@ internal sealed class SqlRecordRepository(
         ArgumentNullException.ThrowIfNull(values);
         ArgumentNullException.ThrowIfNull(stamp);
 
-        return await RunWriteAsync(
+        RecordWriteResult result = await RunWriteAsync(
                 connection,
                 ownsConnection: false,
                 RecordOperations.Insert,
-                scope => InsertCoreAsync(scope, form, schema, callerForm: null, values, stamp, cancellationToken),
+                scope => InsertCoreAsync(
+                    scope,
+                    form,
+                    schema,
+                    callerForm: null,
+                    values,
+                    stamp,
+                    permissions: null,
+                    cancellationToken),
                 cancellationToken)
             .ConfigureAwait(false);
+
+        // With no permissions the insert has no refusal, so a committed record is the only result it can return.
+        return result.IsSuccess ? result.Record : throw new InvalidOperationException(UnexpectedInsertResultMessage);
     }
 
     /// <summary>
@@ -879,19 +934,22 @@ internal sealed class SqlRecordRepository(
     // The insert both InsertAsync overloads share, inside the transaction RunWriteAsync opened. callerForm is the
     // metadata the caller validated the values against, when this transaction read form again itself; null when form
     // is the caller's own (ResolveSubmitted).
-    private async Task<WriteDecision<RecordDto>> InsertCoreAsync(
+    private async Task<WriteDecision<RecordWriteResult>> InsertCoreAsync(
         WriteScope scope,
         FormMetadata form,
         FormSchema schema,
         FormMetadata? callerForm,
         IReadOnlyDictionary<string, FieldValue> values,
         SaveStamp stamp,
+        FormPermissions? permissions,
         CancellationToken cancellationToken)
     {
         DataFieldSet dataFields = FormDefinitionFactory.GetDataFields(form);
         SubmittedValues resolved = ResolveSubmitted(scope, schema, dataFields, callerForm, values, nameof(values));
 
-        // Every statement is built before the first is sent, so a statement the builders refuse sends nothing.
+        // Every base and page INSERT is built before the form lock and before any statement on a record table, so an
+        // insert the builders refuse takes no lock and sends no record statement. The lock, the permission read and
+        // the response snapshot are built later, each when it is sent.
         string globalRecordId = RecordSqlBuilder.NewGlobalRecordId();
         SqlStatement baseInsert = RecordSqlBuilder.InsertBase(schema, globalRecordId, stamp);
         var pageInserts = new List<SqlStatement>(schema.Pages.Count);
@@ -899,8 +957,8 @@ internal sealed class SqlRecordRepository(
         {
             // Every page of the form gets its row, as legacy inserts one whatever the page holds, so a page with no
             // submitted value still gets one. A page whose table or record key the catalogue lacks makes the builder
-            // refuse the whole insert here, before any statement is sent, so a record is never committed without one
-            // of its page rows.
+            // refuse the whole insert here, before the form lock and any record statement, so a record is never
+            // committed without one of its page rows.
             pageInserts.Add(RecordSqlBuilder.InsertPage(
                 page,
                 globalRecordId,
@@ -909,9 +967,31 @@ internal sealed class SqlRecordRepository(
         }
 
         // The form's exclusive write lock comes before the base INSERT, the transaction's first lock on a record table,
-        // and after every statement is built, so a refused insert sends nothing.
+        // and after every base and page INSERT is built, so an insert the builders refuse takes no lock and sends no
+        // record statement.
         await AcquireFormWriteLockAsync(scope, RecordOperations.Insert, schema, exclusive: true, cancellationToken)
             .ConfigureAwait(false);
+
+        // The insert needs INSERT on the base table and on every page table. It is checked once the form's lock is
+        // held, so after any wait for it, and before the base INSERT, from the permissions read on this transaction's
+        // connection for the tables this transaction resolved, never from the caller's earlier read, which only turns
+        // the check on. A grant revoked while the insert waited is therefore a refusal with nothing written, not a
+        // failed statement.
+        if (permissions is not null)
+        {
+            FormPermissions current = await ReadPermissionsInTransactionAsync(
+                    scope,
+                    RecordOperations.Insert,
+                    form,
+                    schema,
+                    includePages: true,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            if (!current.CanInsert(form))
+            {
+                return WriteDecision<RecordWriteResult>.RolledBack(RecordWriteResult.Forbidden());
+            }
+        }
 
         // OUTPUT INSERTED returns the new key uncoerced, so the converter checks it against its reader-built column.
         object? insertedKey = await SqlExecution.ExecuteScalarAsync<object>(
@@ -940,7 +1020,7 @@ internal sealed class SqlRecordRepository(
                 globalRecordId,
                 cancellationToken)
             .ConfigureAwait(false);
-        return WriteDecision<RecordDto>.Committed(snapshot);
+        return WriteDecision<RecordWriteResult>.Committed(RecordWriteResult.Success(snapshot));
     }
 
     // The update both UpdateAsync overloads share, inside the transaction RunWriteAsync opened. callerForm is as for
@@ -1009,11 +1089,21 @@ internal sealed class SqlRecordRepository(
         // transaction's connection for the tables this transaction resolved, never from the caller's earlier read,
         // which only turns the check on. A grant revoked while the update waited on the lock is therefore a refusal
         // with nothing written, not a failed statement.
-        if (permissions is not null
-            && !await MayApplyUpdateAsync(scope, form, schema, stored.MissingPages, cancellationToken)
-                .ConfigureAwait(false))
+        if (permissions is not null)
         {
-            return WriteDecision<RecordWriteResult>.RolledBack(RecordWriteResult.Forbidden());
+            FormPermissions current = await ReadPermissionsInTransactionAsync(
+                    scope,
+                    RecordOperations.Update,
+                    form,
+                    schema,
+                    includePages: true,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            if (!current.CanUpdate(form)
+                || !stored.MissingPages.All(page => current.CanInsertInto(page.Page.TableName)))
+            {
+                return WriteDecision<RecordWriteResult>.RolledBack(RecordWriteResult.Forbidden());
+            }
         }
 
         // Every check has decided that the update writes, and no data statement has been sent, so the stamp is created
@@ -1048,49 +1138,55 @@ internal sealed class SqlRecordRepository(
         return WriteDecision<RecordWriteResult>.Committed(RecordWriteResult.Success(snapshot));
     }
 
-    // Whether the login may apply this update, as FormPermissions decides from the grants read here, inside the
-    // update's transaction: UPDATE on the base table and every page table of form, and INSERT on the table of every
-    // page in missingPages. One read covers the base table, then each page of schema in order, on the tables this
-    // transaction's schema read confirmed; a table it did not confirm gets no entry and so denies.
-    private async Task<bool> MayApplyUpdateAsync(
+    // The login's permissions as read here, inside the write's transaction, on its connection, for the tables this
+    // transaction's schema read confirmed: the base table, then, when includePages is set, each page of schema in
+    // order. A table the schema read did not confirm gets no entry and so denies. Each write applies its own rule of
+    // FormPermissions to the result: an insert CanInsert, an update CanUpdate and CanInsertInto each missing page, a
+    // soft delete CanDelete. Each permission statement is a SELECT that touches no record table, reported under the
+    // write's own operation; none marks DML, so a failure here is classified before any DML.
+    private async Task<FormPermissions> ReadPermissionsInTransactionAsync(
         WriteScope scope,
+        string operation,
         FormMetadata form,
         FormSchema schema,
-        IReadOnlyList<PageTableSchema> missingPages,
+        bool includePages,
         CancellationToken cancellationToken)
     {
-        var requestedNames = new string[schema.Pages.Count + 1];
-        var resolved = new TableSchema?[schema.Pages.Count + 1];
+        int pageCount = includePages ? schema.Pages.Count : 0;
+        var requestedNames = new string[pageCount + 1];
+        var resolved = new TableSchema?[pageCount + 1];
         requestedNames[0] = form.BaseTableName;
         resolved[0] = schema.BaseTable;
-        for (int index = 0; index < schema.Pages.Count; index++)
+        for (int index = 0; index < pageCount; index++)
         {
             requestedNames[index + 1] = schema.Pages[index].Page.TableName;
             resolved[index + 1] = schema.Pages[index].Table;
         }
 
-        FormPermissions current = await SqlPermissionReader.ReadResolvedAsync(
+        return await SqlPermissionReader.ReadResolvedAsync(
                 scope.Connection,
                 scope.Transaction,
-                RecordOperations.Update,
+                operation,
                 requestedNames,
                 resolved,
                 options.CommandTimeoutSeconds,
                 observer,
                 cancellationToken)
             .ConfigureAwait(false);
-
-        return current.CanUpdate(form) && missingPages.All(page => current.CanInsertInto(page.Page.TableName));
     }
 
     // The base-only soft delete, inside the transaction RunWriteAsync opened. A record already deleted is left exactly
-    // as it is, stamps included, so a repeated DELETE writes nothing. A found record's result carries the id as the
-    // locked read returned it, so the caller names the record by its stored spelling without another statement.
+    // as it is, stamps included, so a repeated DELETE writes nothing, and neither it nor an unknown id reads
+    // permissions. A Deleted or AlreadyDeleted result carries the id as the locked read returned it, so the caller
+    // names the record by its stored spelling without another statement; a Forbidden result, for an active record the
+    // permission read refused, carries none.
     private async Task<WriteDecision<SoftDeleteResult>> SoftDeleteCoreAsync(
         WriteScope scope,
+        FormMetadata form,
         FormSchema schema,
         string globalRecordId,
         Func<SaveStamp> createStamp,
+        FormPermissions? permissions,
         CancellationToken cancellationToken)
     {
         if (await ReadBaseRowAsync(
@@ -1110,7 +1206,29 @@ internal sealed class SqlRecordRepository(
             return WriteDecision<SoftDeleteResult>.RolledBack(SoftDeleteResult.AlreadyDeleted(locked.GlobalRecordId));
         }
 
-        // Only an active record is written, so only it needs a stamp, created before the one data statement.
+        // The soft delete needs UPDATE on the base table alone, because it changes only the base row. It is checked
+        // after the locked read, so after any wait for the row, and before the stamp and the UPDATE, from the
+        // permissions read on this transaction's connection for the base table this transaction resolved, never from
+        // the caller's earlier read, which only turns the check on. A grant revoked while the delete waited is
+        // therefore a refusal with nothing written, not a failed statement.
+        if (permissions is not null)
+        {
+            FormPermissions current = await ReadPermissionsInTransactionAsync(
+                    scope,
+                    RecordOperations.Delete,
+                    form,
+                    schema,
+                    includePages: false,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            if (!current.CanDelete(form))
+            {
+                return WriteDecision<SoftDeleteResult>.RolledBack(SoftDeleteResult.Forbidden());
+            }
+        }
+
+        // Only an active record the checks let through is written, so only it needs a stamp, made before the one data
+        // statement.
         SqlStatement softDelete = RecordSqlBuilder.SoftDelete(
             schema,
             locked.UniqueKey,

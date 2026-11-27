@@ -35,7 +35,9 @@ namespace EpiInfo.Api.Contracts;
 /// and gets the same 400. Content that is not valid JSON, such as truncated JSON or content after the value, is a
 /// <c>BadHttpRequestException</c> that <c>ApiExceptionHandler</c> maps to the request-level 400 "malformed JSON". A
 /// valid value that is a JSON array, string, number or boolean rather than an object is the request-level 400
-/// "request body must be a JSON object".
+/// "request body must be a JSON object". An object that names a member more than once, exactly or differing only by
+/// letter case, such as two <c>values</c> members, is the request-level 400 "request body names a member more than
+/// once", so no occurrence is bound in place of another.
 /// </para>
 /// </remarks>
 /// <param name="Values">

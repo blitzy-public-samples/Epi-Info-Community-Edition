@@ -885,9 +885,10 @@ internal static class RecordSqlBuilder
     /// stamped row of an update. Two such writes in progress together would each wait in that read for the other's
     /// uncommitted row and end in a deadlock (1205). Under the lock a create of the form runs beside no other create
     /// and no update of the form, so that read meets no uncommitted row of another create or update; updates still run
-    /// beside each other and serialise per record on <see cref="LockBase"/>. A soft delete takes no lock: it sends no
-    /// statement after its exclusive lock on its base row, so while it holds that lock it waits on no other writer and
-    /// closes no cycle. Reads take no lock.
+    /// beside each other and serialise per record on <see cref="LockBase"/>. A soft delete takes no lock: between its
+    /// <see cref="LockBase"/> read and its UPDATE it sends at most the permission read, which touches no record table,
+    /// and it sends no statement after its exclusive lock on its base row, so while it holds a lock on that row it
+    /// waits on no other writer and closes no cycle. Reads take no lock.
     /// </para>
     /// <para>
     /// The statement names no table: the resource, the mode, the owner and the lock timeout are all positional

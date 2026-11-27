@@ -105,11 +105,18 @@ namespace EpiInfo.Domain.Storage;
 /// <see cref="RecordDto"/> through <see cref="RecordDto.From"/>. A failure in any of them rolls the write back.
 /// </description></item>
 /// <item><description>
-/// <b>Return value:</b> a normal return of <see cref="InsertAsync"/>, a <see cref="RecordWriteStatus.Success"/> from
-/// <see cref="UpdateAsync"/> or <see cref="SoftDeleteStatus.Deleted"/> from <see cref="SoftDeleteAsync"/> means the
+/// <b>Return value:</b> a <see cref="RecordWriteStatus.Success"/> from <see cref="InsertAsync"/> or
+/// <see cref="UpdateAsync"/>, or <see cref="SoftDeleteStatus.Deleted"/> from <see cref="SoftDeleteAsync"/>, means the
 /// transaction committed, and the API's <c>RecordService</c> then records <see cref="WriteOutcome.Written"/> for the
 /// request. Every other result means nothing was written: the transaction rolled back, or no data statement was
 /// sent.
+/// </description></item>
+/// <item><description>
+/// <b>Permissions:</b> a write given non-null permissions decides them again inside its transaction, from the store's
+/// own permission read for the tables that transaction resolved, after the locks that order it and before its first
+/// data statement, and answers <see cref="RecordWriteStatus.Forbidden"/> or <see cref="SoftDeleteStatus.Forbidden"/>
+/// with nothing written when they deny it. The caller's earlier <see cref="GetPermissionsAsync"/> result only turns
+/// that check on, so a grant revoked between the two reads is a refusal, never a failed data statement.
 /// </description></item>
 /// <item><description>
 /// <b>Failures</b> carry the <see cref="WriteOutcome"/> the store can prove:
@@ -418,6 +425,14 @@ public interface IDataStore
     /// <remarks>
     /// <list type="number">
     /// <item><description>
+    /// When <paramref name="permissions"/> is not <see langword="null"/>, the record must pass
+    /// <see cref="FormPermissions.CanInsert"/>, INSERT on the base table and every page table; otherwise roll back with
+    /// <see cref="RecordWriteStatus.Forbidden"/> before any data statement. The store decides it from its own
+    /// permission read inside the transaction, for the base and page tables the transaction resolved, once the
+    /// transaction holds the lock that orders inserts of the form, so the decision follows the grants in force inside
+    /// the transaction, not those the caller read earlier.
+    /// </description></item>
+    /// <item><description>
     /// The base row gets a new GUID string as <c>GlobalRecordId</c> and <c>RecStatus</c> 1. <paramref name="stamp"/>
     /// fills <c>FirstSaveLogonName</c>, <c>FirstSaveTime</c>, <c>LastSaveLogonName</c> and <c>LastSaveTime</c>, each
     /// written only when that column exists. The statement returns the new key through
@@ -437,15 +452,23 @@ public interface IDataStore
     /// The validated, normalised values of writable data fields, keyed by canonical name; a field may be absent.
     /// </param>
     /// <param name="stamp">The save stamp of this write.</param>
+    /// <param name="permissions">
+    /// Non-null turns on the insert check: the caller's own earlier <see cref="GetPermissionsAsync"/> result, which
+    /// never decides it, because the store reads the permissions again inside the transaction.
+    /// <see langword="null"/> means no check and no permission statement, which is what callers pass while permission
+    /// awareness is not delivered.
+    /// </param>
     /// <param name="cancellationToken">The request's abort token.</param>
     /// <returns>
-    /// The new record as committed, with its intrinsic position and count. Every failure throws, so a return always
-    /// means the transaction committed.
+    /// <see cref="RecordWriteStatus.Success"/> with the new record as committed, with its intrinsic position and count;
+    /// or <see cref="RecordWriteStatus.Forbidden"/> when the store's own permission read denied the insert and the
+    /// transaction rolled back with nothing written. No other status is returned: every failure throws.
     /// </returns>
-    Task<RecordDto> InsertAsync(
+    Task<RecordWriteResult> InsertAsync(
         FormMetadata form,
         IReadOnlyDictionary<string, FieldValue> values,
         SaveStamp stamp,
+        FormPermissions? permissions,
         CancellationToken cancellationToken);
 
     /// <summary>
@@ -540,7 +563,14 @@ public interface IDataStore
     /// <item><description>
     /// Read the base row's <c>RecStatus</c> and <c>GlobalRecordId</c> <c>WITH (UPDLOCK, ROWLOCK)</c>. A missing row
     /// gives <see cref="SoftDeleteStatus.NotFound"/>; <c>RecStatus</c> 0 gives
-    /// <see cref="SoftDeleteStatus.AlreadyDeleted"/> with nothing written, stamps included.
+    /// <see cref="SoftDeleteStatus.AlreadyDeleted"/> with nothing written, stamps included. Neither reads permissions.
+    /// </description></item>
+    /// <item><description>
+    /// For an active record, when <paramref name="permissions"/> is not <see langword="null"/>, the record must pass
+    /// <see cref="FormPermissions.CanDelete"/>, UPDATE on the base table; otherwise roll back with
+    /// <see cref="SoftDeleteStatus.Forbidden"/> before any data statement. The store decides it from its own
+    /// permission read inside the transaction, after the locked read, for the base table the transaction resolved, so
+    /// the decision follows the grants in force inside the transaction, not those the caller read earlier.
     /// </description></item>
     /// <item><description>
     /// Otherwise call <paramref name="createStamp"/>, update the base row's <c>RecStatus</c> to 0 and its
@@ -549,8 +579,11 @@ public interface IDataStore
     /// </list>
     /// <para>Page rows are never touched and nothing cascades to other forms.</para>
     /// <para>
-    /// For a record the locked read found, the result carries its <c>GlobalRecordId</c> as stored, taken from that
-    /// read, so the caller can name the record as stored after the commit without another database call.
+    /// A <see cref="SoftDeleteStatus.Deleted"/> or <see cref="SoftDeleteStatus.AlreadyDeleted"/> result carries the
+    /// record's <c>GlobalRecordId</c> as stored, taken from the locked read, so the caller can name the record as
+    /// stored once the transaction ends, without another database call. A <see cref="SoftDeleteStatus.Forbidden"/>
+    /// result carries none, although the locked read found the record, and neither does
+    /// <see cref="SoftDeleteStatus.NotFound"/>.
     /// </para>
     /// <para>
     /// An exception thrown by <paramref name="createStamp"/>, and a <see langword="null"/> it returns, rolls back and
@@ -562,9 +595,16 @@ public interface IDataStore
     /// <param name="globalRecordId">The record's base-table <c>GlobalRecordId</c>.</param>
     /// <param name="createStamp">
     /// Creates the save stamp of this soft delete. It is invoked at most once, inside the transaction, after the
-    /// locked read has found an active record, and before the first data statement. It is never invoked when the soft
-    /// delete writes nothing: <see cref="SoftDeleteStatus.NotFound"/> and
-    /// <see cref="SoftDeleteStatus.AlreadyDeleted"/>. An exception from it ends the call with nothing written.
+    /// locked read has found an active record and the permission check has passed, and before the first data
+    /// statement. It is never invoked when the soft delete writes nothing: <see cref="SoftDeleteStatus.NotFound"/>,
+    /// <see cref="SoftDeleteStatus.AlreadyDeleted"/> and <see cref="SoftDeleteStatus.Forbidden"/>. An exception from
+    /// it ends the call with nothing written.
+    /// </param>
+    /// <param name="permissions">
+    /// Non-null turns on the delete check: the caller's own earlier <see cref="GetPermissionsAsync"/> result, which
+    /// never decides it, because the store reads the base table's permissions again inside the transaction.
+    /// <see langword="null"/> means no check and no permission statement, which is what callers pass while permission
+    /// awareness is not delivered.
     /// </param>
     /// <param name="cancellationToken">The request's abort token.</param>
     /// <returns>
@@ -575,6 +615,7 @@ public interface IDataStore
         FormMetadata form,
         string globalRecordId,
         Func<SaveStamp> createStamp,
+        FormPermissions? permissions,
         CancellationToken cancellationToken);
 
     /// <summary>
@@ -596,12 +637,16 @@ public interface IDataStore
 }
 
 /// <summary>
-/// How <see cref="IDataStore.UpdateAsync"/> ended. Only <see cref="Success"/> means the transaction committed; every
-/// other status means it rolled back with nothing written.
+/// How <see cref="IDataStore.InsertAsync"/> or <see cref="IDataStore.UpdateAsync"/> ended. Only
+/// <see cref="Success"/> means the transaction committed; every other status means it rolled back with nothing
+/// written. An insert ends only in <see cref="Success"/> or <see cref="Forbidden"/>.
 /// </summary>
 public enum RecordWriteStatus
 {
-    /// <summary>The update committed; the API answers 200 with the updated record.</summary>
+    /// <summary>
+    /// The write committed; the API answers 201 with the new record for an insert and 200 with the updated record for
+    /// an update.
+    /// </summary>
     Success,
 
     /// <summary>The <c>GlobalRecordId</c> is not in the base table; the API answers 404.</summary>
@@ -619,17 +664,18 @@ public enum RecordWriteStatus
     ValidationFailed,
 
     /// <summary>
-    /// The store's permission read inside the transaction found that the login may not update the base table or a
-    /// page table, or may not insert into the table of a page whose row is missing; the API answers 403. Only a store
+    /// The store's permission read inside the transaction found that the login may not apply the write: for an
+    /// insert, may not insert into the base table or a page table; for an update, may not update the base table or a
+    /// page table, or may not insert into the table of a page whose row is missing. The API answers 403. Only a store
     /// given permissions, under permission awareness, returns it.
     /// </summary>
     Forbidden,
 }
 
 /// <summary>
-/// The result of <see cref="IDataStore.UpdateAsync"/>: its <see cref="Status"/>, the updated record for
-/// <see cref="RecordWriteStatus.Success"/>, and the failed gate result for
-/// <see cref="RecordWriteStatus.ValidationFailed"/>.
+/// The result of <see cref="IDataStore.InsertAsync"/> or <see cref="IDataStore.UpdateAsync"/>: its
+/// <see cref="Status"/>, the written record for <see cref="RecordWriteStatus.Success"/>, and the failed gate result
+/// for <see cref="RecordWriteStatus.ValidationFailed"/>.
 /// </summary>
 /// <remarks>
 /// The factories are the only way to build one, so <see cref="Record"/> is set exactly for
@@ -649,12 +695,12 @@ public sealed class RecordWriteResult
         Validation = validation;
     }
 
-    /// <summary>How the update ended.</summary>
+    /// <summary>How the write ended.</summary>
     public RecordWriteStatus Status { get; }
 
     /// <summary>
-    /// The updated record with its intrinsic position and count, read inside the committed transaction; set only when
-    /// <see cref="Status"/> is <see cref="RecordWriteStatus.Success"/>.
+    /// The new or updated record with its intrinsic position and count, read inside the committed transaction; set
+    /// only when <see cref="Status"/> is <see cref="RecordWriteStatus.Success"/>.
     /// </summary>
     public RecordDto? Record { get; }
 
@@ -664,12 +710,12 @@ public sealed class RecordWriteResult
     /// </summary>
     public RecordValidationResult? Validation { get; }
 
-    /// <summary>Whether the update committed, in which case <see cref="Record"/> is set.</summary>
+    /// <summary>Whether the write committed, in which case <see cref="Record"/> is set.</summary>
     [MemberNotNullWhen(true, nameof(Record))]
     public bool IsSuccess => Status == RecordWriteStatus.Success;
 
-    /// <summary>A committed update.</summary>
-    /// <param name="record">The updated record, as the snapshot read inside the transaction built it.</param>
+    /// <summary>A committed insert or update.</summary>
+    /// <param name="record">The written record, as the snapshot read inside the transaction built it.</param>
     /// <returns>A <see cref="RecordWriteStatus.Success"/> result carrying <paramref name="record"/>.</returns>
     /// <exception cref="ArgumentNullException"><paramref name="record"/> is <see langword="null"/>.</exception>
     public static RecordWriteResult Success(RecordDto record)
@@ -706,7 +752,8 @@ public sealed class RecordWriteResult
     }
 
     /// <summary>
-    /// The login may not update the record's tables or insert a missing page row of it, so nothing was written.
+    /// The login may not insert the record into the form's tables, or may not update the record's tables or insert a
+    /// missing page row of it, so nothing was written.
     /// </summary>
     /// <returns>A <see cref="RecordWriteStatus.Forbidden"/> result.</returns>
     public static RecordWriteResult Forbidden() => ForbiddenResult;
@@ -726,11 +773,18 @@ public enum SoftDeleteStatus
 
     /// <summary>The <c>GlobalRecordId</c> is not in the base table; the API answers 404.</summary>
     NotFound,
+
+    /// <summary>
+    /// The record was active, and the store's permission read inside the transaction found that the login may not
+    /// update the base table, so the transaction rolled back with nothing written, stamps included; the API answers
+    /// 403. Only a store given permissions, under permission awareness, returns it.
+    /// </summary>
+    Forbidden,
 }
 
 /// <summary>
 /// The result of <see cref="IDataStore.SoftDeleteAsync"/>: its <see cref="Status"/> and, for a record the locked read
-/// found, the base row's <c>GlobalRecordId</c> as stored.
+/// found and the soft delete did not refuse, the base row's <c>GlobalRecordId</c> as stored.
 /// </summary>
 /// <remarks>
 /// The id is the spelling the locked read returned, which can differ in letter case from the one the caller passed
@@ -738,12 +792,15 @@ public enum SoftDeleteStatus
 /// an update names it, without another database call. The id is carried exactly as the matched row holds it: the
 /// column admits any non-null text, so an empty or whitespace id is carried too, and only a missing one is refused.
 /// The factories are the only way to build one, so <see cref="GlobalRecordId"/> is set exactly for
-/// <see cref="SoftDeleteStatus.Deleted"/> and <see cref="SoftDeleteStatus.AlreadyDeleted"/>. Instances are immutable
-/// and safe to share across threads.
+/// <see cref="SoftDeleteStatus.Deleted"/> and <see cref="SoftDeleteStatus.AlreadyDeleted"/>, and neither
+/// <see cref="SoftDeleteStatus.NotFound"/> nor <see cref="SoftDeleteStatus.Forbidden"/> carries an id. Instances are
+/// immutable and safe to share across threads.
 /// </remarks>
 public sealed class SoftDeleteResult
 {
     private static readonly SoftDeleteResult NotFoundResult = new(SoftDeleteStatus.NotFound, null);
+
+    private static readonly SoftDeleteResult ForbiddenResult = new(SoftDeleteStatus.Forbidden, null);
 
     private SoftDeleteResult(SoftDeleteStatus status, string? globalRecordId)
     {
@@ -760,9 +817,13 @@ public sealed class SoftDeleteResult
     /// </summary>
     public string? GlobalRecordId { get; }
 
-    /// <summary>Whether the locked read found the record, in which case <see cref="GlobalRecordId"/> is set.</summary>
+    /// <summary>
+    /// Whether the locked read found the record and the soft delete either committed or found it already deleted, in
+    /// which case <see cref="GlobalRecordId"/> is set. A <see cref="SoftDeleteStatus.Forbidden"/> result is not found:
+    /// it carries no id.
+    /// </summary>
     [MemberNotNullWhen(true, nameof(GlobalRecordId))]
-    public bool IsFound => Status != SoftDeleteStatus.NotFound;
+    public bool IsFound => Status is SoftDeleteStatus.Deleted or SoftDeleteStatus.AlreadyDeleted;
 
     /// <summary>A committed soft delete of an active record.</summary>
     /// <param name="globalRecordId">
@@ -787,6 +848,10 @@ public sealed class SoftDeleteResult
     /// <summary>The record is not in the base table.</summary>
     /// <returns>A <see cref="SoftDeleteStatus.NotFound"/> result, which carries no id.</returns>
     public static SoftDeleteResult NotFound() => NotFoundResult;
+
+    /// <summary>The login may not update the record's base table, so nothing was written, stamps included.</summary>
+    /// <returns>A <see cref="SoftDeleteStatus.Forbidden"/> result, which carries no id.</returns>
+    public static SoftDeleteResult Forbidden() => ForbiddenResult;
 
     // A found record always has a stored id, since the column is NOT NULL. Any other value is the matched row's own and
     // is kept as it is: refusing an empty or whitespace id would turn an already-deleted 204 into a failure, or fail a

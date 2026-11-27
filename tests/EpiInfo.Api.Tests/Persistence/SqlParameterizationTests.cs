@@ -326,11 +326,11 @@ public sealed partial class SqlParameterizationTests : IAsyncLifetime
 /// classes. A builder statement names a table or column of either seeded form, bracketed, double-quoted or bare,
 /// compared ignoring case; any other command is a fixed statement of the store. The two classes are told apart
 /// because AAP 0.7.6 compares only the dynamic identifiers with the reader and leaves fixed names and aliases
-/// uncompared, and because the store also sends fixed text inside a write: an update reads the permissions again in
-/// its transaction through <c>SqlPermissionReader</c>, whose statement binds every table name as a parameter value
-/// and so names no table or column at all; and an insert and an update first take the form's write lock through
-/// <c>sys.sp_getapplock</c>, whose statement binds every value, the lock resource holding the base table's name
-/// included, as a parameter, and so names none either.
+/// uncompared, and because the store also sends fixed text inside a write: an insert, an update and a soft delete
+/// each read the permissions again in their transaction through <c>SqlPermissionReader</c>, whose statement binds
+/// every table name as a parameter value and so names no table or column at all; and an insert and an update first
+/// take the form's write lock through <c>sys.sp_getapplock</c>, whose statement binds every value, the lock resource
+/// holding the base table's name included, as a parameter, and so names none either.
 /// </para>
 /// <para>
 /// A builder statement is held to the closed grammar of <c>RecordSqlBuilder</c>'s fixed text, position by position,
@@ -443,7 +443,7 @@ public sealed class RecordCommandIdentifierProvenanceTests : IAsyncLifetime
         StringComparer.OrdinalIgnoreCase);
 
     // The T-SQL built-in functions of the fixed statements the store sends inside a record write, compared ignoring
-    // case: HAS_PERMS_BY_NAME, of SqlPermissionReader's permission read, which an update sends in its transaction.
+    // case: HAS_PERMS_BY_NAME, of SqlPermissionReader's permission read, which each write sends in its transaction.
     private static readonly HashSet<string> FixedStatementBuiltIns = new(
         ["HAS_PERMS_BY_NAME"],
         StringComparer.OrdinalIgnoreCase);

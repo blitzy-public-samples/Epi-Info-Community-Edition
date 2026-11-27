@@ -5,11 +5,18 @@
 // generateFresh() that `npm run api:generate` uses, then compared with the committed pair byte for byte, line endings
 // aside. Requires the .NET SDK 10.0.1xx (already a build prerequisite, see the root README.md) and `npm ci` in web/.
 // No database is needed and no connection string is read or printed. Nothing in the checkout is written apart from
-// git-ignored build output, and the temporary directory is removed on every path, an interruption by SIGINT, SIGTERM
-// or SIGHUP included: an interrupted check stops every process it started, with their descendants, before it removes
-// the directory, then reports the interruption rather than staleness and ends by that signal (see the Interruption
-// section and currentInterruption in api-generate.mjs). Only a SIGKILL of the check's own node process, which no
-// process can catch, leaves the directory behind, and only a descendant that leaves its process group escapes the stop.
+// git-ignored build output. A committed file is compared only as a regular file whose directories all belong to this
+// checkout: a link in its place or among its directories fails the check (see assertInsideCheckout in
+// api-generate.mjs).
+//
+// Removing the temporary directory and releasing the generation lock are attempted on the normal path and after an
+// interruption by SIGINT, SIGTERM or SIGHUP: an interrupted check stops every process it started, with their
+// descendants, before it removes the directory, then reports the interruption rather than staleness and ends by that
+// signal (see the Interruption section and currentInterruption in api-generate.mjs). A removal or release that fails
+// is reported on stderr on either path, and fails the check even with a current pair. A lock kept because the dotnet
+// process it records has not ended is reported too, and the next run removes it once that process has ended. A
+// SIGKILL of the check's own node process, which no process can catch, skips that cleanup, and a descendant that
+// leaves its process group escapes the stop.
 //
 // Remedy for a stale pair: npm run api:generate, then commit both files.
 //
@@ -25,6 +32,8 @@ import { URL, fileURLToPath } from 'node:url';
 
 import {
   COMMITTED,
+  CheckoutPathError,
+  assertInsideCheckout,
   currentInterruption,
   formatUsage,
   generateFresh,
@@ -34,12 +43,19 @@ import {
 
 const STALE_MESSAGE = 'OpenAPI document or generated client is stale; run npm run api:generate';
 
-// Opening an artifact never waits and never acquires a terminal: O_NONBLOCK makes the open of a FIFO return at once
-// instead of waiting for a writer, and O_NOCTTY keeps a terminal device from becoming the controlling terminal.
-// Windows defines neither flag and has neither kind of file. Neither changes how a regular file reads.
-const openFlags = fs.constants.O_RDONLY | (fs.constants.O_NONBLOCK ?? 0) | (fs.constants.O_NOCTTY ?? 0);
+// Opening an artifact never waits, never acquires a terminal and never follows a symbolic link: O_NONBLOCK makes the
+// open of a FIFO return at once instead of waiting for a writer, O_NOCTTY keeps a terminal device from becoming the
+// controlling terminal, and O_NOFOLLOW makes the open of a link fail instead of reaching what it points to. Windows
+// defines none of the three and has neither FIFOs nor terminal devices; there the path is examined after the open
+// instead (see readRegularFile). None of them changes how a regular file reads.
+const openFlags =
+  fs.constants.O_RDONLY |
+  (fs.constants.O_NONBLOCK ?? 0) |
+  (fs.constants.O_NOCTTY ?? 0) |
+  (fs.constants.O_NOFOLLOW ?? 0);
 
-// Outcomes of comparing a committed file with its fresh counterpart. NOT_REGULAR_FILE is stale as well.
+// Outcomes of comparing a committed file with its fresh counterpart. readRegularFile returns NOT_REGULAR_FILE for a
+// path that is not a regular file, which makes a committed file stale.
 const CURRENT = 'current';
 const STALE = 'stale';
 const NOT_REGULAR_FILE = Symbol('not a regular file');
@@ -86,9 +102,9 @@ async function checkFreshness() {
     return 1;
   }
   if (stale.length > 0) {
-    for (const { file, notRegularFile } of stale) {
-      if (notRegularFile) {
-        process.stderr.write(`OpenAPI freshness check: ${toRepoRelative(file)} is not a regular file\n`);
+    for (const { file, problem } of stale) {
+      if (problem !== null) {
+        process.stderr.write(`OpenAPI freshness check: ${problem}\n`);
       }
       process.stderr.write(`stale: ${toRepoRelative(file)}\n`);
     }
@@ -114,8 +130,9 @@ function reportInterrupted() {
 }
 
 /**
- * Returns the committed files that differ from, are missing beside, or are not regular files in place of their fresh
- * counterparts, each as { file, notRegularFile }. Both are checked.
+ * Returns the committed files that differ from, are missing beside, or are not regular files of this checkout in place
+ * of their fresh counterparts, each as { file, problem }, where problem is null for a file that differs or is missing,
+ * and otherwise the sentence that says why the file was not compared. Both are checked.
  */
 async function findStale(fresh) {
   const pairs = [
@@ -125,9 +142,9 @@ async function findStale(fresh) {
   const stale = [];
   for (const pair of pairs) {
     const generated = await readGenerated(pair.generated);
-    const outcome = await compareCommitted(pair.committed, generated);
+    const { outcome, problem } = await compareCommitted(pair.committed, generated);
     if (outcome !== CURRENT) {
-      stale.push({ file: pair.committed, notRegularFile: outcome === NOT_REGULAR_FILE });
+      stale.push({ file: pair.committed, problem });
     }
   }
   return stale;
@@ -149,17 +166,21 @@ async function readGenerated(file) {
 }
 
 /**
- * Compares the committed file with the fresh normalised text and returns CURRENT, STALE (different or missing) or
- * NOT_REGULAR_FILE. Normalising removes one byte per CRLF, and each CRLF becomes one of the fresh text's n line feeds,
- * so a committed file that matches its L characters holds between L and L + n bytes. A file outside that range is
- * stale without being read. One inside it is read up to one byte past the range, so a file that grew since its size
- * was taken is still too long to match.
+ * Compares the committed file with the fresh normalised text and returns { outcome, problem }: outcome is CURRENT, or
+ * STALE for a file that differs, is missing or is not compared, and problem is null, or for a file not compared, the
+ * sentence that says why. The file is compared only as a regular file whose directories all belong to this checkout
+ * (see assertInsideCheckout in api-generate.mjs); a missing directory is a missing file. Normalising removes one byte
+ * per CRLF, and each CRLF becomes one of the fresh text's n line feeds, so a committed file that matches its L
+ * characters holds between L and L + n bytes. A file outside that range is stale without being read. One inside it is
+ * read up to one byte past the range, so a file that grew since its size was taken is still too long to match.
  */
 async function compareCommitted(file, generated) {
   const minimum = generated.length;
   const maximum = minimum + countLineFeeds(generated);
+  let outcome;
   try {
-    return await readRegularFile(file, async (handle, size) => {
+    await assertInsideCheckout(file);
+    outcome = await readRegularFile(file, async (handle, size) => {
       if (size < minimum || size > maximum) {
         return STALE;
       }
@@ -168,23 +189,32 @@ async function compareCommitted(file, generated) {
     });
   } catch (error) {
     if (error.code === 'ENOENT') {
-      return STALE;
+      return { outcome: STALE, problem: null };
+    }
+    if (error instanceof CheckoutPathError) {
+      return { outcome: STALE, problem: error.message };
     }
     throw new Error(`could not read ${toRepoRelative(file)} (${errorMessage(error)})`, { cause: error });
   }
+  if (outcome === NOT_REGULAR_FILE) {
+    return { outcome: STALE, problem: `${toRepoRelative(file)} is not a regular file` };
+  }
+  return { outcome, problem: null };
 }
 
 /**
  * Opens the file and returns read(handle, size) when it is a regular file, or NOT_REGULAR_FILE, without reading, when
- * it is anything else. The handle is always closed. A failed open, a missing file included, is thrown.
+ * it is anything else, a symbolic link included, whatever it points to. The handle is always closed. A failed open, a
+ * missing file included, is thrown.
  */
 async function readRegularFile(file, read) {
   let handle;
   try {
     handle = await fs.open(file, openFlags);
   } catch (error) {
-    // Some kinds of file refuse the open itself (a socket fails with ENXIO, and so can a device without a driver), so
-    // an existing path that is not a regular file is reported as such whether or not it opens.
+    // Some kinds of file refuse the open itself (a socket fails with ENXIO, as can a device without a driver, and a
+    // symbolic link fails with ELOOP, or EMLINK on some BSDs), so an existing path that is not a regular file is
+    // reported as such whether or not it opens.
     if (error.code !== 'ENOENT' && (await isOtherThanRegularFile(file))) {
       return NOT_REGULAR_FILE;
     }
@@ -192,16 +222,32 @@ async function readRegularFile(file, read) {
   }
   try {
     const stats = await handle.stat();
-    return stats.isFile() ? await read(handle, stats.size) : NOT_REGULAR_FILE;
+    if (!stats.isFile() || !(await isOpenedPath(file, stats))) {
+      return NOT_REGULAR_FILE;
+    }
+    return await read(handle, stats.size);
   } finally {
     await handle.close();
   }
 }
 
-/** Whether the path exists as something other than a regular file. */
+/**
+ * Whether the path itself is the regular file that was opened. Where O_NOFOLLOW is defined, the open has already
+ * refused a symbolic link in the path's place. Where it is not (Windows), the open may have followed one, so the path
+ * must be, without following links, a regular file with the opened file's device and inode.
+ */
+async function isOpenedPath(file, opened) {
+  if (fs.constants.O_NOFOLLOW !== undefined) {
+    return true;
+  }
+  const stats = await fs.lstat(file);
+  return stats.isFile() && stats.dev === opened.dev && stats.ino === opened.ino;
+}
+
+/** Whether the path exists as something other than a regular file, a symbolic link included. */
 async function isOtherThanRegularFile(file) {
   try {
-    return !(await fs.stat(file)).isFile();
+    return !(await fs.lstat(file)).isFile();
   } catch {
     return false;
   }
@@ -260,7 +306,9 @@ const usage = () =>
       ['0', 'both committed files are current'],
       ['1', 'a committed file is stale, or the check could not generate or compare the pair'],
     ],
-    interrupted: 'the temporary directory is removed and nothing is reported as stale',
+    interrupted:
+      'removing the temporary directory and releasing the lock are attempted, a failure is reported, and nothing ' +
+      'is reported as stale',
   });
 
 // The arguments are read before anything else, so --help and a refused argument check nothing.

@@ -22,9 +22,11 @@ namespace EpiInfo.Api.Errors;
 /// <para>
 /// Redaction: every <c>detail</c> is one of the fixed texts below, except that a 500's is
 /// <see cref="UnexpectedDetail"/> followed by the request's trace id (<see cref="UnexpectedDetailFor"/>), the same
-/// value the body's <c>traceId</c> member carries. Every <c>errors</c> message is a fixed Domain text from
-/// <c>ValidationMessages</c>, <c>SearchCriteriaParser</c> or <c>RecordQueryRules</c>. Nothing here formats a submitted
-/// value, a query-string value, SQL text, a connection string, or an exception's message or type into a body.
+/// value the body's <c>traceId</c> member carries. Every <c>errors</c> message is a fixed text: a Domain text from
+/// <c>ValidationMessages</c>, <c>SearchCriteriaParser</c> or <c>RecordQueryRules</c>, or an API text from
+/// <c>RequestParameters</c>, <c>ValuesReader</c>, <c>FieldEventService</c> or the search body check
+/// <c>SearchRequestShape</c>. Nothing here formats a submitted value, a query-string value, SQL text, a connection
+/// string, or an exception's message or type into a body.
 /// </para>
 /// <para>
 /// Endpoints and services return the <see cref="IResult"/> factories; middleware and the exception handler write
@@ -50,7 +52,9 @@ public static class ApiProblems
     /// The <c>detail</c> of the request-level 400 for a body whose content is not one valid JSON value, such as
     /// truncated or unterminated content, a bare word, or content after the value, or that holds a name or string
     /// that cannot be decoded. A valid JSON value that is not an object gets
-    /// <see cref="RequestBodyMustBeObjectDetail"/> instead.
+    /// <see cref="RequestBodyMustBeObjectDetail"/> instead, an object that names a member more than once
+    /// <see cref="RequestBodyRepeatsMemberDetail"/>, and a well-formed search body whose member has the wrong JSON
+    /// kind the field-level 400 that names the member.
     /// </summary>
     public const string MalformedJsonDetail = "malformed JSON";
 
@@ -63,6 +67,15 @@ public static class ApiProblems
     /// has been parsed.
     /// </summary>
     public const string RequestBodyMustBeObjectDetail = "request body must be a JSON object";
+
+    /// <summary>
+    /// The <c>detail</c> of the request-level 400 for a body object, or a search criterion object, that names a
+    /// member more than once, exactly or differing only by letter case, since binding matches member names ignoring
+    /// case. The body reader <c>JsonRequestBody</c> judges the body object, and the search body check the criterion
+    /// objects. Names inside a <c>values</c> object are field names: a repeated one is the field-level 400 of
+    /// <see cref="ValidationMessages.DuplicateField"/> instead.
+    /// </summary>
+    public const string RequestBodyRepeatsMemberDetail = "request body names a member more than once";
 
     /// <summary>The <c>detail</c> of the request-level 400 for a missing, <c>null</c> or non-object <c>values</c>.</summary>
     public const string ValuesMustBeObjectDetail = ValidationMessages.ValuesMustBeObject;
@@ -347,6 +360,9 @@ public static class ApiProblems
 
     /// <summary>The request-level 400 <see cref="RequestBodyMustBeObjectDetail"/>.</summary>
     public static IResult RequestBodyMustBeObject() => RequestLevel(RequestBodyMustBeObjectDetail);
+
+    /// <summary>The request-level 400 <see cref="RequestBodyRepeatsMemberDetail"/>.</summary>
+    public static IResult RequestBodyRepeatsMember() => RequestLevel(RequestBodyRepeatsMemberDetail);
 
     /// <summary>The request-level 400 <see cref="ValuesMustBeObjectDetail"/>.</summary>
     public static IResult ValuesMustBeObject() => RequestLevel(ValuesMustBeObjectDetail);

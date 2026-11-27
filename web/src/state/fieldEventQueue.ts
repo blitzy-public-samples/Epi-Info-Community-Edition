@@ -13,9 +13,11 @@
  *   included, as the record's POST sends it; any other value the server's field-event check
  *   would reject, such as text in a number field, is sent as `null`, so it cannot fail this
  *   event and every later one. Save still validates the value as the draft holds it.
- * - A response is applied by applyFieldEvent, which owns every effect rule; the queue only
- *   checks that the answer has the response's shape and tells applyFieldEvent which fields
- *   the user edited after s(E), whose edits win.
+ * - The client's raiseFieldEvent checks that an OK answer is the whole response before it
+ *   reports one, and settles any other as a failure of its OK status, which the queue
+ *   reports as an answer that cannot be read. The queue sequences events and reports
+ *   failures; applyFieldEvent applies a response and owns every effect rule, told which
+ *   fields the user edited after s(E), whose edits win.
  * - A record change calls reset(): pending events are dropped, the in-flight request is
  *   cancelled, and a response that arrives for an older record generation is ignored.
  *   Sequence numbers and generations stay local and are never sent.
@@ -32,11 +34,10 @@
  *
  * The queue raises no event on its own, so loading or replacing a record raises none.
  */
-import { isExactDecimal, isFieldValue, type ApiClient, type ApiResult } from '../api/client';
+import { isExactDecimal, isWireDate, type ApiClient, type ApiResult } from '../api/client';
 import { describeError, errorMessages, isAbortError, networkError, type ApiError } from '../api/errors';
 import type {
   Diagnostic,
-  DiagnosticSeverity,
   DialogMessage,
   FieldDefinition,
   FieldEventKind,
@@ -53,8 +54,11 @@ import { isDataField } from '../validation/clientValidation';
 /**
  * How long a field-event request may stay unanswered before the queue cancels it. The
  * wait is bounded so that a request that never answers cannot hold drain(), and with it
- * Save and leaving the record. It equals the API's default `Database:CommandTimeoutSeconds`
- * (30 s), so the client does not give up before the server's own bound on a command.
+ * Save and leaving the record; a cancelled event counts as failed and is never resent. It
+ * equals the API's default `Database:CommandTimeoutSeconds` (30 s), but equal values do not
+ * decide which ends first: that timeout bounds each database command, not the request,
+ * which may run several, and this timer starts before the request is sent. An answer the
+ * server sends after the deadline, its own failure included, is ignored.
  */
 export const FIELD_EVENT_DEADLINE_MS = 30_000;
 
@@ -153,102 +157,10 @@ const NO_TIMELY_ANSWER = 'The server did not answer in time.';
 const UNREADABLE_ANSWER = "The server's answer could not be read.";
 const EFFECTS_NOT_APPLIED = 'Its effects could not be applied.';
 
-// The answer of an OK request
-//
-// The client types the body from the OpenAPI document but does not check it at run time,
-// so it is read here as `unknown`. The document requires all six members and none of them
-// is nullable, so a member that is missing, null or of another type makes the whole answer
-// unreadable, and none of its effects is applied.
-
-function isObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
-function isString(value: unknown): value is string {
-  return typeof value === 'string';
-}
-
-function isDialog(value: unknown): value is DialogMessage {
-  return isObject(value) && isString(value.message) && (value.title === null || isString(value.title));
-}
-
-const SEVERITIES: readonly DiagnosticSeverity[] = ['info', 'warning', 'error'];
-
-/** A diagnostic's line: 1-based in the form's program text. */
-function isLine(value: unknown): value is number {
-  return typeof value === 'number' && Number.isInteger(value) && value >= 1;
-}
-
-function isDiagnostic(value: unknown): value is Diagnostic {
-  return (
-    isObject(value) &&
-    SEVERITIES.some((severity) => severity === value.severity) &&
-    isString(value.form) &&
-    isLine(value.line) &&
-    isString(value.command) &&
-    isString(value.message)
-  );
-}
-
-/** A list member as a fresh array, or null when it is missing, null or not an array of `isEntry` entries. */
-function readList<T>(value: unknown, isEntry: (entry: unknown) => entry is T): T[] | null {
-  if (!Array.isArray(value)) {
-    return null;
-  }
-  const list: readonly unknown[] = value;
-  const entries: T[] = [];
-  for (const entry of list) {
-    if (!isEntry(entry)) {
-      return null;
-    }
-    entries.push(entry);
-  }
-  return entries;
-}
-
-/**
- * `assigned` as own entries in the server's order, or null when it is missing, null or not a
- * map of field values. An entry is checked by the client's own field-value check, so a value
- * the client decoded exactly, such as the bigint of 9007199254740993, is an assignment like
- * any other.
- */
-function readAssigned(value: unknown): Values | null {
-  if (!isObject(value)) {
-    return null;
-  }
-  const entries: [string, FieldValue][] = [];
-  for (const [name, entry] of Object.entries(value)) {
-    if (!isFieldValue(entry)) {
-      return null;
-    }
-    entries.push([name, entry]);
-  }
-  // Object.fromEntries defines own properties, so no field name can reach the prototype.
-  return Object.fromEntries(entries);
-}
-
-/** The answer as a response, or null when it lacks any of the six members or one does not have its shape. */
-function readResponse(body: unknown): FieldEventResponse | null {
-  if (!isObject(body)) {
-    return null;
-  }
-  const enabled = readList(body.enabled, isString);
-  const disabled = readList(body.disabled, isString);
-  const cleared = readList(body.cleared, isString);
-  const assigned = readAssigned(body.assigned);
-  const dialogs = readList(body.dialogs, isDialog);
-  const diagnostics = readList(body.diagnostics, isDiagnostic);
-  if (
-    enabled === null ||
-    disabled === null ||
-    cleared === null ||
-    assigned === null ||
-    dialogs === null ||
-    diagnostics === null
-  ) {
-    return null;
-  }
-  return { enabled, disabled, cleared, assigned, dialogs, diagnostics };
+// An OK status on a failure: the client settles an OK answer whose body is not JSON, or is
+// not the whole field-event response, as a failure of that status (raiseFieldEvent).
+function isUnreadableAnswer(error: ApiError): boolean {
+  return error.status !== null && error.status >= 200 && error.status <= 299;
 }
 
 // Settles when `signal` aborts, so the deadline and a reset end the wait even when the
@@ -298,35 +210,13 @@ function dataFields(definition: FormDefinition): FieldDefinition[] {
 // FieldValueCoercion.Coerce) and nothing more: it applies no storage range, option count,
 // length, mask or legal-value rule to an event, so neither do they.
 
-// Exactly YYYY-MM-DD with ASCII digits; without the m flag, `$` matches only at the end of the text.
-const EVENT_DATE = /^(\d{4})-(\d{2})-(\d{2})$/;
-
 // The largest option index the server reads: int.MaxValue.
 const MAX_OPTION_INDEX = 2_147_483_647;
 
-// A calendar date of years 0001-9999, as the server's exact yyyy-MM-dd DateOnly parse reads
-// one: integer arithmetic only, since Date.parse and new Date(y, …) shift years 0-99 and roll
-// overflowing days into the next month.
-function isEventDate(text: string): boolean {
-  const match = EVENT_DATE.exec(text);
-  if (match === null) {
-    return false;
-  }
-  const year = Number(match[1]);
-  const month = Number(match[2]);
-  const day = Number(match[3]);
-  if (year < 1 || month < 1 || month > 12 || day < 1) {
-    return false;
-  }
-  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
-  const daysInMonth = month === 2 ? (leapYear ? 29 : 28) : [4, 6, 9, 11].includes(month) ? 30 : 31;
-  return day <= daysInMonth;
-}
-
 // Whether a value that is not null has the wire shape the server's field-event check gives
 // its field type: a string for text; a finite number for a number, which the client may hold
-// as a bigint or an ExactDecimal; a YYYY-MM-DD calendar date for a date; a boolean for a
-// checkbox; and a whole number from 0 to MAX_OPTION_INDEX for an option.
+// as a bigint or an ExactDecimal; a wire date (isWireDate) for a date, with no storage range;
+// a boolean for a checkbox; and a whole number from 0 to MAX_OPTION_INDEX for an option.
 function hasEventShape(fieldType: FieldType, value: Exclude<FieldValue, null>): boolean {
   switch (fieldType) {
     case 'text':
@@ -340,7 +230,7 @@ function hasEventShape(fieldType: FieldType, value: Exclude<FieldValue, null>): 
         (isExactDecimal(value) && Number.isFinite(Number(value.literal)))
       );
     case 'date':
-      return typeof value === 'string' && isEventDate(value);
+      return isWireDate(value);
     case 'checkbox':
       return typeof value === 'boolean';
     case 'option':
@@ -573,15 +463,10 @@ export function createFieldEventQueue(options: FieldEventQueueOptions): FieldEve
       }
       const { result } = delivery;
       if (!result.ok) {
-        notify(event, failureReason(result.error));
+        notify(event, isUnreadableAnswer(result.error) ? UNREADABLE_ANSWER : failureReason(result.error));
         return;
       }
-      const response = readResponse(result.data);
-      if (response === null) {
-        notify(event, UNREADABLE_ANSWER);
-        return;
-      }
-      apply(event, response);
+      apply(event, result.data);
       clearFailure(event);
     } catch {
       notify(event, EFFECTS_NOT_APPLIED);

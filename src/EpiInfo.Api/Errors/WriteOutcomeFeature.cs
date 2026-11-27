@@ -21,15 +21,16 @@ namespace EpiInfo.Api.Errors;
 /// </description></item>
 /// <item><description>
 /// The store reads the response snapshot and builds the response DTO inside the transaction, before it commits, so
-/// a projection failure rolls the save back. The store call returning successfully is the store reporting the
-/// commit. Call <see cref="MarkWritten"/> as soon as that call returns, before any post-commit step: the post-commit
-/// log line, serialisation and delivery of the DTO already built.
+/// a projection failure rolls the save back. A <c>Success</c> from <c>InsertAsync</c> or <c>UpdateAsync</c>, or
+/// <c>Deleted</c> from <c>SoftDeleteAsync</c>, is the store reporting the commit. Call <see cref="MarkWritten"/> as
+/// soon as that call returns, before any post-commit step: the post-commit log line, serialisation and delivery of
+/// the DTO already built.
 /// </description></item>
 /// <item><description>
-/// Call <see cref="MarkNotWritten"/> as soon as <c>UpdateAsync</c> returns any defined status other than
-/// <c>Success</c>, or <c>SoftDeleteAsync</c> returns <c>NotFound</c> or <c>AlreadyDeleted</c>: the store reports
-/// that it wrote nothing, so a failure while that response is written is <c>notWritten</c>, not <c>unknown</c>,
-/// whatever outcome a later store exception reports.
+/// Call <see cref="MarkNotWritten"/> as soon as <c>InsertAsync</c> returns <c>Forbidden</c>, <c>UpdateAsync</c>
+/// returns any defined status other than <c>Success</c>, or <c>SoftDeleteAsync</c> returns <c>NotFound</c>,
+/// <c>AlreadyDeleted</c> or <c>Forbidden</c>: the store reports that it wrote nothing, so a failure while that
+/// response is written is <c>notWritten</c>, not <c>unknown</c>, whatever outcome a later store exception reports.
 /// </description></item>
 /// <item><description>
 /// A <c>DELETE</c> of an already-deleted record wrote nothing, so it is marked not written, never written.

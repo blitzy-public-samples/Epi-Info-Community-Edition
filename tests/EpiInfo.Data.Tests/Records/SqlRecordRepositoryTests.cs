@@ -261,7 +261,7 @@ public sealed class SqlRecordRepositoryTests : IAsyncLifetime
         var stamp = new SaveStamp(Environment.UserName, SaveStamp.TruncateToSeconds(DateTime.Now));
         DataStoreUnavailableException failure = insert
             ? await Assert.ThrowsAsync<DataStoreUnavailableException>(() =>
-                repository.InsertAsync(form.Metadata, values, stamp, cancellationToken))
+                repository.InsertAsync(form.Metadata, values, stamp, permissions: null, cancellationToken))
             : await Assert.ThrowsAsync<DataStoreUnavailableException>(() =>
                 repository.UpdateAsync(
                     form.Metadata,

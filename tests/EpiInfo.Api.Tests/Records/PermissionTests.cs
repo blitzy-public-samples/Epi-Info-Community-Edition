@@ -29,8 +29,8 @@ namespace EpiInfo.Api.Tests.Records;
 /// Every request therefore travels the production pipeline, its error handling, guards, routing, JSON binding, the
 /// endpoint handler, the service and result execution, and every assertion reads the status, headers and body the
 /// client receives. A real denied database principal is not created, because the database's logins and users stay
-/// unchanged; <see cref="MissingPagePermissionSqlTests"/> proves on the database where the SQL Server store reads the
-/// permissions it re-checks inside an update.
+/// unchanged; <see cref="WritePermissionSqlTests"/> proves on the database where the SQL Server store reads the
+/// permissions it re-checks inside an insert, an update and a soft delete.
 /// </remarks>
 public sealed class PermissionTests
 {
@@ -416,7 +416,7 @@ public sealed class PermissionTests
         }
     }
 
-    /// <summary>The permissions the store holds for the form when an update given permissions runs.</summary>
+    /// <summary>The permissions the store holds for the form when a write given permissions runs.</summary>
     public enum StoreGrants
     {
         /// <summary>INSERT and UPDATE on every table.</summary>
@@ -425,27 +425,69 @@ public sealed class PermissionTests
         /// <summary>No permissions at all.</summary>
         None,
 
-        /// <summary>Every grant but UPDATE on the first page's table, whose row the record holds.</summary>
-        PresentPageUpdateRevoked,
+        /// <summary>Every grant but INSERT on the base table.</summary>
+        BaseInsertRevoked,
 
-        /// <summary>Every grant but INSERT on the second page's table, whose row the record lacks.</summary>
-        MissingPageInsertRevoked,
+        /// <summary>Every grant but UPDATE on the base table.</summary>
+        BaseUpdateRevoked,
+
+        /// <summary>Every grant but UPDATE on the first page's table, whose row the targeted record holds.</summary>
+        FirstPageUpdateRevoked,
+
+        /// <summary>Every grant but INSERT on the second page's table, whose row the targeted record lacks.</summary>
+        SecondPageInsertRevoked,
     }
 
-    // The store decides an update given permissions from the permissions it holds when the update runs, never from the
-    // caller's argument, which only turns the check on, as the SQL Server store reads them again inside its
-    // transaction: on a record lacking its second-page row, an argument granting nothing still saves when the store
-    // grants everything, and an argument granting everything is refused, with nothing written, when the store holds no
-    // permissions or revokes a page's UPDATE or the missing page's INSERT.
+    /// <summary>
+    /// A write handed to the store itself, the permissions the store holds when it runs, whether the caller's argument
+    /// grants everything rather than nothing, and whether the write commits. Each write follows its own rule: an
+    /// insert needs INSERT on every table; an update of a record lacking its second-page row needs UPDATE on every
+    /// table and INSERT on the second page's; a soft delete needs UPDATE on the base table alone.
+    /// </summary>
+    public static TheoryData<Write, StoreGrants, bool, bool> StoreDecisionCases => new()
+    {
+        // The store's own grants decide, against an argument granting nothing and against one granting everything.
+        { Write.Post, StoreGrants.Every, false, true },
+        { Write.Post, StoreGrants.None, true, false },
+        { Write.Post, StoreGrants.BaseInsertRevoked, true, false },
+        { Write.Post, StoreGrants.SecondPageInsertRevoked, true, false },
+
+        // An insert needs no UPDATE.
+        { Write.Post, StoreGrants.BaseUpdateRevoked, true, true },
+        { Write.Post, StoreGrants.FirstPageUpdateRevoked, true, true },
+
+        { Write.Put, StoreGrants.Every, false, true },
+        { Write.Put, StoreGrants.None, true, false },
+        { Write.Put, StoreGrants.BaseUpdateRevoked, true, false },
+        { Write.Put, StoreGrants.FirstPageUpdateRevoked, true, false },
+        { Write.Put, StoreGrants.SecondPageInsertRevoked, true, false },
+
+        // An update needs INSERT only on the table of a page whose row is missing.
+        { Write.Put, StoreGrants.BaseInsertRevoked, true, true },
+
+        { Write.Delete, StoreGrants.Every, false, true },
+        { Write.Delete, StoreGrants.None, true, false },
+        { Write.Delete, StoreGrants.BaseUpdateRevoked, true, false },
+
+        // A soft delete needs UPDATE on the base table alone.
+        { Write.Delete, StoreGrants.BaseInsertRevoked, true, true },
+        { Write.Delete, StoreGrants.FirstPageUpdateRevoked, true, true },
+        { Write.Delete, StoreGrants.SecondPageInsertRevoked, true, true },
+    };
+
+    // The store decides each write given permissions from the permissions it holds when the write runs, never from the
+    // caller's argument, which only turns the check on, as the SQL Server store reads them again inside each write's
+    // transaction. An argument granting nothing still commits when the store's grants allow the write, and one granting
+    // everything is refused, with no write logged, no stamp asked for, no record added and the targeted record
+    // unchanged, when the store holds no permissions or lacks one the write needs. The update and the soft delete
+    // target a record lacking its second-page row.
     [Theory]
-    [InlineData(StoreGrants.Every, false, true)]
-    [InlineData(StoreGrants.None, true, false)]
-    [InlineData(StoreGrants.PresentPageUpdateRevoked, true, false)]
-    [InlineData(StoreGrants.MissingPageInsertRevoked, true, false)]
-    public async Task TheStoreDecidesAnUpdateFromThePermissionsItHoldsWhenItRuns(
+    [MemberData(nameof(StoreDecisionCases))]
+    public async Task TheStoreDecidesEachWriteFromThePermissionsItHoldsWhenItRuns(
+        Write write,
         StoreGrants held,
         bool argumentGrantsEverything,
-        bool saves)
+        bool commits)
     {
         await using var harness = await Harness.StartAsync();
         var lacking = harness.SeedRecord(harness.SecondPage);
@@ -453,39 +495,162 @@ public sealed class PermissionTests
         {
             StoreGrants.Every => harness.AllGranted,
             StoreGrants.None => null,
-            StoreGrants.PresentPageUpdateRevoked => harness.Permissions(Grant.Both, Grant.InsertOnly, Grant.Both),
-            StoreGrants.MissingPageInsertRevoked => harness.Permissions(Grant.Both, Grant.Both, Grant.UpdateOnly),
+            StoreGrants.BaseInsertRevoked => harness.Permissions(Grant.UpdateOnly, Grant.Both, Grant.Both),
+            StoreGrants.BaseUpdateRevoked => harness.Permissions(Grant.InsertOnly, Grant.Both, Grant.Both),
+            StoreGrants.FirstPageUpdateRevoked => harness.Permissions(Grant.Both, Grant.InsertOnly, Grant.Both),
+            StoreGrants.SecondPageInsertRevoked => harness.Permissions(Grant.Both, Grant.Both, Grant.UpdateOnly),
             _ => throw new ArgumentOutOfRangeException(nameof(held)),
         });
         var argument = argumentGrantsEverything ? harness.AllGranted : new FormPermissions([]);
         var stamp = new SaveStamp("tester", new DateTime(2024, 1, 2, 3, 4, 5, DateTimeKind.Local));
+        var stampCalls = 0;
+        SaveStamp CountedStamp()
+        {
+            stampCalls++;
+            return stamp;
+        }
+
+        var values = new Dictionary<string, FieldValue> { [FirstPageField] = FieldValue.FromText("Applied") };
         var before = harness.Snapshot(lacking);
+        var recordsBefore = harness.RecordCount;
         var callsBefore = harness.Store.Calls.Count;
 
-        var result = await harness.Store.UpdateAsync(
-            harness.Form,
-            lacking,
-            new Dictionary<string, FieldValue> { [FirstPageField] = FieldValue.FromText("Applied") },
-            () => stamp,
-            _ => RecordValidationResult.Success(new Dictionary<string, FieldValue>()),
-            argument,
-            CancellationToken.None);
+        bool committed;
+        bool refused;
+        string? insertedId = null;
+        switch (write)
+        {
+            case Write.Post:
+                var inserted = await harness.Store.InsertAsync(
+                    harness.Form,
+                    values,
+                    stamp,
+                    argument,
+                    CancellationToken.None);
+                committed = inserted.Status == RecordWriteStatus.Success;
+                refused = inserted.Status == RecordWriteStatus.Forbidden && inserted.Record is null;
+                insertedId = inserted.Record?.GlobalRecordId;
+                break;
+
+            case Write.Put:
+                var updated = await harness.Store.UpdateAsync(
+                    harness.Form,
+                    lacking,
+                    values,
+                    CountedStamp,
+                    _ => RecordValidationResult.Success(new Dictionary<string, FieldValue>()),
+                    argument,
+                    CancellationToken.None);
+                committed = updated.Status == RecordWriteStatus.Success;
+                refused = updated.Status == RecordWriteStatus.Forbidden && updated.Record is null;
+                break;
+
+            case Write.Delete:
+                var deleted = await harness.Store.SoftDeleteAsync(
+                    harness.Form,
+                    lacking,
+                    CountedStamp,
+                    argument,
+                    CancellationToken.None);
+                committed = deleted.Status == SoftDeleteStatus.Deleted;
+                refused = deleted.Status == SoftDeleteStatus.Forbidden
+                    && !deleted.IsFound
+                    && deleted.GlobalRecordId is null;
+                break;
+
+            default:
+                throw new ArgumentOutOfRangeException(nameof(write));
+        }
 
         var writes = harness.Store.Calls.Skip(callsBefore).Where(call => call.IsWrite).ToList();
-        if (saves)
+        if (!commits)
         {
-            Assert.Equal(RecordWriteStatus.Success, result.Status);
-            Assert.Equal([new FakeStoreCall(nameof(IDataStore.UpdateAsync), IsWrite: true)], writes);
-            var after = harness.Snapshot(lacking);
-            Assert.Equal("Applied", after.Values[FirstPageField].AsText());
-            Assert.Equal(stamp, after.LastSave);
-        }
-        else
-        {
-            Assert.Equal(RecordWriteStatus.Forbidden, result.Status);
+            Assert.True(refused, "The store did not refuse the write with its forbidden result.");
             Assert.Empty(writes);
+            Assert.Equal(0, stampCalls);
+            Assert.Equal(recordsBefore, harness.RecordCount);
             AssertUnchanged(before, harness.Snapshot(lacking));
+            return;
         }
+
+        Assert.True(committed, "The store did not commit the write.");
+        Assert.Equal([new FakeStoreCall(StoreMethod(write), IsWrite: true)], writes);
+        switch (write)
+        {
+            case Write.Post:
+                Assert.Equal(recordsBefore + 1, harness.RecordCount);
+                Assert.NotNull(insertedId);
+                var created = harness.Snapshot(insertedId);
+                Assert.Equal("Applied", created.Values[FirstPageField].AsText());
+                Assert.Equal(stamp, created.FirstSave);
+                AssertUnchanged(before, harness.Snapshot(lacking));
+                break;
+
+            case Write.Put:
+                var afterUpdate = harness.Snapshot(lacking);
+                Assert.Equal("Applied", afterUpdate.Values[FirstPageField].AsText());
+                Assert.Equal(stamp, afterUpdate.LastSave);
+                Assert.Equal(1, stampCalls);
+                break;
+
+            case Write.Delete:
+                var afterDelete = harness.Snapshot(lacking);
+                Assert.Equal(RecordQueryRules.DeletedRecStatus, afterDelete.RecStatus);
+                Assert.Equal(stamp, afterDelete.LastSave);
+                Assert.Equal(1, stampCalls);
+                break;
+        }
+    }
+
+    // A grant revoked between the service's own permission read and the store's transaction: the service's read grants
+    // every write, while the store holds the revoke when the write runs, as the SQL Server store's read inside the
+    // transaction sees a grant revoked after the service's read and before its own. The write is the action's 403, not
+    // a failed write: no write call, no record added and the targeted record unchanged. The service read the
+    // permissions once, and the update and the soft delete reached the store's locked read. The same write sent again
+    // is refused by the service's own read, now that it sees the revoke, so the update and the soft delete then never
+    // reach the store.
+    [Theory]
+    [InlineData(Write.Post)]
+    [InlineData(Write.Put)]
+    [InlineData(Write.Delete)]
+    public async Task AGrantRevokedAfterTheServicesReadIsRefusedByTheStore(Write write)
+    {
+        await using var harness = await Harness.StartAsync();
+        var target = harness.SeedRecord();
+        harness.SetPermissions(harness.AllGranted);
+        harness.Store.SetPermissionsAfterNextRead(harness.ViewId, write switch
+        {
+            // INSERT revoked on the second page.
+            Write.Post => harness.Permissions(Grant.Both, Grant.Both, Grant.UpdateOnly),
+
+            // UPDATE revoked on the second page.
+            Write.Put => harness.Permissions(Grant.Both, Grant.Both, Grant.InsertOnly),
+
+            // UPDATE revoked on the base table.
+            Write.Delete => harness.Permissions(Grant.InsertOnly, Grant.Both, Grant.Both),
+
+            _ => throw new ArgumentOutOfRangeException(nameof(write)),
+        });
+
+        var recordsBefore = harness.RecordCount;
+        var before = harness.Snapshot(target);
+        var refusedByStore = await harness.SendAsync(write, target, "Revoked");
+
+        AssertForbidden(refusedByStore, ForbiddenDetail(write));
+        Assert.Single(refusedByStore.Calls, call => call.Method == nameof(IDataStore.GetPermissionsAsync));
+        if (write != Write.Post)
+        {
+            Assert.Contains(new FakeStoreCall(StoreMethod(write), IsWrite: false), refusedByStore.Calls);
+        }
+
+        Assert.Equal(recordsBefore, harness.RecordCount);
+        AssertUnchanged(before, harness.Snapshot(target));
+
+        var refusedByService = await harness.SendAsync(write, target, "Again");
+        AssertForbidden(refusedByService, ForbiddenDetail(write));
+        Assert.DoesNotContain(refusedByService.Calls, call => call.Method == StoreMethod(write));
+        Assert.Equal(recordsBefore, harness.RecordCount);
+        AssertUnchanged(before, harness.Snapshot(target));
     }
 
     /// <summary>
@@ -713,6 +878,15 @@ public sealed class PermissionTests
         Write.Post => ApiProblems.ForbiddenInsertDetail,
         Write.Put => ApiProblems.ForbiddenUpdateDetail,
         Write.Delete => ApiProblems.ForbiddenDeleteDetail,
+        _ => throw new ArgumentOutOfRangeException(nameof(write)),
+    };
+
+    // The IDataStore member that runs the write, the name the fake logs its calls under.
+    private static string StoreMethod(Write write) => write switch
+    {
+        Write.Post => nameof(IDataStore.InsertAsync),
+        Write.Put => nameof(IDataStore.UpdateAsync),
+        Write.Delete => nameof(IDataStore.SoftDeleteAsync),
         _ => throw new ArgumentOutOfRangeException(nameof(write)),
     };
 
@@ -1052,30 +1226,33 @@ public sealed class PermissionTests
 }
 
 /// <summary>
-/// The in-transaction permission check of <c>PUT</c> on the SQL Server store, against the rehearsal database (AAP
-/// 0.2.4), on a record whose page row is missing and once that row is repaired: every update reads the permissions
-/// inside its transaction, after the locked read, the record read and the required gate and before the first write,
-/// for the base table and every page table, so the UPDATE on each of them and the INSERT on the table of each page
-/// whose row is missing are never decided from the service's earlier read.
+/// The in-transaction permission check of <c>POST</c>, <c>PUT</c> and <c>DELETE</c> on the SQL Server store, against
+/// the rehearsal database (AAP 0.2.4). Every insert reads the permissions inside its transaction after the form's
+/// write lock and before its first write, for the base table and every page table; every update after the locked
+/// read, the record read and the required gate and before its first write, for the base table and every page table,
+/// on a record whose page row is missing and once that row is repaired; and every soft delete after its locked read
+/// and before its UPDATE, for the base table alone. So the INSERT, the UPDATE and the missing-page INSERT each write
+/// needs are never decided from the service's earlier read.
 /// </summary>
 /// <remarks>
 /// <para>
 /// The seeded login holds every permission and no denied principal is created, because the database's logins and
-/// users stay unchanged. The case therefore proves where and on what the check runs through
+/// users stay unchanged. The cases therefore prove where and on what the check runs through
 /// <see cref="SqlCommandRecorder"/>, and <see cref="PermissionTests"/> proves the denial on
 /// <see cref="FakeDataStore"/>.
 /// </para>
 /// <para>
-/// The record is created only through <c>POST /api/forms/{viewId}/records</c>, carrying a fresh
-/// <see cref="TestDatabase.NewMarker"/> in <see cref="TestDatabase.MarkerField"/>, and stays in the database. The one
-/// direct write deletes the <c>FoodHistory3</c> row of that record (AAP 0.3.7, "Data reach of tests"), under the
-/// exclusive <see cref="DatabaseWriteLock"/>. Failure messages describe commands without their bound values and never
-/// print a response body.
+/// Each record is created only through <c>POST /api/forms/{viewId}/records</c>, carrying a fresh
+/// <see cref="TestDatabase.NewMarker"/> in <see cref="TestDatabase.MarkerField"/>, and stays in the database, the one
+/// soft-deleted through <c>DELETE</c> included. The one direct write deletes the <c>FoodHistory3</c> row of the
+/// update case's record (AAP 0.3.7, "Data reach of tests"). Each case holds the exclusive
+/// <see cref="DatabaseWriteLock"/>. Failure messages describe commands without their bound values and never print a
+/// response body.
 /// </para>
 /// </remarks>
 [Trait("Category", "Integration")]
 [Collection(DatabaseCollections.Database)]
-public sealed class MissingPagePermissionSqlTests
+public sealed class WritePermissionSqlTests
 {
     private const string FoodHistory = "FoodHistory";
 
@@ -1086,9 +1263,13 @@ public sealed class MissingPagePermissionSqlTests
 
     private const string PageTwoField = "Lab";
 
-    // The fixed operation names EpiInfo.Data reports to the command observer: the record repository's update, and the
-    // permission reader's form-level read that RecordService makes before it calls the store.
+    // The fixed operation names EpiInfo.Data reports to the command observer: the record repository's insert, update
+    // and soft delete, and the permission reader's form-level read that RecordService makes before it calls the store.
+    private const string InsertOperation = "records.insert";
+
     private const string UpdateOperation = "records.update";
+
+    private const string DeleteOperation = "records.delete";
 
     private const string ServicePermissionOperation = "GetPermissions";
 
@@ -1096,10 +1277,16 @@ public sealed class MissingPagePermissionSqlTests
 
     private const string LockHint = "UPDLOCK";
 
-    // The parameters the in-transaction permission statement binds, in order: the bracket-quoted catalogue names of
-    // FoodHistory's base table, then of its page tables in metaPages.Position order (testdata/sql/03_forms.sql and
-    // 05_data_tables.sql).
+    // The system procedure of the form's write lock, which an insert takes before its first lock on a record table.
+    private const string FormWriteLockProcedure = "sp_getapplock";
+
+    // The parameters the in-transaction permission statement of an insert or an update binds, in order: the
+    // bracket-quoted catalogue names of FoodHistory's base table, then of its page tables in metaPages.Position order
+    // (testdata/sql/03_forms.sql and 05_data_tables.sql).
     private static readonly string[] TableSecurables = ["[FoodHistory]", "[FoodHistory2]", "[FoodHistory3]"];
+
+    // The one parameter the in-transaction permission statement of a soft delete binds: the base table alone.
+    private static readonly string[] BaseTableSecurable = ["[FoodHistory]"];
 
     // Longer than DatabaseWriteLock's 300-second wait, so a lock held by another process fails the lock call rather
     // than this token; xUnit v2 gives a test no cancellation token of its own.
@@ -1134,23 +1321,86 @@ public sealed class MissingPagePermissionSqlTests
         factory.Recorder.Clear();
         await PutAsync(client, viewId, id, PageOneField, "Avery", ct);
         var pageOneUpdate = factory.Recorder.Commands;
-        AssertServiceReadPrecedesTheTransaction(pageOneUpdate);
-        AssertPermissionsCheckedInTheTransaction(pageOneUpdate);
+        AssertServiceReadPrecedesTheTransaction("The PUT", pageOneUpdate);
+        AssertUpdatePermissionsCheckedInTheTransaction(pageOneUpdate);
         Assert.Equal(0, await CountPageTwoRowsAsync(id, ct));
 
         factory.Recorder.Clear();
         await PutAsync(client, viewId, id, PageTwoField, "Pending", ct);
         var pageTwoUpdate = factory.Recorder.Commands;
-        AssertServiceReadPrecedesTheTransaction(pageTwoUpdate);
-        AssertPermissionsCheckedInTheTransaction(pageTwoUpdate);
+        AssertServiceReadPrecedesTheTransaction("The PUT", pageTwoUpdate);
+        AssertUpdatePermissionsCheckedInTheTransaction(pageTwoUpdate);
         Assert.Equal(1, await CountPageTwoRowsAsync(id, ct));
 
         factory.Recorder.Clear();
         await PutAsync(client, viewId, id, PageOneField, "Blake", ct);
         var completeUpdate = factory.Recorder.Commands;
-        AssertServiceReadPrecedesTheTransaction(completeUpdate);
-        AssertPermissionsCheckedInTheTransaction(completeUpdate);
+        AssertServiceReadPrecedesTheTransaction("The PUT", completeUpdate);
+        AssertUpdatePermissionsCheckedInTheTransaction(completeUpdate);
         Assert.Equal(1, await CountPageTwoRowsAsync(id, ct));
+    }
+
+    // A POST reads the permissions of the base table and every page table in its transaction, once it holds the form's
+    // write lock and before its base INSERT, which is where the INSERT on each table is decided. The service's own read
+    // runs before the transaction, outside it, and decides nothing there.
+    [Fact]
+    public async Task InsertPermissions_AreReadInsideTheInsertTransactionAfterTheFormLockBeforeItsFirstWrite()
+    {
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        var ct = timeout.Token;
+        await using var factory = await ApiFactory.ForDatabaseAsync();
+        using var client = factory.CreateClient();
+        await using var dbLock = await DatabaseWriteLock.AcquireExclusiveAsync(ct);
+
+        var viewId = await ApiTestClient.GetViewIdAsync(client, FoodHistory, ct);
+        factory.Recorder.Clear();
+        var created = await ApiTestClient.CreateRecordAsync(
+            client,
+            viewId,
+            new Dictionary<string, object?> { [TestDatabase.MarkerField] = TestDatabase.NewMarker() },
+            ct);
+        var insert = factory.Recorder.Commands;
+
+        AssertServiceReadPrecedesTheTransaction("The POST", insert);
+        AssertInsertPermissionsCheckedInTheTransaction(insert);
+        Assert.Equal(1, await CountPageTwoRowsAsync(created.GlobalRecordId, ct));
+    }
+
+    // A DELETE of an active record reads the permissions of the base table alone in its transaction, after its locked
+    // read and before its UPDATE, which is where the UPDATE on the base table is decided. The service's own read runs
+    // before the transaction, outside it, and decides nothing there.
+    [Fact]
+    public async Task DeletePermissions_AreReadInsideTheDeleteTransactionAfterTheLockedReadBeforeItsUpdate()
+    {
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        var ct = timeout.Token;
+        await using var factory = await ApiFactory.ForDatabaseAsync();
+        using var client = factory.CreateClient();
+        await using var dbLock = await DatabaseWriteLock.AcquireExclusiveAsync(ct);
+
+        var viewId = await ApiTestClient.GetViewIdAsync(client, FoodHistory, ct);
+        var created = await ApiTestClient.CreateRecordAsync(
+            client,
+            viewId,
+            new Dictionary<string, object?> { [TestDatabase.MarkerField] = TestDatabase.NewMarker() },
+            ct);
+
+        factory.Recorder.Clear();
+        var path = string.Create(
+            CultureInfo.InvariantCulture,
+            $"/api/forms/{viewId}/records/{Uri.EscapeDataString(created.GlobalRecordId)}");
+        using (var response = await client.DeleteAsync(path, ct))
+        {
+            Assert.True(
+                response.StatusCode == HttpStatusCode.NoContent,
+                string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"The DELETE returned {(int)response.StatusCode}, expected 204."));
+        }
+
+        var delete = factory.Recorder.Commands;
+        AssertServiceReadPrecedesTheTransaction("The DELETE", delete);
+        AssertDeletePermissionsCheckedInTheTransaction(delete);
     }
 
     // PUT {"values": {field: text}} answers 200 with the record holding the submitted text.
@@ -1187,9 +1437,9 @@ public sealed class MissingPagePermissionSqlTests
             $"The record the PUT of {field} returned does not hold the submitted text.");
     }
 
-    // RecordService's own permission read: one statement, outside any transaction, completed before the update's
-    // transaction sent its first statement.
-    private static void AssertServiceReadPrecedesTheTransaction(IReadOnlyList<RecordedCommand> commands)
+    // RecordService's own permission read: one statement, outside any transaction, completed before the write's
+    // transaction sent its first statement. request names the write in failure messages.
+    private static void AssertServiceReadPrecedesTheTransaction(string request, IReadOnlyList<RecordedCommand> commands)
     {
         var serviceReads = commands
             .Where(command => IsPermissionCheck(command) &&
@@ -1197,20 +1447,92 @@ public sealed class MissingPagePermissionSqlTests
             .ToList();
         Assert.True(
             serviceReads.Count == 1 && !serviceReads[0].InTransaction && serviceReads[0].Succeeded,
-            "The PUT must send exactly one service permission statement, outside any transaction, and it must " +
+            request + " must send exactly one service permission statement, outside any transaction, and it must " +
             "succeed:" + Describe(commands));
 
         var firstInTransaction = commands.FirstOrDefault(command => command.InTransaction);
         Assert.True(
             firstInTransaction is not null && serviceReads[0].Sequence < firstInTransaction.Sequence,
-            "The service permission statement must precede every statement of the update's transaction:" +
+            "The service permission statement must precede every statement of the write's transaction:" +
             Describe(commands));
+    }
+
+    // On the insert's connection, from its form write lock on, the statements before the first write are exactly the
+    // lock and one permission statement bound to the base table and then each page table, both inside the
+    // transaction, and the first write is the insert's own; no other permission statement joins any transaction.
+    private static void AssertInsertPermissionsCheckedInTheTransaction(IReadOnlyList<RecordedCommand> commands)
+    {
+        var formLocks = commands
+            .Where(command => IsOperation(command, InsertOperation) &&
+                command.CommandText.Contains(FormWriteLockProcedure, StringComparison.Ordinal))
+            .ToList();
+        Assert.True(
+            formLocks.Count == 1 && formLocks[0].InTransaction && formLocks[0].Succeeded,
+            "The POST must send exactly one form write lock, inside its transaction:" + Describe(commands));
+        var formLock = formLocks[0];
+
+        var fromLock = commands
+            .Where(command => command.ClientConnectionId == formLock.ClientConnectionId &&
+                command.Sequence >= formLock.Sequence)
+            .ToList();
+        var beforeWrite = fromLock.TakeWhile(command => !command.IsWrite).ToList();
+        var firstWrite = fromLock.FirstOrDefault(command => command.IsWrite);
+        var check = beforeWrite.Count == 2 ? beforeWrite[1] : null;
+        Assert.True(
+            check is not null &&
+            IsOperation(check, InsertOperation) &&
+            check.InTransaction &&
+            IsPermissionCheck(check) &&
+            check.Succeeded &&
+            firstWrite is not null &&
+            IsOperation(firstWrite, InsertOperation) &&
+            firstWrite.InTransaction,
+            "From the form write lock on, the insert's connection must send one permission statement inside the " +
+            "transaction, and then its first write:" + Describe(fromLock));
+
+        AssertTheOneInTransactionCheck(check, TableSecurables, commands);
+    }
+
+    // On the soft delete's connection, from its locked base read on, the statements before the first write are exactly
+    // the locked read and one permission statement bound to the base table alone, both inside the transaction, and the
+    // first write is the soft delete's own; no other permission statement joins any transaction.
+    private static void AssertDeletePermissionsCheckedInTheTransaction(IReadOnlyList<RecordedCommand> commands)
+    {
+        var lockedReads = commands
+            .Where(command => IsOperation(command, DeleteOperation) &&
+                command.CommandText.Contains(LockHint, StringComparison.Ordinal))
+            .ToList();
+        Assert.True(
+            lockedReads.Count == 1 && lockedReads[0].InTransaction && lockedReads[0].Succeeded,
+            "The DELETE must send exactly one locked base read, inside its transaction:" + Describe(commands));
+        var lockedRead = lockedReads[0];
+
+        var fromLock = commands
+            .Where(command => command.ClientConnectionId == lockedRead.ClientConnectionId &&
+                command.Sequence >= lockedRead.Sequence)
+            .ToList();
+        var beforeWrite = fromLock.TakeWhile(command => !command.IsWrite).ToList();
+        var firstWrite = fromLock.FirstOrDefault(command => command.IsWrite);
+        var check = beforeWrite.Count == 2 ? beforeWrite[1] : null;
+        Assert.True(
+            check is not null &&
+            IsOperation(check, DeleteOperation) &&
+            check.InTransaction &&
+            IsPermissionCheck(check) &&
+            check.Succeeded &&
+            firstWrite is not null &&
+            IsOperation(firstWrite, DeleteOperation) &&
+            firstWrite.InTransaction,
+            "From the locked base read on, the soft delete's connection must send one permission statement inside " +
+            "the transaction, and then its UPDATE:" + Describe(fromLock));
+
+        AssertTheOneInTransactionCheck(check, BaseTableSecurable, commands);
     }
 
     // On the update's connection, from its locked base read on, the statements before the first write are exactly the
     // locked read, the record read and one permission statement bound to the base table and then each page table, all
     // inside the transaction; no other permission statement joins any transaction.
-    private static void AssertPermissionsCheckedInTheTransaction(IReadOnlyList<RecordedCommand> commands)
+    private static void AssertUpdatePermissionsCheckedInTheTransaction(IReadOnlyList<RecordedCommand> commands)
     {
         var lockedReads = commands
             .Where(command => IsUpdate(command) && command.CommandText.Contains(LockHint, StringComparison.Ordinal))
@@ -1244,10 +1566,20 @@ public sealed class MissingPagePermissionSqlTests
             "From the locked base read on, the update's connection must send the record read, then one permission " +
             "statement, both inside the transaction, and then its first write:" + Describe(fromLock));
 
+        AssertTheOneInTransactionCheck(check, TableSecurables, commands);
+    }
+
+    // The write's in-transaction permission statement binds exactly the securables expected, in order, and it is the
+    // only permission statement inside any transaction of the request.
+    private static void AssertTheOneInTransactionCheck(
+        RecordedCommand check,
+        string[] securables,
+        IReadOnlyList<RecordedCommand> commands)
+    {
         Assert.True(
-            check.Parameters.Select(parameter => parameter.Value as string).SequenceEqual(TableSecurables),
-            "The in-transaction permission statement must bind exactly the base table and then each page table, " +
-            $"{string.Join(", ", TableSecurables)}: {check}");
+            check.Parameters.Select(parameter => parameter.Value as string).SequenceEqual(securables),
+            "The in-transaction permission statement must bind exactly " +
+            $"{string.Join(", ", securables)}, in that order: {check}");
 
         Assert.True(
             commands.Count(command => IsPermissionCheck(command) && command.InTransaction) == 1,
@@ -1257,8 +1589,10 @@ public sealed class MissingPagePermissionSqlTests
     private static bool IsPermissionCheck(RecordedCommand command) =>
         command.CommandText.Contains(PermissionFunction, StringComparison.Ordinal);
 
-    private static bool IsUpdate(RecordedCommand command) =>
-        string.Equals(command.Operation, UpdateOperation, StringComparison.Ordinal);
+    private static bool IsUpdate(RecordedCommand command) => IsOperation(command, UpdateOperation);
+
+    private static bool IsOperation(RecordedCommand command, string operation) =>
+        string.Equals(command.Operation, operation, StringComparison.Ordinal);
 
     // Each command on its own line, without parameter values.
     private static string Describe(IEnumerable<RecordedCommand> commands) =>

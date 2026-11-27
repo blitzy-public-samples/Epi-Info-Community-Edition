@@ -16,6 +16,8 @@ import { spawn, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import {
   closeSync,
+  fstatSync,
+  lstatSync,
   mkdtempSync,
   openSync,
   readFileSync,
@@ -65,6 +67,95 @@ export class GenerationError extends Error {
     super(message);
     this.name = 'GenerationError';
     this.exitCode = Number.isInteger(exitCode) && exitCode !== 0 ? exitCode : 1;
+  }
+}
+
+/**
+ * A refusal by assertInsideCheckout: the file lies outside the checkout, or one of the directories it is reached
+ * through is a symbolic link, a junction or something else that is not a directory of this checkout.
+ */
+export class CheckoutPathError extends GenerationError {
+  constructor(message) {
+    super(message);
+    this.name = 'CheckoutPathError';
+  }
+}
+
+/**
+ * Checks that every directory between the repository checkout and the file is a directory of this checkout, so that
+ * reading, creating, replacing or removing the file never leaves the checkout. The directories from the checkout down
+ * to the file's own are examined top-down with lstat, which follows no link: a symbolic link (a Windows junction
+ * included, which lstat reports as one) or anything else that is not a directory is refused with a CheckoutPathError
+ * naming it, and so is a file that lies outside the checkout. The checkout's own location, and any link that leads to
+ * it, are not examined. With createMissing, a missing directory is created on its own, never recursively, and then
+ * examined like the others, so nothing is ever created through a link; without it, the lstat failure (ENOENT) is
+ * thrown unchanged. The file itself is not examined: each caller opens, creates or replaces it in a way that never
+ * follows a link in its place. The directories are examined as they are when the check runs, which is why publication
+ * and every operation on the generation lock check them again immediately before they act.
+ */
+export async function assertInsideCheckout(file, { createMissing = false } = {}) {
+  for (const directory of checkoutDirectories(file)) {
+    let stats;
+    try {
+      stats = await fs.lstat(directory);
+    } catch (error) {
+      if (error.code !== 'ENOENT' || !createMissing) {
+        throw error;
+      }
+      try {
+        await fs.mkdir(directory);
+      } catch (mkdirError) {
+        // Created meanwhile by another run; it is examined like any other.
+        if (mkdirError.code !== 'EEXIST') {
+          throw mkdirError;
+        }
+      }
+      stats = await fs.lstat(directory);
+    }
+    assertCheckoutDirectory(file, directory, stats);
+  }
+}
+
+// assertInsideCheckout without createMissing, in one synchronous step, for the lock operations that must not yield to
+// a signal handler (see recordLockChild and releaseLockFileSync). The same directories are examined, with lstatSync,
+// and refused with the same CheckoutPathError messages.
+function assertInsideCheckoutSync(file) {
+  for (const directory of checkoutDirectories(file)) {
+    assertCheckoutDirectory(file, directory, lstatSync(directory));
+  }
+}
+
+// The directories between the checkout and the file, top-down and ending with the file's own, which both checks
+// examine. A file that lies outside the checkout is refused.
+function checkoutDirectories(file) {
+  const relative = path.relative(repoRoot, path.resolve(file));
+  if (relative === '' || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw new CheckoutPathError(
+      `${JSON.stringify(file)} lies outside the checkout ${JSON.stringify(repoRoot)}; only files whose directories ` +
+        'all belong to this checkout are read or written',
+    );
+  }
+  const names = path.dirname(relative).split(path.sep);
+  const directories = [];
+  let directory = repoRoot;
+  // A file directly in the checkout has the directory name '.', which names the checkout itself.
+  for (const name of names[0] === '.' ? [] : names) {
+    directory = path.join(directory, name);
+    directories.push(directory);
+  }
+  return directories;
+}
+
+// Refuses a directory whose lstat reports a symbolic link (a Windows junction included) or anything else that is not
+// a directory.
+function assertCheckoutDirectory(file, directory, stats) {
+  if (stats.isSymbolicLink() || !stats.isDirectory()) {
+    const through = toRepoRelative(directory);
+    const kind = stats.isSymbolicLink() ? 'a symbolic link or junction' : 'not a directory';
+    throw new CheckoutPathError(
+      `${toRepoRelative(file)} is reached through ${through}, which is ${kind}; only files whose directories all ` +
+        `belong to this checkout are read or written, so make ${through} a directory of this checkout`,
+    );
   }
 }
 
@@ -166,8 +257,6 @@ export async function generateFresh() {
     );
     await assertGeneratorCommandInputs(checkoutProject, buildProperties, checkout, dir, cacheMarker, lock);
 
-    // The marker an earlier build without the pin left in the default layout's obj/ no longer decides anything, so it
-    // is removed only where it is certainly this checkout's own; anything else there is left untouched.
     await removeObjLeftoverMarker(checkout);
 
     // The build's own restore finds nothing left to do, and the build recompiles first when sources changed, so the
@@ -535,7 +624,8 @@ function groupHasLiveMember(group) {
 // removes every directory a run left open and releases every lock and claim file still held, all synchronously, then
 // raises the signal again with the default disposition restored. A killed group takes a moment to empty, so that is
 // awaited briefly first; a lock whose recorded child has still not ended is kept by releaseLockFileSync, and the next
-// run removes it as stale.
+// run removes it as stale. A directory that cannot be removed, a lock or claim that cannot be released and a lock kept
+// for its child are each reported on one line.
 function finishInterruption() {
   if (interruptionFinished) {
     return;
@@ -557,10 +647,10 @@ function finishInterruption() {
     }
   }
   for (const lock of heldLocks.values()) {
-    releaseLockFileSync(lock.token);
+    releaseLockFileSync(lock.token, generationLock, reportWhileStopping);
   }
   for (const [claim, token] of heldClaims) {
-    releaseLockFileSync(token, claim);
+    releaseLockFileSync(token, claim, reportWhileStopping);
   }
   removeInterruptionListeners();
   const { signal, exitCode } = interruption;
@@ -577,12 +667,20 @@ function finishInterruption() {
 
 // Generation lock. One file per checkout, under the API's git-ignored obj/, created exclusively by the run that holds
 // it and recording { pid, hostname, token, acquiredAt }, plus childPid while a dotnet process the run started is
-// writing the checkout's outputs: a child outlives a killed parent, so the lock must outlive it too. A waiting run
-// polls, and gives up after the wait limit. A lock is stale when its record names this host, a holder that no longer
-// runs or is this very process (which holds no lock while acquiring one), and no child that still runs; a record that
-// never became readable is stale once older than the grace period. A stale lock is removed (see removeStaleInstance),
-// never one held from another host. Within one process, generateFresh() calls queue first, so the file is contended
-// only between processes and a process never waits for itself.
+// writing the checkout's outputs: a child outlives a killed parent, so the lock must outlive it too. The lock is kept
+// in this obj/ because it serializes the writers of exactly this obj/ and bin/, which a lock kept elsewhere could not
+// do for builds that share a redirected obj/, so an obj/ that is, or is reached through, a symbolic link or junction
+// is refused rather than followed. obj/ and every directory above it are checked to be directories of this checkout
+// (see assertInsideCheckout) immediately before each operation on the lock, its claims and its record updates: each
+// attempt to take the lock, the first of which creates a missing directory on its own, and each read, creation,
+// removal and release. A refusal stops that operation, so none of those files is read, written or removed outside
+// this checkout, and the first attempt refuses before anything is created or any build starts. Such a file is read
+// without following a link in its place, which is refused, and is created only under a name that nothing holds yet. A
+// waiting run polls, and gives up after the wait limit. A lock is stale when its record names this host, a holder that
+// no longer runs or is this very process (which holds no lock while acquiring one), and no child that still runs; a
+// record that never became readable is stale once older than the grace period. A stale lock is removed (see
+// removeStaleInstance), never one held from another host. Within one process, generateFresh() calls queue first, so
+// the file is contended only between processes and a process never waits for itself.
 const generationLock = path.join(apiDir, 'obj', 'EpiInfo.Api.OpenApiGenerate.lock');
 const lockPollMilliseconds = 250;
 const lockWaitLimitMilliseconds = 10 * 60 * 1000;
@@ -626,13 +724,13 @@ async function acquireGenerationLock(dir) {
 }
 
 async function acquireLockFile() {
-  await fs.mkdir(path.dirname(generationLock), { recursive: true });
   const record = newLockRecord();
   const deadline = Date.now() + lockWaitLimitMilliseconds;
   let announced = false;
-  for (;;) {
+  for (let attempt = 1; ; attempt += 1) {
     // An interrupted run stops waiting at the next poll.
     throwIfInterrupted();
+    await assertInsideCheckout(generationLock, { createMissing: attempt === 1 });
     if (createExclusive(generationLock, record)) {
       return record;
     }
@@ -673,6 +771,7 @@ async function acquireLockFile() {
 async function removeStaleInstance(file, stale, depth) {
   const claim = `${file}.claim-${stale.record?.token ?? stale.identity}`;
   const claimant = newLockRecord();
+  await assertInsideCheckout(claim);
   if (!createExclusive(claim, claimant)) {
     const other = await readLockRecord(claim);
     if (other === null) {
@@ -699,15 +798,21 @@ async function removeStaleInstance(file, stale, depth) {
   }
 }
 
-// Removes the claim and record-update files that earlier runs left beside the lock. Once this run holds the lock,
-// every claim refers to a lock instance already gone (nobody claims a live lock), and every other writer of an update
-// has lost the lock, so removing them, even a claim a slow waiter still holds, cannot cost any live lock. A file that
-// cannot be removed is reported and left for the next run.
+// Removes the claim and record-update files that earlier runs left beside the lock, but only those whose recorded
+// process has ended on this host, or whose record never became readable and is older than the grace period (see
+// isStale), and each only while it still holds the record judged stale (see removeIfUnchanged). A claim or update of
+// a run that still lives on this host, or one recorded on another host, is left untouched; so is a symbolic link or
+// anything else that is not a regular file in a leftover's place, which one line names with its remedy. Once this run
+// holds the lock, every claim names a lock instance already gone (nobody claims a live lock), and an update is written
+// only by the run whose token it carries, so no removal can cost a live lock. The lock's directories are checked
+// first (see assertInsideCheckout); when they no longer all belong to this checkout, one line says why and nothing is
+// removed. A file that cannot be read or removed is reported and left for the next run.
 async function removeLockLeftovers() {
   const lockDir = path.dirname(generationLock);
   const lockName = path.basename(generationLock);
   let names;
   try {
+    await assertInsideCheckout(generationLock);
     names = await fs.readdir(lockDir);
   } catch (error) {
     process.stderr.write(`could not list the files beside ${toRepoRelative(generationLock)}: ${errorMessage(error)}\n`);
@@ -715,13 +820,37 @@ async function removeLockLeftovers() {
   }
   for (const name of names) {
     if (name.startsWith(`${lockName}.claim-`) || (name.startsWith(`${lockName}.`) && name.endsWith('.next'))) {
-      const leftover = path.join(lockDir, name);
-      try {
-        await fs.rm(leftover, { force: true });
-      } catch (error) {
-        process.stderr.write(`could not remove ${toRepoRelative(leftover)}: ${errorMessage(error)}\n`);
-      }
+      await removeLockLeftover(path.join(lockDir, name));
     }
+  }
+}
+
+// Removes one leftover beside the lock when it is a regular file whose record is stale, as removeLockLeftovers
+// describes. A leftover that is not a regular file, or that cannot be examined, read or removed, is left and reported
+// on one line.
+async function removeLockLeftover(leftover) {
+  try {
+    await assertInsideCheckout(leftover);
+    // Examined before it is opened, so that a link is reported rather than refused, and a FIFO is never opened.
+    const stats = await fs.lstat(leftover);
+    if (!stats.isFile()) {
+      const kind = stats.isSymbolicLink() ? 'a symbolic link' : 'not a regular file';
+      process.stderr.write(
+        `${toRepoRelative(leftover)} is ${kind}; leftovers of the OpenAPI generation lock are removed only as ` +
+          'regular files of this checkout, so it is left in place: delete it\n',
+      );
+      return;
+    }
+    const holder = await readLockRecord(leftover);
+    if (holder !== null && isStale(holder)) {
+      await removeIfUnchanged(leftover, holder);
+    }
+  } catch (error) {
+    // Gone since the listing: nothing is left to remove.
+    if (error.code === 'ENOENT') {
+      return;
+    }
+    process.stderr.write(`could not remove ${toRepoRelative(leftover)}: ${errorMessage(error)}\n`);
   }
 }
 
@@ -739,42 +868,65 @@ async function releaseGenerationLock(lock) {
   }
 }
 
-// Runs from the process 'exit' event, so it is synchronous and never throws: a lock it cannot remove names a
-// process that no longer runs, and the next run removes it as stale. A lock whose recorded child still runs is kept,
-// because that child goes on writing the checkout's outputs; it turns stale when the child ends. A claim file, which
-// records no child, is released the same way.
-function releaseLockFileSync(token, file = generationLock) {
+// Releases a lock or claim file this process holds, for the process 'exit' event and for finishInterruption, so it is
+// synchronous and never throws. The file is read through readLockRecordSync, which checks its directories and refuses
+// a link in its place, and is removed only while it carries the given token. A lock whose recorded child still runs
+// is kept, because that child goes on writing the checkout's outputs; it turns stale when the child ends, and the next
+// run removes it then. A claim file, which records no child, is released the same way. A file that cannot be released,
+// a refusal included, is left for the next run, which waits for it or removes it as stale. With report, a failed
+// release and a lock kept for its child are each reported on one line. The 'exit' handler passes no report: it finds
+// a lock to release only after removeFresh(dir) or finishInterruption could not release it, which they have reported,
+// or as the process ends on an error that Node reports itself, so its line would only repeat or trail that report.
+function releaseLockFileSync(token, file = generationLock, report = undefined) {
+  const subject = `the OpenAPI generation lock${file === generationLock ? '' : ' claim'} ${toRepoRelative(file)}`;
   try {
-    const record = parseLockRecord(readFileSync(file, 'utf8'));
-    if (record?.token === token && !isChildRunning(record)) {
-      unlinkSync(file);
+    const current = readLockRecordSync(file);
+    // Gone, or not this process's to release.
+    if (current?.record?.token !== token) {
+      return;
     }
-  } catch {
-    // Nothing more can be done while the process exits.
+    if (isChildRunning(current.record)) {
+      report?.(
+        `kept ${subject}: its child process ${current.record.childPid} still runs, and the next run removes the ` +
+          'lock once that process has ended\n',
+      );
+      return;
+    }
+    unlinkSync(file);
+  } catch (error) {
+    // A file or directory gone meanwhile leaves nothing to release.
+    if (error.code !== 'ENOENT') {
+      report?.(
+        `could not release ${subject} (${errorMessage(error)}); if no api:generate or lint run of this checkout is ` +
+          'active, delete that file\n',
+      );
+    }
   }
 }
 
 // Rewrites the held lock's record with childPid set to the given pid, or without childPid when it is undefined. The
 // new record is written whole to `<lock>.<token>.next` and renamed over the lock, so a reader sees the old record or
-// the new one and never a partial one; the lock must still carry this run's token, or the update fails. Every step is
-// synchronous, so an interruption never finds an update under way that could put the lock, or its update file, back
-// after finishInterruption has released it.
+// the new one and never a partial one; the lock must still carry this run's token, or the update fails. The lock's
+// directories are checked first (see assertInsideCheckoutSync), the update file is created exclusively, and the lock is
+// read without following a link (see readLockRecordSync), so the update never reads or writes outside this checkout.
+// The update file's name carries this run's random token, so a file already there is not this run's: it fails the
+// update and is left alone, and only an update file this run created is removed again. Every step is synchronous, so
+// an interruption never finds an update under way that could put the lock, or its update file, back after
+// finishInterruption has released it.
 function recordLockChild(lock, childPid) {
   const { childPid: previous, ...record } = lock.record;
   if (childPid !== undefined) {
     record.childPid = childPid;
   }
   const update = `${generationLock}.${lock.token}.next`;
+  let created = false;
   try {
-    writeFileSync(update, `${JSON.stringify(record)}\n`);
-    let current = null;
-    try {
-      current = { record: parseLockRecord(readFileSync(generationLock, 'utf8')) };
-    } catch (error) {
-      if (error.code !== 'ENOENT') {
-        throw error;
-      }
+    assertInsideCheckoutSync(update);
+    if (!createExclusive(update, record)) {
+      throw new Error(`${toRepoRelative(update)} already exists`);
     }
+    created = true;
+    const current = readLockRecordSync(generationLock);
     if (current?.record?.token !== lock.token) {
       throw new Error(
         current === null ? 'the lock file no longer exists' : `the lock is now held by ${describeHolder(current)}`,
@@ -782,10 +934,15 @@ function recordLockChild(lock, childPid) {
     }
     renameReplacing(update, generationLock);
   } catch (error) {
-    try {
-      rmSync(update, { force: true });
-    } catch (cleanupError) {
-      process.stderr.write(`could not clean up ${toRepoRelative(update)}: ${errorMessage(cleanupError)}\n`);
+    if (created) {
+      try {
+        assertInsideCheckoutSync(update);
+        rmSync(update, { force: true });
+      } catch (cleanupError) {
+        if (cleanupError.code !== 'ENOENT') {
+          process.stderr.write(`could not clean up ${toRepoRelative(update)}: ${errorMessage(cleanupError)}\n`);
+        }
+      }
     }
     const change =
       childPid === undefined ? `clear child process ${previous} from` : `record child process ${childPid} in`;
@@ -818,10 +975,11 @@ function newLockRecord() {
   return { pid: process.pid, hostname: os.hostname(), token: randomUUID(), acquiredAt: new Date().toISOString() };
 }
 
-// Creates the file only if it does not exist and writes the record into it. Returns false when the file exists. A
-// record that cannot be written completely is removed again, so it never stays behind as a lock. All of it is
-// synchronous, so an interruption finds the file either absent or complete and in its creator's hands, never being
-// created by an operation that could complete after the interruption has released everything this process holds.
+// Creates the file only if it does not exist and writes the record into it. Returns false when the file exists, a
+// symbolic link included, which the exclusive open neither follows nor replaces. A record that cannot be written
+// completely is removed again, so it never stays behind as a lock. All of it is synchronous, so an interruption finds
+// the file either absent or complete and in its creator's hands, never being created by an operation that could
+// complete after the interruption has released everything this process holds.
 function createExclusive(file, record) {
   let descriptor;
   try {
@@ -854,26 +1012,118 @@ function createExclusive(file, record) {
   return true;
 }
 
-// Reads a lock or claim file as { record, identity, mtimeMs }, where record is null while the file is empty or holds
-// no valid record, or returns null when the file does not exist. identity names this file instance in a form that
-// can be part of a file name.
+// Opening a lock, claim or record-update file never follows a symbolic link in its place: O_NOFOLLOW makes the open
+// fail instead, with ELOOP, or EMLINK on some BSDs. Windows defines no O_NOFOLLOW, so there the open may follow a
+// link, and the path is examined once the file is open instead (see assertOpenedLockFile).
+const lockReadFlags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0);
+const lockOpenFollowsLinks = fs.constants.O_NOFOLLOW === undefined;
+
+// Reads a lock, claim or record-update file as { record, identity, mtimeMs }, where record is null while the file is
+// empty or holds no valid record, or returns null when the file, or a directory it is reached through, does not
+// exist. identity names this file instance in a form that can be part of a file name. The file's directories are
+// checked first (see assertInsideCheckout), and a symbolic link in the file's place is refused.
 async function readLockRecord(file) {
-  let handle;
   try {
-    handle = await fs.open(file, 'r');
+    await assertInsideCheckout(file);
   } catch (error) {
     if (error.code === 'ENOENT') {
       return null;
     }
     throw error;
   }
+  let handle;
+  try {
+    handle = await fs.open(file, lockReadFlags);
+  } catch (error) {
+    if (error.code === 'ENOENT') {
+      return null;
+    }
+    throw lockOpenError(file, error);
+  }
   try {
     const stats = await handle.stat();
-    const record = parseLockRecord(await handle.readFile('utf8'));
-    return { record, identity: `${stats.dev}-${stats.ino}-${stats.mtimeMs}-${stats.size}`, mtimeMs: stats.mtimeMs };
+    if (lockOpenFollowsLinks) {
+      let pathStats;
+      try {
+        pathStats = await fs.lstat(file);
+      } catch (error) {
+        if (error.code === 'ENOENT') {
+          return null;
+        }
+        throw error;
+      }
+      assertOpenedLockFile(file, stats, pathStats);
+    }
+    return lockFileInstance(stats, await handle.readFile('utf8'));
   } finally {
     await handle.close();
   }
+}
+
+// readLockRecord in one synchronous step, for the lock operations that must not yield to a signal handler (see
+// recordLockChild and releaseLockFileSync): the same checks, the same refusals and the same result.
+function readLockRecordSync(file) {
+  try {
+    assertInsideCheckoutSync(file);
+  } catch (error) {
+    if (error.code === 'ENOENT') {
+      return null;
+    }
+    throw error;
+  }
+  let descriptor;
+  try {
+    descriptor = openSync(file, lockReadFlags);
+  } catch (error) {
+    if (error.code === 'ENOENT') {
+      return null;
+    }
+    throw lockOpenError(file, error);
+  }
+  try {
+    const stats = fstatSync(descriptor);
+    if (lockOpenFollowsLinks) {
+      let pathStats;
+      try {
+        pathStats = lstatSync(file);
+      } catch (error) {
+        if (error.code === 'ENOENT') {
+          return null;
+        }
+        throw error;
+      }
+      assertOpenedLockFile(file, stats, pathStats);
+    }
+    return lockFileInstance(stats, readFileSync(descriptor, 'utf8'));
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
+// The error a failed open of an existing lock file raises: a symbolic link in its place, which the open refuses, is
+// reported as such, and any other failure is passed on unchanged.
+function lockOpenError(file, error) {
+  return error.code === 'ELOOP' || error.code === 'EMLINK' ? lockLinkRefusal(file) : error;
+}
+
+// Where the open may have followed a link, the path itself, examined without following links, must be the file that
+// was opened: no symbolic link, and the opened file's device and inode. Anything else is refused as a link.
+function assertOpenedLockFile(file, opened, pathStats) {
+  if (pathStats.isSymbolicLink() || pathStats.dev !== opened.dev || pathStats.ino !== opened.ino) {
+    throw lockLinkRefusal(file);
+  }
+}
+
+function lockLinkRefusal(file) {
+  return new GenerationError(
+    `${toRepoRelative(file)} is a symbolic link; the OpenAPI generation lock, its claims and its record updates are ` +
+      'read only as regular files of this checkout, so delete it and run again',
+  );
+}
+
+function lockFileInstance(stats, text) {
+  const identity = `${stats.dev}-${stats.ino}-${stats.mtimeMs}-${stats.size}`;
+  return { record: parseLockRecord(text), identity, mtimeMs: stats.mtimeMs };
 }
 
 function parseLockRecord(text) {
@@ -946,7 +1196,8 @@ function procStatFields(stat) {
 }
 
 // Removes the file while it still holds the expected holder: the same token, or, for a record that was never
-// readable, the same file unchanged. Returns whether it removed the file.
+// readable, the same file unchanged. Returns whether it removed the file. The read immediately before the removal
+// checks the file's directories (see readLockRecord), so a refusal stops the removal, and a release fails with it.
 async function removeIfUnchanged(file, expected) {
   const current = await readLockRecord(file);
   if (current === null || !isSameHolder(current, expected)) {
@@ -982,11 +1233,19 @@ function describeHolder(holder) {
 // Publication. The document and the client are one contract pair, so a failed run must never leave a new document
 // beside an old client, or the reverse. Both fresh files, and a copy of each committed file, are first staged beside
 // their targets under names carrying a new random token, and nothing committed is touched until all of them exist;
-// a target that is not a regular file, such as a symbolic link, is refused while staging. Each fresh file is then
-// renamed over its target, which replaces the target whole. When the second rename fails, the first target is put
-// back as it was (its previous bytes, or no file) before the error is raised. The staged files are removed on every
-// path, so nothing is left beside the committed pair, with one exception: when putting the first target back fails,
-// its staged copy of the previous bytes is the only one left, so it is kept and the error names it.
+// a target that is not a regular file, such as a symbolic link, is refused while staging. Every directory between the
+// checkout and each target must be a directory of this checkout, never a symbolic link or junction (see
+// assertInsideCheckout): a missing one is created on its own, and they are checked before each staged file is created,
+// again once everything is staged, before the second rename, and before each rollback step and each removal of a staged
+// file, so no copy, backup, replacement or removal leaves the checkout. Each directory check runs immediately before
+// the operation it guards, but Node's fs has no directory-relative operations, so the two are separate lookups of the
+// same path and a directory replaced between them by a concurrent writer of the checkout is not detected. Each fresh
+// file is then renamed over its target, which replaces the target whole. When the second rename fails, or its target's
+// directories no longer pass the check, the first target is put back as it was (its previous bytes, or no file) before
+// the error is raised. The staged files are removed on every path, so nothing is left beside the committed pair, with
+// one exception: when putting the first target back fails, its staged copy of the previous bytes is the only one left,
+// so it is kept and the error names it. A staged file that cannot be removed, because its directories no longer pass
+// the check or otherwise, is named as left behind.
 async function publishFresh(fresh) {
   const token = randomUUID();
   const pair = [
@@ -998,19 +1257,22 @@ async function publishFresh(fresh) {
     original: `${entry.target}.${token}.orig.tmp`,
     existed: false,
   }));
-  // Every name a copy is started for, so that cleanup touches only the files this run may have created.
+  // Every name a copy is started for, until it is renamed or kept (see forgetStaged), so that cleanup touches only the
+  // files this run may have created and still leaves beside the targets.
   const stagedFiles = [];
   let failed = true;
   try {
     try {
       for (const entry of pair) {
-        await fs.mkdir(path.dirname(entry.target), { recursive: true });
-      }
-      for (const entry of pair) {
+        await assertInsideCheckout(entry.target, { createMissing: true });
         stagedFiles.push(entry.staged);
         // Byte for byte: check-api-fresh.mjs compares these files with the generator's output.
         await fs.copyFile(entry.source, entry.staged, fs.constants.COPYFILE_EXCL);
         entry.existed = await stageOriginal(entry, stagedFiles);
+      }
+      // A directory replaced by a link while the files were staged stops publication before either target is touched.
+      for (const entry of pair) {
+        await assertInsideCheckout(entry.target);
       }
     } catch (error) {
       throw new GenerationError(
@@ -1027,11 +1289,14 @@ async function publishFresh(fresh) {
           'no committed file was changed',
       );
     }
+    forgetStaged(stagedFiles, first.staged);
     try {
+      await assertInsideCheckout(second.target);
       await fs.rename(second.staged, second.target);
     } catch (error) {
       throw await restoreFirstTarget(first, second, error, stagedFiles);
     }
+    forgetStaged(stagedFiles, second.staged);
 
     for (const entry of pair) {
       process.stdout.write(`wrote ${toRepoRelative(entry.target)}\n`);
@@ -1042,13 +1307,27 @@ async function publishFresh(fresh) {
   }
 }
 
+// Opening a committed file for its backup never waits and never follows a symbolic link in its place: O_NONBLOCK
+// keeps the open of a FIFO from blocking, and O_NOFOLLOW makes the open of a link fail instead, with ELOOP, or EMLINK
+// on some BSDs. Windows defines no O_NOFOLLOW, so there only the identity check in stageOriginal refuses a link.
+const backupReadFlags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0);
+
 // Copies the committed file beside itself so that a failed publication can put it back, and reports whether it
-// existed. The target is examined without following links, because a rename replaces a symbolic link itself and a
-// restore could not put it back: anything other than a regular file, a dangling link included, stops publication
-// before either target is touched. The target is examined again after the copy, so a file replaced meanwhile, which
-// the copy may have followed to other bytes, stops publication too.
+// existed. The target's directories are checked again first (see assertInsideCheckout), so the lstat, the open and
+// the copy's creation all happen in a directory of this checkout. The target is examined without following links,
+// because a rename replaces a symbolic link itself and a restore could not put it back: anything other than a regular
+// file, a dangling link included, stops publication before either target is touched. Its bytes are read only through
+// a handle opened without following a link (see backupReadFlags) on the very file lstat examined, a regular file with
+// the same device and inode, so a link or another file put in its place after the lstat is refused before anything
+// is read. The copy is created exclusively and given the target's permission bits, so a restored file keeps them. The
+// target is examined again after the copy, so a file replaced after it was opened, whose bytes the copy then no
+// longer matches, stops publication too.
 async function stageOriginal(entry, stagedFiles) {
   const target = toRepoRelative(entry.target);
+  const notRegularFile = (kind) =>
+    new Error(`${target} is ${kind}; only a regular file is replaced, so make it one and run again`);
+  const replacedWhileCopied = () => new Error(`${target} was replaced while it was being copied; run again`);
+  await assertInsideCheckout(entry.target);
   let before;
   try {
     before = await fs.lstat(entry.target);
@@ -1064,21 +1343,54 @@ async function stageOriginal(entry, stagedFiles) {
       : before.isDirectory()
         ? 'a directory'
         : 'a special file';
-    throw new Error(`${target} is ${kind}; only a regular file is replaced, so make it one and run again`);
+    throw notRegularFile(kind);
   }
-  stagedFiles.push(entry.original);
-  await fs.copyFile(entry.target, entry.original, fs.constants.COPYFILE_EXCL);
+  let source;
+  try {
+    source = await fs.open(entry.target, backupReadFlags);
+  } catch (error) {
+    if (error.code === 'ELOOP' || error.code === 'EMLINK') {
+      throw notRegularFile('a symbolic link');
+    }
+    throw error;
+  }
+  try {
+    const opened = await source.stat();
+    if (!opened.isFile() || opened.dev !== before.dev || opened.ino !== before.ino) {
+      throw replacedWhileCopied();
+    }
+    const bytes = await source.readFile();
+    const mode = before.mode & 0o7777;
+    stagedFiles.push(entry.original);
+    const copy = await fs.open(entry.original, 'wx', mode);
+    try {
+      await copy.writeFile(bytes);
+      // The umask narrows the mode open applies, so the bits are set again exactly.
+      await copy.chmod(mode);
+    } finally {
+      await copy.close();
+    }
+  } finally {
+    await source.close();
+  }
   const after = await fs.lstat(entry.target);
   if (!after.isFile() || after.dev !== before.dev || after.ino !== before.ino) {
-    throw new Error(`${target} was replaced while it was being copied; run again`);
+    throw replacedWhileCopied();
   }
   return true;
 }
 
 // Called after the first target was replaced and the second was not: puts the first back from its staged original,
 // or removes it when it did not exist before, and returns the error that states what the committed pair now holds.
-// When the first cannot be put back, its staged original is the only copy of its previous bytes, so it is taken out
-// of stagedFiles, which the cleanup removes, and the error names it.
+// The first target's directories are checked again immediately before it is removed or put back (see
+// assertInsideCheckout), and a refusal fails that step like any other error, so the rollback never leaves the
+// checkout. When the first cannot be put back, its staged original may be the only copy of its previous bytes, so it
+// is taken out of stagedFiles, which the cleanup removes, and is examined without following links once its directories
+// pass the check again. The error then names one of three outcomes: the copy is a regular file, kept there to be moved
+// back over the target; the copy is gone, it or a directory above it being missing; or the copy could not be examined,
+// because a directory above it is refused or for any other reason, a copy that is not a regular file included, and the
+// error gives that reason and asks for every directory above it to be a directory of this checkout again before it is
+// moved back, so no remedy sends a move through a link.
 async function restoreFirstTarget(first, second, cause, stagedFiles) {
   const replaced = toRepoRelative(first.target);
   const unchanged = toRepoRelative(second.target);
@@ -1087,7 +1399,7 @@ async function restoreFirstTarget(first, second, cause, stagedFiles) {
     `the new ${replaced} remains beside the unchanged ${unchanged}, so the committed pair may be inconsistent`;
   if (!first.existed) {
     try {
-      await fs.rm(first.target, { force: true });
+      await removeInsideCheckout(first.target);
     } catch (removeError) {
       return new GenerationError(
         `${reason}, and removing ${replaced}, which did not exist before, also failed ` +
@@ -1099,24 +1411,33 @@ async function restoreFirstTarget(first, second, cause, stagedFiles) {
     );
   }
   try {
+    await assertInsideCheckout(first.target);
     await fs.rename(first.original, first.target);
   } catch (restoreError) {
-    const index = stagedFiles.indexOf(first.original);
-    if (index !== -1) {
-      stagedFiles.splice(index, 1);
-    }
+    forgetStaged(stagedFiles, first.original);
     const recovery = toRepoRelative(first.original);
     const failure = `${reason}, and restoring ${replaced} also failed (${errorMessage(restoreError)}); ${inconsistent}`;
-    // A failed rename leaves its source in place, so the copy is named as kept unless it is known to be gone.
-    let kept = true;
+    // A failed rename leaves its source in place, so the copy is looked for where it was staged, and only through
+    // directories of this checkout; one reached through a link is not looked into.
+    let unexamined = null;
     try {
-      await fs.lstat(first.original);
+      await assertInsideCheckout(first.original);
+      if (!(await fs.lstat(first.original)).isFile()) {
+        unexamined = 'it is not a regular file';
+      }
     } catch (error) {
-      kept = error.code !== 'ENOENT';
+      if (error.code === 'ENOENT') {
+        return new GenerationError(
+          `${failure}; its staged copy ${recovery} is gone too, so run npm run api:generate again`,
+        );
+      }
+      unexamined = errorMessage(error);
     }
-    if (!kept) {
+    if (unexamined !== null) {
       return new GenerationError(
-        `${failure}; its staged copy ${recovery} is gone too, so run npm run api:generate again`,
+        `${failure}; its previous content was staged as ${recovery}, which could not be examined (${unexamined}): ` +
+          'make every directory it is reached through a directory of this checkout again, and check that it is a ' +
+          `regular file, before moving it back over ${replaced}, or run npm run api:generate again`,
       );
     }
     return new GenerationError(
@@ -1124,18 +1445,28 @@ async function restoreFirstTarget(first, second, cause, stagedFiles) {
         'npm run api:generate again',
     );
   }
+  forgetStaged(stagedFiles, first.original);
   return new GenerationError(
     `${reason}; ${replaced} was restored to its previous content, so neither committed file changed`,
   );
 }
 
-// Removes every staged name that still exists; a renamed one is already gone. Each removal is attempted, and a
-// failure names every file left behind.
+// Takes a staged name out of stagedFiles once it needs no removal: it was renamed over its target, or it is a copy
+// that is kept.
+function forgetStaged(stagedFiles, file) {
+  const index = stagedFiles.indexOf(file);
+  if (index !== -1) {
+    stagedFiles.splice(index, 1);
+  }
+}
+
+// Removes every staged name still listed that exists. Each removal is attempted, and a failure, a refusal of the
+// file's directories included, names every file left behind with its reason.
 async function removeStaged(stagedFiles) {
   const leftovers = [];
   for (const file of stagedFiles) {
     try {
-      await fs.rm(file, { force: true });
+      await removeInsideCheckout(file);
     } catch (error) {
       leftovers.push(`${toRepoRelative(file)} (${errorMessage(error)})`);
     }
@@ -1143,6 +1474,20 @@ async function removeStaged(stagedFiles) {
   if (leftovers.length > 0) {
     throw new GenerationError(`could not remove ${leftovers.join(', ')}; delete what is left by hand`);
   }
+}
+
+// Removes the file, as fs.rm with force does, once its directories are checked again (see assertInsideCheckout), so
+// the removal never leaves the checkout. A missing directory, like a missing file, leaves nothing to remove.
+async function removeInsideCheckout(file) {
+  try {
+    await assertInsideCheckout(file);
+  } catch (error) {
+    if (error.code === 'ENOENT') {
+      return;
+    }
+    throw error;
+  }
+  await fs.rm(file, { force: true });
 }
 
 // Runs a cleanup step once the operation it follows has ended, without letting it hide that operation's outcome.
@@ -1379,10 +1724,12 @@ function assertPinnedCacheMarker(properties, marker, description) {
 }
 
 // Removes src/EpiInfo.Api/obj/EpiInfo.Api.OpenApiFiles.cache, the marker a build without the pin in generateFresh
-// writes in the default layout. Generation no longer depends on it, so it is deleted only when it is certainly this
-// checkout's own leftover: a regular file in a directory that, symbolic links resolved, lies inside the checkout (the
-// canonical path generateFresh passes in). A missing directory or file, a directory that resolves elsewhere, such as a
-// symlinked or shared obj/, and anything other than a regular file are left untouched, and the run goes on.
+// writes in the default layout. Each run pins its own marker into its temporary directory, and removes this one only
+// when it is an eligible leftover of this checkout: a regular file in a directory that, symbolic links resolved, lies
+// inside the checkout (the canonical path generateFresh passes in). The generation lock has already refused an obj/
+// that is, or is reached through, a symbolic link or junction (see acquireLockFile); here too a missing directory or
+// file, a directory that resolves elsewhere, and anything other than a regular file are left untouched, and the run
+// goes on.
 async function removeObjLeftoverMarker(checkout) {
   const objDir = path.join(checkout, path.relative(repoRoot, path.dirname(defaultOpenApiCacheMarker)));
   let canonicalObjDir;
@@ -1665,8 +2012,9 @@ const generateUsage = () =>
       ['1', 'generation or publication failed; a failing dotnet or openapi-typescript run gives its own status'],
     ],
     interrupted:
-      'the temporary directory is removed, and no committed file is changed unless their publication was ' +
-      'already under way, which then completes or rolls back as a whole',
+      'removing the temporary directory and releasing the lock are attempted, a failure is reported, and no ' +
+      'committed file is changed unless their publication was already under way, which then completes or rolls ' +
+      'back as a whole',
   });
 
 // Importing this module, as check-api-fresh.mjs does, must not rewrite the committed files. Node names the main

@@ -373,7 +373,8 @@ public static class FakeForms
 /// It follows the record-set, read and write contract of <see cref="IDataStore"/> as the SQL Server store implements
 /// it: the selected set and <c>UniqueKey</c> order of <see cref="RecordQueryRules"/>, page rows read as a
 /// <c>LEFT JOIN</c> (missing pages give <see cref="FieldValue.Null"/>), search over records that have every page row,
-/// base-only soft delete, delta updates, and the gates of <see cref="UpdateAsync"/> in the interface's order. A
+/// base-only soft delete, delta updates, the gates of <see cref="UpdateAsync"/>, and each write's permission re-check
+/// from the permissions the store holds when the write runs, in the interface's order. A
 /// number written to a <c>float</c> column is stored as its nearest double, the binary64 value SQL Server holds and
 /// reads back, so <c>9007199254740993</c> reads as <c>9007199254740992</c>; every other value is stored exactly. A
 /// <c>values</c> key that is not a data field, a value not of its field's kind, or a value its column cannot store,
@@ -664,8 +665,10 @@ public sealed class FakeDataStore : IDataStore
 
     /// <summary>
     /// Sets the per-table permissions <see cref="GetPermissionsAsync"/> reports for a form, and that
-    /// <see cref="UpdateAsync"/> re-checks under its lock when it is given permissions; <see langword="null"/> reports
-    /// none, so the service runs no permission check, while an update given permissions then grants nothing.
+    /// <see cref="InsertAsync"/>, <see cref="UpdateAsync"/> and <see cref="SoftDeleteAsync"/> re-check under the
+    /// store's lock when they are given permissions; <see langword="null"/> reports none, so the service runs no
+    /// permission check, while a write given permissions then grants nothing. Any change armed by
+    /// <see cref="SetPermissionsAfterNextRead"/> is cancelled.
     /// </summary>
     /// <param name="viewId">The form's view id.</param>
     /// <param name="permissions">The base-table and page-table entries, or <see langword="null"/>.</param>
@@ -674,7 +677,32 @@ public sealed class FakeDataStore : IDataStore
     {
         lock (_gate)
         {
-            Resolve(viewId).Permissions = permissions;
+            var state = Resolve(viewId);
+            state.Permissions = permissions;
+            state.PermissionsAfterNextRead = null;
+        }
+    }
+
+    /// <summary>
+    /// Arms one change of a form's permissions, applied right after the next <see cref="GetPermissionsAsync"/> of
+    /// that form has read the permissions it reports: that read still reports the permissions held before it, and
+    /// every later read and every write's re-check sees <paramref name="permissions"/>. It models a grant changed
+    /// between the service's own permission read and the store's transaction, which the SQL Server store's
+    /// in-transaction permission read sees and the service's earlier read does not.
+    /// </summary>
+    /// <remarks>
+    /// The change fires once. A read that fails before it reads the permissions, by an injected failure or
+    /// cancellation, leaves it armed. Arming it again replaces the change armed earlier, and
+    /// <see cref="SetPermissions"/> cancels it.
+    /// </remarks>
+    /// <param name="viewId">The form's view id.</param>
+    /// <param name="permissions">The permissions held after that read, or <see langword="null"/> for none.</param>
+    /// <exception cref="ArgumentException">The form is unknown.</exception>
+    public void SetPermissionsAfterNextRead(int viewId, FormPermissions? permissions)
+    {
+        lock (_gate)
+        {
+            Resolve(viewId).PermissionsAfterNextRead = new PendingPermissions(permissions);
         }
     }
 
@@ -705,8 +733,9 @@ public sealed class FakeDataStore : IDataStore
     /// Makes every later call to <paramref name="method"/> throw <paramref name="exception"/> at
     /// <paramref name="stage"/>, replacing any failure set for that method. A read throws once its call is logged;
     /// a write throws at its first data statement (<see cref="FakeFailureStage.BeforeWrite"/>) or once its change is
-    /// applied and logged (<see cref="FakeFailureStage.AfterWrite"/>). <c>UpdateAsync</c> and <c>SoftDeleteAsync</c>
-    /// reach that stage only for an active record that passes the gates.
+    /// applied and logged (<see cref="FakeFailureStage.AfterWrite"/>). <c>InsertAsync</c> reaches that stage only when
+    /// its permission check passes, and <c>UpdateAsync</c> and <c>SoftDeleteAsync</c> only for an active record that
+    /// passes the gates.
     /// </summary>
     /// <remarks>
     /// <para>
@@ -1127,16 +1156,27 @@ public sealed class FakeDataStore : IDataStore
             lock (_gate)
             {
                 BeginRead(nameof(GetPermissionsAsync), cancellationToken);
-                return Resolve(form).Permissions;
+                var state = Resolve(form);
+                var read = state.Permissions;
+
+                // A change SetPermissionsAfterNextRead armed takes effect once this read has its answer.
+                if (state.PermissionsAfterNextRead is { } pending)
+                {
+                    state.Permissions = pending.Permissions;
+                    state.PermissionsAfterNextRead = null;
+                }
+
+                return read;
             }
         });
 
 
     /// <inheritdoc />
-    public Task<RecordDto> InsertAsync(
+    public Task<RecordWriteResult> InsertAsync(
         FormMetadata form,
         IReadOnlyDictionary<string, FieldValue> values,
         SaveStamp stamp,
+        FormPermissions? permissions,
         CancellationToken cancellationToken) =>
         Complete(() =>
         {
@@ -1148,6 +1188,16 @@ public sealed class FakeDataStore : IDataStore
                 ThrowIfEveryMemberFails();
                 var state = Resolve(form);
                 var normalised = NormaliseValues(state, values, nameof(values), admitReadOnly: false);
+
+                // Before the first data statement, the insert needs INSERT on the base table and every page table. As
+                // the SQL store reads the grants again inside its transaction, the decision comes from the permissions
+                // this store holds now, under the lock, never from the caller's earlier read, which only turns the
+                // check on. Holding none then grants nothing, so the check fails closed.
+                if (permissions is not null
+                    && !(state.Permissions ?? new FormPermissions([])).CanInsert(state.Form.Metadata))
+                {
+                    return RecordWriteResult.Forbidden();
+                }
 
                 // The first data statement: the base-row insert.
                 ThrowInjected(nameof(InsertAsync), FakeFailureStage.BeforeWrite);
@@ -1172,7 +1222,7 @@ public sealed class FakeDataStore : IDataStore
                 var snapshot = Dto(state, row);
 
                 ThrowInjected(nameof(InsertAsync), FakeFailureStage.AfterWrite);
-                return snapshot;
+                return RecordWriteResult.Success(snapshot);
             }
         });
 
@@ -1293,6 +1343,7 @@ public sealed class FakeDataStore : IDataStore
         FormMetadata form,
         string globalRecordId,
         Func<SaveStamp> createStamp,
+        FormPermissions? permissions,
         CancellationToken cancellationToken) =>
         Complete(() =>
         {
@@ -1312,14 +1363,25 @@ public sealed class FakeDataStore : IDataStore
                     return SoftDeleteResult.NotFound();
                 }
 
-                // A found record's result carries its id as stored, which the lookup matched ignoring case, as the
-                // SQL store's locked read returns it.
+                // A deleted or already-deleted result carries the found record's id as stored, which the lookup
+                // matched ignoring case, as the SQL store's locked read returns it; a refused one carries none.
                 if (row.RecStatus == RecordQueryRules.DeletedRecStatus)
                 {
                     return SoftDeleteResult.AlreadyDeleted(row.GlobalRecordId);
                 }
 
-                // Only an active record is written, so only it needs a stamp, created before the data statement.
+                // After the locked read finds an active record, the soft delete needs UPDATE on the base table. As the
+                // SQL store reads the grant again inside its transaction, the decision comes from the permissions this
+                // store holds now, under the lock, never from the caller's earlier read, which only turns the check on.
+                // Holding none then grants nothing, so the check fails closed.
+                if (permissions is not null
+                    && !(state.Permissions ?? new FormPermissions([])).CanDelete(state.Form.Metadata))
+                {
+                    return SoftDeleteResult.Forbidden();
+                }
+
+                // Only an active record the checks let through is written, so only it needs a stamp, created before
+                // the data statement.
                 var stamp = CreateStamp(nameof(SoftDeleteAsync), createStamp);
 
                 ThrowInjected(nameof(SoftDeleteAsync), FakeFailureStage.BeforeWrite);
@@ -1873,6 +1935,9 @@ public sealed class FakeDataStore : IDataStore
 
         public FormPermissions? Permissions { get; set; }
 
+        // The change SetPermissionsAfterNextRead armed, or null when none is armed.
+        public PendingPermissions? PermissionsAfterNextRead { get; set; }
+
         public IEnumerable<int> PageIds => Form.Metadata.Pages.Select(page => page.PageId);
 
         public StoredRow? Find(string globalRecordId) =>
@@ -1889,6 +1954,9 @@ public sealed class FakeDataStore : IDataStore
         public void Replace(StoredRow current, StoredRow updated) =>
             Rows = Rows.Replace(current, updated, ReferenceEqualityComparer.Instance);
     }
+
+    // A permission change armed to follow the next permission read; Permissions may be null, which then holds none.
+    private sealed record PendingPermissions(FormPermissions? Permissions);
 
     // One record, immutable once published: a write replaces the row rather than changing it. Values is keyed by
     // canonical data-field name, compared ordinally as every values map is, and holds every data field; PresentPageIds

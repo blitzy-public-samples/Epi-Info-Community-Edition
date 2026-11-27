@@ -9,10 +9,12 @@
  * - `enabled`/`disabled` set only the check-code flag. Protected state (read-only
  *   metadata, a deleted record, an unsupported field) is not represented here, so an
  *   `ENABLE` can never unlock a protected control.
- * - `cleared`/`assigned` lose to a user edit made after the event was captured.
- *   Applied to a writable field they mark it dirty, so the next save sends it; applied
- *   to a read-only field the value is shown but never sent, because a read-only field
- *   in a write body is a 400 (C-3 in docs/parity-notes.md).
+ * - `cleared`/`assigned` reach only data fields and lose to a user edit made after the
+ *   event was captured. Applied to a writable field they mark it dirty, so the next save
+ *   sends it; applied to a read-only field the value is shown but never sent, because a
+ *   read-only field in a write body is a 400 (C-3 in docs/parity-notes.md). Which fields
+ *   are data fields and which are writable is decided by `isDataField` and
+ *   `isWritableDataField` of validation/clientValidation, the predicates the save uses.
  */
 import type {
   Diagnostic,
@@ -23,6 +25,7 @@ import type {
   FormDefinition,
   Values,
 } from '../api/types';
+import { isDataField, isWritableDataField } from '../validation/clientValidation';
 
 /** The editor state a field-event response acts on. */
 export interface EditorSnapshot {
@@ -50,20 +53,6 @@ export interface ApplyFieldEventResult {
   diagnostics: Diagnostic[];
 }
 
-/** A field with a page-table column: not a label, a group or an unsupported field. */
-function isDataField(field: FieldDefinition): boolean {
-  return (
-    !field.unsupported &&
-    field.fieldType !== 'label' &&
-    field.fieldType !== 'group' &&
-    field.fieldType !== 'unsupported'
-  );
-}
-
-function isReadOnly(field: FieldDefinition): boolean {
-  return field.validation.readOnly === true;
-}
-
 function indexFields(definition: FormDefinition): Map<string, FieldDefinition> {
   const fields = new Map<string, FieldDefinition>();
   for (const page of definition.pages) {
@@ -76,8 +65,9 @@ function indexFields(definition: FormDefinition): Map<string, FieldDefinition> {
   return fields;
 }
 
-// The response body is typed from the OpenAPI document but not validated at run time,
-// so a member missing from a malformed payload is read as empty instead of throwing.
+// The record editor's queue passes only an answer that the client's raiseFieldEvent has
+// checked, with all six members present in their contract types. These defaults are a guard
+// for a direct caller: a list or map it leaves out is read as empty instead of throwing.
 function listOf<T>(list: readonly T[] | null | undefined): readonly T[] {
   return list ?? [];
 }
@@ -114,10 +104,10 @@ export function applyFieldEvent(input: ApplyFieldEventInput): ApplyFieldEventRes
       return;
     }
     updates.set(name, value);
-    if (isReadOnly(field)) {
-      dirty.delete(name);
-    } else {
+    if (isWritableDataField(field)) {
       dirty.add(name);
+    } else {
+      dirty.delete(name);
     }
   };
 

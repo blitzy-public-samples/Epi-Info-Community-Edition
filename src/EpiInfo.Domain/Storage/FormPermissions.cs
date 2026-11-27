@@ -52,13 +52,21 @@ public sealed record TablePermission(string TableName, bool CanInsert, bool CanU
 /// methods to each write, with no copy of the rule:
 /// </para>
 /// <list type="bullet">
-/// <item><description><c>POST</c> needs <see cref="CanInsert"/>.</description></item>
+/// <item><description>
+/// <c>POST</c> needs <see cref="CanInsert"/>; then, once the insert holds the form's lock and before any statement
+/// that changes data, the store re-checks <see cref="CanInsert"/> from its own permission read inside the
+/// transaction.
+/// </description></item>
 /// <item><description>
 /// <c>PUT</c> needs <see cref="CanUpdate"/>; then, after the locked read and the required gate and before any
 /// statement that changes data, the store re-checks <see cref="CanUpdate"/> and requires <see cref="CanInsertInto"/>
 /// for each page whose row is missing, from its own permission read inside the transaction.
 /// </description></item>
-/// <item><description><c>DELETE</c> needs <see cref="CanDelete"/>.</description></item>
+/// <item><description>
+/// <c>DELETE</c> needs <see cref="CanDelete"/>; then, after the locked read finds an active record and before any
+/// statement that changes data, the store re-checks <see cref="CanDelete"/> from its own permission read of the base
+/// table inside the transaction.
+/// </description></item>
 /// <item><description>A denied write is a 403 and nothing is written.</description></item>
 /// </list>
 /// <para>

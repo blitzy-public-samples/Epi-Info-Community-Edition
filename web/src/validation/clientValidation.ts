@@ -6,7 +6,7 @@
 // value or against a whole bound beyond the safe range, the number mask of an exact decimal,
 // unknown, repeated or ambiguous names) is left to the server's 400 `errors` map. No message ever contains a submitted
 // value, only metadata.
-import { isExactDecimal } from '../api/client';
+import { isExactDecimal, isWireDate } from '../api/client';
 import type { FieldDefinition, FieldType, FieldValue, FormDefinition, PageDefinition, Values } from '../api/types';
 
 // A submitted value that is not empty.
@@ -24,33 +24,9 @@ function emptyFieldErrors(): FieldErrors {
   return Object.create(null) as FieldErrors;
 }
 
-/**
- * The legacy `FIELD_IS_REQUIRED_LONG` text (Epi.Core/SharedStrings.resx), byte for byte, trailing
- * space included, as the server's `ValidationMessages.FieldIsRequiredLong` holds it. `{0}` is the
- * field prompt and `{1}` the page name.
- */
-export const FIELD_IS_REQUIRED_LONG =
-  '{0} is a required field (page {1}). Please fill in this field before attempting to leave the record, save data, or close the form. ';
-
-// The placeholders of FIELD_IS_REQUIRED_LONG, filled in one pass: a prompt that itself holds "{1}"
-// or "$&" is inserted literally, as .NET string.Format inserts it.
-const REQUIRED_PLACEHOLDERS = /\{([01])\}/g;
-
-/**
- * Formats {@link FIELD_IS_REQUIRED_LONG} for one missing field with its prompt and page name, as
- * legacy and the server's `FormatFieldIsRequired` do. The prompt is inserted exactly as given, an
- * empty or whitespace-only prompt included; a missing prompt (`null` or `undefined`) is inserted as
- * empty text.
- */
-export function formatRequiredMessage(prompt: string | null | undefined, pageName: string): string {
-  const subject = prompt ?? '';
-  return FIELD_IS_REQUIRED_LONG.replace(REQUIRED_PLACEHOLDERS, (_placeholder: string, index: string) =>
-    index === '0' ? subject : pageName,
-  );
-}
-
 /** The client's own feedback texts. Builders take metadata only, never a submitted value. */
 export const clientMessages = Object.freeze({
+  required: 'This field is required.',
   textExpected: 'Enter text.',
   numberExpected: 'Enter a number.',
   dateExpected: 'Enter a valid date (YYYY-MM-DD).',
@@ -71,20 +47,35 @@ export function isTextFamily(fieldType: FieldType): boolean {
   return fieldType === 'text' || fieldType === 'multiline' || fieldType === 'legalValues';
 }
 
-/** Whether the field has a page-table column that `values` carries: not a label, group or unsupported field. */
+// Whether a field of each published type has a page-table column that `values` carries. Keyed by
+// the contract's FieldType, so a renamed, added or removed field type fails tsc here.
+const DATA_FIELD_TYPES: Readonly<Record<FieldType, boolean>> = {
+  label: false,
+  group: false,
+  text: true,
+  multiline: true,
+  number: true,
+  date: true,
+  checkbox: true,
+  option: true,
+  legalValues: true,
+  unsupported: false,
+};
+
+/**
+ * Whether the field has a page-table column that `values` carries: a `text`, `multiline`,
+ * `legalValues`, `number`, `date`, `checkbox` or `option` field not flagged `unsupported`. A label,
+ * group or unsupported field is not, and neither is a type the contract does not publish, which a
+ * malformed response can carry and FieldRenderer shows as a protected placeholder that is never
+ * written; only the table's own keys count, so a type named like an Object member (`constructor`,
+ * `__proto__`) is none.
+ */
 export function isDataField(field: FieldDefinition): boolean {
   if (field.unsupported === true) {
     return false;
   }
 
-  switch (field.fieldType) {
-    case 'label':
-    case 'group':
-    case 'unsupported':
-      return false;
-    default:
-      return true;
-  }
+  return Object.hasOwn(DATA_FIELD_TYPES, field.fieldType) && DATA_FIELD_TYPES[field.fieldType];
 }
 
 /** Whether the client may send the field: a data field that is not read-only. */
@@ -105,36 +96,10 @@ export function normalizeValue(field: FieldDefinition, raw: FieldValue | undefin
   return raw === '' && isTextFamily(field.fieldType) ? null : raw;
 }
 
-// Exactly YYYY-MM-DD with ASCII digits; without the m flag, `$` matches only at the end of the text.
-const ISO_DATE = /^(\d{4})-(\d{2})-(\d{2})$/;
-
-// The range of a datetime column, the only column a date field is admitted on.
+// The range of a datetime column, the only column a date field is admitted on: a save rule, which
+// checkType applies to a wire date (isWireDate) alone.
 const MIN_STORABLE_DATE = '1753-01-01';
 const MAX_STORABLE_DATE = '9999-12-31';
-
-// Integer arithmetic only: Date.parse and new Date(y, …) shift years 0-99 and roll overflowing days
-// into the next month. Year 0000 is rejected, as the server's DateOnly parse rejects it.
-function isCalendarDate(text: string): boolean {
-  const match = ISO_DATE.exec(text);
-  if (match === null) {
-    return false;
-  }
-
-  const year = Number(match[1]);
-  const month = Number(match[2]);
-  const day = Number(match[3]);
-  if (year < 1 || month < 1 || month > 12 || day < 1) {
-    return false;
-  }
-
-  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
-  const daysInMonth = month === 2 ? (leapYear ? 29 : 28) : [4, 6, 9, 11].includes(month) ? 30 : 31;
-  return day <= daysInMonth;
-}
-
-function isIsoDateBound(bound: FieldValue | undefined): bound is string {
-  return typeof bound === 'string' && ISO_DATE.test(bound);
-}
 
 // A number bound the client checks: a finite number that is not a whole number beyond the safe range.
 // Such a bound may be the nearest double of a different metadata bound, which a message would then
@@ -209,7 +174,7 @@ function checkType(field: FieldDefinition, value: PresentValue): string | null {
         ? null
         : clientMessages.numberExpected;
     case 'date':
-      if (typeof value !== 'string' || !isCalendarDate(value)) {
+      if (!isWireDate(value)) {
         return clientMessages.dateExpected;
       }
       return value < MIN_STORABLE_DATE || value > MAX_STORABLE_DATE ? clientMessages.dateNotStorable : null;
@@ -264,8 +229,8 @@ function checkRange(field: FieldDefinition, value: PresentValue): string | null 
   }
 
   if (field.fieldType === 'date' && typeof value === 'string') {
-    const lowerBound = isIsoDateBound(lower) ? lower : null;
-    const upperBound = isIsoDateBound(upper) ? upper : null;
+    const lowerBound = isWireDate(lower) ? lower : null;
+    const upperBound = isWireDate(upper) ? upper : null;
     const outOfRange = (lowerBound !== null && value < lowerBound) || (upperBound !== null && value > upperBound);
     return outOfRange ? describeRange(lowerBound, upperBound) : null;
   }
@@ -554,10 +519,10 @@ function isRequiredGated(field: FieldDefinition): boolean {
 /**
  * The required gate over the effective record (the draft laid over the loaded record; the draft
  * alone for a new record). Every missing required field is listed, in page then tab order, with the
- * legacy `FIELD_IS_REQUIRED_LONG` wording. A field is missing when its value is absent, `null` or
- * empty text, as on the server; whitespace is a value. Only writable fields are checked here: the
- * client can never fill a read-only field, so a required read-only one is reported by the server's
- * gate instead.
+ * client's own required text; the server's 400 carries the legacy required-field wording. A field
+ * is missing when its value is absent, `null` or empty text, as on the server; whitespace is a
+ * value. Only writable fields are checked here: the client can never fill a read-only field, so a
+ * required read-only one is reported by the server's gate instead.
  */
 export function checkRequired(definition: FormDefinition, effective: Values): FieldErrors {
   const errors = emptyFieldErrors();
@@ -571,7 +536,7 @@ export function checkRequired(definition: FormDefinition, effective: Values): Fi
       const raw = Object.hasOwn(effective, field.name) ? effective[field.name] : undefined;
       const value = normalizeValue(field, raw);
       if (value === null || value === '') {
-        errors[field.name] = [formatRequiredMessage(field.prompt, page.name)];
+        errors[field.name] = [clientMessages.required];
       }
     }
   }

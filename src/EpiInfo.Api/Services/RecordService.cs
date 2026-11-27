@@ -52,7 +52,10 @@ public sealed record RecordCountResponse(int Count);
 /// </para>
 /// <para>
 /// <b>Permissions.</b> Each write reads the login's permissions afresh. A store that reports none
-/// (<see langword="null"/>) means no check; otherwise a denied write is a 403 before any data statement.
+/// (<see langword="null"/>) means no check; otherwise a denied write is a 403 before any transaction, and the service
+/// hands what it read to the store, which reads the permissions again inside the write's transaction, before its first
+/// data statement, and refuses a write they no longer allow, which the service answers with the same 403 and nothing
+/// written. The service's own read therefore only turns that check on and never decides a write the store runs.
 /// </para>
 /// <para>
 /// <b>Redaction.</b> Log lines use one fixed template whose arguments are the form, the view id, the record id, the
@@ -312,7 +315,11 @@ public sealed partial class RecordService(
     /// <item><description>a denied insert permission is a 403.</description></item>
     /// </list>
     /// <para>
-    /// The store then inserts the base row and every page row and builds the response inside one transaction.
+    /// The store then inserts the base row and every page row and builds the response inside one transaction. Once
+    /// that transaction holds the form's insert lock, and before its base row is inserted, the store reads the
+    /// permissions again inside it and refuses, with nothing written, an insert the login may no longer apply: INSERT
+    /// denied on the base table or a page table. That refusal is the same 403. The service's earlier read only turns
+    /// that check on.
     /// </para>
     /// </remarks>
     /// <param name="httpContext">The current request, which carries the <see cref="WriteOutcomeFeature"/>.</param>
@@ -323,7 +330,7 @@ public sealed partial class RecordService(
     /// <param name="cancellationToken">The request's abort token.</param>
     /// <returns>
     /// 201 with the new <see cref="RecordDto"/> and <c>Location: /api/forms/{viewId}/records/{globalRecordId}</c>, or
-    /// the 400, 403 or 404 described in the remarks.
+    /// the 400, 403 or 404 described in the remarks, the 403 before the store or by its in-transaction re-check.
     /// </returns>
     /// <exception cref="ArgumentNullException"><paramref name="httpContext"/> is <see langword="null"/>.</exception>
     public async Task<IResult> CreateAsync(
@@ -362,16 +369,30 @@ public sealed partial class RecordService(
         var outcome = WriteOutcomeFeature.GetOrCreate(httpContext);
         outcome.MarkWriteStarted();
 
-        var record = await store.InsertAsync(form, check.Values, stamp, cancellationToken).ConfigureAwait(false);
+        var result = await store.InsertAsync(form, check.Values, stamp, permissions, cancellationToken)
+            .ConfigureAwait(false);
 
-        // The store returned, so it committed; nothing after this line reads the database.
-        outcome.MarkWritten();
-        LogWrite(form, InsertOperation, record.GlobalRecordId, CommittedOutcome);
+        switch (result.Status)
+        {
+            case RecordWriteStatus.Success when result.IsSuccess:
+                // The store reported the commit; nothing after this line reads the database.
+                outcome.MarkWritten();
+                LogWrite(form, InsertOperation, result.Record.GlobalRecordId, CommittedOutcome);
 
-        var location = string.Create(
-            CultureInfo.InvariantCulture,
-            $"/api/forms/{viewId}/records/{Uri.EscapeDataString(record.GlobalRecordId)}");
-        return TypedResults.Created(location, record);
+                var location = string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"/api/forms/{viewId}/records/{Uri.EscapeDataString(result.Record.GlobalRecordId)}");
+                return TypedResults.Created(location, result.Record);
+
+            // The store's own permission read refused the insert and wrote nothing, so a failure while this response
+            // is written must report notWritten, not unknown.
+            case RecordWriteStatus.Forbidden:
+                outcome.MarkNotWritten();
+                return ApiProblems.Forbidden(ForbiddenAction.Insert);
+
+            default:
+                throw new InvalidOperationException("The store returned an insert result outside its contract.");
+        }
     }
 
     /// <summary>Updates a record as a delta for <c>PUT /api/forms/{viewId}/records/{globalRecordId}</c>.</summary>
@@ -492,15 +513,22 @@ public sealed partial class RecordService(
     /// </summary>
     /// <remarks>
     /// <para>
-    /// The log line that follows a found record, committed or unchanged, names it by the <c>GlobalRecordId</c> the
-    /// store's locked read returned, as stored. It therefore carries the spelling the record's insert and update lines
-    /// carry, whatever letter case the route used.
+    /// The log line that follows a record the store deleted or found already deleted names it by the
+    /// <c>GlobalRecordId</c> the store's locked read returned, as stored. It therefore carries the spelling the
+    /// record's insert and update lines carry, whatever letter case the route used. The store's refusal carries no id,
+    /// and no such line follows it.
     /// </para>
     /// <para>
-    /// The store calls <see cref="SaveStampProvider.Create"/> only when its locked read finds an active record, so the
-    /// 404 and the already-deleted 204 never need a stamp. A stamp that cannot be made, because the process has no OS
-    /// user name, fails only the delete of an active record, as the store's failure with nothing written: a 500 whose
-    /// <c>writeOutcome</c> is <c>notWritten</c>.
+    /// After a denied delete permission is a 403, the store's locked read decides the 404 and the already-deleted
+    /// 204. For an active record, the store then reads the base table's permissions again inside its transaction and
+    /// refuses, with nothing written, a delete the login may no longer apply: UPDATE denied on the base table. That
+    /// refusal is the same 403. The service's earlier read only turns that check on.
+    /// </para>
+    /// <para>
+    /// The store calls <see cref="SaveStampProvider.Create"/> only when its locked read finds an active record and its
+    /// permission check passes, so the 404, the already-deleted 204 and the 403 never need a stamp. A stamp that
+    /// cannot be made, because the process has no OS user name, fails only the delete of an active record, as the
+    /// store's failure with nothing written: a 500 whose <c>writeOutcome</c> is <c>notWritten</c>.
     /// </para>
     /// </remarks>
     /// <param name="httpContext">The current request, which carries the <see cref="WriteOutcomeFeature"/>.</param>
@@ -509,8 +537,8 @@ public sealed partial class RecordService(
     /// <param name="cancellationToken">The request's abort token.</param>
     /// <returns>
     /// 204 when the record was deleted, and also when it was already deleted, in which case nothing is written, stamps
-    /// included, so a repeated <c>DELETE</c> is safe; 403 for a denied permission; or 404 for an unknown form or
-    /// record.
+    /// included, so a repeated <c>DELETE</c> is safe; 403 for a denied permission, before the store or by its
+    /// in-transaction re-check; or 404 for an unknown form or record.
     /// </returns>
     /// <exception cref="ArgumentNullException">
     /// <paramref name="httpContext"/> or <paramref name="globalRecordId"/> is <see langword="null"/>.
@@ -536,12 +564,12 @@ public sealed partial class RecordService(
             return ApiProblems.Forbidden(ForbiddenAction.Delete);
         }
 
-        // The store creates the stamp only for an active record, the one case that writes, so a 404 and the
-        // already-deleted 204 need none.
+        // The store makes the stamp only for an active record its permission check lets through, the one case that
+        // writes, so a 404, the already-deleted 204 and the store's 403 need none.
         var outcome = WriteOutcomeFeature.GetOrCreate(httpContext);
         outcome.MarkWriteStarted();
 
-        var result = await store.SoftDeleteAsync(form, globalRecordId, stamps.Create, cancellationToken)
+        var result = await store.SoftDeleteAsync(form, globalRecordId, stamps.Create, permissions, cancellationToken)
             .ConfigureAwait(false);
 
         // Each log line names the record by the stored id the store returned, never by the route's spelling.
@@ -553,7 +581,7 @@ public sealed partial class RecordService(
                 LogWrite(form, SoftDeleteOperation, result.GlobalRecordId, CommittedOutcome);
                 return TypedResults.NoContent();
 
-            // Both results below mean the store wrote nothing, so a failure while the response is written must report
+            // Each result below means the store wrote nothing, so a failure while the response is written must report
             // notWritten, not unknown; an already-deleted record is never marked written.
             case SoftDeleteStatus.AlreadyDeleted when result.IsFound:
                 outcome.MarkNotWritten();
@@ -563,6 +591,10 @@ public sealed partial class RecordService(
             case SoftDeleteStatus.NotFound:
                 outcome.MarkNotWritten();
                 return ApiProblems.RecordNotFound();
+
+            case SoftDeleteStatus.Forbidden:
+                outcome.MarkNotWritten();
+                return ApiProblems.Forbidden(ForbiddenAction.Delete);
 
             default:
                 throw new InvalidOperationException("The store returned a delete result outside its contract.");
@@ -624,8 +656,9 @@ public sealed partial class RecordService(
         return true;
     }
 
-    // The one place a write meets the permission rule, whose derivation FormPermissions owns. A store that reports no
-    // permissions means no check, so a SQL permission failure then surfaces from the write itself.
+    // The one place the service's own read meets the permission rule, whose derivation FormPermissions owns; the store
+    // applies the same rule again inside each write's transaction. A store that reports no permissions means no check,
+    // so a SQL permission failure then surfaces from the write itself.
     private static bool IsAllowed(FormPermissions? permissions, FormMetadata form, ForbiddenAction action) =>
         permissions is null || action switch
         {

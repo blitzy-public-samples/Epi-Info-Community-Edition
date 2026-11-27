@@ -17,6 +17,8 @@
 //   A DELETE is acknowledged by its bodyless 204 alone; any other 2xx offers Retry.
 // - A response whose body cannot be read, cut off or not JSON, is a failure of the status
 //   it carried, never the no-response case, and states no write outcome.
+// - Every request is sent same-origin with redirect 'error', and a redirect, followed or
+//   not, is the no-response case, whatever it leads to (0.3.7).
 // - C-6: Delete asks first; Cancel sends nothing, Confirm sends exactly one DELETE.
 // - P2 permissions (0.2.4): a save the definition's flags deny sends no request; a known
 //   denial or a 403 keeps the draft and offers Discard edits, which reverts it in place.
@@ -367,6 +369,53 @@ function nullBodyAdvertisingFive(status: 204 | 205 | 304): Response {
 /** A request that never received a response. */
 function networkFailure(): Promise<Response> {
   return Promise.reject(new TypeError('Failed to fetch'));
+}
+
+// Redirects in place of the API's answer. Each answer below would read as a proven outcome or
+// a success were it taken for the API's own, so only its refusal as no response passes.
+
+/** Where a redirect from something between the client and the API sends a request: another origin. */
+const REDIRECT_TARGET = 'http://elsewhere.example/api/forms';
+
+/** `response` as fetch reports it after following a redirect to it. */
+function asRedirected(response: Response): Response {
+  Object.defineProperty(response, 'redirected', { value: true });
+  return response;
+}
+
+/** What fetch returns for a redirect under redirect 'manual': an opaque redirect, status 0, no body. */
+function opaqueRedirect(): Response {
+  const response = new Response(null, { status: 200 });
+  Object.defineProperties(response, {
+    type: { value: 'opaqueredirect' },
+    status: { value: 0 },
+    ok: { value: false },
+  });
+  return response;
+}
+
+/** A 307 to REDIRECT_TARGET, as a transport that follows no redirect returns it, whose body claims `notWritten`. */
+function temporaryRedirect(): Response {
+  return new Response(JSON.stringify({ title: 'Temporary Redirect', status: 307, writeOutcome: 'notWritten' }), {
+    status: 307,
+    headers: { location: REDIRECT_TARGET, 'content-type': 'application/problem+json' },
+  });
+}
+
+/**
+ * Fetch's handling of a 307 to REDIRECT_TARGET, by the request's redirect mode: 'error'
+ * rejects with a TypeError, 'manual' gives an opaque redirect, and 'follow' gives the
+ * target's notWritten 503.
+ */
+function fetchRedirecting(request: Request): Promise<Response> {
+  switch (request.redirect) {
+    case 'error':
+      return Promise.reject(new TypeError('Failed to fetch'));
+    case 'manual':
+      return Promise.resolve(opaqueRedirect());
+    case 'follow':
+      return Promise.resolve(asRedirected(problem(503, { writeOutcome: 'notWritten' })));
+  }
 }
 
 // Request bodies, read as `unknown` and narrowed
@@ -979,9 +1028,7 @@ describe('validation', () => {
     expect(api.calls).toEqual([]);
     expect(Object.keys(result.current.fieldErrors)).toEqual([OTHER_TEXT]);
     const messages = result.current.fieldErrors[OTHER_TEXT];
-    expect(messages).toHaveLength(1);
-    expect(messages[0]).toContain(fieldByName(OTHER_TEXT).prompt ?? OTHER_TEXT);
-    expect(messages[0]).toContain('is a required field');
+    expect(messages).toEqual([clientMessages.required]);
     expect(result.current.banner).toBeNull();
   });
 
@@ -1000,6 +1047,23 @@ describe('validation', () => {
     expect(sentValues(api.calls[0])).toEqual({ [TEXT]: 'Jones' });
     expect(result.current.fieldErrors).toEqual({});
     expect(onSaved).toHaveBeenCalledWith(saved);
+  });
+
+  // A date value is first a wire date, YYYY-MM-DD naming a real day of the years 0001-9999, as
+  // every response's dates are; only a wire date then meets the datetime column's storage range,
+  // a save rule alone, which no field event applies.
+  it.each<[string, FieldValue, string[]]>([
+    ['a leap day', '2000-02-29', []],
+    ['the first day a datetime column stores', '1753-01-01', []],
+    ['the last day a datetime column stores', '9999-12-31', []],
+    ['a day the calendar lacks', '2011-02-29', [clientMessages.dateExpected]],
+    ['year 0000', '0000-01-01', [clientMessages.dateExpected]],
+    ['the legacy MM-DD-YYYY text', '01-15-2011', [clientMessages.dateExpected]],
+    ['a number', 20110115, [clientMessages.dateExpected]],
+    ['the day before the datetime range', '1752-12-31', [clientMessages.dateNotStorable]],
+    ['the first wire date', '0001-01-01', [clientMessages.dateNotStorable]],
+  ])('gives feedback on %s in a date field', (_case, value, messages) => {
+    expect(validateField(fieldByName('DOB'), value)).toEqual(messages);
   });
 
   // A digit in a text '#' mask is a literal, as on the server: '##-2' needs two digits, a hyphen and a 2.
@@ -1063,9 +1127,9 @@ describe('validation', () => {
 
   // Synthetic metadata: a plain writable text field renamed `__proto__`, the name of Object's
   // prototype accessor. Its message must stay an own entry of the editor's error map, so the
-  // invalid new record is stopped before any request. The required messages are the legacy text
-  // typed out, the prompt inserted verbatim, a blank one included; the format message, whose
-  // wording the plan leaves open, is matched by the limit it states.
+  // invalid new record is stopped before any request. The required message is the client's own
+  // required text; the format message, whose wording the plan leaves open, is matched by the
+  // limit it states.
   it.each<{
     readonly feedback: string;
     readonly update: (field: FieldDefinition) => FieldDefinition;
@@ -1079,33 +1143,13 @@ describe('validation', () => {
       expected: [/\b3\b/],
     },
     {
-      feedback: 'the required message with its prompt',
-      update: (field) => ({ ...field, prompt: 'Nickname', validation: { ...field.validation, required: true } }),
+      feedback: 'the required message',
+      update: (field) => ({ ...field, validation: { ...field.validation, required: true } }),
       enter: [[OTHER_TEXT, 'Smith']],
-      expected: [
-        'Nickname is a required field (page Page 1). Please fill in this field before attempting to leave the record, save data, or close the form. ',
-      ],
-    },
-    {
-      feedback: 'the required message with a whitespace prompt',
-      update: (field) => ({ ...field, prompt: '   ', validation: { ...field.validation, required: true } }),
-      enter: [[OTHER_TEXT, 'Smith']],
-      expected: [
-        '    is a required field (page Page 1). Please fill in this field before attempting to leave the record, save data, or close the form. ',
-      ],
-    },
-    {
-      feedback: 'the required message with an empty prompt',
-      update: (field) => ({ ...field, prompt: '', validation: { ...field.validation, required: true } }),
-      enter: [[OTHER_TEXT, 'Smith']],
-      expected: [
-        ' is a required field (page Page 1). Please fill in this field before attempting to leave the record, save data, or close the form. ',
-      ],
+      expected: [clientMessages.required],
     },
   ])('keeps $feedback for a field named __proto__ and sends nothing', async ({ update, enter, expected }) => {
     const definition = withField(TEXT, (field) => update({ ...field, name: '__proto__' }));
-    const page = definition.pages.find((candidate) => candidate.fields.some((field) => field.name === '__proto__'));
-    expect(page?.name).toBe('Page 1');
     const { api, result } = mountNew(definition);
     for (const [name, value] of enter) {
       edit(result, name, value);
@@ -1661,8 +1705,6 @@ const UNTRUSTED_NOT_WRITTEN: readonly {
   /** Laid over the conforming body; an `undefined` member is left out. */
   readonly members: Readonly<Record<string, unknown>>;
   readonly traceId: string | null;
-  /** The response arrived through a redirect that fetch followed. */
-  readonly redirected?: true;
 }[] = [
   // An intermediary's answer, such as the development proxy's, when the API did not answer.
   { name: "an intermediary's 502", status: 502, contentType: 'application/problem+json', members: {}, traceId: TRACE_ID },
@@ -1696,15 +1738,8 @@ const UNTRUSTED_NOT_WRITTEN: readonly {
     members: { detail: undefined },
     traceId: TRACE_ID,
   },
-  // A conforming body that answers the request a redirect led to, not the save.
-  ...OUTCOME_STATUSES.map((status) => ({
-    name: `a redirected ${String(status)}`,
-    status,
-    contentType: 'application/problem+json',
-    members: {},
-    traceId: TRACE_ID,
-    redirected: true as const,
-  })),
+  // A conforming body that answers the request a redirect led to, not the save, is refused
+  // before it is read, as no response: REDIRECT_REPLIES.
 ];
 
 /** A `status` response served as `contentType` whose body is a notWritten write problem with `members` laid over it. */
@@ -1721,12 +1756,6 @@ function notWrittenAnswer(status: number, contentType: string, members: Readonly
   return new Response(JSON.stringify(body), { status, headers: { 'content-type': contentType } });
 }
 
-/** `response` as fetch returns one it reached by following a redirect. */
-function redirectedResponse(response: Response): Response {
-  Object.defineProperty(response, 'redirected', { value: true });
-  return response;
-}
-
 interface UnsafeCase {
   readonly method: RecordWriteMethod;
   /** What answered the save, for the test name. */
@@ -1741,8 +1770,24 @@ interface UnsafeCase {
 }
 
 /**
+ * A redirect in place of the save's answer, in each form a transport may give it: fetch
+ * refuses it, and a replacement transport may follow it to a conforming notWritten 500 or
+ * 503, return the opaque redirect, or return the redirect itself. None reached the API's
+ * answer, so each is no response (0.3.7).
+ */
+const REDIRECT_REPLIES: readonly { readonly failure: string; readonly reply: Reply }[] = [
+  { failure: 'a redirect, which fetch refuses', reply: fetchRedirecting },
+  ...OUTCOME_STATUSES.map((status) => ({
+    failure: `a redirect its transport followed to a notWritten ${String(status)}`,
+    reply: () => Promise.resolve(asRedirected(problem(status, { writeOutcome: 'notWritten' }))),
+  })),
+  { failure: 'an opaque redirect', reply: () => Promise.resolve(opaqueRedirect()) },
+  { failure: 'a 307 redirect claiming notWritten', reply: () => Promise.resolve(temporaryRedirect()) },
+];
+
+/**
  * Every failed save that Retry must not resend: each unproven 500 and 503, each untrusted
- * notWritten, and no response.
+ * notWritten, no response, and a redirect.
  */
 const UNSAFE_CASES: readonly UnsafeCase[] = RECORD_WRITE_METHODS.flatMap((method): UnsafeCase[] => [
   ...OUTCOME_STATUSES.flatMap((status) =>
@@ -1758,13 +1803,10 @@ const UNSAFE_CASES: readonly UnsafeCase[] = RECORD_WRITE_METHODS.flatMap((method
     ),
   ),
   ...UNTRUSTED_NOT_WRITTEN.map(
-    ({ name, status, contentType, members, traceId, redirected }): UnsafeCase => ({
+    ({ name, status, contentType, members, traceId }): UnsafeCase => ({
       method,
       failure: `${name} saying notWritten`,
-      reply: () => {
-        const answer = notWrittenAnswer(status, contentType, members);
-        return redirected === true ? redirectedResponse(answer) : answer;
-      },
+      reply: () => notWrittenAnswer(status, contentType, members),
       traceId,
       cause: status === 500 ? errorMessages.server : errorMessages.unavailableWithoutDraft,
       outcome: null,
@@ -1778,6 +1820,16 @@ const UNSAFE_CASES: readonly UnsafeCase[] = RECORD_WRITE_METHODS.flatMap((method
     cause: errorMessages.networkWithoutDraft,
     outcome: null,
   },
+  ...REDIRECT_REPLIES.map(
+    ({ failure, reply }): UnsafeCase => ({
+      method,
+      failure,
+      reply: () => reply,
+      traceId: null,
+      cause: errorMessages.networkWithoutDraft,
+      outcome: null,
+    }),
+  ),
 ]);
 
 describe('write outcomes and Retry (0.3.4.2)', () => {
@@ -1886,8 +1938,9 @@ describe('write outcomes and Retry (0.3.4.2)', () => {
   });
 
   // Only the direct reply to a record create, update or delete is a WriteProblemDetails
-  // (0.3.4.1): the same conforming notWritten reply to any other call, or reached through a
-  // redirect, states no write outcome. Keyed by every member of ApiClient, so an operation
+  // (0.3.4.1): the same conforming notWritten reply to any other call states no write
+  // outcome, and one reached through a redirect is refused as no response (0.3.7), so it
+  // states none either. Keyed by every member of ApiClient, so an operation
   // the client gains fails tsc until it is listed.
   const OUTCOME_OF_DIRECT_REPLY: Readonly<
     Record<
@@ -1919,24 +1972,43 @@ describe('write outcomes and Retry (0.3.4.2)', () => {
   it.each(
     Object.entries(OUTCOME_OF_DIRECT_REPLY).flatMap(([name, { call, outcome }]) =>
       OUTCOME_STATUSES.flatMap((status) => [
-        { name, call, status, via: 'directly', redirected: false, outcome },
-        // A reply that would state an outcome directly states none through a redirect.
-        ...(outcome === null ? [] : [{ name, call, status, via: 'through a redirect', redirected: true, outcome: null }]),
+        {
+          name,
+          call,
+          status,
+          via: 'directly',
+          redirected: false,
+          settled: { status, traceId: TRACE_ID, writeOutcome: outcome },
+        },
+        // A reply that would state an outcome directly is refused through a redirect, before
+        // it is read, so the call settles as no response and states none.
+        ...(outcome === null
+          ? []
+          : [
+              {
+                name,
+                call,
+                status,
+                via: 'through a redirect',
+                redirected: true,
+                settled: { kind: 'network', status: null, traceId: null, writeOutcome: null },
+              },
+            ]),
       ]),
     ),
   )(
-    'reads writeOutcome $outcome from a conforming $status notWritten answering $name $via',
-    async ({ call, status, redirected, outcome }) => {
+    'settles a conforming $status notWritten answering $name $via',
+    async ({ call, status, redirected, settled }) => {
       const api = createFakeApi();
       // The raiseFieldEvent row sends the one field event itself.
       apisRaisingEvents.add(api);
       const answer = problem(status, { writeOutcome: 'notWritten' });
-      api.reply(redirected ? redirectedResponse(answer) : answer);
+      api.reply(redirected ? asRedirected(answer) : answer);
 
       const result = await call(createApiClient({ baseUrl: 'http://localhost', fetch: api.fetch }));
 
       expect(api.calls).toHaveLength(1);
-      expect(result.ok ? null : result.error).toMatchObject({ status, traceId: TRACE_ID, writeOutcome: outcome });
+      expect(result.ok ? null : result.error).toMatchObject(settled);
     },
   );
 });
@@ -2442,8 +2514,10 @@ describe('the request deadline (0.3.4.2)', () => {
 });
 
 // Every request asks for a JSON body or ProblemDetails; only the four calls that send a body
-// declare it as JSON, the one media type the API accepts on them.
-describe('request headers', () => {
+// declare it as JSON, the one media type the API accepts on them. Every request is sent in
+// mode 'same-origin' with redirect 'error', so fetch keeps it on the API's origin and paths,
+// refusing a redirect rather than following it (0.3.7).
+describe('request headers and destination', () => {
   const ACCEPT = 'application/json, application/problem+json';
   const JSON_BODY = 'application/json';
 
@@ -2477,7 +2551,7 @@ describe('request headers', () => {
   };
 
   it.each(Object.entries(OPERATIONS))(
-    '%s asks for JSON or ProblemDetails and declares a JSON body only when it sends one',
+    '%s asks for JSON or ProblemDetails, declares a JSON body only when it sends one, and is sent same-origin with redirects refused',
     async (_name, { call, contentType }) => {
       const requests: Request[] = [];
       const fetchRecording = (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
@@ -2492,6 +2566,8 @@ describe('request headers', () => {
       expect(request.headers.get('Accept')).toBe(ACCEPT);
       expect(request.headers.get('Content-Type')).toBe(contentType);
       expect(request.body === null).toBe(contentType === null);
+      expect(request.mode).toBe('same-origin');
+      expect(request.redirect).toBe('error');
     },
   );
 });
@@ -2960,6 +3036,14 @@ describe('a response whose body cannot be read (0.3.4.2)', () => {
     ['a 404 ProblemDetails', () => Promise.resolve(problem(404)), { kind: 'notFound', status: 404, traceId: TRACE_ID }],
     // Only a request that got no response at all is a network failure.
     ['no response', networkFailure, { kind: 'network', status: null, traceId: null }],
+    // A redirect is no response from the API, whatever it leads to, a well-formed record included.
+    [
+      'a record its transport reached by following a redirect',
+      () => Promise.resolve(asRedirected(jsonResponse(200, recordFixture()))),
+      { kind: 'network', status: null, traceId: null },
+    ],
+    ['an opaque redirect', () => Promise.resolve(opaqueRedirect()), { kind: 'network', status: null, traceId: null }],
+    ['a 307 its transport did not follow', () => Promise.resolve(temporaryRedirect()), { kind: 'network', status: null, traceId: null }],
   ])('settles a read answered with %s as that failure', async (_case, answer, expected) => {
     const client = createApiClient({ baseUrl: 'http://localhost', fetch: answer });
 
@@ -3896,14 +3980,17 @@ describe('exact numbers', () => {
     expect(result.ok && result.data).toEqual(expected);
   });
 
+  // The six members of a field-event answer with no effects, which the client checks before it
+  // reports the answer. A member beside them is no part of the contract and is passed on as read,
+  // so a `values` member there shows the reader: its entries sit where a record's field values do.
+  const NO_EFFECTS = '"enabled":[],"disabled":[],"cleared":[],"assigned":{},"dialogs":[],"diagnostics":[]';
+
   it.each<[string, string]>([
-    ['escapes, unicode and a repeated key', '{"values":{"a":"q\\"b\\\\s\\/\\u00e9\\ud83d\\ude00\\n\\t","b":"x","a":"last"}}'],
-    ['members named __proto__ and constructor', '{"values":{"__proto__":"own","constructor":{"__proto__":[1]}}}'],
-    ['whitespace, nesting and every literal', ' \n{ "values" : { "a" : [ 1 , -0 , 1.5e-7 , 1E+20 , -2.5E-3 , true , false , null , { } , [ ] ] } }\r\n\t'],
-    ['the numbers a double holds exactly', '{"values":{"a":9007199254740991,"b":-9007199254740991,"c":0,"d":1e308,"e":5e-324}}'],
+    ['escapes, unicode and a repeated key', `{${NO_EFFECTS},"values":{"a":"q\\"b\\\\s\\/\\u00e9\\ud83d\\ude00\\n\\t","b":"x","a":"last"}}`],
+    ['members named __proto__ and constructor', `{${NO_EFFECTS},"values":{"__proto__":"own","constructor":{"__proto__":[1]}}}`],
+    ['whitespace, nesting and every literal', ` \n{ ${NO_EFFECTS} , "values" : { "a" : [ 1 , -0 , 1.5e-7 , 1E+20 , -2.5E-3 , true , false , null , { } , [ ] ] } }\r\n\t`],
+    ['the numbers a double holds exactly', `{${NO_EFFECTS},"values":{"a":9007199254740991,"b":-9007199254740991,"c":0,"d":1e308,"e":5e-324}}`],
   ])('reads a body with %s as JSON.parse does', async (_case, text) => {
-    // A field-event answer is passed on as parsed, unchecked, so any JSON body shows the reader;
-    // its `values` entries sit where a record's field values do.
     const read = await clientAnswering(text).raiseFieldEvent(VIEW_ID, { event: 'FieldAfter', fieldName: 'a', values: {} });
     const expected: unknown = JSON.parse(text);
 
@@ -3943,7 +4030,7 @@ describe('exact numbers', () => {
   // that hold `decimal` and `42` are written as those two strings, never as the decimal 42 they
   // resemble, beside a real exact decimal, which is written bare as the number typed.
   const RECORD_TEXT = '{"globalRecordId":"g","uniqueKey":1,"recStatus":1,"position":1,"count":1,"values":{}}';
-  const ENVELOPE_TEXT = '{"enabled":[],"disabled":[],"cleared":[],"assigned":{},"dialogs":[],"diagnostics":[]}';
+  const ENVELOPE_TEXT = `{${NO_EFFECTS}}`;
 
   interface ValuesWrite {
     readonly write: string;

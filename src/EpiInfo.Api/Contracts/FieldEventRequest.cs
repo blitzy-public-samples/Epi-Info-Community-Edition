@@ -29,9 +29,11 @@ namespace EpiInfo.Api.Contracts;
 /// answers a body that is not a JSON object itself. Content that is not valid JSON, such as truncated JSON or
 /// content after the value, is a <c>BadHttpRequestException</c> that <c>ApiExceptionHandler</c> maps to the
 /// request-level 400 "malformed JSON". A valid value that is a JSON array, string, number or boolean is the
-/// request-level 400 "request body must be a JSON object". A body that is the JSON literal <c>null</c> reads as no
-/// request and gets the request-level 400 "request body is required", which <c>JsonContentTypeMiddleware</c> gives a
-/// missing or empty body before the endpoint runs.
+/// request-level 400 "request body must be a JSON object". An object that names a member more than once, exactly or
+/// differing only by letter case, such as two <c>event</c> or <c>fieldName</c> members, is the request-level 400
+/// "request body names a member more than once", so no occurrence is bound in place of another. A body that is the
+/// JSON literal <c>null</c> reads as no request and gets the request-level 400 "request body is required", which
+/// <c>JsonContentTypeMiddleware</c> gives a missing or empty body before the endpoint runs.
 /// </para>
 /// <para>
 /// <c>FieldEventService</c> answers a bound request with one of two 400 shapes. A missing, <c>null</c>, wrongly typed

@@ -1,6 +1,7 @@
 using System.Collections;
 using System.ComponentModel;
 using System.Data;
+using System.Diagnostics;
 using System.Globalization;
 using System.Net;
 using System.Net.Sockets;
@@ -183,19 +184,28 @@ public sealed class SqlErrorClassifierTests
     // Cancellation: a cancelled request token decides only together with evidence that the failure is the abort.
 
     // The two errors, both number 0 with class 11 and state 0, of the attention acknowledgement SqlClient 5.2.3 raises
-    // for a command cancelled while it runs, in the English (neutral) and German resources of SqlClient.
+    // for a command cancelled while it runs, in the English (neutral) and German resources of SqlClient. The English
+    // "operation cancelled" text is internal for SqlClientFailureRecognitionTests, which tells a localised message from
+    // it.
     private const string SevereErrorEnglish =
         "A severe error occurred on the current command.  The results, if any, should be discarded.";
-    private const string OperationCancelledEnglish = "Operation cancelled by user.";
+    internal const string OperationCancelledEnglish = "Operation cancelled by user.";
     private const string SevereErrorGerman =
         "Schwerer Fehler für den aktuellen Befehl. Die Ergebnisse (wenn vorhanden) sollten verworfen werden.";
     private const string OperationCancelledGerman = "Der Vorgang wurde vom Benutzer abgebrochen.";
 
+    // The same two errors with Dutch text, which SqlClient ships in no culture, so they are not its acknowledgement.
+    private const string SevereErrorDutch =
+        "Er is een ernstige fout opgetreden bij de huidige opdracht. Eventuele resultaten moeten worden genegeerd.";
+    private const string OperationCancelledDutch = "Bewerking geannuleerd door de gebruiker.";
+
     private static readonly CancellationToken CancelledToken = new(canceled: true);
 
     /// <summary>
-    /// Cancellation evidence as SqlClient raises it, each under a cancelled and an uncancelled token: UI culture,
-    /// exception, whether the token is cancelled, expected kind and expected number.
+    /// Cancellation evidence as SqlClient raises it, under a cancelled and an uncancelled token, whatever the UI
+    /// culture: UI culture, exception, whether the token is cancelled, expected kind and expected number. Under a
+    /// cancelled token each acknowledgement is classified in a UI culture other than the language of its text, and the
+    /// lone "operation cancelled" error is the acknowledgement of an attention that no severe error preceded.
     /// </summary>
     public static TheoryData<string, Exception, bool, SqlFailureKind, int?> CancellationEvidence => new()
     {
@@ -203,12 +213,16 @@ public sealed class SqlErrorClassifierTests
         { "en-US", new TaskCanceledException("x", null, CancelledToken), true, SqlFailureKind.Cancelled, null },
         { "en-US", new TaskCanceledException(), true, SqlFailureKind.Cancelled, null },
         {
-            "en-US", AttentionAcknowledgement(SevereErrorEnglish, OperationCancelledEnglish), true,
+            "ja-JP", AttentionAcknowledgement(SevereErrorEnglish, OperationCancelledEnglish), true,
             SqlFailureKind.Cancelled, 0
         },
         {
-            "de-DE", AttentionAcknowledgement(SevereErrorGerman, OperationCancelledGerman), true,
+            "en-US", AttentionAcknowledgement(SevereErrorGerman, OperationCancelledGerman), true,
             SqlFailureKind.Cancelled, 0
+        },
+        {
+            "ja-JP", SqlExceptionFactory.Create([SqlExceptionFactory.Error(0, 11, OperationCancelledEnglish, 0)]),
+            true, SqlFailureKind.Cancelled, 0
         },
         { "en-US", new OperationCanceledException(), false, SqlFailureKind.Unexpected, null },
         {
@@ -218,6 +232,10 @@ public sealed class SqlErrorClassifierTests
         {
             "de-DE", AttentionAcknowledgement(SevereErrorGerman, OperationCancelledGerman), false,
             SqlFailureKind.Unexpected, 0
+        },
+        {
+            "en-US", SqlExceptionFactory.Create([SqlExceptionFactory.Error(0, 11, OperationCancelledEnglish, 0)]),
+            false, SqlFailureKind.Unexpected, 0
         },
     };
 
@@ -235,8 +253,11 @@ public sealed class SqlErrorClassifierTests
     }
 
     /// <summary>
-    /// Failures that only coincide with a cancelled token, each with the classification it keeps: exception, expected
-    /// kind and expected number.
+    /// Failures that only coincide with a cancelled token, each with the classification it keeps, including SqlClient
+    /// errors that are not its acknowledgement alone: the lone severe error SqlClient raises for a statement the server
+    /// marked as failed without sending an error of its own; the two errors of the acknowledgement in a text SqlClient
+    /// ships in no culture; a fatal number-0 error, alone or after the "operation cancelled" error; a server error
+    /// before the acknowledgement; and an exception carrying no error. Exception, expected kind and expected number.
     /// </summary>
     public static TheoryData<Exception, SqlFailureKind, int?> FailuresCoincidingWithCancellation => new()
     {
@@ -277,6 +298,22 @@ public sealed class SqlErrorClassifierTests
             SqlFailureKind.Unexpected,
             0
         },
+        { AttentionAcknowledgement(SevereErrorDutch, OperationCancelledDutch), SqlFailureKind.Unexpected, 0 },
+        {
+            SqlExceptionFactory.Create(
+            [
+                SqlExceptionFactory.Error(0, 11, OperationCancelledEnglish, 0),
+                SqlExceptionFactory.Error(0, 20, ServerSevereErrorMessage, 0),
+            ]),
+            SqlFailureKind.Unexpected,
+            0
+        },
+        {
+            SqlExceptionFactory.Create([SqlExceptionFactory.Error(0, 20, ServerSevereErrorMessage, 0)]),
+            SqlFailureKind.Unexpected,
+            0
+        },
+        { SqlExceptionFactory.CreateWithoutErrors(), SqlFailureKind.Unexpected, null },
         {
             SqlExceptionFactory.Create(
             [
@@ -307,11 +344,13 @@ public sealed class SqlErrorClassifierTests
             SqlExceptionFactory.Error(0, 11, operationCancelled, 0),
         ]);
 
-    // Pool exhaustion while opening: recognised by SqlClient's own pool-timeout message in the effective UI culture.
+    // Pool exhaustion while opening: recognised by exact equality with SqlClient's own pool-timeout texts, whatever the
+    // UI culture.
 
-    // SqlClient 5.2.3's ADP_PooledOpenTimeout text in its English (neutral), German and French resources, and its
-    // ADP_NonPooledOpenTimeout text, which is not pool exhaustion.
-    private const string PooledOpenTimeoutEnglish =
+    // SqlClient 5.2.3's pool-timeout text in its English (neutral), German and French resources, and its non-pooled
+    // open-timeout text in the same three, which is not pool exhaustion. The English pool-timeout text is internal for
+    // SqlClientFailureRecognitionTests, which tells a localised message from it.
+    internal const string PooledOpenTimeoutEnglish =
         "Timeout expired.  The timeout period elapsed prior to obtaining a connection from the pool.  This may have "
         + "occurred because all pooled connections were in use and max pool size was reached.";
     private const string PooledOpenTimeoutGerman =
@@ -326,14 +365,25 @@ public sealed class SqlErrorClassifierTests
         "Timeout attempting to open the connection.  The time period elapsed prior to attempting to open the "
         + "connection has been exceeded.  This may have occurred because of too many simultaneous non-pooled "
         + "connection attempts.";
+    private const string NonPooledOpenTimeoutGerman =
+        "Timeout beim Versuch, die Verbindung zu öffnen. Die Zeitspanne, die vor dem Versuch, die Verbindung zu "
+        + "öffnen, verstreichen kann, wurde überschritten. Die Ursache sind möglicherweise zu viele gleichzeitige "
+        + "Versuche, Verbindungen ohne Pooling herzustellen.";
+    private const string NonPooledOpenTimeoutFrench =
+        "Lors de la tentative d'ouverture de connexion, le délai d'attente a expiré. La durée écoulée avant la "
+        + "tentative d'ouverture de connexion a été dépassée.";
+
+    // Only a part of the English pool-timeout text.
+    private const string PooledOpenTimeoutEnglishPart =
+        "The timeout period elapsed prior to obtaining a connection from the pool.";
 
     [Theory]
-    [InlineData("en-US", typeof(InvalidOperationException), PooledOpenTimeoutEnglish, true, SqlFailureKind.Unavailable)]
-    [InlineData("en-US", typeof(InvalidOperationException), PooledOpenTimeoutEnglish, false, SqlFailureKind.Unexpected)]
-    [InlineData("de-DE", typeof(InvalidOperationException), PooledOpenTimeoutGerman, true, SqlFailureKind.Unavailable)]
-    [InlineData("de-DE", typeof(InvalidOperationException), PooledOpenTimeoutGerman, false, SqlFailureKind.Unexpected)]
-    [InlineData("fr-FR", typeof(InvalidOperationException), PooledOpenTimeoutFrench, true, SqlFailureKind.Unavailable)]
-    [InlineData("fr-FR", typeof(InvalidOperationException), PooledOpenTimeoutFrench, false, SqlFailureKind.Unexpected)]
+    [InlineData("ja-JP", typeof(InvalidOperationException), PooledOpenTimeoutEnglish, true, SqlFailureKind.Unavailable)]
+    [InlineData("ja-JP", typeof(InvalidOperationException), PooledOpenTimeoutEnglish, false, SqlFailureKind.Unexpected)]
+    [InlineData("en-US", typeof(InvalidOperationException), PooledOpenTimeoutGerman, true, SqlFailureKind.Unavailable)]
+    [InlineData("en-US", typeof(InvalidOperationException), PooledOpenTimeoutGerman, false, SqlFailureKind.Unexpected)]
+    [InlineData("ja-JP", typeof(InvalidOperationException), PooledOpenTimeoutFrench, true, SqlFailureKind.Unavailable)]
+    [InlineData("ja-JP", typeof(InvalidOperationException), PooledOpenTimeoutFrench, false, SqlFailureKind.Unexpected)]
     [InlineData("de-DE", typeof(InvalidOperationException), PooledOpenTimeoutEnglish, true, SqlFailureKind.Unavailable)]
     [InlineData("en-US", typeof(InvalidOperationException), "Invalid operation. The connection is closed.", true,
         SqlFailureKind.Unexpected)]
@@ -344,6 +394,14 @@ public sealed class SqlErrorClassifierTests
     [InlineData("en-US", typeof(InvalidOperationException), NonPooledOpenTimeoutEnglish, true,
         SqlFailureKind.Unexpected)]
     [InlineData("en-US", typeof(InvalidOperationException), NonPooledOpenTimeoutEnglish, false,
+        SqlFailureKind.Unexpected)]
+    [InlineData("de-DE", typeof(InvalidOperationException), NonPooledOpenTimeoutGerman, true,
+        SqlFailureKind.Unexpected)]
+    [InlineData("fr-FR", typeof(InvalidOperationException), NonPooledOpenTimeoutFrench, true,
+        SqlFailureKind.Unexpected)]
+    [InlineData("en-US", typeof(InvalidOperationException), PooledOpenTimeoutEnglishPart, true,
+        SqlFailureKind.Unexpected)]
+    [InlineData("en-US", typeof(InvalidOperationException), PooledOpenTimeoutEnglish + " Retry later.", true,
         SqlFailureKind.Unexpected)]
     [InlineData("en-US", typeof(Exception), PooledOpenTimeoutEnglish, true, SqlFailureKind.Unexpected)]
     public void Classify_PoolTimeout_IsUnavailableOnlyForSqlClientPoolTimeoutWhileOpening(
@@ -704,7 +762,6 @@ public sealed class SqlErrorClassifierTests
     [InlineData(null)]
     public void CancelledFailure_IsTheFixedCancellationKeepingItsSqlErrorNumber(int? number)
     {
-        using var culture = new UiCultureScope("en-US");
         SqlException inner = AttentionAcknowledgement(SevereErrorEnglish, OperationCancelledEnglish);
         var failure = new SqlFailure(SqlFailureKind.Cancelled, number);
 
@@ -787,7 +844,6 @@ public sealed class SqlErrorClassifierTests
         string? expectedRollbackType,
         int? expectedRollbackNumber)
     {
-        using var culture = new UiCultureScope("en-US");
         SqlException acknowledgement = AttentionAcknowledgement(SevereErrorEnglish, OperationCancelledEnglish);
 
         Exception raised = SqlRecordRepository.BuildFailure(
@@ -1158,16 +1214,6 @@ public sealed class SqlErrorClassifierTests
         Assert.Equal(0, dispatches);
         Assert.Empty(recorder.Commands);
         Assert.Equal(ConnectionState.Closed, connection.State);
-    }
-
-    /// <summary>Sets <see cref="CultureInfo.CurrentUICulture"/> for one test and restores it on disposal.</summary>
-    private sealed class UiCultureScope : IDisposable
-    {
-        private readonly CultureInfo _previous = CultureInfo.CurrentUICulture;
-
-        public UiCultureScope(string name) => CultureInfo.CurrentUICulture = CultureInfo.GetCultureInfo(name);
-
-        public void Dispose() => CultureInfo.CurrentUICulture = _previous;
     }
 
     /// <summary>
@@ -1706,4 +1752,247 @@ public sealed class SqlConnectionFactoryRecoveryTests : IAsyncLifetime
         private static bool IsTransportEnd(Exception failure) =>
             failure is IOException or SocketException or OperationCanceledException or ObjectDisposedException;
     }
+}
+
+/// <summary>
+/// Integration tests of <see cref="SqlErrorClassifier"/> against failures SqlClient itself raises, the guard against
+/// drift between the pinned provider and both the pool-timeout and "operation cancelled" texts the classifier holds
+/// and the shapes the unit tests build by hand: pool exhaustion while opening, through
+/// <see cref="SqlConnectionFactory"/> and through SqlClient alone, and the attention acknowledgement of a running
+/// command that the request token cancelled, each in every culture SqlClient 5.2.3 ships resources for and in one it
+/// ships none for; and the acknowledgement of one that <see cref="SqlCommand.Cancel"/> cancelled. Each pool
+/// is keyed by a unique application name, so it is shared with no other test. They need the rehearsal database and read
+/// and write no data: they open connections, and their only statements are <c>WAITFOR DELAY</c>, <c>SELECT @@SPID</c>
+/// and a read of <c>sys.dm_exec_requests</c>.
+/// </summary>
+[Collection(DatabaseCollections.Database)]
+[Trait("Category", "Integration")]
+public sealed class SqlClientFailureRecognitionTests : IAsyncLifetime
+{
+    // A pool of one connection, held while the next open waits for it; SqlClient ends that wait after the connect
+    // timeout with its pool-timeout InvalidOperationException.
+    private const int MaxPoolSize = 1;
+    private const int ConnectTimeoutSeconds = 1;
+    private const string ApplicationNamePrefix = "EpiInfo.Web.Tests pool timeout ";
+
+    // A statement that runs far longer than any test waits, and touches no table.
+    private const string LongWait = "WAITFOR DELAY '00:00:30';";
+
+    // How long a cancellation test waits for the server to report its command waiting in WAITFOR, well inside the
+    // statement's 30 seconds and the command's default 30-second timeout, and how often it looks.
+    private static readonly TimeSpan WaitingCommandWait = TimeSpan.FromSeconds(20);
+
+    private static readonly TimeSpan WaitingCommandPoll = TimeSpan.FromMilliseconds(25);
+
+    public Task InitializeAsync() => TestDatabase.EnsureReachableAsync();
+
+    public Task DisposeAsync() => Task.CompletedTask;
+
+    // Each culture SqlClient 5.2.3 ships resources for, with whether its text differs from the English one, and
+    // nl-NL, for which it ships none, so its message is the neutral English text, as for en-US.
+    [Theory]
+    [InlineData("en-US", false)]
+    [InlineData("de-DE", true)]
+    [InlineData("es-ES", true)]
+    [InlineData("fr-FR", true)]
+    [InlineData("it-IT", true)]
+    [InlineData("ja-JP", true)]
+    [InlineData("ko-KR", true)]
+    [InlineData("pt-BR", true)]
+    [InlineData("ru-RU", true)]
+    [InlineData("zh-Hans", true)]
+    [InlineData("zh-Hant", true)]
+    [InlineData("nl-NL", false)]
+    public async Task OpenOnAnExhaustedPool_InAnyCulture_IsUnavailableOnlyWhileOpening(string uiCulture, bool localised)
+    {
+        using var culture = new UiCultureScope(uiCulture);
+        SqlConnectionStringBuilder target = TestDatabase.Builder();
+        target.Pooling = true;
+        target.MinPoolSize = 0;
+        target.MaxPoolSize = MaxPoolSize;
+        target.ConnectTimeout = ConnectTimeoutSeconds;
+        target.ApplicationName = ApplicationNamePrefix + Guid.NewGuid().ToString("N");
+        var factory = new SqlConnectionFactory(new DatabaseOptions(target.ConnectionString));
+
+        // The factory opens with this string, so it keys the one pool every open below uses.
+        string effective = SqlConnectionFactory.EffectiveConnectionString(target.ConnectionString);
+        try
+        {
+            await using SqlConnection held = await factory.OpenAsync(
+                nameof(IDataStore.PingAsync),
+                CancellationToken.None);
+
+            // Through the factory, as the store opens: unavailable, nothing written, no SQL error number.
+            DataStoreUnavailableException exhausted = await Assert.ThrowsAsync<DataStoreUnavailableException>(
+                () => factory.OpenAsync(nameof(IDataStore.PingAsync), CancellationToken.None));
+            Assert.Equal(WriteOutcome.NotWritten, exhausted.Outcome);
+            Assert.Null(exhausted.SqlErrorNumber);
+            InvalidOperationException asynchronous = Assert.IsType<InvalidOperationException>(exhausted.InnerException);
+
+            // Through SqlClient alone, synchronously, on the same pool.
+            await using var second = new SqlConnection(effective);
+            InvalidOperationException synchronous = Assert.Throws<InvalidOperationException>(() => second.Open());
+
+            foreach (InvalidOperationException timeout in new[] { asynchronous, synchronous })
+            {
+                Assert.Equal(
+                    new SqlFailure(SqlFailureKind.Unavailable, null),
+                    SqlErrorClassifier.Classify(timeout, CancellationToken.None, duringOpen: true));
+                Assert.Equal(
+                    new SqlFailure(SqlFailureKind.Unexpected, null),
+                    SqlErrorClassifier.Classify(timeout, CancellationToken.None, duringOpen: false));
+
+                // The message is SqlClient's text for this culture: a localised one where SqlClient ships it, otherwise
+                // the neutral English text.
+                if (localised)
+                {
+                    Assert.NotEqual(SqlErrorClassifierTests.PooledOpenTimeoutEnglish, timeout.Message);
+                }
+                else
+                {
+                    Assert.Equal(SqlErrorClassifierTests.PooledOpenTimeoutEnglish, timeout.Message);
+                }
+            }
+        }
+        finally
+        {
+            // Only this test's pool is cleared: the one keyed by its own effective string.
+            await using var poolKey = new SqlConnection(effective);
+            SqlConnection.ClearPool(poolKey);
+        }
+    }
+
+    // A running command the request token cancelled ends in SqlClient's attention acknowledgement: the client's
+    // cancellation, with number 0, under that token, in each culture SqlClient 5.2.3 ships resources for and in nl-NL,
+    // for which it ships none, and unexpected under any other token. Each culture comes with whether its "operation
+    // cancelled" text differs from the English one, as for the pool timeout.
+    [Theory]
+    [InlineData("en-US", false)]
+    [InlineData("de-DE", true)]
+    [InlineData("es-ES", true)]
+    [InlineData("fr-FR", true)]
+    [InlineData("it-IT", true)]
+    [InlineData("ja-JP", true)]
+    [InlineData("ko-KR", true)]
+    [InlineData("pt-BR", true)]
+    [InlineData("ru-RU", true)]
+    [InlineData("zh-Hans", true)]
+    [InlineData("zh-Hant", true)]
+    [InlineData("nl-NL", false)]
+    public async Task CommandCancelledByTheRequestToken_IsCancelledWithNumberZero(string uiCulture, bool localised)
+    {
+        using var culture = new UiCultureScope(uiCulture);
+        await using SqlConnection connection = await TestDatabase.OpenConnectionAsync();
+        short session = await SessionIdAsync(connection);
+        await using var command = new SqlCommand(LongWait, connection);
+        using var cancellation = new CancellationTokenSource();
+
+        Task<int> execution = command.ExecuteNonQueryAsync(cancellation.Token);
+        await WaitUntilWaitingInWaitForAsync(session, execution);
+        cancellation.Cancel();
+        SqlException acknowledgement = await Assert.ThrowsAsync<SqlException>(() => execution);
+
+        AssertAcknowledgementShape(acknowledgement);
+        Assert.Equal(
+            new SqlFailure(SqlFailureKind.Cancelled, 0),
+            SqlErrorClassifier.Classify(acknowledgement, cancellation.Token));
+        Assert.Equal(
+            new SqlFailure(SqlFailureKind.Unexpected, 0),
+            SqlErrorClassifier.Classify(acknowledgement, CancellationToken.None));
+
+        // The last error is SqlClient's "operation cancelled" text for this culture: a localised one where SqlClient
+        // ships it, otherwise the neutral English text.
+        string operationCancelled = acknowledgement.Errors[^1].Message;
+        if (localised)
+        {
+            Assert.NotEqual(SqlErrorClassifierTests.OperationCancelledEnglish, operationCancelled);
+        }
+        else
+        {
+            Assert.Equal(SqlErrorClassifierTests.OperationCancelledEnglish, operationCancelled);
+        }
+    }
+
+    // SqlCommand.Cancel, called while the command runs, ends it in the same acknowledgement under a token that was
+    // never cancelled. That is no client abort, so it stays unexpected, with number 0.
+    [Fact]
+    public async Task CommandCancelledBySqlCommandCancel_WithoutACancelledToken_IsUnexpectedWithNumberZero()
+    {
+        await using SqlConnection connection = await TestDatabase.OpenConnectionAsync();
+        short session = await SessionIdAsync(connection);
+        await using var command = new SqlCommand(LongWait, connection);
+
+        Task<int> execution = command.ExecuteNonQueryAsync(CancellationToken.None);
+        await WaitUntilWaitingInWaitForAsync(session, execution);
+        command.Cancel();
+        SqlException acknowledgement = await Assert.ThrowsAsync<SqlException>(() => execution);
+
+        AssertAcknowledgementShape(acknowledgement);
+        Assert.Equal(
+            new SqlFailure(SqlFailureKind.Unexpected, 0),
+            SqlErrorClassifier.Classify(acknowledgement, CancellationToken.None));
+    }
+
+    // The shape in which SqlErrorClassifierTests builds the acknowledgement: two errors, each number 0 with class 11.
+    private static void AssertAcknowledgementShape(SqlException acknowledgement) =>
+        Assert.Equal(
+            new[] { (0, (byte)11), (0, (byte)11) },
+            acknowledgement.Errors.Cast<SqlError>().Select(error => (error.Number, error.Class)));
+
+    // The server session of an open connection, read before its command starts.
+    private static async Task<short> SessionIdAsync(SqlConnection connection)
+    {
+        await using var command = new SqlCommand("SELECT @@SPID;", connection);
+        return Assert.IsType<short>(await command.ExecuteScalarAsync());
+    }
+
+    // Waits, on a second connection, until the session's request is waiting in WAITFOR on the server, so a cancellation
+    // reaches a running command rather than one still on its way there. The command ending first, or no such wait
+    // within WaitingCommandWait, fails the test.
+    private static async Task WaitUntilWaitingInWaitForAsync(short session, Task execution)
+    {
+        await using SqlConnection monitor = await TestDatabase.OpenConnectionAsync();
+        var waited = Stopwatch.StartNew();
+        while (true)
+        {
+            await using (var command = monitor.CreateCommand())
+            {
+                command.CommandText =
+                    "SELECT COUNT(*) FROM sys.dm_exec_requests " +
+                    "WHERE [session_id] = @session AND [wait_type] = N'WAITFOR';";
+                command.Parameters.Add(new SqlParameter("@session", SqlDbType.SmallInt) { Value = session });
+                if (Assert.IsType<int>(await command.ExecuteScalarAsync()) > 0)
+                {
+                    return;
+                }
+            }
+
+            if (execution.IsCompleted)
+            {
+                Assert.Fail(
+                    "The command ended before the server reported it waiting in WAITFOR, so it was never cancelled.");
+            }
+
+            if (waited.Elapsed > WaitingCommandWait)
+            {
+                Assert.Fail(
+                    string.Create(
+                        CultureInfo.InvariantCulture,
+                        $"The server did not report the command waiting in WAITFOR within " +
+                        $"{WaitingCommandWait.TotalSeconds} seconds, so it was never cancelled."));
+            }
+
+            await Task.Delay(WaitingCommandPoll);
+        }
+    }
+}
+
+/// <summary>Sets <see cref="CultureInfo.CurrentUICulture"/> for one test and restores it on disposal.</summary>
+file sealed class UiCultureScope : IDisposable
+{
+    private readonly CultureInfo _previous = CultureInfo.CurrentUICulture;
+
+    public UiCultureScope(string name) => CultureInfo.CurrentUICulture = CultureInfo.GetCultureInfo(name);
+
+    public void Dispose() => CultureInfo.CurrentUICulture = _previous;
 }

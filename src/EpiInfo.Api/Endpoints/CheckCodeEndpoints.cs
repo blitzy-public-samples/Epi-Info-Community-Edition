@@ -25,10 +25,13 @@ namespace EpiInfo.Api.Endpoints;
 /// <see cref="JsonBodyMetadata"/> places the route under <c>JsonContentTypeMiddleware</c>, which answers 415 for any
 /// media type other than <c>application/json</c> with an optional <c>charset=utf-8</c>, <c>+json</c> types and a
 /// missing <c>Content-Type</c> included, and the request-level 400 for an empty body. The 1,048,576-byte body limit
-/// gives 413. The handler reads the body through <see cref="JsonRequestBody"/>, which parses the whole body first: a
-/// valid value that is not an object is the request-level 400 "request body must be a JSON object", returned before
-/// the service runs. The exception handler gives 400 for malformed JSON, 503 for an unavailable store and 500
-/// otherwise.
+/// gives 413. The handler reads the body through <see cref="JsonRequestBody"/>, which parses the whole body first. An
+/// array, a string, a number or a boolean is the request-level 400 "request body must be a JSON object", and an object
+/// that names a member more than once, ignoring letter case, is the request-level 400 "request body names a member
+/// more than once", each returned before the service runs. The JSON literal <c>null</c> reads as no request, which
+/// the service answers, once it has found the form, with its request-level 400 "request body is required". The
+/// keys of <c>values</c> are field names, so a repeated one is the service's field-level 400 instead. The exception
+/// handler gives 400 for malformed JSON, 503 for an unavailable store and 500 otherwise.
 /// </para>
 /// <para>
 /// The route never writes, so it carries no <c>WriteEndpointMetadata</c> and its 500 and 503 bodies are plain

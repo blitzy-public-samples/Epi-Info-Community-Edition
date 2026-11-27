@@ -1,7 +1,6 @@
 using System.Collections.Frozen;
 using System.Globalization;
 using System.Net.Sockets;
-using System.Resources;
 using EpiInfo.Domain.Storage;
 using Microsoft.Data.SqlClient;
 
@@ -73,15 +72,19 @@ public enum WriteStage
 /// </summary>
 /// <remarks>
 /// <para>
-/// The classifier only inspects: it retries nothing and logs nothing. It compares exception messages only to
-/// recognise three texts SqlClient itself generates: the pool-timeout message, the attention-acknowledgement
-/// ("operation cancelled") error, and the SQL Network Interfaces scaffold <c>(provider: ..., error: ... - ...)</c>
-/// that marks an error SqlClient's network interface layer raised, from which it reads only the integer SNI error
-/// code. It never copies, returns or logs message text otherwise. The exceptions it
+/// The classifier only inspects: it retries nothing and logs nothing. It reads exception message text in three places
+/// only, none of which depends on the current culture: it compares the message of an
+/// <see cref="InvalidOperationException"/> raised while opening, by ordinal equality, with the pool-timeout texts
+/// SqlClient 5.2.3 ships; it compares the message of each error of a <see cref="SqlException"/> raised under a
+/// cancelled token, by ordinal equality, with the "operation cancelled" texts SqlClient 5.2.3 ships; and it reads the
+/// integer SNI error code from the SQL Network Interfaces scaffold <c>(provider: ..., error: ... - ...)</c> that marks
+/// an error SqlClient's network interface layer raised. The evidence that a failure is the client's cancellation is
+/// the exception's type, or SqlClient's attention acknowledgement: errors all number 0 below severity class 20, one of
+/// them carrying an "operation cancelled" text. It never copies, returns or logs message text. The exceptions it
 /// builds carry fixed messages, the caller's fixed operation name and the SQL error number, never SQL text, a
 /// parameter value, a connection string or a database message; the original failure is attached only as the inner
-/// exception. The only other thing it writes is <see cref="Exception.Data"/> of the exception raised for a failure:
-/// a cancellation's SQL error number and a failed rollback's type name and SQL error number.
+/// exception. The only other thing it writes is <see cref="Exception.Data"/> of the exception raised for a failure: a
+/// cancellation's SQL error number and a failed rollback's type name and SQL error number.
 /// </para>
 /// <para>
 /// A <see cref="DataStoreUnavailableException"/> or <see cref="DataStoreWriteException"/> that a store method has
@@ -128,22 +131,86 @@ public static class SqlErrorClassifier
     /// <summary>The fixed message of the cancellation exception <see cref="ToDataStoreException"/> builds.</summary>
     internal const string CancelledMessage = "The data store operation was cancelled.";
 
-    // SqlClient raises pool exhaustion as an InvalidOperationException with no error number, whose message is its
-    // resource PooledOpenTimeoutResource in the current UI culture: "Timeout expired.  The timeout period elapsed
-    // prior to obtaining a connection from the pool. ..." in English. IsPoolTimeout matches this English fragment only
-    // when SqlClient's resources yield no text for that resource, so a localised message is recognised whenever
-    // SqlClient ships its text.
-    private const string PoolTimeoutMessageFragment = "obtaining a connection from the pool";
+    // SqlClient 5.2.3 raises pool exhaustion while opening as an InvalidOperationException with no error number, whose
+    // message is its pool-timeout text in the culture it formats the message in. These are that text exactly as the
+    // pinned package ships it, in its neutral resources and in each culture it ships resources for. An asynchronous
+    // open can format the message on a thread other than the one that classifies it, so the set holds every culture's
+    // text and IsPoolTimeout never consults the current culture. The texts change only with the SqlClient version:
+    // SqlClientFailureRecognitionTests raises the failure through SqlClient itself in each of these cultures.
+    private static readonly FrozenSet<string> PoolTimeoutMessages = new[]
+    {
+        // The neutral resources (English), whose text a culture SqlClient ships no resources for also gets.
+        "Timeout expired.  The timeout period elapsed prior to obtaining a connection from the pool.  This may have "
+            + "occurred because all pooled connections were in use and max pool size was reached.",
+        // de (German)
+        "Timeout abgelaufen. Das Zeitlimit ist vor dem Anfordern einer Verbindung aus dem Pool abgelaufen. "
+            + "Möglicherweise werden alle Verbindungen im Pool bereits verwendet, und die maximale Poolgröße wurde "
+            + "erreicht.",
+        // es (Spanish)
+        "Valor de tiempo de espera caducado. El período de tiempo de espera expiró antes de obtener una conexión del "
+            + "grupo. Esto puede suceder porque todas las conexiones de la agrupación estaban en uso y se alcanzó el "
+            + "máximo tamaño del grupo.",
+        // fr (French)
+        "Expiration du délai d'attente. Le délai d'attente s'est écoulé avant obtention d'une connexion du pool. Ceci "
+            + "est probablement dû au fait que toutes les connexions regroupées sont en cours d'utilisation et que la "
+            + "taille maximale du pool a été atteinte.",
+        // it (Italian)
+        "Timeout scaduto. Il tempo disponibile è scaduto prima di aver ottenuto la connessione dal pool.  Ciò "
+            + "potrebbe essere accaduto perché tutte le connessioni dal pool erano in uso ed era già stata raggiunta "
+            + "la dimensione massima del pool.",
+        // ja (Japanese)
+        "タイムアウトに達しました。プールから接続を取得する前にタイムアウト期間が過ぎました。"
+            + "プールされた接続がすべて使用中で、プール サイズの制限値に達した可能性があります。",
+        // ko (Korean)
+        "제한 시간이 만료되었습니다. 풀에서 연결을 만들기 전에 제한 시간이 경과되었습니다. 풀링된 연결이 사용 "
+            + "중이었거나 최대 풀 크기에 도달했기 때문일 수 있습니다.",
+        // pt-BR (Portuguese, Brazil)
+        "Tempo limite expirado.  O período de tempo limite foi atingido antes que fosse obtida uma conexão do pool.  "
+            + "Isso pode ter ocorrido porque todas as conexões do pool estavam em uso e o tamanho máximo do pool foi "
+            + "atingido.",
+        // ru (Russian)
+        "Истекло время ожидания. Время ожидания истекло раньше, чем удалось получить подключение из пула. Возможно, "
+            + "все подключения в пуле уже используются и достигнут максимальный размер пула.",
+        // zh-Hans (Chinese, Simplified)
+        "超时时间已到。超时时间已到，但是尚未从池中获取连接。出现这种情况可能是因为所有池连接均在使用，"
+            + "并且达到了最大池大小。",
+        // zh-Hant (Chinese, Traditional)
+        "已超過連接逾時的設定。在取得集區連接之前超過逾時等待的時間，可能的原因為所有的共用連接已在使用中，"
+            + "並已達共用集區大小的最大值。",
+    }.ToFrozenSet(StringComparer.Ordinal);
 
-    // The SqlClient resources holding the texts the classifier recognises (see the remarks above): the pool-timeout
-    // message, and the "operation cancelled" error SqlClient adds when the server acknowledges a cancelled command.
-    private const string SqlClientResourceBaseName = "Microsoft.Data.SqlClient.Resources.Strings";
-    private const string PooledOpenTimeoutResource = "ADP_PooledOpenTimeout";
-    private const string OperationCancelledResource = "SQL_OperationCancelled";
-
-    // SqlClient's own string resources. A ResourceManager loads and caches each culture's set on first use.
-    private static readonly ResourceManager SqlClientStrings =
-        new(SqlClientResourceBaseName, typeof(SqlException).Assembly);
+    // When the server acknowledges the attention SqlClient 5.2.3 sends for a cancelled command, SqlClient appends an
+    // "operation cancelled" error of its own, whose message is that text in the culture it formats the message in.
+    // These are that text exactly as the pinned package ships it, in its neutral resources and in each culture it
+    // ships resources for. The acknowledgement can be formatted on a thread other than the one that classifies it, so
+    // the set holds every culture's text and IsAttentionAcknowledgement never consults the current culture. The texts
+    // change only with the SqlClient version: SqlClientFailureRecognitionTests cancels a running command through
+    // SqlClient itself in each of these cultures.
+    private static readonly FrozenSet<string> OperationCancelledMessages = new[]
+    {
+        // The neutral resources (English), whose text a culture SqlClient ships no resources for also gets.
+        "Operation cancelled by user.",
+        // de (German)
+        "Der Vorgang wurde vom Benutzer abgebrochen.",
+        // es (Spanish)
+        "Operación cancelada por el usuario.",
+        // fr (French)
+        "Opération annulée par l'utilisateur.",
+        // it (Italian)
+        "Operazione annullata dall'utente.",
+        // ja (Japanese)
+        "操作はユーザーによって取り消されました。",
+        // ko (Korean)
+        "사용자가 작업을 취소했습니다.",
+        // pt-BR (Portuguese, Brazil)
+        "Operação cancelada pelo usuário.",
+        // ru (Russian)
+        "Операция отменена пользователем.",
+        // zh-Hans (Chinese, Simplified)
+        "用户已取消操作。",
+        // zh-Hant (Chinese, Traditional)
+        "使用者已經取消作業。",
+    }.ToFrozenSet(StringComparer.Ordinal);
 
     // The error number SqlClient gives each error of its attention acknowledgement; SQL Server never raises number 0.
     private const int AttentionAcknowledgementErrorNumber = 0;
@@ -187,12 +254,15 @@ public static class SqlErrorClassifier
     /// <see cref="SqlFailureKind.Cancelled"/> when <paramref name="cancellationToken"/> is cancelled and the failure
     /// is the cancellation itself: an <see cref="OperationCanceledException"/>, <see cref="TaskCanceledException"/>
     /// included, which SqlClient raises for a token cancelled before a command or while opening; or SqlClient's
-    /// attention acknowledgement for a command it cancelled, a <see cref="SqlException"/> whose errors all have number
-    /// 0 and a severity class below 20, at least one of them carrying SqlClient's own "operation cancelled" text in
-    /// the current UI culture or the invariant culture. The number is the <see cref="SqlException"/>'s primary number,
-    /// 0 for the acknowledgement, and absent for an <see cref="OperationCanceledException"/>. Any other failure under a
-    /// cancelled token, such as a timeout (-2), a permission error or a server error raised alongside the
-    /// acknowledgement, keeps the class the items below give it.
+    /// attention acknowledgement for a command it cancelled, a <see cref="SqlException"/> whose errors are all number 0
+    /// with a severity class below 20, at least one of them carrying, by ordinal equality, the "operation cancelled"
+    /// text SqlClient 5.2.3 ships in its neutral (English) resources or in one of the cultures it ships resources for
+    /// (de, es, fr, it, ja, ko, pt-BR, ru, zh-Hans and zh-Hant), whatever the current culture. The number is the
+    /// <see cref="SqlException"/>'s primary number, 0 for the acknowledgement, and absent for an
+    /// <see cref="OperationCanceledException"/>. Any other failure under a cancelled token, such as a timeout (-2), a
+    /// permission error, a server error raised alongside the acknowledgement, the lone severe error SqlClient raises
+    /// for a statement the server marked as failed without sending an error of its own, a fatal number-0 error or a
+    /// <see cref="SqlException"/> carrying no error, keeps the class the items below give it.
     /// </description></item>
     /// <item><description>
     /// <see cref="SqlFailureKind.Unavailable"/> for a <see cref="SqlException"/> whose
@@ -215,10 +285,10 @@ public static class SqlErrorClassifier
     /// <item><description>
     /// <see cref="SqlFailureKind.Unavailable"/>, with no number, for SqlClient's pool-timeout
     /// <see cref="InvalidOperationException"/> when <paramref name="duringOpen"/> is <see langword="true"/>: its
-    /// message equals SqlClient's own pool-timeout text (resource <c>ADP_PooledOpenTimeout</c>) in the current UI
-    /// culture, the one SqlClient formats it in, or in the invariant culture. Only when SqlClient yields neither text
-    /// does a message containing the English fragment "obtaining a connection from the pool" qualify instead.
-    /// SqlClient's non-pooled open timeout is not pool exhaustion.
+    /// message equals, by ordinal comparison, the pool-timeout text SqlClient 5.2.3 ships in its neutral (English)
+    /// resources or in one of the cultures it ships resources for (de, es, fr, it, ja, ko, pt-BR, ru, zh-Hans and
+    /// zh-Hant), whatever the current culture. A message holding only part of such a text, or more than it, does not
+    /// qualify, and SqlClient's non-pooled open timeout is not pool exhaustion.
     /// </description></item>
     /// <item><description>
     /// <see cref="SqlFailureKind.Unexpected"/> for everything else, whether or not
@@ -261,11 +331,15 @@ public static class SqlErrorClassifier
         || (sqlException is not null && IsAttentionAcknowledgement(sqlException));
 
     // When the server acknowledges the attention SqlClient sends for a cancelled command (a cancelled token or
-    // SqlCommand.Cancel), SqlClient 5.2.3 raises a SqlException whose errors are all number 0 with class 11: a severe
-    // error, then its SQL_OperationCancelled text "Operation cancelled by user." in the current UI culture. It adds
-    // that text only on the acknowledgement, never for a command timeout, which is the single error -2. Any error
-    // the server raised itself (a nonzero number) or a fatal class means the failure is not the abort alone, so it
-    // keeps its own classification.
+    // SqlCommand.Cancel), SqlClient 5.2.3 raises a SqlException of errors it builds itself, each number 0 with class
+    // 11: a severe error, then its "operation cancelled" error. It appends the "operation cancelled" error only on the
+    // attention path, so one of OperationCancelledMessages is the evidence, compared by ordinal equality. SqlClient
+    // raises the same severe error alone for a statement the server marked as failed without sending an error of its
+    // own, a failure of the command that may merely coincide with an abort, so a lone severe error stays its own
+    // class. SQL Server never raises number 0, and a command timeout is the single error -2. Any error the server
+    // raised itself (a nonzero number), a fatal class, or no error at all means the failure is not the abort alone,
+    // so it keeps its own classification. Classify asks only under a cancelled token, so an acknowledgement under any
+    // other token stays unexpected.
     private static bool IsAttentionAcknowledgement(SqlException exception)
     {
         if (exception.Errors.Count == 0)
@@ -273,7 +347,7 @@ public static class SqlErrorClassifier
             return false;
         }
 
-        bool acknowledged = false;
+        bool cancelled = false;
         foreach (SqlError error in exception.Errors)
         {
             if (error.Number != AttentionAcknowledgementErrorNumber || error.Class >= FatalErrorClass)
@@ -281,59 +355,16 @@ public static class SqlErrorClassifier
                 return false;
             }
 
-            acknowledged |= IsSqlClientText(error.Message, OperationCancelledResource, out _);
+            cancelled |= error.Message is string message && OperationCancelledMessages.Contains(message);
         }
 
-        return acknowledged;
+        return cancelled;
     }
 
-    // SqlClient's pool-exhaustion InvalidOperationException: its message is SqlClient's PooledOpenTimeoutResource text,
-    // or, only when SqlClient yields no text for that resource, contains the English PoolTimeoutMessageFragment.
-    private static bool IsPoolTimeout(Exception exception)
-    {
-        if (exception is not InvalidOperationException)
-        {
-            return false;
-        }
-
-        string message = exception.Message;
-        bool matches = IsSqlClientText(message, PooledOpenTimeoutResource, out bool textAvailable);
-        return textAvailable
-            ? matches
-            : message.Contains(PoolTimeoutMessageFragment, StringComparison.OrdinalIgnoreCase);
-    }
-
-    // True when message is, by ordinal equality, SqlClient's text for resourceName in the current UI culture, the one
-    // SqlClient formats its messages in, or in the invariant culture. textAvailable is false when neither lookup
-    // yields a text, so a caller can tell a resource that a future SqlClient renamed from a message that differs.
-    private static bool IsSqlClientText(string? message, string resourceName, out bool textAvailable)
-    {
-        string? current = SqlClientText(resourceName, CultureInfo.CurrentUICulture);
-        string? invariant = SqlClientText(resourceName, CultureInfo.InvariantCulture);
-        textAvailable = current is not null || invariant is not null;
-
-        return message is not null
-            && (string.Equals(message, current, StringComparison.Ordinal)
-                || string.Equals(message, invariant, StringComparison.Ordinal));
-    }
-
-    // SqlClient's text for resourceName in culture, falling back as ResourceManager does to the neutral resources,
-    // or null when SqlClient provides none. The three exceptions caught are the ones ResourceManager.GetString raises
-    // for missing or unusable resources; Classify must never throw.
-    private static string? SqlClientText(string resourceName, CultureInfo culture)
-    {
-        try
-        {
-            return SqlClientStrings.GetString(resourceName, culture);
-        }
-        catch (Exception exception) when (exception
-            is MissingManifestResourceException
-            or MissingSatelliteAssemblyException
-            or InvalidOperationException)
-        {
-            return null;
-        }
-    }
+    // SqlClient's pool-exhaustion InvalidOperationException: its message is, by ordinal equality, one of
+    // PoolTimeoutMessages. A message holding only part of such a text, or more than it, is not; nothing else is read.
+    private static bool IsPoolTimeout(Exception exception) =>
+        exception is InvalidOperationException { Message: string message } && PoolTimeoutMessages.Contains(message);
 
     /// <summary>
     /// Classifies a single SQL Server error number: <see cref="SqlFailureKind.Unavailable"/> when it is in

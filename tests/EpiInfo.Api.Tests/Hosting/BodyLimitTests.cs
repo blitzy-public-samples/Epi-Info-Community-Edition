@@ -9,6 +9,8 @@ using EpiInfo.Api.Hosting;
 using EpiInfo.Api.Tests.Infrastructure;
 using EpiInfo.Domain.Values;
 using EpiInfo.Tests.Shared;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Hosting.Server;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Http.Features;
@@ -143,12 +145,23 @@ public sealed class BodyLimitHostFixture : IAsyncLifetime
 /// large the body, in either guard order, on the shared hosts.
 /// </para>
 /// <para>
+/// A chunk-size line whose value overflows, which Kestrel's body stream fails with an <see cref="IOException"/>
+/// wrapping an <see cref="OverflowException"/>, is the fixed request-level 400 on every body endpoint through the
+/// API's composition on real Kestrel, with one Information <c>RequestFailed</c> line, no Error line and no store call.
+/// Any other <see cref="IOException"/> of the server's body stream is a server fault: through the API's composition on
+/// TestServer, with the body stream replaced by one that fails every read, every body endpoint answers it with the
+/// generic 500 and one Error <c>RequestFailed</c> line naming <see cref="IOException"/>.
+/// </para>
+/// <para>
 /// The guard's own rules are also pinned by invoking it directly: which requests get the raised server limit, which
-/// pass through untouched, the counting stream's read bound, and when a body-read failure a reader caught is rethrown.
+/// pass through untouched, the counting stream's read bound, when a body-read failure a reader caught is rethrown, and
+/// that only the chunk-size overflow of a chunked body, among the failures of the server's body stream, becomes the
+/// guard's 400.
 /// </para>
 /// <para>
 /// TestServer is reached through its in-process <see cref="HttpClient"/>, and the composition's Kestrel through
-/// <see cref="KestrelApiFactory.CreateKestrelClient"/>, whose bodies stay within one byte of the limit. The
+/// <see cref="KestrelApiFactory.CreateKestrelClient"/>, whose bodies stay within one byte of the limit, or, for
+/// framing that client cannot write, through the raw socket client below. The
 /// guard-pipeline Kestrel hosts, whose cases include exact chunk framing of several megabytes on the wire, are reached
 /// through a raw HTTP/1.1 socket client that sends the exact framing given and reads the response while the body is
 /// still being sent: <see cref="HttpClient"/> waits for the whole body to be sent before it surfaces a response, so a
@@ -190,6 +203,8 @@ public sealed class BodyLimitTests : IClassFixture<BodyLimitHostFixture>
 
     private const string ExpectedRequestBodyRequiredDetail = "request body is required";
 
+    private const string ExpectedInvalidRequestDetail = "the request is invalid";
+
     private const string ExpectedResourceNotFoundDetail = "the resource does not exist";
 
     private const string ExpectedMethodNotAllowedDetail = "method not allowed";
@@ -209,6 +224,17 @@ public sealed class BodyLimitTests : IClassFixture<BodyLimitHostFixture>
     private const int SmallBuffer = 3;
 
     private const char Padding = ' ';
+
+    // The fixed message of the guard's 400 for a body its server stream cannot read, never the server's own message.
+    private const string ExpectedUnreadableBodyMessage = "The request body could not be read.";
+
+    // A 500's detail: this fixed sentence and label, then the body's own traceId.
+    private const string ExpectedUnexpectedDetailPrefix = "An unexpected error occurred. Trace id: ";
+
+    // The ProblemDetails extension of a record write's 500, and its value when the store was never asked to write.
+    private const string WriteOutcomeMember = "writeOutcome";
+
+    private const string ExpectedNotWritten = "notWritten";
 
     // The exception handler's failure line: its event id and name, under the handler's log category.
     private const int RequestFailedEventId = 1;
@@ -292,6 +318,12 @@ public sealed class BodyLimitTests : IClassFixture<BodyLimitHostFixture>
 
         /// <summary>HTTP/1.1 chunked transfer coding, with no <c>Content-Length</c>.</summary>
         Chunked,
+
+        /// <summary>
+        /// HTTP/1.1 chunked transfer coding, with no <c>Content-Length</c>, whose framing the body bytes already hold
+        /// exactly as they go on the wire, chunk-size lines included; only the raw socket client sends it.
+        /// </summary>
+        RawChunked,
     }
 
     /// <summary>A route outside the four body endpoints.</summary>
@@ -372,6 +404,36 @@ public sealed class BodyLimitTests : IClassFixture<BodyLimitHostFixture>
         StartedWithItsStatus,
     }
 
+    /// <summary>What every read of the server's body stream under the guard fails with.</summary>
+    public enum ServerReadFailure
+    {
+        /// <summary>
+        /// An <see cref="IOException"/> whose inner exception is an <see cref="OverflowException"/>, as Kestrel raises
+        /// for a chunk-size line whose value overflows.
+        /// </summary>
+        ChunkSizeOverflow,
+
+        /// <summary>The same overflow-shaped <see cref="IOException"/> on a request the client has aborted.</summary>
+        AbortedChunkSizeOverflow,
+
+        /// <summary>An <see cref="IOException"/> with no inner exception, as an internal I/O failure raises.</summary>
+        PlainIOException,
+
+        /// <summary>
+        /// A <see cref="BadHttpRequestException"/> with status 413, as Kestrel raises past its own limit.
+        /// </summary>
+        TooLarge,
+
+        /// <summary>
+        /// A <see cref="BadHttpRequestException"/> with status 400, as Kestrel raises for a chunk size that is not
+        /// hexadecimal.
+        /// </summary>
+        BadRequest,
+
+        /// <summary>An <see cref="OperationCanceledException"/>, which is not an I/O failure.</summary>
+        Canceled,
+    }
+
     /// <summary>The configured limit: 1,048,576 bytes, read from the committed <c>appsettings.json</c>.</summary>
     private static long Limit => Committed.Options.MaxRequestBodySize;
 
@@ -450,6 +512,29 @@ public sealed class BodyLimitTests : IClassFixture<BodyLimitHostFixture>
                     {
                         data.Add(server, endpoint, framing);
                     }
+                }
+            }
+
+            return data;
+        }
+    }
+
+    /// <summary>
+    /// Each body endpoint with each HTTP/1.1 chunk-size line whose value overflows the integer Kestrel parses it into:
+    /// 2^31 in eight digits, and nine, sixteen, seventeen and eighteen hexadecimal <c>f</c>s.
+    /// </summary>
+    public static TheoryData<BodyEndpoint, string> OverflowingChunkSizeCases
+    {
+        get
+        {
+            string[] sizeLines =
+                ["80000000", "fffffffff", "ffffffffffffffff", "fffffffffffffffff", "ffffffffffffffffff"];
+            var data = new TheoryData<BodyEndpoint, string>();
+            foreach (BodyEndpoint endpoint in AllEndpoints)
+            {
+                foreach (string sizeLine in sizeLines)
+                {
+                    data.Add(endpoint, sizeLine);
                 }
             }
 
@@ -722,6 +807,58 @@ public sealed class BodyLimitTests : IClassFixture<BodyLimitHostFixture>
         }
     }
 
+    /// <summary>
+    /// Each failure of the server's body stream on a body with <c>Content-Length</c> and on a chunked one, with each
+    /// read overload.
+    /// </summary>
+    public static TheoryData<ServerReadFailure, BodyFraming, ReadOverload> ServerReadFailureCases
+    {
+        get
+        {
+            var data = new TheoryData<ServerReadFailure, BodyFraming, ReadOverload>();
+            foreach (ServerReadFailure failure in Enum.GetValues<ServerReadFailure>())
+            {
+                foreach (BodyFraming framing in AllFramings)
+                {
+                    foreach (ReadOverload overload in AllReadOverloads)
+                    {
+                        data.Add(failure, framing, overload);
+                    }
+                }
+            }
+
+            return data;
+        }
+    }
+
+    /// <summary>
+    /// Each body endpoint with each failure of the server's body stream that is not the client's framing: a plain
+    /// <see cref="IOException"/> on a body with <c>Content-Length</c> and on a chunked one, and the overflow-shaped
+    /// <see cref="IOException"/> on a body with <c>Content-Length</c>, which has no chunk-size line.
+    /// </summary>
+    public static TheoryData<BodyEndpoint, ServerReadFailure, BodyFraming> ServerFaultBodyReadCases
+    {
+        get
+        {
+            (ServerReadFailure Failure, BodyFraming Framing)[] faults =
+            [
+                (ServerReadFailure.PlainIOException, BodyFraming.ContentLength),
+                (ServerReadFailure.PlainIOException, BodyFraming.Chunked),
+                (ServerReadFailure.ChunkSizeOverflow, BodyFraming.ContentLength),
+            ];
+            var data = new TheoryData<BodyEndpoint, ServerReadFailure, BodyFraming>();
+            foreach (BodyEndpoint endpoint in AllEndpoints)
+            {
+                foreach ((ServerReadFailure failure, BodyFraming framing) in faults)
+                {
+                    data.Add(endpoint, failure, framing);
+                }
+            }
+
+            return data;
+        }
+    }
+
     // The API's own composition, Program.cs on real Kestrel, sets Kestrel's cap to the committed limit, which is also
     // the default and the largest limit the API options allow.
     [Fact]
@@ -931,6 +1068,110 @@ public sealed class BodyLimitTests : IClassFixture<BodyLimitHostFixture>
         Assert.Equal(typeof(BadHttpRequestException).FullName, StateValue(line, "ExceptionType"));
         Assert.Equal(traceId, StateValue(line, "TraceId"));
         Assert.Empty(api.Store.Calls);
+    }
+
+    // Through the API's own composition on real Kestrel, over the raw socket client: a chunk-size line whose value
+    // overflows makes Kestrel's body stream raise an IOException wrapping an OverflowException, a client framing error
+    // that the guard turns into its 400. Every body endpoint answers it with the fixed request-level 400 and leaves
+    // exactly one Information RequestFailed line naming the HTTP abstractions' BadHttpRequestException, whose TraceId
+    // is the body's traceId, and no Error line. Nothing of the request is echoed or logged, and the store is never
+    // called, so nothing is written. Each case has its own host and store.
+    [Theory]
+    [MemberData(nameof(OverflowingChunkSizeCases))]
+    public async Task ApiCompositionAnswersAChunkSizeThatOverflowsWithTheFixed400(
+        BodyEndpoint endpoint,
+        string sizeLine)
+    {
+        await using ComposedApiHost api = ComposedApiHost.Start(ServerKind.Kestrel);
+        var input = new CaseInput(TestDatabase.NewMarker(), api.RecordId);
+        (HttpMethod method, string path, string json) = EndpointTarget(endpoint, input);
+        byte[] wire = Encoding.UTF8.GetBytes($"{sizeLine}\r\n{json}\r\n0\r\n\r\n");
+        var request = new BodyRequest(method, path, JsonMediaType, wire, BodyFraming.RawChunked);
+
+        ReceivedResponse response = await api.SendRawAsync(request);
+
+        AssertProblem(response, HttpStatusCode.BadRequest, ExpectedInvalidRequestDetail);
+        AssertEchoesNoRequestContent(response);
+        string text = Encoding.UTF8.GetString(response.Body);
+        Assert.False(text.Contains(input.Text, StringComparison.Ordinal), "The error body echoes the case's marker.");
+        Assert.False(text.Contains(sizeLine, StringComparison.Ordinal), "The error body echoes the chunk size.");
+        string? traceId;
+        using (JsonDocument document = ParseJson(response))
+        {
+            traceId = document.RootElement.GetProperty(TraceIdMember).GetString();
+        }
+
+        CapturedLogEntry line = Assert.Single(api.Logs.Find(entry => entry.Category == HandlerCategory));
+        Assert.Equal(RequestFailedEventId, line.EventId.Id);
+        Assert.Equal(RequestFailedEvent, line.EventId.Name);
+        Assert.Equal(LogLevel.Information, line.Level);
+        Assert.Null(line.ExceptionType);
+        Assert.Equal(StatusCodes.Status400BadRequest, StateValue(line, "StatusCode"));
+        Assert.Equal(typeof(BadHttpRequestException).FullName, StateValue(line, "ExceptionType"));
+        Assert.Equal(traceId, StateValue(line, "TraceId"));
+        Assert.Empty(api.Logs.Find(entry => entry.Level >= LogLevel.Error));
+        Assert.False(api.Logs.ContainsText(input.Text), "A log line holds the case's marker.");
+        Assert.Empty(api.Store.Calls);
+        Assert.Empty(api.Store.WriteCalls);
+    }
+
+    // Through the API's own composition on TestServer, with each request's body replaced ahead of the pipeline by a
+    // server body stream whose every read fails: an IOException that is not the chunk-size overflow of a chunked body
+    // is a server fault, which the guard leaves as it is. Every body endpoint answers it with the generic 500, whose
+    // detail is the fixed sentence and the body's traceId, with writeOutcome notWritten on a record write, and leaves
+    // exactly one Error line, the handler's RequestFailed line naming System.IO.IOException with that traceId and no
+    // exception object. Neither the body nor any log line holds the exception's message or the case's marker, and the
+    // store is never called. Each case has its own host and store.
+    [Theory]
+    [MemberData(nameof(ServerFaultBodyReadCases))]
+    public async Task ApiCompositionAnswersAServerFaultInTheBodyReadWithTheGeneric500(
+        BodyEndpoint endpoint,
+        ServerReadFailure kind,
+        BodyFraming framing)
+    {
+        string sentinel = TestDatabase.NewMarker();
+        await using ComposedApiHost api = ComposedApiHost.StartWithFailingBody(ServerFailure(kind, sentinel));
+        var input = new CaseInput(TestDatabase.NewMarker(), api.RecordId);
+        (HttpMethod method, string path, string json) = EndpointTarget(endpoint, input);
+        var request = new BodyRequest(method, path, JsonMediaType, Encoding.UTF8.GetBytes(json), framing);
+        bool recordWrite = endpoint is BodyEndpoint.Create or BodyEndpoint.Update;
+
+        ReceivedResponse response = await api.SendAsync(request);
+
+        Assert.Equal((int)HttpStatusCode.InternalServerError, response.StatusCode);
+        string? traceId;
+        string? writeOutcome;
+        using (JsonDocument document = ParseJson(response))
+        {
+            JsonElement body = document.RootElement;
+            Assert.Equal(JsonValueKind.Object, body.ValueKind);
+            traceId = body.TryGetProperty(TraceIdMember, out JsonElement id) ? id.GetString() : null;
+            writeOutcome = body.TryGetProperty(WriteOutcomeMember, out JsonElement outcome)
+                ? outcome.GetString()
+                : null;
+        }
+
+        AssertProblem(response, HttpStatusCode.InternalServerError, ExpectedUnexpectedDetailPrefix + traceId);
+        Assert.Equal(recordWrite ? ExpectedNotWritten : null, writeOutcome);
+        AssertEchoesNoRequestContent(response);
+        string text = Encoding.UTF8.GetString(response.Body);
+        Assert.False(text.Contains(input.Text, StringComparison.Ordinal), "The error body echoes the case's marker.");
+        Assert.False(text.Contains(sentinel, StringComparison.Ordinal), "The error body quotes the exception.");
+
+        CapturedLogEntry line = Assert.Single(api.Logs.Find(entry => entry.Category == HandlerCategory));
+        Assert.Same(line, Assert.Single(api.Logs.Find(entry => entry.Level >= LogLevel.Error)));
+        Assert.Equal(RequestFailedEventId, line.EventId.Id);
+        Assert.Equal(RequestFailedEvent, line.EventId.Name);
+        Assert.Equal(LogLevel.Error, line.Level);
+        Assert.Null(line.ExceptionType);
+        Assert.Equal(StatusCodes.Status500InternalServerError, StateValue(line, "StatusCode"));
+        Assert.Equal(typeof(IOException).FullName, StateValue(line, "ExceptionType"));
+        Assert.Equal(recordWrite ? ExpectedNotWritten : null, StateValue(line, "WriteOutcome"));
+        Assert.Equal(traceId, StateValue(line, "TraceId"));
+        Assert.False(api.Logs.ContainsText(sentinel), "A log line quotes the exception.");
+        Assert.False(api.Logs.ContainsText(input.Text), "A log line holds the case's marker.");
+        Assert.Empty(api.Store.Calls);
+        Assert.Empty(api.Store.WriteCalls);
     }
 
     // Exact HTTP/1.1 chunk framing on Kestrel: every chunking of the exact limit carries more wire bytes than the
@@ -1519,6 +1760,95 @@ public sealed class BodyLimitTests : IClassFixture<BodyLimitHostFixture>
             context.Response.StatusCode);
     }
 
+    // Invoked directly over a server body stream whose every read fails, on a body with Content-Length and on a chunked
+    // one, through any read overload, with a reader that catches the failure and, for a BadHttpRequestException, ends
+    // the request as JSON binding does: its status and no body. Only the chunk-size overflow of a chunked body on a
+    // live request, an IOException wrapping an OverflowException, fails the read with the guard's 400 instead, whose
+    // message is fixed and whose inner exception is the original, and the guard rethrows that 400 like its own 413.
+    // Every other failure reaches the reader as the same instance, its stack trace kept from the inner stream's read
+    // where that read threw it: a plain IOException on either framing, the overflow-shaped one on a body with
+    // Content-Length or on an aborted request, and a cancellation, none of which the guard rethrows; and a
+    // BadHttpRequestException the server raised, 413 or 400, which keeps its own status and is rethrown as it is.
+    [Theory]
+    [MemberData(nameof(ServerReadFailureCases))]
+    public async Task OnlyTheChunkSizeOverflowOfAChunkedBodyBecomesTheGuardsFixed400(
+        ServerReadFailure kind,
+        BodyFraming framing,
+        ReadOverload overload)
+    {
+        string sentinel = TestDatabase.NewMarker();
+        Exception raised = ServerFailure(kind, sentinel);
+        (long? contentLength, bool chunked) = framing switch
+        {
+            BodyFraming.ContentLength => ((long?)SmallLimit, false),
+            BodyFraming.Chunked => ((long?)null, true),
+            _ => throw new ArgumentOutOfRangeException(nameof(framing), framing, "Not a framing a context declares."),
+        };
+        using var inner = new FailingBodyStream(raised);
+        DefaultHttpContext context = CreateContext(
+            EndpointShape.JsonBody,
+            JsonMediaType,
+            contentLength,
+            chunked,
+            inner,
+            feature: null);
+        using var aborted = new CancellationTokenSource();
+        if (kind == ServerReadFailure.AbortedChunkSizeOverflow)
+        {
+            await aborted.CancelAsync();
+        }
+
+        context.RequestAborted = aborted.Token;
+        Exception? caught = null;
+
+        Exception? thrown = await Record.ExceptionAsync(() => InvokeGuardAsync(context, SmallLimit, async downstream =>
+        {
+            try
+            {
+                await ReadOnceAsync(downstream.Request.Body, overload, new byte[LargeBuffer]);
+            }
+            catch (Exception failure) when (failure is IOException or OperationCanceledException)
+            {
+                caught = failure;
+            }
+
+            if (caught is BadHttpRequestException badRequest)
+            {
+                downstream.Response.StatusCode = badRequest.StatusCode;
+            }
+        }));
+
+        Assert.NotNull(caught);
+        if (kind == ServerReadFailure.ChunkSizeOverflow && chunked)
+        {
+            BadHttpRequestException unreadable = Assert.IsType<BadHttpRequestException>(caught);
+            Assert.Equal(StatusCodes.Status400BadRequest, unreadable.StatusCode);
+            Assert.Equal(ExpectedUnreadableBodyMessage, unreadable.Message);
+            Assert.Same(raised, unreadable.InnerException);
+            Assert.Contains("LimitedReadStream", unreadable.StackTrace, StringComparison.Ordinal);
+            Assert.Same(unreadable, thrown);
+            return;
+        }
+
+        Assert.Same(raised, caught);
+        Assert.Contains("LimitedReadStream", caught.StackTrace, StringComparison.Ordinal);
+        if (overload is ReadOverload.ArraySync or ReadOverload.Span)
+        {
+            // A synchronous read throws inside the inner stream, so only a rethrow that keeps the stack trace keeps
+            // that frame as well.
+            Assert.Contains(nameof(FailingBodyStream), caught.StackTrace, StringComparison.Ordinal);
+        }
+
+        if (raised is BadHttpRequestException)
+        {
+            Assert.Same(raised, thrown);
+        }
+        else
+        {
+            Assert.Null(thrown);
+        }
+    }
+
     // The framing budget the guard gives a chunked body on top of its payload: one-byte chunks carry the most framing
     // an extension-free, canonically sized chunking can, "1\r\n" before and "\r\n" after each byte, 5 bytes per payload
     // byte, and the last chunk "0\r\n" with the "\r\n" ending an empty trailer adds 5.
@@ -1619,6 +1949,10 @@ public sealed class BodyLimitTests : IClassFixture<BodyLimitHostFixture>
         {
             BodyFraming.ContentLength => new ByteArrayContent(request.Body),
             BodyFraming.Chunked => new StreamContent(new ForwardOnlyStream(request.Body)),
+            BodyFraming.RawChunked => throw new ArgumentOutOfRangeException(
+                nameof(request),
+                request.Framing,
+                "Raw chunk framing is sent only by the raw socket client."),
             _ => throw new ArgumentOutOfRangeException(nameof(request), request.Framing, "Not a body framing."),
         };
         using var message = new HttpRequestMessage(request.Method, request.Path) { Content = content };
@@ -1814,6 +2148,20 @@ public sealed class BodyLimitTests : IClassFixture<BodyLimitHostFixture>
             ReadOverload.Span => stream.Read(buffer.AsSpan()),
             ReadOverload.Memory => await stream.ReadAsync(buffer.AsMemory()),
             _ => throw new ArgumentOutOfRangeException(nameof(overload), overload, "Not a read overload."),
+        };
+
+    // The exception every read of a failing server body stream raises for kind, with sentinel as its message, so a
+    // case can prove that no response or log line quotes it.
+    private static Exception ServerFailure(ServerReadFailure kind, string sentinel) =>
+        kind switch
+        {
+            ServerReadFailure.ChunkSizeOverflow or ServerReadFailure.AbortedChunkSizeOverflow =>
+                new IOException(sentinel, new OverflowException()),
+            ServerReadFailure.PlainIOException => new IOException(sentinel),
+            ServerReadFailure.TooLarge => new BadHttpRequestException(sentinel, StatusCodes.Status413PayloadTooLarge),
+            ServerReadFailure.BadRequest => new BadHttpRequestException(sentinel, StatusCodes.Status400BadRequest),
+            ServerReadFailure.Canceled => new OperationCanceledException(sentinel),
+            _ => throw new ArgumentOutOfRangeException(nameof(kind), kind, "Not a server read failure."),
         };
 
     private static GuardHostKind HostKind(ServerKind server) =>
@@ -2033,7 +2381,10 @@ public sealed class BodyLimitTests : IClassFixture<BodyLimitHostFixture>
     /// <remarks>
     /// Requests go through the factory's own client: in process on TestServer, over a loopback socket on Kestrel. A
     /// body here is at most one byte over the limit, small enough for the socket client to surface Kestrel's early 413
-    /// reliably, so these cases need no raw-socket client; the larger framings of the guard-pipeline cases do.
+    /// reliably, so the size cases need no raw-socket client; the larger framings of the guard-pipeline cases do.
+    /// Framing that client cannot write, such as a chunk-size line given verbatim, reaches the Kestrel host through the
+    /// raw socket client instead. A host from <see cref="StartWithFailingBody"/> also replaces each request's body,
+    /// ahead of the whole pipeline, with a server body stream whose every read fails.
     /// </remarks>
     private sealed class ComposedApiHost : IAsyncDisposable
     {
@@ -2091,8 +2442,48 @@ public sealed class BodyLimitTests : IClassFixture<BodyLimitHostFixture>
             }
         }
 
+        /// <summary>
+        /// Starts the composition on TestServer with each request's body replaced, before the first middleware runs,
+        /// by a <see cref="FailingBodyStream"/> whose every read fails with <paramref name="failure"/>, as a server
+        /// body stream with an internal fault does; the caller disposes the host.
+        /// </summary>
+        /// <param name="failure">The exception every body read raises.</param>
+        /// <returns>The started host.</returns>
+        public static ComposedApiHost StartWithFailingBody(Exception failure)
+        {
+            var store = new FakeDataStore(FakeForms.TwoPage);
+            string recordId = store.SeedRecord(FakeForms.TwoPageViewId);
+            var factory = new ApiFactory(ApiFactoryOptions.ForFake(store));
+
+            try
+            {
+                // The derived factory runs the factory's own configuration first, so its store and log capture stay
+                // the ones this host exposes, and disposing the factory disposes it too.
+                HttpClient client = factory
+                    .WithWebHostBuilder(builder => builder.ConfigureTestServices(
+                        services => services.AddSingleton<IStartupFilter>(new FailingBodyStartupFilter(failure))))
+                    .CreateClient();
+                return new ComposedApiHost(store, recordId, factory, client);
+            }
+            catch
+            {
+                factory.Dispose();
+                throw;
+            }
+        }
+
         /// <summary>Sends <paramref name="request"/> to the host once; nothing is retried.</summary>
         public Task<ReceivedResponse> SendAsync(BodyRequest request) => SendThroughClientAsync(_client, request);
+
+        /// <summary>
+        /// Sends <paramref name="request"/> to the host once over the raw HTTP/1.1 socket client, with framing exactly
+        /// as given, which the factory's client cannot write; nothing is retried.
+        /// </summary>
+        /// <exception cref="InvalidOperationException">The host is not on real Kestrel.</exception>
+        public Task<ReceivedResponse> SendRawAsync(BodyRequest request) =>
+            _factory is KestrelApiFactory kestrel
+                ? RawHttp1Client.SendAsync(kestrel.BaseAddress, request)
+                : throw new InvalidOperationException("Only a host on real Kestrel has a socket for raw framing.");
 
         /// <inheritdoc />
         public async ValueTask DisposeAsync()
@@ -2119,7 +2510,10 @@ public sealed class BodyLimitTests : IClassFixture<BodyLimitHostFixture>
     /// <param name="Method">The HTTP method.</param>
     /// <param name="Path">The origin-form path.</param>
     /// <param name="ContentType">The raw <c>Content-Type</c>, or <see langword="null"/> to send none.</param>
-    /// <param name="Body">The body bytes.</param>
+    /// <param name="Body">
+    /// The body bytes; for <see cref="BodyFraming.RawChunked"/>, the chunked body as it goes on the wire, framing
+    /// included.
+    /// </param>
     /// <param name="Framing">How the body's length reaches the server.</param>
     /// <param name="ChunkSize">The payload bytes per chunk when the raw client sends the body chunked.</param>
     /// <param name="ChunkExtension">
@@ -2306,14 +2700,16 @@ public sealed class BodyLimitTests : IClassFixture<BodyLimitHostFixture>
     }
 
     /// <summary>
-    /// A server body stream whose every read fails with one <see cref="BadHttpRequestException"/>, as Kestrel's does
-    /// once a body passes its own limit.
+    /// A server body stream whose every read fails with one exception, as Kestrel's does with a
+    /// <see cref="BadHttpRequestException"/> once a body passes its own limit, or with an <see cref="IOException"/>
+    /// wrapping an <see cref="OverflowException"/> once a chunk size overflows, and as any server stream with an
+    /// internal I/O fault does.
     /// </summary>
     private sealed class FailingBodyStream : Stream
     {
-        private readonly BadHttpRequestException _failure;
+        private readonly Exception _failure;
 
-        public FailingBodyStream(BadHttpRequestException failure)
+        public FailingBodyStream(Exception failure)
         {
             _failure = failure;
         }
@@ -2352,6 +2748,32 @@ public sealed class BodyLimitTests : IClassFixture<BodyLimitHostFixture>
         public override void SetLength(long value) => throw new NotSupportedException();
 
         public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    }
+
+    /// <summary>
+    /// Adds, ahead of the whole pipeline, a middleware that replaces each request's body with a
+    /// <see cref="FailingBodyStream"/> over one failure, so the guards, the endpoints and the exception handler all
+    /// see a server body stream that fails every read.
+    /// </summary>
+    private sealed class FailingBodyStartupFilter : IStartupFilter
+    {
+        private readonly Exception _failure;
+
+        public FailingBodyStartupFilter(Exception failure)
+        {
+            _failure = failure;
+        }
+
+        public Action<IApplicationBuilder> Configure(Action<IApplicationBuilder> next) => app =>
+        {
+            app.Use(async (HttpContext context, RequestDelegate rest) =>
+            {
+                using var body = new FailingBodyStream(_failure);
+                context.Request.Body = body;
+                await rest(context);
+            });
+            next(app);
+        };
     }
 
     /// <summary>A response feature whose response has started, as once an endpoint has sent its headers.</summary>
@@ -2500,7 +2922,7 @@ public sealed class BodyLimitTests : IClassFixture<BodyLimitHostFixture>
 
             long bodyLength = request.Framing switch
             {
-                BodyFraming.ContentLength => request.Body.LongLength,
+                BodyFraming.ContentLength or BodyFraming.RawChunked => request.Body.LongLength,
                 BodyFraming.Chunked => ChunkedLength(
                     request.Body.LongLength,
                     request.ChunkSize,
@@ -2518,14 +2940,15 @@ public sealed class BodyLimitTests : IClassFixture<BodyLimitHostFixture>
             var wire = new byte[checked(headBytes.Length + (int)bodyLength)];
             headBytes.CopyTo(wire, 0);
             int written = headBytes.Length;
-            if (request.Framing == BodyFraming.ContentLength)
+            if (request.Framing == BodyFraming.Chunked)
             {
-                request.Body.CopyTo(wire, written);
-                written += request.Body.Length;
+                written = WriteChunks(wire, written, request);
             }
             else
             {
-                written = WriteChunks(wire, written, request);
+                // A body with Content-Length, or raw chunk framing that the body already holds.
+                request.Body.CopyTo(wire, written);
+                written += request.Body.Length;
             }
 
             Assert.Equal(wire.Length, written);

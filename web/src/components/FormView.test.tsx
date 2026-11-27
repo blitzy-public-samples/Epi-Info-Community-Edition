@@ -7,11 +7,13 @@
 // FormView runs against the real client, hooks and field components. The client's fetch
 // seam is an in-memory API that answers the read routes of one form and its stored active
 // records: one record by default, two or none where a case asks. A PUT of a stored record
-// or a POST of a new one is answered only with a reply the case queued, at once or held
-// until the case releases it, and a saved reply updates the stored records. Any other
-// request, and a write no reply was queued for, is answered 500 and recorded, and fails
-// the test, so loading the form is also shown to send GETs only and raise no field event
-// (DATA-01).
+// or a POST of a new one is answered with the next reply the case queued, at once or held
+// until the case releases it, and a saved reply updates the stored records. A case may
+// answer more through two options: its own `route`, tried before every other route, and
+// `answersFieldEvents`, which answers field events with no effects. A request nothing
+// answers, and a write no reply was queued for, is answered 500 and recorded, and fails the
+// case in afterEach. DATA-01, that loading sends GETs only and raises no field event, is
+// asserted by the clean-load case, not implied by the 500 default.
 //
 // The write cases drive the editor through FormView: a dirty draft is saved before a grid
 // open or Back to forms continues, and a failed save keeps the draft and cancels the move;
@@ -71,7 +73,7 @@ import {
   withField,
   writableCheckboxNames,
 } from '../test/formDefinitionFixture';
-import { clientMessages, formatRequiredMessage } from '../validation/clientValidation';
+import { clientMessages } from '../validation/clientValidation';
 import { FormView } from './FormView';
 import { RecordNavigator, type RecordNavigatorProps } from './RecordNavigator';
 import type { RecordGridProps } from './RecordGrid';
@@ -118,8 +120,8 @@ afterEach(() => {
   // Unmounted first: a failing check below skips the setup file's cleanup, and a form left
   // mounted would fail the next case too.
   cleanup();
-  // A request no route answers fails the case: a field event, which no case here raises,
-  // or a write the case queued no reply for.
+  // A request no route answers fails the case, such as a field event the case did not opt
+  // to answer or a write it queued no reply for.
   expect(unrouted).toEqual([]);
   // A reply left over answers a write the case expected and FormView never sent.
   expect(writeAnswers, 'write replies queued but never requested').toHaveLength(0);
@@ -223,6 +225,14 @@ function fieldLevelProblem(errors: Record<string, string[]>): HttpValidationProb
     errors,
     traceId: '00-test-validation-00',
   };
+}
+
+/**
+ * The test's own stand-in for the server's required-field message of a field: like the server's
+ * required-gate message, it opens with the prompt and names the page.
+ */
+function serverRequiredMessage(prompt: string, pageName: string): string {
+  return `${prompt} must be filled in (page ${pageName}).`;
 }
 
 // Marks a bigint inside JSON.stringify's output so it can be written as a bare integer; no
@@ -555,7 +565,6 @@ function present<T>(value: T | null | undefined, what: string): T {
   return value;
 }
 
-/** The prompt of a fixture field that has one; every fixture field does. */
 /** The number `record` holds for `name`, as the form and the grid show it. */
 function recordNumberText(record: RecordDto, name: string): string {
   const value = record.values[name];
@@ -565,6 +574,7 @@ function recordNumberText(record: RecordDto, name: string): string {
   return String(value);
 }
 
+/** The prompt of a fixture field that has one; every fixture field does. */
 function promptOf(field: FieldDefinition): string {
   return present(field.prompt, `prompt of ${field.name}`);
 }
@@ -1095,7 +1105,7 @@ describe('FormView accessible structure (SC-8)', () => {
     }));
     const severity = fieldByName('IllnessSeverity', definition);
     const prompt = promptOf(severity);
-    const message = formatRequiredMessage(severity.prompt, pageOf(definition, severity.pageId).name);
+    const message = serverRequiredMessage(prompt, pageOf(definition, severity.pageId).name);
     const recordsPath = `/api/forms/${definition.viewId}/records`;
     // The one write this case makes: a POST the server's required gate rejects. The client
     // leaves option fields to that gate, as legacy data entry never required them.
@@ -1696,9 +1706,10 @@ describe('FormView field rendering: isolation, row identity, registry lookup and
   });
 
   // The contract closes `fieldType`, but a malformed response can carry any string, and
-  // these name members every object inherits.
+  // these name members every object inherits. Such a field is no data field, so Find offers
+  // no criterion for it either, while every published data field stays searchable.
   it.each(['constructor', 'toString', '__proto__', 'hasOwnProperty', 'valueOf'])(
-    'renders a field of the malformed type %s as a protected placeholder',
+    'renders a field of the malformed type %s as a protected placeholder that Find does not offer',
     async (malformed) => {
       const fieldType: string = malformed;
       const { container } = await renderForm(withField('Zip', (field) => ({ ...field, fieldType: fieldType as FieldType })));
@@ -1707,6 +1718,13 @@ describe('FormView field rendering: isolation, row identity, registry lookup and
       expect(within(wrapper).getByText('Unsupported field type: unknown')).toBeTruthy();
       expect(wrapper.classList.contains('field--protected')).toBe(true);
       expect(wrapper.querySelectorAll(`${NATIVE_CONTROLS}, button`)).toHaveLength(0);
+
+      fireEvent.click(within(screen.getByRole('toolbar', { name: 'Form actions' })).getByRole('button', { name: 'Find' }));
+      const picker = within(screen.getByRole('dialog', { name: 'Find record' })).getByRole('group', {
+        name: 'Fields to search',
+      });
+      expect(within(picker).queryByRole('checkbox', { name: 'Zip' })).toBeNull();
+      expect(within(picker).getByRole('checkbox', { name: 'PhoneNumber' })).toBeTruthy();
     },
   );
 
@@ -2573,25 +2591,58 @@ describe('FormView validation summary', () => {
     expect(navigatorStatus()).toBe('1 of 1');
   });
 
-  // Last Name sits on page 1; Lab sits on page 2 and its prompt ends with a colon.
-  it.each([{ name: 'LastName' }, { name: 'Lab' }])(
-    'shows the required-field message of $name once, its prompt as the jump label, and other messages after their label',
+  // Last Name sits on page 1; Lab sits on page 2 and its prompt ends with a colon. No seeded
+  // field is required, so each case makes the fixture field required.
+  const REQUIRED_FIELDS = [{ name: 'LastName' }, { name: 'Lab' }];
+
+  /** The fixture form with the field `name` required. */
+  function requiring(name: string): FormDefinition {
+    return withField(name, (field) => ({ ...field, validation: { ...field.validation, required: true } }));
+  }
+
+  /** An item's text for a message shown after its label: a label that ends with a colon is followed by a space only. */
+  function afterLabel(label: string, message: string): string {
+    return `${label}${label.endsWith(':') ? ' ' : ': '}${message}`;
+  }
+
+  /**
+   * Checks that `item`'s one button is the summary's jump labelled by `field`'s prompt, clicks it,
+   * and waits until it shows `field`'s page and focuses its control. The focus raises a field
+   * event, answered with no effects, after the `earlier` writes.
+   */
+  async function expectJumpToField(
+    summary: HTMLElement,
+    item: HTMLElement,
+    definition: FormDefinition,
+    field: FieldDefinition,
+    earlier: readonly string[],
+  ): Promise<void> {
+    const prompt = promptOf(field);
+    const jump = within(item).getByRole('button');
+    expect(jump).toBe(within(summary).getByRole('button', { name: prompt }));
+    expect(jump.textContent).toBe(prompt);
+    fireEvent.click(jump);
+    await waitFor(() => {
+      expect(document.activeElement?.id).toBe(fieldControlId(field.name));
+    });
+    const page = pageOf(definition, field.pageId);
+    expect(screen.getByRole('tab', { name: page.name }).getAttribute('aria-selected')).toBe('true');
+    expect(controlOf(definition, field.name)).toBe(document.activeElement);
+    await waitFor(() => {
+      expect(writeCalls().map(requestLine)).toEqual([...earlier, `POST ${FORM_PATH}/checkcode/field-event`]);
+    });
+  }
+
+  it.each(REQUIRED_FIELDS)(
+    "lists the client's required message of $name after its prompt, whose jump focuses the field, in form order with other messages",
     async ({ name }) => {
-      // No seeded field is required, so the fixture field is made required here.
-      const definition = withField(name, (field) => ({
-        ...field,
-        validation: { ...field.validation, required: true },
-      }));
+      const definition = requiring(name);
       const required = fieldByName(name, definition);
-      const prompt = promptOf(required);
-      const page = pageOf(definition, required.pageId);
-      const requiredMessage = formatRequiredMessage(required.prompt, page.name);
       const feverTemp = fieldByName('FeverTemp', definition);
       const upper = feverTemp.validation.upper;
       if (typeof upper !== 'number') {
         throw new Error('FeverTemp has no numeric upper bound');
       }
-      // Focusing a control from its jump label raises a field event, answered with no effects.
       await renderForm(definition, { answersFieldEvents: true });
 
       // A new record with the required field blank and one other value entered, so it is not
@@ -2608,34 +2659,181 @@ describe('FormView validation summary', () => {
       const feverErrors = present(document.getElementById(fieldErrorId(feverTemp.name)), 'error list of FeverTemp');
       expect(feverErrors.querySelectorAll('p')).toHaveLength(1);
       const feverMessage = feverErrors.textContent ?? '';
-      // In form order: the required message verbatim, its prompt appearing once; FeverTemp's
-      // message after its prompt and the separator.
+      // In form order, each message after its prompt and the separator.
+      const requiredText = afterLabel(promptOf(required), clientMessages.required);
       const expected = new Map([
-        [required.name, requiredMessage],
-        [feverTemp.name, `${promptOf(feverTemp)}: ${feverMessage}`],
+        [required.name, requiredText],
+        [feverTemp.name, afterLabel(promptOf(feverTemp), feverMessage)],
       ]);
       const items = within(summary).getAllByRole('listitem');
       expect(items.map((item) => item.textContent)).toEqual(
         allFields(definition).flatMap((field) => expected.get(field.name) ?? []),
       );
 
-      // The required message's prompt is its jump label, which shows the page and focuses the control.
       const requiredItem = present(
-        items.find((item) => item.textContent === requiredMessage),
+        items.find((item) => item.textContent === requiredText),
         'summary item of the required field',
       );
-      const jump = within(requiredItem).getByRole('button');
-      expect(jump).toBe(within(summary).getByRole('button', { name: prompt }));
-      expect(jump.textContent).toBe(prompt);
-      fireEvent.click(jump);
-      await waitFor(() => {
-        expect(document.activeElement?.id).toBe(fieldControlId(required.name));
-      });
-      expect(screen.getByRole('tab', { name: page.name }).getAttribute('aria-selected')).toBe('true');
-      expect(controlOf(definition, required.name)).toBe(document.activeElement);
-      await waitFor(() => {
-        expect(writeCalls().map(requestLine)).toEqual([`POST ${FORM_PATH}/checkcode/field-event`]);
-      });
+      await expectJumpToField(summary, requiredItem, definition, required, []);
+    },
+  );
+
+  it.each(REQUIRED_FIELDS)(
+    "shows the server's required message of $name once, verbatim, its opening prompt as the jump label",
+    async ({ name }) => {
+      const definition = requiring(name);
+      const required = fieldByName(name, definition);
+      const prompt = promptOf(required);
+      const message = serverRequiredMessage(prompt, pageOf(definition, required.pageId).name);
+      // The stored record holds no value for the required field. A PUT that does not touch it
+      // leaves it to the server, whose required gate rejects the save.
+      const stored = savedWith(RECORD, { [required.name]: null });
+      const put = `PUT ${FORM_PATH}/records/${stored.globalRecordId}`;
+      replyToWrite({ kind: 'problem', problem: fieldLevelProblem({ [required.name]: [message] }) });
+      await renderForm(definition, { records: [stored], answersFieldEvents: true });
+
+      // A value the client accepts, in another field.
+      edit(definition, 'FeverTemp', '101.5');
+      fireEvent.click(formActionButton('Save'));
+
+      const summary = await findValidationSummary();
+      await flush();
+      const writes = writeCalls();
+      expect(writes.map(requestLine)).toEqual([put]);
+      expect(writtenValues(writes[0])).toEqual({ FeverTemp: 101.5 });
+      // The message verbatim, its prompt shown once: the jump label is its opening words.
+      const items = within(summary).getAllByRole('listitem');
+      expect(items.map((item) => item.textContent)).toEqual([message]);
+      const [requiredItem] = items;
+      expect(requiredItem.firstChild).toBe(within(requiredItem).getByRole('button', { name: prompt }));
+      await expectJumpToField(summary, requiredItem, definition, required, [put]);
+    },
+  );
+
+  it("shows the server's required-field message of a required field, which opens with its prompt and names its page, once, and every other message after its label", async () => {
+    // Five of the rows' fields are made required; Address has no prompt, so its label is its
+    // name; and the page Lab sits on has a blank name.
+    const required = new Set(['CaseID', 'FirstName', 'Age', 'PatientAddress', 'Lab']);
+    const fixture = createFormDefinitionFixture();
+    const blankPageId = fieldByName('Lab', fixture).pageId;
+    const definition: FormDefinition = {
+      ...fixture,
+      pages: fixture.pages.map((page) => ({
+        ...page,
+        name: page.pageId === blankPageId ? '  ' : page.name,
+        fields: page.fields.map((field) => ({
+          ...field,
+          prompt: field.name === 'PatientAddress' ? null : field.prompt,
+          validation: { ...field.validation, required: field.validation.required || required.has(field.name) },
+        })),
+      })),
+    };
+    const prompt = (name: string): string => promptOf(fieldByName(name, definition));
+    const pageName = (name: string): string => pageOf(definition, fieldByName(name, definition).pageId).name;
+    // The server's messages, in form order and then a key that names no field. Only the
+    // FirstName row meets every condition and is shown once; each other row misses one and is
+    // shown after its label.
+    const rows = [
+      // Required and opens with its prompt, but names no page.
+      {
+        key: 'CaseID',
+        label: prompt('CaseID'),
+        message: `${prompt('CaseID')} must be a whole number.`,
+        once: false,
+      },
+      // Required, opens with its prompt and names its page.
+      {
+        key: 'FirstName',
+        label: prompt('FirstName'),
+        message: serverRequiredMessage(prompt('FirstName'), pageName('FirstName')),
+        once: true,
+      },
+      // Opens with its prompt and names its page, but the field is not required.
+      {
+        key: 'LastName',
+        label: prompt('LastName'),
+        message: serverRequiredMessage(prompt('LastName'), pageName('LastName')),
+        once: false,
+      },
+      // Required and names its page, but the prompt's letters only open a longer word.
+      {
+        key: 'Age',
+        label: prompt('Age'),
+        message: serverRequiredMessage(`${prompt('Age')}s`, pageName('Age')),
+        once: false,
+      },
+      // Required and names its page, but opens with the blank prompt, not the name that labels it.
+      {
+        key: 'PatientAddress',
+        label: 'PatientAddress',
+        message: serverRequiredMessage('', pageName('PatientAddress')),
+        once: false,
+      },
+      // Required and opens with its prompt, but its page's name is blank, which names no page.
+      {
+        key: 'Lab',
+        label: prompt('Lab'),
+        message: serverRequiredMessage(prompt('Lab'), pageName('Lab')),
+        once: false,
+      },
+      // A key that names no field.
+      {
+        key: 'values',
+        label: 'values',
+        message: 'values holds a name that is not a field of the form.',
+        once: false,
+      },
+    ];
+    replyToWrite({
+      kind: 'problem',
+      problem: fieldLevelProblem(Object.fromEntries(rows.map(({ key, message }) => [key, [message]]))),
+    });
+    // The stored record holds a value for every required field, so only the server rejects the save.
+    await renderForm(definition, { records: [savedWith(RECORD, { PatientAddress: '12 Elm Street' })] });
+
+    edit(definition, 'FeverTemp', '101.5');
+    fireEvent.click(formActionButton('Save'));
+
+    const summary = await findValidationSummary();
+    await flush();
+    expect(writeCalls().map(requestLine)).toEqual([`PUT ${FORM_PATH}/records/${RECORD.globalRecordId}`]);
+    const items = within(summary).getAllByRole('listitem');
+    expect(items.map((item) => item.textContent)).toEqual(
+      rows.map(({ label, message, once }) => (once ? message : afterLabel(label, message))),
+    );
+    // Each field's item opens with its jump button, named by its label; the key that names no
+    // field, the last row, has none.
+    rows.slice(0, -1).forEach(({ key, label }, index) => {
+      expect(items[index].firstChild, key).toBe(within(items[index]).getByRole('button', { name: label }));
+    });
+    expect(within(items[rows.length - 1]).queryByRole('button')).toBeNull();
+  });
+
+  // Age's prompt is made the first word of the client's number message. Client feedback names no
+  // page, so it follows the prompt whether or not the field is required.
+  it.each([{ required: false }, { required: true }])(
+    "shows the client's message after the prompt when the prompt is the message's first word (required: $required)",
+    async ({ required }) => {
+      const definition = withField('Age', (field) => ({
+        ...field,
+        prompt: 'Enter',
+        validation: { ...field.validation, required },
+      }));
+      await renderForm(definition);
+
+      edit(definition, 'Age', 'abc');
+      fireEvent.click(formActionButton('Save'));
+
+      const summary = await findValidationSummary();
+      await flush();
+      expect(writeCalls().map(requestLine)).toEqual([]);
+      expect(clientMessages.numberExpected.startsWith('Enter ')).toBe(true);
+      const items = within(summary).getAllByRole('listitem');
+      expect(items.map((item) => item.textContent)).toEqual([`Enter: ${clientMessages.numberExpected}`]);
+      // The button holds the prompt alone, and the separator and the whole message follow it.
+      const jump = within(items[0]).getByRole('button', { name: 'Enter' });
+      expect(items[0].firstChild).toBe(jump);
+      expect(jump.textContent).toBe('Enter');
     },
   );
 });
@@ -3022,9 +3220,10 @@ describe('FormView malformed form metadata', () => {
   // 0-based int32 index on an option field and the label text on a legal-values field, a finite
   // number on a number field and a YYYY-MM-DD calendar date on a date field, `null` when unset.
   // Options are a list, possibly empty, on an option or legal-values field and `null` on a
-  // field of every other published type. A definition departing from that is a failed load,
-  // never a form whose radio group or list silently substitutes a choice or offers none, or
-  // whose range check drops a bound.
+  // field of every other published type. A check-code diagnostic's line is 1-based in the
+  // program text. A definition departing from that is a failed load, never a form whose radio
+  // group or list silently substitutes a choice or offers none, or whose range check drops a
+  // bound.
 
   type OptionValue = NonNullable<FieldDefinition['options']>[number]['value'];
   type Bound = FieldDefinition['validation']['lower'];
@@ -3049,6 +3248,15 @@ describe('FormView malformed form metadata', () => {
     return withField(name, (field) => ({ ...field, validation: { ...field.validation, [bound]: value as Bound } }));
   }
 
+  /** The fixture with one unsupported-command diagnostic on `line`, as a response may carry it. */
+  function withDiagnosticOn(line: number): FormDefinition {
+    const fixture = createFormDefinitionFixture();
+    return {
+      ...fixture,
+      unsupportedCheckCode: [{ severity: 'warning', form: fixture.name, line, command: 'GOTO', message: 'Not supported.' }],
+    };
+  }
+
   it.each<{ label: string; definition: () => FormDefinition }>([
     { label: 'a boolean option value', definition: () => withFirstOptionValue('IllnessSeverity', true) },
     { label: 'a null option value', definition: () => withFirstOptionValue('IllnessSeverity', null) },
@@ -3066,6 +3274,7 @@ describe('FormView malformed form metadata', () => {
     { label: 'a number as a date bound', definition: () => withBound('DateofInterview', 'lower', 20110115) },
     { label: 'an impossible date bound', definition: () => withBound('DateofInterview', 'upper', '2011-13-45') },
     { label: '29 February of a common year as a date bound', definition: () => withBound('OnsetDate', 'lower', '2011-02-29') },
+    ...[0, -1, 1.5].map((line) => ({ label: `a diagnostic on line ${line}`, definition: () => withDiagnosticOn(line) })),
   ])('reports a definition with $label as a failed load and renders none of its fields', async ({ definition }) => {
     const malformed = definition();
     const { container } = mountForm(malformed);
@@ -3085,6 +3294,7 @@ describe('FormView malformed form metadata', () => {
     { label: 'an empty options list on a legal-values field', field: 'Sex', definition: () => withOptions('Sex', []) },
     { label: 'a fractional negative number bound', field: 'Age', definition: () => withBound('Age', 'lower', -0.5) },
     { label: 'a leap day as a date bound', field: 'OnsetDate', definition: () => withBound('OnsetDate', 'upper', '2012-02-29') },
+    { label: 'a diagnostic on line 1', field: 'LastName', definition: () => withDiagnosticOn(1) },
   ])('loads $label with every field rendered', async ({ field, definition }) => {
     const { container, definition: rendered } = await renderForm(definition());
 
@@ -5575,6 +5785,39 @@ describe('FormView Find record', () => {
     const box = within(dialog).getByRole('textbox', { name: label });
     const row = present(box.parentElement, `criterion row of ${name}`);
     expect(within(row).getByRole('button', { name: `Remove ${name}` })).toBeTruthy();
+  });
+
+  // A field the server flags unsupported holds no searchable value whatever its wire type,
+  // so the picker leaves it out, as the editor does, and still offers every other data
+  // field, then the system fields, in order.
+  it.each<{ name: string; fieldType: FieldType }>([
+    { name: 'LastName', fieldType: 'text' },
+    { name: 'PatientAddress', fieldType: 'multiline' },
+    { name: 'Sex', fieldType: 'legalValues' },
+    { name: 'CaseID', fieldType: 'number' },
+    { name: 'DOB', fieldType: 'date' },
+    { name: 'Asian', fieldType: 'checkbox' },
+    { name: 'IllnessSeverity', fieldType: 'option' },
+  ])('offers no criterion for the $fieldType field $name flagged unsupported', async ({ name, fieldType }) => {
+    const definition = withField(name, (field) => ({ ...field, unsupported: true, unsupportedType: 'Grid' }));
+    expect(fieldByName(name, definition).fieldType).toBe(fieldType);
+    await renderForm(definition);
+
+    const picker = within(openFind()).getByRole('group', { name: 'Fields to search' });
+    expect(within(picker).queryByRole('checkbox', { name })).toBeNull();
+    const offered = within(picker)
+      .getAllByRole('checkbox')
+      .map((box) => {
+        const nameId = present(box.getAttribute('aria-labelledby'), 'aria-labelledby of a Find checkbox');
+        return present(document.getElementById(nameId), `element ${nameId}`).textContent;
+      });
+    expect(offered).toEqual([
+      ...allFields(definition)
+        .filter((field) => isDataField(field) && field.name !== name)
+        .map((field) => field.name),
+      'GlobalRecordId',
+      'RecStatus',
+    ]);
   });
 
   /** The words of a picker name or prompt: its text split at each <wbr> inside the element. */

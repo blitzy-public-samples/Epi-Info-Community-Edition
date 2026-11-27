@@ -28,6 +28,7 @@ import type {
   SearchRequest,
   SearchResponse,
 } from '../api/types';
+import { isDataField } from '../validation/clientValidation';
 import { ConnectionError } from './ConnectionError';
 
 /** One entry of the field picker. */
@@ -118,18 +119,6 @@ const EARLIER_RECORD_NOT_LISTED = 'The record that was on screen when you search
 // It holds none of the toolbar's and navigator's names, which Playwright matches by substring.
 const RESULTS_REGION_LABEL = 'Search results';
 
-// The data-field types SearchCriteriaParser accepts. Labels, groups and unsupported
-// fields (Yes/No, grids, relates, command buttons, …) hold no searchable value.
-const SEARCHABLE_TYPES: ReadonlySet<FieldType> = new Set<FieldType>([
-  'text',
-  'multiline',
-  'legalValues',
-  'number',
-  'option',
-  'date',
-  'checkbox',
-]);
-
 // The base-table columns legacy Find appends after the page fields.
 const SYSTEM_FIELDS: readonly SearchableField[] = [
   { name: 'GlobalRecordId', label: 'Global record ID', hint: SYSTEM_HINT, kind: 'system' },
@@ -207,14 +196,17 @@ function fieldsInOrder(definition: FormDefinition): FieldDefinition[] {
 }
 
 /**
- * The fields Find can search, in picker order: every data field whose type holds a
- * searchable value, pages by `position` and then `tabIndex`, followed by the system
- * fields `GlobalRecordId` and `RecStatus`. Labels, groups and unsupported fields,
- * Yes/No included, are left out. Pure: the definition is not modified.
+ * The fields Find can search, in picker order: every data field, pages by `position`
+ * and then `tabIndex`, followed by the system fields `GlobalRecordId` and `RecStatus`.
+ * Data fields are the ones clientValidation's `isDataField` admits, the predicate the
+ * editor uses, so labels, groups, every field the server marks unsupported, by its
+ * `unsupported` flag or its type, and a field of a type the contract does not publish
+ * are left out: Yes/No, grids, relates and command buttons hold no searchable value.
+ * Pure: the definition is not modified.
  */
 export function searchableFields(definition: FormDefinition): SearchableField[] {
   const result: SearchableField[] = fieldsInOrder(definition)
-    .filter((field) => SEARCHABLE_TYPES.has(field.fieldType))
+    .filter(isDataField)
     .map((field) => ({ name: field.name, label: promptOf(field), hint: hintFor(field), kind: field.fieldType }));
 
   // The server resolves a data field before a system field of the same name, so a

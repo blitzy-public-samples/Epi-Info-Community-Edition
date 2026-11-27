@@ -10,6 +10,7 @@
 // such nodes drop it, and the spinbuttons are announced without the field's label. A
 // text input is a textbox in every view and keeps its label, value and disabled state.
 // Its text follows the field's date mask, falling back to the user's locale.
+import { isWireDate } from '../../api/client';
 import type { FieldComponentProps } from './fieldComponents';
 import {
   fieldAriaProps,
@@ -18,9 +19,6 @@ import {
   fieldLabelText,
   fieldWrapperClass,
 } from './fieldComponents';
-
-/** A wire date: four-digit year, two-digit month and day. */
-const ISO_DATE = /^(\d{4})-(\d{2})-(\d{2})$/;
 
 // The user's locale, as the browser shows an enabled date input. UTC, because the
 // date is built at UTC midnight, so no time-zone offset can move it to another day;
@@ -43,31 +41,22 @@ interface CalendarDate {
 }
 
 /**
- * A wire string as a calendar date, or `null` when it is not a valid ISO calendar
- * date, `''` included.
+ * A wire string as a calendar date, or `null` when it is not a wire date
+ * (isWireDate), so neither an impossible date such as 2011-02-30 nor year 0000, which
+ * has no Gregorian rendering, nor `''`.
  */
 function calendarDate(iso: string): CalendarDate | null {
-  const match = ISO_DATE.exec(iso);
-  if (match === null) {
+  if (!isWireDate(iso)) {
     return null;
   }
-  const year = Number(match[1]);
-  const monthIndex = Number(match[2]) - 1;
-  const day = Number(match[3]);
+  // A wire date is exactly YYYY-MM-DD, so each part has its fixed place.
+  const year = iso.slice(0, 4);
+  const month = iso.slice(5, 7);
+  const day = iso.slice(8, 10);
   // setUTCFullYear keeps a year below 100 as written; Date.UTC would map it to 19xx.
   const date = new Date(0);
-  date.setUTCFullYear(year, monthIndex, day);
-  // An impossible date such as 2011-02-30, month 00 or day 00 rolls over to another
-  // day, and year 0000 has no Gregorian rendering; none is a calendar date.
-  if (
-    year < 1 ||
-    date.getUTCFullYear() !== year ||
-    date.getUTCMonth() !== monthIndex ||
-    date.getUTCDate() !== day
-  ) {
-    return null;
-  }
-  return { parts: { YYYY: match[1], MM: match[2], DD: match[3] }, date };
+  date.setUTCFullYear(Number(year), Number(month) - 1, Number(day));
+  return { parts: { YYYY: year, MM: month, DD: day }, date };
 }
 
 /**

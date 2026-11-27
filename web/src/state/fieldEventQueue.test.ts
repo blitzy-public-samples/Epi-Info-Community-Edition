@@ -969,6 +969,8 @@ describe('createFieldEventQueue', () => {
   const effectful = envelope({ assigned: { Age: ASSIGNED_AGE }, dialogs: [FEVER_DIALOG] });
 
   it.each([
+    { shape: 'an empty body', text: '' },
+    { shape: 'a body that is not JSON', text: '<html>Bad gateway</html>' },
     { shape: 'a null body', text: 'null' },
     { shape: 'an array body', text: '[]' },
     { shape: 'none of the members', text: '{"message":"Not available"}' },

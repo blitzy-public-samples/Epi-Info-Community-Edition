@@ -34,9 +34,9 @@ namespace EpiInfo.Data;
 /// names both a code table and a column. <see cref="GetPermissionsAsync"/> resolves the form's tables in the catalogue
 /// and checks their permissions. A record read given the instance <see cref="GetFormMetadataAsync"/> returned in the
 /// same request uses the catalogue schema that read built, and reads the metadata and schema again only for an instance
-/// the reader did not return. A write reads them again inside its transaction, and an update given permissions also
-/// reads, inside that transaction, the permissions of the tables it resolved. Every identifier in record SQL comes
-/// from a schema the reader built from the catalogue.
+/// the reader did not return. A write reads them again inside its transaction, and every write given permissions, an
+/// insert, an update or a soft delete, also reads, inside that transaction, the permissions of the tables it resolved.
+/// Every identifier in record SQL comes from a schema the reader built from the catalogue.
 /// </para>
 /// <para>
 /// <b>Failures.</b> Every member runs inside the same boundary, which lets exactly three kinds of failure through
@@ -229,15 +229,16 @@ public sealed class SqlServerDataStore : IDataStore
             cancellationToken);
 
     /// <inheritdoc />
-    public Task<RecordDto> InsertAsync(
+    public Task<RecordWriteResult> InsertAsync(
         FormMetadata form,
         IReadOnlyDictionary<string, FieldValue> values,
         SaveStamp stamp,
+        FormPermissions? permissions,
         CancellationToken cancellationToken) =>
         RunAsync(
             nameof(IDataStore.InsertAsync),
             OperationKind.Write,
-            () => recordRepository.InsertAsync(form, values, stamp, cancellationToken),
+            () => recordRepository.InsertAsync(form, values, stamp, permissions, cancellationToken),
             cancellationToken);
 
     /// <inheritdoc />
@@ -267,11 +268,12 @@ public sealed class SqlServerDataStore : IDataStore
         FormMetadata form,
         string globalRecordId,
         Func<SaveStamp> createStamp,
+        FormPermissions? permissions,
         CancellationToken cancellationToken) =>
         RunAsync(
             nameof(IDataStore.SoftDeleteAsync),
             OperationKind.Write,
-            () => recordRepository.SoftDeleteAsync(form, globalRecordId, createStamp, cancellationToken),
+            () => recordRepository.SoftDeleteAsync(form, globalRecordId, createStamp, permissions, cancellationToken),
             cancellationToken);
 
     /// <inheritdoc />

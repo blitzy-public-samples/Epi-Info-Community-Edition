@@ -117,6 +117,36 @@ public sealed class ErrorContractTests
 
     private const string ExpectedRequestBodyMustBeObjectDetail = "request body must be a JSON object";
 
+    private const string ExpectedRequestBodyRepeatsMemberDetail = "request body names a member more than once";
+
+    private const string ExpectedDuplicateFieldMessage =
+        "This field is given more than once; field names are matched without regard to letter case.";
+
+    // The search body's member messages, each under its member's wire name, and its criteria key.
+    private const string IncludeDeletedKey = "includeDeleted";
+
+    private const string ExcludeGlobalRecordIdKey = "excludeGlobalRecordId";
+
+    private const string CriteriaKey = "criteria";
+
+    private const string ExpectedIncludeDeletedMessage = "includeDeleted must be true, false or null.";
+
+    private const string ExpectedExcludeGlobalRecordIdMessage = "excludeGlobalRecordId must be a string or null.";
+
+    private const string ExpectedCriteriaNotArrayMessage = "criteria must be an array of {field, value} objects.";
+
+    private const string ExpectedOverLongCriteriaMessage =
+        "criteria must be an array of at most 6 {field, value} objects.";
+
+    private const string ExpectedFieldNotStringMessage = "criteria[0] field must be a string.";
+
+    private const string ExpectedValueNotScalarMessage =
+        "criteria[0] value must be a string, number, boolean or null.";
+
+    private const string ExpectedValueNotFiniteMessage = "criteria[0] value must be a finite number.";
+
+    private const string ExpectedValueMissingMessage = "criteria[0] needs a value, which may be null.";
+
     private const string ExpectedValuesMustBeObjectDetail = "values must be an object";
 
     private const string ExpectedFormNotFoundDetail = "the form does not exist";
@@ -459,10 +489,173 @@ public sealed class ErrorContractTests
 
                         // One byte that holds no JSON token is content, not an empty body.
                         data.Add(environment, framing, route, " ", ExpectedMalformedJsonDetail);
+
+                        // An object member name that cannot be decoded, an escaped lone surrogate, alone and after a
+                        // repeated member: no name of the object can be compared until every one is read.
+                        data.Add(environment, framing, route, """{"\uD800":1}""", ExpectedMalformedJsonDetail);
+                        data.Add(environment, framing, route, """{"a":1,"A":2,"\uDC00":3}""", ExpectedMalformedJsonDetail);
                     }
 
                     // A missing body: an HTTP/1.1 request without framing headers cannot carry one.
                     data.Add(environment, KestrelUnframed, route, string.Empty, ExpectedRequestBodyRequiredDetail);
+                }
+            }
+
+            return data;
+        }
+    }
+
+    // The placeholder a body template holds where its case puts a fresh sentinel.
+    private const string SentinelToken = "%SENTINEL%";
+
+    // The framings of the member cases: TestServer, and exact bytes on real Kestrel.
+    private static readonly string[] MemberCaseFramings = [TestServerContentLength, KestrelContentLength];
+
+    /// <summary>
+    /// Body templates that name a member more than once, exactly or differing only by letter case: a member of the body
+    /// object on each body route, a known member or an unknown one, and a member of a search criterion object. Each
+    /// runs on every member-case framing, in each environment.
+    /// </summary>
+    public static TheoryData<string, string, string, string> RepeatedMemberBodies
+    {
+        get
+        {
+            (string Route, string Body)[] bodies =
+            [
+                (CreateRoute, """{"values":{"LastName":"%SENTINEL%"},"values":{"LastName":"second"}}"""),
+                (CreateRoute, """{"values":{"LastName":"%SENTINEL%"},"VALUES":{"LastName":"second"}}"""),
+                (CreateRoute, """{"values":{"LastName":"first"},"note":"%SENTINEL%","Note":1}"""),
+                (UpdateRoute, """{"values":{"RecStatus":0,"LastName":"%SENTINEL%"},"values":{"LastName":"second"}}"""),
+                (UpdateRoute, """{"Values":{"LastName":"%SENTINEL%"},"values":{"LastName":"second"}}"""),
+                (SearchRoute, """{"criteria":[{"field":"LastName","value":"%SENTINEL%"}],"criteria":[{"field":"LastName","value":"b"}]}"""),
+                (SearchRoute, """{"criteria":[{"field":"LastName","value":"a"}],"includeDeleted":"%SENTINEL%","IncludeDeleted":false}"""),
+                (SearchRoute, """{"criteria":[{"field":"LastName","field":"Age","value":"%SENTINEL%"}]}"""),
+                (SearchRoute, """{"criteria":[{"field":"Age","value":1},{"field":"LastName","value":"%SENTINEL%","VALUE":"b"}]}"""),
+                (FieldEventRoute, """{"event":"FieldAfter","event":"FieldBefore","fieldName":"LastName","values":{"LastName":"%SENTINEL%"}}"""),
+                (FieldEventRoute, """{"event":"FieldAfter","fieldName":"LastName","fieldName":"Age","values":{"LastName":"%SENTINEL%"}}"""),
+                (FieldEventRoute, """{"event":"FieldAfter","fieldName":"LastName","values":{"LastName":"%SENTINEL%"},"Values":{}}"""),
+            ];
+
+            var data = new TheoryData<string, string, string, string>();
+            foreach (var environment in EnvironmentNames)
+            {
+                foreach (var framing in MemberCaseFramings)
+                {
+                    foreach (var (route, body) in bodies)
+                    {
+                        data.Add(environment, framing, route, body);
+                    }
+                }
+            }
+
+            return data;
+        }
+    }
+
+    /// <summary>
+    /// Well-formed search body templates with one member of the wrong JSON kind, each with the <c>errors</c> key and
+    /// message it must get, on every member-case framing, in each environment.
+    /// </summary>
+    public static TheoryData<string, string, string, string, string> WronglyTypedSearchBodies
+    {
+        get
+        {
+            (string Body, string Key, string Message)[] bodies =
+            [
+                (
+                    """{"criteria":[{"field":"RecStatus","value":"1"}],"includeDeleted":"true"}""",
+                    IncludeDeletedKey,
+                    ExpectedIncludeDeletedMessage),
+                (
+                    """{"criteria":[{"field":"RecStatus","value":"1"}],"includeDeleted":1}""",
+                    IncludeDeletedKey,
+                    ExpectedIncludeDeletedMessage),
+                (
+                    """{"criteria":[{"field":"RecStatus","value":"1"}],"includeDeleted":"' OR 1=1-- %SENTINEL%"}""",
+                    IncludeDeletedKey,
+                    ExpectedIncludeDeletedMessage),
+                (
+                    """{"criteria":[{"field":"LastName","value":"x"}],"excludeGlobalRecordId":1}""",
+                    ExcludeGlobalRecordIdKey,
+                    ExpectedExcludeGlobalRecordIdMessage),
+                (
+                    """{"criteria":[{"field":"LastName","value":"x"}],"excludeGlobalRecordId":["%SENTINEL%"]}""",
+                    ExcludeGlobalRecordIdKey,
+                    ExpectedExcludeGlobalRecordIdMessage),
+                (
+                    """{"criteria":{"field":"LastName","value":"%SENTINEL%"}}""",
+                    CriteriaKey,
+                    ExpectedCriteriaNotArrayMessage),
+                (
+                    """{"criteria":[{"field":5,"value":"%SENTINEL%"}]}""",
+                    CriteriaKey,
+                    ExpectedFieldNotStringMessage),
+                (
+                    """{"criteria":[{"field":"LastName","value":{"%SENTINEL%":1}}]}""",
+                    CriteriaKey,
+                    ExpectedValueNotScalarMessage),
+                (
+                    """{"criteria":[{"field":"Age","value":1e400}]}""",
+                    CriteriaKey,
+                    ExpectedValueNotFiniteMessage),
+                (
+                    """{"criteria":[{"field":"LastName"}]}""",
+                    CriteriaKey,
+                    ExpectedValueMissingMessage),
+
+                // Past six items the problems of the criteria are one fixed message, however many items have one.
+                (
+                    """{"criteria":[{"field":"LastName","value":"a"},null,null,null,null,null,{"field":5,"value":"%SENTINEL%"}]}""",
+                    CriteriaKey,
+                    ExpectedOverLongCriteriaMessage),
+                (
+                    "{\"criteria\":["
+                        + string.Join(',', Enumerable.Repeat("""{"field":"LastName","value":["%SENTINEL%"]}""", 2_000))
+                        + "]}",
+                    CriteriaKey,
+                    ExpectedOverLongCriteriaMessage),
+            ];
+
+            var data = new TheoryData<string, string, string, string, string>();
+            foreach (var environment in EnvironmentNames)
+            {
+                foreach (var framing in MemberCaseFramings)
+                {
+                    foreach (var (body, key, message) in bodies)
+                    {
+                        data.Add(environment, framing, body, key, message);
+                    }
+                }
+            }
+
+            return data;
+        }
+    }
+
+    /// <summary>
+    /// Body templates whose <c>values</c> object names one field twice, differing only by letter case, on the three
+    /// routes that take <c>values</c>, on every member-case framing, in each environment.
+    /// </summary>
+    public static TheoryData<string, string, string, string> RepeatedValuesKeyBodies
+    {
+        get
+        {
+            (string Route, string Body)[] bodies =
+            [
+                (CreateRoute, """{"values":{"LastName":"%SENTINEL%","LASTNAME":"second"}}"""),
+                (UpdateRoute, """{"values":{"lastName":"%SENTINEL%","LastName":"second"}}"""),
+                (FieldEventRoute, """{"event":"FieldAfter","fieldName":"LastName","values":{"LastName":"%SENTINEL%","lastname":"b"}}"""),
+            ];
+
+            var data = new TheoryData<string, string, string, string>();
+            foreach (var environment in EnvironmentNames)
+            {
+                foreach (var framing in MemberCaseFramings)
+                {
+                    foreach (var (route, body) in bodies)
+                    {
+                        data.Add(environment, framing, route, body);
+                    }
                 }
             }
 
@@ -937,6 +1130,116 @@ public sealed class ErrorContractTests
         Assert.Equal(expectedDetail, problem.GetProperty("detail").GetString());
         Assert.False(problem.TryGetProperty("errors", out _), "The request-level 400 carries an errors map.");
         Assert.False(problem.TryGetProperty("writeOutcome", out _), "The request-level 400 carries a writeOutcome.");
+        Assert.Empty(store.WriteCalls);
+    }
+
+    // A body that names a member more than once is ambiguous, since binding matches member names ignoring case and
+    // would let the last occurrence replace the first unseen. On each body route, for a member of the body object and
+    // for a member of a search criterion, it is the request-level 400 naming the repeat, with no errors map and no
+    // writeOutcome, answered before any store call, so nothing is read or written. Neither the body nor a log line
+    // quotes the sentinel the first occurrence carries.
+    [Theory]
+    [MemberData(nameof(RepeatedMemberBodies))]
+    public async Task RepeatedMemberIsARequestLevel400(
+        string environment,
+        string framing,
+        string route,
+        string template)
+    {
+        var sentinel = NewSentinel();
+        var store = FakeDataStore.WithStandardForms();
+        await using ApiFactoryBase factory = CreateMemberCaseFactory(store, environment, framing);
+        var (method, path) = ResolveRoute(store, route);
+
+        var (status, mediaType, text) = await SendBodyAsync(
+            factory,
+            method,
+            path,
+            framing,
+            template.Replace(SentinelToken, sentinel, StringComparison.Ordinal));
+
+        Assert.Equal((int)HttpStatusCode.BadRequest, status);
+        Assert.Equal(ProblemMediaType, mediaType);
+        using var document = JsonDocument.Parse(text);
+        var problem = ApiTestClient.AssertProblemDetails(document.RootElement, (int)HttpStatusCode.BadRequest);
+        Assert.Equal(ExpectedRequestBodyRepeatsMemberDetail, problem.GetProperty("detail").GetString());
+        Assert.False(problem.TryGetProperty("errors", out _), "The request-level 400 carries an errors map.");
+        Assert.False(problem.TryGetProperty("writeOutcome", out _), "The request-level 400 carries a writeOutcome.");
+        Assert.False(text.Contains(sentinel, StringComparison.Ordinal), "The 400 body quotes the request body.");
+        Assert.False(factory.Logs.ContainsText(sentinel), "A log line quotes the request body.");
+        Assert.Empty(store.Calls);
+    }
+
+    // A well-formed search body whose member has the wrong JSON kind is not malformed JSON. It is the field-level 400
+    // naming the problem under the member's wire name, with the fixed message alone and no writeOutcome, answered
+    // before any store call, so the form is not looked up and nothing is searched or written. Neither the body nor a
+    // log line quotes the sentinel the wrongly typed member carries.
+    [Theory]
+    [MemberData(nameof(WronglyTypedSearchBodies))]
+    public async Task WronglyTypedSearchMemberIsAFieldLevel400NamingIt(
+        string environment,
+        string framing,
+        string template,
+        string key,
+        string message)
+    {
+        var sentinel = NewSentinel();
+        var store = FakeDataStore.WithStandardForms();
+        await using ApiFactoryBase factory = CreateMemberCaseFactory(store, environment, framing);
+        var (method, path) = ResolveRoute(store, SearchRoute);
+
+        var (status, mediaType, text) = await SendBodyAsync(
+            factory,
+            method,
+            path,
+            framing,
+            template.Replace(SentinelToken, sentinel, StringComparison.Ordinal));
+
+        Assert.Equal((int)HttpStatusCode.BadRequest, status);
+        Assert.Equal(ProblemMediaType, mediaType);
+        using var document = JsonDocument.Parse(text);
+        var problem = ApiTestClient.AssertProblemDetails(document.RootElement, (int)HttpStatusCode.BadRequest);
+        Assert.Equal(ExpectedValidationFailedDetail, problem.GetProperty("detail").GetString());
+        Assert.Equal(new[] { message }, AssertErrorMessages(problem, key));
+        Assert.Equal(new[] { key }, problem.GetProperty("errors").EnumerateObject().Select(entry => entry.Name));
+        Assert.False(problem.TryGetProperty("writeOutcome", out _), "The field-level 400 carries a writeOutcome.");
+        Assert.False(text.Contains(sentinel, StringComparison.Ordinal), "The 400 body quotes the request body.");
+        Assert.False(factory.Logs.ContainsText(sentinel), "A log line quotes the request body.");
+        Assert.Empty(store.Calls);
+    }
+
+    // The keys of a values object are field names, not members of the body, so a field named twice there, differing
+    // only by letter case, keeps the field-level 400 under its canonical name with the fixed duplicate-field message,
+    // on each route that takes values, and nothing is written.
+    [Theory]
+    [MemberData(nameof(RepeatedValuesKeyBodies))]
+    public async Task RepeatedValuesKeyKeepsTheFieldLevelDuplicateError(
+        string environment,
+        string framing,
+        string route,
+        string template)
+    {
+        var sentinel = NewSentinel();
+        var store = FakeDataStore.WithStandardForms();
+        await using ApiFactoryBase factory = CreateMemberCaseFactory(store, environment, framing);
+        var (method, path) = ResolveRoute(store, route);
+
+        var (status, mediaType, text) = await SendBodyAsync(
+            factory,
+            method,
+            path,
+            framing,
+            template.Replace(SentinelToken, sentinel, StringComparison.Ordinal));
+
+        Assert.Equal((int)HttpStatusCode.BadRequest, status);
+        Assert.Equal(ProblemMediaType, mediaType);
+        using var document = JsonDocument.Parse(text);
+        var problem = ApiTestClient.AssertProblemDetails(document.RootElement, (int)HttpStatusCode.BadRequest);
+        Assert.Equal(ExpectedValidationFailedDetail, problem.GetProperty("detail").GetString());
+        Assert.Equal(new[] { ExpectedDuplicateFieldMessage }, AssertErrorMessages(problem, "LastName"));
+        Assert.Equal(new[] { "LastName" }, problem.GetProperty("errors").EnumerateObject().Select(entry => entry.Name));
+        Assert.False(text.Contains(sentinel, StringComparison.Ordinal), "The 400 body quotes the request body.");
+        Assert.False(factory.Logs.ContainsText(sentinel), "A log line quotes the request body.");
         Assert.Empty(store.WriteCalls);
     }
 
@@ -2751,6 +3054,19 @@ public sealed class ErrorContractTests
         _ => throw new ArgumentOutOfRangeException(nameof(outcome), outcome, "Not a write outcome."),
     };
 
+    // A host over store as Program.cs composes it, with the client absent: on real Kestrel for a Kestrel framing and on
+    // TestServer otherwise.
+    private static ApiFactoryBase CreateMemberCaseFactory(FakeDataStore store, string environment, string framing)
+    {
+        var options = ApiFactoryOptions.ForFake(store, environment) with
+        {
+            ExtraSettings = ClientPathSetting(AbsentClientFolder()),
+        };
+        return framing is KestrelContentLength or KestrelChunked or KestrelUnframed
+            ? new KestrelApiFactory(options)
+            : new ApiFactory(options);
+    }
+
     // The method and path of a body route; the update route gets a freshly seeded active record.
     private static (HttpMethod Method, string Path) ResolveRoute(FakeDataStore store, string route) => route switch
     {
@@ -3297,12 +3613,13 @@ public sealed class ErrorContractTests
 
         public Task<bool> PingAsync(CancellationToken cancellationToken) => inner.PingAsync(cancellationToken);
 
-        public Task<RecordDto> InsertAsync(
+        public Task<RecordWriteResult> InsertAsync(
             FormMetadata form,
             IReadOnlyDictionary<string, FieldValue> values,
             SaveStamp stamp,
+            FormPermissions? permissions,
             CancellationToken cancellationToken) =>
-            inner.InsertAsync(form, values, stamp, cancellationToken);
+            inner.InsertAsync(form, values, stamp, permissions, cancellationToken);
 
         public Task<RecordWriteResult> UpdateAsync(
             FormMetadata form,
@@ -3325,8 +3642,9 @@ public sealed class ErrorContractTests
             FormMetadata form,
             string globalRecordId,
             Func<SaveStamp> createStamp,
+            FormPermissions? permissions,
             CancellationToken cancellationToken) =>
-            inner.SoftDeleteAsync(form, globalRecordId, createStamp, cancellationToken);
+            inner.SoftDeleteAsync(form, globalRecordId, createStamp, permissions, cancellationToken);
 
         public Task<FormPermissions?> GetPermissionsAsync(FormMetadata form, CancellationToken cancellationToken) =>
             inner.GetPermissionsAsync(form, cancellationToken);
@@ -4064,17 +4382,35 @@ public sealed class RecordWriteOutcomeTests
     }
 
     /// <summary>
-    /// A private TestServer host that composes the record-write pipeline as <c>Program.cs</c> plans it (AAP 0.3.4.7):
-    /// the ProblemDetails customisation, <see cref="ApiExceptionHandler"/>, the API's JSON settings,
-    /// <c>ThrowOnBadRequest</c>, status-code pages, routing, the media-type guard and the record endpoints over
-    /// <see cref="RecordService"/>, with a <see cref="FakeDataStore"/> and a <see cref="ControlledTimeProvider"/>.
+    /// An independent TestServer host built for these cases: the record endpoints and the services behind them over a
+    /// <see cref="FakeDataStore"/>, with a <see cref="PostResultFailureSeam"/> in the pipeline. It is not the API as
+    /// <c>Program.cs</c> composes it.
     /// </summary>
     /// <remarks>
-    /// These cases therefore run before, and independently of, the final composition root. The host runs in the
-    /// Production environment with <c>src/EpiInfo.Api</c> as its content root, so the committed
+    /// <para>
+    /// It registers ProblemDetails customised by <see cref="ApiProblems.Customize"/>,
+    /// <see cref="ApiExceptionHandler"/>, the API's JSON settings (<see cref="JsonSetup.AddApiJson"/>),
+    /// <c>ThrowOnBadRequest</c>, the store, a <see cref="CheckCodeEngine"/>, a <see cref="ControlledTimeProvider"/> as
+    /// the clock, <see cref="SaveStampProvider"/>, <see cref="FormService"/> and <see cref="RecordService"/>. Its
+    /// pipeline is the exception handler, the default status-code pages, routing, the seam, the JSON media-type guard
+    /// (<see cref="JsonContentTypeMiddleware"/>) and the record endpoints.
+    /// </para>
+    /// <para>
+    /// Everything else <c>Program.cs</c> adds is left out, among it the listen-setting and request <c>Host</c> checks
+    /// of <see cref="LoopbackBindingGuard"/>, the JSON console and the floors of <see cref="ProtectedLogLevels"/>,
+    /// <see cref="ApiExceptionBoundaryMiddleware"/>, the status-code page writer
+    /// <see cref="ApiProblems.WriteStatusCodePageAsync"/>, <see cref="RouteConstraintMatcherPolicy"/>,
+    /// <see cref="RequestBodyLimitMiddleware"/>, the form, field-event, health and OpenAPI endpoints, and
+    /// <see cref="ClientAppHosting"/>. Record writes through the API as <c>Program.cs</c> composes it are proved on
+    /// <see cref="ApiFactory"/>: their store failures and write outcomes in <see cref="ErrorContractTests"/>, and
+    /// writes in a process without an OS user name in <see cref="StoreFailureWriteOutcomeTests"/>.
+    /// </para>
+    /// <para>
+    /// The host runs in the Production environment with <c>src/EpiInfo.Api</c> as its content root, so the committed
     /// <c>appsettings.json</c> logging filters apply, and its only logger providers are a
-    /// <see cref="CapturingLoggerProvider"/> and, when given, one more. <see cref="PostResultFailureSeam"/> sits after
-    /// routing, so its failure is raised inside the matched write endpoint's request.
+    /// <see cref="CapturingLoggerProvider"/> and, when given, one more. The seam sits after routing, so its failure is
+    /// raised inside the matched write endpoint's request.
+    /// </para>
     /// </remarks>
     private sealed class RecordWriteHost : IAsyncDisposable
     {

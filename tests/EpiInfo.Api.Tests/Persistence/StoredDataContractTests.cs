@@ -516,6 +516,7 @@ public sealed class SqlRecordRepositoryWriteTests : IAsyncLifetime
                 metadata,
                 upperCased,
                 () => new SaveStamp(Environment.UserName, SecondTime),
+                permissions: null,
                 ct);
             Assert.Equal(
                 (SoftDeleteStatus.NotFound, false, (string?)null),
@@ -529,6 +530,7 @@ public sealed class SqlRecordRepositoryWriteTests : IAsyncLifetime
             metadata,
             deleteSpelling,
             () => new SaveStamp(Environment.UserName, SecondTime),
+            permissions: null,
             ct);
         SqlSnapshot afterDelete = await SqlSnapshot.CaptureAsync(ct);
 
@@ -551,6 +553,7 @@ public sealed class SqlRecordRepositoryWriteTests : IAsyncLifetime
             metadata,
             deleteSpelling,
             () => new SaveStamp(Environment.UserName, ThirdTime),
+            permissions: null,
             ct);
         Assert.Equal(
             (SoftDeleteStatus.AlreadyDeleted, true, (string?)id),
@@ -560,6 +563,7 @@ public sealed class SqlRecordRepositoryWriteTests : IAsyncLifetime
             metadata,
             Guid.NewGuid().ToString().ToUpperInvariant(),
             () => new SaveStamp(Environment.UserName, FourthTime),
+            permissions: null,
             ct);
         Assert.Equal(
             (SoftDeleteStatus.NotFound, false, (string?)null),
@@ -687,7 +691,7 @@ public sealed class SqlRecordRepositoryWriteTests : IAsyncLifetime
             DataStoreWriteException update = await Assert.ThrowsAsync<DataStoreWriteException>(
                 () => store.UpdateAsync(metadata, id, submitted, source, passes, permissions: null, ct));
             DataStoreWriteException delete = await Assert.ThrowsAsync<DataStoreWriteException>(
-                () => store.SoftDeleteAsync(metadata, id, source, ct));
+                () => store.SoftDeleteAsync(metadata, id, source, permissions: null, ct));
 
             Assert.True(stampCalls.Count == 2, $"A source that {name} was not asked once per write.");
             Assert.Equal(
@@ -745,7 +749,8 @@ public sealed class SqlRecordRepositoryWriteTests : IAsyncLifetime
         // A soft delete of the active record asks once, after its locked read and before its one write.
         stampCalls.Clear();
         Factory.Recorder.Clear();
-        SoftDeleteResult deleted = await store.SoftDeleteAsync(metadata, id, CountingSource(ThirdTime), ct);
+        SoftDeleteResult deleted =
+            await store.SoftDeleteAsync(metadata, id, CountingSource(ThirdTime), permissions: null, ct);
         Assert.Equal((SoftDeleteStatus.Deleted, (string?)id), (deleted.Status, deleted.GlobalRecordId));
         atStamp = Assert.Single(stampCalls);
         IReadOnlyList<RecordedCommand> deleteTransaction = TransactionOf(Factory.Recorder.Commands, DeleteOperation);
@@ -779,11 +784,12 @@ public sealed class SqlRecordRepositoryWriteTests : IAsyncLifetime
         Factory.Recorder.Clear();
         RecordWriteResult updateOfDeleted = await store.UpdateAsync(
             metadata, id, submitted, CountingSource(FourthTime), passes, permissions: null, ct);
-        SoftDeleteResult repeated = await store.SoftDeleteAsync(metadata, id, CountingSource(FourthTime), ct);
+        SoftDeleteResult repeated =
+            await store.SoftDeleteAsync(metadata, id, CountingSource(FourthTime), permissions: null, ct);
         RecordWriteResult updateOfUnknown = await store.UpdateAsync(
             metadata, unknownId, submitted, CountingSource(FourthTime), passes, permissions: null, ct);
         SoftDeleteResult deleteOfUnknown =
-            await store.SoftDeleteAsync(metadata, unknownId, CountingSource(FourthTime), ct);
+            await store.SoftDeleteAsync(metadata, unknownId, CountingSource(FourthTime), permissions: null, ct);
 
         Assert.Equal(
             (RecordWriteStatus.Deleted, SoftDeleteStatus.AlreadyDeleted, RecordWriteStatus.NotFound,
@@ -1393,12 +1399,13 @@ public sealed class SqlRecordRepositoryWriteTests : IAsyncLifetime
         public Task<bool> PingAsync(CancellationToken cancellationToken) => _real.PingAsync(cancellationToken);
 
         /// <inheritdoc />
-        public Task<RecordDto> InsertAsync(
+        public Task<RecordWriteResult> InsertAsync(
             FormMetadata form,
             IReadOnlyDictionary<string, FieldValue> values,
             SaveStamp stamp,
+            FormPermissions? permissions,
             CancellationToken cancellationToken) =>
-            _real.InsertAsync(form, values, stamp, cancellationToken);
+            _real.InsertAsync(form, values, stamp, permissions, cancellationToken);
 
         /// <inheritdoc />
         /// <remarks>
@@ -1430,8 +1437,9 @@ public sealed class SqlRecordRepositoryWriteTests : IAsyncLifetime
             FormMetadata form,
             string globalRecordId,
             Func<SaveStamp> createStamp,
+            FormPermissions? permissions,
             CancellationToken cancellationToken) =>
-            _real.SoftDeleteAsync(form, globalRecordId, createStamp, cancellationToken);
+            _real.SoftDeleteAsync(form, globalRecordId, createStamp, permissions, cancellationToken);
 
         /// <inheritdoc />
         public Task<FormPermissions?> GetPermissionsAsync(FormMetadata form, CancellationToken cancellationToken) =>
@@ -2328,8 +2336,9 @@ public sealed class FakeDataStoreStoredNumberTests
                 return (store.SeedRecord(ViewId, values), null);
 
             case Write.Insert:
-                var inserted = await store.InsertAsync(Form, values, Stamp, CancellationToken.None);
-                return (inserted.GlobalRecordId, inserted);
+                var inserted = await store.InsertAsync(Form, values, Stamp, permissions: null, CancellationToken.None);
+                Assert.True(inserted.IsSuccess);
+                return (inserted.Record.GlobalRecordId, inserted.Record);
 
             case Write.Update:
                 var id = store.SeedRecord(ViewId);

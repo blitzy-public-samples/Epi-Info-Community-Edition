@@ -26,6 +26,14 @@ namespace EpiInfo.Api.Hosting;
 /// same 415 ProblemDetails, so that path is left alone.
 /// </para>
 /// <para>
+/// The media type itself is compared as sent, before the header is parsed: the text before the first <c>;</c>,
+/// trimmed of spaces and horizontal tabs at its two ends, must be <c>application/json</c>. The media-type grammar has
+/// no whitespace around the <c>/</c> (RFC 9110, section 8.3.1), but the header parser skips it, so without that
+/// comparison <c>application/ json</c> would pass as JSON. Whitespace at either end of the value is not part of the
+/// field value (section 5.5), and whitespace before the <c>;</c> is the optional whitespace the parameter grammar
+/// allows (section 5.6.6), so both stay allowed.
+/// </para>
+/// <para>
 /// A quoted parameter value is the same value as its token form (RFC 9110, section 5.6.6), so
 /// <c>charset="utf-8"</c> is accepted as <c>utf-8</c>. The framework's JSON body read looks the charset up without
 /// removing the quotes and throws, which would be a 500, so such a request's <c>Content-Type</c> is replaced, after
@@ -47,6 +55,8 @@ public sealed class JsonContentTypeMiddleware
     private const string Utf8Charset = "utf-8";
 
     private const string CanonicalUtf8JsonContentType = "application/json; charset=utf-8";
+
+    private const string OptionalWhitespace = " \t";
 
     private readonly RequestDelegate _next;
 
@@ -102,12 +112,15 @@ public sealed class JsonContentTypeMiddleware
 
     /// <summary>
     /// Whether <paramref name="contentType"/> is <c>application/json</c>, compared case-insensitively, with no
-    /// parameter or with exactly one <c>charset</c> parameter whose unquoted value is <c>utf-8</c>.
+    /// parameter or with exactly one <c>charset</c> parameter whose unquoted value is <c>utf-8</c>. The media type is
+    /// the text before the first <c>;</c>, or the whole value, with spaces and horizontal tabs removed from its two
+    /// ends only, and it must equal <c>application/json</c> as written: whitespace inside it, as in
+    /// <c>application/ json</c> or <c>application /json</c>, makes it another media type.
     /// </summary>
     /// <param name="contentType">The request's <c>Content-Type</c> header value, or <see langword="null"/>.</param>
     /// <returns>
-    /// <see langword="false"/> for a missing, blank or unparseable value, any other media type (<c>+json</c> types
-    /// included), any other parameter, another charset, or a repeated parameter.
+    /// <see langword="false"/> for a missing, blank or unparseable value, any other media type (<c>+json</c> types and
+    /// whitespace inside the media type included), any other parameter, another charset, or a repeated parameter.
     /// </returns>
     public static bool IsAllowedJsonContentType(string? contentType) =>
         IsAllowedJsonContentType(contentType, out _);
@@ -116,12 +129,13 @@ public sealed class JsonContentTypeMiddleware
     private static bool IsAllowedJsonContentType(string? contentType, out bool charsetQuoted)
     {
         charsetQuoted = false;
-        if (string.IsNullOrWhiteSpace(contentType) || !MediaTypeHeaderValue.TryParse(contentType, out var mediaType))
+        if (string.IsNullOrWhiteSpace(contentType) || !HasJsonMediaTypeToken(contentType))
         {
             return false;
         }
 
-        if (!StringSegment.Equals(mediaType.MediaType, JsonMediaType, StringComparison.OrdinalIgnoreCase))
+        if (!MediaTypeHeaderValue.TryParse(contentType, out var mediaType)
+            || !StringSegment.Equals(mediaType.MediaType, JsonMediaType, StringComparison.OrdinalIgnoreCase))
         {
             return false;
         }
@@ -149,6 +163,17 @@ public sealed class JsonContentTypeMiddleware
 
         charsetQuoted = HeaderUtilities.IsQuoted(parameter.Value);
         return true;
+    }
+
+    // The media type as sent, before parsing: the text before the first ';', or all of it, trimmed of spaces and
+    // horizontal tabs at its two ends only, is application/json ignoring case. The parser skips whitespace around the
+    // '/', so this comparison is what rejects "application/ json" and "application /json".
+    private static bool HasJsonMediaTypeToken(string contentType)
+    {
+        var value = contentType.AsSpan();
+        var separator = value.IndexOf(';');
+        var token = (separator < 0 ? value : value[..separator]).Trim(OptionalWhitespace);
+        return token.Equals(JsonMediaType, StringComparison.OrdinalIgnoreCase);
     }
 
     // Decided from headers only; the body is never read, peeked or buffered. Mixing BodyReader peeks with later Body
