@@ -11,10 +11,11 @@ namespace EpiInfo.Api.Tests.Architecture;
 
 /// <summary>
 /// Keeps the legacy desktop stack out of the new tree (AAP 0.5.4, 0.7.6): <c>EpiInfo.Web.sln</c> holds exactly the
-/// eight SDK-style projects, neither they nor the three props files they import name a forbidden reference, their
-/// folders and <c>tests/Shared</c> hold no <c>packages.config</c> or DLL and are the only folders their file items
-/// link, the four <c>src/</c> assemblies reference only the shared framework, the pinned packages and each other, and
-/// no C# string literal under <c>src/</c> holds DDL statement text.
+/// eight SDK-style projects and <c>src/</c> and <c>tests/</c> hold no other, neither they, the three props files they
+/// import nor any other project, props or targets file under <c>src/</c> or <c>tests/</c> names a forbidden reference,
+/// their folders and <c>tests/Shared</c> hold no <c>packages.config</c> or DLL and are the only folders their file
+/// items link, the four <c>src/</c> assemblies reference only the shared framework, the pinned packages and each other,
+/// and no C# string literal under <c>src/</c> holds DDL statement text.
 /// </summary>
 /// <remarks>
 /// <para>
@@ -22,22 +23,27 @@ namespace EpiInfo.Api.Tests.Architecture;
 /// <c>dotnet test</c>, <c>--filter "Category!=Integration"</c> included, runs it.
 /// </para>
 /// <para>
-/// It reads only <c>EpiInfo.Web.sln</c>, <c>Directory.Packages.props</c>, <c>src/**</c>,
-/// <c>tests/Directory.Build.props</c>, the four <c>tests/EpiInfo.*.Tests</c> folders and <c>tests/Shared</c>. It never
-/// lists the files at the top of <c>tests/</c> and never recurses into <c>tests/</c> as a whole: on a case-insensitive
-/// file system that folder is the legacy <c>Tests/</c>, whose <c>Tests.csproj</c> legitimately holds <c>HintPath</c>
-/// and <c>packages.config</c>. Folders are walked one level at a time, and a <c>bin/</c> or <c>obj/</c> folder is
-/// pruned by name before anything else, links included, so it is never entered. Every other file the class opens and
-/// every folder it lists, whether reached by a walk or by a fixed path such as <c>EpiInfo.Web.sln</c> or
-/// <c>tests/</c>, is link-checked first: a symbolic link, junction or other reparse point at it, or at any folder
-/// between it and the repository root, fails the scan rather than being followed or skipped, a dangling link included,
-/// and every file a walk yields lies inside the folder it walks. Only the walk and read self-tests write, and only to
-/// a fresh temporary folder they delete.
+/// It reads only <c>EpiInfo.Web.sln</c>, <c>Directory.Packages.props</c>, <c>src/**</c> and <c>tests/**</c>. Both
+/// trees are walked whole, so a project at the top of <c>tests/</c> or in a folder of any name is found. On a
+/// case-insensitive file system <c>tests/</c> is the legacy <c>Tests/</c> folder, whose <c>Tests.csproj</c>
+/// legitimately holds <c>HintPath</c> and <c>packages.config</c>: only there, and only that project at the top of
+/// <c>tests/</c>, is set aside, while on a case-sensitive file system a <c>tests/Tests.csproj</c> is scanned like any
+/// other project. Folders are walked one level at a time, and a <c>bin/</c> or <c>obj/</c> folder is pruned by name
+/// before anything else, links included, so it is never entered. Every other file the class opens and every folder it
+/// lists, whether reached by a walk or by a fixed path such as <c>EpiInfo.Web.sln</c> or <c>tests/</c>, is
+/// link-checked first: a symbolic link, junction or other reparse point at it, or at any folder between it and the
+/// repository root, fails the scan rather than being followed or skipped, a dangling link included, and every file a
+/// walk yields lies inside the folder it walks. Only the self-tests write, and only to a fresh temporary folder they
+/// delete.
 /// </para>
 /// </remarks>
 public sealed partial class ForbiddenReferenceTests
 {
     private const string SolutionFolderTypeGuid = "2150E333-8FDC-42A3-9474-1A3956D46DE8";
+
+    // The project at the top of the legacy Tests/ folder, under its tracked name; on a case-insensitive file system
+    // that folder is tests/ itself.
+    private const string LegacyTestsProject = "tests/Tests.csproj";
 
     private static readonly string[] SourceProjects =
     [
@@ -63,6 +69,13 @@ public sealed partial class ForbiddenReferenceTests
     ];
 
     private static readonly string[] Projects = [.. SourceProjects, .. TestProjects];
+
+    // The two trees every project of the new solution lives in, each walked whole for its MSBuild files.
+    private static readonly string[] NewTreeFolders = ["src", "tests"];
+
+    // The MSBuild text a project of the new tree builds or imports: projects, and the props and targets files that
+    // MSBuild imports into them, a nested Directory.Build.props or Directory.Build.targets included.
+    private static readonly string[] MsBuildExtensions = [".csproj", ".props", ".targets"];
 
     // Every folder is listed one level at a time with these options. Hidden entries are listed and access errors
     // surface, so nothing in a scanned folder escapes the checks. Name matching is case-insensitive on every platform,
@@ -94,14 +107,13 @@ public sealed partial class ForbiddenReferenceTests
         IEnumerable<string> sourceProjects = ProjectFilesUnder(Full("src")).Select(Rel);
         AssertSameSet(SourceProjects, sourceProjects, "src/");
 
-        // Only the EpiInfo.*.Tests folders are listed, once tests/ is known to be a real folder; the top of tests/ may
-        // be the legacy Tests/ folder.
-        string tests = RealFolderWithin(RepositoryPaths.Root, Full("tests"));
-        IEnumerable<string> testProjects = Directory
-            .EnumerateDirectories(tests, "EpiInfo.*.Tests", TopLevelScan)
-            .SelectMany(ProjectFilesUnder)
-            .Select(Rel);
-        AssertSameSet(TestProjects, testProjects, "tests/EpiInfo.*.Tests/");
+        // Every project anywhere under tests/, at its top or in a folder outside the EpiInfo.*.Tests naming, counts;
+        // where tests/ is the legacy Tests/ folder, that folder's own project is set aside first.
+        IEnumerable<string> testProjects = NewTreeMsBuildFiles(RepositoryPaths.Root)
+            .Where(path =>
+                path.StartsWith("tests/", StringComparison.Ordinal) &&
+                string.Equals(Path.GetExtension(path), ".csproj", StringComparison.OrdinalIgnoreCase));
+        AssertSameSet(TestProjects, testProjects, "tests/");
 
         // tests/Shared is linked source of the database-backed test projects (AAP 0.4.2), never a ninth project.
         string shared = Full("tests", "Shared");
@@ -750,9 +762,232 @@ public sealed partial class ForbiddenReferenceTests
         }
     }
 
+    // The discovery self-tests below build their trees the same way. Every project, props and targets file in src/ and
+    // tests/ is found, at the top of tests/, in a folder of any name and at any depth, its extension in any case; build
+    // output, other files, and the folders beside src/ and tests/, where the legacy projects lie, yield nothing.
+    [Fact]
+    public void MsBuildDiscovery_FindsEveryProjectPropsAndTargetsFileInSrcAndTests()
+    {
+        DirectoryInfo temp = Directory.CreateTempSubdirectory("epiinfo-scan-");
+        try
+        {
+            string boundary = Path.Combine(temp.FullName, "boundary");
+            string[] found =
+            [
+                "src/A/A.csproj",
+                "src/A/Custom.TARGETS",
+                "src/Directory.Build.props",
+                "tests/EpiInfo.X.Tests/EpiInfo.X.Tests.csproj",
+                "tests/Other/Deep/Other.csproj",
+                "tests/Other/Directory.Build.targets",
+                "tests/Root.csproj",
+            ];
+            string[] ignored =
+            [
+                "src/A/A.cs",
+                "src/A/obj/A.csproj.nuget.g.props",
+                "tests/Other/bin/Hidden.csproj",
+                "tests/Other/obj/Hidden.csproj",
+                "tests/Other/packages.config",
+                "tests/Other/Deep/readme.md",
+                "Directory.Packages.props",
+                "Epi.Core/Epi.Core.csproj",
+            ];
+            foreach (string file in found.Concat(ignored))
+            {
+                WriteEmptyFile(boundary, file);
+            }
 
-    /// <summary>The eleven MSBuild files the token scan reads: the eight projects and the three props files.</summary>
-    private static IReadOnlyList<string> ScannedMsBuildFiles() => [.. Projects, .. PropsFiles];
+            Assert.Equal(found.Order(StringComparer.Ordinal), NewTreeMsBuildFiles(boundary));
+        }
+        finally
+        {
+            temp.Delete(recursive: true);
+        }
+    }
+
+    // Where a backslash is not a directory separator it is an ordinary name character, so a file whose name spells a
+    // nested path is found as its own entry, backslash kept, and that entry reads the file's own text, never the
+    // nested file's: at the top of tests/ beside the project its name spells, at the top of src/, and two folders deep.
+    [Theory]
+    [InlineData("tests/EpiInfo.X.Tests/EpiInfo.X.Tests.csproj", @"tests/EpiInfo.X.Tests\EpiInfo.X.Tests.csproj")]
+    [InlineData("src/A/A.csproj", @"src/A\A.csproj")]
+    [InlineData("tests/Other/Deep/Other.props", @"tests/Other\Deep\Other.props")]
+    public void MsBuildDiscovery_FindsAndReadsABackslashNamedFileAsItsOwnEntry(string nested, string backslashNamed)
+    {
+        // Windows separates folders with a backslash, so no name there can hold one, and no such file can exist to be
+        // taken for another; every other host runs the whole test.
+        if (Path.DirectorySeparatorChar == '\\' || Path.AltDirectorySeparatorChar == '\\')
+        {
+            return;
+        }
+
+        DirectoryInfo temp = Directory.CreateTempSubdirectory("epiinfo-scan-");
+        try
+        {
+            string boundary = Path.Combine(temp.FullName, "boundary");
+            foreach (string folder in NewTreeFolders)
+            {
+                Directory.CreateDirectory(Under(boundary, folder));
+            }
+
+            string[] files = [nested, backslashNamed];
+            foreach (string file in files)
+            {
+                WriteEmptyFile(boundary, file);
+                File.WriteAllText(Under(boundary, file), $"<Project><!-- {file} --></Project>");
+            }
+
+            IReadOnlyList<string> discovered = NewTreeMsBuildFiles(boundary);
+
+            Assert.Equal(files.Order(StringComparer.Ordinal), discovered);
+            Assert.All(
+                discovered,
+                entry => Assert.Equal($"<Project><!-- {entry} --></Project>", ReadRelativeFileWithin(boundary, entry)));
+        }
+        finally
+        {
+            temp.Delete(recursive: true);
+        }
+    }
+
+    // Only the legacy project, at the top of tests/ under its exact name, is set aside, and only where tests/ is the
+    // legacy Tests/ folder; a project spelt otherwise, such as tests/tests.csproj, is kept either way.
+    [Theory]
+    [InlineData("tests/Tests.csproj", true, false)]
+    [InlineData("tests/Tests.csproj", false, true)]
+    [InlineData("tests/tests.csproj", true, true)]
+    [InlineData("tests/tests.csproj", false, true)]
+    [InlineData("tests/Other/Tests.csproj", true, true)]
+    [InlineData("tests/Other/Tests.csproj", false, true)]
+    [InlineData("src/Tests.csproj", true, true)]
+    [InlineData("src/Tests.csproj", false, true)]
+    public void LegacyTestsProjectRule(string path, bool testsIsLegacyTests, bool kept)
+    {
+        string[] discovered = ["src/Directory.Build.props", path, "tests/EpiInfo.Api.Tests/EpiInfo.Api.Tests.csproj"];
+        string[] expected =
+            kept ? discovered : [.. discovered.Where(entry => !string.Equals(entry, path, StringComparison.Ordinal))];
+
+        Assert.Equal(expected, WithoutLegacyTestsProject(discovered, testsIsLegacyTests));
+    }
+
+    // tests/ is the legacy Tests/ exactly where the file system ignores case, which a probe file of the test's own
+    // measures, whichever of the two spellings were created.
+    [Theory]
+    [InlineData("tests")]
+    [InlineData("Tests")]
+    [InlineData("Tests", "tests")]
+    public void TestsFolderAlias_HoldsExactlyWhereTheFileSystemIgnoresCase(params string[] folders)
+    {
+        DirectoryInfo temp = Directory.CreateTempSubdirectory("epiinfo-scan-");
+        try
+        {
+            WriteEmptyFile(temp.FullName, "case-probe");
+            bool ignoresCase = File.Exists(Under(temp.FullName, "CASE-PROBE"));
+
+            string boundary = Path.Combine(temp.FullName, "boundary");
+            foreach (string folder in folders)
+            {
+                Directory.CreateDirectory(Under(boundary, folder));
+            }
+
+            Assert.Equal(ignoresCase, TestsFolderIsLegacyTestsFolder(boundary));
+        }
+        finally
+        {
+            temp.Delete(recursive: true);
+        }
+    }
+
+    /// <summary>
+    /// The MSBuild files the token scan reads, each once: the eight projects and the three props files by fixed path,
+    /// so one that is missing is reported, and every project, props and targets file <see cref="NewTreeMsBuildFiles"/>
+    /// finds in <c>src/</c> and <c>tests/</c>, so one outside the solution or the naming of its folders is read too.
+    /// </summary>
+    private static IReadOnlyList<string> ScannedMsBuildFiles() =>
+    [
+        .. Projects
+            .Concat(PropsFiles)
+            .Concat(NewTreeMsBuildFiles(RepositoryPaths.Root))
+            .Distinct(StringComparer.Ordinal),
+    ];
+
+    /// <summary>
+    /// Every project, props and targets file in <c>src/</c> and <c>tests/</c> below <paramref name="boundary"/>, as
+    /// boundary-relative, slash-separated paths in ordinal order, each its own entry: only the platform's directory
+    /// separator becomes a slash, so a backslash in a name is kept. Both trees are walked whole by
+    /// <see cref="FilesWithin"/>, so <c>bin/</c> and <c>obj/</c> are pruned and a link fails the walk, and an extension
+    /// matches in any case. Where <see cref="TestsFolderIsLegacyTestsFolder"/> finds <c>tests/</c> to be the legacy
+    /// <c>Tests/</c> folder, <see cref="WithoutLegacyTestsProject"/> sets that folder's own project aside.
+    /// </summary>
+    /// <param name="boundary">
+    /// The tree holding <c>src/</c> and <c>tests/</c>, for the repository scans the repository root; messages name
+    /// paths relative to it.
+    /// </param>
+    /// <exception cref="InvalidOperationException">
+    /// A link lies in either tree, at it, or at the <c>tests</c> or <c>Tests</c> folder of the boundary.
+    /// </exception>
+    /// <exception cref="DirectoryNotFoundException"><c>src/</c> or <c>tests/</c> is not an existing folder.</exception>
+    internal static IReadOnlyList<string> NewTreeMsBuildFiles(string boundary)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(boundary);
+        string fullBoundary = Path.TrimEndingDirectorySeparator(Path.GetFullPath(boundary));
+        string[] discovered =
+        [
+            .. NewTreeFolders
+                .SelectMany(folder => FilesWithin(fullBoundary, Path.Combine(fullBoundary, folder)))
+                .Where(path => MsBuildExtensions.Contains(Path.GetExtension(path), StringComparer.OrdinalIgnoreCase))
+                .Select(path => RelativeTo(fullBoundary, path))
+                .Order(StringComparer.Ordinal),
+        ];
+        return WithoutLegacyTestsProject(discovered, TestsFolderIsLegacyTestsFolder(fullBoundary));
+    }
+
+    /// <summary>
+    /// Whether <c>tests/</c> and <c>Tests/</c> at the top of <paramref name="boundary"/> are one folder, as on a
+    /// case-insensitive file system, where the new test tree and the legacy <c>Tests/</c> share their top level.
+    /// </summary>
+    /// <remarks>
+    /// Both spellings must resolve to an existing real folder, and a case-insensitive listing of the boundary's top
+    /// level must hold exactly one folder of that name. On a case-sensitive file system two separate folders list as
+    /// two, and a spelling with no folder of its own does not resolve, so either answers false. The boundary itself is
+    /// where the tree lies, so, as for a walk, it is listed without a link check of its own.
+    /// </remarks>
+    /// <param name="boundary">
+    /// The tree whose top level is checked, for the repository scans the repository root.
+    /// </param>
+    /// <exception cref="InvalidOperationException">The <c>tests</c> or <c>Tests</c> folder is a link.</exception>
+    internal static bool TestsFolderIsLegacyTestsFolder(string boundary)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(boundary);
+        string fullBoundary = Path.TrimEndingDirectorySeparator(Path.GetFullPath(boundary));
+        bool bothResolve =
+            MissingFolderOnLinkFreePath(fullBoundary, Path.Combine(fullBoundary, "tests")) is null &&
+            MissingFolderOnLinkFreePath(fullBoundary, Path.Combine(fullBoundary, "Tests")) is null;
+        return bothResolve && new DirectoryInfo(fullBoundary).GetDirectories("tests", TopLevelScan).Length == 1;
+    }
+
+    /// <summary>
+    /// <paramref name="discovered"/>, in its order, without the legacy project at the top of <c>tests/</c> when
+    /// <paramref name="testsIsLegacyTests"/> says that folder is the legacy <c>Tests/</c>, and unchanged otherwise, so
+    /// on a case-sensitive file system a <c>tests/Tests.csproj</c> is scanned like any other project. The path matches
+    /// exactly: the walk yields each file under its name on disk, where the legacy project has its tracked name
+    /// <c>Tests.csproj</c>, so a project spelt otherwise, such as a <c>tests/tests.csproj</c> beside it in a folder
+    /// whose own entries are case-sensitive, is a project of the new tree and is scanned.
+    /// </summary>
+    /// <param name="discovered">
+    /// Boundary-relative, slash-separated paths, as <see cref="NewTreeMsBuildFiles"/> finds them.
+    /// </param>
+    /// <param name="testsIsLegacyTests">The answer of <see cref="TestsFolderIsLegacyTestsFolder"/>.</param>
+    internal static IReadOnlyList<string> WithoutLegacyTestsProject(
+        IEnumerable<string> discovered,
+        bool testsIsLegacyTests)
+    {
+        ArgumentNullException.ThrowIfNull(discovered);
+        return testsIsLegacyTests
+            ? [.. discovered.Where(path => !string.Equals(path, LegacyTestsProject, StringComparison.Ordinal))]
+            : [.. discovered];
+    }
 
     /// <summary>
     /// The new tree a file item may link into, as full paths: the eight project folders and <c>tests/Shared</c>, the
@@ -804,8 +1039,7 @@ public sealed partial class ForbiddenReferenceTests
 
     private static string Full(params string[] relative) => RepositoryPaths.Combine(relative);
 
-    private static string Rel(string fullPath) =>
-        Path.GetRelativePath(RepositoryPaths.Root, fullPath).Replace('\\', '/');
+    private static string Rel(string fullPath) => RelativeTo(RepositoryPaths.Root, fullPath);
 
     /// <summary>
     /// Every file below <paramref name="directory"/>, outside <c>bin/</c> and <c>obj/</c>, as full paths: the walk of
@@ -816,11 +1050,36 @@ public sealed partial class ForbiddenReferenceTests
 
     /// <summary>
     /// The text of the file at the repository-relative, slash-separated path <paramref name="relative"/>, read by
-    /// <see cref="ReadFileWithin"/> bounded by the repository root, so a link fails the read with its
+    /// <see cref="ReadRelativeFileWithin"/> bounded by the repository root, so a link fails the read with its
     /// repository-relative path; <see langword="null"/> when the file does not exist.
     /// </summary>
     private static string? ReadRepositoryFile(string relative) =>
-        ReadFileWithin(RepositoryPaths.Root, Full(relative.Split('/')));
+        ReadRelativeFileWithin(RepositoryPaths.Root, relative);
+
+    /// <summary>
+    /// The text of the file at <paramref name="relative"/>, a boundary-relative, slash-separated path such as
+    /// <see cref="NewTreeMsBuildFiles"/> yields, read by <see cref="ReadFileWithin"/>. The path is split at slashes
+    /// only, so a backslash, an ordinary name character where it is not the directory separator, stays part of the
+    /// name it is in, and the file read is the one that path names.
+    /// </summary>
+    /// <param name="boundary">
+    /// The tree the read stays inside, for the repository reads the repository root; messages name paths relative to
+    /// it.
+    /// </param>
+    /// <param name="relative">The file's path relative to <paramref name="boundary"/>, slash-separated.</param>
+    /// <returns>
+    /// The file's text, or <see langword="null"/> when no file is there, or a folder above it does not exist.
+    /// </returns>
+    /// <exception cref="InvalidOperationException">
+    /// The file lies outside the boundary, or it or a folder between it and the boundary is a link.
+    /// </exception>
+    internal static string? ReadRelativeFileWithin(string boundary, string relative)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(boundary);
+        ArgumentException.ThrowIfNullOrWhiteSpace(relative);
+        string fullBoundary = Path.TrimEndingDirectorySeparator(Path.GetFullPath(boundary));
+        return ReadFileWithin(fullBoundary, Path.Combine([fullBoundary, .. relative.Split('/')]));
+    }
 
     private static IEnumerable<string> ProjectFilesUnder(string directory) =>
         FilesUnder(directory)
@@ -1021,8 +1280,11 @@ public sealed partial class ForbiddenReferenceTests
             Path.EndsInDirectorySeparator(folder) ? folder : folder + Path.DirectorySeparatorChar,
             StringComparison.Ordinal);
 
+    // The path relative to the boundary, in slash form. Only the platform's directory separator becomes a slash: where
+    // that separator is not a backslash, a backslash is an ordinary name character, so a file named a\b.csproj keeps
+    // a path of its own, apart from b.csproj in folder a.
     private static string RelativeTo(string boundary, string path) =>
-        Path.GetRelativePath(boundary, path).Replace('\\', '/');
+        Path.GetRelativePath(boundary, path).Replace(Path.DirectorySeparatorChar, '/');
 
     private static string Under(string folder, string relative) => Path.Combine([folder, .. relative.Split('/')]);
 

@@ -141,7 +141,9 @@ export function DateInput(props: FieldComponentProps) {
           if (disabled) {
             return;
           }
-          // The browser yields '' for a cleared or incomplete entry, else YYYY-MM-DD.
+          // Blank (a cleared or incomplete entry) emits null; any other value passes unchanged,
+          // a year beyond four digits included, for the API's four-digit YYYY-MM-DD check
+          // (mirrored for feedback by clientValidation.ts) to report.
           onChange(e.target.value === '' ? null : e.target.value);
         }}
         onFocus={() => {

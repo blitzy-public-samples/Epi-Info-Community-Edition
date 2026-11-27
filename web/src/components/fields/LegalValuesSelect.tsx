@@ -24,14 +24,14 @@ import {
  * list is shown as one extra option after "No selection", so a read shows the stored
  * value unchanged.
  *
- * The options are keyed by the select's `disabled` state, so each change of it replaces
- * every option node while the select itself stays mounted. An option has no state of
- * its own here and inherits it from the select, and Chromium can keep an option's
- * accessibility object from before such a change: after a record opened from Find
- * re-enabled the select, every option was announced disabled and none selected. Options
- * created in the select's current state are announced in that state. Keeping the select
- * leaves its focus, label, value and ARIA attributes untouched, so the replacement raises
- * no focus, blur or change.
+ * The options are keyed by the select's `disabled` state, so each change of that state
+ * replaces every option node while the select itself stays mounted. An option has no
+ * state of its own here and inherits it from the select, and Chromium can keep an
+ * option's accessibility object across a change of the select's disabled state, so a
+ * reused option can be announced with stale disabled and selected state. Options created
+ * in the select's current state are announced in that state. Only the options are
+ * replaced: keeping the select leaves its focus, identity, label, value and ARIA
+ * attributes untouched, so the replacement raises no focus, blur or change.
  */
 export function LegalValuesSelect(props: FieldComponentProps) {
   const { field, value, disabled, errors, onChange, onFocus, onBlur } = props;
