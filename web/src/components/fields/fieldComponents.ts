@@ -4,9 +4,11 @@
 // to choose a component. The server has already mapped every metadata type to a
 // `fieldType` (Phone Number and Comment Legal to `text`, Yes/No to `unsupported`),
 // so nothing here matches type names.
-import type { ComponentType, ReactNode } from 'react';
+import { useEffect, useRef, useState } from 'react';
+import type { ComponentType, ReactNode, RefObject } from 'react';
 import { isExactDecimal } from '../../api/client';
 import type { FieldDefinition, FieldType, FieldValue } from '../../api/types';
+import { clientMessages } from '../../validation/clientValidation';
 import { CheckboxInput } from './CheckboxInput';
 import { DateInput } from './DateInput';
 import { GroupSection } from './GroupSection';
@@ -62,9 +64,9 @@ export type FieldAriaProps = {
  * so the id is safe in the DOM and in a CSS selector whatever the metadata name holds.
  *
  * Because the encoded name never contains `-`, an id derived from a control's id as
- * `${fieldControlId(name)}-<role>` (the error list, a hint, a radio) can never equal
- * another field's control id or a different role's id. Every id derived for a field
- * follows that form.
+ * `${fieldControlId(name)}-<role>` (the error list, a hint, a length-limit notice, a
+ * radio) can never equal another field's control id or a different role's id. Every id
+ * derived for a field follows that form.
  */
 export function fieldControlId(name: string): string {
   return 'field-' + name.replace(/[^A-Za-z0-9]/g, (unit) => '_' + unit.charCodeAt(0).toString(16).padStart(4, '0'));
@@ -131,6 +133,82 @@ export function fieldTextValue(value: FieldValue): string {
   }
   // An exact decimal is the number typed, shown as its JSON literal.
   return isExactDecimal(value) ? value.literal : String(value);
+}
+
+/** What useLengthLimitNotice gives a text control: the ref to attach, and the notice to show beside it. */
+export interface LengthLimitNotice<T extends HTMLInputElement | HTMLTextAreaElement> {
+  /** Attached to the native control whose `maxLength` attribute is the limit. */
+  readonly ref: RefObject<T>;
+  /** The client's `maxLength` message while the control's last entry was cut to the limit; otherwise `null`. */
+  readonly notice: string | null;
+}
+
+/**
+ * Tells the user when a text control's native `maxLength` cut what they typed or pasted.
+ * The limit stays the native attribute, as legacy sets the text box's MaxLength, and the
+ * browser drops whatever passes it without a word. A native `beforeinput` listener (React's
+ * onBeforeInput is a polyfill that carries no `inputType`) works out the length each
+ * insertion would reach: the value's length, less the selection it replaces, plus the text
+ * inserted as the browser stores it. Past `maxLength` the notice is the client's
+ * `maxLength` message; an insertion that fits, any other edit, and blur clear it. It is
+ * feedback only: no error, no `aria-invalid`, no change to the draft. Nothing is listened
+ * to while `maxLength` is `undefined` or the control is disabled.
+ */
+export function useLengthLimitNotice<T extends HTMLInputElement | HTMLTextAreaElement>(
+  maxLength: number | undefined,
+  disabled: boolean,
+): LengthLimitNotice<T> {
+  const ref = useRef<T>(null);
+  const [cut, setCut] = useState(false);
+
+  useEffect(() => {
+    const control = ref.current;
+    if (control === null || maxLength === undefined || disabled) {
+      return undefined;
+    }
+    const limit = maxLength;
+    const onBeforeInput = (event: Event): void => {
+      if (!(event instanceof InputEvent)) {
+        return;
+      }
+      if (!event.inputType.startsWith('insert')) {
+        // Any other edit, a deletion, undo or redo, supersedes the entry that was cut.
+        setCut(false);
+        return;
+      }
+      // While an IME composes, the selection spans the uncommitted text the update replaces.
+      const selected = (control.selectionEnd ?? 0) - (control.selectionStart ?? 0);
+      setCut(control.value.length - selected + insertedLength(control, event) > limit);
+    };
+    const onBlur = (): void => {
+      setCut(false);
+    };
+    control.addEventListener('beforeinput', onBeforeInput);
+    control.addEventListener('blur', onBlur);
+    return () => {
+      control.removeEventListener('beforeinput', onBeforeInput);
+      control.removeEventListener('blur', onBlur);
+      // A cut seen before the control was disabled or its limit changed no longer applies.
+      setCut(false);
+    };
+  }, [maxLength, disabled]);
+
+  return { ref, notice: cut && maxLength !== undefined && !disabled ? clientMessages.maxLength(maxLength) : null };
+}
+
+/**
+ * Length of the text an `insert…` input event adds to `control`, as Chromium stores it. A
+ * line break typed is one character. Typed, pasted or dropped text counts each CRLF, CR or
+ * LF once, and a single-line input drops its trailing line breaks and turns each other one
+ * into a space, so a cell copied from a spreadsheet with its line break still fits.
+ */
+function insertedLength(control: HTMLInputElement | HTMLTextAreaElement, event: InputEvent): number {
+  if (event.inputType === 'insertLineBreak' || event.inputType === 'insertParagraph') {
+    return 1;
+  }
+  // A plain-text control's inserted text, a paste's included, is `data`; `dataTransfer` carries it when `data` is null.
+  const text = (event.data ?? event.dataTransfer?.getData('text/plain') ?? '').replace(/\r\n?/g, '\n');
+  return (control instanceof HTMLInputElement ? text.replace(/\n+$/, '') : text).length;
 }
 
 // Import cycle: the components import helpers from here, so every helper and component stays a hoisted `function` declaration and nothing reads this map at module evaluation.

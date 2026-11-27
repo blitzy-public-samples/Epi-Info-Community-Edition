@@ -25,11 +25,13 @@ namespace EpiInfo.Api.Contracts;
 /// appears in the OpenAPI document.
 /// </para>
 /// <para>
-/// The binder still answers a body that is not a well-formed JSON object. Malformed or truncated JSON, and a body
-/// that is a JSON array, string, number or boolean, fail binding with a <c>BadHttpRequestException</c>, which
-/// <c>ApiExceptionHandler</c> maps to the request-level 400 "malformed JSON". A body that is the JSON literal
-/// <c>null</c> binds no request and gets the request-level 400 "request body is required", which
-/// <c>JsonContentTypeMiddleware</c> gives a missing or empty body before binding.
+/// The endpoint reads the whole body as one JSON value through <c>JsonRequestBody</c> before it reads this type, and
+/// answers a body that is not a JSON object itself. Content that is not valid JSON, such as truncated JSON or
+/// content after the value, is a <c>BadHttpRequestException</c> that <c>ApiExceptionHandler</c> maps to the
+/// request-level 400 "malformed JSON". A valid value that is a JSON array, string, number or boolean is the
+/// request-level 400 "request body must be a JSON object". A body that is the JSON literal <c>null</c> reads as no
+/// request and gets the request-level 400 "request body is required", which <c>JsonContentTypeMiddleware</c> gives a
+/// missing or empty body before the endpoint runs.
 /// </para>
 /// <para>
 /// <c>FieldEventService</c> answers a bound request with one of two 400 shapes. A missing, <c>null</c>, wrongly typed

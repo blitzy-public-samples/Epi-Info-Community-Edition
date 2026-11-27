@@ -15,10 +15,10 @@ namespace EpiInfo.Api.Contracts;
 /// not writable; the record validator rejects both with a 400, not this type.
 /// </para>
 /// <para>
-/// The type holds no validation and no binding or schema attributes. <c>Endpoints/RecordEndpoints.cs</c> decides how
-/// the body binds, and <c>OpenApi/ScalarSchemaTransformer.cs</c> documents <c>values</c> as an object whose
-/// <c>additionalProperties</c> is <c>FieldValue</c>, so no <see cref="JsonElement"/> shape reaches the OpenAPI
-/// document.
+/// The type holds no validation and no binding or schema attributes. <c>Endpoints/RecordEndpoints.cs</c> reads the
+/// body into it through <c>JsonRequestBody</c>, and <c>OpenApi/ScalarSchemaTransformer.cs</c> documents <c>values</c>
+/// as an object whose <c>additionalProperties</c> is <c>FieldValue</c>, so no <see cref="JsonElement"/> shape reaches
+/// the OpenAPI document.
 /// </para>
 /// <para>
 /// A missing <c>values</c> binds as <see langword="null"/> because the serializer option
@@ -29,11 +29,13 @@ namespace EpiInfo.Api.Contracts;
 /// <c>JsonElement?</c> is a nullable value type.
 /// </para>
 /// <para>
-/// A missing body, or an empty one sent as <c>application/json</c>, never reaches this type:
-/// <c>JsonContentTypeMiddleware</c> answers it with the request-level 400 "request body is required", and a body
-/// that is the JSON literal <c>null</c> binds no request and gets the same 400. Malformed or truncated JSON, and a
-/// body that is a JSON array, string, number or boolean rather than an object, fail binding with a
-/// <c>BadHttpRequestException</c>, which <c>ApiExceptionHandler</c> maps to the request-level 400 "malformed JSON".
+/// The endpoint reads the whole body as one JSON value before it reads this type. A missing body, or an empty one
+/// sent as <c>application/json</c>, never reaches this type: <c>JsonContentTypeMiddleware</c> answers it with the
+/// request-level 400 "request body is required", and a body that is the JSON literal <c>null</c> reads as no request
+/// and gets the same 400. Content that is not valid JSON, such as truncated JSON or content after the value, is a
+/// <c>BadHttpRequestException</c> that <c>ApiExceptionHandler</c> maps to the request-level 400 "malformed JSON". A
+/// valid value that is a JSON array, string, number or boolean rather than an object is the request-level 400
+/// "request body must be a JSON object".
 /// </para>
 /// </remarks>
 /// <param name="Values">

@@ -50,8 +50,8 @@ namespace EpiInfo.Api.OpenApi;
 /// <c>criteria</c> is a required, non-null array of 1 to <see cref="RecordQueryRules.MaxSearchFields"/> criteria,
 /// because an empty list, a seventh field and a field named twice are each a 400; its <c>includeDeleted</c> and
 /// <c>excludeGlobalRecordId</c> stay optional. The four operations carrying <see cref="JsonBodyMetadata"/> publish
-/// their body as required and as a plain <c>$ref</c> to its component, without the <c>null</c> branch of their
-/// nullable binding, because a missing or <c>null</c> body is a 400.
+/// their body as required and as a plain <c>$ref</c> to its component, without the <c>null</c> branch a nullable
+/// body parameter would publish, because a missing or <c>null</c> body is a 400.
 /// </description></item>
 /// <item><description>
 /// The search response's <c>items</c> as an array of at most <see cref="RecordQueryRules.SearchCap"/> results, the
@@ -721,9 +721,10 @@ public sealed class ScalarSchemaTransformer :
         Enum = CreateEnum(statuses),
     };
 
-    // The four JSON-body endpoints bind a nullable body, so that a JSON null reaches the service's request-level 400,
-    // and the generator publishes that binding: an optional body whose schema is oneOf [null, $ref]. On the wire the
-    // body is a required, non-null object, so it is marked required and each null branch is dropped.
+    // The four JSON-body endpoints read their body themselves, so that a JSON null reaches the service's request-level
+    // 400, and declare it through Accepts metadata. A nullable body parameter would instead be published as an
+    // optional body whose schema is oneOf [null, $ref]. On the wire the body is a required, non-null object, so it is
+    // marked required and any such null branch is dropped.
     private static void RequireJsonBody(OpenApiOperation operation)
     {
         if (operation.RequestBody is not OpenApiRequestBody body)

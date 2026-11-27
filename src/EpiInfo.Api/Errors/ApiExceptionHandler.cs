@@ -29,7 +29,9 @@ namespace EpiInfo.Api.Errors;
 /// <see cref="IRequestBodyReadFeature"/> saw the body end before its first byte (an empty chunked body); "malformed
 /// JSON" when a <see cref="JsonException"/> caused it otherwise; and "the request is invalid" otherwise. 413 and 415
 /// get their fixed bodies; any other 4xx keeps its status with the fixed invalid-request text. A request-body JSON
-/// failure arrives only in this form, because binding wraps it in a <see cref="BadHttpRequestException"/>.
+/// failure arrives only in this form, because the body reader <see cref="JsonRequestBody"/> wraps it in a
+/// <see cref="BadHttpRequestException"/>. A valid body that is not a JSON object never arrives here: that reader
+/// answers it itself.
 /// </description></item>
 /// <item><description>A <see cref="DataStoreUnavailableException"/> is a 503.</description></item>
 /// <item><description>
@@ -234,7 +236,7 @@ internal sealed partial class ApiExceptionHandler(ILogger<ApiExceptionHandler> l
         request.HttpContext.Features.Get<IHttpRequestBodyDetectionFeature>() is { CanHaveBody: false }
         || request.ContentLength == 0;
 
-    // Empty by its headers, or, for a JSON failure, by the body guard's read state: the reads binding made found the
+    // Empty by its headers, or, for a JSON failure, by the body guard's read state: the body reader's reads found the
     // end of the body before its first byte, as with an empty chunked body. Nothing here reads the body, and a host
     // without the guard is judged by its headers alone.
     private static bool IsEmptyBody(HttpRequest request, BadHttpRequestException exception) =>

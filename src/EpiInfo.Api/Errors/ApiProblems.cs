@@ -46,11 +46,23 @@ public static class ApiProblems
     /// <summary>The <c>detail</c> of a field-level 400.</summary>
     public const string ValidationFailedDetail = "one or more values are invalid";
 
-    /// <summary>The <c>detail</c> of the request-level 400 for a body that is not valid JSON.</summary>
+    /// <summary>
+    /// The <c>detail</c> of the request-level 400 for a body whose content is not one valid JSON value, such as
+    /// truncated or unterminated content, a bare word, or content after the value, or that holds a name or string
+    /// that cannot be decoded. A valid JSON value that is not an object gets
+    /// <see cref="RequestBodyMustBeObjectDetail"/> instead.
+    /// </summary>
     public const string MalformedJsonDetail = "malformed JSON";
 
     /// <summary>The <c>detail</c> of the request-level 400 for a missing, empty or JSON <c>null</c> body.</summary>
     public const string RequestBodyRequiredDetail = "request body is required";
+
+    /// <summary>
+    /// The <c>detail</c> of the request-level 400 for a body that is one valid JSON value but not an object: an
+    /// array, a string, a number or a boolean. The body reader <c>JsonRequestBody</c> judges it once the whole body
+    /// has been parsed.
+    /// </summary>
+    public const string RequestBodyMustBeObjectDetail = "request body must be a JSON object";
 
     /// <summary>The <c>detail</c> of the request-level 400 for a missing, <c>null</c> or non-object <c>values</c>.</summary>
     public const string ValuesMustBeObjectDetail = ValidationMessages.ValuesMustBeObject;
@@ -332,6 +344,9 @@ public static class ApiProblems
 
     /// <summary>The request-level 400 <see cref="RequestBodyRequiredDetail"/>.</summary>
     public static IResult RequestBodyRequired() => RequestLevel(RequestBodyRequiredDetail);
+
+    /// <summary>The request-level 400 <see cref="RequestBodyMustBeObjectDetail"/>.</summary>
+    public static IResult RequestBodyMustBeObject() => RequestLevel(RequestBodyMustBeObjectDetail);
 
     /// <summary>The request-level 400 <see cref="ValuesMustBeObjectDetail"/>.</summary>
     public static IResult ValuesMustBeObject() => RequestLevel(ValuesMustBeObjectDetail);

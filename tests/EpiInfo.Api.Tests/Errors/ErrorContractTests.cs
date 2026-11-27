@@ -115,6 +115,8 @@ public sealed class ErrorContractTests
 
     private const string ExpectedRequestBodyRequiredDetail = "request body is required";
 
+    private const string ExpectedRequestBodyMustBeObjectDetail = "request body must be a JSON object";
+
     private const string ExpectedValuesMustBeObjectDetail = "values must be an object";
 
     private const string ExpectedFormNotFoundDetail = "the form does not exist";
@@ -435,6 +437,21 @@ public sealed class ErrorContractTests
                         // Content that is not JSON: an unterminated object and a bare word.
                         data.Add(environment, framing, route, "{", ExpectedMalformedJsonDetail);
                         data.Add(environment, framing, route, "x", ExpectedMalformedJsonDetail);
+
+                        // Content that is not JSON although its first token starts a value that is not an object: an
+                        // unterminated array, a trailing comma, and a number or a boolean followed by more content.
+                        // The whole body is judged, never its first token alone.
+                        data.Add(environment, framing, route, "[", ExpectedMalformedJsonDetail);
+                        data.Add(environment, framing, route, "[1,]", ExpectedMalformedJsonDetail);
+                        data.Add(environment, framing, route, "5 x", ExpectedMalformedJsonDetail);
+                        data.Add(environment, framing, route, "true false", ExpectedMalformedJsonDetail);
+
+                        // Well-formed JSON that is not an object: an array and a number.
+                        data.Add(environment, framing, route, "[]", ExpectedRequestBodyMustBeObjectDetail);
+                        data.Add(environment, framing, route, "5", ExpectedRequestBodyMustBeObjectDetail);
+
+                        // The JSON literal null is valid JSON that carries no request, answered as a missing body.
+                        data.Add(environment, framing, route, "null", ExpectedRequestBodyRequiredDetail);
 
                         // No content: Content-Length 0, or a body of unknown length whose first read ends it (on
                         // Kestrel the zero-length chunk alone).

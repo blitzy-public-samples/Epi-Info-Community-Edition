@@ -25,7 +25,10 @@ namespace EpiInfo.Api.Endpoints;
 /// <see cref="JsonBodyMetadata"/> places the route under <c>JsonContentTypeMiddleware</c>, which answers 415 for any
 /// media type other than <c>application/json</c> with an optional <c>charset=utf-8</c>, <c>+json</c> types and a
 /// missing <c>Content-Type</c> included, and the request-level 400 for an empty body. The 1,048,576-byte body limit
-/// gives 413, and the exception handler gives 400 for malformed JSON, 503 for an unavailable store and 500 otherwise.
+/// gives 413. The handler reads the body through <see cref="JsonRequestBody"/>, which parses the whole body first: a
+/// valid value that is not an object is the request-level 400 "request body must be a JSON object", returned before
+/// the service runs. The exception handler gives 400 for malformed JSON, 503 for an unavailable store and 500
+/// otherwise.
 /// </para>
 /// <para>
 /// The route never writes, so it carries no <c>WriteEndpointMetadata</c> and its 500 and 503 bodies are plain
@@ -64,13 +67,17 @@ public static class CheckCodeEndpoints
         return app;
     }
 
-    // The body is nullable so a JSON null body reaches the service's request-level 400 rather than a binder message.
-    // The service is marked [FromServices] so build-time OpenAPI generation never relies on service-collection
-    // inference to tell it apart from a body parameter.
-    private static Task<IResult> RunFieldEventAsync(
+    // The body is read by JsonRequestBody rather than bound, and declared by the Accepts metadata above; a JSON null
+    // body reads as no request and reaches the service's request-level 400. The service is marked [FromServices] so
+    // build-time OpenAPI generation never relies on service-collection inference to tell it apart from a body
+    // parameter.
+    private static async Task<IResult> RunFieldEventAsync(
+        HttpContext httpContext,
         [FromRoute] int viewId,
-        [FromBody] FieldEventRequest? request,
         [FromServices] FieldEventService service,
-        CancellationToken cancellationToken) =>
-        service.RunAsync(viewId, request, cancellationToken);
+        CancellationToken cancellationToken)
+    {
+        var body = await JsonRequestBody.ReadObjectAsync<FieldEventRequest>(httpContext, cancellationToken);
+        return body.Problem ?? await service.RunAsync(viewId, body.Value, cancellationToken);
+    }
 }

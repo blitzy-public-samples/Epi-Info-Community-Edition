@@ -318,6 +318,20 @@
     outline-offset: var(--focus-ring-width);
   }
 
+  /* A date input's calendar button is a tab stop of its own in Chromium.
+   * While it has focus, the input matches :focus-within but neither :focus
+   * nor :focus-visible, and :focus or :focus-visible on the button itself
+   * never matches, so the ring is drawn on the button from the input's
+   * state in place of the browser's thin one. The ring also shows after the
+   * button is clicked, as it does on a clicked date input. Engines without
+   * this pseudo-element drop the rule, so it stays apart from the rule
+   * above. */
+  input[type="date"]:focus-within:not(:focus)::-webkit-calendar-picker-indicator {
+    outline: var(--focus-ring-width) solid var(--color-focus);
+    outline-offset: var(--focus-ring-width);
+    border-radius: var(--radius-small);
+  }
+
   /* aria-disabled elements are not natively inert, so pointer input is
    * blocked here. */
   [aria-disabled="true"] {
@@ -590,8 +604,21 @@
     flex: none;
   }
 
+  /* The label clicks through to its box, so it shows the box's pointer and
+   * gives the pair its 44px row, as an option group's labels do. Its text is
+   * one anonymous flex item, so a long label still wraps beside the box. */
   .field > input[type="checkbox"] + label {
+    display: flex;
     flex: 1 1 0;
+    align-items: center;
+    min-block-size: var(--target-size);
+    cursor: pointer;
+  }
+
+  /* A disabled box ignores its label's clicks, so the label shows the
+   * disabled cursor as the box does. */
+  .field > input[type="checkbox"]:disabled + label {
+    cursor: not-allowed;
   }
 
   /* Option group: radio-label pairs in equal columns under the legend. The
@@ -809,17 +836,18 @@
   }
 
   /* Each row's open action: its first cell's text styled as a link. It fills
-   * the cell and is one line tall, so a blank value, whose button holds only
-   * visually hidden text, still has a hover target across the cell's line;
-   * the cell's padding sets the rest of the row height. A pointer click
-   * anywhere on the row opens the record as well. */
+   * the cell and keeps the 44px minimum target in both directions, so a short
+   * or blank value, whose button holds only visually hidden text, still has
+   * a full hover and touch target; the cell's padding sets the rest of the
+   * row height. A pointer click anywhere on the row opens the record as
+   * well. */
   .record-grid__open {
     /* Block-level, so no inline baseline gap adds to the row's height. */
     display: flex;
     justify-content: flex-start;
     inline-size: 100%;
-    min-block-size: 1lh;
-    min-inline-size: 0;
+    min-block-size: var(--target-size);
+    min-inline-size: var(--target-size);
     padding: 0;
     border: 0;
     background-color: transparent;
@@ -830,6 +858,13 @@
     text-decoration: underline;
     text-underline-offset: 2px;
     white-space: nowrap;
+  }
+
+  /* The open action's cell: the button's target height takes the place of
+   * the line and part of the padding of the row's other cells, so the row
+   * stays one line plus their padding tall. */
+  .record-grid tbody td:first-child {
+    padding-block: calc((1lh + 2 * var(--space-3) - var(--target-size)) / 2);
   }
 
   /* A button is an atomic inline box, which does not take its cell's
@@ -1006,9 +1041,13 @@
     padding-inline-start: var(--space-5);
   }
 
-  /* A field label that jumps to the field: styled as a link. */
+  /* A field label that jumps to the field: styled as a link. It keeps the
+   * base button's 44px minimum target in both directions, so a short label
+   * such as "Age" is still a full target; its text starts where the other
+   * items' labels do, and any extra width trails it. */
   .validation-summary li button {
-    min-inline-size: 0;
+    justify-content: flex-start;
+    min-inline-size: var(--target-size);
     padding: 0;
     border: 0;
     background-color: transparent;

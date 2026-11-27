@@ -872,6 +872,209 @@ describe('FormView accessible structure (SC-8)', () => {
     ).toEqual([['', 'No selection'], ...sexOptions.map((option) => [String(option.value), option.label])]);
   });
 
+  // A metadata maxLength stays the control's native limit, as legacy's MaxLength is, so the
+  // browser cuts an entry that passes it, and the cut is told beside the field. jsdom applies
+  // no edit for a beforeinput event, so each step sets the value and selection the browser
+  // holds, then dispatches the native beforeinput Chromium fires for the entry: a typed
+  // character's `data`, a paste's whole clipboard text, `null` for a line break.
+  describe('the length-limit notice of a text control', () => {
+    interface Entry {
+      readonly inputType: string;
+      readonly data: string | null;
+      /** The selection the entry replaces; by default collapsed at the end of the value. */
+      readonly selection?: readonly [number, number];
+    }
+
+    function textControlOf(definition: FormDefinition, name: string): HTMLInputElement | HTMLTextAreaElement {
+      const control = controlOf(definition, name);
+      if (!(control instanceof HTMLInputElement || control instanceof HTMLTextAreaElement)) {
+        throw new Error(`the control of ${name} is a ${control.tagName}`);
+      }
+      return control;
+    }
+
+    /** Gives `control` the value `value` as typing does, selects, and dispatches `entry`'s beforeinput. */
+    function enter(control: HTMLInputElement | HTMLTextAreaElement, value: string, entry: Entry): void {
+      if (control.value !== value) {
+        fireEvent.change(control, { target: { value } });
+      }
+      const [start, end] = entry.selection ?? [value.length, value.length];
+      control.setSelectionRange(start, end);
+      act(() => {
+        control.dispatchEvent(
+          new InputEvent('beforeinput', { inputType: entry.inputType, data: entry.data, bubbles: true, cancelable: true }),
+        );
+      });
+    }
+
+    function withValidation(name: string, validation: Partial<FieldDefinition['validation']>): FormDefinition {
+      return withField(name, (field) => ({ ...field, validation: { ...field.validation, ...validation } }));
+    }
+
+    /** Requests other than reads and the field events focus and blur raise. */
+    function recordWrites(): string[] {
+      return writeCalls()
+        .filter((call) => !call.url.pathname.endsWith('/checkcode/field-event'))
+        .map(requestLine);
+    }
+
+    const TYPED_AT_LIMIT: Entry = { inputType: 'insertText', data: '9' };
+
+    it.each<{ what: string; name: string; maxLength?: number; value: string; entry: Entry; cutTo: string }>([
+      {
+        what: 'a sixth character typed into a full Zip',
+        name: 'Zip',
+        value: '12345',
+        entry: { inputType: 'insertText', data: '6' },
+        cutTo: '12345',
+      },
+      {
+        what: 'a paste longer than Zip',
+        name: 'Zip',
+        value: '',
+        entry: { inputType: 'insertFromPaste', data: '123456' },
+        cutTo: '12345',
+      },
+      {
+        what: 'a paste over a selection that leaves Zip too long',
+        name: 'Zip',
+        value: '12345',
+        entry: { inputType: 'insertFromPaste', data: '678', selection: [1, 3] },
+        // The browser keeps as much of the paste as fits in place of the selection.
+        cutTo: '16745',
+      },
+      {
+        what: 'a character typed into a full phone number beside its format hint',
+        name: 'PhoneNumber',
+        maxLength: 12,
+        value: '555-014-8636',
+        entry: { inputType: 'insertText', data: '0' },
+        cutTo: '555-014-8636',
+      },
+      {
+        what: 'a line break typed into a full Address',
+        name: 'PatientAddress',
+        maxLength: 8,
+        value: '12 Elm S',
+        entry: { inputType: 'insertLineBreak', data: null },
+        cutTo: '12 Elm S',
+      },
+      {
+        what: 'a paste into Address still too long once its CRLF is one line break',
+        name: 'PatientAddress',
+        maxLength: 8,
+        value: '',
+        entry: { inputType: 'insertFromPaste', data: '12 Elm\r\nSt.' },
+        cutTo: '12 Elm\nS',
+      },
+    ])(
+      'announces $what beside the field as a notice, not an error, until a fitting entry, a deletion or blur',
+      async ({ name, maxLength, value, entry, cutTo }) => {
+        const definition = maxLength === undefined ? createFormDefinitionFixture() : withValidation(name, { maxLength });
+        const field = fieldByName(name, definition);
+        const limit = present(field.validation.maxLength, `maxLength of ${name}`);
+        expect(cutTo, 'the value the browser keeps').toHaveLength(limit);
+        const pattern = field.validation.pattern;
+        const hintIds = typeof pattern === 'string' && pattern !== '' ? [`${fieldControlId(name)}-hint`] : [];
+        const limitId = `${fieldControlId(name)}-limit`;
+        const { container } = await renderForm(definition, { answersFieldEvents: true });
+        // Installing the record moves focus without raising an event; the case's own focus comes after it.
+        await flush();
+        const control = textControlOf(definition, name);
+        act(() => {
+          control.focus();
+        });
+
+        const expectShown = (step: string): void => {
+          const notice = within(wrapperOf(container, name)).getByRole('status');
+          expect(notice.id, step).toBe(limitId);
+          expect(notice.tagName, step).toBe('SMALL');
+          expect(notice.textContent, step).toBe(`Enter at most ${String(limit)} characters.`);
+          expect(control.getAttribute('aria-describedby'), step).toBe([...hintIds, limitId].join(' '));
+          expect(control.hasAttribute('aria-invalid'), step).toBe(false);
+          expect(wrapperOf(container, name).querySelector('.field-error'), step).toBeNull();
+        };
+        const expectHidden = (step: string): void => {
+          expect(within(wrapperOf(container, name)).queryByRole('status'), step).toBeNull();
+          expect(document.getElementById(limitId), step).toBeNull();
+          expect(control.getAttribute('aria-describedby'), step).toBe(hintIds.length > 0 ? hintIds.join(' ') : null);
+        };
+
+        expectHidden('before the entry');
+        enter(control, value, entry);
+        expectShown('after the entry');
+        // The browser then keeps the cut value and fires input, which the draft takes.
+        fireEvent.change(control, { target: { value: cutTo } });
+        expectShown('once the draft holds the cut value');
+        expect(controlValue(control)).toBe(cutTo);
+
+        enter(control, cutTo, { inputType: 'insertText', data: '1', selection: [limit - 1, limit] });
+        expectHidden('after a character typed over the last one');
+
+        enter(control, cutTo, TYPED_AT_LIMIT);
+        expectShown('after a character typed at the limit');
+        enter(control, cutTo, { inputType: 'deleteContentBackward', data: null });
+        expectHidden('after a deletion');
+
+        enter(control, cutTo, TYPED_AT_LIMIT);
+        expectShown('after another character typed at the limit');
+        act(() => {
+          control.blur();
+        });
+        expectHidden('after blur');
+
+        // The blur raised its one FieldAfter, and no step wrote the record.
+        await waitFor(() => {
+          expect(calls.filter((call) => call.body?.includes('"event":"FieldAfter"') === true)).toHaveLength(1);
+        });
+        await flush();
+        expect(calls.filter((call) => call.body?.includes('"event":"FieldAfter"') === true)).toHaveLength(1);
+        expect(recordWrites()).toEqual([]);
+      },
+    );
+
+    it.each<{ what: string; name: string; validation?: Partial<FieldDefinition['validation']>; value: string; entry: Entry }>([
+      {
+        what: 'a paste that fills Zip once its trailing CRLF is dropped',
+        name: 'Zip',
+        value: '',
+        entry: { inputType: 'insertFromPaste', data: '12345\r\n' },
+      },
+      {
+        what: 'a paste that fills Address once its CRLF is one line break',
+        name: 'PatientAddress',
+        validation: { maxLength: 5 },
+        value: '',
+        entry: { inputType: 'insertFromPaste', data: 'ab\r\ncd' },
+      },
+      {
+        what: 'a long paste into a field with no maxLength',
+        name: 'LastName',
+        value: 'Lovelace',
+        entry: { inputType: 'insertFromPaste', data: 'x'.repeat(100) },
+      },
+      {
+        what: 'a paste longer than a read-only, so disabled, Zip',
+        name: 'Zip',
+        validation: { readOnly: true },
+        value: '',
+        entry: { inputType: 'insertFromPaste', data: '123456' },
+      },
+    ])('shows no length-limit notice for $what', async ({ name, validation, value, entry }) => {
+      const definition = validation === undefined ? createFormDefinitionFixture() : withValidation(name, validation);
+      const { container } = await renderForm(definition);
+      const control = textControlOf(definition, name);
+
+      enter(control, value, entry);
+
+      expect(within(wrapperOf(container, name)).queryByRole('status')).toBeNull();
+      expect(document.getElementById(`${fieldControlId(name)}-limit`)).toBeNull();
+      expect(control.hasAttribute('aria-describedby')).toBe(false);
+      await flush();
+      expect(writeCalls().map(requestLine)).toEqual([]);
+    });
+  });
+
   it('labels a control by the field name when the prompt is null', async () => {
     const definition = withField('PatientAddress', (field) => ({ ...field, prompt: null }));
     const { container } = await renderForm(definition);
@@ -2204,6 +2407,72 @@ describe('FormView validation summary', () => {
     }
     expect(navigatorStatus()).toBe('1 of 1');
   });
+
+  // Last Name sits on page 1; Lab sits on page 2 and its prompt ends with a colon.
+  it.each([{ name: 'LastName' }, { name: 'Lab' }])(
+    'shows the required-field message of $name once, its prompt as the jump label, and other messages after their label',
+    async ({ name }) => {
+      // No seeded field is required, so the fixture field is made required here.
+      const definition = withField(name, (field) => ({
+        ...field,
+        validation: { ...field.validation, required: true },
+      }));
+      const required = fieldByName(name, definition);
+      const prompt = promptOf(required);
+      const page = pageOf(definition, required.pageId);
+      const requiredMessage = formatRequiredMessage(required.prompt, page.name);
+      const feverTemp = fieldByName('FeverTemp', definition);
+      const upper = feverTemp.validation.upper;
+      if (typeof upper !== 'number') {
+        throw new Error('FeverTemp has no numeric upper bound');
+      }
+      // Focusing a control from its jump label raises a field event, answered with no effects.
+      await renderForm(definition, { answersFieldEvents: true });
+
+      // A new record with the required field blank and one other value entered, so it is not
+      // empty (an empty new record is never posted). Client validation rejects the save.
+      fireEvent.click(navigatorButton('New'));
+      await within(screen.getByRole('toolbar', { name: 'Record navigation' })).findByText('New record');
+      edit(definition, feverTemp.name, String(upper + 1));
+      fireEvent.click(formActionButton('Save'));
+
+      const summary = await findValidationSummary();
+      await flush();
+      expect(writeCalls().map(requestLine)).toEqual([]);
+      // FeverTemp's one message, as shown beside the field.
+      const feverErrors = present(document.getElementById(fieldErrorId(feverTemp.name)), 'error list of FeverTemp');
+      expect(feverErrors.querySelectorAll('p')).toHaveLength(1);
+      const feverMessage = feverErrors.textContent ?? '';
+      // In form order: the required message verbatim, its prompt appearing once; FeverTemp's
+      // message after its prompt and the separator.
+      const expected = new Map([
+        [required.name, requiredMessage],
+        [feverTemp.name, `${promptOf(feverTemp)}: ${feverMessage}`],
+      ]);
+      const items = within(summary).getAllByRole('listitem');
+      expect(items.map((item) => item.textContent)).toEqual(
+        allFields(definition).flatMap((field) => expected.get(field.name) ?? []),
+      );
+
+      // The required message's prompt is its jump label, which shows the page and focuses the control.
+      const requiredItem = present(
+        items.find((item) => item.textContent === requiredMessage),
+        'summary item of the required field',
+      );
+      const jump = within(requiredItem).getByRole('button');
+      expect(jump).toBe(within(summary).getByRole('button', { name: prompt }));
+      expect(jump.textContent).toBe(prompt);
+      fireEvent.click(jump);
+      await waitFor(() => {
+        expect(document.activeElement?.id).toBe(fieldControlId(required.name));
+      });
+      expect(screen.getByRole('tab', { name: page.name }).getAttribute('aria-selected')).toBe('true');
+      expect(controlOf(definition, required.name)).toBe(document.activeElement);
+      await waitFor(() => {
+        expect(writeCalls().map(requestLine)).toEqual([`POST ${FORM_PATH}/checkcode/field-event`]);
+      });
+    },
+  );
 });
 
 describe('FormView with no pages', () => {

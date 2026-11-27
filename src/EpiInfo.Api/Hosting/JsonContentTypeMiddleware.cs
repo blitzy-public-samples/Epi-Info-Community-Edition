@@ -27,11 +27,11 @@ namespace EpiInfo.Api.Hosting;
 /// </para>
 /// <para>
 /// A quoted parameter value is the same value as its token form (RFC 9110, section 5.6.6), so
-/// <c>charset="utf-8"</c> is accepted as <c>utf-8</c>. The framework's JSON binding looks the charset up without
+/// <c>charset="utf-8"</c> is accepted as <c>utf-8</c>. The framework's JSON body read looks the charset up without
 /// removing the quotes and throws, which would be a 500, so such a request's <c>Content-Type</c> is replaced, after
 /// both checks pass and before the endpoint runs, by the fixed canonical spelling
-/// <c>application/json; charset=utf-8</c> of the same media type. Every other accepted spelling binds as sent and is
-/// left as it is.
+/// <c>application/json; charset=utf-8</c> of the same media type. Every other accepted spelling is read as sent and
+/// is left as it is.
 /// </para>
 /// <para>
 /// Error bodies come only from <see cref="ApiProblems"/>, which writes fixed text plus <c>traceId</c>; the received
@@ -89,9 +89,9 @@ public sealed class JsonContentTypeMiddleware
             return;
         }
 
-        // The framework's JSON binding does not unquote the charset, and fails on the quoted "utf-8" that the rule
-        // above accepts, so binding gets the fixed canonical spelling of the same media type. The received value is
-        // never copied, and an unquoted spelling binds as sent.
+        // The framework's JSON body read does not unquote the charset, and fails on the quoted "utf-8" that the rule
+        // above accepts, so the endpoint's body reader gets the fixed canonical spelling of the same media type. The
+        // received value is never copied, and an unquoted spelling is read as sent.
         if (charsetQuoted)
         {
             context.Request.ContentType = CanonicalUtf8JsonContentType;
@@ -153,8 +153,9 @@ public sealed class JsonContentTypeMiddleware
 
     // Decided from headers only; the body is never read, peeked or buffered. Mixing BodyReader peeks with later Body
     // stream reads can lose data, and RequestBodyLimitMiddleware's counting stream must see every byte. A chunked
-    // body that turns out to be empty therefore reaches binding, and the exception handler answers its JSON failure
-    // with the same request-level 400, because the counting stream reports that the body ended before its first byte.
+    // body that turns out to be empty therefore reaches the endpoint's body reader, and the exception handler answers
+    // its JSON failure with the same request-level 400, because the counting stream reports that the body ended before
+    // its first byte.
     private static bool CanHaveBody(HttpContext context)
     {
         if (context.Request.ContentLength == 0)
@@ -163,7 +164,7 @@ public sealed class JsonContentTypeMiddleware
         }
 
         // On Kestrel an HTTP/1.1 request with neither Content-Length nor Transfer-Encoding cannot have a body. A host
-        // that does not expose the feature is left to binding.
+        // that does not expose the feature is left to the endpoint's body reader.
         return context.Features.Get<IHttpRequestBodyDetectionFeature>()?.CanHaveBody != false;
     }
 }

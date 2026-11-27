@@ -12,7 +12,7 @@ namespace EpiInfo.Api.Json;
 
 /// <summary>
 /// The single definition of the API's wire JSON settings. <see cref="AddApiJson"/> applies them to the options that
-/// minimal-API binding, typed results, the ProblemDetails writer and OpenAPI schema generation share, and tests use
+/// the request body reader, typed results, the ProblemDetails writer and OpenAPI schema generation share, and tests use
 /// <see cref="CreateSerializerOptions"/> to read responses exactly as the server writes them.
 /// </summary>
 /// <remarks>
@@ -53,9 +53,14 @@ namespace EpiInfo.Api.Json;
 /// The one presence check is a criterion's <c>value</c>, which <see cref="Apply"/> marks required on
 /// <see cref="SearchCriterion"/> alone. <c>null</c> is a legal value there, the blank criterion, so only presence
 /// tells it from an omission. A criterion without <c>value</c> fails deserialisation with a
-/// <see cref="JsonException"/>, which minimal-API binding reports as a 400 <c>BadHttpRequestException</c>;
-/// <c>"value": null</c> still reaches <see cref="FieldValueJsonConverter"/> and becomes
-/// <see cref="EpiInfo.Domain.Values.FieldValue.Null"/>.
+/// <see cref="JsonException"/>, which the body reader <c>JsonRequestBody</c> reports as a 400
+/// <c>BadHttpRequestException</c> and the exception handler answers with "malformed JSON"; <c>"value": null</c> still
+/// reaches <see cref="FieldValueJsonConverter"/> and becomes <see cref="EpiInfo.Domain.Values.FieldValue.Null"/>.
+/// </para>
+/// <para>
+/// The four body endpoints read their body with these options as one JSON value before they read the request type:
+/// content that is not valid JSON is "malformed JSON", a valid value that is not an object is "request body must be
+/// a JSON object", and JSON <c>null</c> or an empty body is "request body is required".
 /// </para>
 /// </remarks>
 public static class JsonSetup

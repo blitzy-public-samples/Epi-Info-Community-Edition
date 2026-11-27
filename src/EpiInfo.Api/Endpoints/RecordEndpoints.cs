@@ -36,11 +36,14 @@ namespace EpiInfo.Api.Endpoints;
 /// <para>
 /// <b>Bodies.</b> Create, update and search carry <see cref="JsonBodyMetadata"/>, under which
 /// <c>JsonContentTypeMiddleware</c> answers 415 for any media type other than <c>application/json</c> and the
-/// request-level 400 for an empty body; the body limit gives 413. Body parameters are nullable, so a JSON
-/// <c>null</c> body reaches the service's request-level 400, and malformed JSON surfaces as a
-/// <c>BadHttpRequestException</c> that the exception handler maps. The OpenAPI document still publishes each body as
-/// required and non-null, and each body route's 400 as either shape: the request-level ProblemDetails or the
-/// field-level <see cref="HttpValidationProblemDetails"/>. The query routes' 400 is the field-level shape only.
+/// request-level 400 for an empty body; the body limit gives 413. Each handler reads its body through
+/// <see cref="JsonRequestBody"/> rather than by parameter binding, so the whole body is parsed before its kind is
+/// judged: content that is not valid JSON surfaces as a <c>BadHttpRequestException</c> that the exception handler maps
+/// to "malformed JSON", a valid value that is not an object is answered with "request body must be a JSON object"
+/// before any service call, and a JSON <c>null</c> body reaches the service's request-level 400. Each body is declared
+/// by its <c>Accepts</c> metadata alone, and the OpenAPI document publishes each body as required and non-null, and
+/// each body route's 400 as either shape: the request-level ProblemDetails or the field-level
+/// <see cref="HttpValidationProblemDetails"/>. The query routes' 400 is the field-level shape only.
 /// </para>
 /// <para>
 /// <b>Write failures.</b> Create, update and delete declare the 403 ProblemDetails the service returns when the
@@ -279,36 +282,51 @@ public static class RecordEndpoints
     }
 
     /// <summary>Handles <c>POST /api/forms/{viewId}/records</c>.</summary>
-    /// <param name="httpContext">The current request, on which the service records the write outcome.</param>
+    /// <param name="httpContext">
+    /// The current request, whose body is read as a <see cref="RecordWriteRequest"/> and on which the service records
+    /// the write outcome.
+    /// </param>
     /// <param name="viewId">The form's <c>metaViews.ViewId</c>, already an integer by its route constraint.</param>
-    /// <param name="request">The bound body, or <see langword="null"/> for a JSON <c>null</c> body.</param>
     /// <param name="service">The record service.</param>
     /// <param name="cancellationToken">The request's abort token.</param>
-    /// <returns>201 with the new record and its <c>Location</c>, or the service's 400, 403 or 404.</returns>
-    private static Task<IResult> CreateRecordAsync(
+    /// <returns>
+    /// 201 with the new record and its <c>Location</c>, the request-level 400 for a body that is not a JSON object, or
+    /// the service's 400, 403 or 404.
+    /// </returns>
+    private static async Task<IResult> CreateRecordAsync(
         HttpContext httpContext,
         [FromRoute] int viewId,
-        [FromBody] RecordWriteRequest? request,
         [FromServices] RecordService service,
-        CancellationToken cancellationToken) =>
-        service.CreateAsync(httpContext, viewId, request, cancellationToken);
+        CancellationToken cancellationToken)
+    {
+        var body = await JsonRequestBody.ReadObjectAsync<RecordWriteRequest>(httpContext, cancellationToken);
+        return body.Problem ?? await service.CreateAsync(httpContext, viewId, body.Value, cancellationToken);
+    }
 
     /// <summary>Handles <c>PUT /api/forms/{viewId}/records/{globalRecordId}</c>.</summary>
-    /// <param name="httpContext">The current request, on which the service records the write outcome.</param>
+    /// <param name="httpContext">
+    /// The current request, whose body is read as a <see cref="RecordWriteRequest"/> and on which the service records
+    /// the write outcome.
+    /// </param>
     /// <param name="viewId">The form's <c>metaViews.ViewId</c>, already an integer by its route constraint.</param>
     /// <param name="globalRecordId">The record's <c>GlobalRecordId</c>.</param>
-    /// <param name="request">The bound body, or <see langword="null"/> for a JSON <c>null</c> body.</param>
     /// <param name="service">The record service.</param>
     /// <param name="cancellationToken">The request's abort token.</param>
-    /// <returns>200 with the updated record, or the service's 400, 403, 404 or 409.</returns>
-    private static Task<IResult> UpdateRecordAsync(
+    /// <returns>
+    /// 200 with the updated record, the request-level 400 for a body that is not a JSON object, or the service's 400,
+    /// 403, 404 or 409.
+    /// </returns>
+    private static async Task<IResult> UpdateRecordAsync(
         HttpContext httpContext,
         [FromRoute] int viewId,
         [FromRoute] string globalRecordId,
-        [FromBody] RecordWriteRequest? request,
         [FromServices] RecordService service,
-        CancellationToken cancellationToken) =>
-        service.UpdateAsync(httpContext, viewId, globalRecordId, request, cancellationToken);
+        CancellationToken cancellationToken)
+    {
+        var body = await JsonRequestBody.ReadObjectAsync<RecordWriteRequest>(httpContext, cancellationToken);
+        return body.Problem
+            ?? await service.UpdateAsync(httpContext, viewId, globalRecordId, body.Value, cancellationToken);
+    }
 
     /// <summary>Handles <c>DELETE /api/forms/{viewId}/records/{globalRecordId}</c>.</summary>
     /// <param name="httpContext">The current request, on which the service records the write outcome.</param>
@@ -326,17 +344,22 @@ public static class RecordEndpoints
         service.DeleteAsync(httpContext, viewId, globalRecordId, cancellationToken);
 
     /// <summary>Handles <c>POST /api/forms/{viewId}/records/search</c>.</summary>
+    /// <param name="httpContext">The current request, whose body is read as a <see cref="SearchRequest"/>.</param>
     /// <param name="viewId">The form's <c>metaViews.ViewId</c>, already an integer by its route constraint.</param>
-    /// <param name="request">The bound body, or <see langword="null"/> for a JSON <c>null</c> body.</param>
     /// <param name="service">The record service.</param>
     /// <param name="cancellationToken">The request's abort token.</param>
-    /// <returns>200 with the matches, or the service's 400 or 404.</returns>
-    private static Task<IResult> SearchRecordsAsync(
+    /// <returns>
+    /// 200 with the matches, the request-level 400 for a body that is not a JSON object, or the service's 400 or 404.
+    /// </returns>
+    private static async Task<IResult> SearchRecordsAsync(
+        HttpContext httpContext,
         [FromRoute] int viewId,
-        [FromBody] SearchRequest? request,
         [FromServices] RecordService service,
-        CancellationToken cancellationToken) =>
-        service.SearchAsync(viewId, request, cancellationToken);
+        CancellationToken cancellationToken)
+    {
+        var body = await JsonRequestBody.ReadObjectAsync<SearchRequest>(httpContext, cancellationToken);
+        return body.Problem ?? await service.SearchAsync(viewId, body.Value, cancellationToken);
+    }
 
     // 404 for an unknown form, record or position, and the plain 500 and 503 of a read.
     private static RouteHandlerBuilder ProducesReadErrors(this RouteHandlerBuilder builder) =>

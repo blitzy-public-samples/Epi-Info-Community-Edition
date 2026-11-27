@@ -4,7 +4,7 @@
 // Render-only: no state, no effects and no rule about what counts as an error.
 import { useId, useMemo } from 'react';
 import type { FieldDefinition, FormDefinition, PageDefinition } from '../api/types';
-import { isDataField, type FieldErrors } from '../validation/clientValidation';
+import { formatRequiredMessage, isDataField, type FieldErrors } from '../validation/clientValidation';
 
 export interface ValidationSummaryProps {
   /** The open form: maps a field name to its prompt and orders the messages by the field's place. */
@@ -47,15 +47,26 @@ interface SummaryItem {
   readonly label: string;
   readonly isField: boolean;
   readonly message: string;
+  /**
+   * Whether the message opens with the label itself, as the field's required-field message does:
+   * the label is then shown as the message's opening words, not ahead of it.
+   */
+  readonly leadsWithLabel: boolean;
 }
 
 function byPosition(a: PageDefinition, b: PageDefinition): number {
   return a.position - b.position || a.pageId - b.pageId;
 }
 
-/** A definition's fields in form order, and the names its data fields hold. */
+/** A field and the name of the page it sits on. */
+interface PlacedField {
+  readonly field: FieldDefinition;
+  readonly pageName: string;
+}
+
+/** A definition's fields in form order, each with its page's name, and the names its data fields hold. */
 interface FormOrder {
-  readonly fields: readonly FieldDefinition[];
+  readonly fields: readonly PlacedField[];
   readonly dataFieldNames: ReadonlySet<string>;
 }
 
@@ -66,19 +77,24 @@ interface FormOrder {
  */
 const formOrders = new WeakMap<FormDefinition, FormOrder>();
 
-/** Every field in form order: pages by `position`, then fields by `tabIndex` (a stable sort, so ties keep metadata order). */
+/**
+ * Every field in form order, each with the name of its page: pages by `position`, then fields by
+ * `tabIndex` (a stable sort, so ties keep metadata order).
+ */
 function formOrderOf(definition: FormDefinition): FormOrder {
   const cached = formOrders.get(definition);
   if (cached !== undefined) {
     return cached;
   }
-  const fields: FieldDefinition[] = [];
+  const fields: PlacedField[] = [];
   for (const page of [...definition.pages].sort(byPosition)) {
-    fields.push(...[...page.fields].sort((a, b) => a.tabIndex - b.tabIndex));
+    for (const field of [...page.fields].sort((a, b) => a.tabIndex - b.tabIndex)) {
+      fields.push({ field, pageName: page.name });
+    }
   }
   const order: FormOrder = {
     fields,
-    dataFieldNames: new Set(fields.filter(isDataField).map((field) => field.name)),
+    dataFieldNames: new Set(fields.filter(({ field }) => isDataField(field)).map(({ field }) => field.name)),
   };
   formOrders.set(definition, order);
   return order;
@@ -88,6 +104,17 @@ function formOrderOf(definition: FormDefinition): FormOrder {
 function fieldLabel(field: FieldDefinition): string {
   const prompt = field.prompt;
   return typeof prompt === 'string' && prompt.trim() !== '' ? prompt : field.name;
+}
+
+/**
+ * The field's required-field message on its page when that message opens with `label`, the
+ * field's label: always for a field with a prompt, which the message opens with. `null` for a
+ * field whose prompt is missing or blank, since its message opens with that blank prompt and not
+ * with the field name its label falls back to.
+ */
+function requiredMessageLedBy(field: FieldDefinition, label: string, pageName: string): string | null {
+  const message = formatRequiredMessage(field.prompt, pageName);
+  return label !== '' && message.startsWith(label) ? message : null;
 }
 
 const NO_ITEMS: readonly SummaryItem[] = [];
@@ -110,27 +137,42 @@ function summaryItems(
   const items: SummaryItem[] = [];
   const listed = new Set<string>();
 
-  const add = (name: string, label: string, isField: boolean, messages: readonly string[]) => {
+  // `ledMessage` is the one message, if any, that opens with `label`.
+  const add = (
+    name: string,
+    label: string,
+    isField: boolean,
+    messages: readonly string[],
+    ledMessage: string | null,
+  ) => {
     listed.add(name);
     messages.forEach((message, index) => {
-      items.push({ key: `${isField ? 'field' : 'other'}:${name}:${String(index)}`, name, label, isField, message });
+      items.push({
+        key: `${isField ? 'field' : 'other'}:${name}:${String(index)}`,
+        name,
+        label,
+        isField,
+        message,
+        leadsWithLabel: message === ledMessage,
+      });
     });
   };
 
   const { fields, dataFieldNames } = formOrderOf(definition);
 
-  for (const field of fields) {
+  for (const { field, pageName } of fields) {
     if (!isDataField(field) && dataFieldNames.has(field.name)) {
       continue;
     }
     if (!listed.has(field.name) && Object.hasOwn(fieldErrors, field.name)) {
-      add(field.name, fieldLabel(field), true, fieldErrors[field.name]);
+      const label = fieldLabel(field);
+      add(field.name, label, true, fieldErrors[field.name], requiredMessageLedBy(field, label, pageName));
     }
   }
 
   for (const [name, messages] of Object.entries(fieldErrors)) {
     if (!listed.has(name)) {
-      add(name, name, false, messages);
+      add(name, name, false, messages, null);
     }
   }
 
@@ -148,8 +190,9 @@ function separatorAfter(label: string): string {
 /**
  * Lists every message of `fieldErrors` under its field's prompt, in the order the fields appear in
  * the form, then messages under keys that name no field, after the request-level `detail`. Each
- * message is shown verbatim: the required-field message already names the prompt and page. Renders
- * nothing when there is no message and no detail.
+ * message is shown verbatim after its label, except the required-field message, which already
+ * opens with the prompt and names the page: it is shown once, verbatim, its opening prompt being
+ * the label. Renders nothing when there is no message and no detail.
  */
 export function ValidationSummary({
   definition,
@@ -202,8 +245,15 @@ export function ValidationSummary({
                 ) : (
                   <strong>{item.label}</strong>
                 )}
-                {separatorAfter(item.label)}
-                {item.message}
+                {item.leadsWithLabel ? (
+                  // The label stands as the message's opening words, so the prompt appears once.
+                  item.message.slice(item.label.length)
+                ) : (
+                  <>
+                    {separatorAfter(item.label)}
+                    {item.message}
+                  </>
+                )}
                 {offersJump && !selectable && (
                   <>
                     {' '}

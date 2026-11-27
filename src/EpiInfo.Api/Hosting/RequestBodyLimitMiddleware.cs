@@ -142,7 +142,7 @@ public sealed class RequestBodyLimitMiddleware
             var stream = new LimitedReadStream(request.Body, _limit);
             request.Body = stream;
 
-            // The reads binding makes leave their state here, so the exception handler can tell a body that ended
+            // The endpoint's body reads leave their state here, so the exception handler can tell a body that ended
             // before its first byte from content that is not JSON without reading the body again.
             context.Features.Set<IRequestBodyReadFeature>(stream);
             return InvokeCountedAsync(context, stream);
@@ -389,8 +389,8 @@ public sealed class RequestBodyLimitMiddleware
 /// </summary>
 /// <remarks>
 /// The feature is set only on a request whose body the guard wraps, and it is never a reason to read: its values come
-/// from reads binding already made, so the body is never read, peeked or buffered twice. Both values only grow, and
-/// they describe the decoded body bytes, never the transfer framing.
+/// from reads the endpoint already made, so the body is never read, peeked or buffered twice. Both values only grow,
+/// and they describe the decoded body bytes, never the transfer framing.
 /// </remarks>
 public interface IRequestBodyReadFeature
 {

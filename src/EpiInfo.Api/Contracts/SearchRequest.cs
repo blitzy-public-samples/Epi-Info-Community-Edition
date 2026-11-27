@@ -21,12 +21,16 @@ namespace EpiInfo.Api.Contracts;
 /// reach SQL Server only as parameters.
 /// </para>
 /// <para>
-/// Binding relies on the JSON options of JsonSetup. FieldValueJsonConverter reads each criterion <c>value</c>.
-/// <c>RespectRequiredConstructorParameters</c> keeps its default <see langword="false"/>, so a missing
-/// <c>criteria</c>, <c>includeDeleted</c>, <c>excludeGlobalRecordId</c> or criterion <c>field</c> binds as
-/// <see langword="null"/> instead of failing binding, and a missing <c>criteria</c> reaches its documented 400. The one
-/// exception is a criterion's <c>value</c>, which JsonSetup marks required: a criterion without it fails binding, and
-/// ApiExceptionHandler answers with the request-level 400, while <c>"value": null</c> binds as the blank criterion.
+/// The endpoint reads the whole body as one JSON value through JsonRequestBody, under the JSON options of JsonSetup,
+/// before it reads this type. Content that is not valid JSON is the request-level 400 "malformed JSON", and a valid
+/// value that is not an object is the request-level 400 "request body must be a JSON object". FieldValueJsonConverter
+/// reads each criterion <c>value</c>. <c>RespectRequiredConstructorParameters</c> keeps its default
+/// <see langword="false"/>, so a missing <c>criteria</c>, <c>includeDeleted</c>, <c>excludeGlobalRecordId</c> or
+/// criterion <c>field</c> binds as <see langword="null"/> instead of failing deserialisation, and a missing
+/// <c>criteria</c> reaches its documented 400. The one exception is a criterion's <c>value</c>, which JsonSetup marks
+/// required: a criterion without it fails deserialisation, which the reader raises as a <c>BadHttpRequestException</c>
+/// and ApiExceptionHandler answers with the request-level 400 "malformed JSON", while <c>"value": null</c> binds as
+/// the blank criterion.
 /// ScalarSchemaTransformer publishes <c>criteria[].value</c> as the <c>FieldValue</c> scalar union
 /// <c>string | number | boolean | null</c>, so no member of the <see cref="EpiInfo.Domain.Values.FieldValue"/> struct
 /// appears in the OpenAPI document.
@@ -42,13 +46,14 @@ namespace EpiInfo.Api.Contracts;
 /// <see cref="EpiInfo.Domain.Values.FieldValueKind.Number"/> or
 /// <see cref="EpiInfo.Domain.Values.FieldValueKind.Boolean"/>; kind
 /// <see cref="EpiInfo.Domain.Values.FieldValueKind.Null"/> always means the caller sent <c>"value": null</c>. An
-/// object or array <c>value</c>, or a criterion that omits <c>value</c>, fails binding with the request-level 400.
+/// object or array <c>value</c>, or a criterion that omits <c>value</c>, fails deserialisation with the request-level
+/// 400 "malformed JSON".
 /// </para>
 /// <para>
 /// The interpretation per field type, trimming, the six-field limit, the rejection of a field named twice and of an
 /// unknown or unsearchable field all belong to SearchCriteriaParser, each answered with a 400. A missing or
 /// <c>null</c> <c>criteria</c>, or an empty array, is the request-level 400 "criteria must not be empty", which
-/// RecordService raises; binding never rejects it. The serializer materialises the list as a
+/// RecordService raises; deserialisation never rejects it. The serializer materialises the list as a
 /// <see cref="List{T}"/>. It leaves <see cref="SearchCriterion.Field"/> <see langword="null"/> for a criterion that
 /// omits <c>field</c>, because it does not enforce required constructor parameters, and for <c>"field": null</c>,
 /// because it does not enforce nullable annotations; the parser rejects a null name as unknown.
@@ -59,8 +64,8 @@ namespace EpiInfo.Api.Contracts;
 /// <c>RecStatus = 1</c>. <see langword="true"/> selects every row, deleted records included. The selected set bounds
 /// the matches and numbers each result's <c>position</c>, its <c>ROW_NUMBER()</c> by <c>UniqueKey</c> over the selected
 /// set before the criteria apply, so it equals the record's navigation position in that set. Only a JSON boolean binds:
-/// the string <c>"true"</c>, a number or an object fails binding, and ApiExceptionHandler answers with a request-level
-/// 400.
+/// the string <c>"true"</c>, a number or an object fails deserialisation, and ApiExceptionHandler answers with the
+/// request-level 400 "malformed JSON".
 /// </param>
 /// <param name="ExcludeGlobalRecordId">
 /// The <c>GlobalRecordId</c> of the record open in the editor, which the result must not list. It is removed on the

@@ -463,6 +463,23 @@ public sealed class FieldEventEndpointTests
     }
 
     /// <summary>
+    /// An object value is rejected with the full fixed sentence, written out here rather than taken from
+    /// <see cref="ValuesReader.ScalarValueExpected"/>, so the message keeps the subject and full stop every other
+    /// field-level message has.
+    /// </summary>
+    [Fact]
+    public async Task ObjectValueIsRejectedWithTheFullFixedSentence()
+    {
+        await using var host = EndpointHost.Start(new FakeDataStore(FormWithOptionField()));
+
+        var problem = await SendRejectedEventAsync(
+            host,
+            """{"event":"FieldAfter","fieldName":"Age","values":{"LastName":{"first":"Smith"}}}""");
+
+        AssertErrors(problem, ["LastName"], ["A string, number, boolean or null is expected."]);
+    }
+
+    /// <summary>
     /// A raw fault does not hide the entries beside it: every property is resolved in document order by the
     /// precedence typing applies, so a name that is not a data field reads its own error, a data field named again is
     /// a duplicate under its canonical name, a faulted first occurrence keeps its fault, and the event is not

@@ -176,8 +176,16 @@ public sealed class ValidationTests : IAsyncLifetime
     /// </summary>
     public static TheoryData<string, string, string> RequestLevelPostCases => new()
     {
-        // A JSON array is not a request object, so binding fails.
-        { CaseReport, "[]", ApiProblems.MalformedJsonDetail },
+        // Well-formed JSON that is not a request object: an array, an array holding a request object, a number, a
+        // string and a boolean.
+        { CaseReport, "[]", ApiProblems.RequestBodyMustBeObjectDetail },
+        { CaseReport, """[{"values":{}}]""", ApiProblems.RequestBodyMustBeObjectDetail },
+        { CaseReport, "5", ApiProblems.RequestBodyMustBeObjectDetail },
+        { CaseReport, "\"x\"", ApiProblems.RequestBodyMustBeObjectDetail },
+        { CaseReport, "true", ApiProblems.RequestBodyMustBeObjectDetail },
+
+        // An array that is not valid JSON, whose first token alone would look like a non-object value.
+        { CaseReport, "[1,]", ApiProblems.MalformedJsonDetail },
 
         // values missing, null or not an object.
         { CaseReport, "{}", ValidationMessages.ValuesMustBeObject },

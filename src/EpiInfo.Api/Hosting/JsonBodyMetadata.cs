@@ -1,3 +1,9 @@
+using System.Text.Json;
+using System.Text.Json.Serialization.Metadata;
+using EpiInfo.Api.Errors;
+using Microsoft.Extensions.Options;
+using HttpJsonOptions = Microsoft.AspNetCore.Http.Json.JsonOptions;
+
 namespace EpiInfo.Api.Hosting;
 
 /// <summary>
@@ -17,7 +23,8 @@ namespace EpiInfo.Api.Hosting;
 /// <para>
 /// The type itself is the signal, so it has no members. It deliberately implements no framework metadata
 /// interface such as <c>IAcceptsMetadata</c>: that would change routing's content-type matching and the generated
-/// OpenAPI document. Each endpoint declares its own <c>Accepts</c> metadata.
+/// OpenAPI document. Each endpoint declares its own <c>Accepts</c> metadata and reads its body through
+/// <see cref="JsonRequestBody.ReadObjectAsync{T}(HttpContext, CancellationToken)"/>.
 /// </para>
 /// </remarks>
 public sealed class JsonBodyMetadata
@@ -48,4 +55,146 @@ public static class JsonBodyEndpointExtensions
         builder.WithMetadata(JsonBodyMetadata.Instance);
         return builder;
     }
+}
+
+/// <summary>
+/// The one reader of the request body of the four endpoints that carry <see cref="JsonBodyMetadata"/>. It reads the
+/// whole body as one JSON value before it looks at the value's kind, so content that is not valid JSON is told apart
+/// from a valid JSON value that is not an object, whatever the first token is.
+/// </summary>
+/// <remarks>
+/// <para>Outcomes, in order:</para>
+/// <list type="number">
+/// <item><description>
+/// A <c>Content-Type</c> that is not a JSON media type throws a <see cref="BadHttpRequestException"/> with status
+/// 415. In the API pipeline <c>JsonContentTypeMiddleware</c> and routing answer it first; this keeps a host without
+/// that guard on 415.
+/// </description></item>
+/// <item><description>
+/// Content that is not exactly one valid JSON value, under the HTTP JSON options that <c>JsonSetup.AddApiJson</c>
+/// configures, throws a <see cref="BadHttpRequestException"/> with status 400 whose inner exception is the
+/// <see cref="JsonException"/>: a syntax error anywhere, such as <c>[</c>, <c>[1,]</c> or a bare word, content after
+/// the value, such as <c>5 x</c> or <c>true false</c>, and an empty or whitespace-only body. <c>ApiExceptionHandler</c>
+/// answers it with "request body is required" when the body was empty and "malformed JSON" otherwise.
+/// </description></item>
+/// <item><description>
+/// The JSON literal <c>null</c> gives neither a value nor a problem, so the service answers it with its
+/// request-level 400 "request body is required".
+/// </description></item>
+/// <item><description>
+/// A valid value that is not an object, that is an array, a string, a number or a boolean, gives the request-level
+/// 400 of <see cref="ApiProblems.RequestBodyMustBeObject"/>.
+/// </description></item>
+/// <item><description>
+/// An object is deserialised into the request type with the same options. A member that does not convert, such as a
+/// search criterion without <c>value</c>, a string <c>includeDeleted</c> or an object criterion <c>value</c>, throws
+/// the same 400 <see cref="BadHttpRequestException"/> with its <see cref="JsonException"/> as the inner exception, so
+/// it is "malformed JSON" as well.
+/// </description></item>
+/// </list>
+/// <para>
+/// A <see cref="BadHttpRequestException"/> from the body stream, such as the 413 of the body limit or of Kestrel, an
+/// <see cref="IOException"/> and an <see cref="OperationCanceledException"/> propagate unchanged, so the exception
+/// handler and the exception boundary answer them by their own rules. The exceptions thrown here carry fixed messages
+/// only: neither the body nor a serializer message, which can quote the body, is ever copied into them. The body is
+/// read once, through <see cref="HttpRequest.Body"/>, so the body limit's counting stream sees every byte and its
+/// <see cref="IRequestBodyReadFeature"/> describes this read. Nothing is logged or kept.
+/// </para>
+/// </remarks>
+public static class JsonRequestBody
+{
+    private const string UnsupportedMediaTypeMessage = "The request body is not JSON.";
+
+    private const string InvalidJsonMessage = "The request body is not valid JSON for this endpoint.";
+
+    /// <summary>
+    /// Reads the request body as one JSON value and, when it is an object, as a <typeparamref name="T"/>.
+    /// </summary>
+    /// <typeparam name="T">The request type the endpoint takes, such as <c>RecordWriteRequest</c>.</typeparam>
+    /// <param name="context">The current request.</param>
+    /// <param name="cancellationToken">The request's abort token.</param>
+    /// <returns>
+    /// The request for an object body; a <see cref="JsonRequestBodyResult{T}"/> with neither a value nor a problem for
+    /// the JSON literal <c>null</c>; or the request-level 400 problem for any other valid JSON value.
+    /// </returns>
+    /// <exception cref="ArgumentNullException"><paramref name="context"/> is <see langword="null"/>.</exception>
+    /// <exception cref="BadHttpRequestException">
+    /// With status 415 for a <c>Content-Type</c> that is not JSON; with status 400, and the
+    /// <see cref="JsonException"/> as its inner exception, for content that is not one valid JSON value or an object
+    /// that does not convert to <typeparamref name="T"/>; or as the body stream raised it, such as a 413.
+    /// </exception>
+    public static async Task<JsonRequestBodyResult<T>> ReadObjectAsync<T>(
+        HttpContext context,
+        CancellationToken cancellationToken)
+        where T : class
+    {
+        ArgumentNullException.ThrowIfNull(context);
+
+        var request = context.Request;
+        if (!request.HasJsonContentType())
+        {
+            throw new BadHttpRequestException(UnsupportedMediaTypeMessage, StatusCodes.Status415UnsupportedMediaType);
+        }
+
+        // The options minimal-API binding, typed results and the ProblemDetails writer share, so the body is read
+        // under exactly the wire rules of JsonSetup.
+        var options = context.RequestServices.GetRequiredService<IOptions<HttpJsonOptions>>().Value.SerializerOptions;
+
+        JsonElement? root;
+        try
+        {
+            root = await request.ReadFromJsonAsync(GetTypeInfo<JsonElement?>(options), cancellationToken);
+        }
+        catch (JsonException exception)
+        {
+            throw InvalidJson(exception);
+        }
+
+        if (root is not { } element)
+        {
+            return default;
+        }
+
+        if (element.ValueKind != JsonValueKind.Object)
+        {
+            return new(null, ApiProblems.RequestBodyMustBeObject());
+        }
+
+        try
+        {
+            return new(element.Deserialize(GetTypeInfo<T>(options)), null);
+        }
+        catch (JsonException exception)
+        {
+            throw InvalidJson(exception);
+        }
+    }
+
+    // The contract the options' own resolver builds, as binding looks it up, rather than the reflection-based generic
+    // overloads of the serializer.
+    private static JsonTypeInfo<TValue> GetTypeInfo<TValue>(JsonSerializerOptions options) =>
+        (JsonTypeInfo<TValue>)options.GetTypeInfo(typeof(TValue));
+
+    private static BadHttpRequestException InvalidJson(JsonException exception) =>
+        new(InvalidJsonMessage, StatusCodes.Status400BadRequest, exception);
+}
+
+/// <summary>The outcome of <see cref="JsonRequestBody.ReadObjectAsync{T}(HttpContext, CancellationToken)"/>.</summary>
+/// <typeparam name="T">The request type the endpoint takes.</typeparam>
+/// <param name="Value">
+/// The request read from an object body, or <see langword="null"/> for the JSON literal <c>null</c> or when
+/// <paramref name="Problem"/> is set.
+/// </param>
+/// <param name="Problem">
+/// The request-level 400 to return instead of calling the service, or <see langword="null"/> when there is none.
+/// </param>
+public readonly record struct JsonRequestBodyResult<T>(T? Value, IResult? Problem)
+    where T : class
+{
+    /// <summary>
+    /// Returns the type name only. The compiler-generated record <c>ToString</c> would print the request, whose
+    /// members are field data that must never reach a log line or an error body.
+    /// </summary>
+    /// <returns><c>JsonRequestBodyResult</c>.</returns>
+    public override string ToString() => nameof(JsonRequestBodyResult<>);
 }

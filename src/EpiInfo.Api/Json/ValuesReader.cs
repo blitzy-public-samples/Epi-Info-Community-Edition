@@ -367,7 +367,7 @@ public sealed class TypedValuesResult
 public static class ValuesReader
 {
     /// <summary>The field-level message for a <c>values</c> member that is a JSON object or array.</summary>
-    public const string ScalarValueExpected = "must be a string, number, boolean or null";
+    public const string ScalarValueExpected = "A string, number, boolean or null is expected.";
 
     /// <summary>Reads the raw entries of a <c>values</c> member.</summary>
     /// <param name="values">
