@@ -1,3 +1,4 @@
+using System.IO.Compression;
 using EpiInfo.Api;
 using EpiInfo.Api.Endpoints;
 using EpiInfo.Api.Errors;
@@ -7,6 +8,7 @@ using EpiInfo.Api.Json;
 using EpiInfo.Api.OpenApi;
 using EpiInfo.Api.Services;
 using EpiInfo.CheckCode;
+using Microsoft.AspNetCore.ResponseCompression;
 using Microsoft.AspNetCore.Routing.Matching;
 using Microsoft.AspNetCore.Routing.Patterns;
 using Microsoft.AspNetCore.Routing.Template;
@@ -88,6 +90,33 @@ builder.Services.AddHealthChecks().AddCheck<SqlServerHealthCheck>(SqlServerHealt
 // HTTP-method and content-type policies can answer 405 or 415 for a path no route matches.
 builder.Services.TryAddEnumerable(ServiceDescriptor.Singleton<MatcherPolicy, RouteConstraintMatcherPolicy>());
 
+// Text responses, the client's page, script and styles and the API's JSON, are compressed for a client that accepts
+// it; images, ProblemDetails bodies and every other type outside the framework's default list are sent as they are.
+// Brotli is listed first, so a browser that accepts both at equal weight, as current browsers do, gets br; gzip
+// serves a client that accepts only gzip. Both use Optimal, Brotli quality 4 and gzip level 6, because the middleware
+// compresses each response as it is sent: Optimal costs a few milliseconds on the client's script and sends markedly
+// fewer bytes than the providers' default Fastest, while Brotli's SmallestSize saves little more at a cost of hundreds
+// of milliseconds per response.
+// The middleware adds Vary: Accept-Encoding only to a response it codes, or to a HEAD it would code, and leaves the
+// ETag as it is. The static client's files are the only responses that carry an ETag, and their host, ClientAppHosting,
+// gives each answer of a type the middleware codes that Vary itself, the identity answer and a 304 included, and an
+// answer sent, or whose 200 would be sent, in a coding the weak form of the file's ETag, which If-None-Match there
+// compares weakly.
+// EnableForHttps stays false. The API listens on plain HTTP on 127.0.0.1 only, so the setting never applies, and a
+// BREACH-style attack, which recovers a secret from the encrypted length of compressed responses that also reflect
+// text the attacker chooses, has neither an encrypted channel nor a secret here: no authentication or anti-forgery
+// token exists in local single-user mode, and no network observer sees loopback traffic. An HTTPS listener added
+// later must opt in on purpose.
+builder.Services.AddResponseCompression(options =>
+{
+    options.EnableForHttps = false;
+    options.Providers.Add<BrotliCompressionProvider>();
+    options.Providers.Add<GzipCompressionProvider>();
+    options.MimeTypes = ResponseCompressionDefaults.MimeTypes;
+});
+builder.Services.Configure<BrotliCompressionProviderOptions>(options => options.Level = CompressionLevel.Optimal);
+builder.Services.Configure<GzipCompressionProviderOptions>(options => options.Level = CompressionLevel.Optimal);
+
 var app = builder.Build();
 
 // Checked again on the built configuration, which also holds sources applied during Build, such as test-host settings.
@@ -127,6 +156,14 @@ app.UseStatusCodePages(ApiProblems.WriteStatusCodePageAsync);
 // is answered 400 before anything is served. Exception handling and status-code pages, when registered, come before
 // it; nothing that serves content does.
 app.UseLoopbackHostGuard();
+
+// Inside the exception handler, the API's exception boundary and status-code pages. An exception from a response
+// being compressed unwinds through this middleware, which puts the original response body back, before the handler
+// clears the response and writes its fixed ProblemDetails uncompressed, and a client abort, or any failure once the
+// response started, during the final compressed flush reaches the exception boundary, which settles it. After the host
+// guard, so a refused Host is answered before anything is served; before routing, so the endpoints, OpenAPI, /health
+// and the static client all pass through it.
+app.UseResponseCompression();
 
 app.UseRouting();
 
@@ -742,10 +779,11 @@ namespace EpiInfo.Api
     /// </para>
     /// <para>
     /// Nothing else is set or changed. The Content-Security-Policy holds the one directive <c>frame-ancestors</c>,
-    /// which restricts nothing the client itself loads. Caching outside <c>/api</c> stays with its owners: the hashed
-    /// client bundles keep the static-file defaults and <c>index.html</c> its <c>no-cache</c>. No HSTS header is sent,
-    /// because the API listens on plain HTTP on the loopback address only, and no CORS header, because the client is
-    /// same-origin.
+    /// which restricts nothing the client itself loads. Caching outside <c>/api</c> stays with its owner, the static
+    /// client host: the hashed client bundles under <c>/assets</c> are <c>public, max-age=31536000, immutable</c> and
+    /// <c>index.html</c> is <c>no-cache</c>, and that host gives each file's answer the <c>Vary</c> and the entity tag
+    /// of the representation it sends. No HSTS header is sent, because the API listens on plain HTTP on the
+    /// loopback address only, and no CORS header, because the client is same-origin.
     /// </para>
     /// </remarks>
     internal static class ResponseHeaderPolicy

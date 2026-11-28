@@ -1,12 +1,15 @@
 using System.Globalization;
 using System.Runtime.Versioning;
 using System.Security;
+using Microsoft.AspNetCore.Http.Headers;
+using Microsoft.AspNetCore.ResponseCompression;
 using Microsoft.AspNetCore.Routing.Constraints;
 using Microsoft.AspNetCore.Routing.Matching;
 using Microsoft.AspNetCore.Routing.Patterns;
 using Microsoft.AspNetCore.StaticFiles;
 using Microsoft.Extensions.FileProviders;
 using Microsoft.Extensions.Primitives;
+using Microsoft.Net.Http.Headers;
 using Microsoft.Win32.SafeHandles;
 
 namespace EpiInfo.Api.Hosting;
@@ -35,6 +38,13 @@ namespace EpiInfo.Api.Hosting;
 /// excludes by default, whose name starts with a dot or which are hidden or system files; and every symbolic link,
 /// junction or other reparse point below the folder, with everything beneath it, so nothing outside the folder is
 /// served. The folder itself may be a link.
+/// </para>
+/// <para>
+/// Where response compression is registered, each answer describes the representation it stands for. A file of a
+/// type the compression middleware codes carries <c>Vary: Accept-Encoding</c> on its 200, HEAD and 304, coded or not;
+/// an answer sent in a coding, or a 304 or HEAD whose 200 would be, carries the weak form of the file's entity tag;
+/// and an identity answer and a range answer, which is never coded, keep the strong tag. <c>If-None-Match</c> is
+/// compared weakly, so a weak tag still revalidates, while <c>If-Match</c> and <c>If-Range</c> compare strongly.
 /// </para>
 /// <para>
 /// Each file is read through one handle and confirmed to be the entry the listing found. On Linux the handle's own
@@ -110,6 +120,14 @@ public static partial class ClientAppHosting
 
     private static readonly string[] FallbackMethods = [HttpMethods.Get, HttpMethods.Head];
 
+    private const string IndexCacheControl = "no-cache";
+
+    private const string AssetCacheControl = "public, max-age=31536000, immutable";
+
+    // Matched by whole segment, so a folder such as assets-old/ is not under it, and ignoring case, because where the
+    // copy looks names up ignoring case /ASSETS/app.js is the same asset.
+    private static readonly PathString AssetsPath = new("/assets");
+
     /// <summary>
     /// Reads the client folder that <see cref="ApiOptions.ClientPath"/> names, resolved against the content root,
     /// into memory once, serves that copy and maps the <c>index.html</c> fallback. When the folder or its
@@ -184,14 +202,24 @@ public static partial class ClientAppHosting
             return app;
         }
 
+        // Optional: a host that registers no response compression sends every file as it is, so its answers keep the
+        // static-file defaults, a strong entity tag and no Vary, and If-None-Match keeps the middleware's comparison.
+        IResponseCompressionProvider? compression = app.Services.GetService<IResponseCompressionProvider>();
         var staticOptions = new StaticFileOptions
         {
             FileProvider = fileProvider,
-            OnPrepareResponse = MarkIndexUncached,
+            OnPrepareResponse = compression is null
+                ? SetCacheControl
+                : context =>
+                {
+                    SetCacheControl(context);
+                    DescribeRepresentation(context, compression);
+                },
         };
 
-        app.UseStaticFiles(staticOptions);
-        MapClientFallback(app, staticOptions);
+        bool coded = compression is not null;
+        UseClientFiles(app, staticOptions, coded);
+        MapClientFallback(app, staticOptions, coded);
         return app;
     }
 
@@ -379,14 +407,108 @@ public static partial class ClientAppHosting
         Message = ClientUntrustedMessage)]
     private static partial void LogClientUntrusted(ILogger logger);
 
-    // The page names the current hashed bundles, so browsers must revalidate it; the bundles themselves are
-    // content-addressed and keep the default caching.
-    private static void MarkIndexUncached(StaticFileResponseContext context)
+    // The page names the current hashed bundles, so browsers must revalidate it, under whichever path it is served:
+    // the fallback answers every client route with it. Vite writes every file under assets/ with a hash of its content
+    // in its name, so a changed file is a new URL: an asset, which holds no user data, may be kept by any cache for a
+    // year and is not revalidated, a reload included. Only the answers that describe the file, 200, 206 and 304, get
+    // that lifetime: the middleware also calls this for a 412 or a 416, which answer the request's conditional or Range
+    // headers. Any other file keeps the static-file defaults, which set no Cache-Control.
+    private static void SetCacheControl(StaticFileResponseContext context)
     {
+        HttpResponse response = context.Context.Response;
         if (string.Equals(context.File.Name, IndexFileName, StringComparison.OrdinalIgnoreCase))
         {
-            context.Context.Response.Headers.CacheControl = "no-cache";
+            response.Headers.CacheControl = IndexCacheControl;
         }
+        else if (response.StatusCode < StatusCodes.Status400BadRequest
+                 && context.Context.Request.Path.StartsWithSegments(AssetsPath, StringComparison.OrdinalIgnoreCase))
+        {
+            response.Headers.CacheControl = AssetCacheControl;
+        }
+    }
+
+    // A file of a type the compression middleware codes, which it decides on the Content-Type the static-file
+    // middleware has set by now, is sent br or gzip to a client that accepts a coding and as it is to one that does
+    // not. Every answer that describes it, 200, HEAD and 304, therefore varies by Accept-Encoding (RFC 9110, section
+    // 12.5.5), the identity 200 included, so that no cache reuses it for a request of another Accept-Encoding, and a
+    // 304 carries the Vary and the entity tag its 200 would have carried (section 15.4.5). The middleware adds Vary
+    // only to an answer it is about to code, never to an identity answer or a 304, and adds none where the value is
+    // already listed, so it is listed once.
+    // The middleware also leaves the entity tag the static-file middleware set, which names the identity bytes. A
+    // strong tag names one representation's exact bytes (section 8.8.3), so an answer sent in a coding, or a 304 or
+    // HEAD whose 200 would be, gets the weak form of that tag: a tag taken from coded bytes then fails the strong
+    // comparison of If-Range, whose Range is then ignored and the whole identity file sent, and of If-Match, which then
+    // fails. Revalidation is unaffected, because If-None-Match compares weakly (CompareIfNoneMatchWeakly). A range
+    // answer, 206, is never coded, because the middleware leaves an answer with a Content-Range alone, as
+    // ShouldCompressResponse reports: its bytes are the identity bytes whatever the request accepts, so it keeps the
+    // strong tag and gets no Vary. A 412 or a 416 describes no file and gets neither.
+    private static void DescribeRepresentation(
+        StaticFileResponseContext context,
+        IResponseCompressionProvider compression)
+    {
+        HttpContext httpContext = context.Context;
+        HttpResponse response = httpContext.Response;
+        if (response.StatusCode >= StatusCodes.Status400BadRequest || !compression.ShouldCompressResponse(httpContext))
+        {
+            return;
+        }
+
+        // Compared as the middleware compares the values it finds, so neither adds a second Accept-Encoding.
+        IHeaderDictionary headers = response.Headers;
+        if (!headers.GetCommaSeparatedValues(HeaderNames.Vary)
+                .Contains(HeaderNames.AcceptEncoding, StringComparer.OrdinalIgnoreCase))
+        {
+            headers.Append(HeaderNames.Vary, HeaderNames.AcceptEncoding);
+        }
+
+        // The middleware's own decision: it codes only for a request that names a coding and only where a provider is
+        // chosen, so Accept-Encoding: identity, or a coding whose weight is 0, keeps the strong tag.
+        if (compression.CheckRequestAcceptsCompression(httpContext)
+            && compression.GetCompressionProvider(httpContext) is not null)
+        {
+            ResponseHeaders typed = response.GetTypedHeaders();
+            if (typed.ETag is { IsWeak: false } etag)
+            {
+                typed.ETag = new EntityTagHeaderValue(etag.Tag, isWeak: true);
+            }
+        }
+    }
+
+    // RFC 9110 (section 13.1.2) requires If-None-Match to compare entity tags weakly, by their opaque tags alone, but
+    // the static-file middleware compares them strongly, so the weak tag of a coded answer would never match the strong
+    // tag it computes and each revalidation of a coded file would resend the whole file. Each weak tag of the
+    // If-None-Match of a request the middleware may serve, a GET or HEAD with no endpoint to run, is therefore replaced
+    // by the strong tag of the same opaque tag before the middleware reads it. Every tag the middleware computes is
+    // strong, so its strong comparison then decides exactly as the weak comparison would. An If-None-Match holding no
+    // weak tag is left as it is, and If-Match and If-Range keep the strong comparison the RFC requires of them.
+    private static Task CompareIfNoneMatchWeakly(HttpContext context, RequestDelegate next)
+    {
+        HttpRequest request = context.Request;
+        if (context.GetEndpoint()?.RequestDelegate is null
+            && (HttpMethods.IsGet(request.Method) || HttpMethods.IsHead(request.Method)))
+        {
+            // The middleware's own parse, so the tags rewritten are exactly the tags it compares.
+            RequestHeaders typed = request.GetTypedHeaders();
+            IList<EntityTagHeaderValue> tags = typed.IfNoneMatch;
+            if (tags.Any(tag => tag.IsWeak))
+            {
+                typed.IfNoneMatch = tags.Select(tag => tag.IsWeak ? new EntityTagHeaderValue(tag.Tag) : tag).ToList();
+            }
+        }
+
+        return next(context);
+    }
+
+    // Both serving paths, the root static-file middleware and the index.html fallback, serve through here, so both
+    // decide a conditional request alike.
+    private static void UseClientFiles(IApplicationBuilder builder, StaticFileOptions staticOptions, bool coded)
+    {
+        if (coded)
+        {
+            builder.Use(CompareIfNoneMatchWeakly);
+        }
+
+        builder.UseStaticFiles(staticOptions);
     }
 
     // Built the way MapFallbackToFile builds its endpoint, except for the route. Its single "{*path:nonfile}" pattern
@@ -395,9 +517,9 @@ public static partial class ClientAppHosting
     // an unknown API route must return. The route table only prunes a route from the api and openapi nodes through a
     // required simple parameter, never through a catch-all or an optional parameter, so client routes take two
     // endpoints: the root, and a required first segment plus a catch-all rest.
-    private static void MapClientFallback(WebApplication app, StaticFileOptions staticOptions)
+    private static void MapClientFallback(WebApplication app, StaticFileOptions staticOptions, bool coded)
     {
-        RequestDelegate serveIndex = BuildServeIndex(app, staticOptions);
+        RequestDelegate serveIndex = BuildServeIndex(app, staticOptions, coded);
 
         ConfigureFallback(app.Map("/", serveIndex));
 
@@ -408,7 +530,7 @@ public static partial class ClientAppHosting
         ConfigureFallback(app.Map(clientRoutes, serveIndex));
     }
 
-    private static RequestDelegate BuildServeIndex(WebApplication app, StaticFileOptions staticOptions)
+    private static RequestDelegate BuildServeIndex(WebApplication app, StaticFileOptions staticOptions, bool coded)
     {
         IApplicationBuilder fallbackApp = ((IEndpointRouteBuilder)app).CreateApplicationBuilder();
         fallbackApp.Use(next => context =>
@@ -420,7 +542,7 @@ public static partial class ClientAppHosting
             context.SetEndpoint(null);
             return next(context);
         });
-        fallbackApp.UseStaticFiles(staticOptions);
+        UseClientFiles(fallbackApp, staticOptions, coded);
         return fallbackApp.Build();
     }
 

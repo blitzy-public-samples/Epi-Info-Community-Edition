@@ -1,8 +1,10 @@
 using System.Globalization;
+using System.IO.Compression;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Sockets;
 using System.Runtime.Versioning;
+using System.Text;
 using System.Text.Json;
 using EpiInfo.Api.Errors;
 using EpiInfo.Api.Hosting;
@@ -564,7 +566,10 @@ public sealed class LoopbackHostGuardTests : IDisposable
 /// and serves only that copy, so no link, edit, addition or deletion made afterwards changes what is served. Links
 /// below the folder, the server's own paths and the files a physical provider hides are left out, and a folder over
 /// the limits, or outside Windows a folder that every user can write or that holds a folder or file every user can
-/// write, serves no client and logs one fixed warning.
+/// write, serves no client and logs one fixed warning. The copy is sent with the Cache-Control of its path, and its
+/// text, like the API's JSON, compressed for a client that accepts br or gzip. Every 200, HEAD and 304 of a file of a
+/// coded type varies by Accept-Encoding, and one sent, or whose 200 would be sent, in a coding carries the weak form
+/// of the file's entity tag, which revalidates through If-None-Match but authorizes no If-Range or If-Match.
 /// </summary>
 /// <remarks>
 /// The class needs no database: it carries no <c>Integration</c> trait and joins no database collection, and each case
@@ -587,6 +592,14 @@ public sealed class ClientAppSnapshotTests : IDisposable
     private const string SecretContent = "secret outside the client folder";
 
     private const string SecretFile = "secret.js";
+
+    // A root file outside assets/, which a case writes when it needs one.
+    private const string RootFilePath = "robots.txt";
+
+    private const string RootFileContent = "User-agent: *";
+
+    // The lifetime of a content-hashed asset: any cache may keep it for a year and never revalidate it.
+    private const string AssetCacheControl = "public, max-age=31536000, immutable";
 
     // 0775 and 0664: the owner and the group may write, and other users may only read and enter a folder.
     private const UnixFileMode GroupWritableFileMode =
@@ -801,6 +814,369 @@ public sealed class ClientAppSnapshotTests : IDisposable
         Assert.Equal(HttpStatusCode.PartialContent, partial.StatusCode);
         Assert.Equal(new ContentRangeHeaderValue(8, 11, AssetContent.Length), partial.Content.Headers.ContentRange);
         Assert.Equal(AssetContent.Substring(8, 4), await partial.Content.ReadAsStringAsync());
+    }
+
+    // The page is revalidated on every load, under its own path and every client route the fallback answers with it;
+    // a file under assets/, whose name Vite derives from its content, is kept for a year and never revalidated; and
+    // any other file keeps the static-file defaults, which set no Cache-Control.
+    [Theory]
+    [InlineData("/", "no-cache")]
+    [InlineData("/" + ClientAppHosting.IndexFileName, "no-cache")]
+    [InlineData("/forms/1", "no-cache")]
+    [InlineData("/" + AssetPath, AssetCacheControl)]
+    [InlineData("/" + ImagePath, AssetCacheControl)]
+    [InlineData("/" + RootFilePath, null)]
+    public async Task CacheControlFollowsThePathOfTheFile(string path, string? expected)
+    {
+        WriteFile(_client, RootFilePath, RootFileContent);
+        await using ApiFactory factory = CreateFactory();
+        using HttpClient client = factory.CreateClient();
+
+        using HttpResponseMessage response = await client.GetAsync(path);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Equal(expected, RawCacheControl(response));
+    }
+
+    // A conditional request with the ETag a first answer gave gets the 304, which carries the same Cache-Control, so
+    // the browser's stored copy keeps the lifetime its path calls for.
+    [Theory]
+    [InlineData("/" + AssetPath, AssetCacheControl)]
+    [InlineData("/", "no-cache")]
+    public async Task RevalidationKeepsTheCacheControlOfThePath(string path, string expected)
+    {
+        await using ApiFactory factory = CreateFactory();
+        using HttpClient client = factory.CreateClient();
+        using HttpResponseMessage first = await client.GetAsync(path);
+        EntityTagHeaderValue etag = Assert.IsType<EntityTagHeaderValue>(first.Headers.ETag);
+
+        using var revalidation = new HttpRequestMessage(HttpMethod.Get, path);
+        revalidation.Headers.IfNoneMatch.Add(etag);
+        using HttpResponseMessage response = await client.SendAsync(revalidation);
+
+        Assert.Equal(HttpStatusCode.NotModified, response.StatusCode);
+        Assert.Equal(expected, RawCacheControl(response));
+        Assert.Empty(await response.Content.ReadAsByteArrayAsync());
+    }
+
+    // A 412 answers the request's If-Match and a 416 its Range, not the file, so neither may be kept as the asset.
+    [Theory]
+    [InlineData("If-Match", "\"not-the-asset\"", HttpStatusCode.PreconditionFailed)]
+    [InlineData("Range", "bytes=1000-2000", HttpStatusCode.RequestedRangeNotSatisfiable)]
+    public async Task AssetAnswerToTheRequestHeadersCarriesNoLifetime(
+        string header,
+        string value,
+        HttpStatusCode expected)
+    {
+        await using ApiFactory factory = CreateFactory();
+        using HttpClient client = factory.CreateClient();
+        using var request = new HttpRequestMessage(HttpMethod.Get, "/" + AssetPath);
+        Assert.True(request.Headers.TryAddWithoutValidation(header, value), $"The {header} header was not added.");
+
+        using HttpResponseMessage response = await client.SendAsync(request);
+
+        Assert.Equal(expected, response.StatusCode);
+        Assert.Null(RawCacheControl(response));
+    }
+
+    // A script, the page and the API's JSON: without Accept-Encoding each is sent as it is, a file with its
+    // Content-Length; with br or gzip accepted each is sent in that coding, varying by Accept-Encoding and without the
+    // identity length, decodes to exactly the identity bytes, and keeps the hardening headers and its path's
+    // Cache-Control.
+    [Theory]
+    [InlineData("/" + AssetPath, "br", AssetCacheControl, true)]
+    [InlineData("/" + AssetPath, "gzip", AssetCacheControl, true)]
+    [InlineData("/", "br", "no-cache", true)]
+    [InlineData("/", "gzip", "no-cache", true)]
+    [InlineData("/api/forms", "br", "no-store", false)]
+    [InlineData("/api/forms", "gzip", "no-store", false)]
+    public async Task TextResponseIsCompressedForAClientThatAcceptsIt(
+        string path,
+        string encoding,
+        string cacheControl,
+        bool isFile)
+    {
+        await using ApiFactory factory = new(
+            ClientOptions(_client) with { DataStore = FakeDataStore.WithStandardForms() });
+        using HttpClient client = factory.CreateClient();
+
+        using HttpResponseMessage identity = await client.GetAsync(path);
+        byte[] identityBytes = await identity.Content.ReadAsByteArrayAsync();
+        Assert.Equal(HttpStatusCode.OK, identity.StatusCode);
+        Assert.Empty(identity.Content.Headers.ContentEncoding);
+        Assert.Equal(
+            isFile ? identityBytes.Length.ToString(CultureInfo.InvariantCulture) : null,
+            RawHeader(identity, "Content-Length"));
+        Assert.NotEmpty(identityBytes);
+
+        using HttpResponseMessage encoded = await SendAcceptingAsync(client, path, encoding);
+
+        await AssertEncodedAsync(encoded, encoding, identityBytes, cacheControl);
+    }
+
+    // On real Kestrel the coded script reaches the socket as it does on TestServer: in the coding asked for, varying by
+    // Accept-Encoding, with the hardening headers and the asset lifetime, and decoding to exactly the file.
+    [Theory]
+    [InlineData("br")]
+    [InlineData("gzip")]
+    public async Task KestrelSendsTheScriptCompressed(string encoding)
+    {
+        await using var factory = new KestrelApiFactory(ClientOptions(_client));
+        using HttpClient client = factory.CreateKestrelClient();
+
+        using HttpResponseMessage encoded = await SendAcceptingAsync(client, "/" + AssetPath, encoding);
+
+        await AssertEncodedAsync(encoded, encoding, Encoding.UTF8.GetBytes(AssetContent), AssetCacheControl);
+    }
+
+    // An image, whose type is outside the compressed types, and a range answer, whose Content-Range counts identity
+    // bytes, are sent to a client that accepts a coding exactly as to one that does not: the same identity bytes, the
+    // same strong entity tag and no Vary, because neither answer depends on Accept-Encoding.
+    [Theory]
+    [InlineData("/" + ImagePath, null, "br")]
+    [InlineData("/" + ImagePath, null, "gzip")]
+    [InlineData("/" + AssetPath, "bytes=8-11", "br")]
+    [InlineData("/" + AssetPath, "bytes=8-11", "gzip")]
+    public async Task ImageAndRangeAnswersAreNeverCompressed(string path, string? range, string encoding)
+    {
+        await using ApiFactory factory = CreateFactory();
+        using HttpClient client = factory.CreateClient();
+        using HttpRequestMessage identityRequest = Request(path, range, acceptEncoding: null);
+        using HttpResponseMessage identity = await client.SendAsync(identityRequest);
+        byte[] identityBytes = await identity.Content.ReadAsByteArrayAsync();
+
+        using HttpRequestMessage request = Request(path, range, encoding);
+        using HttpResponseMessage response = await client.SendAsync(request);
+
+        Assert.Equal(range is null ? HttpStatusCode.OK : HttpStatusCode.PartialContent, response.StatusCode);
+        Assert.Empty(response.Content.Headers.ContentEncoding);
+        Assert.Equal(RawHeader(identity, "Content-Range"), RawHeader(response, "Content-Range"));
+        Assert.Equal(identityBytes, await response.Content.ReadAsByteArrayAsync());
+        byte[] expected = range is null ? ImageContent : Encoding.UTF8.GetBytes(AssetContent.Substring(8, 4));
+        Assert.Equal(expected, identityBytes);
+        Assert.Equal(expected.Length.ToString(CultureInfo.InvariantCulture), RawHeader(identity, "Content-Length"));
+        Assert.Equal(RawHeader(identity, "Content-Length"), RawHeader(response, "Content-Length"));
+        Assert.False(Assert.IsType<EntityTagHeaderValue>(identity.Headers.ETag).IsWeak);
+        Assert.Equal(RawHeader(identity, "ETag"), RawHeader(response, "ETag"));
+        Assert.Null(RawHeader(identity, "Vary"));
+        Assert.Null(RawHeader(response, "Vary"));
+    }
+
+    // An error body, written by status-code pages outside the compression and of a type it leaves alone, is the plain
+    // fixed ProblemDetails whatever coding the client accepts.
+    [Theory]
+    [InlineData("/api/nope")]
+    [InlineData("/assets/missing.js")]
+    public async Task ErrorBodyIsNotCompressed(string path)
+    {
+        await using ApiFactory factory = CreateFactory();
+        using HttpClient client = factory.CreateClient();
+
+        using HttpResponseMessage response = await SendAcceptingAsync(client, path, "br, gzip");
+
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+        Assert.Empty(response.Content.Headers.ContentEncoding);
+        Assert.Equal(ApiProblems.ProblemContentType, response.Content.Headers.ContentType?.MediaType);
+        using JsonDocument document = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        ApiTestClient.AssertProblemDetails(document.RootElement, StatusCodes.Status404NotFound);
+    }
+
+    // Without Accept-Encoding the script, the page and a client route are sent as they are, but a client that accepts
+    // br or gzip gets them coded, so their identity 200 and HEAD vary by Accept-Encoding, once, and keep the strong tag
+    // of the identity bytes; an image, whose type is never coded, carries no Vary.
+    [Theory]
+    [InlineData("GET", "/" + AssetPath, true)]
+    [InlineData("HEAD", "/" + AssetPath, true)]
+    [InlineData("GET", "/", true)]
+    [InlineData("HEAD", "/", true)]
+    [InlineData("GET", "/forms/1", true)]
+    [InlineData("GET", "/" + ImagePath, false)]
+    [InlineData("HEAD", "/" + ImagePath, false)]
+    public async Task IdentityAnswerVariesByAcceptEncodingWhereItsTypeIsCoded(string method, string path, bool varies)
+    {
+        await using ApiFactory factory = CreateFactory();
+        using HttpClient client = factory.CreateClient();
+
+        using HttpResponseMessage response = await SendWithHeadersAsync(client, new HttpMethod(method), path);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Empty(response.Content.Headers.ContentEncoding);
+        Assert.Equal(varies ? "Accept-Encoding" : null, RawHeader(response, "Vary"));
+        Assert.False(Assert.IsType<EntityTagHeaderValue>(response.Headers.ETag).IsWeak);
+    }
+
+    // Each revalidation: a path, its Cache-Control, the form of the tag the client sends and the coding it accepts.
+    public static TheoryData<string, string, string, string?> Revalidations()
+    {
+        var data = new TheoryData<string, string, string, string?>();
+        (string Path, string CacheControl)[] files = [("/" + AssetPath, AssetCacheControl), ("/", "no-cache")];
+        foreach ((string path, string cacheControl) in files)
+        {
+            foreach (string sent in new[] { "strong", "weak", "weak among others" })
+            {
+                foreach (string? encoding in new[] { "br", "gzip", null })
+                {
+                    data.Add(path, cacheControl, sent, encoding);
+                }
+            }
+        }
+
+        return data;
+    }
+
+    // If-None-Match compares weakly, so the strong tag of the identity bytes, its weak form, which a coded answer gave,
+    // and that weak form listed after another tag each revalidate the file with a 304. The 304 carries what its 200
+    // would: Vary: Accept-Encoding, once, the weak tag where the 200 would be coded and the strong tag where it would
+    // not, and the Cache-Control of its path.
+    [Theory]
+    [MemberData(nameof(Revalidations))]
+    public async Task RevalidationCarriesTheVaryAndTheTagOfTheAnswerItStandsFor(
+        string path,
+        string cacheControl,
+        string sent,
+        string? encoding)
+    {
+        await using ApiFactory factory = CreateFactory();
+        using HttpClient client = factory.CreateClient();
+        string tag = await IdentityTagAsync(client, path);
+        string ifNoneMatch = sent switch
+        {
+            "strong" => tag,
+            "weak" => "W/" + tag,
+            "weak among others" => "\"not-the-file\", W/" + tag,
+            _ => throw new ArgumentOutOfRangeException(nameof(sent), sent, "Not a tag form this case sends."),
+        };
+
+        using HttpResponseMessage response = await SendWithHeadersAsync(
+            client,
+            HttpMethod.Get,
+            path,
+            ("Accept-Encoding", encoding),
+            ("If-None-Match", ifNoneMatch));
+
+        Assert.Equal(HttpStatusCode.NotModified, response.StatusCode);
+        Assert.Equal("Accept-Encoding", RawHeader(response, "Vary"));
+        Assert.Equal(encoding is null ? tag : "W/" + tag, RawHeader(response, "ETag"));
+        Assert.Equal(cacheControl, RawCacheControl(response));
+        Assert.Empty(response.Content.Headers.ContentEncoding);
+        Assert.Empty(await response.Content.ReadAsByteArrayAsync());
+    }
+
+    // A 200 or HEAD sent in br or gzip, of the script, the page or a client route, carries the weak form of the tag of
+    // the identity bytes, so its tag never claims to name the identity bytes, and Vary: Accept-Encoding once.
+    [Theory]
+    [InlineData("GET", "/" + AssetPath, "br")]
+    [InlineData("GET", "/" + AssetPath, "gzip")]
+    [InlineData("HEAD", "/" + AssetPath, "br")]
+    [InlineData("HEAD", "/" + AssetPath, "gzip")]
+    [InlineData("GET", "/", "br")]
+    [InlineData("HEAD", "/", "gzip")]
+    [InlineData("GET", "/forms/1", "gzip")]
+    [InlineData("HEAD", "/forms/1", "br")]
+    public async Task CodedAnswerCarriesTheWeakTagOfTheFile(string method, string path, string encoding)
+    {
+        await using ApiFactory factory = CreateFactory();
+        using HttpClient client = factory.CreateClient();
+        string tag = await IdentityTagAsync(client, path);
+
+        using HttpResponseMessage response = await SendWithHeadersAsync(
+            client,
+            new HttpMethod(method),
+            path,
+            ("Accept-Encoding", encoding));
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Equal(new[] { encoding }, response.Content.Headers.ContentEncoding);
+        Assert.Equal("W/" + tag, RawHeader(response, "ETag"));
+        Assert.Equal("Accept-Encoding", RawHeader(response, "Vary"));
+    }
+
+    // If-Range and If-Match compare strongly. On an identity request for bytes 8 to 11, the weak tag a br answer gave
+    // makes If-Range ignore the Range, so the whole file is sent, and makes If-Match fail with a 412; the strong tag of
+    // the identity bytes lets either send the range. A range answer is never coded, so it keeps the strong tag and
+    // carries no Vary, while the whole file sent in its place varies by Accept-Encoding like any identity 200.
+    [Theory]
+    [InlineData("If-Range", true, HttpStatusCode.OK)]
+    [InlineData("If-Range", false, HttpStatusCode.PartialContent)]
+    [InlineData("If-Match", true, HttpStatusCode.PreconditionFailed)]
+    [InlineData("If-Match", false, HttpStatusCode.PartialContent)]
+    public async Task OnlyTheIdentityTagAuthorizesARangeOrAMatch(string header, bool codedTag, HttpStatusCode expected)
+    {
+        await using ApiFactory factory = CreateFactory();
+        using HttpClient client = factory.CreateClient();
+        string tag = await IdentityTagAsync(client, "/" + AssetPath);
+        string sent = tag;
+        if (codedTag)
+        {
+            using HttpResponseMessage coded = await SendAcceptingAsync(client, "/" + AssetPath, "br");
+            Assert.Equal(new[] { "br" }, coded.Content.Headers.ContentEncoding);
+            sent = Assert.IsType<string>(RawHeader(coded, "ETag"));
+            Assert.Equal("W/" + tag, sent);
+        }
+
+        using HttpResponseMessage response = await SendWithHeadersAsync(
+            client,
+            HttpMethod.Get,
+            "/" + AssetPath,
+            ("Range", "bytes=8-11"),
+            (header, sent));
+
+        Assert.Equal(expected, response.StatusCode);
+        Assert.Empty(response.Content.Headers.ContentEncoding);
+        string body = await response.Content.ReadAsStringAsync();
+        switch (expected)
+        {
+            case HttpStatusCode.OK:
+                Assert.Equal(AssetContent, body);
+                Assert.Null(RawHeader(response, "Content-Range"));
+                Assert.Equal(tag, RawHeader(response, "ETag"));
+                Assert.Equal("Accept-Encoding", RawHeader(response, "Vary"));
+                break;
+
+            case HttpStatusCode.PartialContent:
+                Assert.Equal(AssetContent.Substring(8, 4), body);
+                Assert.Equal(
+                    new ContentRangeHeaderValue(8, 11, AssetContent.Length),
+                    response.Content.Headers.ContentRange);
+                Assert.Equal(tag, RawHeader(response, "ETag"));
+                Assert.Null(RawHeader(response, "Vary"));
+                break;
+
+            default:
+                Assert.DoesNotContain(AssetContent.Substring(8, 4), body, StringComparison.Ordinal);
+                Assert.Null(RawHeader(response, "ETag"));
+                Assert.Null(RawHeader(response, "Vary"));
+                break;
+        }
+    }
+
+    // On real Kestrel a browser's revalidation of the coded script, with the weak tag it was given and the coding it
+    // accepts, is a 304 carrying Vary: Accept-Encoding once, that weak tag and the asset lifetime, as on TestServer.
+    [Theory]
+    [InlineData("br")]
+    [InlineData("gzip")]
+    public async Task KestrelRevalidatesTheCodedScriptWithVaryAndItsWeakTag(string encoding)
+    {
+        await using var factory = new KestrelApiFactory(ClientOptions(_client));
+        using HttpClient client = factory.CreateKestrelClient();
+        string tag = await IdentityTagAsync(client, "/" + AssetPath);
+        using HttpResponseMessage coded = await SendAcceptingAsync(client, "/" + AssetPath, encoding);
+        Assert.Equal(new[] { encoding }, coded.Content.Headers.ContentEncoding);
+        string weak = Assert.IsType<string>(RawHeader(coded, "ETag"));
+        Assert.Equal("W/" + tag, weak);
+
+        using HttpResponseMessage response = await SendWithHeadersAsync(
+            client,
+            HttpMethod.Get,
+            "/" + AssetPath,
+            ("Accept-Encoding", encoding),
+            ("If-None-Match", weak));
+
+        Assert.Equal(HttpStatusCode.NotModified, response.StatusCode);
+        Assert.Equal("Accept-Encoding", RawHeader(response, "Vary"));
+        Assert.Equal(weak, RawHeader(response, "ETag"));
+        Assert.Equal(AssetCacheControl, RawCacheControl(response));
+        Assert.Empty(await response.Content.ReadAsByteArrayAsync());
     }
 
     // One entry past the entry limit, or one file past the byte limit: the folder is not served at all, and the host
@@ -1020,6 +1396,112 @@ public sealed class ClientAppSnapshotTests : IDisposable
         return new ReceivedResponse(response.StatusCode, await response.Content.ReadAsStringAsync());
     }
 
+    private static string? RawCacheControl(HttpResponseMessage response) => RawHeader(response, "Cache-Control");
+
+    // A response or content header as the server wrote it, unparsed and never computed by the client, so the order and
+    // spelling of a value are asserted too, and a Content-Length the server did not send is absent; null when the
+    // response has none.
+    private static string? RawHeader(HttpResponseMessage response, string name) =>
+        response.Headers.NonValidated.TryGetValues(name, out HeaderStringValues values)
+        || response.Content.Headers.NonValidated.TryGetValues(name, out values)
+            ? values.ToString()
+            : null;
+
+    // A GET of path, with a Range header when range is given and an Accept-Encoding header when acceptEncoding is.
+    private static HttpRequestMessage Request(string path, string? range, string? acceptEncoding)
+    {
+        var request = new HttpRequestMessage(HttpMethod.Get, path);
+        if (range is not null)
+        {
+            Assert.True(request.Headers.TryAddWithoutValidation("Range", range), "The Range header was not added.");
+        }
+
+        if (acceptEncoding is not null)
+        {
+            Assert.True(
+                request.Headers.TryAddWithoutValidation("Accept-Encoding", acceptEncoding),
+                "The Accept-Encoding header was not added.");
+        }
+
+        return request;
+    }
+
+    // Neither client decodes a coded body itself, so the header is sent as given and the coded bytes are received.
+    private static async Task<HttpResponseMessage> SendAcceptingAsync(
+        HttpClient client,
+        string path,
+        string acceptEncoding)
+    {
+        using HttpRequestMessage request = Request(path, range: null, acceptEncoding);
+        return await client.SendAsync(request);
+    }
+
+    // A request of method for path carrying each header whose value is given, added unvalidated, so a weak tag or a
+    // list of tags is sent exactly as written; a header whose value is null is not sent.
+    private static async Task<HttpResponseMessage> SendWithHeadersAsync(
+        HttpClient client,
+        HttpMethod method,
+        string path,
+        params (string Name, string? Value)[] headers)
+    {
+        using var request = new HttpRequestMessage(method, path);
+        foreach ((string name, string? value) in headers)
+        {
+            if (value is not null)
+            {
+                Assert.True(request.Headers.TryAddWithoutValidation(name, value), $"The {name} header was not added.");
+            }
+        }
+
+        return await client.SendAsync(request);
+    }
+
+    // The entity tag, quoted, of the identity 200 to a GET of path without Accept-Encoding, which must be strong.
+    private static async Task<string> IdentityTagAsync(HttpClient client, string path)
+    {
+        using HttpResponseMessage identity = await client.GetAsync(path);
+        Assert.Equal(HttpStatusCode.OK, identity.StatusCode);
+        Assert.Empty(identity.Content.Headers.ContentEncoding);
+        EntityTagHeaderValue etag = Assert.IsType<EntityTagHeaderValue>(identity.Headers.ETag);
+        Assert.False(etag.IsWeak, "The tag of the identity answer is weak.");
+        Assert.Equal(etag.Tag, RawHeader(identity, "ETag"));
+        return etag.Tag;
+    }
+
+    // The 200 of a compressed text response: its one Content-Encoding is the coding asked for, its Vary is exactly
+    // Accept-Encoding, listed once, it has no Content-Length, its body decodes to exactly the identity bytes, and it
+    // carries the hardening headers and exactly the Cache-Control of its path.
+    private static async Task AssertEncodedAsync(
+        HttpResponseMessage response,
+        string encoding,
+        byte[] identityBytes,
+        string cacheControl)
+    {
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Equal(new[] { encoding }, response.Content.Headers.ContentEncoding);
+        Assert.Equal("Accept-Encoding", RawHeader(response, "Vary"));
+        Assert.Null(RawHeader(response, "Content-Length"));
+        Assert.Equal(identityBytes, Decode(encoding, await response.Content.ReadAsByteArrayAsync()));
+        Assert.Equal("nosniff", RawHeader(response, "X-Content-Type-Options"));
+        Assert.Equal("DENY", RawHeader(response, "X-Frame-Options"));
+        Assert.Equal("frame-ancestors 'none'", RawHeader(response, "Content-Security-Policy"));
+        Assert.Equal(cacheControl, RawCacheControl(response));
+    }
+
+    private static byte[] Decode(string encoding, byte[] body)
+    {
+        using var coded = new MemoryStream(body);
+        using Stream decoder = encoding switch
+        {
+            "br" => new BrotliStream(coded, CompressionMode.Decompress),
+            "gzip" => new GZipStream(coded, CompressionMode.Decompress),
+            _ => throw new ArgumentOutOfRangeException(nameof(encoding), encoding, "Not a coding the API sends."),
+        };
+        using var decoded = new MemoryStream();
+        decoder.CopyTo(decoded);
+        return decoded.ToArray();
+    }
+
     // The one entry the client host logged; only its warnings use that category.
     private static CapturedLogEntry AssertOneClientWarning(ApiFactory factory)
     {
@@ -1055,11 +1537,14 @@ public sealed class ClientAppSnapshotTests : IDisposable
         return link;
     }
 
-    private ApiFactory CreateFactory(string? clientPath = null) =>
-        new(ApiFactoryOptions.ForFake(new FakeDataStore()) with
+    // A host over a fake store serving the client folder at clientPath.
+    private static ApiFactoryOptions ClientOptions(string clientPath) =>
+        ApiFactoryOptions.ForFake(new FakeDataStore()) with
         {
-            ExtraSettings = new Dictionary<string, string?> { [ApiOptions.ClientPathKey] = clientPath ?? _client },
-        });
+            ExtraSettings = new Dictionary<string, string?> { [ApiOptions.ClientPathKey] = clientPath },
+        };
+
+    private ApiFactory CreateFactory(string? clientPath = null) => new(ClientOptions(clientPath ?? _client));
 
     // What a case reads from a response, taken before the response is disposed.
     private sealed record ReceivedResponse(HttpStatusCode Status, string Text);

@@ -2689,8 +2689,9 @@ public sealed class ErrorContractTests
     // The API's response headers: every response, whichever part of the pipeline writes it, carries
     // X-Content-Type-Options nosniff, X-Frame-Options DENY and a Content-Security-Policy of exactly frame-ancestors
     // 'none'. Every /api response, success and error alike, is exactly no-store, the 500 the exception handler writes
-    // with its own cache headers included. Outside /api caching stays with its owners: index.html keeps no-cache, and
-    // the asset, /health, OpenAPI and a missing asset are never no-store. The client is served from a temporary folder.
+    // with its own cache headers included. Outside /api caching stays with the static client host: index.html keeps
+    // no-cache, a client asset is exactly public, max-age=31536000, immutable, and /health, OpenAPI and a missing asset
+    // are neither no-store nor immutable. The client is served from a temporary folder.
     [Theory]
     [MemberData(nameof(EnvironmentsAndResponseSurfaces))]
     public async Task EveryResponseCarriesTheHardeningHeadersAndApiResponsesAreNoStore(
@@ -3424,13 +3425,15 @@ public sealed class ErrorContractTests
         };
 
     // Each surface's status, and the Cache-Control it must carry exactly: no-store under /api, no-cache for the index,
-    // and, where null, any value other than no-store.
+    // the long immutable lifetime for a client asset, and, where null, any value that is neither no-store nor
+    // immutable.
     private static void AssertSurfaceHeaders(HttpResponseMessage response, string surface)
     {
         (HttpStatusCode status, string? cacheControl) = surface switch
         {
             ClientRootSurface or ClientRouteSurface => (HttpStatusCode.OK, "no-cache"),
-            ClientAssetSurface or HealthSurface or OpenApiSurface => (HttpStatusCode.OK, null),
+            ClientAssetSurface => (HttpStatusCode.OK, "public, max-age=31536000, immutable"),
+            HealthSurface or OpenApiSurface => (HttpStatusCode.OK, null),
             MissingAssetSurface => (HttpStatusCode.NotFound, null),
             CreateSurface => (HttpStatusCode.Created, "no-store"),
             ApiRouteMissSurface => (HttpStatusCode.NotFound, "no-store"),
@@ -3449,6 +3452,9 @@ public sealed class ErrorContractTests
             Assert.False(
                 cache.Any(value => value.Contains("no-store", StringComparison.OrdinalIgnoreCase)),
                 "A response outside /api is no-store.");
+            Assert.False(
+                cache.Any(value => value.Contains("immutable", StringComparison.OrdinalIgnoreCase)),
+                "A response that is not a served client asset is immutable.");
         }
         else
         {
