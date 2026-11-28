@@ -323,6 +323,8 @@ const DELETED_TEXT = 'This record is deleted and is read-only.';
 const SAVING_TEXT = 'Saving…';
 const RECORD_DELETED_TEXT = 'Record deleted.';
 const SAVED_TEXT = 'Changes saved.';
+// The save a move made confirmed on the record it opened, which that save did not touch.
+const PREVIOUS_SAVED_TEXT = 'Changes to the previous record were saved.';
 // A dialog's chunk could not be fetched: the server, which serves it, did not answer.
 const DIALOG_FAILED_TEXT = `The dialog could not be opened. ${errorMessages.networkWithoutDraft}`;
 const RETRY = 'Retry';
@@ -1556,6 +1558,7 @@ function FormWorkspace({
           backBlocked={movesBlocked}
           saving={editor.savePending}
           saved={editor.saved}
+          savedPrevious={editor.savedPrevious}
           deleteConfirmed={deletedIn !== null}
           deleteDisabled={deleteDisabled}
           onBackToForms={backToForms}
@@ -1697,6 +1700,11 @@ interface WorkspaceToolbarProps {
   /** The last save of the draft succeeded and nothing has changed since. */
   readonly saved: boolean;
   /**
+   * That save stored the record a move left, not the record now open, so the confirmation
+   * names the previous record; it holds only with `saved`.
+   */
+  readonly savedPrevious: boolean;
+  /**
    * A confirmed delete removed the record, and the user has not moved on since. Saving… takes
    * precedence, and this takes precedence over the confirmation of an earlier save.
    */
@@ -1719,6 +1727,7 @@ function WorkspaceToolbar({
   backBlocked,
   saving,
   saved,
+  savedPrevious,
   deleteConfirmed,
   deleteDisabled,
   onBackToForms,
@@ -1734,7 +1743,7 @@ function WorkspaceToolbar({
   } else if (deleteConfirmed) {
     statusText = RECORD_DELETED_TEXT;
   } else if (saved) {
-    statusText = SAVED_TEXT;
+    statusText = savedPrevious ? PREVIOUS_SAVED_TEXT : SAVED_TEXT;
   }
   return (
     <div className="form-toolbar" role="toolbar" aria-label="Form actions">
@@ -1764,7 +1773,8 @@ function WorkspaceToolbar({
       </button>
       {/* Always rendered, so the status text is announced when it appears; it tells a save
           under way apart from a Save disabled by permission or protection, and confirms a
-          save that succeeded until the next edit, and a delete, whose record the navigator has
+          save that succeeded until the next edit, naming the previous record when a move's
+          save stored the record it left, and a delete, whose record the navigator has
           already replaced. Visually hidden only while empty. */}
       <span role="status" className={statusText === '' ? 'visually-hidden' : undefined}>
         {statusText}

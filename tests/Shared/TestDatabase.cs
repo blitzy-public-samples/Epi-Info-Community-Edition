@@ -139,6 +139,26 @@ public static class TestDatabase
         OpenAsync(Builder(), cancellationToken);
 
     /// <summary>
+    /// Opens a connection to the resolved database with pooling off; the caller disposes it. Disposing it ends its
+    /// session, and with it every lock the session owns, such as an application lock taken with
+    /// <c>@LockOwner = 'Session'</c>, as closing <see cref="DatabaseWriteLock"/>'s own session does.
+    /// </summary>
+    /// <remarks>
+    /// A test that takes a session-owned lock opens its session here. A connection from
+    /// <see cref="OpenConnectionAsync"/> goes back to SqlClient's pool when disposed, with its session and every lock
+    /// that session owns still held, so the lock would outlive the test and its <see cref="DatabaseWriteLock"/>, and
+    /// block another test process for as long as the pool keeps that session.
+    /// </remarks>
+    /// <param name="cancellationToken">Cancels the open.</param>
+    /// <exception cref="TestDatabaseUnavailableException">As for <see cref="OpenConnectionAsync"/>.</exception>
+    public static Task<SqlConnection> OpenUnpooledConnectionAsync(CancellationToken cancellationToken = default)
+    {
+        SqlConnectionStringBuilder target = Builder();
+        target.Pooling = false;
+        return OpenAsync(target, cancellationToken);
+    }
+
+    /// <summary>
     /// Fails unless the rehearsal database answers <c>SELECT DB_NAME()</c> within five seconds. Every
     /// integration test class awaits it before its first test, for example in
     /// <see cref="IAsyncLifetime.InitializeAsync"/>. The probe runs once per process and its outcome,

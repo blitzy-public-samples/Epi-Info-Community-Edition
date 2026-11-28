@@ -1548,8 +1548,9 @@ describe('save progress', () => {
 });
 
 // `saved` confirms the last successful save of the draft until the next edit, write, delete or
-// discard. A save leave() made is confirmed on the record its move installs; the record a later
-// move installs without a save, or after a move that failed, confirms nothing.
+// discard. A save leave() made is confirmed on the record its move installs, and `savedPrevious`
+// marks it there as the previous record's unless that record is the one saved; the record a
+// later move installs without a save, or after a move that failed, confirms nothing.
 describe('save confirmation', () => {
   /** The record a move installs. */
   function nextRecord(): RecordDto {
@@ -1598,12 +1599,14 @@ describe('save confirmation', () => {
     await succeed(mounted);
 
     expect(result.current.saved).toBe(true);
+    // The record the save stored is the one open, so the confirmation is its own.
+    expect(result.current.savedPrevious).toBe(false);
     expect(result.current.isDirty).toBe(false);
     edit(result, OTHER_TEXT, 'Brown');
     expect(result.current.saved).toBe(false);
   });
 
-  it('confirms the save leave() made on the record its move installs, and nothing on the record after a move that saved nothing', async () => {
+  it('confirms the save leave() made on the record its move installs, as the previous record\'s, and nothing on the record after a move that saved nothing', async () => {
     const { api, result, record, props, rerender } = mountExisting();
     edit(result, TEXT, 'Jones');
     // Navigation freezes the draft before it awaits leave(), and installs the next record after.
@@ -1611,18 +1614,74 @@ describe('save confirmation', () => {
     api.reply(jsonResponse(200, savedCopy(record, { [TEXT]: 'Jones' })));
     expect(await perform(() => result.current.leave())).toBe(true);
     expect(result.current.saved).toBe(true);
+    // Until the move installs another record, the record saved is the one open.
+    expect(result.current.savedPrevious).toBe(false);
 
     const next = nextRecord();
     rerender({ ...props, record: next, recordGeneration: props.recordGeneration + 1, transitioning: false });
     expect(result.current.values[TEXT]).toBe('Next');
     expect(result.current.saved).toBe(true);
+    expect(result.current.savedPrevious).toBe(true);
 
     rerender({ ...props, record: next, recordGeneration: props.recordGeneration + 1, transitioning: true });
     expect(await perform(() => result.current.leave())).toBe(true);
     rerender({ ...props, recordGeneration: props.recordGeneration + 2, transitioning: false });
     expect(result.current.values[TEXT]).toBe('Smith');
     expect(result.current.saved).toBe(false);
+    expect(result.current.savedPrevious).toBe(false);
     expect(api.lines()).toEqual([`PUT ${recordPath(record)}`]);
+  });
+
+  // A move installs New, which the save did not store, or the record the save stored opened
+  // again: by First at position 1, Go to its own number or its grid row, read afresh.
+  it.each<{ from: string; to: string; previous: boolean }>([
+    { from: 'a stored record', to: 'New', previous: true },
+    { from: 'a stored record', to: 'the record saved', previous: false },
+    { from: 'a new record', to: 'New', previous: true },
+    { from: 'a new record', to: 'the record saved', previous: false },
+  ])(
+    'confirms the save leave() made of $from on $to that its move installs, as the previous record\'s: $previous',
+    async ({ from, to, previous }) => {
+      const { api, result, props, rerender } = from === 'a new record' ? mountNew() : mountExisting();
+      edit(result, TEXT, 'Jones');
+      const stored =
+        props.record === null
+          ? createdRecord({ [TEXT]: 'Jones', ...uncheckedCheckboxes() })
+          : savedCopy(props.record, { [TEXT]: 'Jones' });
+      rerender({ ...props, transitioning: true });
+      api.reply(jsonResponse(props.record === null ? 201 : 200, stored));
+      expect(await perform(() => result.current.leave())).toBe(true);
+      expect(result.current.savedPrevious).toBe(false);
+
+      const installed = to === 'New' ? { record: null, isNew: true } : { record: { ...stored }, isNew: false };
+      rerender({ ...props, ...installed, recordGeneration: props.recordGeneration + 1, transitioning: false });
+
+      expect(result.current.values[TEXT]).toBe(to === 'New' ? null : 'Jones');
+      expect(result.current.saved).toBe(true);
+      expect(result.current.savedPrevious).toBe(previous);
+      expect(api.lines()).toEqual([props.record === null ? `POST ${RECORDS_PATH}` : `PUT ${recordPath(props.record)}`]);
+    },
+  );
+
+  it('confirms a later save of the record a move opened as that record\'s own', async () => {
+    const { api, result, record, props, rerender } = mountExisting();
+    edit(result, TEXT, 'Jones');
+    rerender({ ...props, transitioning: true });
+    api.reply(jsonResponse(200, savedCopy(record, { [TEXT]: 'Jones' })));
+    expect(await perform(() => result.current.leave())).toBe(true);
+    const next = nextRecord();
+    rerender({ ...props, record: next, recordGeneration: props.recordGeneration + 1, transitioning: false });
+    expect(result.current.savedPrevious).toBe(true);
+
+    edit(result, TEXT, 'Brown');
+    expect(result.current.saved).toBe(false);
+    expect(result.current.savedPrevious).toBe(false);
+    api.reply(jsonResponse(200, savedCopy(next, { [TEXT]: 'Brown' })));
+    expect(await perform(() => result.current.save())).toBe(true);
+
+    expect(result.current.saved).toBe(true);
+    expect(result.current.savedPrevious).toBe(false);
+    expect(api.lines()).toEqual([`PUT ${recordPath(record)}`, `PUT ${recordPath(next)}`]);
   });
 
   it('confirms nothing on a later move once the move a leave() save made way for has failed', async () => {

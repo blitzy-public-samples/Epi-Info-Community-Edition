@@ -148,8 +148,15 @@ export interface RecordEditor {
    * The last save of the draft succeeded and left nothing unsaved: Save, a save on leave,
    * Retry or Save again. It holds until the next edit, write, delete or discard, and is kept
    * on the record that a leave's save made way for, so a move that saved first confirms it.
+   * There it confirms the save of the record left, not of the record now open, unless the
+   * move opened the record it saved again; `savedPrevious` tells the two apart.
    */
   readonly saved: boolean;
+  /**
+   * `saved` confirms the save of the record a leave's save made way for, not of the record
+   * now open: the move installed New or another record. Never `true` without `saved`.
+   */
+  readonly savedPrevious: boolean;
   /**
    * A save is under way: one started by save(), saveAgain() or a Retry of a POST or PUT,
    * from its start, through the field-event drain and client validation, until its write
@@ -273,6 +280,11 @@ interface EditorState {
    * followed. Kept across the record change that a leave's save made way for.
    */
   readonly saved: boolean;
+  /**
+   * The `saved` kept across that record change belongs to the record left: the change
+   * installed New or a record other than the one the save stored. Read only with `saved`.
+   */
+  readonly savedPrevious: boolean;
 }
 
 interface FieldIndex {
@@ -494,6 +506,7 @@ function freshDraft(index: FieldIndex, record: RecordDto | null, isNew: boolean,
     leaving: false,
     uncertain: false,
     saved: false,
+    savedPrevious: false,
   };
 }
 
@@ -771,6 +784,11 @@ function createController(host: ControllerHost): Controller {
    * change will follow: a failed or cancelled move never carries it to a later one.
    */
   let carrySaved = false;
+  /**
+   * The `globalRecordId` of the record whose save `carrySaved` keeps, as the server returned
+   * it, so the install tells the record left from the same record opened again.
+   */
+  let carriedRecordId: string | null = null;
 
   /** The draft is being left or replaced: no edit or field event may change it. */
   const frozen = (): boolean => leaveLocks > 0 || awaitingCommit || host.options().transitioning === true;
@@ -866,14 +884,19 @@ function createController(host: ControllerHost): Controller {
     blurredForDialog = null;
     queue().reset();
     const { saving, savePending, saved } = host.state();
+    const carried = carrySaved && saved;
     host.update({
       ...freshDraft(index(), record, isNew, generation),
       saving,
       savePending,
       leaving: leaveLocks > 0,
-      saved: carrySaved && saved,
+      saved: carried,
+      // The same record opened again, at First or Go to its own number or from the grid,
+      // is the record saved; New, or any other record, was not.
+      savedPrevious: carried && (isNew || record === null || record.globalRecordId !== carriedRecordId),
     });
     carrySaved = false;
+    carriedRecordId = null;
   }
 
   /** Drops the draft's edits, banner and check-code state; the record stays open. */
@@ -995,7 +1018,9 @@ function createController(host: ControllerHost): Controller {
       uncertainWrite = null;
       // A save leave() made precedes the record change it made way for, which keeps `saved`.
       carrySaved = leaveLocks > 0;
-      host.update({ uncertain: false, saved: true });
+      carriedRecordId = carrySaved ? result.data.globalRecordId : null;
+      // Until a record change, the record this save stored is the one open.
+      host.update({ uncertain: false, saved: true, savedPrevious: false });
       adoptRecord(result.data, write);
       // A save runs no check code, so the field-event failures it drained stay on screen:
       // their effects, such as an assigned Age, are still missing from the record.
@@ -1495,6 +1520,7 @@ function present(
   // record or none open, and only it takes the protected styling.
   const isProtected = (name: string): boolean => deletedShown || isProtectedIn(state, index, name);
   const isDirty = isDraftDirty(state, index);
+  const saved = state.saved && !isDirty;
   return {
     values: state.values,
     dirty: state.dirty,
@@ -1503,7 +1529,8 @@ function present(
     banner: state.banner,
     saving: state.saving,
     saveBlocked: state.uncertain,
-    saved: state.saved && !isDirty,
+    saved,
+    savedPrevious: saved && state.savedPrevious,
     // A leave of a dirty draft saves it once its drain ends, so the save is under way from
     // the drain's start; one a write of unknown outcome refuses never starts.
     savePending: state.savePending || (state.leaving && isDirty && !state.uncertain),

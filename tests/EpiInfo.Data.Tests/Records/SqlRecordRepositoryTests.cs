@@ -68,9 +68,9 @@ namespace EpiInfo.Data.Tests.Records;
 /// row on every page, and the repository reads the lowest such row whose <c>LastName</c> is plain seeded text. The
 /// identity cases' failure messages are fixed text, so no id reaches the output except through an equality assertion;
 /// the repository-read case describes commands with <see cref="RecordedCommand.Describe"/> without parameter values.
-/// The form-write-lock cases take only application locks, in a transaction they roll back or on a session they close,
-/// and change no data: the lock-wait case's insert and its update of an id no row holds both fail at the lock, before
-/// any INSERT or UPDATE, and it compares snapshots to prove it.
+/// The form-write-lock cases take only application locks, in a transaction they roll back or on an unpooled session
+/// they close, which ends the session and its lock, and change no data: the lock-wait case's insert and its update of
+/// an id no row holds both fail at the lock, before any INSERT or UPDATE, and it compares snapshots to prove it.
 /// Cases that compare snapshots hold the exclusive <see cref="DatabaseWriteLock"/>, the others the shared one.
 /// </para>
 /// <para>
@@ -240,7 +240,10 @@ public sealed class SqlRecordRepositoryTests : IAsyncLifetime
     // update holds it, against a create's exclusive request; exclusive, as a create holds it, against an update's
     // shared request. The write waits at its lock until the command timeout ends the wait, which fails it as
     // unavailable (SQL error -2) with nothing written: it sent no INSERT or UPDATE, the snapshot shows no change, and
-    // its update targets an id no row holds, so no record exists for it to change.
+    // its update targets an id no row holds, so no record exists for it to change. The second session owns its lock
+    // and is unpooled, so closing it ends the session and the lock before the test releases its DatabaseWriteLock, and
+    // the case proves that no session holds the lock by then: one left behind would make the next create or update of
+    // the form, in any test process, wait on it until its command timeout.
     [Theory]
     [InlineData(SharedLockMode, true)]
     [InlineData(ExclusiveLockMode, false)]
@@ -262,39 +265,45 @@ public sealed class SqlRecordRepositoryTests : IAsyncLifetime
             options,
             recorder);
         SqlSnapshot before = await SqlSnapshot.CaptureAsync(cancellationToken);
+        string resource = FormWriteLockResourcePrefix + form.Schema.BaseTable.Name;
 
-        await using SqlConnection holder = await TestDatabase.OpenConnectionAsync(cancellationToken);
-        await using (SqlCommand take = holder.CreateCommand())
+        DataStoreUnavailableException failure;
+        await using (SqlConnection holder = await TestDatabase.OpenUnpooledConnectionAsync(cancellationToken))
         {
-            take.CommandText =
-                "DECLARE @result int; EXEC @result = sys.sp_getapplock @Resource = @resource, @LockMode = @mode, " +
-                "@LockOwner = N'Session', @LockTimeout = 0; SELECT @result;";
-            take.Parameters.Add(new SqlParameter("@resource", SqlDbType.NVarChar, 255)
+            await using (SqlCommand take = holder.CreateCommand())
             {
-                Value = FormWriteLockResourcePrefix + form.Schema.BaseTable.Name,
-            });
-            take.Parameters.Add(new SqlParameter("@mode", SqlDbType.NVarChar, 32) { Value = heldMode });
-            Assert.True(
-                await take.ExecuteScalarAsync(cancellationToken) is 0,
-                "The second session could not take the form's application lock.");
+                take.CommandText =
+                    "DECLARE @result int; EXEC @result = sys.sp_getapplock @Resource = @resource, @LockMode = @mode, " +
+                    "@LockOwner = N'Session', @LockTimeout = 0; SELECT @result;";
+                take.Parameters.Add(new SqlParameter("@resource", SqlDbType.NVarChar, 255) { Value = resource });
+                take.Parameters.Add(new SqlParameter("@mode", SqlDbType.NVarChar, 32) { Value = heldMode });
+                Assert.True(
+                    await take.ExecuteScalarAsync(cancellationToken) is 0,
+                    "The second session could not take the form's application lock.");
+            }
+
+            IReadOnlyDictionary<string, FieldValue> values =
+                Values(ignoreCase: false, (LastNameField, FieldValue.FromText(TestDatabase.NewMarker())));
+            var stamp = new SaveStamp(Environment.UserName, SaveStamp.TruncateToSeconds(DateTime.Now));
+            failure = insert
+                ? await Assert.ThrowsAsync<DataStoreUnavailableException>(() =>
+                    repository.InsertAsync(form.Metadata, values, stamp, permissions: null, cancellationToken))
+                : await Assert.ThrowsAsync<DataStoreUnavailableException>(() =>
+                    repository.UpdateAsync(
+                        form.Metadata,
+                        Guid.NewGuid().ToString(),
+                        values,
+                        () => stamp,
+                        _ => RecordValidationResult.Success(new Dictionary<string, FieldValue>(StringComparer.Ordinal)),
+                        permissions: null,
+                        cancellationToken));
         }
 
-        IReadOnlyDictionary<string, FieldValue> values =
-            Values(ignoreCase: false, (LastNameField, FieldValue.FromText(TestDatabase.NewMarker())));
-        var stamp = new SaveStamp(Environment.UserName, SaveStamp.TruncateToSeconds(DateTime.Now));
-        DataStoreUnavailableException failure = insert
-            ? await Assert.ThrowsAsync<DataStoreUnavailableException>(() =>
-                repository.InsertAsync(form.Metadata, values, stamp, permissions: null, cancellationToken))
-            : await Assert.ThrowsAsync<DataStoreUnavailableException>(() =>
-                repository.UpdateAsync(
-                    form.Metadata,
-                    Guid.NewGuid().ToString(),
-                    values,
-                    () => stamp,
-                    _ => RecordValidationResult.Success(new Dictionary<string, FieldValue>(StringComparer.Ordinal)),
-                    permissions: null,
-                    cancellationToken));
-
+        // Checked before this test opens any other connection: a pooled one could be handed the holder's session, and
+        // resetting that session for reuse would release a lock its close had left behind.
+        Assert.True(
+            await ApplicationLockIsFreeAsync(resource, cancellationToken),
+            "The second session's form application lock outlived its closed connection.");
         Assert.Equal(WriteOutcome.NotWritten, failure.Outcome);
         Assert.Equal(CommandTimeoutErrorNumber, failure.SqlErrorNumber);
         Assert.Empty(recorder.Writes());
@@ -304,6 +313,18 @@ public sealed class SqlRecordRepositoryTests : IAsyncLifetime
         Assert.True(
             SqlSnapshot.Compare(before, await SqlSnapshot.CaptureAsync(cancellationToken)).IsEmpty,
             "The write that waited past the command timeout changed the record tables.");
+    }
+
+    // Whether a new session could take the application lock on resource exclusively now, as APPLOCK_TEST reports it:
+    // true only when no session holds it in any mode. The asking session is unpooled, so it is never a pooled session
+    // that holds the lock itself, whose own lock APPLOCK_TEST would report as grantable.
+    private static async Task<bool> ApplicationLockIsFreeAsync(string resource, CancellationToken cancellationToken)
+    {
+        await using SqlConnection connection = await TestDatabase.OpenUnpooledConnectionAsync(cancellationToken);
+        await using SqlCommand command = connection.CreateCommand();
+        command.CommandText = "SELECT APPLOCK_TEST(N'public', @resource, N'Exclusive', N'Session');";
+        command.Parameters.Add(new SqlParameter("@resource", SqlDbType.NVarChar, 255) { Value = resource });
+        return Assert.IsType<int>(await command.ExecuteScalarAsync(cancellationToken)) == 1;
     }
 
     // CaseReport1 holds the seeded read-only data fields StateIDNumber, CDCIDNumber and ReportedToCDCDate

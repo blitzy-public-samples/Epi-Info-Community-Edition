@@ -22,7 +22,8 @@
 // record follows canInsert and Save of a stored record canUpdate, and a 403 keeps the draft; the validation summary lists each errored field's prompt
 // with its message, from client validation or a field-level 400; and the toolbar
 // announces Saving… while a save is under way, a leave's from the start of its field-event
-// drain, then Changes saved. until the next edit. The connection-banner cases answer their
+// drain, then Changes saved. until the next edit, or, on the record a leave's save made way
+// for, Changes to the previous record were saved. The connection-banner cases answer their
 // own outage reads and failed writes, and check the banner each shows.
 //
 // A number field holds an integer beyond ±Number.MAX_SAFE_INTEGER, which a `bigint`
@@ -1995,8 +1996,9 @@ describe('FormView save progress', () => {
       `PUT ${FORM_PATH}/records/${RECORD_A.globalRecordId}`,
     ]);
     expect(isDisabled(navigatorButton('Previous'))).toBe(false);
-    // The save the move made is confirmed on the record it made way for, until a later move.
-    expect(status.textContent).toBe('Changes saved.');
+    // The save the move made is confirmed on the record it made way for as the previous
+    // record's, which the record now open is not, until a later move.
+    expect(status.textContent).toBe('Changes to the previous record were saved.');
     fireEvent.click(navigatorButton('Previous'));
     await waitFor(() => {
       expect(navigatorStatus()).toBe('1 of 2');
