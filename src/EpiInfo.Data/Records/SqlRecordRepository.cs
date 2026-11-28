@@ -130,9 +130,13 @@ internal sealed class FindAdmission
 /// and catalogue schema from <see cref="SqlMetadataReader.ReuseOrReadFormAsync"/>: for the instance
 /// <see cref="SqlMetadataReader.GetFormMetadataAsync"/> returned earlier in the same request, the schema that read
 /// built, with no metadata command; for any other instance, a fresh read on the connection by
-/// <see cref="FormMetadata.ViewId"/>. A write always reads both again through
-/// <see cref="SqlMetadataReader.ReadFormAsync"/> inside its transaction. Nothing is kept across requests, and every
-/// identifier a statement names comes from a schema the reader built from the catalogue.
+/// <see cref="FormMetadata.ViewId"/>. A write takes both inside its transaction, as its first statements, from
+/// <see cref="SqlMetadataReader.VerifyOrReadFormAsync"/>: for that instance, one statement digests the metadata, the
+/// catalogue columns of the bound tables and the other forms' claims as they stand in the transaction, and the
+/// request's read is used when the digest equals that read's; otherwise, and for any other instance, the form is read
+/// again with <see cref="SqlMetadataReader.ReadFormAsync"/> on the transaction. Either way the form's tables are found
+/// to be its own before any record statement. Nothing is kept across requests, and every identifier a statement
+/// names comes from a schema the reader built from the catalogue.
 /// </para>
 /// <para>
 /// <b>Reads</b> send only <c>SELECT</c> statements, in no transaction. Their failures propagate unchanged for
@@ -161,21 +165,24 @@ internal sealed class FindAdmission
 /// <b>Concurrency.</b> The response snapshot reads the whole base table under <c>HOLDLOCK</c> while the write holds
 /// its own base row exclusively, so two writes in progress together could each wait there for the other's row. Before
 /// its first lock on a record table, after the values passed the contract check, an insert therefore takes the form's
-/// write lock exclusive and an update takes it shared (<see cref="RecordSqlBuilder.AcquireFormWriteLock"/>), both
-/// owned by the transaction. Creates of a form run one at a time and never beside an update of it, so neither forms
-/// a lock cycle with the other; updates still run together and serialise per record on the update lock of the
-/// locked read. A soft delete takes no form lock: between its locked read and its UPDATE it sends at most the
-/// permission read, which touches no record table, and it sends nothing after its exclusive base-row lock, so while it
-/// holds a record lock it waits on no other writer. A wait for the form's lock is bounded by the command timeout, and
-/// one that SQL Server ends without the lock is reported as unavailable with nothing written.
+/// write lock exclusive, and an update and a soft delete take it shared
+/// (<see cref="RecordSqlBuilder.AcquireFormWriteLock"/>), each owned by the transaction. Creates of a form run one at a
+/// time and never beside an update or a soft delete of it, so no create forms a lock cycle with another writer;
+/// updates and soft deletes still run together and serialise per record on the update lock of the locked read. A soft
+/// delete needs the lock although it reads no snapshot: its locked read scans the base table under update locks and
+/// its UPDATE converts its row's lock to exclusive, so beside a create, whose snapshot waits for key-range locks on the
+/// base table while it holds its new row exclusively, a <c>HOLDLOCK</c> reader of the base table such as a Find or a
+/// count could otherwise close a cycle between the two writers. A wait for the form's lock is bounded by the command
+/// timeout, and one that SQL Server ends without the lock is reported as unavailable with nothing written.
 /// </para>
 /// <para>
 /// <b>Permissions.</b> A write given non-null permissions reads them again on its own connection and inside its
-/// transaction, through <see cref="SqlPermissionReader.ReadResolvedAsync"/>, for the tables its schema read resolved,
-/// and decides from that read alone: an insert after the form's exclusive lock, on the base table and every page
-/// table; an update after the required gate, on the base table and every page table; a soft delete after its locked
-/// read, on the base table only. Each read comes before the write's first data statement, so a refusal rolls back
-/// with nothing written and the caller's earlier read never decides it.
+/// transaction, through <see cref="SqlPermissionReader.ReadForWriteAsync"/>, for the tables its schema resolved, asking
+/// only for what the write needs, and decides from that read alone: an insert after the form's exclusive lock, INSERT
+/// on the base table and every page table; an update after the required gate, UPDATE on the base table and every page
+/// table and INSERT on the table of each page whose row the locked read found missing; a soft delete after its locked
+/// read, UPDATE on the base table only. Each read comes before the write's first data statement, so a refusal rolls
+/// back with nothing written and the caller's earlier read never decides it.
 /// </para>
 /// <para>
 /// <b>Contract violations.</b> A <c>values</c> key that names no writable data field, a repeated field, or a value
@@ -184,12 +191,12 @@ internal sealed class FindAdmission
 /// </para>
 /// <para>
 /// <b>Metadata changed since the caller read it.</b> The public <c>InsertAsync</c> and <c>UpdateAsync</c> check the
-/// values against the metadata their transaction reads, which can differ from the <see cref="FormMetadata"/> the
-/// caller validated them against. A refusal there is the caller's broken argument only when the caller's own metadata
-/// refuses the values too, by the same rules. When it accepts them, or when an insert's transaction no longer finds
-/// the form, the metadata changed after the caller's read: that is no contract violation, and the write rolls back
-/// before any base- or page-table statement and fails as a <see cref="DataStoreWriteException"/> with
-/// <see cref="WriteOutcome.NotWritten"/> and no SQL error number.
+/// values against the metadata their transaction verified or read, which can differ from the
+/// <see cref="FormMetadata"/> the caller validated them against. A refusal there is the caller's broken argument only
+/// when the caller's own metadata refuses the values too, by the same rules. When it accepts them, or when an insert's
+/// transaction no longer finds the form, the metadata changed after the caller's read: that is no contract violation,
+/// and the write rolls back before any base- or page-table statement and fails as a
+/// <see cref="DataStoreWriteException"/> with <see cref="WriteOutcome.NotWritten"/> and no SQL error number.
 /// </para>
 /// <para>
 /// The instance holds only thread-safe collaborators and is safe to share across threads. It logs nothing, and every
@@ -662,8 +669,8 @@ internal sealed class SqlRecordRepository(
     /// the base table and every page table, which must grant INSERT on each of them (<c>Forbidden</c>); then the base
     /// row with one save stamp for both stamp pairs, one row on every page in page order holding every writable data
     /// column (<c>NULL</c> when absent), then the response snapshot, all in one transaction that then commits. The
-    /// exclusive lock runs inserts of the form one at a time and never beside an update of it, so concurrent inserts
-    /// all commit rather than deadlock in their snapshot reads (class remarks).
+    /// exclusive lock runs inserts of the form one at a time and never beside an update or a soft delete of it, so
+    /// concurrent inserts all commit rather than deadlock in their snapshot reads (class remarks).
     /// </summary>
     /// <param name="form">The form's metadata, as the store's metadata read returned it.</param>
     /// <param name="values">The validated values of writable data fields, keyed by canonical name.</param>
@@ -713,7 +720,7 @@ internal sealed class SqlRecordRepository(
                     // finds was removed after that read: the metadata changed, which is no broken argument, and the
                     // failure, raised before any record statement, is reported as writing nothing.
                     (FormMetadata Form, FormSchema Schema) read = await metadata
-                            .ReadFormAsync(scope.Connection, scope.Transaction, form.ViewId, cancellationToken)
+                            .VerifyOrReadFormAsync(scope.Connection, scope.Transaction, form, cancellationToken)
                             .ConfigureAwait(false)
                         ?? throw new InvalidOperationException(UnknownFormMessage);
 
@@ -744,9 +751,9 @@ internal sealed class SqlRecordRepository(
     /// (<c>Forbidden</c>); the one call of <paramref name="createStamp"/>; the base last-save stamp; for each page
     /// holding a submitted field, in page order, the submitted columns, inserting the page row first when the update
     /// finds none, as legacy repairs it; then the snapshot and the commit.
-    /// Updates hold the shared lock together, and none runs beside a create of the form, which holds it exclusive
-    /// (class remarks). Concurrent saves of one record serialise on the base-row lock and the later commit wins for a
-    /// field both submitted, with no row-version check.
+    /// Updates and soft deletes hold the shared lock together, and none runs beside a create of the form, which holds
+    /// it exclusive (class remarks). Concurrent saves of one record serialise on the base-row lock and the later
+    /// commit wins for a field both submitted, with no row-version check.
     /// </remarks>
     /// <param name="form">The form's metadata, as the store's metadata read returned it.</param>
     /// <param name="globalRecordId">The record's base-table <c>GlobalRecordId</c>, matched exactly.</param>
@@ -803,7 +810,7 @@ internal sealed class SqlRecordRepository(
                 async scope =>
                 {
                     if (await metadata
-                            .ReadFormAsync(scope.Connection, scope.Transaction, form.ViewId, cancellationToken)
+                            .VerifyOrReadFormAsync(scope.Connection, scope.Transaction, form, cancellationToken)
                             .ConfigureAwait(false) is not { } read)
                     {
                         return WriteDecision<RecordWriteResult>.RolledBack(RecordWriteResult.NotFound());
@@ -829,13 +836,12 @@ internal sealed class SqlRecordRepository(
     /// <summary>
     /// Soft-deletes a record on its base row only, as <see cref="IDataStore.SoftDeleteAsync"/>: <c>RecStatus</c> 0
     /// with the last-save stamp, in one transaction. Page rows are never touched and nothing cascades. In order: the
-    /// locked base read (<c>NotFound</c>, or <c>AlreadyDeleted</c> for <c>RecStatus</c> 0); when
-    /// <paramref name="permissions"/> is not <see langword="null"/>, one permission read inside this transaction for
-    /// the base table alone, which must grant UPDATE on it (<c>Forbidden</c>); the one call of
-    /// <paramref name="createStamp"/>; the base UPDATE; the commit. It takes no form write lock: between its locked
-    /// read and its UPDATE it sends at most that permission read, which touches no record table, and it sends nothing
-    /// after its exclusive lock on the base row, so it closes no lock cycle with an insert or an update (class
-    /// remarks).
+    /// form's shared write lock; the locked base read (<c>NotFound</c>, or <c>AlreadyDeleted</c> for <c>RecStatus</c>
+    /// 0); when <paramref name="permissions"/> is not <see langword="null"/>, one permission read inside this
+    /// transaction for the base table alone, which must grant UPDATE on it (<c>Forbidden</c>); the one call of
+    /// <paramref name="createStamp"/>; the base UPDATE; the commit. Soft deletes and updates hold the shared lock
+    /// together and none runs beside a create of the form, which holds it exclusive, so a soft delete closes no lock
+    /// cycle with a create through a <c>HOLDLOCK</c> reader of the base table (class remarks).
     /// </summary>
     /// <param name="form">The form's metadata, as the store's metadata read returned it.</param>
     /// <param name="globalRecordId">
@@ -886,7 +892,7 @@ internal sealed class SqlRecordRepository(
                 async scope =>
                 {
                     if (await metadata
-                            .ReadFormAsync(scope.Connection, scope.Transaction, form.ViewId, cancellationToken)
+                            .VerifyOrReadFormAsync(scope.Connection, scope.Transaction, form, cancellationToken)
                             .ConfigureAwait(false) is not { } read)
                     {
                         return WriteDecision<SoftDeleteResult>.RolledBack(SoftDeleteResult.NotFound());
@@ -1121,7 +1127,8 @@ internal sealed class SqlRecordRepository(
                     RecordOperations.Insert,
                     form,
                     schema,
-                    includePages: true,
+                    baseCheck: (Insert: true, Update: false),
+                    pageCheck: _ => (Insert: true, Update: false),
                     cancellationToken)
                 .ConfigureAwait(false);
             if (!current.CanInsert(form))
@@ -1181,7 +1188,8 @@ internal sealed class SqlRecordRepository(
             ResolveSubmitted(scope, schema, dataFields, callerForm, submitted, nameof(submitted));
 
         // The form's shared write lock comes before the locked read, the transaction's first lock on a record table:
-        // updates hold it together and serialise per record on the locked read, and none runs beside a create.
+        // updates and soft deletes hold it together and serialise per record on the locked read, and none runs beside
+        // a create.
         await AcquireFormWriteLockAsync(scope, RecordOperations.Update, schema, exclusive: false, cancellationToken)
             .ConfigureAwait(false);
 
@@ -1228,12 +1236,14 @@ internal sealed class SqlRecordRepository(
         // with nothing written, not a failed statement.
         if (permissions is not null)
         {
+            var missingPageIds = new HashSet<int>(stored.MissingPages.Select(page => page.Page.PageId));
             FormPermissions current = await ReadPermissionsInTransactionAsync(
                     scope,
                     RecordOperations.Update,
                     form,
                     schema,
-                    includePages: true,
+                    baseCheck: (Insert: false, Update: true),
+                    pageCheck: page => (Insert: missingPageIds.Contains(page.Page.PageId), Update: true),
                     cancellationToken)
                 .ConfigureAwait(false);
             if (!current.CanUpdate(form)
@@ -1276,36 +1286,40 @@ internal sealed class SqlRecordRepository(
     }
 
     // The login's permissions as read here, inside the write's transaction, on its connection, for the tables this
-    // transaction's schema read confirmed: the base table, then, when includePages is set, each page of schema in
-    // order. A table the schema read did not confirm gets no entry and so denies. Each write applies its own rule of
-    // FormPermissions to the result: an insert CanInsert, an update CanUpdate and CanInsertInto each missing page, a
-    // soft delete CanDelete. Each permission statement is a SELECT that touches no record table, reported under the
-    // write's own operation; none marks DML, so a failure here is classified before any DML.
+    // transaction's schema confirmed, asking each only for the permissions the write needs there
+    // (SqlPermissionReader.ReadForWriteAsync): the base table for baseCheck, then, when pageCheck is given, each page
+    // of schema in order for what pageCheck returns. A table the schema did not confirm gets no entry and so denies,
+    // and so does a permission not asked for. Each write applies its own rule of FormPermissions to the result: an
+    // insert CanInsert, an update CanUpdate and CanInsertInto each missing page, a soft delete CanDelete. Each
+    // permission statement is a SELECT that touches no record table, reported under the write's own operation; none
+    // marks DML, so a failure here is classified before any DML.
     private async Task<FormPermissions> ReadPermissionsInTransactionAsync(
         WriteScope scope,
         string operation,
         FormMetadata form,
         FormSchema schema,
-        bool includePages,
+        (bool Insert, bool Update) baseCheck,
+        Func<PageTableSchema, (bool Insert, bool Update)>? pageCheck,
         CancellationToken cancellationToken)
     {
-        int pageCount = includePages ? schema.Pages.Count : 0;
-        var requestedNames = new string[pageCount + 1];
-        var resolved = new TableSchema?[pageCount + 1];
-        requestedNames[0] = form.BaseTableName;
-        resolved[0] = schema.BaseTable;
-        for (int index = 0; index < pageCount; index++)
+        var checks = new List<WritePermissionCheck>(schema.Pages.Count + 1)
         {
-            requestedNames[index + 1] = schema.Pages[index].Page.TableName;
-            resolved[index + 1] = schema.Pages[index].Table;
+            new(form.BaseTableName, schema.BaseTable, baseCheck.Insert, baseCheck.Update),
+        };
+        if (pageCheck is not null)
+        {
+            foreach (PageTableSchema page in schema.Pages)
+            {
+                (bool insert, bool update) = pageCheck(page);
+                checks.Add(new WritePermissionCheck(page.Page.TableName, page.Table, insert, update));
+            }
         }
 
-        return await SqlPermissionReader.ReadResolvedAsync(
+        return await SqlPermissionReader.ReadForWriteAsync(
                 scope.Connection,
                 scope.Transaction,
                 operation,
-                requestedNames,
-                resolved,
+                checks,
                 options.CommandTimeoutSeconds,
                 observer,
                 cancellationToken)
@@ -1326,6 +1340,12 @@ internal sealed class SqlRecordRepository(
         FormPermissions? permissions,
         CancellationToken cancellationToken)
     {
+        // The form's shared write lock comes before the locked read, the transaction's first lock on a record table,
+        // as an update takes it: soft deletes and updates hold it together and serialise per record on the locked
+        // read, and none runs beside a create, which holds it exclusive (class remarks).
+        await AcquireFormWriteLockAsync(scope, RecordOperations.Delete, schema, exclusive: false, cancellationToken)
+            .ConfigureAwait(false);
+
         if (await ReadBaseRowAsync(
                 scope.Connection,
                 scope.Transaction,
@@ -1355,7 +1375,8 @@ internal sealed class SqlRecordRepository(
                     RecordOperations.Delete,
                     form,
                     schema,
-                    includePages: false,
+                    baseCheck: (Insert: false, Update: true),
+                    pageCheck: null,
                     cancellationToken)
                 .ConfigureAwait(false);
             if (!current.CanDelete(form))
@@ -1379,12 +1400,12 @@ internal sealed class SqlRecordRepository(
     }
 
     // Takes the form's write lock inside the write's transaction (RecordSqlBuilder.AcquireFormWriteLock): exclusive
-    // for a create, shared for an update, released by the commit or the rollback. It is no INSERT or UPDATE, so it
-    // marks no DML and a failure here is classified before any DML. A wait that SQL Server ends without the lock, by
-    // its timeout or as a deadlock victim, is unavailability with nothing written, as a deadlock or a command timeout
-    // of any statement is; a command timeout while waiting reaches the caller as SqlClient's own timeout. Any other
-    // refusal is unexpected, and so is a result the converter refuses: none at all, or one not of the int the
-    // statement selects.
+    // for a create, shared for an update and a soft delete, released by the commit or the rollback. It is no INSERT or
+    // UPDATE, so it marks no DML and a failure here is classified before any DML. A wait that SQL Server ends without
+    // the lock, by its timeout or as a deadlock victim, is unavailability with nothing written, as a deadlock or a
+    // command timeout of any statement is; a command timeout while waiting reaches the caller as SqlClient's own
+    // timeout. Any other refusal is unexpected, and so is a result the converter refuses: none at all, or one not of
+    // the int the statement selects.
     private async Task AcquireFormWriteLockAsync(
         WriteScope scope,
         string operation,

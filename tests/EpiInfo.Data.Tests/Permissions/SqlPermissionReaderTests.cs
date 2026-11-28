@@ -145,6 +145,64 @@ public sealed class SqlPermissionReaderTests : IAsyncLifetime
         Assert.DoesNotContain("N'SELECT'", permission.CommandText, StringComparison.OrdinalIgnoreCase);
     }
 
+    // The request's own metadata read already confirmed the form's tables in the catalogue, so for the very instance
+    // that read returned, the reader and the store send the one permission statement and no catalogue read, and
+    // report what the read of a copy reports, which confirms the tables with its own catalogue read.
+    [Theory]
+    [MemberData(nameof(SeededForms))]
+    public async Task RequestsOwnForm_IsCheckedOnItsAttachedSchema_WithOnlyThePermissionStatement(
+        int viewId,
+        string formName,
+        string[] expectedTables)
+    {
+        CancellationToken ct = timeout.Token;
+        _ = await LoadFormAsync(viewId, formName, expectedTables, ct);
+        var recorder = new SqlCommandRecorder();
+        var options = new DatabaseOptions(TestDatabase.ConnectionString);
+        var factory = new SqlConnectionFactory(options);
+        var metadataReader = new SqlMetadataReader(factory, options, recorder);
+        var reader = new SqlPermissionReader(factory, metadataReader, options, recorder);
+        FormMetadata? form = await metadataReader.GetFormMetadataAsync(viewId, ct);
+        Assert.NotNull(form);
+        string[] securables = [.. expectedTables.Select(table => "[" + table + "]")];
+
+        recorder.Clear();
+        FormPermissions? attached = await reader.GetPermissionsAsync(form, ct);
+        IReadOnlyList<RecordedCommand> attachedCommands = recorder.Commands;
+        recorder.Clear();
+        FormPermissions? copied = await reader.GetPermissionsAsync(form with { }, ct);
+        IReadOnlyList<RecordedCommand> copiedCommands = recorder.Commands;
+
+        Assert.NotNull(attached);
+        Assert.NotNull(copied);
+        Assert.Equal(copied.Tables, attached.Tables);
+        Assert.Equal(Pairs(copied.ResolvedTableNames), Pairs(attached.ResolvedTableNames));
+        Assert.True(attached.CanInsert(form) && attached.CanUpdate(form) && attached.CanDelete(form));
+        Assert.True(attachedCommands.Count == 1, DescribeCommands(attachedCommands));
+        RecordedCommand permission = attachedCommands[0];
+        Assert.True(
+            permission.Succeeded && !permission.InTransaction && !permission.IsWrite,
+            permission.ToString());
+        Assert.Contains(PermissionFunction, permission.CommandText, StringComparison.Ordinal);
+        Assert.Equal(securables, permission.Parameters.Select(parameter => Assert.IsType<string>(parameter.Value)));
+        Assert.True(copiedCommands.Count == 2, DescribeCommands(copiedCommands));
+        Assert.Equal(permission.CommandText, copiedCommands[1].CommandText);
+
+        var store = new SqlServerDataStore(options, recorder);
+        FormMetadata? storeForm = await store.GetFormMetadataAsync(viewId, ct);
+        Assert.NotNull(storeForm);
+        recorder.Clear();
+        FormPermissions? fromStore = await store.GetPermissionsAsync(storeForm, ct);
+
+        Assert.NotNull(fromStore);
+        Assert.Equal(attached.Tables, fromStore.Tables);
+        RecordedCommand storePermission = Assert.Single(recorder.Commands);
+        Assert.Contains(PermissionFunction, storePermission.CommandText, StringComparison.Ordinal);
+        Assert.Equal(
+            securables,
+            storePermission.Parameters.Select(parameter => Assert.IsType<string>(parameter.Value)));
+    }
+
     [Theory]
     [MemberData(nameof(SeededForms))]
     public async Task RepeatedCalls_OnOneReader_ReadTheCatalogueAndPermissionsAgain(

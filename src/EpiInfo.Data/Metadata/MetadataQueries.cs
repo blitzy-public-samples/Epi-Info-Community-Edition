@@ -7,10 +7,18 @@ namespace EpiInfo.Data.Metadata;
 /// contract with the reader's Dapper row classes.
 /// </summary>
 /// <remarks>
+/// <para>
 /// The metadata tables are referenced unqualified, as legacy Epi Info does, so they resolve as any unqualified
 /// name does: in the caller's default schema first, then in <c>dbo</c>. The parameter names below are spelled
 /// literally inside the statements, because a constant built from them would need interpolation; keep both
 /// spellings identical.
+/// </para>
+/// <para>
+/// The six statements of a form read (<see cref="View"/>, <see cref="DataTableName"/>, <see cref="Pages"/>,
+/// <see cref="Fields"/>, <see cref="Columns"/> and <see cref="TableClaims"/>) are composed from row sources that
+/// <see cref="FormFingerprint"/> embeds unchanged, so the probe a write sends inside its transaction digests exactly
+/// the rows and columns a form read returns.
+/// </para>
 /// </remarks>
 internal static class MetadataQueries
 {
@@ -42,42 +50,34 @@ internal static class MetadataQueries
         ORDER BY v.[ViewId];
         """;
 
-    /// <summary>Takes <c>@viewId</c>; returns <c>ViewId</c>, <c>Name</c> of that <c>metaViews</c> row, or no row for an unknown form.</summary>
-    internal const string View = """
+    /// <summary>Name of the form verification probe's result column, the digest <see cref="FormFingerprint"/> returns.</summary>
+    public const string FingerprintColumn = "Fingerprint";
+
+    // The row sources of a form read: each statement below is its source followed by its ORDER BY, and
+    // FormFingerprint embeds each source unchanged as a derived table, so both select the same rows and columns.
+    private const string ViewSource = """
         SELECT v.[ViewId] AS ViewId,
                v.[Name] AS Name
         FROM [metaViews] AS v
-        WHERE v.[ViewId] = @viewId;
+        WHERE v.[ViewId] = @viewId
         """;
 
-    /// <summary>Takes <c>@viewId</c>; returns the distinct non-null <c>DataTableName</c> values of the form's <c>metaFields</c> rows.</summary>
-    /// <remarks>
-    /// Same statement as legacy <c>MetadataDbProvider.GetDataTableName</c>. Legacy takes the first row; the reader
-    /// instead requires exactly one non-blank row and treats anything else as broken metadata.
-    /// </remarks>
-    internal const string DataTableName = """
+    private const string DataTableNameSource = """
         SELECT DISTINCT [DataTableName] AS DataTableName
         FROM [metaFields]
         WHERE [ViewId] = @viewId
-          AND [DataTableName] IS NOT NULL;
+          AND [DataTableName] IS NOT NULL
         """;
 
-    /// <summary>Takes <c>@viewId</c>; returns <c>PageId</c>, <c>Name</c>, <c>Position</c> (<c>smallint</c>, 0-based in the seed) ordered by <c>Position</c>, then <c>PageId</c>.</summary>
-    internal const string Pages = """
+    private const string PagesSource = """
         SELECT [PageId] AS PageId,
                [Name] AS Name,
                [Position] AS Position
         FROM [metaPages]
         WHERE [ViewId] = @viewId
-        ORDER BY [Position], [PageId];
         """;
 
-    /// <summary>Takes <c>@viewId</c>; returns every <c>metaFields</c> row of the form with its <c>metaFieldTypes</c> name as <c>FieldTypeName</c>, ordered by <c>FieldId</c>.</summary>
-    /// <remarks>
-    /// System rows with a null <c>PageId</c> (<c>UniqueKey</c>, <c>RecStatus</c>, <c>GlobalRecordId</c>) are included;
-    /// the reader and the form-definition factory decide what is listed. <c>PromptText</c> is aliased <c>Prompt</c>.
-    /// </remarks>
-    internal const string Fields = """
+    private const string FieldsSource = """
         SELECT f.[FieldId] AS FieldId,
                f.[Name] AS Name,
                f.[PromptText] AS Prompt,
@@ -100,6 +100,111 @@ internal static class MetadataQueries
         FROM [metaFields] AS f
         INNER JOIN [metaFieldTypes] AS ft ON ft.[FieldTypeId] = f.[FieldTypeId]
         WHERE f.[ViewId] = @viewId
+        """;
+
+    // The catalogue columns of the tables a list of names reaches, up to the IN that each user completes with its own
+    // list of names: Columns with @names, FormFingerprint with the form's own names. The user tables are the
+    // sys.objects rows of type U, the rows of sys.tables, read without the joins sys.tables adds for columns this
+    // source never selects.
+    private const string ColumnsSource = """
+        SELECT t.[name] AS TableName,
+               c.[name] AS ColumnName,
+               ty.[name] AS TypeName,
+               c.[max_length] AS MaxLengthBytes,
+               c.[is_nullable] AS IsNullable,
+               c.[is_identity] AS IsIdentity,
+               c.[column_id] AS ColumnId,
+               t.[object_id] AS ObjectId,
+               CONVERT(nvarchar(16), CAST(t.[modify_date] AS binary(8)), 2) AS ModifiedStamp
+        FROM sys.objects AS t
+        INNER JOIN sys.columns AS c ON c.[object_id] = t.[object_id]
+        INNER JOIN sys.types AS ty ON ty.[user_type_id] = c.[user_type_id]
+        WHERE t.[type] = 'U'
+          AND t.[object_id] = OBJECT_ID(QUOTENAME(t.[name]))
+          AND t.[name] COLLATE Latin1_General_100_CI_AS IN
+        """;
+
+    // The common table expressions of TableClaims, without their WITH: [Own], the form's own table names; [Split],
+    // each own name cut before each of its last 1 to 11 UTF-16 code units; and [Named], each form's distinct
+    // data-table names. FormFingerprint uses all three.
+    private const string ClaimSources = """
+        [Own] ([Name]) AS
+        (
+            SELECT @baseName
+            UNION ALL
+            SELECT @baseName + CAST(p.[PageId] AS nvarchar(11))
+            FROM [metaPages] AS p
+            WHERE p.[ViewId] = @viewId
+        ),
+        [Split] ([Prefix], [Suffix]) AS
+        (
+            -- The prefix length is guarded inside the expression, because SQL Server may compute it before the filter.
+            SELECT SUBSTRING(o.[Name] COLLATE Latin1_General_100_BIN2, 1, CASE WHEN n.[Units] > s.[Length] THEN n.[Units] - s.[Length] ELSE 0 END),
+                   SUBSTRING(o.[Name] COLLATE Latin1_General_100_BIN2, n.[Units] - s.[Length] + 1, s.[Length])
+            FROM [Own] AS o
+            CROSS APPLY (SELECT DATALENGTH(o.[Name]) / 2) AS n ([Units])
+            CROSS JOIN (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10), (11)) AS s ([Length])
+            WHERE n.[Units] > s.[Length]
+        ),
+        [Named] ([ViewId], [DataTableName], [Length]) AS
+        (
+            -- One row per form and spelling, kept apart by its binary text and its length, before any comparison.
+            SELECT f.[ViewId], f.[DataTableName] COLLATE Latin1_General_100_BIN2, DATALENGTH(f.[DataTableName])
+            FROM [metaFields] AS f
+            GROUP BY f.[ViewId], f.[DataTableName] COLLATE Latin1_General_100_BIN2, DATALENGTH(f.[DataTableName])
+        )
+        """;
+
+    private const string ClaimsSource = """
+        SELECT f.[ViewId] AS ViewId,
+               f.[DataTableName] AS DataTableName,
+               CAST(NULL AS int) AS PageId
+        FROM [Named] AS f
+        INNER JOIN [Own] AS o
+            ON f.[DataTableName] COLLATE Latin1_General_100_CI_AS = o.[Name] COLLATE Latin1_General_100_CI_AS
+        WHERE f.[ViewId] <> @viewId
+        GROUP BY f.[ViewId], f.[DataTableName], f.[Length]
+        UNION ALL
+        SELECT p.[ViewId],
+               f.[DataTableName],
+               p.[PageId]
+        FROM [Split] AS s
+        INNER JOIN [metaPages] AS p
+            ON CAST(p.[PageId] AS nvarchar(11)) COLLATE Latin1_General_100_BIN2 = s.[Suffix] COLLATE Latin1_General_100_BIN2
+           AND p.[ViewId] <> @viewId
+        INNER JOIN [Named] AS f
+            ON f.[ViewId] = p.[ViewId]
+           AND f.[DataTableName] COLLATE Latin1_General_100_CI_AS = s.[Prefix] COLLATE Latin1_General_100_CI_AS
+        GROUP BY p.[ViewId], p.[PageId], f.[DataTableName], f.[Length]
+        """;
+
+    /// <summary>Takes <c>@viewId</c>; returns <c>ViewId</c>, <c>Name</c> of that <c>metaViews</c> row, or no row for an unknown form.</summary>
+    internal const string View = $"""
+        {ViewSource};
+        """;
+
+    /// <summary>Takes <c>@viewId</c>; returns the distinct non-null <c>DataTableName</c> values of the form's <c>metaFields</c> rows.</summary>
+    /// <remarks>
+    /// Same statement as legacy <c>MetadataDbProvider.GetDataTableName</c>. Legacy takes the first row; the reader
+    /// instead requires exactly one non-blank row and treats anything else as broken metadata.
+    /// </remarks>
+    internal const string DataTableName = $"""
+        {DataTableNameSource};
+        """;
+
+    /// <summary>Takes <c>@viewId</c>; returns <c>PageId</c>, <c>Name</c>, <c>Position</c> (<c>smallint</c>, 0-based in the seed) ordered by <c>Position</c>, then <c>PageId</c>.</summary>
+    internal const string Pages = $"""
+        {PagesSource}
+        ORDER BY [Position], [PageId];
+        """;
+
+    /// <summary>Takes <c>@viewId</c>; returns every <c>metaFields</c> row of the form with its <c>metaFieldTypes</c> name as <c>FieldTypeName</c>, ordered by <c>FieldId</c>.</summary>
+    /// <remarks>
+    /// System rows with a null <c>PageId</c> (<c>UniqueKey</c>, <c>RecStatus</c>, <c>GlobalRecordId</c>) are included;
+    /// the reader and the form-definition factory decide what is listed. <c>PromptText</c> is aliased <c>Prompt</c>.
+    /// </remarks>
+    internal const string Fields = $"""
+        {FieldsSource}
         ORDER BY f.[FieldId];
         """;
 
@@ -125,52 +230,18 @@ internal static class MetadataQueries
     /// under trailing-space padding, refuses nothing. Lengths come from <c>DATALENGTH</c>, which counts trailing
     /// spaces where <c>LEN</c> does not, and the text is cut under a binary collation, so positions count UTF-16
     /// code units under any database collation. Each claimed spelling is grouped by its binary text and its length,
-    /// so case and trailing-space variants are each returned as stored. The statement uses no <c>TRY_CAST</c>,
+    /// so case and trailing-space variants are each returned as stored; each form's spellings are grouped so before
+    /// any comparison (<c>[Named]</c>), so the comparisons grow with the forms' distinct data-table names, not with
+    /// their fields. The statement uses no <c>TRY_CAST</c>,
     /// <c>OPENJSON</c> or <c>STRING_SPLIT</c>, so it runs at every compatibility level SQL Server 2022 supports.
     /// </para>
     /// </remarks>
-    internal const string TableClaims = """
-        WITH [Own] ([Name]) AS
-        (
-            SELECT @baseName
-            UNION ALL
-            SELECT @baseName + CAST(p.[PageId] AS nvarchar(11))
-            FROM [metaPages] AS p
-            WHERE p.[ViewId] = @viewId
-        ),
-        [Split] ([Prefix], [Suffix]) AS
-        (
-            -- The prefix length is guarded inside the expression, because SQL Server may compute it before the filter.
-            SELECT SUBSTRING(o.[Name] COLLATE Latin1_General_100_BIN2, 1, CASE WHEN n.[Units] > s.[Length] THEN n.[Units] - s.[Length] ELSE 0 END),
-                   SUBSTRING(o.[Name] COLLATE Latin1_General_100_BIN2, n.[Units] - s.[Length] + 1, s.[Length])
-            FROM [Own] AS o
-            CROSS APPLY (SELECT DATALENGTH(o.[Name]) / 2) AS n ([Units])
-            CROSS JOIN (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10), (11)) AS s ([Length])
-            WHERE n.[Units] > s.[Length]
-        )
-        SELECT f.[ViewId] AS ViewId,
-               f.[DataTableName] COLLATE Latin1_General_100_BIN2 AS DataTableName,
-               CAST(NULL AS int) AS PageId
-        FROM [metaFields] AS f
-        INNER JOIN [Own] AS o
-            ON f.[DataTableName] COLLATE Latin1_General_100_CI_AS = o.[Name] COLLATE Latin1_General_100_CI_AS
-        WHERE f.[ViewId] <> @viewId
-        GROUP BY f.[ViewId], f.[DataTableName] COLLATE Latin1_General_100_BIN2, DATALENGTH(f.[DataTableName])
-        UNION ALL
-        SELECT p.[ViewId],
-               f.[DataTableName] COLLATE Latin1_General_100_BIN2,
-               p.[PageId]
-        FROM [Split] AS s
-        INNER JOIN [metaPages] AS p
-            ON CAST(p.[PageId] AS nvarchar(11)) COLLATE Latin1_General_100_BIN2 = s.[Suffix] COLLATE Latin1_General_100_BIN2
-           AND p.[ViewId] <> @viewId
-        INNER JOIN [metaFields] AS f
-            ON f.[ViewId] = p.[ViewId]
-           AND f.[DataTableName] COLLATE Latin1_General_100_CI_AS = s.[Prefix] COLLATE Latin1_General_100_CI_AS
-        GROUP BY p.[ViewId], p.[PageId], f.[DataTableName] COLLATE Latin1_General_100_BIN2, DATALENGTH(f.[DataTableName]);
+    internal const string TableClaims = $"""
+        WITH {ClaimSources}
+        {ClaimsSource};
         """;
 
-    /// <summary>Takes <c>@names</c>; returns <c>TableName</c>, <c>ColumnName</c>, <c>TypeName</c>, <c>MaxLengthBytes</c>, <c>IsNullable</c>, <c>IsIdentity</c>, <c>ColumnId</c> for each named table that its unqualified name reaches for the caller, ordered by table, then <c>ColumnId</c>.</summary>
+    /// <summary>Takes <c>@names</c>; returns <c>TableName</c>, <c>ColumnName</c>, <c>TypeName</c>, <c>MaxLengthBytes</c>, <c>IsNullable</c>, <c>IsIdentity</c>, <c>ColumnId</c>, <c>ObjectId</c>, <c>ModifiedStamp</c> for each named table that its unqualified name reaches for the caller, ordered by table, then <c>ColumnId</c>.</summary>
     /// <remarks>
     /// <para>
     /// The names arrive as one JSON array, so the text stays constant and the list stays a single typed parameter;
@@ -203,28 +274,24 @@ internal static class MetadataQueries
     /// one-part identifiers it builds from it in later SQL, like the unqualified <c>meta*</c> reads of this class,
     /// resolve the same way, so descriptors, catalogue rows and record or code-table SQL always reach one object.
     /// A table, view or synonym of the same name in the default schema shadows a <c>dbo</c> table: a shadowing
-    /// table is the one returned, and a shadowing view or synonym, which is not in <c>sys.tables</c>, leaves the name
-    /// with no row.
+    /// table is the one returned, and a shadowing view or synonym, which is not a user table (a <c>sys.objects</c>
+    /// row of type <c>U</c>, as every <c>sys.tables</c> row is), leaves the name with no row.
     /// </para>
     /// <para>
     /// <c>sys.types</c> is joined on <c>user_type_id</c>, so a column of an alias type reports the alias name, which
     /// the field-type mapper does not admit, and the field ends up unsupported.
     /// </para>
+    /// <para>
+    /// <c>ObjectId</c> and <c>ModifiedStamp</c> identify the table each row belongs to: its <c>object_id</c>, and its
+    /// <c>modify_date</c> as the 16 hexadecimal digits of the <c>datetime</c>'s eight bytes, which change when the
+    /// table is dropped and created again or altered. The reader builds no schema from them; they make the rows a
+    /// form read returns, and so the digest <see cref="FormFingerprint"/> compares, name the very tables the read
+    /// bound.
+    /// </para>
     /// </remarks>
-    internal const string Columns = """
+    internal const string Columns = $"""
         IF (SELECT d.[compatibility_level] FROM sys.databases AS d WHERE d.[database_id] = DB_ID()) >= 130
-            SELECT t.[name] AS TableName,
-                   c.[name] AS ColumnName,
-                   ty.[name] AS TypeName,
-                   c.[max_length] AS MaxLengthBytes,
-                   c.[is_nullable] AS IsNullable,
-                   c.[is_identity] AS IsIdentity,
-                   c.[column_id] AS ColumnId
-            FROM sys.tables AS t
-            INNER JOIN sys.columns AS c ON c.[object_id] = t.[object_id]
-            INNER JOIN sys.types AS ty ON ty.[user_type_id] = c.[user_type_id]
-            WHERE t.[object_id] = OBJECT_ID(QUOTENAME(t.[name]))
-              AND t.[name] COLLATE Latin1_General_100_CI_AS IN
+            {ColumnsSource}
                   (SELECT n.[value] COLLATE Latin1_General_100_CI_AS FROM OPENJSON(@names) AS n)
             ORDER BY t.[name], c.[column_id];
         ELSE
@@ -267,21 +334,100 @@ internal static class MetadataQueries
                 WHERE s.[Position] > 0
                   AND m.[At] IS NOT NULL
             )
-            SELECT t.[name] AS TableName,
-                   c.[name] AS ColumnName,
-                   ty.[name] AS TypeName,
-                   c.[max_length] AS MaxLengthBytes,
-                   c.[is_nullable] AS IsNullable,
-                   c.[is_identity] AS IsIdentity,
-                   c.[column_id] AS ColumnId
-            FROM sys.tables AS t
-            INNER JOIN sys.columns AS c ON c.[object_id] = t.[object_id]
-            INNER JOIN sys.types AS ty ON ty.[user_type_id] = c.[user_type_id]
-            WHERE t.[object_id] = OBJECT_ID(QUOTENAME(t.[name]))
-              AND t.[name] COLLATE Latin1_General_100_CI_AS IN
+            {ColumnsSource}
                   (SELECT s.[Name] COLLATE Latin1_General_100_CI_AS FROM [Scan] AS s WHERE s.[Name] IS NOT NULL)
             ORDER BY t.[name], c.[column_id]
             OPTION (MAXRECURSION 0);
+        """;
+
+    /// <summary>
+    /// Takes <c>@viewId</c> and <c>@baseName</c>; returns one row, <c>Fingerprint</c>: the SHA-256 digest
+    /// (<c>varbinary</c>, 32 bytes) of every row <see cref="View"/>, <see cref="DataTableName"/>, <see cref="Pages"/>,
+    /// <see cref="Fields"/>, <see cref="Columns"/> and <see cref="TableClaims"/> return for the form now, the form's
+    /// own table names standing for <c>@names</c>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The record repository sends it inside a write's transaction, before any record statement, in place of those
+    /// six statements, with the view id and base name of the form read the request made outside the transaction. The
+    /// reader computes the same digest from the rows that read returned (<c>SqlMetadataReader</c>), so an equal
+    /// digest shows that every row and column a form read consumes is unchanged, and the form, its catalogue schema
+    /// and its ownership decision stand as that read made them; any other digest has the reader read the form again.
+    /// </para>
+    /// <para>
+    /// Each row source of those statements is embedded unchanged as a derived table, so the probe selects exactly
+    /// their rows. The columns follow from the form read's own: <see cref="Columns"/> reads the tables of the form's
+    /// base and page names, and here <c>[Own]</c>, the names <see cref="TableClaims"/> derives from <c>@baseName</c>
+    /// and the form's current <c>metaPages</c> rows, stands for that list; equal pages and data-table names give the
+    /// same names, and different ones already change the digest.
+    /// </para>
+    /// <para>
+    /// A row is the source's one-letter tag (<c>V</c>, <c>T</c>, <c>P</c>, <c>F</c>, <c>C</c>, <c>L</c>) followed by
+    /// each column in the source's order: <c>-</c> for <c>NULL</c>, and otherwise the value's text preceded by its
+    /// length in UTF-16 code units and a colon. A column the reader reads as a number or a bit gives its decimal text,
+    /// converted to <c>nvarchar(41)</c>, which holds that text whole for every numeric type; any other column is cast
+    /// to <c>nvarchar(max)</c>, whole. The encoding is prefix-free, so two rows encode alike only when every value is
+    /// alike. Each branch hashes each of its encoded rows with SHA-256 over its UTF-16 code units, so only 32-byte
+    /// digests leave the branches; the row digests, in ascending byte order so the order rows arrive in does not
+    /// matter, are written as uppercase hexadecimal, concatenated, and hashed again. No row gives the digest of the
+    /// empty text. The
+    /// statement uses no <c>OPENJSON</c>, <c>STRING_AGG</c>, <c>TRY_CAST</c> or <c>STRING_SPLIT</c>, only
+    /// <c>CONCAT</c>, <c>HASHBYTES</c> and <c>FOR XML PATH</c>, so it runs at every compatibility level SQL Server
+    /// 2022 supports, and it reads only <c>meta*</c> tables and catalogue views, naming no record table.
+    /// </para>
+    /// </remarks>
+    internal static readonly string FormFingerprint = $"""
+        WITH {ClaimSources},
+        [Fingerprinted] ([Hash]) AS
+        (
+            {FingerprintRows('V', ViewSource, Number("ViewId"), Text("Name"))}
+            UNION ALL
+            {FingerprintRows('T', DataTableNameSource, Text("DataTableName"))}
+            UNION ALL
+            {FingerprintRows('P', PagesSource, Number("PageId"), Text("Name"), Number("Position"))}
+            UNION ALL
+            {FingerprintRows(
+                'F',
+                FieldsSource,
+                Number("FieldId"),
+                Text("Name"),
+                Text("Prompt"),
+                Number("TabIndex"),
+                Number("PageId"),
+                Number("IsRequired"),
+                Number("IsReadOnly"),
+                Number("IsEncrypted"),
+                Number("MaxLength"),
+                Text("Lower"),
+                Text("Upper"),
+                Text("Pattern"),
+                Text("SourceTableName"),
+                Text("CodeColumnName"),
+                Text("TextColumnName"),
+                Number("Sort"),
+                Text("List"),
+                Number("FieldTypeId"),
+                Text("FieldTypeName"))}
+            UNION ALL
+            {FingerprintRows(
+                'C',
+                ColumnsSource + " (SELECT o.[Name] COLLATE Latin1_General_100_CI_AS FROM [Own] AS o)",
+                Text("TableName"),
+                Text("ColumnName"),
+                Text("TypeName"),
+                Number("MaxLengthBytes"),
+                Number("IsNullable"),
+                Number("IsIdentity"),
+                Number("ColumnId"),
+                Number("ObjectId"),
+                Text("ModifiedStamp"))}
+            UNION ALL
+            {FingerprintRows('L', ClaimsSource, Number("ViewId"), Text("DataTableName"), Number("PageId"))}
+        )
+        SELECT HASHBYTES('SHA2_256', ISNULL((SELECT CONVERT(nvarchar(64), h.[Hash], 2)
+                                             FROM [Fingerprinted] AS h
+                                             ORDER BY h.[Hash]
+                                             FOR XML PATH('')), N'')) AS {FingerprintColumn};
         """;
 
     /// <summary>Takes <c>@viewId</c> and <c>@maxLength</c>; returns <c>CheckCode</c> (<c>nvarchar(max)</c>, possibly <c>NULL</c>), the form's program cut to its first <c>@maxLength</c> UTF-16 code units, or no row for an unknown form.</summary>
@@ -330,4 +476,30 @@ internal static class MetadataQueries
         WHERE c.[object_id] = @objectId
         ORDER BY c.[column_id];
         """;
+
+    // One branch of FormFingerprint's [Fingerprinted]: the SHA-256 digest of every row of source, read as the derived
+    // table r, encoded as tag followed by each column in turn (FormFingerprint remarks). The names are this class's
+    // own aliases.
+    private static string FingerprintRows(char tag, string source, params DigestColumn[] columns)
+    {
+        IEnumerable<string> encoded = columns.Select(column =>
+        {
+            string text = column.IsNumber
+                ? $"CONVERT(nvarchar(41), r.[{column.Name}])"
+                : $"CAST(r.[{column.Name}] AS nvarchar(max))";
+            return $"CASE WHEN r.[{column.Name}] IS NULL THEN N'-' " +
+                $"ELSE CONCAT(DATALENGTH({text}) / 2, N':', {text}) END";
+        });
+        return $"SELECT HASHBYTES('SHA2_256', CONCAT(N'{tag}', {string.Join(", ", encoded)}))\nFROM ({source}) AS r";
+    }
+
+    // A column the reader reads as text: its value cast to nvarchar(max), whole.
+    private static DigestColumn Text(string name) => new(name, IsNumber: false);
+
+    // A column the reader reads only as a number or a bit: its decimal text, which for a value of any SQL Server
+    // numeric type is at most 40 characters (a negative decimal(38, 37)), so nvarchar(41) holds it whole.
+    private static DigestColumn Number(string name) => new(name, IsNumber: true);
+
+    // One column of a FormFingerprint branch: its alias in the source, and whether its text is that of a number.
+    private readonly record struct DigestColumn(string Name, bool IsNumber);
 }

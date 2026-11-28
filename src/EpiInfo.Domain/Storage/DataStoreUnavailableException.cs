@@ -7,8 +7,8 @@ namespace EpiInfo.Domain.Storage;
 /// </summary>
 /// <remarks>
 /// <para>
-/// The <c>EpiInfo.Data</c> store raises it only for the failures its <c>SqlErrorClassifier</c> classifies as
-/// unavailable:
+/// The <c>EpiInfo.Data</c> store raises it for two kinds of failure only. The first is a failure its
+/// <c>SqlErrorClassifier</c> classifies as unavailable:
 /// </para>
 /// <list type="bullet">
 /// <item><description>
@@ -27,9 +27,23 @@ namespace EpiInfo.Domain.Storage;
 /// connection string's code 25 and the other configuration codes, and a generic fatal number-0 error without the
 /// network layer's text, such as a server-side severe error, remain a 500;
 /// </description></item>
-/// <item><description>SqlClient connection-pool exhaustion while opening a connection;</description></item>
+/// <item><description>SqlClient connection-pool exhaustion while opening a connection.</description></item>
+/// </list>
+/// <para>
+/// The second is a condition the store detects itself, with no exception for the classifier to classify, so
+/// <see cref="SqlErrorNumber"/> is <see langword="null"/> and <see cref="Outcome"/> is
+/// <see cref="WriteOutcome.NotWritten"/>:
+/// </para>
+/// <list type="bullet">
 /// <item><description>
-/// an absent or blank <c>ConnectionStrings:EpiInfo</c>, detected before any connection is attempted.
+/// an absent or blank <c>ConnectionStrings:EpiInfo</c>, detected before any connection is attempted;
+/// </description></item>
+/// <item><description>
+/// the refusal of the per-form write lock that a write requests through <c>sp_getapplock</c> inside its transaction,
+/// before its first DML statement: <c>sp_getapplock</c> returns -1, the lock request timed out, or -3, the request
+/// was chosen as a deadlock victim. These are <c>sp_getapplock</c> return codes, not SQL Server error numbers, so the
+/// -1 here is not the connection error number -1 above, and the refusal raises no SQL exception. A command timeout
+/// while the lock request waits is a SQL exception numbered -2, which the classifier classifies as the first kind.
 /// </description></item>
 /// </list>
 /// <para>
@@ -81,7 +95,8 @@ public sealed class DataStoreUnavailableException : Exception
     /// <param name="outcome">What is known about the stored data, chosen by the rules in the remarks.</param>
     /// <param name="sqlErrorNumber">
     /// The SQL Server error number when the cause was a SQL exception; <see langword="null"/> otherwise, as for a
-    /// missing connection string or pool exhaustion.
+    /// missing connection string, pool exhaustion or a refused form write lock, whose <c>sp_getapplock</c> return code
+    /// (-1 timed out, -3 deadlock victim) is not an error number and is never passed here.
     /// </param>
     /// <param name="innerException">The underlying failure, attached for diagnostics only; may be <see langword="null"/>.</param>
     /// <exception cref="ArgumentNullException"><paramref name="operation"/> is <see langword="null"/>.</exception>
@@ -119,7 +134,8 @@ public sealed class DataStoreUnavailableException : Exception
 
     /// <summary>
     /// The SQL Server error number of the underlying SQL exception, or <see langword="null"/> when the cause was not a
-    /// SQL exception (a missing connection string, or pool exhaustion).
+    /// SQL exception: a missing connection string, pool exhaustion, or a form write lock that <c>sp_getapplock</c>
+    /// refused with its return code -1 (timed out) or -3 (deadlock victim), which is never stored here.
     /// </summary>
     public int? SqlErrorNumber { get; }
 }

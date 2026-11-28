@@ -26,8 +26,8 @@ namespace EpiInfo.Domain.Storage;
 /// </list>
 /// <para>
 /// These are the "Unexpected" (500) class of the error classification. Examples: a constraint or conversion error; a
-/// permission error (229, 230) while permission awareness is not delivered; the <see cref="ArgumentException"/> of a
-/// malformed connection string; an <see cref="InvalidOperationException"/> that is not SqlClient pool exhaustion.
+/// permission error (229, 230) that the store's permission read did not foresee; the <see cref="ArgumentException"/> of
+/// a malformed connection string; an <see cref="InvalidOperationException"/> that is not SqlClient pool exhaustion.
 /// </para>
 /// <para>The outcome follows what the store can prove about the data:</para>
 /// <list type="bullet">

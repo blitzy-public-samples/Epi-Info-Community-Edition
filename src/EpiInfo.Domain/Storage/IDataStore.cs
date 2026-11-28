@@ -43,7 +43,8 @@ namespace EpiInfo.Domain.Storage;
 /// never from a caller's string; in <c>EpiInfo.Data</c> that is the reader-built <c>TableSchema</c>. The
 /// <see cref="FormMetadata"/> a record method receives identifies the form. A record read takes its tables and columns
 /// from the catalogue read that produced that very instance in the same request, or reads them again for any other
-/// instance; a write reads them again inside its transaction.
+/// instance; a write confirms inside its transaction that the metadata and catalogue rows that read returned still
+/// stand, and reads them again there when they do not or for any other instance.
 /// </para>
 /// <para>
 /// <b>Cancellation.</b> Every method takes the request's abort token as its last, required parameter, so no caller

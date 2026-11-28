@@ -1,6 +1,10 @@
 using System.Data;
+using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using EpiInfo.Data.Sql;
 using EpiInfo.Domain.Forms;
@@ -21,13 +25,15 @@ namespace EpiInfo.Data.Metadata;
 /// <para>
 /// Nothing is kept across requests: <see cref="GetFormMetadataAsync"/> and every other read method send the commands
 /// they need on every call, so a changed form or column type is seen by the next request. Within a request, the
-/// catalogue schema <see cref="GetFormMetadataAsync"/> built stays attached to the exact instance it returned and is
-/// released with it, so a record read given that instance takes the schema through
-/// <see cref="ReuseOrReadFormAsync"/> with no command; any other instance is read again. Every statement is a
-/// <c>SELECT</c>, runs through <see cref="SqlExecution"/> with the configured command timeout and the command
-/// observer, and binds every value as a typed parameter. The one command with dynamic text, the code-table read, holds
-/// one <c>SELECT</c> per distinct code-table column a request needs, and names only tables and columns this class built
-/// from the catalogue and admitted as code tables.
+/// catalogue schema <see cref="GetFormMetadataAsync"/> built, and the rows that read consumed, stay attached to the
+/// exact instance it returned and are released with it. A record read given that instance takes the schema through
+/// <see cref="ReuseOrReadFormAsync"/>, and the permission reader through <see cref="TryGetAttachedSchema"/>, with no
+/// command; a write verifies the rows inside its transaction with the one <see cref="MetadataQueries.FormFingerprint"/>
+/// statement of <see cref="VerifyOrReadFormAsync"/>, and reads the form again when they changed. Any other instance is
+/// read again. Every statement is a <c>SELECT</c>, runs through <see cref="SqlExecution"/> with the configured command
+/// timeout and the command observer, and binds every value as a typed parameter. The one command with dynamic text,
+/// the code-table read, holds one <c>SELECT</c> per distinct code-table column a request needs, and names only tables
+/// and columns this class built from the catalogue and admitted as code tables.
 /// </para>
 /// <para>
 /// Metadata names an object only in its role. A form is read and written only through its own record tables
@@ -42,7 +48,7 @@ namespace EpiInfo.Data.Metadata;
 /// Failures to open a connection or to run a command are not caught here: <see cref="SqlConnectionFactory"/> and the
 /// store that owns this reader classify them. The exceptions raised here carry fixed messages that name no table,
 /// column, value or SQL text. The instance holds immutable collaborators and a thread-safe weak table of immutable
-/// schemas, and is safe to share across threads.
+/// schemas and read rows, whose digest is computed once under a lock, and is safe to share across threads.
 /// </para>
 /// </remarks>
 /// <param name="connectionFactory">Opens the connections of the port reads.</param>
@@ -56,6 +62,7 @@ internal sealed class SqlMetadataReader(
     // Fixed operation names reported to the connection factory and the command observer.
     private const string ListFormsOperation = "metadata.listForms";
     private const string ReadFormOperation = "metadata.readForm";
+    private const string VerifyFormOperation = "metadata.verifyForm";
     private const string ReadOptionsOperation = "metadata.readOptions";
     private const string ReadCheckCodeOperation = "metadata.readCheckCode";
     private const string ReadTempTableOperation = "metadata.readTempTable";
@@ -99,11 +106,12 @@ internal sealed class SqlMetadataReader(
 
     private readonly ISqlCommandObserver observer = observer ?? throw new ArgumentNullException(nameof(observer));
 
-    // The catalogue schema GetFormMetadataAsync built with each form it returned, keyed by that exact instance. The
-    // table compares keys by reference, never by record equality, so a copy or another read of the same form finds
-    // nothing, and it holds each key weakly, so an entry lives only as long as its form instance, which in the API ends
-    // with the request that read it. Nothing is answered from it except to a caller holding that very instance.
-    private readonly ConditionalWeakTable<FormMetadata, FormSchema> schemasByForm = new();
+    // The catalogue schema GetFormMetadataAsync built with each form it returned, and the rows that read consumed,
+    // keyed by that exact instance. The table compares keys by reference, never by record equality, so a copy or
+    // another read of the same form finds nothing, and it holds each key weakly, so an entry lives only as long as its
+    // form instance, which in the API ends with the request that read it. Nothing is answered from it except to a
+    // caller holding that very instance.
+    private readonly ConditionalWeakTable<FormMetadata, FormRead> readsByForm = new();
 
     /// <summary>Lists every form in <c>metaViews</c> with its page count, ordered by <c>ViewId</c>.</summary>
     /// <param name="cancellationToken">The request's abort token.</param>
@@ -137,12 +145,14 @@ internal sealed class SqlMetadataReader(
     /// <summary>Reads one form's metadata, with each field's page-table column as the catalogue reports it.</summary>
     /// <remarks>
     /// Every call opens a connection and sends the commands of <see cref="ReadFormAsync"/>; nothing is answered from
-    /// an earlier call. The catalogue schema built by the same read stays attached to the returned instance alone, so
-    /// a record read given that instance takes it through <see cref="ReuseOrReadFormAsync"/> without a command. The
-    /// attachment ends when the instance is no longer referenced, which for the API is the end of the request. A form
-    /// is returned only when its tables are its own record tables, as <see cref="ReadFormAsync"/> decides: its base
-    /// table and a table for every one of its pages exist with the record-table columns, and no other form's metadata
-    /// resolves to any of them.
+    /// an earlier call. The catalogue schema built by the same read, and the rows the read consumed, stay attached to
+    /// the returned instance alone: a record read given that instance takes the schema through
+    /// <see cref="ReuseOrReadFormAsync"/> without a command, the permission read takes it through
+    /// <see cref="TryGetAttachedSchema"/>, and a write verifies the rows inside its transaction with one statement
+    /// through <see cref="VerifyOrReadFormAsync"/>. The attachment ends when the instance is no longer referenced,
+    /// which for the API is the end of the request. A form is returned only when its tables are its own record tables,
+    /// as <see cref="ReadFormAsync"/> decides: its base table and a table for every one of its pages exist with the
+    /// record-table columns, and no other form's metadata resolves to any of them.
     /// </remarks>
     /// <param name="viewId">The form's <c>metaViews.ViewId</c>.</param>
     /// <param name="cancellationToken">The request's abort token.</param>
@@ -159,14 +169,14 @@ internal sealed class SqlMetadataReader(
             .ConfigureAwait(false);
         await using (connection.ConfigureAwait(false))
         {
-            if (await ReadFormAsync(connection, transaction: null, viewId, cancellationToken)
+            if (await ReadFormCoreAsync(connection, transaction: null, viewId, cancellationToken)
                     .ConfigureAwait(false) is not { } read)
             {
                 return null;
             }
 
             // The instance was built by this read, so no entry can exist for it yet.
-            schemasByForm.Add(read.Form, read.Schema);
+            readsByForm.Add(read.Form, read);
             return read.Form;
         }
     }
@@ -288,9 +298,10 @@ internal sealed class SqlMetadataReader(
 
     /// <summary>
     /// Reads one form's metadata and its catalogue schema on a connection the caller owns, sending every command on
-    /// each call; nothing is cached. The record repository calls it inside each write transaction, so a write sees the
-    /// schema as it stands, and through <see cref="ReuseOrReadFormAsync"/> for a read whose form instance this reader
-    /// did not return.
+    /// each call; nothing is cached. The record repository calls it inside a write's transaction through
+    /// <see cref="VerifyOrReadFormAsync"/> when the form read its request made outside the transaction is not attached
+    /// to the form it was given or no longer matches, so a write sees the schema as it stands, and through
+    /// <see cref="ReuseOrReadFormAsync"/> for a read whose form instance this reader did not return.
     /// </summary>
     /// <remarks>
     /// <para>
@@ -331,6 +342,20 @@ internal sealed class SqlMetadataReader(
     {
         ArgumentNullException.ThrowIfNull(connection);
 
+        return await ReadFormCoreAsync(connection, transaction, viewId, cancellationToken).ConfigureAwait(false)
+            is { } read
+                ? (read.Form, read.Schema)
+                : null;
+    }
+
+    // ReadFormAsync's commands and checks, returning with the form and its schema every row the read consumed, which
+    // GetFormMetadataAsync attaches to the form for a later verification (FormRead).
+    private async Task<FormRead?> ReadFormCoreAsync(
+        SqlConnection connection,
+        SqlTransaction? transaction,
+        int viewId,
+        CancellationToken cancellationToken)
+    {
         IReadOnlyList<ViewRow> views = await QueryAsync<ViewRow>(
                 connection,
                 transaction,
@@ -388,13 +413,14 @@ internal sealed class SqlMetadataReader(
             pageTableNames[index] = baseTableName + pageRows[index].PageId.ToString(CultureInfo.InvariantCulture);
         }
 
-        IReadOnlyList<TableSchema> tables = await ReadTablesAsync(
+        IReadOnlyList<ColumnRow> columnRows = await ReadColumnRowsAsync(
                 connection,
                 transaction,
                 pageTableNames.Prepend(baseTableName),
                 ReadFormOperation,
                 cancellationToken)
             .ConfigureAwait(false);
+        IReadOnlyList<TableSchema> tables = ToTables(columnRows);
 
         (TableSchema baseTable, TableSchema[] pageTables) = ResolveRecordTables(tables, baseTableName, pageTableNames);
 
@@ -485,7 +511,10 @@ internal sealed class SqlMetadataReader(
             Array.AsReadOnly(pages),
             Array.AsReadOnly(fields));
         var schema = new FormSchema(viewId, baseTable, pageSchemas);
-        return (form, schema);
+        return new FormRead(
+            form,
+            schema,
+            new FormReadRows(baseTableName, views, dataTableNames, pageRows, fieldRows, columnRows, claims));
     }
 
     /// <summary>
@@ -517,13 +546,147 @@ internal sealed class SqlMetadataReader(
         ArgumentNullException.ThrowIfNull(connection);
         ArgumentNullException.ThrowIfNull(form);
 
-        if (schemasByForm.TryGetValue(form, out FormSchema? schema))
+        if (TryGetAttachedSchema(form, out FormSchema? schema))
         {
             return (form, schema);
         }
 
         return await ReadFormAsync(connection, transaction: null, form.ViewId, cancellationToken)
             .ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Finds the catalogue schema <see cref="GetFormMetadataAsync"/> built with <paramref name="form"/>, when
+    /// <paramref name="form"/> is the very instance that call returned. No command is sent.
+    /// </summary>
+    /// <remarks>
+    /// Any other instance, a <see langword="with"/> copy or one built in memory included, has no schema, so a caller
+    /// can only reuse a schema this reader built from the catalogue for the same request's read of the form.
+    /// </remarks>
+    /// <param name="form">The form's metadata, as the caller was given it for this request.</param>
+    /// <param name="schema">The attached schema, or <see langword="null"/> when there is none.</param>
+    /// <returns><see langword="true"/> when a schema is attached to <paramref name="form"/>.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="form"/> is null.</exception>
+    internal bool TryGetAttachedSchema(FormMetadata form, [NotNullWhen(true)] out FormSchema? schema)
+    {
+        ArgumentNullException.ThrowIfNull(form);
+
+        if (readsByForm.TryGetValue(form, out FormRead? read))
+        {
+            schema = read.Schema;
+            return true;
+        }
+
+        schema = null;
+        return false;
+    }
+
+    /// <summary>
+    /// Supplies a write's transaction with the form's metadata and catalogue schema as they stand on
+    /// <paramref name="connection"/> and <paramref name="transaction"/>, verifying the request's own form read with
+    /// one statement where it can and reading the form again where it cannot.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// When <paramref name="form"/> is the very instance <see cref="GetFormMetadataAsync"/> returned, one
+    /// <see cref="MetadataQueries.FormFingerprint"/> statement digests, inside the transaction, every row the six
+    /// statements of <see cref="ReadFormAsync"/> would return now, and the digest is compared with the one this reader
+    /// computes from the rows that read returned (<see cref="FingerprintMatchesAsync"/>). Equal digests mean the
+    /// metadata, the catalogue columns of the bound tables, those tables' identity and last change, and the other
+    /// forms' claims are what the request read, so the form, its schema and the decision that its tables are its own
+    /// stand unchanged and are returned with no further command. Otherwise, and for any other instance, the form is
+    /// read again with <see cref="ReadFormAsync"/> on the same connection and transaction, whose checks then decide.
+    /// </para>
+    /// <para>
+    /// Either way the decision is made on the transaction's own connection before any record statement, and nothing is
+    /// kept across requests: the attachment lives only as long as the request's form instance.
+    /// </para>
+    /// </remarks>
+    /// <param name="connection">An open connection; this method neither opens nor closes it.</param>
+    /// <param name="transaction">The transaction every command joins, or <see langword="null"/>.</param>
+    /// <param name="form">The form's metadata, as the caller validated the write's values against it.</param>
+    /// <param name="cancellationToken">The request's abort token.</param>
+    /// <returns>
+    /// <paramref name="form"/> itself with its attached schema when the digests are equal; otherwise what
+    /// <see cref="ReadFormAsync"/> returns for <see cref="FormMetadata.ViewId"/>, <see langword="null"/> when the form
+    /// is no longer in <c>metaViews</c>.
+    /// </returns>
+    /// <exception cref="ArgumentNullException"><paramref name="connection"/> or <paramref name="form"/> is null.</exception>
+    /// <exception cref="InvalidOperationException">
+    /// A read of the form again finds that its fields do not name exactly one non-blank data table; that its base table
+    /// or one of its page tables is not in the catalogue; that one of them lacks the record-table columns; or that a
+    /// name another form's metadata claims resolves to one of them.
+    /// </exception>
+    internal async Task<(FormMetadata Form, FormSchema Schema)?> VerifyOrReadFormAsync(
+        SqlConnection connection,
+        SqlTransaction? transaction,
+        FormMetadata form,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(connection);
+        ArgumentNullException.ThrowIfNull(form);
+
+        if (readsByForm.TryGetValue(form, out FormRead? read)
+            && await FingerprintMatchesAsync(connection, transaction, form.ViewId, form, cancellationToken)
+                .ConfigureAwait(false))
+        {
+            return (form, read.Schema);
+        }
+
+        return await ReadFormAsync(connection, transaction, form.ViewId, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Sends the <see cref="MetadataQueries.FormFingerprint"/> statement for <paramref name="viewId"/> and the base
+    /// name of the form read attached to <paramref name="form"/>, and compares the digest it returns with the digest
+    /// of the rows that read returned.
+    /// </summary>
+    /// <remarks>
+    /// Production passes the form's own view id, through <see cref="VerifyOrReadFormAsync"/>. The digest of the
+    /// attached rows is computed once, on first use, from the very rows the read consumed, never from a second read.
+    /// A digest that is missing, of another length or of other bytes does not match.
+    /// </remarks>
+    /// <param name="connection">An open connection; this method neither opens nor closes it.</param>
+    /// <param name="transaction">The transaction the command joins, or <see langword="null"/>.</param>
+    /// <param name="viewId">The <c>metaViews.ViewId</c> whose rows the statement digests.</param>
+    /// <param name="form">The instance <see cref="GetFormMetadataAsync"/> returned, whose rows are compared.</param>
+    /// <param name="cancellationToken">The request's abort token.</param>
+    /// <returns>
+    /// <see langword="true"/> when the digests are equal; <see langword="false"/> otherwise, and with no command sent
+    /// when no form read is attached to <paramref name="form"/>.
+    /// </returns>
+    /// <exception cref="ArgumentNullException"><paramref name="connection"/> or <paramref name="form"/> is null.</exception>
+    internal async Task<bool> FingerprintMatchesAsync(
+        SqlConnection connection,
+        SqlTransaction? transaction,
+        int viewId,
+        FormMetadata form,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(connection);
+        ArgumentNullException.ThrowIfNull(form);
+
+        if (!readsByForm.TryGetValue(form, out FormRead? read))
+        {
+            return false;
+        }
+
+        byte[]? current = await SqlExecution.ExecuteScalarAsync<byte[]>(
+                connection,
+                transaction,
+                VerifyFormOperation,
+                new SqlStatement(
+                    MetadataQueries.FormFingerprint,
+                    [
+                        ColumnValueConverter.Int32(MetadataQueries.ViewIdParameter, viewId),
+                        ColumnValueConverter.Text(MetadataQueries.BaseNameParameter, read.Rows.BaseName),
+                    ]),
+                options.CommandTimeoutSeconds,
+                observer,
+                cancellationToken)
+            .ConfigureAwait(false);
+
+        return current is not null && read.Rows.Fingerprint.SequenceEqual(current);
     }
 
     /// <summary>
@@ -562,9 +725,9 @@ internal sealed class SqlMetadataReader(
     }
 
     /// <summary>
-    /// Resolves table names against the catalogue alone, on a connection the caller owns: one <c>sys.tables</c> and
-    /// <c>sys.columns</c> read for all of them, with no <c>meta*</c> read. The permission reader uses it to confirm a
-    /// form's own base and page tables before it checks them.
+    /// Resolves table names against the catalogue alone, on a connection the caller owns: one read of the user tables
+    /// and their <c>sys.columns</c> for all of them, with no <c>meta*</c> read. The permission reader uses it to
+    /// confirm the base and page tables of a form whose own read it did not make before it checks them.
     /// </summary>
     /// <param name="connection">An open connection; this method neither opens nor closes it.</param>
     /// <param name="transaction">The transaction the command joins, or <see langword="null"/>.</param>
@@ -712,12 +875,23 @@ internal sealed class SqlMetadataReader(
         SqlTransaction? transaction,
         IEnumerable<string> requestedNames,
         string operation,
+        CancellationToken cancellationToken) =>
+        ToTables(await ReadColumnRowsAsync(connection, transaction, requestedNames, operation, cancellationToken)
+            .ConfigureAwait(false));
+
+    // The catalogue rows of the tables the names reach, from one Columns statement, in its order; no command and no
+    // row when no name is given.
+    private async Task<IReadOnlyList<ColumnRow>> ReadColumnRowsAsync(
+        SqlConnection connection,
+        SqlTransaction? transaction,
+        IEnumerable<string> requestedNames,
+        string operation,
         CancellationToken cancellationToken)
     {
         string[] names = requestedNames.Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
         if (names.Length == 0)
         {
-            return Array.AsReadOnly(Array.Empty<TableSchema>());
+            return Array.AsReadOnly(Array.Empty<ColumnRow>());
         }
 
         // One JSON array keeps the statement text constant whatever the number of names; Text binds it as
@@ -727,14 +901,19 @@ internal sealed class SqlMetadataReader(
             ColumnValueConverter.Text(MetadataQueries.NamesParameter, JsonSerializer.Serialize(names)),
         ];
 
-        IReadOnlyList<ColumnRow> rows = await QueryAsync<ColumnRow>(
+        return await QueryAsync<ColumnRow>(
                 connection,
                 transaction,
                 operation,
                 new SqlStatement(MetadataQueries.Columns, parameters),
                 cancellationToken)
             .ConfigureAwait(false);
+    }
 
+    // The tables of catalogue rows, each with the catalogue's own spelling of its table and column names, in the order
+    // their first rows arrive.
+    private static IReadOnlyList<TableSchema> ToTables(IReadOnlyList<ColumnRow> rows)
+    {
         // Grouped ordinally, so two tables whose names differ only by case (possible in a case-sensitive database)
         // stay apart; MatchTable then decides which one a requested name means.
         var rowsByTable = new Dictionary<string, List<ColumnRow>>(StringComparer.Ordinal);
@@ -1201,6 +1380,39 @@ internal sealed class SqlMetadataReader(
         return Array.AsReadOnly(ordered.Select(value => new FieldOption(FieldValue.FromText(value), value)).ToArray());
     }
 
+    /// <summary>
+    /// Encodes one row of a form read as <see cref="MetadataQueries.FormFingerprint"/> encodes it on the server: the
+    /// row's tag, then each value in order, <c>-</c> for <see langword="null"/> and otherwise its length in UTF-16
+    /// code units in invariant digits, a colon and the text.
+    /// </summary>
+    /// <remarks>
+    /// The encoding is prefix-free: a value starts with <c>-</c> or with a digit and says where it ends, so two rows of
+    /// one tag and arity encode alike only when every value is alike, and a value cannot pass for the next one.
+    /// </remarks>
+    /// <param name="tag">The letter of the statement the row comes from.</param>
+    /// <param name="values">The row's values as SQL Server casts them to <c>nvarchar</c>.</param>
+    /// <returns>The encoded row.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="values"/> is null.</exception>
+    internal static string EncodeFingerprintRow(char tag, params string?[] values)
+    {
+        ArgumentNullException.ThrowIfNull(values);
+
+        var text = new StringBuilder().Append(tag);
+        foreach (string? value in values)
+        {
+            if (value is null)
+            {
+                text.Append('-');
+            }
+            else
+            {
+                text.Append(value.Length.ToString(CultureInfo.InvariantCulture)).Append(':').Append(value);
+            }
+        }
+
+        return text.ToString();
+    }
+
     private static ColumnSchema[] ToColumns(IEnumerable<ColumnRow> rows) =>
         rows.OrderBy(row => row.ColumnId)
             .Select(row => new ColumnSchema(
@@ -1324,5 +1536,153 @@ internal sealed class SqlMetadataReader(
         public bool IsIdentity { get; set; }
 
         public int ColumnId { get; set; }
+
+        // The table's object_id and modify_date stamp (MetadataQueries.Columns); 0 and null for the tempdb fixture
+        // rows, whose statement returns neither. Only the form read's digest uses them.
+        public int ObjectId { get; set; }
+
+        public string? ModifiedStamp { get; set; }
+    }
+
+    // One form read: the form, its catalogue schema and the rows the read consumed. GetFormMetadataAsync attaches it
+    // to the form it returns.
+    private sealed class FormRead(FormMetadata form, FormSchema schema, FormReadRows rows)
+    {
+        public FormMetadata Form { get; } = form;
+
+        public FormSchema Schema { get; } = schema;
+
+        public FormReadRows Rows { get; } = rows;
+    }
+
+    // The rows one form read consumed, from each of its six statements, and the data-table name it took as the base
+    // name, with their digest as MetadataQueries.FormFingerprint computes it on the server. The rows are those the
+    // read built the form, the schema and its ownership decision from; nothing changes them after the read.
+    private sealed class FormReadRows
+    {
+        private readonly IReadOnlyList<ViewRow> views;
+        private readonly IReadOnlyList<string?> dataTableNames;
+        private readonly IReadOnlyList<PageRow> pages;
+        private readonly IReadOnlyList<FieldRow> fields;
+        private readonly IReadOnlyList<ColumnRow> columns;
+        private readonly IReadOnlyList<TableClaimRow> claims;
+
+        // Computed once, on first use, so a request that never writes never pays for it.
+        private readonly Lazy<byte[]> fingerprint;
+
+        public FormReadRows(
+            string baseName,
+            IReadOnlyList<ViewRow> views,
+            IReadOnlyList<string?> dataTableNames,
+            IReadOnlyList<PageRow> pages,
+            IReadOnlyList<FieldRow> fields,
+            IReadOnlyList<ColumnRow> columns,
+            IReadOnlyList<TableClaimRow> claims)
+        {
+            BaseName = baseName;
+            this.views = views;
+            this.dataTableNames = dataTableNames;
+            this.pages = pages;
+            this.fields = fields;
+            this.columns = columns;
+            this.claims = claims;
+            fingerprint = new Lazy<byte[]>(ComputeFingerprint, LazyThreadSafetyMode.ExecutionAndPublication);
+        }
+
+        // The form's one non-blank DataTableName as the read found it, which the probe binds as @baseName.
+        public string BaseName { get; }
+
+        public ReadOnlySpan<byte> Fingerprint => fingerprint.Value;
+
+        // Each row encoded as MetadataQueries.FormFingerprint encodes it, with each column in its source's order.
+        private IEnumerable<string> EncodedRows()
+        {
+            foreach (ViewRow view in views)
+            {
+                yield return EncodeFingerprintRow('V', Number(view.ViewId), view.Name);
+            }
+
+            foreach (string? dataTableName in dataTableNames)
+            {
+                yield return EncodeFingerprintRow('T', dataTableName);
+            }
+
+            foreach (PageRow page in pages)
+            {
+                yield return EncodeFingerprintRow('P', Number(page.PageId), page.Name, Number(page.Position));
+            }
+
+            foreach (FieldRow field in fields)
+            {
+                yield return EncodeFingerprintRow(
+                    'F',
+                    Number(field.FieldId),
+                    field.Name,
+                    field.Prompt,
+                    field.TabIndex?.ToString(CultureInfo.InvariantCulture),
+                    Number(field.PageId),
+                    Bit(field.IsRequired),
+                    Bit(field.IsReadOnly),
+                    Bit(field.IsEncrypted),
+                    Number(field.MaxLength),
+                    field.Lower,
+                    field.Upper,
+                    field.Pattern,
+                    field.SourceTableName,
+                    field.CodeColumnName,
+                    field.TextColumnName,
+                    Bit(field.Sort),
+                    field.List,
+                    Number(field.FieldTypeId),
+                    field.FieldTypeName);
+            }
+
+            foreach (ColumnRow column in columns)
+            {
+                yield return EncodeFingerprintRow(
+                    'C',
+                    column.TableName,
+                    column.ColumnName,
+                    column.TypeName,
+                    Number(column.MaxLengthBytes),
+                    Bit(column.IsNullable),
+                    Bit(column.IsIdentity),
+                    Number(column.ColumnId),
+                    Number(column.ObjectId),
+                    column.ModifiedStamp);
+            }
+
+            foreach (TableClaimRow claim in claims)
+            {
+                yield return EncodeFingerprintRow('L', Number(claim.ViewId), claim.DataTableName, Number(claim.PageId));
+            }
+        }
+
+        // The digest of the encoded rows: SHA-256 of each row's UTF-16 code units, the row digests sorted ascending as
+        // uppercase hexadecimal (whose ordinal order is their byte order), concatenated, and hashed again. The code
+        // units are hashed as stored in memory, little-endian on every platform .NET runs the API on, which is how
+        // SQL Server holds nvarchar; on any other byte order the digests differ and every write reads the form again.
+        private byte[] ComputeFingerprint()
+        {
+            var rowDigests = new List<string>();
+            foreach (string row in EncodedRows())
+            {
+                rowDigests.Add(Convert.ToHexString(SHA256.HashData(MemoryMarshal.AsBytes(row.AsSpan()))));
+            }
+
+            rowDigests.Sort(StringComparer.Ordinal);
+            string concatenated = string.Concat(rowDigests);
+            return SHA256.HashData(MemoryMarshal.AsBytes(concatenated.AsSpan()));
+        }
+
+        // A value as SQL Server casts it to nvarchar: integers in invariant digits, bits as 1 or 0.
+        private static string? Number(long? value) => value?.ToString(CultureInfo.InvariantCulture);
+
+        private static string? Bit(bool? value) => value switch
+        {
+            null => null,
+            true => "1",
+            false => "0",
+        };
     }
 }

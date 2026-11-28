@@ -18,7 +18,9 @@ namespace EpiInfo.Api.Tests.Persistence;
 /// later commit, together, and the page writes of the two saves never interleave. There is no row-version check: the
 /// later writer wins, as in legacy Epi Info. Creates on the form, sent together with each other or beside an update of
 /// another record, all commit, each with its base row and one row on every page: no two such writes form a lock
-/// cycle, so none is ended as a deadlock victim and answered 503.
+/// cycle, so none is ended as a deadlock victim and answered 503. Soft deletes, Find searches and counts sent beside
+/// creates all succeed too: each soft delete takes the form's write lock shared, so no reader closes a cycle between
+/// it and a create.
 /// </summary>
 /// <remarks>
 /// <para>
@@ -69,6 +71,12 @@ namespace EpiInfo.Api.Tests.Persistence;
 /// record, its marker in <c>LastName</c>, and no other change than the update's own columns. Their messages name
 /// tables, columns, ids and counts, never a stored or submitted value.
 /// </para>
+/// <para>
+/// The mixed case sends rounds of creates, soft deletes of records the round created first, Find searches and counts,
+/// all in flight together. Every request must succeed, no recorded command may end with SQL error 1205, every soft
+/// delete's locked read must follow its transaction's shared form write lock, and the record tables must hold exactly
+/// the created records, the deleted ones at <c>RecStatus</c> 0 and the others at 1.
+/// </para>
 /// </remarks>
 [Trait("Category", "Integration")]
 [Collection(DatabaseCollections.Database)]
@@ -111,8 +119,30 @@ public sealed partial class ConcurrentSaveTests : IAsyncLifetime
     private const int CreateBurstSize = 10;
     private const int CreateBesideUpdateRounds = 10;
 
-    // RecStatus of an active record, as the save path writes it on insert.
+    // Rounds of the mixed burst: in each, creates, soft deletes of records the round created first, Find searches and
+    // counts on the form all in flight together, the mix whose HOLDLOCK readers once closed a cycle between a soft
+    // delete and a create's snapshot.
+    private const int MixedBurstRounds = 10;
+    private const int MixedBurstCreates = 3;
+    private const int MixedBurstDeletes = 3;
+    private const int MixedBurstFinds = 2;
+    private const int MixedBurstCounts = 2;
+
+    // The record repository's operation name for a soft delete, the fixed opening of the form write lock it sends
+    // ("DECLARE @result int; EXEC @result = sys.sp_getapplock @Resource = @p0, @LockMode = @p1, ..."), the mode it
+    // binds for a soft delete, and SQL Server's deadlock-victim error number.
+    private const string DeleteOperation = "records.delete";
+    private const string FormWriteLockPrefix = "DECLARE @result int; EXEC @result = sys.sp_getapplock ";
+    private const string SharedLockMode = "Shared";
+    private const int DeadlockVictimError = 1205;
+
+    // The Find criterion of the mixed burst: every LastName that starts like a test marker, so the search reads the
+    // base and page rows the creates and soft deletes of the burst change.
+    private const string MarkerSearchPattern = TestDatabase.MarkerPrefix + "*";
+
+    // RecStatus of an active record, as the save path writes it on insert, and of a soft-deleted one.
     private const short ActiveRecStatus = 1;
+    private const short DeletedRecStatus = 0;
 
     // FoodHistory.GlobalRecordId is nvarchar(255) (testdata/sql/05_data_tables.sql).
     private const int GlobalRecordIdLength = 255;
@@ -595,6 +625,183 @@ public sealed partial class ConcurrentSaveTests : IAsyncLifetime
                 (BaseTable, LastSaveTimeColumn),
             },
             "the creates beside the updates");
+    }
+
+    // Creates, soft deletes, Find searches and counts of one form sent together: the soft delete takes the form's write
+    // lock shared before its locked read, so it never runs beside a create, which holds the lock exclusive, and no
+    // HOLDLOCK reader can close a cycle between the two writers. Every request succeeds, no command ends as a deadlock
+    // victim (1205), each soft delete's transaction takes the shared lock right before its locked read, and the record
+    // tables hold exactly the created records, the deleted ones at RecStatus 0 and the others at 1.
+    [Fact]
+    public async Task Creates_deletes_finds_and_counts_sent_together_all_succeed_without_a_deadlock()
+    {
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        CancellationToken ct = timeout.Token;
+        await using DatabaseWriteLock dbLock = await DatabaseWriteLock.AcquireExclusiveAsync(ct);
+
+        Factory.Clock.SetLocalNow(TestStart);
+        int viewId = await ApiTestClient.GetViewIdAsync(Client, FormName, ct);
+        SqlSnapshot before = await SqlSnapshot.CaptureAsync(ct);
+        var created = new Dictionary<string, string>(StringComparer.Ordinal);
+        var deleted = new HashSet<string>(StringComparer.Ordinal);
+        Factory.Recorder.Clear();
+
+        for (int round = 1; round <= MixedBurstRounds; round++)
+        {
+            string label = string.Create(CultureInfo.InvariantCulture, $"round {round} of the mixed burst");
+            StampAt(minutes: round);
+
+            // The records this round deletes exist before the burst starts, so each delete finds an active record.
+            var toDelete = new Dictionary<string, string>(StringComparer.Ordinal);
+            await CreateSimultaneouslyAsync(viewId, MixedBurstDeletes, $"the deletable records of {label}", toDelete, ct);
+
+            string[] markers = [.. Enumerable.Range(0, MixedBurstCreates).Select(_ => TestDatabase.NewMarker())];
+            Task<CreatedRecord>[] creates =
+            [
+                .. markers.Select(marker =>
+                    ApiTestClient.CreateRecordAsync(Client, viewId, FieldValues((PageOneField, marker)), ct)),
+            ];
+            Task<HttpResponseMessage>[] deletes =
+                [.. toDelete.Keys.Select(id => Client.DeleteAsync(RecordPath(viewId, id), ct))];
+            Task<HttpResponseMessage>[] finds =
+            [
+                .. Enumerable.Range(0, MixedBurstFinds).Select(_ => ApiTestClient.PostJsonAsync(
+                    Client,
+                    string.Create(CultureInfo.InvariantCulture, $"/api/forms/{viewId}/records/search"),
+                    new { criteria = new[] { new { field = PageOneField, value = MarkerSearchPattern } } },
+                    ct)),
+            ];
+            Task<HttpResponseMessage>[] counts =
+            [
+                .. Enumerable.Range(0, MixedBurstCounts).Select(_ => Client.GetAsync(
+                    string.Create(CultureInfo.InvariantCulture, $"/api/forms/{viewId}/records/count"),
+                    ct)),
+            ];
+            Task<HttpResponseMessage>[] responses = [.. deletes, .. finds, .. counts];
+            try
+            {
+                await WhenAllSettledAsync([.. creates, .. responses]);
+
+                string[] failures = [.. creates.Where(create => !create.IsCompletedSuccessfully).Select(FailureOf)];
+                Assert.True(
+                    failures.Length == 0,
+                    $"{label}: every POST must return 201 with its record; {string.Join(" | ", failures)}");
+                for (int index = 0; index < creates.Length; index++)
+                {
+                    RecordCreated(created, await creates[index], markers[index], $"POST {index + 1} of {label}");
+                }
+
+                await AssertEachStatusAsync(deletes, HttpStatusCode.NoContent, "DELETE", label, ct);
+                await AssertEachStatusAsync(finds, HttpStatusCode.OK, "POST records/search", label, ct);
+                await AssertEachStatusAsync(counts, HttpStatusCode.OK, "GET records/count", label, ct);
+            }
+            finally
+            {
+                foreach (Task<HttpResponseMessage> response in responses)
+                {
+                    await SettleAsync(response);
+                }
+
+                await WhenAllSettledAsync(creates);
+            }
+
+            foreach ((string id, string marker) in toDelete)
+            {
+                created.Add(id, marker);
+                deleted.Add(id);
+            }
+        }
+
+        IReadOnlyList<RecordedCommand> commands = Factory.Recorder.Commands;
+        RecordedCommand[] victims = [.. commands.Where(command => command.SqlErrorNumber == DeadlockVictimError)];
+        Assert.True(
+            victims.Length == 0,
+            $"No command of the mixed burst may end as a deadlock victim (SQL error {DeadlockVictimError}):" +
+            DescribeCommands(victims));
+        AssertEachDeleteTookTheSharedFormLockFirst(commands, MixedBurstRounds * MixedBurstDeletes);
+
+        SqlSnapshot after = await SqlSnapshot.CaptureAsync(ct);
+        AssertOnlyCreatedRecordsAdded(
+            SqlSnapshot.Compare(before, after),
+            after,
+            created,
+            changedRecord: null,
+            allowedChanges: new HashSet<(string Table, string Column)>(),
+            "the mixed burst");
+        string[] wrongStatus =
+        [
+            .. created.Keys
+                .Where(id => StoredCell(after, BaseTable, RecStatusColumn, id) is not short status
+                    || status != (deleted.Contains(id) ? DeletedRecStatus : ActiveRecStatus))
+                .Order(StringComparer.Ordinal),
+        ];
+        Assert.True(
+            wrongStatus.Length == 0,
+            $"After the mixed burst each deleted record must hold RecStatus 0 and every other created record 1; these " +
+            $"GlobalRecordIds do not: [{string.Join(", ", wrongStatus)}].");
+    }
+
+    // Each response of requests answered expected; a message names the request, its index, the status and the
+    // problem's title and error keys, never a value.
+    private static async Task AssertEachStatusAsync(
+        IReadOnlyList<Task<HttpResponseMessage>> requests,
+        HttpStatusCode expected,
+        string request,
+        string label,
+        CancellationToken ct)
+    {
+        for (int index = 0; index < requests.Count; index++)
+        {
+            string name = string.Create(CultureInfo.InvariantCulture, $"{request} {index + 1} of {label}");
+            Assert.True(requests[index].IsCompletedSuccessfully, $"{name} sent no response; {FailureOf(requests[index])}");
+            await AssertStatusAsync(await requests[index], expected, name, ct);
+        }
+    }
+
+    // On each connection, every locked base read a soft delete sends inside its transaction directly follows that
+    // transaction's form write lock, taken shared and granted, and the burst sent exactly expected such reads.
+    private static void AssertEachDeleteTookTheSharedFormLockFirst(IReadOnlyList<RecordedCommand> commands, int expected)
+    {
+        int lockedReads = 0;
+        var violations = new List<RecordedCommand>();
+        foreach (IGrouping<Guid, RecordedCommand> connection in commands
+                     .Where(command => string.Equals(command.Operation, DeleteOperation, StringComparison.Ordinal))
+                     .GroupBy(command => command.ClientConnectionId))
+        {
+            RecordedCommand? formLock = null;
+            foreach (RecordedCommand command in connection.OrderBy(command => command.Sequence))
+            {
+                if (command.CommandText.StartsWith(FormWriteLockPrefix, StringComparison.Ordinal))
+                {
+                    formLock = command;
+                    continue;
+                }
+
+                if (IsLockedBaseRead(command))
+                {
+                    lockedReads++;
+                    bool sharedFirst = formLock is not null
+                        && formLock.InTransaction
+                        && formLock.Succeeded
+                        && command.InTransaction
+                        && Binds(formLock, SharedLockMode);
+                    if (!sharedFirst)
+                    {
+                        violations.Add(command);
+                    }
+                }
+
+                formLock = null;
+            }
+        }
+
+        Assert.True(
+            lockedReads == expected && violations.Count == 0,
+            string.Create(
+                CultureInfo.InvariantCulture,
+                $"Each soft delete must take the form's write lock {SharedLockMode} inside its transaction right before " +
+                $"its locked read of {BaseTable}: expected {expected} locked reads, actual {lockedReads}, " +
+                $"{violations.Count} without the lock before them:{DescribeCommands(violations)}"));
     }
 
     // Sends count creates, each with a fresh marker in LastName, with every request in flight before any is awaited,

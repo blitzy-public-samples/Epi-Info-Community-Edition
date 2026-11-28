@@ -20,21 +20,23 @@ namespace EpiInfo.Data.Permissions;
 /// from them, and it denies any table without an entry, such as a page whose table is missing from the catalogue.
 /// </para>
 /// <para>
-/// Each <see cref="GetPermissionsAsync"/> call uses one connection, outside any transaction. It sends at most one
-/// catalogue read, through <see cref="SqlMetadataReader.ResolveTablesAsync"/>: it confirms the form's own base and page
-/// tables and supplies each one's catalogue spelling, without reading the form's metadata again. That read is not sent
-/// when the base and page table names are all blank. Then one parameterised statement checks INSERT and UPDATE on up
-/// to 1,000 confirmed tables, and one more is sent for each further 1,000 or part of 1,000. A table the catalogue does
-/// not hold gets no entry, so it is denied; when no table is confirmed, no permission statement is sent and the result
-/// has no entry.
+/// Each <see cref="GetPermissionsAsync"/> call uses one connection, outside any transaction. For the very form instance
+/// the metadata reader returned in the same request, it checks the base and page tables of the catalogue schema that
+/// read built (<see cref="SqlMetadataReader.TryGetAttachedSchema"/>) and sends no catalogue read. For any other
+/// instance it sends one catalogue read, through <see cref="SqlMetadataReader.ResolveTablesAsync"/>: it confirms the
+/// form's own base and page tables and supplies each one's catalogue spelling, without reading the form's metadata
+/// again. That read is not sent when the base and page table names are all blank. Then one parameterised statement
+/// checks INSERT and UPDATE on up to 1,000 confirmed tables, and one more is sent for each further 1,000 or part of
+/// 1,000. A table the catalogue does not hold gets no entry, so it is denied; when no table is confirmed, no permission
+/// statement is sent and the result has no entry.
 /// </para>
 /// <para>
-/// <see cref="ReadResolvedAsync"/> sends the same permission statements, and builds the same entries, for tables a
-/// caller already resolved, on that caller's connection and inside its transaction, and sends no catalogue read. The
-/// record repository uses it within each write given permissions: an insert and an update, for the base table and
-/// every page table, and a soft delete, for the base table alone. So the INSERT an insert requires, the UPDATE and
-/// missing-page INSERT an update requires and the base-table UPDATE a soft delete requires are each decided inside
-/// the write's own transaction, on the tables that transaction's schema read confirmed.
+/// <see cref="ReadForWriteAsync"/> checks, for tables a write already resolved, on that write's connection and inside
+/// its transaction, only the permissions the write needs, and sends no catalogue read. The record repository uses it
+/// within each write given permissions: INSERT on the base table and every page table for an insert, UPDATE on them
+/// and INSERT on the table of each page whose row is missing for an update, and UPDATE on the base table for a soft
+/// delete. So the permissions each write requires are each decided inside the write's own transaction, on the tables
+/// that transaction's schema confirmed, by a statement of the write's own that repeats none the request sent before.
 /// </para>
 /// <para>
 /// Each entry carries the catalogue spelling of its table, and <see cref="FormPermissions.ResolvedTableNames"/> maps
@@ -65,10 +67,10 @@ namespace EpiInfo.Data.Permissions;
 /// </list>
 /// <para>
 /// Every statement is a <c>SELECT</c> and changes nothing. Nothing is cached: no call reuses an earlier call's
-/// catalogue or permission result, so a grant or revoke applies to the next request. Failures are not caught here:
-/// the connection factory classifies a failure to open, and the store that owns this reader, or the write whose
-/// transaction <see cref="ReadResolvedAsync"/> joins, classifies the rest. The instance holds only immutable
-/// collaborators and is safe to share across threads.
+/// permission result, and a catalogue result only within the request whose metadata read made it, so a grant or revoke
+/// applies to the next request. Failures are not caught here: the connection factory classifies a failure to open, and
+/// the store that owns this reader, or the write whose transaction <see cref="ReadForWriteAsync"/> joins, classifies
+/// the rest. The instance holds only immutable collaborators and is safe to share across threads.
 /// </para>
 /// </remarks>
 /// <param name="connectionFactory">Opens the one connection each call uses.</param>
@@ -101,8 +103,28 @@ internal sealed class SqlPermissionReader(
 
     private const string PermissionSqlTail = ") AS s ([Securable]);";
 
+    // The write-time statement: the same fixed fragments around one "(@pN, @pM)" row per table, where @pM is the Int32
+    // mask of the permissions the write needs there, InsertMaskBit for INSERT and UpdateMaskBit for UPDATE. The two bit
+    // checks are fixed text, so the statement text depends only on the number of tables, never on what a write asks
+    // for. A permission not asked for is NULL.
+    private const string WritePermissionSqlHead = """
+        SELECT s.[Securable] AS Securable,
+               CASE WHEN (s.[Needs] & 1) = 1 THEN HAS_PERMS_BY_NAME(s.[Securable], N'OBJECT', N'INSERT') END AS CanInsert,
+               CASE WHEN (s.[Needs] & 2) = 2 THEN HAS_PERMS_BY_NAME(s.[Securable], N'OBJECT', N'UPDATE') END AS CanUpdate
+        FROM (VALUES
+        """;
+
+    private const string WritePermissionSqlTail = ") AS s ([Securable], [Needs]);";
+
+    // The bits of a write-time row's mask, matching the fixed bit checks of WritePermissionSqlHead.
+    private const int InsertMaskBit = 1;
+
+    private const int UpdateMaskBit = 2;
+
     // SQL Server accepts at most 2,100 parameters in one request. A form never comes near that, but a longer table
-    // list is split into statements of this many tables so the check cannot fail on the limit.
+    // list is split into statements of this many tables, so that a form-level statement binds at most 1,000
+    // parameters and a write-time statement, which binds two per table, at most 2,000, and the check cannot fail on
+    // the limit.
     private const int MaxTablesPerStatement = 1000;
 
     private readonly SqlConnectionFactory connectionFactory =
@@ -122,9 +144,11 @@ internal sealed class SqlPermissionReader(
     /// <param name="form">
     /// The form's metadata, as the store's metadata reader returned it for the current request. Its
     /// <see cref="FormMetadata.BaseTableName"/> and each page's <see cref="PageMetadata.TableName"/> name the tables
-    /// to check, and each name is confirmed against the catalogue for this call, so every name checked is one the
-    /// database returned. A blank name, or one the catalogue does not hold, is not checked. The parameter list mirrors
-    /// <see cref="IDataStore.GetPermissionsAsync"/>, so the store forwards its arguments unchanged.
+    /// to check. When it is the very instance that read returned, the tables are those the read's catalogue schema
+    /// bound for this request; otherwise each name is confirmed against the catalogue for this call. Either way every
+    /// name checked is one the database returned in this request. A blank name, or one the catalogue does not hold, is
+    /// not checked. The parameter list mirrors <see cref="IDataStore.GetPermissionsAsync"/>, so the store forwards its
+    /// arguments unchanged.
     /// </param>
     /// <param name="cancellationToken">The request's abort token.</param>
     /// <returns>
@@ -151,16 +175,29 @@ internal sealed class SqlPermissionReader(
     {
         ArgumentNullException.ThrowIfNull(form);
 
-        List<string> requestedNames = RequestedTableNames(form);
+        // The schema the request's own metadata read built, when form is the instance that read returned: its tables
+        // are the ones the catalogue confirmed for this request, so they are checked with no catalogue read of their
+        // own. Any other form instance has its names confirmed by one catalogue read below.
+        IReadOnlyList<string> requestedNames;
+        IReadOnlyList<TableSchema?>? attachedTables = null;
+        if (metadataReader.TryGetAttachedSchema(form, out FormSchema? schema))
+        {
+            (requestedNames, attachedTables) = SchemaTables(form, schema);
+        }
+        else
+        {
+            requestedNames = RequestedTableNames(form);
+        }
 
         SqlConnection connection = await connectionFactory
             .OpenAsync(Operation, cancellationToken)
             .ConfigureAwait(false);
         await using (connection.ConfigureAwait(false))
         {
-            IReadOnlyList<TableSchema?> resolved = await metadataReader
-                .ResolveTablesAsync(connection, transaction: null, requestedNames, cancellationToken)
-                .ConfigureAwait(false);
+            IReadOnlyList<TableSchema?> resolved = attachedTables
+                ?? await metadataReader
+                    .ResolveTablesAsync(connection, transaction: null, requestedNames, cancellationToken)
+                    .ConfigureAwait(false);
 
             return await ReadResolvedAsync(
                     connection,
@@ -180,11 +217,9 @@ internal sealed class SqlPermissionReader(
     /// connection and, when one is given, inside the caller's transaction. No catalogue read is sent.
     /// </summary>
     /// <remarks>
-    /// The record repository calls it inside each write given permissions, before the write's first data statement:
-    /// inside an insert, after the form's exclusive write lock, for the base table and every page table; inside an
-    /// update, after the locked read and the required gate, for the base table and every page table; and inside a soft
-    /// delete, after the locked read, for the base table alone. So the permissions each write requires are decided by
-    /// the grants in force at that point of its transaction, on tables that transaction's own schema read confirmed.
+    /// <see cref="GetPermissionsAsync"/> calls it for the tables it confirmed or took from the request's attached
+    /// schema. A write checks its own permissions inside its transaction with <see cref="ReadForWriteAsync"/>, whose
+    /// statement asks only for the permissions that write needs.
     /// </remarks>
     /// <param name="connection">An open connection; this method neither opens nor closes it.</param>
     /// <param name="transaction">The transaction the statements join, or <see langword="null"/> for none.</param>
@@ -231,16 +266,168 @@ internal sealed class SqlPermissionReader(
 
         // Only tables the catalogue holds are checked, in request order and once each. A missing table gets no
         // entry, which FormPermissions denies, so the result can only fail closed.
-        var tables = new List<TableSchema>(resolved.Count);
+        var tables = new List<CheckedTable>(resolved.Count);
         var seen = new HashSet<string>(StringComparer.Ordinal);
         foreach (TableSchema? table in resolved)
         {
             if (table is not null && seen.Add(table.Name))
             {
-                tables.Add(table);
+                tables.Add(new CheckedTable(table, Insert: true, Update: true));
             }
         }
 
+        return await ReadCheckedAsync(
+                connection,
+                transaction,
+                operation,
+                tables,
+                writeTime: false,
+                requestedNames,
+                resolved,
+                commandTimeoutSeconds,
+                observer,
+                cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Reads, inside a write's transaction and on its connection, exactly the permissions that write needs at that
+    /// point: for each table the write checks, INSERT, UPDATE or both, as the write's rule asks. No catalogue read is
+    /// sent.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The record repository calls it inside each write given permissions, before the write's first data statement:
+    /// inside an insert, after the form's exclusive write lock, for INSERT on the base table and every page table;
+    /// inside an update, after the locked read and the required gate, for UPDATE on the base table and every page
+    /// table and INSERT on the table of every page whose row the locked read found missing; and inside a soft delete,
+    /// after the locked read, for UPDATE on the base table alone. So the permissions each write requires are decided by
+    /// the grants in force at that point of its transaction, on tables that transaction's own schema confirmed.
+    /// </para>
+    /// <para>
+    /// The statement binds each table, once, as two positional parameters: the bracket-quoted name of its reader-built
+    /// table, as <see cref="System.Data.DbType.String"/>, and beside it an <see cref="System.Data.DbType.Int32"/> mask
+    /// of the permissions to evaluate there, 1 for INSERT, 2 for UPDATE and 3 for both, which fixed bit checks in the
+    /// statement text test, so no requirement shapes the text. A permission not asked for is <c>NULL</c> and so denies,
+    /// and the write's rule never consults it. The projection is the write's own requirement, so it is not the
+    /// statement <see cref="GetPermissionsAsync"/> sends for the form definition and the service's checks.
+    /// </para>
+    /// </remarks>
+    /// <param name="connection">An open connection; this method neither opens nor closes it.</param>
+    /// <param name="transaction">The write's transaction, or <see langword="null"/> for none.</param>
+    /// <param name="operation">The write's fixed operation name, reported to the command observer.</param>
+    /// <param name="checks">
+    /// The tables to check in order, each with its name as the metadata spells it, the table the write's schema bound
+    /// for it (<see langword="null"/> when it bound none, which checks nothing and so denies) and the permissions the
+    /// write needs on it. A table named twice is checked once, for every permission either entry asks for.
+    /// </param>
+    /// <param name="commandTimeoutSeconds">The command timeout in whole seconds.</param>
+    /// <param name="observer">Receives every command this method sends.</param>
+    /// <param name="cancellationToken">The request's abort token.</param>
+    /// <returns>
+    /// One entry per distinct table checked for at least one permission, in request order, named with its catalogue
+    /// spelling, each flag set only where it was asked for and <c>HAS_PERMS_BY_NAME</c> returned 1; and
+    /// <see cref="FormPermissions.ResolvedTableNames"/> mapping each requested name that was bound to its entry's name.
+    /// When nothing is checked, no statement is sent and the result has no entry.
+    /// </returns>
+    /// <exception cref="ArgumentNullException">An argument, or a requested name, is null.</exception>
+    /// <exception cref="SqlException">A permission command failed; the caller classifies it.</exception>
+    /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> was cancelled.</exception>
+    internal static async Task<FormPermissions> ReadForWriteAsync(
+        SqlConnection connection,
+        SqlTransaction? transaction,
+        string operation,
+        IReadOnlyList<WritePermissionCheck> checks,
+        int commandTimeoutSeconds,
+        ISqlCommandObserver observer,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(connection);
+        ArgumentNullException.ThrowIfNull(operation);
+        ArgumentNullException.ThrowIfNull(checks);
+        ArgumentNullException.ThrowIfNull(observer);
+
+        var requestedNames = new string[checks.Count];
+        var resolved = new TableSchema?[checks.Count];
+        var tables = new List<CheckedTable>(checks.Count);
+        var indexByName = new Dictionary<string, int>(checks.Count, StringComparer.Ordinal);
+        for (int index = 0; index < checks.Count; index++)
+        {
+            WritePermissionCheck check = checks[index];
+            ArgumentNullException.ThrowIfNull(check.RequestedName, nameof(checks));
+            requestedNames[index] = check.RequestedName;
+            resolved[index] = check.Table;
+            if (check.Table is not { } table || !(check.Insert || check.Update))
+            {
+                continue;
+            }
+
+            // One row per table, asking for every permission any entry naming it asks for.
+            if (indexByName.TryGetValue(table.Name, out int existing))
+            {
+                CheckedTable merged = tables[existing];
+                tables[existing] = merged with
+                {
+                    Insert = merged.Insert || check.Insert,
+                    Update = merged.Update || check.Update,
+                };
+            }
+            else
+            {
+                indexByName.Add(table.Name, tables.Count);
+                tables.Add(new CheckedTable(table, check.Insert, check.Update));
+            }
+        }
+
+        return await ReadCheckedAsync(
+                connection,
+                transaction,
+                operation,
+                tables,
+                writeTime: true,
+                requestedNames,
+                resolved,
+                commandTimeoutSeconds,
+                observer,
+                cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    // The base table, then each page table in the schema's page order, metaPages.Position then PageId, which is the
+    // order RequestedTableNames gives the same form's names: each name as the form spells it, which for a form the
+    // metadata reader built is the catalogue spelling, beside the table the reader bound for it.
+    private static (IReadOnlyList<string> Names, IReadOnlyList<TableSchema?> Tables) SchemaTables(
+        FormMetadata form,
+        FormSchema schema)
+    {
+        var names = new string[schema.Pages.Count + 1];
+        var tables = new TableSchema?[schema.Pages.Count + 1];
+        names[0] = form.BaseTableName;
+        tables[0] = schema.BaseTable;
+        for (int index = 0; index < schema.Pages.Count; index++)
+        {
+            names[index + 1] = schema.Pages[index].Page.TableName;
+            tables[index + 1] = schema.Pages[index].Table;
+        }
+
+        return (names, tables);
+    }
+
+    // Checks each table, in order, with as many statements as MaxTablesPerStatement needs, and builds the entries and
+    // the resolved names of the result. writeTime chooses the write-time statement, which evaluates only the
+    // permissions each table asks for, over the form-level one, which evaluates both on every table.
+    private static async Task<FormPermissions> ReadCheckedAsync(
+        SqlConnection connection,
+        SqlTransaction? transaction,
+        string operation,
+        List<CheckedTable> tables,
+        bool writeTime,
+        IReadOnlyList<string> requestedNames,
+        IReadOnlyList<TableSchema?> resolved,
+        int commandTimeoutSeconds,
+        ISqlCommandObserver observer,
+        CancellationToken cancellationToken)
+    {
         if (tables.Count == 0)
         {
             return new FormPermissions([]);
@@ -254,7 +441,7 @@ internal sealed class SqlPermissionReader(
                     connection,
                     transaction,
                     operation,
-                    PermissionStatement(tables, start, count),
+                    PermissionStatement(tables, start, count, writeTime),
                     commandTimeoutSeconds,
                     observer,
                     cancellationToken)
@@ -272,7 +459,7 @@ internal sealed class SqlPermissionReader(
         var permissions = new TablePermission[tables.Count];
         for (int index = 0; index < permissions.Length; index++)
         {
-            TableSchema table = tables[index];
+            TableSchema table = tables[index].Table;
 
             // A table with no result row is denied, and only the value 1 grants: 0 and NULL deny.
             rowsBySecurable.TryGetValue(SqlIdentifier.Quote(table), out PermissionRow? row);
@@ -317,22 +504,38 @@ internal sealed class SqlPermissionReader(
 
     // Builds one permission statement for tables[start] to tables[start + count - 1]. The text holds only the fixed
     // fragments and the generated names @p0, @p1, ...: each table reaches SQL Server only as the nvarchar(max) value
-    // of its own parameter, the bracket-quoted name of a reader-built TableSchema, so no identifier or value ever
-    // shapes the statement text.
-    private static SqlStatement PermissionStatement(List<TableSchema> tables, int start, int count)
+    // of its own parameter, the bracket-quoted name of a reader-built TableSchema, and in a write-time statement the
+    // permissions it needs only as the int value of the parameter beside it, so no identifier or value ever shapes the
+    // statement text.
+    private static SqlStatement PermissionStatement(List<CheckedTable> tables, int start, int count, bool writeTime)
     {
         var parameters = new PositionalParameters();
-        var text = new StringBuilder(PermissionSqlHead);
+        var text = new StringBuilder(writeTime ? WritePermissionSqlHead : PermissionSqlHead);
         for (int index = start; index < start + count; index++)
         {
-            string securable = SqlIdentifier.Quote(tables[index]);
+            CheckedTable table = tables[index];
+            string securable = SqlIdentifier.Quote(table.Table);
             text.Append(index == start ? "(" : ", (")
-                .Append(parameters.Add(name => ColumnValueConverter.Text(name, securable)))
-                .Append(')');
+                .Append(parameters.Add(name => ColumnValueConverter.Text(name, securable)));
+            if (writeTime)
+            {
+                int mask = table.Mask;
+                text.Append(", ").Append(parameters.Add(name => ColumnValueConverter.Int32(name, mask)));
+            }
+
+            text.Append(')');
         }
 
-        text.Append(PermissionSqlTail);
+        text.Append(writeTime ? WritePermissionSqlTail : PermissionSqlTail);
         return parameters.ToStatement(text.ToString());
+    }
+
+    // A table one statement checks, and which of its permissions to evaluate in a write-time statement.
+    private readonly record struct CheckedTable(TableSchema Table, bool Insert, bool Update)
+    {
+        // The write-time row's mask: InsertMaskBit when the write needs INSERT, UpdateMaskBit when it needs UPDATE.
+        // ReadForWriteAsync checks no table that asks for neither, so a bound mask is never 0.
+        public int Mask => (Insert ? InsertMaskBit : 0) | (Update ? UpdateMaskBit : 0);
     }
 
     // Dapper row type: the property names match the column aliases of the permission statement. Securable is the
@@ -346,3 +549,23 @@ internal sealed class SqlPermissionReader(
         public int? CanUpdate { get; set; }
     }
 }
+
+/// <summary>
+/// One table a write checks inside its transaction through <see cref="SqlPermissionReader.ReadForWriteAsync"/>, and the
+/// permissions the write needs on it.
+/// </summary>
+/// <param name="RequestedName">
+/// The table's name exactly as the form's metadata spells it, <see cref="FormMetadata.BaseTableName"/> or
+/// <see cref="PageMetadata.TableName"/>; never <see langword="null"/>.
+/// </param>
+/// <param name="Table">
+/// The reader-built table the write's schema bound for that name, or <see langword="null"/> when it bound none, which
+/// checks nothing and so denies.
+/// </param>
+/// <param name="Insert">Whether the write needs INSERT on the table.</param>
+/// <param name="Update">Whether the write needs UPDATE on the table.</param>
+internal readonly record struct WritePermissionCheck(
+    string RequestedName,
+    TableSchema? Table,
+    bool Insert,
+    bool Update);

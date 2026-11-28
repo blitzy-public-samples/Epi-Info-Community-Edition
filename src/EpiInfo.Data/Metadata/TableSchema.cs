@@ -241,10 +241,11 @@ public sealed class PageTableSchema
 /// </summary>
 /// <remarks>
 /// <para>
-/// Only <c>SqlMetadataReader</c> constructs this type, from a catalogue read. A write reads the catalogue again inside
-/// its transaction. A record read uses the schema its request's metadata read built, reachable only through the form
-/// metadata instance that read returned, and reads the catalogue again for any other instance, so no schema serves
-/// another request.
+/// Only <c>SqlMetadataReader</c> constructs this type, from a catalogue read. A record read, the permission read and a
+/// write use the schema their request's metadata read built, reachable only through the form metadata instance that
+/// read returned, and read the catalogue again for any other instance, so no schema serves another request. A write
+/// uses it only once one statement inside its transaction has shown that the rows the read built it from still stand,
+/// and otherwise reads the catalogue again there.
 /// </para>
 /// <para>The instance is immutable after construction and safe to share across threads.</para>
 /// </remarks>

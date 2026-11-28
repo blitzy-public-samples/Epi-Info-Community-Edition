@@ -31,12 +31,15 @@ namespace EpiInfo.Data;
 /// their page counts, and <see cref="GetCheckCodeAsync"/> one of the form's program. <see cref="GetFormMetadataAsync"/>
 /// reads the form's <c>meta*</c> rows and its tables' catalogue columns on every call. <see cref="GetOptionsAsync"/>
 /// resolves and reads only the code tables the form's Legal Values data fields name, and opens no connection when none
-/// names both a code table and a column. <see cref="GetPermissionsAsync"/> resolves the form's tables in the catalogue
-/// and checks their permissions. A record read given the instance <see cref="GetFormMetadataAsync"/> returned in the
-/// same request uses the catalogue schema that read built, and reads the metadata and schema again only for an instance
-/// the reader did not return. A write reads them again inside its transaction, and every write given permissions, an
-/// insert, an update or a soft delete, also reads, inside that transaction, the permissions of the tables it resolved.
-/// Every identifier in record SQL comes from a schema the reader built from the catalogue.
+/// names both a code table and a column. <see cref="GetPermissionsAsync"/> checks the permissions of the form's tables,
+/// taking them from the catalogue schema the request's metadata read built and resolving them in the catalogue only
+/// for an instance the reader did not return. A record read given the instance <see cref="GetFormMetadataAsync"/>
+/// returned in the same request uses the catalogue schema that read built, and reads the metadata and schema again
+/// only for an instance the reader did not return. A write given that instance verifies, inside its transaction and
+/// with one statement, that the rows that read returned still stand, and reads the metadata and schema again there
+/// when they do not or for any other instance; every write given permissions, an insert, an update or a soft delete,
+/// also reads, inside that transaction, the permissions it needs on the tables it resolved. Every identifier in record
+/// SQL comes from a schema the reader built from the catalogue.
 /// </para>
 /// <para>
 /// <b>Find admission.</b> <see cref="SearchAsync"/> first takes one of the record repository's two Find slots, and

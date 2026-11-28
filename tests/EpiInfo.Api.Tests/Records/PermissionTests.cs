@@ -1232,9 +1232,16 @@ public sealed class PermissionTests
 /// read, the record read and the required gate and before its first write, for the base table and every page table,
 /// on a record whose page row is missing and once that row is repaired; and every soft delete after its locked read
 /// and before its UPDATE, for the base table alone. So the INSERT, the UPDATE and the missing-page INSERT each write
-/// needs are never decided from the service's earlier read.
+/// needs are never decided from the service's earlier read. Each case pins that statement's parameters exactly: each
+/// table's bracket-quoted name as <c>String</c>, then the <c>Int32</c> mask of what the write needs there, 1 for
+/// INSERT, 2 for UPDATE and 3 for both.
 /// </summary>
 /// <remarks>
+/// <para>
+/// The same requests, and the form definition, send no statement twice with the same parameter values: the service's
+/// permission check takes the tables the request's own metadata read confirmed, and a write's transaction verifies that
+/// read with one statement instead of reading the form again.
+/// </para>
 /// <para>
 /// The seeded login holds every permission and no denied principal is created, because the database's logins and
 /// users stay unchanged. The cases therefore prove where and on what the check runs through
@@ -1273,6 +1280,14 @@ public sealed class WritePermissionSqlTests
 
     private const string ServicePermissionOperation = "GetPermissions";
 
+    // The metadata reader's operation prefix, the operation of its write-time form verification, and that of the
+    // catalogue read a permission check sends for a form instance the reader did not return.
+    private const string MetadataOperationPrefix = "metadata.";
+
+    private const string VerifyFormOperation = "metadata.verifyForm";
+
+    private const string ResolveTablesOperation = "metadata.resolveTables";
+
     private const string PermissionFunction = "HAS_PERMS_BY_NAME";
 
     private const string LockHint = "UPDLOCK";
@@ -1280,22 +1295,45 @@ public sealed class WritePermissionSqlTests
     // The system procedure of the form's write lock, which an insert takes before its first lock on a record table.
     private const string FormWriteLockProcedure = "sp_getapplock";
 
-    // The parameters the in-transaction permission statement of an insert or an update binds, in order: the
-    // bracket-quoted catalogue names of FoodHistory's base table, then of its page tables in metaPages.Position order
-    // (testdata/sql/03_forms.sql and 05_data_tables.sql).
-    private static readonly string[] TableSecurables = ["[FoodHistory]", "[FoodHistory2]", "[FoodHistory3]"];
+    // The bracket-quoted catalogue names of FoodHistory's base table and of its page tables in metaPages.Position order
+    // (testdata/sql/03_forms.sql and 05_data_tables.sql), the securables the in-transaction permission statement binds.
+    private const string BaseSecurable = "[FoodHistory]";
 
-    // The one parameter the in-transaction permission statement of a soft delete binds: the base table alone.
-    private static readonly string[] BaseTableSecurable = ["[FoodHistory]"];
+    private const string PageOneSecurable = "[FoodHistory2]";
+
+    private const string PageTwoSecurable = "[FoodHistory3]";
+
+    // The Int32 mask the in-transaction permission statement binds beside each securable, saying what the write needs
+    // on that table, as SqlPermissionReader's fixed bit checks read it: 1 INSERT, 2 UPDATE, 3 both.
+    private const int InsertMask = 1;
+
+    private const int UpdateMask = 2;
+
+    private const int InsertAndUpdateMask = InsertMask | UpdateMask;
+
+    // An insert's statement binds the base table and then each page table, each for INSERT.
+    private static readonly (string Securable, int Mask)[] InsertRequirements =
+        [(BaseSecurable, InsertMask), (PageOneSecurable, InsertMask), (PageTwoSecurable, InsertMask)];
+
+    // A soft delete's statement binds the base table alone, for UPDATE.
+    private static readonly (string Securable, int Mask)[] DeleteRequirements = [(BaseSecurable, UpdateMask)];
 
     // Longer than DatabaseWriteLock's 300-second wait, so a lock held by another process fails the lock call rather
     // than this token; xUnit v2 gives a test no cancellation token of its own.
     private static readonly TimeSpan TestTimeout = TimeSpan.FromMinutes(10);
 
+    /// <summary>
+    /// The requests whose statements are compared: the FoodHistory form definition, and a create, an update and a soft
+    /// delete of a FoodHistory record.
+    /// </summary>
+    public static TheoryData<string> Requests => new() { "GET", "POST", "PUT", "DELETE" };
+
     // A PUT of a page-one field on a record lacking its FoodHistory3 row, a PUT of the page-two field that repairs the
     // row, and a PUT once every page row is present each read the permissions of the base table and every page table
     // in their transaction, which is where the UPDATE on each table, and the INSERT on FoodHistory3 while its row is
-    // missing, are decided. The service's own read runs before each transaction, outside it, and decides nothing there.
+    // missing, are decided: the first two ask FoodHistory3 for INSERT and UPDATE whichever page their field is on, and
+    // the third asks it for UPDATE alone. The service's own read runs before each transaction, outside it, and decides
+    // nothing there.
     [Fact]
     public async Task UpdatePermissions_AreReadInsideTheUpdateTransactionBeforeItsFirstWrite()
     {
@@ -1322,22 +1360,31 @@ public sealed class WritePermissionSqlTests
         await PutAsync(client, viewId, id, PageOneField, "Avery", ct);
         var pageOneUpdate = factory.Recorder.Commands;
         AssertServiceReadPrecedesTheTransaction("The PUT", pageOneUpdate);
-        AssertUpdatePermissionsCheckedInTheTransaction(pageOneUpdate);
+        AssertUpdatePermissionsCheckedInTheTransaction(pageOneUpdate, pageTwoRowMissing: true);
         Assert.Equal(0, await CountPageTwoRowsAsync(id, ct));
 
         factory.Recorder.Clear();
         await PutAsync(client, viewId, id, PageTwoField, "Pending", ct);
         var pageTwoUpdate = factory.Recorder.Commands;
         AssertServiceReadPrecedesTheTransaction("The PUT", pageTwoUpdate);
-        AssertUpdatePermissionsCheckedInTheTransaction(pageTwoUpdate);
+        AssertUpdatePermissionsCheckedInTheTransaction(pageTwoUpdate, pageTwoRowMissing: true);
         Assert.Equal(1, await CountPageTwoRowsAsync(id, ct));
 
         factory.Recorder.Clear();
         await PutAsync(client, viewId, id, PageOneField, "Blake", ct);
         var completeUpdate = factory.Recorder.Commands;
         AssertServiceReadPrecedesTheTransaction("The PUT", completeUpdate);
-        AssertUpdatePermissionsCheckedInTheTransaction(completeUpdate);
+        AssertUpdatePermissionsCheckedInTheTransaction(completeUpdate, pageTwoRowMissing: false);
         Assert.Equal(1, await CountPageTwoRowsAsync(id, ct));
+
+        // What the update needs on each table travels only in the mask parameters, so the statement text is the same
+        // with the page row missing and with every row present.
+        Assert.True(
+            string.Equals(
+                InTransactionCheckText(pageOneUpdate),
+                InTransactionCheckText(completeUpdate),
+                StringComparison.Ordinal),
+            "The in-transaction permission statement's text must not depend on what the update needs on each table.");
     }
 
     // A POST reads the permissions of the base table and every page table in its transaction, once it holds the form's
@@ -1403,6 +1450,113 @@ public sealed class WritePermissionSqlTests
         AssertDeletePermissionsCheckedInTheTransaction(delete);
     }
 
+    // No statement of the form definition or of a write is sent twice with the same parameter values (the identical-
+    // statement rule of the per-request SQL measurement): the service's permission check takes the tables the
+    // request's own metadata read confirmed, with no catalogue read of its own, and a write verifies that read inside
+    // its transaction with one probe, the transaction's first statement, instead of reading the form again; its
+    // permission statement asks only for what the write needs, so it repeats none the service sent.
+    [Theory]
+    [MemberData(nameof(Requests))]
+    public async Task Request_SendsNoStatementTwice_AndAWriteVerifiesItsFormWithOneStatement(string method)
+    {
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        var ct = timeout.Token;
+        await using var factory = await ApiFactory.ForDatabaseAsync();
+        using var client = factory.CreateClient();
+        await using var dbLock = await DatabaseWriteLock.AcquireExclusiveAsync(ct);
+
+        var viewId = await ApiTestClient.GetViewIdAsync(client, FoodHistory, ct);
+        var formPath = string.Create(CultureInfo.InvariantCulture, $"/api/forms/{viewId}");
+        string? id = null;
+        if (method is "PUT" or "DELETE")
+        {
+            var created = await ApiTestClient.CreateRecordAsync(
+                client,
+                viewId,
+                new Dictionary<string, object?> { [TestDatabase.MarkerField] = TestDatabase.NewMarker() },
+                ct);
+            id = created.GlobalRecordId;
+        }
+
+        factory.Recorder.Clear();
+        switch (method)
+        {
+            case "GET":
+                AssertStatus(await client.GetAsync(formPath, ct), HttpStatusCode.OK, "The GET");
+                break;
+            case "POST":
+                await ApiTestClient.CreateRecordAsync(
+                    client,
+                    viewId,
+                    new Dictionary<string, object?> { [TestDatabase.MarkerField] = TestDatabase.NewMarker() },
+                    ct);
+                break;
+            case "PUT" when id is not null:
+                await PutAsync(client, viewId, id, PageOneField, "Casey", ct);
+                break;
+            case "DELETE" when id is not null:
+                AssertStatus(
+                    await client.DeleteAsync($"{formPath}/records/{Uri.EscapeDataString(id)}", ct),
+                    HttpStatusCode.NoContent,
+                    "The DELETE");
+                break;
+            default:
+                throw new ArgumentOutOfRangeException(nameof(method), method, "The test sends no such request.");
+        }
+
+        var commands = factory.Recorder.Commands;
+        var repeated = commands
+            .GroupBy(StatementKey, StringComparer.Ordinal)
+            .Where(sameStatement => sameStatement.Count() > 1)
+            .Select(sameStatement => sameStatement.First())
+            .ToList();
+        Assert.True(
+            repeated.Count == 0,
+            $"The {method} sent these statements more than once with the same parameter values:" +
+            Describe(repeated) + Environment.NewLine + "All commands:" + Describe(commands));
+        Assert.True(
+            !commands.Any(command => IsOperation(command, ResolveTablesOperation)) &&
+            commands.Count(command => IsOperation(command, ServicePermissionOperation)) == 1,
+            $"The {method}'s permission check must send exactly one statement and no catalogue read:" +
+            Describe(commands));
+
+        if (method != "GET")
+        {
+            var inTransaction = commands.Where(command => command.InTransaction).ToList();
+            var metadataInTransaction = inTransaction
+                .Where(command => command.Operation.StartsWith(MetadataOperationPrefix, StringComparison.Ordinal))
+                .ToList();
+            Assert.True(
+                metadataInTransaction.Count == 1 &&
+                IsOperation(metadataInTransaction[0], VerifyFormOperation) &&
+                metadataInTransaction[0].Succeeded &&
+                ReferenceEquals(inTransaction[0], metadataInTransaction[0]),
+                $"The {method}'s transaction must verify its form with one probe, its first statement, and read no " +
+                "metadata again:" + Describe(inTransaction));
+        }
+    }
+
+    // A response's status, which a failure message names without the body; the response is disposed.
+    private static void AssertStatus(HttpResponseMessage response, HttpStatusCode expected, string request)
+    {
+        using (response)
+        {
+            Assert.True(
+                response.StatusCode == expected,
+                string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"{request} returned {(int)response.StatusCode}, expected {(int)expected}."));
+        }
+    }
+
+    // A command's text with its parameters' names, types and values: two commands with one key are one statement
+    // sent twice.
+    private static string StatementKey(RecordedCommand command) =>
+        command.CommandText + string.Concat(command.Parameters.Select(parameter => string.Create(
+            CultureInfo.InvariantCulture,
+            $"\u0000{parameter.Name}\u0000{parameter.DbType}\u0000{parameter.Value?.GetType().FullName}" +
+            $"\u0000{parameter.Value}")));
+
     // PUT {"values": {field: text}} answers 200 with the record holding the submitted text.
     private static async Task PutAsync(
         HttpClient client,
@@ -1458,8 +1612,8 @@ public sealed class WritePermissionSqlTests
     }
 
     // On the insert's connection, from its form write lock on, the statements before the first write are exactly the
-    // lock and one permission statement bound to the base table and then each page table, both inside the
-    // transaction, and the first write is the insert's own; no other permission statement joins any transaction.
+    // lock and one permission statement bound to the base table and then each page table, each for INSERT, both inside
+    // the transaction, and the first write is the insert's own; no other permission statement joins any transaction.
     private static void AssertInsertPermissionsCheckedInTheTransaction(IReadOnlyList<RecordedCommand> commands)
     {
         var formLocks = commands
@@ -1490,12 +1644,12 @@ public sealed class WritePermissionSqlTests
             "From the form write lock on, the insert's connection must send one permission statement inside the " +
             "transaction, and then its first write:" + Describe(fromLock));
 
-        AssertTheOneInTransactionCheck(check, TableSecurables, commands);
+        AssertTheOneInTransactionCheck(check, InsertRequirements, commands);
     }
 
     // On the soft delete's connection, from its locked base read on, the statements before the first write are exactly
-    // the locked read and one permission statement bound to the base table alone, both inside the transaction, and the
-    // first write is the soft delete's own; no other permission statement joins any transaction.
+    // the locked read and one permission statement bound to the base table alone, for UPDATE, both inside the
+    // transaction, and the first write is the soft delete's own; no other permission statement joins any transaction.
     private static void AssertDeletePermissionsCheckedInTheTransaction(IReadOnlyList<RecordedCommand> commands)
     {
         var lockedReads = commands
@@ -1526,13 +1680,16 @@ public sealed class WritePermissionSqlTests
             "From the locked base read on, the soft delete's connection must send one permission statement inside " +
             "the transaction, and then its UPDATE:" + Describe(fromLock));
 
-        AssertTheOneInTransactionCheck(check, BaseTableSecurable, commands);
+        AssertTheOneInTransactionCheck(check, DeleteRequirements, commands);
     }
 
     // On the update's connection, from its locked base read on, the statements before the first write are exactly the
     // locked read, the record read and one permission statement bound to the base table and then each page table, all
-    // inside the transaction; no other permission statement joins any transaction.
-    private static void AssertUpdatePermissionsCheckedInTheTransaction(IReadOnlyList<RecordedCommand> commands)
+    // inside the transaction; no other permission statement joins any transaction. The statement asks each table for
+    // UPDATE, and FoodHistory3 for INSERT as well when pageTwoRowMissing says the record has no row there.
+    private static void AssertUpdatePermissionsCheckedInTheTransaction(
+        IReadOnlyList<RecordedCommand> commands,
+        bool pageTwoRowMissing)
     {
         var lockedReads = commands
             .Where(command => IsUpdate(command) && command.CommandText.Contains(LockHint, StringComparison.Ordinal))
@@ -1566,25 +1723,52 @@ public sealed class WritePermissionSqlTests
             "From the locked base read on, the update's connection must send the record read, then one permission " +
             "statement, both inside the transaction, and then its first write:" + Describe(fromLock));
 
-        AssertTheOneInTransactionCheck(check, TableSecurables, commands);
+        (string Securable, int Mask)[] requirements =
+        [
+            (BaseSecurable, UpdateMask),
+            (PageOneSecurable, UpdateMask),
+            (PageTwoSecurable, pageTwoRowMissing ? InsertAndUpdateMask : UpdateMask),
+        ];
+        AssertTheOneInTransactionCheck(check, requirements, commands);
     }
 
-    // The write's in-transaction permission statement binds exactly the securables expected, in order, and it is the
-    // only permission statement inside any transaction of the request.
+    // The write's in-transaction permission statement binds exactly the parameters expected, in order: for each table,
+    // @p(2i) its securable as String and @p(2i+1) the mask of what the write needs there as Int32. It is the only
+    // permission statement inside any transaction of the request.
     private static void AssertTheOneInTransactionCheck(
         RecordedCommand check,
-        string[] securables,
+        (string Securable, int Mask)[] requirements,
         IReadOnlyList<RecordedCommand> commands)
     {
+        var expected = requirements
+            .SelectMany((requirement, index) => new (string Name, DbType DbType, object? Value)[]
+            {
+                (ParameterName(2 * index), DbType.String, requirement.Securable),
+                (ParameterName((2 * index) + 1), DbType.Int32, requirement.Mask),
+            })
+            .ToList();
         Assert.True(
-            check.Parameters.Select(parameter => parameter.Value as string).SequenceEqual(securables),
-            "The in-transaction permission statement must bind exactly " +
-            $"{string.Join(", ", securables)}, in that order: {check}");
+            check.Parameters.Select(parameter => (parameter.Name, parameter.DbType, parameter.Value))
+                .SequenceEqual(expected),
+            "The in-transaction permission statement must bind exactly, in this order, each table's securable as " +
+            "String and then the mask of what the write needs on it as Int32: " +
+            string.Join(", ", requirements.Select(requirement => string.Create(
+                CultureInfo.InvariantCulture,
+                $"{requirement.Securable} {requirement.Mask}"))) +
+            $": {check}");
 
         Assert.True(
             commands.Count(command => IsPermissionCheck(command) && command.InTransaction) == 1,
             "Exactly one permission statement may run inside a transaction:" + Describe(commands));
     }
+
+    // The positional name EpiInfo.Data gives a statement's parameter at ordinal, @p0, @p1, ...
+    private static string ParameterName(int ordinal) =>
+        string.Create(CultureInfo.InvariantCulture, $"@p{ordinal}");
+
+    // The text of the one permission statement the request sent inside a transaction.
+    private static string InTransactionCheckText(IReadOnlyList<RecordedCommand> commands) =>
+        commands.Single(command => IsPermissionCheck(command) && command.InTransaction).CommandText;
 
     private static bool IsPermissionCheck(RecordedCommand command) =>
         command.CommandText.Contains(PermissionFunction, StringComparison.Ordinal);

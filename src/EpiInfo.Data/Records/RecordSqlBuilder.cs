@@ -171,13 +171,17 @@ internal enum SelectedSetClause
 /// <c>GlobalRecordId</c>, so page statements seek. A writer can still wait on another record's writer, in the locked
 /// scan or in the snapshot read, which scans the base table for the intrinsic coordinates under <c>HOLDLOCK</c> while
 /// the writer holds its own base row exclusively: the new key of a create, the stamped row of an update. Two writes
-/// waiting there for each other's row would deadlock, so a create and an update each take the form's write lock
-/// (<see cref="AcquireFormWriteLock"/>) first, exclusive for a create and shared for an update. No create then runs
-/// beside another create or an update of the same form, which removes every cycle a create can close, while updates
-/// still run together and serialise per record on the locked read. Two updates of different records can therefore
-/// still wait for each other's stamped row in their snapshot reads where the locked scan keeps only the matching row
-/// locked; a deadlock that ends such a wait (1205), or one with a writer outside the application, is reported by the
-/// repository as not written, and so is a wait for the form's write lock that ends without the lock.
+/// waiting there for each other's row would deadlock. A soft delete reads no snapshot, but its locked scan and the
+/// conversion of its row lock to exclusive for its UPDATE can wait on a <c>HOLDLOCK</c> reader of the base table that
+/// itself waits on a create's new row, while that create's snapshot waits on the soft delete's locks: a cycle through
+/// the reader. A create, an update and a soft delete therefore each take the form's write lock
+/// (<see cref="AcquireFormWriteLock"/>) first, exclusive for a create and shared for an update and a soft delete. No
+/// create then runs beside another create, an update or a soft delete of the same form, preventing those cycles.
+/// Updates and soft deletes still run together and serialise per record on the locked read.
+/// Two updates of different records can therefore still wait for each other's stamped row in their snapshot reads
+/// where the locked scan keeps only the matching row locked; a deadlock that ends such a wait (1205), or one with a
+/// writer outside the application, is reported by the repository as not written, and so is a wait for the form's
+/// write lock that ends without the lock.
 /// </para>
 /// <para>
 /// <b>Read hint.</b> The database runs locking <c>READ COMMITTED</c>, with neither read-committed snapshot nor
@@ -861,8 +865,8 @@ internal static class RecordSqlBuilder
     /// describe one committed state, including the transaction's own writes. Inside the write transaction the hint's
     /// locks last until its commit, which the repository sends immediately after this read; no later statement of the
     /// transaction waits on them. The form's write lock the transaction took first (<see cref="AcquireFormWriteLock"/>)
-    /// keeps a create's read from meeting the uncommitted base row of another create or of an update, and an update's
-    /// read from meeting a create's.
+    /// keeps a create's read from meeting the uncommitted base row of another create, of an update or of a soft
+    /// delete, and an update's read from meeting a create's.
     /// </remarks>
     /// <param name="schema">The form's catalogue view.</param>
     /// <param name="dataFields">The data fields to project, in data-field order.</param>
@@ -910,16 +914,17 @@ internal static class RecordSqlBuilder
     /// </summary>
     /// <remarks>
     /// <para>
-    /// A create takes the lock exclusive and an update takes it shared, each before any statement of its transaction
-    /// that holds a lock on a record table. The response snapshot (<see cref="RecordSnapshot"/>) reads the whole base
-    /// table under <c>HOLDLOCK</c> after the write's own exclusive lock on its base row, the new key of a create or the
-    /// stamped row of an update. Two such writes in progress together would each wait in that read for the other's
-    /// uncommitted row and end in a deadlock (1205). Under the lock a create of the form runs beside no other create
-    /// and no update of the form, so that read meets no uncommitted row of another create or update; updates still run
-    /// beside each other and serialise per record on <see cref="LockBase"/>. A soft delete takes no lock: between its
-    /// <see cref="LockBase"/> read and its UPDATE it sends at most the permission read, which touches no record table,
-    /// and it sends no statement after its exclusive lock on its base row, so while it holds a lock on that row it
-    /// waits on no other writer and closes no cycle. Reads take no lock.
+    /// A create takes the lock exclusive, and an update and a soft delete take it shared, each before any statement of
+    /// its transaction that holds a lock on a record table. The response snapshot (<see cref="RecordSnapshot"/>) reads
+    /// the whole base table under <c>HOLDLOCK</c> after the write's own exclusive lock on its base row, the new key of
+    /// a create or the stamped row of an update. Two such writes in progress together would each wait in that read for
+    /// the other's uncommitted row and end in a deadlock (1205). A soft delete reads no snapshot, yet beside a create
+    /// it can close a cycle too: its <see cref="LockBase"/> scan holds update locks on base rows and its UPDATE waits
+    /// to convert its row's lock to exclusive behind a <c>HOLDLOCK</c> reader of the base table, such as a Find or a
+    /// count, that waits on the create's uncommitted row, while the create's snapshot waits for key-range locks behind
+    /// the soft delete's. Under the lock a create of the form runs beside no other create, no update and no soft
+    /// delete of the form, so neither cycle can form; updates and soft deletes still run beside each other and
+    /// serialise per record on <see cref="LockBase"/>. Reads do not take the form's write lock.
     /// </para>
     /// <para>
     /// The statement names no table: the resource, the mode, the owner and the lock timeout are all positional
@@ -932,7 +937,7 @@ internal static class RecordSqlBuilder
     /// <param name="schema">The form's catalogue view, whose base table names the resource.</param>
     /// <param name="exclusive">
     /// <see langword="true"/> for the exclusive lock of a create; <see langword="false"/> for the shared lock of an
-    /// update.
+    /// update or a soft delete.
     /// </param>
     /// <returns>
     /// A statement returning the <c>sp_getapplock</c> return code as one <c>int</c>: 0 or 1 when the lock is granted,
