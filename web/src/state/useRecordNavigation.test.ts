@@ -462,7 +462,6 @@ afterEach(() => {
   }
 });
 
-
 describe('useRecordNavigation', () => {
   describe('loading and moving through the active set', () => {
     it.each([
@@ -715,7 +714,6 @@ describe('useRecordNavigation', () => {
       expect(api.calls.some((call) => call.url.pathname.includes('/records/at/'))).toBe(false);
     });
   });
-
 
   // UniqueKey order A(1), D(0), B(1), C(1): B is record 2 of the active set and record
   // 3 of every row, and D exists only in the set with deleted records.

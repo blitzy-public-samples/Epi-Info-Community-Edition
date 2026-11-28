@@ -409,7 +409,6 @@ public static class SearchCriteriaParser
         return SearchParseResult.Success(conditions);
     }
 
-
     // Resolves a criterion's name to a searchable column: a data field first, then the two system fields. The
     // defensive branch rejects a data field of a kind that holds no value, which the data-field set never contains.
     private static bool TryResolve(DataFieldSet dataFields, string? name, out ResolvedField field)
@@ -651,7 +650,6 @@ public static class SearchCriteriaParser
         alternatives = parsed;
         return ValueError.None;
     }
-
 
     // Date: blank matches a column holding no value; otherwise each alternative is the prefix operator on an ISO
     // date the field's datetime column can hold, so a bare prefix or another format is invalid (a target departure

@@ -3113,7 +3113,6 @@ public sealed class ErrorContractTests
         AssertConsoleLine(services, pathSentinel);
     }
 
-
     // Every case names its client folder, so none falls back to the committed default (the repository's web/dist),
     // whose presence depends on whether the client was built.
     private static ApiFactory CreateFactory(string environment, string clientFolder) =>

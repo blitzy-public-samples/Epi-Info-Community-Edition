@@ -814,7 +814,6 @@ public sealed class CheckCodeScenarioTests
         }
     }
 
-
     // EC-GEO-01: GEOCODE is skipped, so the response holds no effect and exactly one info diagnostic at the line the
     // seeded program puts it on, and the API logged it.
     private static async Task AssertGeocodeSkippedAndLoggedAsync(
@@ -1099,7 +1098,6 @@ public sealed class CheckCodeScenarioTests
             : throw new XunitException(
                 $"{context}: '{name}' must be a 32-bit integer; it is a JSON {value.ValueKind}.");
     }
-
 
     // The oracle reproduces each EC-WEEK-* scenario's expected OnsetWeek from its given OnsetDate.
     private static void AssertOracleMatchesWeekScenarios()

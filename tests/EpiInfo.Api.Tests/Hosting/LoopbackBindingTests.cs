@@ -898,7 +898,6 @@ public sealed class ClientAppSnapshotTests : IDisposable
         Assert.Empty(factory.Logs.Find(entry => entry.Category == ClientAppHosting.LoggerCategory));
     }
 
-
     // The Linux confirmation: a handle's own path, every link resolved, is compared with the real path of the file the
     // listing found, so a handle opened through a folder link or a file link is refused, and one opened at the file's
     // real path is accepted.

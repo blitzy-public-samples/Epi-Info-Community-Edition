@@ -3233,7 +3233,6 @@ public sealed partial class ListAndSearchTests
                 ct: ct));
     }
 
-
     // AAP 0.3.4.4 (C-16, C-17): a result's position is its ROW_NUMBER over the selected set by UniqueKey, taken before
     // the criteria apply, so it equals the position endpoint over the same set and the legacy record number, the
     // count of rows with UniqueKey <= k (RunTimeView.cs:673-694). A RecStatus criterion stays inside the selected set.
@@ -3892,7 +3891,6 @@ public sealed partial class ListAndSearchTests
     private static int RecStatus(JsonElement item) => Property(item, "recStatus").GetInt32();
 
     private static int Position(JsonElement item) => Property(item, "position").GetInt32();
-
 
     // The fixed, bracket-quoted tables of each seeded form (testdata/sql/05_data_tables.sql): its base table and its
     // page tables in page order. No identifier in the statements below is built from input.

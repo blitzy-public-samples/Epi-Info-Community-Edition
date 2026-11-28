@@ -1831,7 +1831,6 @@ public sealed partial class StoredDataContractTests : IAsyncLifetime
         }
     }
 
-
     // Every column of the row holds exactly its expected typed value; a column absent from expected must be NULL, and
     // GlobalRecordId is the record's id. Every mismatch is listed at once.
     private static void AssertRowHolds(
@@ -2035,7 +2034,6 @@ public sealed partial class StoredDataContractTests : IAsyncLifetime
 
         return (globalRecordId, uniqueKey);
     }
-
 
     // The expected cells of every page row: the never-written columns NULL, then each layer of writes in order, a
     // later write of a column replacing an earlier one. Any column left out is expected NULL by AssertRowHolds.

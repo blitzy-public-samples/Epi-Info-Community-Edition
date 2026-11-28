@@ -734,7 +734,6 @@ public sealed class IdentifierProvenanceIntegrationTests
         AssertUnchanged(before, await SqlSnapshot.CaptureAsync(cancellationToken));
     }
 
-
     // The text a caller has written before the predicate: the reader-built base table and its alias, as
     // RecordSqlBuilder.Count writes them.
     private static string StatementStart(FormSchema schema) =>

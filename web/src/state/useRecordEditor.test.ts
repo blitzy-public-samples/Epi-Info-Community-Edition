@@ -574,7 +574,6 @@ afterEach(() => {
   }
 });
 
-
 describe('create bodies (C-10)', () => {
   it('leaves and saves an untouched new record without a request', async () => {
     const { api, result } = mountNew();
@@ -1172,7 +1171,6 @@ describe('validation', () => {
   });
 });
 
-
 describe('leaving a record (0.3.6)', () => {
   it('saves a dirty record first and lets it go only after the 200', async () => {
     const { api, result, record, onSaved } = mountExisting();
@@ -1512,7 +1510,6 @@ describe('save progress', () => {
     expect(result.current.savePending).toBe(false);
   });
 });
-
 
 // `saved` confirms the last successful save of the draft until the next edit, write, delete or
 // discard. A save leave() made is confirmed on the record its move installs; the record a later

@@ -1436,7 +1436,6 @@ public sealed partial class ConcurrentSaveTests : IAsyncLifetime
             $"GlobalRecordId {globalRecordId}, but {string.Join("; ", violations)}. The diff holds: {diff}");
     }
 
-
     // The base row carries the save stamp of the pair: the logon name of this process, which hosts the API, and a
     // LastSaveTime not earlier than the test's start that is the pair's own stamp time.
     private static void AssertSaveStamp(SqlSnapshot snapshot, string globalRecordId, DateTime pairTime, string pair)

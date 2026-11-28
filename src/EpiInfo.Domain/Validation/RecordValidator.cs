@@ -730,7 +730,6 @@ public sealed class RecordValidator
         }
     }
 
-
     // Everything the checks need about one data field, interpreted once from the metadata and the form definition,
     // with every metadata-only message formatted in advance. Immutable after construction.
     private sealed class FieldRule

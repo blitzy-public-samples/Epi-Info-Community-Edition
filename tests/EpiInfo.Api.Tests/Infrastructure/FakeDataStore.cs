@@ -863,7 +863,6 @@ public sealed class FakeDataStore : IDataStore
         }
     }
 
-
     /// <inheritdoc />
     public Task<IReadOnlyList<FormSummary>> ListFormsAsync(CancellationToken cancellationToken) =>
         Complete<IReadOnlyList<FormSummary>>(() =>
@@ -1180,7 +1179,6 @@ public sealed class FakeDataStore : IDataStore
                 return read;
             }
         });
-
 
     /// <inheritdoc />
     public Task<RecordWriteResult> InsertAsync(

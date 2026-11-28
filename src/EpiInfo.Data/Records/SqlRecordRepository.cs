@@ -654,7 +654,6 @@ internal sealed class SqlRecordRepository(
         }
     }
 
-
     /// <summary>
     /// Inserts a new active record, as <see cref="IDataStore.InsertAsync"/>: the form's exclusive write lock; when
     /// <paramref name="permissions"/> is not <see langword="null"/>, one permission read inside this transaction for
@@ -1041,7 +1040,6 @@ internal sealed class SqlRecordRepository(
         return await GetByIdCoreAsync(connection, form, schema, globalRecordId, cancellationToken)
             .ConfigureAwait(false);
     }
-
 
     // The by-id read both GetByIdAsync overloads share: one statement returning the row, every page row and the
     // record's intrinsic position and count.
@@ -1536,7 +1534,6 @@ internal sealed class SqlRecordRepository(
                 onDispatch: scope.MarkDmlSent)
             .ConfigureAwait(false);
 
-
     // Runs one write transaction on connection and, when it owns the connection, releases it. A release failure after
     // a confirmed commit is reported as written (ReleaseCommittedAsync), the one outcome the store can then prove. On
     // every other path a release failure is discarded and the result or exception already decided stands unchanged,
@@ -1832,7 +1829,6 @@ internal sealed class SqlRecordRepository(
         scope.MarkRollbackCompleted();
         return null;
     }
-
 
     // The contract check of a write's values inside its transaction (ResolveValues), and whose error a refusal is.
     // Without callerForm, the transaction writes with the caller's own metadata, so a refusal is the caller's broken

@@ -883,7 +883,6 @@ public static partial class ReadEquivalenceProcedure
             : "the Number is not the stored option index";
     }
 
-
     // The reference EPIWEEK, ported line for line from testdata/tools/epi_functions.py (epiweek with fdow = 0): an
     // oracle independent of the API's interpreter. Null where the start of the year before or after the date is not
     // representable, which no datetime column value of a seeded record reaches.

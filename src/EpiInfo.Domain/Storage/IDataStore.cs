@@ -438,7 +438,6 @@ public interface IDataStore
     /// <returns><see langword="true"/> when the database answered.</returns>
     Task<bool> PingAsync(CancellationToken cancellationToken);
 
-
     /// <summary>
     /// Inserts a new active record: one base row and one row on every page, then reads the response snapshot and
     /// commits, all in one transaction.

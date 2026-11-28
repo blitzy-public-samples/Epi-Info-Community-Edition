@@ -6098,7 +6098,6 @@ describe('FormView Find record', () => {
     expect(calls.filter(isSearch).map(sentExclusion)).toEqual([RECORD_A.globalRecordId]);
   });
 
-
   it("keeps a field's message while its criterion holds the text sent, and the banner's summary while such a message shows", async () => {
     const problem = {
       type: 'https://tools.ietf.org/html/rfc9110#section-15.5.1',

@@ -434,7 +434,6 @@ public sealed class SqlMetadataReaderTests : IAsyncLifetime
         Assert.Equal([ValidationMessages.NotALegalValue], rejected.FieldErrors["Choice"]);
     }
 
-
     // The seeded loosestoolsperday texts in two cultures' string sort. The empty name is the invariant culture, which
     // ranks "-" before "0", so "1-3" comes first. Thai collation ignores punctuation, so it compares "10+" as 10 and
     // "1-3" as 13 and puts "10+" first.

@@ -745,7 +745,6 @@ public sealed class RecordValidatorTests
         AssertOnlyFieldError(result, field, expected);
     }
 
-
     [Fact]
     public void ValidateInput_TextFieldGivenNumber_IsTextExpected()
     {
@@ -1114,7 +1113,6 @@ public sealed class RecordValidatorTests
 
         Assert.Equal(FieldValue.FromNumber(raw), values[field]);
     }
-
 
     /// <summary><c>FeverTemp</c> 112 is scenario <c>EC-VAL-02</c>.</summary>
     [Theory]
@@ -1815,7 +1813,6 @@ public sealed class RecordValidatorTests
 
         AssertOnlyFieldError(result, "AssignedCode", ValidationMessages.ReadOnlyField);
     }
-
 
     // ---- Phase 2 of a POST: CheckNewRecord ----
 

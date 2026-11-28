@@ -556,7 +556,6 @@ public sealed class ValidationTests : IAsyncLifetime
         Assert.Equal(marker, stored[MarkerField]);
     }
 
-
     // The text a raw JSON value submits, for checking that no error message echoes it: a string's content or a
     // number's literal; null when the value is the JSON null and so submits no text.
     private static string? SubmittedText(string rawValue)
@@ -756,7 +755,6 @@ public sealed class ValidationTests : IAsyncLifetime
         return created;
     }
 }
-
 
 /// <summary>
 /// The validation cases that need no database, over <see cref="FakeDataStore"/>: the required gate of

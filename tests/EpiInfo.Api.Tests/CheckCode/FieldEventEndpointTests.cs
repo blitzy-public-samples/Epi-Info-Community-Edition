@@ -1142,7 +1142,6 @@ public sealed class FieldEventEndpointTests
     private static bool HasStateValue(CapturedLogEntry entry, string key, object expected) =>
         entry.State.Any(pair => string.Equals(pair.Key, key, StringComparison.Ordinal) && Equals(pair.Value, expected));
 
-
     // FakeForms.WithCheckCode carrying TypedValuesProgram, with the Option field Colour (items Red, Green, Blue on a
     // smallint column) added to its page, since no fixture has an Option field.
     private static FakeForm FormWithOptionField()
