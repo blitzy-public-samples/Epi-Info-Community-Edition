@@ -31,6 +31,9 @@ export const clientMessages = Object.freeze({
   numberExpected: 'Enter a number.',
   dateExpected: 'Enter a valid date (YYYY-MM-DD).',
   dateNotStorable: 'Enter a date between 1753-01-01 and 9999-12-31.',
+  // A date field with a date mask is entered and shown in that mask, so its messages speak it.
+  dateExpectedInMask: (mask: string): string => `Enter a valid date (${mask}).`,
+  dateNotStorableBetween: (lower: string, upper: string): string => `Enter a date between ${lower} and ${upper}.`,
   booleanExpected: 'Check or clear this box.',
   optionExpected: 'Choose one of the listed options.',
   noOptions: 'No options are available for this field.',
@@ -173,11 +176,19 @@ function checkType(field: FieldDefinition, value: PresentValue): string | null {
         (typeof value === 'number' && Number.isFinite(value))
         ? null
         : clientMessages.numberExpected;
-    case 'date':
+    case 'date': {
+      // A field with a date mask names the mask and shows the storable range through it.
+      const mask = dateMaskOf(field.validation.pattern);
       if (!isWireDate(value)) {
-        return clientMessages.dateExpected;
+        return mask === null ? clientMessages.dateExpected : clientMessages.dateExpectedInMask(mask);
       }
-      return value < MIN_STORABLE_DATE || value > MAX_STORABLE_DATE ? clientMessages.dateNotStorable : null;
+      if (value >= MIN_STORABLE_DATE && value <= MAX_STORABLE_DATE) {
+        return null;
+      }
+      return mask === null
+        ? clientMessages.dateNotStorable
+        : clientMessages.dateNotStorableBetween(shownDate(MIN_STORABLE_DATE, mask), shownDate(MAX_STORABLE_DATE, mask));
+    }
     case 'checkbox':
       return typeof value === 'boolean' ? null : clientMessages.booleanExpected;
     case 'option':
@@ -232,7 +243,14 @@ function checkRange(field: FieldDefinition, value: PresentValue): string | null 
     const lowerBound = isWireDate(lower) ? lower : null;
     const upperBound = isWireDate(upper) ? upper : null;
     const outOfRange = (lowerBound !== null && value < lowerBound) || (upperBound !== null && value > upperBound);
-    return outOfRange ? describeRange(lowerBound, upperBound) : null;
+    // The bounds are shown as the field shows a date: through its date mask, or as wire dates without one.
+    const mask = dateMaskOf(field.validation.pattern);
+    return outOfRange
+      ? describeRange(
+          lowerBound === null ? null : shownDate(lowerBound, mask),
+          upperBound === null ? null : shownDate(upperBound, mask),
+        )
+      : null;
   }
 
   return null;
@@ -248,6 +266,88 @@ function describeRange(lower: string | null, upper: string | null): string | nul
   }
 
   return upper !== null ? clientMessages.rangeAtMost(upper) : null;
+}
+
+// Date masks: the client's display and entry format of a date field (seeded `MM-DD-YYYY`). The server
+// checks no value against one, and neither does matchesPattern; DateInput shows and reads a date
+// through it, and the date messages above show their dates through it.
+
+/** A date-mask token, as Epi Info writes them (`MM-DD-YYYY`, `DD-MM-YYYY`, `YYYY-MM-DD`), in any case. */
+const DATE_MASK_TOKEN = /YYYY|MM|DD/gi;
+
+// The same tokens as one capture group: splitting a mask on it alternates literal runs (even
+// entries) and tokens (odd entries), each token found left to right as DATE_MASK_TOKEN finds it.
+const DATE_MASK_SEGMENTS = /(YYYY|MM|DD)/i;
+
+const ASCII_DIGITS = /^[0-9]+$/;
+
+/**
+ * The pattern as a date mask, or `null` when it is none. A date mask holds each of the tokens `YYYY`,
+ * `MM` and `DD` exactly once, in any case, and every other character is a literal, so a partial mask
+ * such as `MM-DD` and a date/time mask, whose `MM` also stands for minutes, are not date masks.
+ */
+export function dateMaskOf(pattern: string | null | undefined): string | null {
+  if (typeof pattern !== 'string') {
+    return null;
+  }
+  const tokens = (pattern.match(DATE_MASK_TOKEN) ?? []).map((token) => token.toUpperCase()).sort();
+  return tokens.join(' ') === 'DD MM YYYY' ? pattern : null;
+}
+
+/**
+ * A wire date written through a date mask: each `YYYY`, `MM` and `DD` token, in any case, becomes the
+ * four-digit year, two-digit month and two-digit day, and every other character stays as written, so
+ * `MM-DD-YYYY` writes 2010-02-06 as `02-06-2010`. `null` when `iso` is not a wire date (isWireDate),
+ * so an impossible date such as 2011-02-30 is never rewritten, or when `mask` is not a date mask.
+ */
+export function maskedDateText(iso: string, mask: string): string | null {
+  if (!isWireDate(iso) || dateMaskOf(mask) === null) {
+    return null;
+  }
+  // A wire date is exactly YYYY-MM-DD, so each part has its fixed place.
+  const parts: Readonly<Record<string, string>> = { YYYY: iso.slice(0, 4), MM: iso.slice(5, 7), DD: iso.slice(8, 10) };
+  // A replacer function's result is inserted as is, so no `$` in a mask is special.
+  return mask.replace(DATE_MASK_TOKEN, (token) => parts[token.toUpperCase()]);
+}
+
+/**
+ * The wire date `YYYY-MM-DD` that text entered in a date mask stands for, never with a time, or
+ * `null` when it stands for none. The text must follow the mask exactly: as many characters as the
+ * mask, ASCII digits at the positions of each token (four for `YYYY`, two for `MM` and `DD`), and
+ * every other character as the mask writes it, compared per UTF-16 code unit with nothing trimmed.
+ * The day it spells must then be a wire date, so `02-30-2011`, `13-45-2011` and `00-01-0000` stand
+ * for none. `null` too when `mask` is not a date mask.
+ */
+export function wireDateFromMaskedText(text: string, mask: string): string | null {
+  if (dateMaskOf(mask) === null || text.length !== mask.length) {
+    return null;
+  }
+
+  const parts = new Map<string, string>();
+  let at = 0;
+  for (const [index, segment] of mask.split(DATE_MASK_SEGMENTS).entries()) {
+    const typed = text.slice(at, at + segment.length);
+    at += segment.length;
+    if (index % 2 === 0) {
+      if (typed !== segment) {
+        return null;
+      }
+    } else if (ASCII_DIGITS.test(typed)) {
+      parts.set(segment.toUpperCase(), typed);
+    } else {
+      return null;
+    }
+  }
+
+  // A date mask holds each token once, so each part was read above.
+  const iso = `${parts.get('YYYY') ?? ''}-${parts.get('MM') ?? ''}-${parts.get('DD') ?? ''}`;
+  return isWireDate(iso) ? iso : null;
+}
+
+// A wire date as a date field's messages show it: through the field's date mask, or as the wire
+// writes it when the field has none.
+function shownDate(iso: string, mask: string | null): string {
+  return (mask === null ? null : maskedDateText(iso, mask)) ?? iso;
 }
 
 // The texts a legal-values field accepts, compared case-sensitively; options that are not text are

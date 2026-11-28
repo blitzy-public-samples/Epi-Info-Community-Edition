@@ -34,6 +34,30 @@ function interpret(text: string): FieldValue {
   return numberFromText(text) ?? text;
 }
 
+// A digit in the sense of .NET char.IsDigit (Unicode Nd).
+const DIGIT = /\p{Nd}/u;
+
+/**
+ * Whether leaving the control clears its text, as legacy's `control_Leave` clears a
+ * number box: the text holds at least one negative sign or decimal separator, in the
+ * client's number syntax `-` and `.`, and no digit, whatever else it holds, so `-`, `.`,
+ * `-.` and `-abc` are cleared while `-5`, `37.` and `abc` are not. Tested per UTF-16 code
+ * unit, as .NET tests each char, so a surrogate half of an astral digit is no digit.
+ */
+function clearsOnLeave(text: string): boolean {
+  let digits = 0;
+  let symbols = 0;
+  for (let i = 0; i < text.length; i++) {
+    const unit = text.charAt(i);
+    if (unit === '-' || unit === '.') {
+      symbols++;
+    } else if (DIGIT.test(unit)) {
+      digits++;
+    }
+  }
+  return digits === 0 && symbols > 0;
+}
+
 /** Text the control shows for a value; an empty value is `''`. */
 function display(value: FieldValue): string {
   // `undefined` is outside FieldValue but can arrive from a missing `values` key at
@@ -57,11 +81,14 @@ function display(value: FieldValue): string {
  * the editor while the user types. The draft is replaced when `value` changes to something
  * the draft does not already stand for, such as a check-code `ASSIGN` or another record.
  *
- * When the control loses focus, a draft that stands for the field's number shows that
- * number as the field holds it, the value a save sends and the server stores: `1e2`
- * becomes `100`, `045`, `45.` and ` 45 ` become `45`, and blank text becomes empty. This
- * changes no value, so no `onChange` is called and the dirty set stays as it is. Text
- * that is not a number, such as `-`, `abc` or `1e400`, stays as typed beside its error.
+ * When the control loses focus, text with a sign or decimal separator and no digit, such
+ * as `-`, `.` or `-.`, is cleared and the field's value becomes `null`, as legacy's
+ * `control_Leave` clears it, before `FieldAfter` is raised. Otherwise a draft that stands
+ * for the field's number shows that number as the field holds it, the value a save sends
+ * and the server stores: `1e2` becomes `100`, `045`, `45.` and ` 45 ` become `45`, and
+ * blank text becomes empty. This changes no value, so no `onChange` is called and the dirty
+ * set stays as it is. Other text that is not a number, such as `abc` or `1e400`, stays as
+ * typed beside its error.
  */
 export function NumberInput(props: FieldComponentProps) {
   const { field, value, disabled, errors, onChange, onFocus, onBlur } = props;
@@ -99,9 +126,16 @@ export function NumberInput(props: FieldComponentProps) {
           onFocus?.();
         }}
         onBlur={() => {
-          // Only a draft that stands for the current value is redisplayed, so a value the
-          // editor has not taken yet keeps its text. Raw text displays as itself.
-          if (sameFieldValue(interpret(draft), value)) {
+          // Sign-only or separator-only text is cleared first, so FieldAfter sees the empty
+          // field. Otherwise only a draft that stands for the current value is redisplayed,
+          // so a value the editor has not taken yet keeps its text. Raw text displays as itself.
+          if (clearsOnLeave(draft)) {
+            setDraft('');
+            // A field already empty, `undefined` from a missing `values` key included, stays as it is.
+            if (value !== null && value !== undefined) {
+              onChange(null);
+            }
+          } else if (sameFieldValue(interpret(draft), value)) {
             setDraft(display(value));
           }
           onBlur?.();

@@ -29,15 +29,18 @@
 // column admits, exactly: read from JSON, shown and entered digit for digit. A number typed
 // as a fraction whose nearest double is whole is sent as typed, in its field event and its
 // save. A number field shows the number its text stands for once it loses focus, so Age
-// typed as `1e2` shows the 100 it saves, while text that is not a number stays as typed
-// beside its error. A tabIndex beyond the safe range, read from the form route's own body
-// text, still orders the page and Find.
+// typed as `1e2` shows the 100 it saves, text with a sign or decimal separator and no digit
+// is cleared as legacy clears it, and other text that is not a number stays as typed
+// beside its error. A date field with a date mask is a text box in that mask, described by
+// a "Format:" hint naming it: text that follows the mask is saved as its wire date, and
+// other text stays as typed beside a message in the mask's terms. A tabIndex beyond the
+// safe range, read from the form route's own body text, still orders the page and Find.
 //
 // The navigator cases hold a navigation read: a pending load disables no control, marks the
 // toolbar and its status busy and announces itself outside them, a press supersedes it, and
 // the draft it replaces is frozen, every field disabled and none marked protected.
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
-import { Profiler } from 'react';
+import { Profiler, useState } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vitest';
 
 import { createApiClient } from '../api/client';
@@ -634,6 +637,15 @@ function localeDate(iso: string): string {
   }).format(Date.UTC(year, month - 1, day));
 }
 
+/** A wire `YYYY-MM-DD` date as the fixture's date mask `MM-DD-YYYY` writes it, `''` for none: the text a date control shows. */
+function inDateMask(iso: FieldValue | undefined): string {
+  if (typeof iso !== 'string') {
+    return '';
+  }
+  const [year, month, day] = iso.split('-');
+  return `${month}-${day}-${year}`;
+}
+
 // Write-flow helpers
 
 /** Lets every pending promise callback and zero-delay timer run. */
@@ -672,6 +684,27 @@ function controlOf(definition: FormDefinition, name: string): HTMLElement {
 function descriptionOf(control: HTMLElement): string {
   const ids = (control.getAttribute('aria-describedby') ?? '').split(/\s+/).filter((id) => id !== '');
   return ids.map((id) => document.getElementById(id)?.textContent ?? '').join(' ');
+}
+
+/**
+ * Asserts the format hint of a date control whose field shows no error: `hint` is the text
+ * of the `small` right after the control, which alone describes it; `null` is no hint and no
+ * description.
+ */
+function expectDateHint(control: HTMLElement, hint: string | null): void {
+  const hintId = `${control.id}-hint`;
+  const element = document.getElementById(hintId);
+  if (hint === null) {
+    expect(element, `hint of ${control.id}`).toBeNull();
+    expect(control.parentElement?.querySelector('small') ?? null, `hint of ${control.id}`).toBeNull();
+    expect(control.getAttribute('aria-describedby'), `description of ${control.id}`).toBeNull();
+    return;
+  }
+  const shownHint = present(element, `hint of ${control.id}`);
+  expect(shownHint.tagName, `hint of ${control.id}`).toBe('SMALL');
+  expect(shownHint.textContent, `hint of ${control.id}`).toBe(hint);
+  expect(control.nextElementSibling, `hint of ${control.id}`).toBe(shownHint);
+  expect(control.getAttribute('aria-describedby'), `description of ${control.id}`).toBe(hintId);
 }
 
 /** Changes a field's value as typing does; no focus moves, so no field event is raised. */
@@ -723,7 +756,8 @@ const expectedControls: Readonly<Record<SingleControlFieldType, { readonly tagNa
   text: { tagName: 'INPUT', type: 'text' },
   multiline: { tagName: 'TEXTAREA' },
   number: { tagName: 'INPUT' },
-  date: { tagName: 'INPUT', type: 'date' },
+  // Every fixture date field has the date mask MM-DD-YYYY, its entry format, so it is a text input.
+  date: { tagName: 'INPUT', type: 'text' },
   checkbox: { tagName: 'INPUT', type: 'checkbox' },
   legalValues: { tagName: 'SELECT' },
 };
@@ -1410,18 +1444,26 @@ describe('FormView accessible structure (SC-8)', () => {
   // Chromium's accessibility snapshots drop a disabled date input and announce its
   // spinbuttons without the field's label, so a protected date is a read-only text box.
   // Its text follows the field's date mask, which holds each of YYYY, MM and DD once in
-  // any case; any other pattern, or none, shows the date in the user's locale.
-  it.each([
-    { name: 'DOB', stored: '1980-05-01', pattern: 'MM-DD-YYYY', shown: '05-01-1980' },
-    { name: 'DOB', stored: '1980-05-01', pattern: 'DD-MM-YYYY', shown: '01-05-1980' },
-    { name: 'DOB', stored: '1980-05-01', pattern: 'yyyy/mm/dd', shown: '1980/05/01' },
-    { name: 'DOB', stored: '1980-05-01', pattern: null, shown: localeDate('1980-05-01') },
-    { name: 'DOB', stored: '1980-05-01', pattern: 'MM-DD', shown: localeDate('1980-05-01') },
-    { name: 'DOB', stored: '1980-05-01', pattern: 'MM-DD-YYYY HH:MM:SS AMPM', shown: localeDate('1980-05-01') },
-    { name: 'OnsetDate', stored: null, pattern: 'MM-DD-YYYY', shown: '' },
+  // any case; any other pattern, or none, shows the date in the user's locale. A date
+  // mask is also stated in a "Format:" hint that describes the box, as a patterned
+  // text field's is; a field with no date mask has none.
+  it.each<{ name: string; stored: string | null; pattern: string | null; shown: string; hint: string | null }>([
+    { name: 'DOB', stored: '1980-05-01', pattern: 'MM-DD-YYYY', shown: '05-01-1980', hint: 'Format: MM-DD-YYYY' },
+    { name: 'DOB', stored: '1980-05-01', pattern: 'DD-MM-YYYY', shown: '01-05-1980', hint: 'Format: DD-MM-YYYY' },
+    { name: 'DOB', stored: '1980-05-01', pattern: 'yyyy/mm/dd', shown: '1980/05/01', hint: 'Format: yyyy/mm/dd' },
+    { name: 'DOB', stored: '1980-05-01', pattern: null, shown: localeDate('1980-05-01'), hint: null },
+    { name: 'DOB', stored: '1980-05-01', pattern: 'MM-DD', shown: localeDate('1980-05-01'), hint: null },
+    {
+      name: 'DOB',
+      stored: '1980-05-01',
+      pattern: 'MM-DD-YYYY HH:MM:SS AMPM',
+      shown: localeDate('1980-05-01'),
+      hint: null,
+    },
+    { name: 'OnsetDate', stored: null, pattern: 'MM-DD-YYYY', shown: '', hint: 'Format: MM-DD-YYYY' },
   ])(
-    'renders the read-only date $name, stored $stored with pattern $pattern, as a disabled read-only text box showing $shown, and writable dates as date inputs',
-    async ({ name, stored, pattern, shown }) => {
+    'renders the read-only date $name, stored $stored with pattern $pattern, as a disabled read-only text box showing $shown, and writable dates as text boxes in their date mask',
+    async ({ name, stored, pattern, shown, hint }) => {
       const definition = withField(name, (field) => ({
         ...field,
         validation: { ...field.validation, readOnly: true, pattern },
@@ -1437,19 +1479,94 @@ describe('FormView accessible structure (SC-8)', () => {
       expect(control.hasAttribute('readonly')).toBe(true);
       expect(control.hasAttribute('min') || control.hasAttribute('max')).toBe(false);
       expect(controlValue(control)).toBe(shown);
+      expectDateHint(control, hint);
 
       const writableDates = allFields(definition).filter(
         (field) => field.fieldType === 'date' && field.name !== name,
       );
       expect(writableDates).not.toHaveLength(0);
+      // Each writable date keeps the fixture's date mask, its entry format, its placeholder
+      // and its hint.
       for (const field of writableDates) {
         const input = present(wrapperOf(container, field.name).querySelector('input'), `control of ${field.name}`);
-        const value = RECORD.values[field.name] ?? null;
-        expect(input.getAttribute('type'), field.name).toBe('date');
+        expect(field.validation.pattern, field.name).toBe('MM-DD-YYYY');
+        expect(input.getAttribute('type'), field.name).toBe('text');
+        expect(input.getAttribute('placeholder'), field.name).toBe('MM-DD-YYYY');
         expect(isDisabled(input), field.name).toBe(false);
         expect(input.hasAttribute('readonly'), field.name).toBe(false);
-        expect(controlValue(input), field.name).toBe(typeof value === 'string' ? value : '');
+        expect(controlValue(input), field.name).toBe(inDateMask(RECORD.values[field.name]));
+        expectDateHint(input, 'Format: MM-DD-YYYY');
       }
+    },
+  );
+
+  // A writable date's date mask is its display and entry format, so the field is a text box in
+  // that mask, with the mask as its placeholder, a "Format:" hint that describes it, and no
+  // picker bounds. A pattern that is no date mask keeps the browser's date input, whose value
+  // is the wire date and whose bounds are min and max, with no hint.
+  it.each<{
+    pattern: string | null;
+    type: string;
+    shown: string;
+    placeholder: string | null;
+    hint: string | null;
+    bounds: boolean;
+  }>([
+    {
+      pattern: 'MM-DD-YYYY',
+      type: 'text',
+      shown: '05-01-1980',
+      placeholder: 'MM-DD-YYYY',
+      hint: 'Format: MM-DD-YYYY',
+      bounds: false,
+    },
+    {
+      pattern: 'DD-MM-YYYY',
+      type: 'text',
+      shown: '01-05-1980',
+      placeholder: 'DD-MM-YYYY',
+      hint: 'Format: DD-MM-YYYY',
+      bounds: false,
+    },
+    {
+      pattern: 'yyyy/mm/dd',
+      type: 'text',
+      shown: '1980/05/01',
+      placeholder: 'yyyy/mm/dd',
+      hint: 'Format: yyyy/mm/dd',
+      bounds: false,
+    },
+    { pattern: null, type: 'date', shown: '1980-05-01', placeholder: null, hint: null, bounds: true },
+    { pattern: 'MM-DD', type: 'date', shown: '1980-05-01', placeholder: null, hint: null, bounds: true },
+    {
+      pattern: 'MM-DD-YYYY HH:MM:SS AMPM',
+      type: 'date',
+      shown: '1980-05-01',
+      placeholder: null,
+      hint: null,
+      bounds: true,
+    },
+  ])(
+    'renders the writable date DOB with pattern $pattern as a $type input showing $shown',
+    async ({ pattern, type, shown, placeholder, hint, bounds }) => {
+      const lower = '1900-01-01';
+      const upper = '2012-12-31';
+      const definition = withField('DOB', (field) => ({
+        ...field,
+        validation: { ...field.validation, pattern, lower, upper },
+      }));
+      await renderForm(definition);
+      expect(RECORD.values.DOB).toBe('1980-05-01');
+
+      const control = controlOf(definition, 'DOB');
+      expect(control.id).toBe(fieldControlId('DOB'));
+      expect(control.getAttribute('type')).toBe(type);
+      expect(controlValue(control)).toBe(shown);
+      expect(control.getAttribute('placeholder')).toBe(placeholder);
+      expect([control.getAttribute('min'), control.getAttribute('max')]).toEqual(bounds ? [lower, upper] : [null, null]);
+      expect(isDisabled(control)).toBe(false);
+      expect(control.hasAttribute('readonly')).toBe(false);
+      expectDateHint(control, hint);
     },
   );
 
@@ -5098,7 +5215,7 @@ describe('a number field shows the number its text stands for once it loses focu
     },
   );
 
-  it.each<[string]>([['-'], ['abc'], ['1e400']])(
+  it.each<[string]>([['abc'], ['1e400']])(
     'keeps the text %j in Age as typed once it loses focus, beside its error, and sends no write',
     async (text) => {
       const { definition } = await renderForm(createFormDefinitionFixture(), { answersFieldEvents: true });
@@ -5115,6 +5232,188 @@ describe('a number field shows the number its text stands for once it loses focu
       expect(within(summary).getAllByRole('listitem')).toHaveLength(1);
       expect(descriptionOf(age)).toContain(clientMessages.numberExpected);
       expect(age).toHaveProperty('value', text);
+    },
+  );
+
+  // Legacy's control_Leave clears a number box holding a negative sign or decimal separator
+  // and no digit, so the field is left empty, with no error, before its FieldAfter.
+  it.each<[string]>([['-'], ['.'], ['-.'], ['-abc']])(
+    'clears the text %j in Age once it loses focus, raises FieldAfter with Age empty, and saves Age as null',
+    async (text) => {
+      const { definition } = await renderForm(createFormDefinitionFixture(), { answersFieldEvents: true });
+      expect(RECORD.values.Age).toBe(31);
+      replyToWrite({ kind: 'saved', record: savedWith(RECORD, { Age: null }) });
+
+      const age = await enterAge(definition, text);
+
+      expect(age).toHaveProperty('value', '');
+      const fieldAfter = await waitFor(() =>
+        present(
+          calls.find(
+            (call) =>
+              call.method === 'POST' &&
+              call.body?.includes('"event":"FieldAfter"') === true &&
+              call.body.includes('"fieldName":"Age"'),
+          ),
+          'the FieldAfter event of Age',
+        ),
+      );
+      expect(writtenValues(fieldAfter).Age).toBeNull();
+      fireEvent.click(formActionButton('Save'));
+      const update = await waitFor(() => present(calls.find((call) => call.method === 'PUT'), 'the update'));
+      expect(update.body).toBe('{"values":{"Age":null}}');
+      const status = within(screen.getByRole('toolbar', { name: 'Form actions' })).getByRole('status');
+      await waitFor(() => {
+        expect(status.textContent).toBe('Changes saved.');
+      });
+      expect(screen.queryByRole('heading', { name: 'Please correct the following' })).toBeNull();
+      expect(age).toHaveProperty('value', '');
+    },
+  );
+
+  // What leaving the box emits and raises, in order, with NumberInput holding its own value as
+  // the editor does: only text with a sign or separator and no digit is cleared, to null, and
+  // only before FieldAfter is raised.
+  it.each<[string, string, FieldValue[]]>([
+    ['-', '', ['-', null]],
+    ['.', '', ['.', null]],
+    ['-.', '', ['-.', null]],
+    ['-abc', '', ['-abc', null]],
+    ['-5', '-5', [-5]],
+    ['37.', '37', [37]],
+    ['abc', 'abc', ['abc']],
+  ])('leaves the text %j showing %j, having emitted %j before FieldAfter', (text, shown, emitted) => {
+    const age = fieldByName('Age');
+    const events: unknown[] = [];
+    function HeldNumber() {
+      const [value, setValue] = useState<FieldValue>(null);
+      return (
+        <NumberInput
+          field={age}
+          value={value}
+          disabled={false}
+          isProtected={false}
+          errors={[]}
+          onChange={(next) => {
+            events.push({ change: next });
+            setValue(next);
+          }}
+          onBlur={() => {
+            events.push('FieldAfter');
+          }}
+        />
+      );
+    }
+    render(<HeldNumber />);
+    const input = screen.getByLabelText(promptOf(age));
+
+    act(() => {
+      input.focus();
+    });
+    fireEvent.change(input, { target: { value: text } });
+    act(() => {
+      input.blur();
+    });
+
+    expect(input).toHaveProperty('value', shown);
+    expect(events).toEqual([...emitted.map((value) => ({ change: value })), 'FieldAfter']);
+  });
+});
+
+describe('a date field with a date mask is entered and shown in its mask', () => {
+  /** Focuses the date `name`, types `text` and leaves it, as a user does; FieldBefore and FieldAfter are raised. */
+  async function enterDate(definition: FormDefinition, name: string, text: string): Promise<HTMLElement> {
+    // Installing the record moves focus without raising an event; the case's own focus comes after it.
+    await flush();
+    const control = controlOf(definition, name);
+    act(() => {
+      control.focus();
+    });
+    fireEvent.change(control, { target: { value: text } });
+    act(() => {
+      control.blur();
+    });
+    return control;
+  }
+
+  /** The values the FieldAfter event of `name` carried, once it is sent. */
+  async function fieldAfterValues(name: string): Promise<Record<string, unknown>> {
+    const fieldAfter = await waitFor(() =>
+      present(
+        calls.find(
+          (call) =>
+            call.method === 'POST' &&
+            call.body?.includes('"event":"FieldAfter"') === true &&
+            call.body.includes(`"fieldName":${JSON.stringify(name)}`),
+        ),
+        `the FieldAfter event of ${name}`,
+      ),
+    );
+    return writtenValues(fieldAfter);
+  }
+
+  // RECORD's DOB is 1980-05-01, so each entry is an edit. Text that follows the mask MM-DD-YYYY
+  // and names a real day is that wire date; blank text is no value; text typed in the wire form
+  // is that date too, and leaving the field shows it in the mask.
+  it.each<{ typed: string; shown: string; sent: string | null }>([
+    { typed: '05-11-2011', shown: '05-11-2011', sent: '2011-05-11' },
+    { typed: '02-29-2000', shown: '02-29-2000', sent: '2000-02-29' },
+    { typed: '2011-05-11', shown: '05-11-2011', sent: '2011-05-11' },
+    { typed: '', shown: '', sent: null },
+    { typed: '   ', shown: '', sent: null },
+  ])(
+    'saves DOB typed as $typed as $sent, raises FieldAfter with it, and shows $shown once it is left',
+    async ({ typed, shown, sent }) => {
+      const { definition } = await renderForm(createFormDefinitionFixture(), { answersFieldEvents: true });
+      replyToWrite({ kind: 'saved', record: savedWith(RECORD, { DOB: sent }) });
+
+      const dob = await enterDate(definition, 'DOB', typed);
+
+      expect(controlValue(dob)).toBe(shown);
+      expect((await fieldAfterValues('DOB')).DOB).toBe(sent);
+      fireEvent.click(formActionButton('Save'));
+      const update = await waitFor(() => present(calls.find((call) => call.method === 'PUT'), 'the update'));
+      expect(update.body).toBe(`{"values":{"DOB":${JSON.stringify(sent)}}}`);
+      const status = within(screen.getByRole('toolbar', { name: 'Form actions' })).getByRole('status');
+      await waitFor(() => {
+        expect(status.textContent).toBe('Changes saved.');
+      });
+      await flush();
+      // The saved record holds the wire date, shown in the mask.
+      expect(controlValue(dob)).toBe(shown);
+    },
+  );
+
+  // Partial or impossible text is kept as typed and reported in the mask's terms; a real day
+  // outside the field's bounds or the datetime range is reported with its bounds in the mask.
+  it.each<{ name: string; typed: string; message: string }>([
+    { name: 'DOB', typed: '05-1', message: 'Enter a valid date (MM-DD-YYYY).' },
+    { name: 'DOB', typed: '13-45-2011', message: 'Enter a valid date (MM-DD-YYYY).' },
+    { name: 'DOB', typed: '02-30-2011', message: 'Enter a valid date (MM-DD-YYYY).' },
+    { name: 'DOB', typed: '2011/05/11', message: 'Enter a valid date (MM-DD-YYYY).' },
+    { name: 'DOB', typed: '5-11-2011', message: 'Enter a valid date (MM-DD-YYYY).' },
+    { name: 'DOB', typed: '12-31-1752', message: 'Enter a date between 01-01-1753 and 12-31-9999.' },
+    { name: 'DateofInterview', typed: '01-14-2011', message: 'Enter a value from 01-15-2011 to 12-31-2012.' },
+    { name: 'OnsetDate', typed: '01-01-2013', message: 'Enter a value from 01-15-2011 to 12-31-2012.' },
+  ])(
+    'keeps $name typed as $typed once it is left, and Save shows $message and sends no write',
+    async ({ name, typed, message }) => {
+      const { definition } = await renderForm(createFormDefinitionFixture(), { answersFieldEvents: true });
+
+      const control = await enterDate(definition, name, typed);
+
+      expect(controlValue(control)).toBe(typed);
+      fireEvent.click(formActionButton('Save'));
+      const summary = await findValidationSummary();
+      await flush();
+      expect(calls.filter((call) => call.method === 'PUT')).toEqual([]);
+      const items = summaryItemsFor(summary, promptOf(fieldByName(name, definition)));
+      expect(items.map((item) => item.textContent?.includes(message))).toEqual([true]);
+      expect(within(summary).getAllByRole('listitem')).toHaveLength(1);
+      // The format hint and the error both describe the box, the hint first.
+      expect(control.getAttribute('aria-describedby')).toBe(`${fieldControlId(name)}-hint ${fieldErrorId(name)}`);
+      expect(descriptionOf(control)).toBe(`Format: MM-DD-YYYY ${message}`);
+      expect(controlValue(control)).toBe(typed);
     },
   );
 });

@@ -358,6 +358,48 @@ function readAgeScenario(): AgeScenario {
   return { given: { DOB: dob, DateofInterview: interview }, expected: { Age: age } };
 }
 
+/** The `validation.pattern` of each field `names` lists, `null` for none, from `GET /api/forms/{viewId}`. */
+async function fieldPatterns(get: JsonGet, viewId: number, names: readonly string[]): Promise<Map<string, string | null>> {
+  const path = `/api/forms/${viewId}`;
+  const response = await get(path);
+  expect(response.status, `GET ${path}`).toBe(200);
+  const body = await response.body();
+  const pages = isObject(body) ? body.pages : undefined;
+  const patterns = new Map<string, string | null>();
+  for (const page of isArray(pages) ? pages : []) {
+    const fields = isObject(page) ? page.fields : undefined;
+    for (const field of isArray(fields) ? fields : []) {
+      if (isObject(field) && typeof field.name === 'string' && names.includes(field.name)) {
+        const pattern = isObject(field.validation) ? field.validation.pattern : undefined;
+        patterns.set(field.name, typeof pattern === 'string' ? pattern : null);
+      }
+    }
+  }
+  for (const name of names) {
+    if (!patterns.has(name)) {
+      throw new Error(`GET ${path} does not list the field ${name}.`);
+    }
+  }
+  return patterns;
+}
+
+/**
+ * A scenario's `YYYY-MM-DD` date as a user enters it in a date field with `pattern`. A date mask, a pattern holding
+ * each of `YYYY`, `MM` and `DD` once in any case (seeded `MM-DD-YYYY`), is the field's entry format, so the date is
+ * written through it; a field with any other pattern, or none, keeps the browser's date input, whose value is the
+ * date as it is.
+ */
+function dateEntry(iso: string, pattern: string | null): string {
+  const tokens = /YYYY|MM|DD/gi;
+  const found = (pattern?.match(tokens) ?? []).map((token) => token.toUpperCase()).sort();
+  if (pattern === null || found.join(' ') !== 'DD MM YYYY') {
+    return iso;
+  }
+  const [year, month, day] = iso.split('-');
+  const parts: Readonly<Record<string, string>> = { YYYY: year, MM: month, DD: day };
+  return pattern.replace(tokens, (token) => parts[token.toUpperCase()]);
+}
+
 /** Starts recording what `page` sends; call it before the first navigation. */
 function recordTraffic(page: Page): Traffic {
   const loadWindow: SentRequest[] = [];
@@ -942,22 +984,34 @@ async function runWorkflow(
 
   await test.step('SC-10: check code assigns Age when DOB is left', async () => {
     const scenario = readAgeScenario();
+    // The scenario's dates are wire dates; each is typed in its field's entry format, its date mask.
+    const get = tracedGet(request);
+    const food = formNamed(await readForms(get), 'FoodHistory');
+    const patterns = await fieldPatterns(get, food.viewId, ['DateofInterview', 'DOB']);
+    const interviewEntry = dateEntry(scenario.given.DateofInterview, patterns.get('DateofInterview') ?? null);
+    const dobEntry = dateEntry(scenario.given.DOB, patterns.get('DOB') ?? null);
     const writesBefore = traffic.recordWrites.length;
     await backToForms(page);
     await openForm(page, 'FoodHistory', nFood);
     await navigatorButton(page, 'New').click();
     await expect(status).toHaveText('New record');
 
-    await page.getByLabel(INTERVIEW_LABEL, { exact: true }).fill(scenario.given.DateofInterview);
+    await page.getByLabel(INTERVIEW_LABEL, { exact: true }).fill(interviewEntry);
     const dob = page.getByLabel(DOB_LABEL, { exact: true });
-    await dob.fill(scenario.given.DOB);
-    // DOB is left by blur, not Tab: in Chromium, Tab inside a native date input moves between its month, day and
-    // year parts, so focus would stay on DOB and FieldAfter would never be raised.
+    await dob.fill(dobEntry);
+    // DOB is left by blur, which raises its FieldAfter as leaving the field does whatever its control: a field with
+    // no date mask keeps the native date input, inside which Tab moves between the month, day and year parts.
     const [leftDob] = await Promise.all([
       page.waitForResponse((response) => isFieldEventPost(response, 'FieldAfter', 'DOB')),
       dob.blur(),
     ]);
     expect(leftDob.status(), 'POST of the DOB FieldAfter event').toBe(200);
+    // The entries reach the API as the scenario's wire dates, and DOB still shows its entry.
+    const sent: unknown = leftDob.request().postDataJSON();
+    expect(sent, 'values of the DOB FieldAfter event').toMatchObject({
+      values: { DOB: scenario.given.DOB, DateofInterview: scenario.given.DateofInterview },
+    });
+    await expect(dob).toHaveValue(dobEntry);
     const effects: unknown = await leftDob.json();
     expect(effects, 'effects of the DOB FieldAfter event').toMatchObject({
       assigned: { Age: scenario.expected.Age },

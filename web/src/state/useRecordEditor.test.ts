@@ -1050,19 +1050,55 @@ describe('validation', () => {
 
   // A date value is first a wire date, YYYY-MM-DD naming a real day of the years 0001-9999, as
   // every response's dates are; only a wire date then meets the datetime column's storage range,
-  // a save rule alone, which no field event applies.
-  it.each<[string, FieldValue, string[]]>([
-    ['a leap day', '2000-02-29', []],
-    ['the first day a datetime column stores', '1753-01-01', []],
-    ['the last day a datetime column stores', '9999-12-31', []],
-    ['a day the calendar lacks', '2011-02-29', [clientMessages.dateExpected]],
-    ['year 0000', '0000-01-01', [clientMessages.dateExpected]],
-    ['the legacy MM-DD-YYYY text', '01-15-2011', [clientMessages.dateExpected]],
-    ['a number', 20110115, [clientMessages.dateExpected]],
-    ['the day before the datetime range', '1752-12-31', [clientMessages.dateNotStorable]],
-    ['the first wire date', '0001-01-01', [clientMessages.dateNotStorable]],
-  ])('gives feedback on %s in a date field', (_case, value, messages) => {
-    expect(validateField(fieldByName('DOB'), value)).toEqual(messages);
+  // a save rule alone, which no field event applies. A field without a date mask speaks the wire
+  // format; one with a date mask, which is its entry and display format, speaks that mask, here
+  // the fixture DOB's MM-DD-YYYY.
+  const ISO_DATE_EXPECTED = 'Enter a valid date (YYYY-MM-DD).';
+  const ISO_DATE_NOT_STORABLE = 'Enter a date between 1753-01-01 and 9999-12-31.';
+  const MASKED_DATE_EXPECTED = 'Enter a valid date (MM-DD-YYYY).';
+  const MASKED_DATE_NOT_STORABLE = 'Enter a date between 01-01-1753 and 12-31-9999.';
+  it.each<[string, FieldValue, string[], string[]]>([
+    ['a leap day', '2000-02-29', [], []],
+    ['the first day a datetime column stores', '1753-01-01', [], []],
+    ['the last day a datetime column stores', '9999-12-31', [], []],
+    ['a day the calendar lacks', '2011-02-29', [ISO_DATE_EXPECTED], [MASKED_DATE_EXPECTED]],
+    ['year 0000', '0000-01-01', [ISO_DATE_EXPECTED], [MASKED_DATE_EXPECTED]],
+    // DateInput turns text that follows the mask into its wire date, so text in the mask is
+    // never itself a value; only text that matches no date reaches the editor raw.
+    ['the legacy MM-DD-YYYY text', '01-15-2011', [ISO_DATE_EXPECTED], [MASKED_DATE_EXPECTED]],
+    ['a partial entry', '05-1', [ISO_DATE_EXPECTED], [MASKED_DATE_EXPECTED]],
+    ['a number', 20110115, [ISO_DATE_EXPECTED], [MASKED_DATE_EXPECTED]],
+    ['the day before the datetime range', '1752-12-31', [ISO_DATE_NOT_STORABLE], [MASKED_DATE_NOT_STORABLE]],
+    ['the first wire date', '0001-01-01', [ISO_DATE_NOT_STORABLE], [MASKED_DATE_NOT_STORABLE]],
+  ])('gives feedback on %s in a date field, in the wire format without a date mask and in the mask with one', (_case, value, wireMessages, maskedMessages) => {
+    const dob = fieldByName('DOB');
+    expect(dob.validation.pattern).toBe('MM-DD-YYYY');
+    expect(validateField({ ...dob, validation: { ...dob.validation, pattern: null } }, value)).toEqual(wireMessages);
+    expect(validateField(dob, value)).toEqual(maskedMessages);
+  });
+
+  // The bounds of a range message are shown as the field shows a date: as wire dates without a
+  // date mask, through the mask with one. A pattern that is no date mask speaks the wire format.
+  it.each<[string | null, string | null, string | null, string, string[]]>([
+    [null, '2011-01-15', '2012-12-31', '2011-01-14', ['Enter a value from 2011-01-15 to 2012-12-31.']],
+    ['MM-DD', '2011-01-15', '2012-12-31', '2013-01-01', ['Enter a value from 2011-01-15 to 2012-12-31.']],
+    ['MM-DD-YYYY', '2011-01-15', '2012-12-31', '2011-01-14', ['Enter a value from 01-15-2011 to 12-31-2012.']],
+    ['MM-DD-YYYY', '2011-01-15', null, '2011-01-14', ['Enter a value of at least 01-15-2011.']],
+    ['MM-DD-YYYY', null, '2012-12-31', '2013-01-01', ['Enter a value of at most 12-31-2012.']],
+    ['dd.mm.yyyy', '2011-01-15', '2012-12-31', '2013-01-01', ['Enter a value from 15.01.2011 to 31.12.2012.']],
+    ['MM-DD-YYYY', '2011-01-15', '2012-12-31', '2011-01-15', []],
+  ])('shows the range of a date field with pattern %s and bounds %s to %s, given %s', (pattern, lower, upper, value, messages) => {
+    const field = fieldByName('DateofInterview');
+    expect(validateField({ ...field, validation: { ...field.validation, pattern, lower, upper } }, value)).toEqual(messages);
+  });
+
+  it.each<[string, string]>([
+    ['dd.mm.yyyy', 'Enter a valid date (dd.mm.yyyy).'],
+    ['YYYY/MM/DD', 'Enter a valid date (YYYY/MM/DD).'],
+    ['MM-DD-YYYY HH:MM', ISO_DATE_EXPECTED],
+  ])('names the date mask %s, when the pattern is one, in the message for text that is no date', (pattern, message) => {
+    const dob = fieldByName('DOB');
+    expect(validateField({ ...dob, validation: { ...dob.validation, pattern } }, '31.12.2011x')).toEqual([message]);
   });
 
   // A digit in a text '#' mask is a literal, as on the server: '##-2' needs two digits, a hyphen and a 2.

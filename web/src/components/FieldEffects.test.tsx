@@ -52,6 +52,8 @@ const RECORD: RecordDto = recordFixture({
 
 /** EC-AGE-03: YEARS(DOB, DateofInterview) assigns 11 for this leap-day birth date. */
 const DOB_ENTERED = '2000-02-29';
+/** DOB_ENTERED as the user types it, in DOB's date mask MM-DD-YYYY. */
+const DOB_TYPED = '02-29-2000';
 const ASSIGNED_AGE = 11;
 
 // Wire bodies
@@ -371,19 +373,39 @@ describe('FieldEffects: check-code effects reach the screen (SC-10)', () => {
 
   it('shows an assigned value after FieldAfter, which carries the edited value', async () => {
     const api = await openForm({ 'FieldAfter:DOB': { assigned: { Age: ASSIGNED_AGE } } });
+    expect(fieldByName('DOB', definition).validation.pattern).toBe('MM-DD-YYYY');
 
-    enter('DOB', DOB_ENTERED);
+    enter('DOB', DOB_TYPED);
 
     await waitFor(() => {
       expect(fieldControl('Age').value).toBe(String(ASSIGNED_AGE));
     });
+    expect(fieldControl('DOB').value).toBe(DOB_TYPED);
     expect(eventKeys(api)).toEqual(['FieldBefore:DOB', 'FieldAfter:DOB']);
+    // The date typed in its mask reaches the event as its wire date.
     expect(sentEvent(api, 'FieldAfter:DOB').values).toMatchObject({
       DOB: DOB_ENTERED,
       DateofInterview: '2011-02-28',
       Age: null,
     });
     expect(fieldControl('Age').disabled).toBe(false);
+  });
+
+  // An assigned date replaces the text a date field holds and shows through its date mask.
+  it('shows a date assigned by check code in its date mask, replacing a partial entry', async () => {
+    const api = await openForm({
+      'FieldAfter:DOB': { assigned: { DOB: DOB_ENTERED, DateofInterview: '2011-03-01' } },
+    });
+
+    enter('DOB', '02-29-20');
+    expect(fieldControl('DOB').value).toBe('02-29-20');
+
+    await waitFor(() => {
+      expect(fieldControl('DOB').value).toBe(DOB_TYPED);
+    });
+    expect(fieldControl('DateofInterview').value).toBe('03-01-2011');
+    // The partial entry names no day, so the event carried DOB as no value.
+    expect(sentEvent(api, 'FieldAfter:DOB').values).toMatchObject({ DOB: null, DateofInterview: '2011-02-28' });
   });
 
   it('disables a field, and a later event enables it again', async () => {
@@ -407,24 +429,25 @@ describe('FieldEffects: check-code effects reach the screen (SC-10)', () => {
     expect(eventKeys(api)).toEqual(['FieldBefore:DOB', 'FieldAfter:DOB', 'FieldBefore:FirstName']);
   });
 
-  // A disabled date shows its date as read-only text through the field's date mask, while
-  // the editor, and so every event payload, keeps the wire's ISO string.
-  it('shows a date disabled by check code as read-only text in its date mask, and ENABLE restores its date input', async () => {
+  // A date is shown through the field's date mask, as an entry box while enabled and as
+  // read-only text while disabled, while the editor, and so every event payload, keeps the
+  // wire's ISO string.
+  it('shows a date disabled by check code as read-only text in its date mask, and ENABLE restores its entry box in that mask', async () => {
     const api = await openForm({
       'FieldAfter:DOB': { disabled: ['DateofInterview'] },
       'FieldBefore:FirstName': { enabled: ['DateofInterview'] },
     });
-    // RECORD's DateofInterview, and the field's metadata bounds and date mask.
+    // RECORD's DateofInterview, and the field's date mask, its entry and display format.
     const stored = '2011-02-28';
-    const { lower, upper, pattern } = fieldByName('DateofInterview', definition).validation;
+    const { pattern } = fieldByName('DateofInterview', definition).validation;
     expect(pattern).toBe('MM-DD-YYYY');
     const before = fieldControl('DateofInterview');
-    expect([before.type, before.value, before.disabled, before.min, before.max]).toEqual([
-      'date',
-      stored,
+    expect([before.type, before.value, before.placeholder, before.disabled, before.readOnly]).toEqual([
+      'text',
+      '02-28-2011',
+      'MM-DD-YYYY',
       false,
-      lower,
-      upper,
+      false,
     ]);
 
     const dob = fieldControl('DOB');
@@ -445,12 +468,12 @@ describe('FieldEffects: check-code effects reach the screen (SC-10)', () => {
       expect(fieldControl('DateofInterview').disabled).toBe(false);
     });
     const enabled = fieldControl('DateofInterview');
-    expect([enabled.type, enabled.value, enabled.readOnly, enabled.min, enabled.max]).toEqual([
-      'date',
-      stored,
+    expect([enabled.type, enabled.value, enabled.placeholder, enabled.disabled, enabled.readOnly]).toEqual([
+      'text',
+      '02-28-2011',
+      'MM-DD-YYYY',
       false,
-      lower,
-      upper,
+      false,
     ]);
     // FieldBefore:FirstName was captured while the date was disabled, and carries its ISO value.
     expect(sentEvent(api, 'FieldBefore:FirstName').values).toMatchObject({ DateofInterview: stored });
@@ -598,7 +621,8 @@ describe('FieldEffects: check-code effects reach the screen (SC-10)', () => {
   it('shows a value assigned to a read-only field and keeps the field disabled', async () => {
     const api = await openForm({ 'FieldAfter:OnsetDate': { assigned: { OnsetWeek: 7 } } });
 
-    enter('OnsetDate', '2011-02-15');
+    // Typed in OnsetDate's date mask MM-DD-YYYY; the event carries the wire date.
+    enter('OnsetDate', '02-15-2011');
 
     await waitFor(() => {
       expect(fieldControl('OnsetWeek').value).toBe('7');
