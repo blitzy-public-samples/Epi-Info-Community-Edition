@@ -23,7 +23,7 @@ namespace EpiInfo.Data.Tests.Records;
 /// <summary>
 /// Integration tests of the record statements the repository builds and runs, against the seeded forms of the
 /// rehearsal database. The metadata reader supplies every form, page, table and column schema, so each identifier a
-/// statement names is one the catalogue returned. The cases pin five contracts:
+/// statement names is one the catalogue returned. The cases pin six contracts:
 /// <list type="bullet">
 /// <item><description>
 /// The form write lock a create and an update take first, <see cref="RecordSqlBuilder.AcquireFormWriteLock"/>: it
@@ -41,6 +41,13 @@ namespace EpiInfo.Data.Tests.Records;
 /// id exactly, so a spelling that differs from it only by trailing spaces, within or beyond the column's width, finds
 /// no row; the base-row reads return the id as stored, the spelling every later statement binds; and Find's exclusion
 /// of the open record matches the same way, so such a spelling excludes nothing.
+/// </description></item>
+/// <item><description>
+/// Single-record coordinates (AAP 0.3.4.3 and 0.3.4.4): <see cref="RecordSqlBuilder.RecordAt"/>,
+/// <see cref="RecordSqlBuilder.RecordById"/>, <see cref="RecordSqlBuilder.RecordSnapshot"/> and
+/// <see cref="RecordSqlBuilder.SetPositionLookup"/> give a record the count of its set through its own key and the
+/// count of the set, computed for that row alone under the base-table hold hint, and <c>RecordAt</c> joins the page
+/// tables to its fetched row only.
 /// </description></item>
 /// <item><description>
 /// Stored reads: every stored data value of the seeded forms, with the runtime type SqlClient returns for its column,
@@ -122,6 +129,11 @@ public sealed class SqlRecordRepositoryTests : IAsyncLifetime
     private const string NonLetterPattern = "%[^A-Za-z]%";
     private const string BinaryCollation = "Latin1_General_BIN2";
 
+    // The table hint of every base-table reference of a held read, and RecordSqlBuilder's alias of the base table
+    // inside the counts of a record's coordinates, which this test cannot reference.
+    private const string HeldTableHint = " WITH (HOLDLOCK)";
+    private const string CountedBaseAlias = "i";
+
     // Covers a wait of up to 300 seconds for the test lock and the work behind it.
     private static readonly TimeSpan RepositoryTestTimeout = TimeSpan.FromMinutes(10);
 
@@ -129,6 +141,15 @@ public sealed class SqlRecordRepositoryTests : IAsyncLifetime
 
     /// <summary>The seeded forms.</summary>
     public static TheoryData<string> Forms => new() { "CaseReport", "FoodHistory" };
+
+    /// <summary>Each seeded form with each selected set: the active set, then every row.</summary>
+    public static TheoryData<string, bool> FormSets => new()
+    {
+        { "CaseReport", false },
+        { "CaseReport", true },
+        { "FoodHistory", false },
+        { "FoodHistory", true },
+    };
 
     /// <summary>Each seeded form with each padding: within and beyond the width of its id column.</summary>
     public static TheoryData<string, int> PaddedIds => new()
@@ -739,6 +760,254 @@ public sealed class SqlRecordRepositoryTests : IAsyncLifetime
         AssertOnlySuccessfulReads(recorder, expectedCommands: 1);
     }
 
+    // AAP 0.3.4.4 "Position" and 0.3.4.3 "Record": a record's selected-set position is COUNT(*) of the selected set
+    // with UniqueKey <= k, and its own position and count are taken over the active set when it is active and over
+    // every row otherwise. The records are chosen by that formula in direct SQL: the first, middle and last position of
+    // the selected set, and the lowest-keyed deleted record. RecordAt at each one's position, RecordById,
+    // RecordSnapshot and SetPositionLookup on each return the coordinates direct COUNT_BIG(*) queries give, and
+    // RecordAt past the end of the set finds no row. Each statement computes them for its selected row alone, with no
+    // window over every row; RecordAt applies its OFFSET to the base keys inside its derived table and joins the page
+    // tables to the fetched row only; and every base-table reference carries HOLDLOCK while no page table carries a
+    // hint (RecordSqlBuilder's class remarks, "Read hint").
+    [Theory]
+    [MemberData(nameof(FormSets))]
+    public async Task SingleRecordReads_CoordinatesAreTheCountsThroughTheSelectedRowAndOnlyItIsJoined(
+        string formName,
+        bool includeDeleted)
+    {
+        await TestDatabase.EnsureReachableAsync();
+        await using DatabaseWriteLock dbLock = await DatabaseWriteLock.AcquireSharedAsync();
+
+        var recorder = new SqlCommandRecorder();
+        await using SeededForm form = await SeededForm.OpenAsync(formName, recorder);
+
+        SetCounts lowest = Assert.Single(await form.ReadEachRowAsync(CountsThrough(form, form.UniqueKey), ReadCounts));
+        long setCount = includeDeleted ? lowest.All : lowest.Active;
+        Assert.True(setCount >= 3, "The selected set holds fewer than three records.");
+
+        var samples = new List<(long? Position, CoordinateRow Row, SetCounts Counts)>();
+        foreach (long position in new[] { 1, (setCount + 1) / 2, setCount })
+        {
+            CoordinateRow row = Assert.Single(
+                await form.ReadEachRowAsync(AtFormulaPosition(form, includeDeleted, position), ReadBaseRow));
+            samples.Add((position, row, Assert.Single(
+                await form.ReadEachRowAsync(CountsThrough(form, row.UniqueKey), ReadCounts))));
+        }
+
+        CoordinateRow deleted = Assert.Single(await form.ReadEachRowAsync(LowestDeleted(form), ReadBaseRow));
+        SetCounts deletedCounts = Assert.Single(
+            await form.ReadEachRowAsync(CountsThrough(form, deleted.UniqueKey), ReadCounts));
+        samples.Add((includeDeleted ? deletedCounts.AllThrough : (long?)null, deleted, deletedCounts));
+        recorder.Clear();
+
+        int commands = 0;
+        foreach ((long? position, CoordinateRow row, SetCounts counts) in samples)
+        {
+            CoordinateRow intrinsic = row.RecStatus == ActiveStatus
+                ? row with { Position = counts.ActiveThrough, Count = counts.Active }
+                : row with { Position = counts.AllThrough, Count = counts.All };
+
+            if (position is { } at)
+            {
+                RecordSelect atSelect = RecordSqlBuilder.RecordAt(
+                    form.Schema,
+                    form.DataFields,
+                    includeDeleted,
+                    checked((int)at));
+                AssertOffsetAppliesToTheBaseKeysBeforeEveryPageJoin(form.Schema, atSelect.Statement.Text);
+                Assert.Equal(intrinsic, Assert.Single(await form.ReadEachRowAsync(atSelect.Statement, ReadRecordRow)));
+                commands++;
+            }
+
+            RecordSelect byId = RecordSqlBuilder.RecordById(form.Schema, form.DataFields, row.GlobalRecordId);
+            AssertCountsHeldForTheRowAlone(form.Schema, byId.Statement.Text);
+            Assert.Equal(intrinsic, Assert.Single(await form.ReadEachRowAsync(byId.Statement, ReadRecordRow)));
+
+            RecordSelect snapshot = RecordSqlBuilder.RecordSnapshot(
+                form.Schema,
+                form.DataFields,
+                row.UniqueKey,
+                row.GlobalRecordId);
+            AssertCountsHeldForTheRowAlone(form.Schema, snapshot.Statement.Text);
+            Assert.Equal(intrinsic, Assert.Single(await form.ReadEachRowAsync(snapshot.Statement, ReadRecordRow)));
+
+            SqlStatement lookup = RecordSqlBuilder.SetPositionLookup(form.Schema, row.GlobalRecordId, includeDeleted);
+            AssertCountsHeldForTheRowAlone(form.Schema, lookup.Text);
+            CoordinateRow placed = Assert.Single(await form.ReadEachRowAsync(lookup, ReadSetRow));
+            Assert.Equal(row with { Position = placed.Position, Count = placed.Count }, placed);
+            Assert.Equal(includeDeleted ? counts.All : counts.Active, placed.Count);
+            Assert.Equal(position is not null, RecordQueryRules.IsInSelectedSet(placed.RecStatus, includeDeleted));
+            if (position is not null)
+            {
+                Assert.Equal(includeDeleted ? counts.AllThrough : counts.ActiveThrough, placed.Position);
+            }
+
+            commands += 3;
+        }
+
+        RecordSelect pastTheEnd = RecordSqlBuilder.RecordAt(
+            form.Schema,
+            form.DataFields,
+            includeDeleted,
+            checked((int)(setCount + 1)));
+        Assert.Empty(await form.ReadEachRowAsync(pastTheEnd.Statement, ReadRecordRow));
+        commands++;
+
+        AssertOnlySuccessfulReads(recorder, commands);
+    }
+
+    // RecordAt's derived table reads the base keys of the selected set under the hold hint and applies ORDER BY ...
+    // OFFSET ... FETCH to them before it closes, and every page table is joined to that one fetched row after it; the
+    // statement's counts are those of AssertCountsHeldForTheRowAlone.
+    private static void AssertOffsetAppliesToTheBaseKeysBeforeEveryPageJoin(FormSchema schema, string text)
+    {
+        AssertCountsHeldForTheRowAlone(schema, text);
+
+        string baseAlias = RecordSqlBuilder.BaseAlias;
+        string derivedRead = "FROM (SELECT " + string.Join(
+                ", ",
+                new[] { schema.GlobalRecordId, schema.UniqueKey, schema.RecStatus }.Select(column =>
+                    baseAlias + "." + SqlIdentifier.Quote(RecordSqlBuilder.Require(column)))) +
+            " FROM " + SqlIdentifier.Quote(schema.BaseTable) + " " + baseAlias + HeldTableHint;
+        string fetchedRow = " ROWS FETCH NEXT 1 ROWS ONLY) " + baseAlias;
+        int readAt = text.IndexOf(derivedRead, StringComparison.Ordinal);
+        int offsetAt = text.IndexOf(" OFFSET ", StringComparison.Ordinal);
+        int fetchedAt = text.IndexOf(fetchedRow, StringComparison.Ordinal);
+        Assert.True(readAt >= 0, "RecordAt does not read the base keys in a held derived table.");
+        Assert.Equal(1, Occurrences(text, " OFFSET "));
+        Assert.True(
+            readAt < offsetAt && offsetAt < fetchedAt,
+            "RecordAt does not apply its OFFSET inside the derived table that reads the base keys.");
+
+        int tables = schema.Pages.Count(page => page.Table is not null);
+        Assert.True(tables > 0, "The seeded form has no page table.");
+        Assert.Equal(tables, Occurrences(text, " JOIN "));
+        Assert.True(
+            text.IndexOf(" JOIN ", StringComparison.Ordinal) == fetchedAt + fetchedRow.Length + " LEFT".Length,
+            "RecordAt joins a page table before its derived table has fetched the one base row.");
+    }
+
+    // The statement names no window, so no coordinate is computed for a row it does not return; every reference to
+    // the base table, as the outer row b or as a counted row, carries the hold hint; and every page table is joined
+    // with no hint at all.
+    private static void AssertCountsHeldForTheRowAlone(FormSchema schema, string text)
+    {
+        Assert.DoesNotContain(" OVER (", text, StringComparison.Ordinal);
+
+        string baseTable = SqlIdentifier.Quote(schema.BaseTable) + " ";
+        int baseReferences = Occurrences(text, baseTable);
+        Assert.True(baseReferences > 1, "The statement does not count against the base table.");
+        Assert.Equal(
+            baseReferences,
+            Occurrences(text, baseTable + RecordSqlBuilder.BaseAlias + HeldTableHint) +
+            Occurrences(text, baseTable + CountedBaseAlias + HeldTableHint));
+        Assert.Equal(baseReferences, Occurrences(text, HeldTableHint));
+
+        for (int index = 0; index < schema.Pages.Count; index++)
+        {
+            if (schema.Pages[index].Table is { } table)
+            {
+                string pageTable = SqlIdentifier.Quote(table) + " ";
+                Assert.Equal(
+                    Occurrences(text, pageTable),
+                    Occurrences(text, pageTable + RecordSqlBuilder.PageAlias(index) + " ON "));
+            }
+        }
+    }
+
+    // The base row whose count of selected rows through its own key is the position, the AAP 0.3.4.4 formula, read
+    // with no OFFSET: none past the end of the set.
+    private static SqlStatement AtFormulaPosition(SeededForm form, bool includeDeleted, long position)
+    {
+        string table = SqlIdentifier.Quote(form.Schema.BaseTable);
+        string uniqueKey = SqlIdentifier.Quote(RecordSqlBuilder.Require(form.Schema.UniqueKey));
+        string recStatus = SqlIdentifier.Quote(RecordSqlBuilder.Require(form.Schema.RecStatus));
+        string inSet = includeDeleted ? string.Empty : " AND x." + recStatus + " = @activeStatus";
+        var sql = new StringBuilder("SELECT ").Append(BaseRowColumns(form)).Append(" FROM ").Append(table)
+            .Append(" b WHERE (SELECT COUNT_BIG(*) FROM ").Append(table).Append(" x WHERE x.").Append(uniqueKey)
+            .Append(" <= b.").Append(uniqueKey).Append(inSet).Append(") = @position");
+        if (!includeDeleted)
+        {
+            sql.Append(" AND b.").Append(recStatus).Append(" = @activeStatus");
+        }
+
+        return new SqlStatement(
+            sql.ToString(),
+            [
+                new SqlParameterValue("@activeStatus", DbType.Int16, ActiveStatus, Size: null),
+                new SqlParameterValue("@position", DbType.Int64, position, Size: null),
+            ]);
+    }
+
+    // The deleted base row with the lowest UniqueKey.
+    private static SqlStatement LowestDeleted(SeededForm form)
+    {
+        string uniqueKey = SqlIdentifier.Quote(RecordSqlBuilder.Require(form.Schema.UniqueKey));
+        string recStatus = SqlIdentifier.Quote(RecordSqlBuilder.Require(form.Schema.RecStatus));
+        return new SqlStatement(
+            "SELECT TOP (1) " + BaseRowColumns(form) + " FROM " + SqlIdentifier.Quote(form.Schema.BaseTable) +
+            " b WHERE b." + recStatus + " <> @activeStatus ORDER BY b." + uniqueKey,
+            [new SqlParameterValue("@activeStatus", DbType.Int16, ActiveStatus, Size: null)]);
+    }
+
+    // COUNT_BIG(*) of the active rows and of every row, each through the key and in all.
+    private static SqlStatement CountsThrough(SeededForm form, int uniqueKey)
+    {
+        string table = SqlIdentifier.Quote(form.Schema.BaseTable);
+        string key = "x." + SqlIdentifier.Quote(RecordSqlBuilder.Require(form.Schema.UniqueKey)) + " <= @uniqueKey";
+        string active = "x." + SqlIdentifier.Quote(RecordSqlBuilder.Require(form.Schema.RecStatus)) +
+            " = @activeStatus";
+        string count = "(SELECT COUNT_BIG(*) FROM " + table + " x";
+        return new SqlStatement(
+            $"SELECT {count} WHERE {active} AND {key}), {count} WHERE {active}), {count} WHERE {key}), {count})",
+            [
+                new SqlParameterValue("@activeStatus", DbType.Int16, ActiveStatus, Size: null),
+                new SqlParameterValue("@uniqueKey", DbType.Int32, uniqueKey, Size: null),
+            ]);
+    }
+
+    // b.[GlobalRecordId], b.[UniqueKey], b.[RecStatus], the order ReadBaseRow reads.
+    private static string BaseRowColumns(SeededForm form) =>
+        "b." + SqlIdentifier.Quote(form.GlobalRecordIdColumn) +
+        ", b." + SqlIdentifier.Quote(RecordSqlBuilder.Require(form.Schema.UniqueKey)) +
+        ", b." + SqlIdentifier.Quote(RecordSqlBuilder.Require(form.Schema.RecStatus));
+
+    private static CoordinateRow ReadBaseRow(DbDataReader rows) =>
+        new(rows.GetString(0), rows.GetInt32(1), rows.GetInt16(2), Position: 0, Count: 0);
+
+    private static SetCounts ReadCounts(DbDataReader rows) =>
+        new(rows.GetInt64(0), rows.GetInt64(1), rows.GetInt64(2), rows.GetInt64(3));
+
+    private static CoordinateRow ReadRecordRow(DbDataReader rows) =>
+        new(
+            rows.GetString(RecordSqlBuilder.RecordGlobalRecordIdOrdinal),
+            rows.GetInt32(RecordSqlBuilder.RecordUniqueKeyOrdinal),
+            rows.GetInt16(RecordSqlBuilder.RecordRecStatusOrdinal),
+            rows.GetInt64(RecordSqlBuilder.RecordIntrinsicPositionOrdinal),
+            rows.GetInt64(RecordSqlBuilder.RecordIntrinsicCountOrdinal));
+
+    private static CoordinateRow ReadSetRow(DbDataReader rows) =>
+        new(
+            rows.GetString(RecordSqlBuilder.BaseRowGlobalRecordIdOrdinal),
+            rows.GetInt32(RecordSqlBuilder.BaseRowUniqueKeyOrdinal),
+            rows.GetInt16(RecordSqlBuilder.BaseRowRecStatusOrdinal),
+            rows.GetInt64(RecordSqlBuilder.SetPositionOrdinal),
+            rows.GetInt64(RecordSqlBuilder.SetCountOrdinal));
+
+    // The number of non-overlapping ordinal occurrences of value in text.
+    private static int Occurrences(string text, string value)
+    {
+        int count = 0;
+        for (int index = text.IndexOf(value, StringComparison.Ordinal);
+            index >= 0;
+            index = text.IndexOf(value, index + value.Length, StringComparison.Ordinal))
+        {
+            count++;
+        }
+
+        return count;
+    }
+
     // AAP 0.3.4.4 "Open record": Find leaves the open record out on the server, before the total and the cap. The
     // exclusion matches the id as every lookup by id does, so the stored id excludes its record, while a spelling that
     // differs from it only by trailing spaces, within or beyond the column's width, identifies no record, as the
@@ -1102,6 +1371,17 @@ public sealed class SqlRecordRepositoryTests : IAsyncLifetime
     // A Find row's stored id and key, and the total of matches every row carries.
     private readonly record struct FoundRow(string GlobalRecordId, int UniqueKey, long Total);
 
+    // A base row's stored id, key and status with the position and count a statement gives it.
+    private readonly record struct CoordinateRow(
+        string GlobalRecordId,
+        int UniqueKey,
+        short RecStatus,
+        long Position,
+        long Count);
+
+    // COUNT_BIG(*) of the active rows through a key and in all, and of every row through that key and in all.
+    private readonly record struct SetCounts(long ActiveThrough, long Active, long AllThrough, long All);
+
     /// <summary>
     /// A seeded form exactly as the metadata reader returns it: its metadata, its catalogue schema and the
     /// reader-built column of each data field, in storage order.
@@ -1331,6 +1611,27 @@ public sealed class SqlRecordRepositoryTests : IAsyncLifetime
             Assert.True(rows.Count == 1, "The seeded form has no active record with a row on every page.");
             return rows[0];
         }
+
+        // Runs a statement outside any transaction and reads every row it returns with readRow.
+        public Task<IReadOnlyList<T>> ReadEachRowAsync<T>(SqlStatement statement, Func<DbDataReader, T> readRow) =>
+            SqlExecution.ReadAsync<IReadOnlyList<T>>(
+                _connection,
+                transaction: null,
+                Operation,
+                statement,
+                _commandTimeoutSeconds,
+                _observer,
+                CancellationToken.None,
+                async (rows, token) =>
+                {
+                    var result = new List<T>();
+                    while (await rows.ReadAsync(token))
+                    {
+                        result.Add(readRow(rows));
+                    }
+
+                    return result.AsReadOnly();
+                });
 
         // Parses a GlobalRecordId criterion as a client sends it, builds the Find statement over the active set with
         // the given exclusion, runs it, and reads each row's stored id and key and the total every row carries.
@@ -4765,7 +5066,7 @@ public sealed class SystemValueConversionTests : IAsyncLifetime
             () => ColumnValueConverter.FromSystemText(schemaColumn, DBNull.Value));
     }
 
-    // COUNT_BIG, ROW_NUMBER and the bigint SUM windows are declared Int64; the list's page flag is declared Int32.
+    // COUNT_BIG and ROW_NUMBER are declared Int64; the list's page flag is declared Int32.
     [Theory]
     [InlineData(DbType.Int64, TypeCode.Int64, "2147483647", 2147483647)]
     [InlineData(DbType.Int64, TypeCode.Int64, "-2147483648", -2147483648)]

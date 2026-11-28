@@ -359,8 +359,8 @@ public sealed partial class SqlParameterizationTests : IAsyncLifetime
 /// </description></item>
 /// <item><description>
 /// A bracketed alias stands only right after <c>AS</c>: one of the result-column aliases <c>[c0]</c> to <c>[cN]</c>,
-/// bounded by the form's pages and data fields, or inside a derived table one of its columns <c>[ip]</c> and
-/// <c>[ic]</c>. A result-column alias is referenced, unqualified, only after the <c>AS</c> that declares it.
+/// bounded by the form's pages and data fields. A result-column alias is referenced, unqualified, only after the
+/// <c>AS</c> that declares it.
 /// </description></item>
 /// <item><description>No identifier names a table of the other form, and none is double-quoted.</description></item>
 /// </list>
@@ -418,8 +418,8 @@ public sealed class RecordCommandIdentifierProvenanceTests : IAsyncLifetime
     private const string LaterPageTextPrefix = "lab-";
 
     // RecordSqlBuilder's table aliases, which this assembly cannot reference: BaseAlias, of the base table or of the
-    // derived table that reads it; IntrinsicSourceAlias, of the base table inside that derived table; and the prefix
-    // of PageAlias(n), of the page at index n.
+    // derived table that reads it; IntrinsicSourceAlias, of the base table inside the subqueries that count a
+    // record's position and count; and the prefix of PageAlias(n), of the page at index n.
     private const string BaseAlias = "b";
 
     private const string IntrinsicSourceAlias = "i";
@@ -431,13 +431,14 @@ public sealed class RecordCommandIdentifierProvenanceTests : IAsyncLifetime
 
     private static readonly string[] RecordWriteOperations = [InsertOperation, UpdateOperation, DeleteOperation];
 
-    // The closed vocabulary of record commands: every keyword and built-in that RecordSqlBuilder's fixed text writes,
-    // in any of its statements, compared ignoring case as SQL Server reads them.
+    // The closed vocabulary of record commands, compared ignoring case as SQL Server reads them: every keyword and
+    // built-in that RecordSqlBuilder's fixed text writes in any of its statements, plus CAST and its type bigint,
+    // which the rule for fixed statements reads (class remarks).
     private static readonly HashSet<string> BuilderKeywords = new(
         [
             "AND", "AS", "bigint", "BY", "CASE", "CAST", "COUNT_BIG", "DATALENGTH", "ELSE", "END", "FETCH", "FROM",
             "HOLDLOCK", "INSERT", "INSERTED", "INTO", "JOIN", "LEFT", "NEXT", "NOT", "OFFSET", "ON", "ONLY", "ORDER",
-            "OUTPUT", "OVER", "PRECEDING", "ROW_NUMBER", "ROWLOCK", "ROWS", "SELECT", "SET", "SUM", "THEN", "UNBOUNDED",
+            "OUTPUT", "ROWLOCK", "ROWS", "SELECT", "SET", "THEN", "TOP",
             "UPDATE", "UPDLOCK", "VALUES", "WHEN", "WHERE", "WITH",
         ],
         StringComparer.OrdinalIgnoreCase);
@@ -463,10 +464,6 @@ public sealed class RecordCommandIdentifierProvenanceTests : IAsyncLifetime
     private const string SystemSchema = "sys";
 
     private const string ExecuteKeyword = "EXEC";
-
-    // RecordSqlBuilder's IntrinsicPositionColumn and IntrinsicCountColumn without brackets: the columns its derived
-    // table declares with AS.
-    private static readonly HashSet<string> DerivedTableColumns = new(["ip", "ic"], StringComparer.Ordinal);
 
     // The keywords after which T-SQL reads a table reference, and those of them after which "(" opens a derived table.
     private static readonly string[] TablePositionKeywords = ["FROM", "JOIN", "INTO", "UPDATE"];
@@ -893,13 +890,7 @@ public sealed class RecordCommandIdentifierProvenanceTests : IAsyncLifetime
                 return null;
             }
 
-            if (inDerivedTable && DerivedTableColumns.Contains(name))
-            {
-                return null;
-            }
-
-            return $"[{name}] follows AS but is not a result-column alias [c0] to [c{form.ResultAliases.Count - 1}]" +
-                (inDerivedTable ? " or a derived-table column [ip] or [ic]" : string.Empty);
+            return $"[{name}] follows AS but is not a result-column alias [c0] to [c{form.ResultAliases.Count - 1}]";
         }
 
         if (shape.TableReferenceEnds.Contains(index - 1))
@@ -932,7 +923,7 @@ public sealed class RecordCommandIdentifierProvenanceTests : IAsyncLifetime
             return null;
         }
 
-        return form.ResultAliases.Contains(name) || DerivedTableColumns.Contains(name)
+        return form.ResultAliases.Contains(name)
             ? $"[{name}] is a result-column alias outside the AS that declares it"
             : $"[{name}] stands in a column position but is not a column the metadata reader returned for {form.Name}";
     }

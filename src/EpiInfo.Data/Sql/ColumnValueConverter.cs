@@ -472,8 +472,8 @@ internal static class ColumnValueConverter
     }
 
     /// <summary>
-    /// Reads an integer a statement computes rather than stores, such as a <c>COUNT_BIG</c>, a <c>ROW_NUMBER</c>, a
-    /// running <c>SUM</c> of <c>bigint</c> or a fixed <c>CASE</c> flag, as the <see cref="int"/> the port carries.
+    /// Reads an integer a statement computes rather than stores, such as a <c>COUNT_BIG</c>, a <c>ROW_NUMBER</c> or a
+    /// fixed <c>CASE</c> flag, as the <see cref="int"/> the port carries.
     /// </summary>
     /// <param name="nativeType">
     /// The native type the builder declares for the computed column: <see cref="DbType.Int64"/> for <c>bigint</c>

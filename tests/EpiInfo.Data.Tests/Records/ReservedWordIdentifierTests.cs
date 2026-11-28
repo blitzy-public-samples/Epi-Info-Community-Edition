@@ -124,6 +124,8 @@ public sealed class ReservedWordIdentifierTests
     private const string IncompletePage = "#IncompletePage";
     private const string NocountBase = "#NocountBase";
     private const string NocountPage = "#NocountPage";
+    private const string DuplicateIdBase = "#DuplicateIdBase";
+    private const string DuplicateIdPage = "#DuplicateIdPage";
 
     // A second page's table that lacks the GlobalRecordId record key column.
     private const string KeylessPage = "#KeylessPage";
@@ -141,6 +143,9 @@ public sealed class ReservedWordIdentifierTests
 
     // The tail every counted UPDATE of the builders ends with: the statement selects its own row count.
     private const string RowCountSelect = "; SELECT @@ROWCOUNT";
+
+    // The clause with which a by-id read chooses its one base row.
+    private const string TopOne = "TOP (1)";
 
     private static readonly TimeSpan TestTimeout = TimeSpan.FromSeconds(120);
 
@@ -1742,6 +1747,124 @@ public sealed class ReservedWordIdentifierTests
         }
     }
 
+    /// <summary>
+    /// The base tables key on <c>UniqueKey</c> alone, so several base rows can carry one <c>GlobalRecordId</c>. For
+    /// such an id the read by id (<see cref="RecordSqlBuilder.RecordById"/>) and the selected-set placement
+    /// (<see cref="RecordSqlBuilder.SetPositionLookup"/>, over the active set and over every row) each return exactly
+    /// one row, the exact match with the lowest <c>UniqueKey</c>, with that row's own coordinates: the number of rows
+    /// of the set whose key is at most its own, and the size of the set. The read by id takes them over the row's
+    /// intrinsic set, the active rows for an active row and every row otherwise, and the placement over the selected
+    /// set. Each statement chooses that row with its one <c>TOP (1)</c>. The expected values follow from the rows the
+    /// test inserts, by the formula <c>COUNT(*)</c> of the set with <c>UniqueKey &lt;= k</c>.
+    /// </summary>
+    /// <param name="firstMatchStatus">The <c>RecStatus</c> of the lowest-keyed row carrying the id.</param>
+    [Theory]
+    [InlineData(RecordQueryRules.ActiveRecStatus)]
+    [InlineData(RecordQueryRules.DeletedRecStatus)]
+    public async Task ByIdReads_IdOnSeveralBaseRows_ReturnOnlyTheLowestKeyedMatchWithItsCoordinates(
+        int firstMatchStatus)
+    {
+        await TestDatabase.EnsureReachableAsync();
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        var cancellationToken = timeout.Token;
+        await using var writeLock = await DatabaseWriteLock.AcquireExclusiveAsync(cancellationToken);
+        await using var connection = await TestDatabase.OpenConnectionAsync(cancellationToken);
+        try
+        {
+            var fixture = await CreateFixtureAsync(
+                connection,
+                DuplicateIdBase,
+                DuplicateIdPage,
+                $"[{Surname}] nvarchar(4000)",
+                [new FixtureField(Surname, TextTypeId, TextTypeName)],
+                cancellationToken);
+
+            // The shared id sits on the second, fourth and sixth rows, the first of them with the case's status, and
+            // other ids, active and deleted, lie before, between and after them, so each row carrying the id has
+            // coordinates of its own in every set.
+            var sharedId = RecordSqlBuilder.NewGlobalRecordId();
+            (string GlobalRecordId, int RecStatus)[] layout =
+            [
+                (RecordSqlBuilder.NewGlobalRecordId(), RecordQueryRules.ActiveRecStatus),
+                (sharedId, firstMatchStatus),
+                (RecordSqlBuilder.NewGlobalRecordId(), RecordQueryRules.DeletedRecStatus),
+                (sharedId, RecordQueryRules.ActiveRecStatus),
+                (RecordSqlBuilder.NewGlobalRecordId(), RecordQueryRules.ActiveRecStatus),
+                (sharedId, RecordQueryRules.DeletedRecStatus),
+            ];
+            var rows = new List<PlacedRow>(layout.Length);
+            foreach (var (globalRecordId, recStatus) in layout)
+            {
+                var uniqueKey = await InsertBaseRowAsync(
+                    connection,
+                    DuplicateIdBase,
+                    globalRecordId,
+                    recStatus,
+                    cancellationToken);
+                rows.Add(new PlacedRow(globalRecordId, uniqueKey, recStatus, Position: 0, Count: 0));
+            }
+
+            var matches = rows.Where(row => string.Equals(row.GlobalRecordId, sharedId, StringComparison.Ordinal));
+            var first = matches.MinBy(row => row.UniqueKey);
+            Assert.Equal(firstMatchStatus, first.RecStatus);
+
+            // The row's coordinates over a set: the members whose key is at most its own, and the number of members.
+            PlacedRow Placed(PlacedRow row, bool everyRow)
+            {
+                var set = rows.Where(member => everyRow || member.RecStatus == RecordQueryRules.ActiveRecStatus)
+                    .ToArray();
+                return row with
+                {
+                    Position = set.LongCount(member => member.UniqueKey <= row.UniqueKey),
+                    Count = set.LongLength,
+                };
+            }
+
+            var byId = RecordSqlBuilder.RecordById(fixture.Schema, fixture.DataFields, sharedId);
+            Assert.Equal(1, Regex.Count(byId.Statement.Text, Regex.Escape(TopOne)));
+            var read = await ReadPlacedRowsAsync(
+                fixture,
+                connection,
+                byId.Statement,
+                (RecordSqlBuilder.RecordGlobalRecordIdOrdinal,
+                    RecordSqlBuilder.RecordUniqueKeyOrdinal,
+                    RecordSqlBuilder.RecordRecStatusOrdinal,
+                    RecordSqlBuilder.RecordIntrinsicPositionOrdinal,
+                    RecordSqlBuilder.RecordIntrinsicCountOrdinal),
+                cancellationToken);
+            AssertPlacedRow(
+                Placed(first, everyRow: first.RecStatus != RecordQueryRules.ActiveRecStatus),
+                read,
+                "read by id");
+
+            foreach (var includeDeleted in new[] { false, true })
+            {
+                var lookup = RecordSqlBuilder.SetPositionLookup(fixture.Schema, sharedId, includeDeleted);
+                Assert.Equal(1, Regex.Count(lookup.Text, Regex.Escape(TopOne)));
+                var placed = await ReadPlacedRowsAsync(
+                    fixture,
+                    connection,
+                    lookup,
+                    (RecordSqlBuilder.BaseRowGlobalRecordIdOrdinal,
+                        RecordSqlBuilder.BaseRowUniqueKeyOrdinal,
+                        RecordSqlBuilder.BaseRowRecStatusOrdinal,
+                        RecordSqlBuilder.SetPositionOrdinal,
+                        RecordSqlBuilder.SetCountOrdinal),
+                    cancellationToken);
+                AssertPlacedRow(
+                    Placed(first, everyRow: includeDeleted),
+                    placed,
+                    includeDeleted ? "placement over every row" : "placement over the active set");
+            }
+
+            Assert.Empty(fixture.Recorder.Failed());
+        }
+        finally
+        {
+            await DropTablesAsync(connection, DuplicateIdPage, DuplicateIdBase);
+        }
+    }
+
     // Creates the base and page tables on the test's connection, reads them back through the reader's temporary-table
     // overload, and builds the in-memory form over the reader-built tables. Constraints are unnamed, so the session's
     // tables never collide with another session's.
@@ -1850,6 +1973,56 @@ public sealed class ReservedWordIdentifierTests
         Assert.True(uniqueKey > 0, "The base insert must return the new UniqueKey.");
         return globalRecordId;
     }
+
+    // Inserts a base row holding the given id and status by a plain parameterised command, which, unlike the builder's
+    // insert, can repeat an id, and returns the row's new UniqueKey.
+    private static async Task<int> InsertBaseRowAsync(
+        SqlConnection connection,
+        string baseName,
+        string globalRecordId,
+        int recStatus,
+        CancellationToken cancellationToken)
+    {
+        await using var command = new SqlCommand(
+            $"INSERT INTO [{baseName}] ([RecStatus], [GlobalRecordId]) OUTPUT INSERTED.[UniqueKey] " +
+            "VALUES (@status, @id)",
+            connection);
+        command.Parameters.Add(new SqlParameter("@status", SqlDbType.SmallInt) { Value = checked((short)recStatus) });
+        command.Parameters.Add(IdParameter(globalRecordId));
+        return Assert.IsType<int>(await command.ExecuteScalarAsync(cancellationToken));
+    }
+
+    // Runs a by-id read on the fixture's connection and reads every row it returns at the given ordinals: the stored
+    // id, the key and the status, then the position and the count, both bigint.
+    private static Task<List<PlacedRow>> ReadPlacedRowsAsync(
+        Fixture fixture,
+        SqlConnection connection,
+        SqlStatement statement,
+        (int GlobalRecordId, int UniqueKey, int RecStatus, int Position, int Count) ordinals,
+        CancellationToken cancellationToken) =>
+        SqlExecution.ReadAsync(
+            connection,
+            transaction: null,
+            FixtureOperation,
+            statement,
+            fixture.CommandTimeoutSeconds,
+            fixture.Recorder,
+            cancellationToken,
+            async (reader, token) =>
+            {
+                var rows = new List<PlacedRow>();
+                while (await reader.ReadAsync(token))
+                {
+                    rows.Add(new PlacedRow(
+                        reader.GetString(ordinals.GlobalRecordId),
+                        reader.GetInt32(ordinals.UniqueKey),
+                        reader.GetInt16(ordinals.RecStatus),
+                        reader.GetInt64(ordinals.Position),
+                        reader.GetInt64(ordinals.Count)));
+                }
+
+                return rows;
+            });
 
     private static Task<int> ExecuteAsync(
         Fixture fixture,
@@ -1978,6 +2151,21 @@ public sealed class ReservedWordIdentifierTests
         Assert.Equal(1, actual.Position);
         Assert.Equal(1, actual.Count);
         AssertValues(actual.Values, expected, step);
+    }
+
+    // The read returned exactly one row, the expected base row with the expected coordinates, compared without
+    // quoting the id.
+    private static void AssertPlacedRow(PlacedRow expected, IReadOnlyList<PlacedRow> rows, string read)
+    {
+        Assert.True(rows.Count == 1, "The " + read + " returned " + rows.Count + " rows, where one was expected.");
+        var actual = rows[0];
+        Assert.True(
+            string.Equals(expected.GlobalRecordId, actual.GlobalRecordId, StringComparison.Ordinal),
+            "The " + read + " returned a row of another GlobalRecordId.");
+        Assert.Equal(expected.UniqueKey, actual.UniqueKey);
+        Assert.Equal(expected.RecStatus, actual.RecStatus);
+        Assert.Equal(expected.Position, actual.Position);
+        Assert.Equal(expected.Count, actual.Count);
     }
 
     // Compares every value without quoting either, so no field value reaches the test output.
@@ -2278,6 +2466,14 @@ public sealed class ReservedWordIdentifierTests
         string LastSave,
         int LastSaveBytes,
         short RecStatus);
+
+    // A base row as a by-id read returns it, its id as stored, with a position and a count.
+    private readonly record struct PlacedRow(
+        string GlobalRecordId,
+        int UniqueKey,
+        int RecStatus,
+        long Position,
+        long Count);
 
     // Records every command, and closes the write's connection once the first INSERT or UPDATE has succeeded, so the
     // server has run DML that the write's next statement and its rollback then cannot follow. A fault injection for
