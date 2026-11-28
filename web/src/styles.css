@@ -91,7 +91,17 @@
   --color-info-text: #0a3069;
   --color-info-subtle: #ddf4ff;
 
-  --color-backdrop: rgb(31 35 40 / 0.5);
+  /* The modal backdrop is one tint at one opacity. Both are tokens of their
+   * own so that the backdrop and the backdrop over the page, the one opaque
+   * colour the page shows through it, are built from the same values. */
+  --backdrop-tint: 31 35 40;
+  --backdrop-opacity: 50%;
+  --color-backdrop: rgb(var(--backdrop-tint) / var(--backdrop-opacity));
+  --color-backdrop-over-page: color-mix(
+    in srgb,
+    rgb(var(--backdrop-tint)) var(--backdrop-opacity),
+    var(--color-page)
+  );
   /* The scroll cue of the record grid and of the find picker: a shade at an
    * edge of a scroll box with more content beyond it, which shows on the
    * page, the stripes and the row tints alike. */
@@ -964,21 +974,35 @@
     outline-offset: calc(-1 * var(--focus-ring-width));
   }
 
-  /* The scroll box's frame, which does not scroll, draws the scroll cue: a
-   * shade at each side past which columns lie out of view, set by RecordGrid
-   * from the box's measurements. The shades lie over the rows, whose stripes
-   * and tints would hide a shadow under them, and let pointer input through.
-   * They reach the box's edges, which lie the box's padding past the frame's,
-   * but stop at the table's top and bottom, so the focus ring's top and
-   * bottom stay clear and its sides are only darkened. min-inline-size: 0
+  /* The scroll box's frame, which does not scroll, draws the scroll cue of
+   * the record grid and of the find results: a shade at each side past which
+   * columns lie out of view, set from the box's measurements (RecordGrid's
+   * useHiddenSides). The shades lie over the rows, whose stripes and tints
+   * would hide a shadow under them, and let pointer input through. They
+   * reach the box's edges, which lie --scroll-cue-outset past the frame's:
+   * the grid's box by its padding, which its negative margin lays over the
+   * section's, while the find results' box has no such margin and fills its
+   * frame. They stop at the table's top and bottom, so the focus ring's top
+   * and bottom stay clear and its sides are only darkened. min-inline-size: 0
    * lets the frame shrink below the table's width. */
-  .record-grid__frame {
+  .record-grid__frame,
+  .find-dialog__frame {
     position: relative;
     min-inline-size: 0;
   }
 
+  .record-grid__frame {
+    --scroll-cue-outset: calc(-1 * var(--focus-ring-room));
+  }
+
+  .find-dialog__frame {
+    --scroll-cue-outset: 0px;
+  }
+
   .record-grid__frame::before,
-  .record-grid__frame::after {
+  .record-grid__frame::after,
+  .find-dialog__frame::before,
+  .find-dialog__frame::after {
     content: "";
     position: absolute;
     inset-block: var(--focus-ring-room);
@@ -987,18 +1011,22 @@
     opacity: 0;
   }
 
-  .record-grid__frame::before {
-    inset-inline-start: calc(-1 * var(--focus-ring-room));
+  .record-grid__frame::before,
+  .find-dialog__frame::before {
+    inset-inline-start: var(--scroll-cue-outset);
     background-image: linear-gradient(to right, var(--color-scroll-cue), transparent);
   }
 
-  .record-grid__frame::after {
-    inset-inline-end: calc(-1 * var(--focus-ring-room));
+  .record-grid__frame::after,
+  .find-dialog__frame::after {
+    inset-inline-end: var(--scroll-cue-outset);
     background-image: linear-gradient(to left, var(--color-scroll-cue), transparent);
   }
 
   .record-grid__frame--more-start::before,
-  .record-grid__frame--more-end::after {
+  .record-grid__frame--more-end::after,
+  .find-dialog__frame--more-start::before,
+  .find-dialog__frame--more-end::after {
     opacity: 1;
   }
 
@@ -1465,10 +1493,34 @@
    * overflow stops wheel, touch and keyboard scrolling of the page and keeps
    * its scroll position for when the dialog closes; the stable gutter keeps
    * the room the page scrollbar took, so the page does not shift sideways
-   * when that scrollbar goes. */
+   * when that scrollbar goes.
+   *
+   * The fixed backdrop ends where that gutter begins, and the gutter shows
+   * only the canvas, which takes the root's background colour. So the root
+   * paints the backdrop over the page, and the gutter looks dimmed like the
+   * page beside it, while <body> keeps the page colour, which no longer
+   * passes to the canvas, and covers at least the viewport, so no canvas
+   * shows under the backdrop to be dimmed twice. Overlay scrollbars take no
+   * gutter, and there the backdrop covers the whole viewport itself. */
   :root:has(> body > .dialog-backdrop) {
     overflow: hidden;
     scrollbar-gutter: stable;
+    background-color: var(--color-backdrop-over-page);
+  }
+
+  :root:has(> body > .dialog-backdrop) > body {
+    min-block-size: 100vh;
+  }
+
+  /* A check-code message shows over Find or the delete confirmation in a
+   * backdrop of its own, which dims the page a second time; the gutter takes
+   * both. */
+  :root:has(> body > .dialog-backdrop ~ .dialog-backdrop) {
+    background-color: color-mix(
+      in srgb,
+      rgb(var(--backdrop-tint)) var(--backdrop-opacity),
+      var(--color-backdrop-over-page)
+    );
   }
 
   /* The backdrop keeps a scroll range only for a dialog taller than the
@@ -1588,19 +1640,49 @@
     pointer-events: auto;
   }
 
-  /* Find record: wider panel, field picker, criterion rows, results. The
-   * scroll padding at each end is the height the action bar shows when
-   * pinned to the top or bottom edge, with two lines of status above its
-   * buttons as on a narrow screen and its inner border, so a control focused
-   * under the bar scrolls clear of it with its focus ring. The first field
-   * checkbox, focused on open, sits below the start padding, so the dialog
-   * opens at its heading. */
+  /* Find record: wider panel, heading, field picker, criterion rows,
+   * results. The heading stays above a body that scrolls on its own, so no
+   * scroll, nor what a search brings into view, takes the heading out of
+   * view: the dialog is one column that does not scroll, the heading keeps
+   * its height and the body takes the rest of the dialog's bounded height.
+   * The heading and the body hold the dialog's padding between them, so the
+   * body's scroll area reaches the dialog's edges below the heading, and the
+   * heading's own bottom padding is the gap above the body. */
   .find-dialog {
+    flex-direction: column;
+    flex-wrap: nowrap;
+    justify-content: flex-start;
+    align-items: stretch;
+    gap: 0;
     max-inline-size: 56rem;
-    scroll-padding-block: calc(
-      var(--target-size) + 2 * var(--space-3) + var(--space-2) + 2lh + var(--border-width) +
-        var(--focus-ring-room)
-    );
+    padding: 0;
+  }
+
+  .find-dialog > h2 {
+    flex: none;
+    padding: var(--space-5) var(--space-5) var(--space-3);
+  }
+
+  /* The body: banner, form, action bar and results, one per row. Positioned,
+   * it is the containing block of its .visually-hidden text, which therefore
+   * stays inside its scroll area, as the dialog's does; contain keeps a
+   * scroll that reaches its end from moving what is behind. The scroll
+   * padding keeps the focus ring of a control focused at either edge inside
+   * the body; where the action bar pins (see "Pinned action bar" below), it
+   * also clears the bar. The first field checkbox, focused on open, lies
+   * near the body's top, which it cannot scroll above, so the body opens
+   * unscrolled. */
+  .find-dialog > .find-dialog__body {
+    position: relative;
+    display: flex;
+    flex: 1 1 auto;
+    flex-direction: column;
+    gap: var(--space-3);
+    min-block-size: 0;
+    padding: 0 var(--space-5) var(--space-5);
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    scroll-padding-block: var(--focus-ring-room);
   }
 
   .find-dialog form {
@@ -1770,22 +1852,14 @@
     flex: 1 1 100%;
   }
 
-  /* The status line, Search and Close: an opaque bar that stays in view, in
-   * unchanged document and Tab order. It pins to the dialog's bottom edge
-   * while its place is below the view, as while the picker and criteria
-   * scroll under it, to the top edge while its place is above the view, as
-   * while the results scroll under it, and sits in its place otherwise. A
-   * border on each side divides it from what scrolls under it. The negative
-   * insets are the dialog's padding plus that border, so a pinned bar sits
-   * flush on the dialog's edge with its outer border clipped there rather
-   * than doubling the dialog's own; the negative inline margins are the
-   * dialog's padding, so the bar spans the dialog. The status takes the
-   * room the buttons leave at the start, and wraps above them when that
-   * room is too narrow. */
+  /* The status line, Search and Close: an opaque bar after the criteria and
+   * before the results, in document and Tab order. A border on each side
+   * divides it from them and, where it pins (see "Pinned action bar"
+   * below), from what scrolls under it and the heading. The negative inline
+   * margins are the body's padding, so the bar spans the dialog. The status
+   * takes the room the buttons leave at the start, and wraps above them
+   * when that room is too narrow. */
   .find-dialog__footer {
-    position: sticky;
-    inset-block: calc(-1 * (var(--space-5) + var(--border-width)));
-    z-index: 1;
     display: flex;
     flex-wrap: wrap;
     align-items: center;
@@ -1796,6 +1870,54 @@
     padding-inline: var(--space-5);
     border-block: var(--border-width) solid var(--color-border);
     background-color: var(--color-page);
+  }
+
+  /* Pinned action bar. Where the viewport has room for it, the bar stays in
+   * view: it pins to the body's bottom edge while its place is below the
+   * view, as while the picker and criteria scroll under it, to its top
+   * edge, under the heading, while its place is above the view, as while
+   * the results scroll under it, and sits in its place otherwise. The body
+   * has no top padding, so the top inset is 0. The bottom inset is the
+   * body's padding plus the bar's border, so a bar pinned there sits flush
+   * on the dialog's bottom edge with its outer border clipped rather than
+   * doubling the dialog's own. The body's scroll padding at each end is the
+   * height the bar shows when pinned to that edge, with two lines of status
+   * above its buttons as on a narrow screen: both its borders at the top,
+   * under the heading, and its inner border at the bottom, where its outer
+   * one is clipped. So a control focused under the bar scrolls clear of it
+   * with its focus ring.
+   *
+   * Room is a body taller than both scroll paddings and a focused control
+   * with its ring, so a viewport at least this tall:
+   *     2rem              backdrop padding, 2 × --space-4
+   *   + 2px               the dialog's two borders
+   *   + 3.8125rem         heading: --space-5, a 1.25rem line at 1.25, --space-3
+   *   + 7.75rem + 6px     top padding: the bar's content (--target-size,
+   *                       2 × --space-3, --space-2 and two 1.5rem lines),
+   *                       its two borders and --focus-ring-room
+   *   + 7.75rem + 5px     bottom padding: the same with one border
+   *   + 2.75rem + 8px     a --target-size control, --focus-ring-room each side
+   *   = 24.0625rem + 21px, 406px at the default 16px text.
+   * In a shorter viewport, such as a phone held sideways or a short window
+   * at high zoom, no scroll position would keep a focused control clear of a
+   * pinned bar, so the bar keeps normal flow and the body's scroll padding
+   * is the focus ring's room alone: nothing pinned hides the control that
+   * has focus (WCAG 2.4.11) or crowds out reflowed content (WCAG 1.4.10).
+   * The heading stays above the body at every height. */
+  @media (min-height: calc(24.0625rem + 21px)) {
+    .find-dialog > .find-dialog__body {
+      --find-dialog-bar-content-size: calc(var(--target-size) + 2 * var(--space-3) + var(--space-2) + 2lh);
+      scroll-padding-block:
+        calc(var(--find-dialog-bar-content-size) + 2 * var(--border-width) + var(--focus-ring-room))
+        calc(var(--find-dialog-bar-content-size) + var(--border-width) + var(--focus-ring-room));
+    }
+
+    .find-dialog__footer {
+      position: sticky;
+      inset-block-start: 0;
+      inset-block-end: calc(-1 * (var(--space-5) + var(--border-width)));
+      z-index: 1;
+    }
   }
 
   /* Without results nothing follows the bar, so it can never pin to the top

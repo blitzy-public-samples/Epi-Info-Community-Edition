@@ -8,6 +8,7 @@
 import {
   useEffect,
   useId,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -30,6 +31,7 @@ import type {
 } from '../api/types';
 import { isDataField } from '../validation/clientValidation';
 import { ConnectionError } from './ConnectionError';
+import { useHiddenSides } from './RecordGrid';
 
 /** One entry of the field picker. */
 export type SearchableField = {
@@ -130,7 +132,7 @@ const FOCUSABLE_SELECTOR = 'button, [href], input, select, textarea, summary, [t
 const MODAL_SELECTOR = '[aria-modal="true"]';
 // What a settled search brings into view: its banner, then a value box its 400 marks.
 const INVALID_CRITERION_SELECTOR = '.find-dialog__criterion input[aria-invalid="true"]';
-const BANNER_SELECTOR = ':scope > [role="alert"]';
+const BANNER_SELECTOR = ':scope > .find-dialog__body > [role="alert"]';
 const STALE_RESULTS_CLASS = 'find-dialog__results--stale';
 
 /** The field's prompt exactly as metadata holds it, or its name when the prompt is missing or blank. */
@@ -426,8 +428,8 @@ function focusInitial(dialog: HTMLElement): void {
 }
 
 /**
- * Scrolls the element into view as little as its scroll containers allow, the dialog
- * first. A browser without scrollIntoView, as jsdom is, leaves the scroll unchanged.
+ * Scrolls the element into view as little as its scroll containers allow, the dialog's
+ * body first. A browser without scrollIntoView, as jsdom is, leaves the scroll unchanged.
  */
 function scrollIntoViewNearest(element: Element | null): void {
   if (element !== null && typeof element.scrollIntoView === 'function') {
@@ -762,6 +764,18 @@ export function FindRecordDialog({
     valueRefs.current.get(name)?.focus();
   }, [selected]);
 
+  // Each new response starts its results at the inline start, with Position and Open in
+  // view: the region stays mounted from one search's results to the next, which would
+  // otherwise open at the sideways offset the old ones were scrolled to. The same
+  // results, pending or out of date, keep that offset. Declared before the scroll cue's
+  // measurement, which therefore measures the reset offset.
+  useLayoutEffect(() => {
+    if (resultsRef.current !== null) {
+      resultsRef.current.scrollLeft = 0;
+    }
+  }, [response]);
+  const hiddenSides = useHiddenSides(resultsRef, open && (response?.items.length ?? 0) > 0, response);
+
   if (!open) {
     return null;
   }
@@ -915,6 +929,11 @@ export function FindRecordDialog({
 
   const items = response?.items ?? [];
   const columns = items.length > 0 ? Object.keys(items[0].values) : [];
+  const frameClassName = [
+    'find-dialog__frame',
+    ...(hiddenSides.start ? ['find-dialog__frame--more-start'] : []),
+    ...(hiddenSides.end ? ['find-dialog__frame--more-end'] : []),
+  ].join(' ');
   let statusText = '';
   // The excluded-record sentence, shown after statusText in an element of its own.
   let statusNote: string | null = null;
@@ -966,230 +985,239 @@ export function FindRecordDialog({
         onKeyDown={handleKeyDown}
       >
         <h2 id={headingId}>Find record</h2>
-        {banner}
+        {/* Only the body scrolls, so the heading stays in view above it whatever the
+            outcome of a search brings into view; the banner, the criteria, the action
+            bar and the results scroll under it. */}
+        <div className="find-dialog__body">
+          {banner}
 
-        <form id={formId} noValidate onSubmit={handleSubmit}>
-          <fieldset className="find-dialog__fields" aria-describedby={guidanceId}>
-            <legend>Fields to search</legend>
-            {/* Under the legend and outside the scrolling options, so both stay in view.
-                Always rendered, so the note is announced when the sixth field is picked. */}
-            <p id={limitNoteId} role="status" className={atLimit ? undefined : 'visually-hidden'}>
-              {atLimit ? LIMIT_NOTE : ''}
-            </p>
-            <p id={guidanceId}>
-              <small>{PICKER_GUIDANCE}</small>
-            </p>
-            <div className="find-dialog__options">
-              {fields.map((field, index) => {
-                const picked = selected.has(field.name);
-                const disabled = !picked && atLimit;
-                const nameId = `${baseId}-field-${index}`;
-                const descriptionId = `${nameId}-description`;
-                // A prompt that only repeats the name would be read twice.
-                const described = field.label !== field.name;
-                const describedBy = [described ? descriptionId : null, disabled ? limitNoteId : null]
-                  .filter((id): id is string => id !== null)
-                  .join(' ');
+          <form id={formId} noValidate onSubmit={handleSubmit}>
+            <fieldset className="find-dialog__fields" aria-describedby={guidanceId}>
+              <legend>Fields to search</legend>
+              {/* Under the legend and outside the scrolling options, so both stay in view.
+                  Always rendered, so the note is announced when the sixth field is picked. */}
+              <p id={limitNoteId} role="status" className={atLimit ? undefined : 'visually-hidden'}>
+                {atLimit ? LIMIT_NOTE : ''}
+              </p>
+              <p id={guidanceId}>
+                <small>{PICKER_GUIDANCE}</small>
+              </p>
+              <div className="find-dialog__options">
+                {fields.map((field, index) => {
+                  const picked = selected.has(field.name);
+                  const disabled = !picked && atLimit;
+                  const nameId = `${baseId}-field-${index}`;
+                  const descriptionId = `${nameId}-description`;
+                  // A prompt that only repeats the name would be read twice.
+                  const described = field.label !== field.name;
+                  const describedBy = [described ? descriptionId : null, disabled ? limitNoteId : null]
+                    .filter((id): id is string => id !== null)
+                    .join(' ');
+                  return (
+                    <label key={field.name}>
+                      <input
+                        ref={(element) => {
+                          if (element === null) {
+                            checkboxRefs.current.delete(field.name);
+                          } else {
+                            checkboxRefs.current.set(field.name, element);
+                          }
+                        }}
+                        type="checkbox"
+                        checked={picked}
+                        disabled={disabled}
+                        aria-labelledby={nameId}
+                        aria-describedby={describedBy === '' ? undefined : describedBy}
+                        onChange={(event) => {
+                          const checked = event.target.checked;
+                          setPicked(field.name, checked);
+                          if (checked && !atLimit) {
+                            focusValueOfRef.current = field.name;
+                          }
+                        }}
+                      />
+                      {/* The checkbox is named by the plain field name. Chrome reads each
+                          <wbr> of the shown copy as a space in a name, so that copy is
+                          hidden from assistive technology. */}
+                      <span id={nameId} hidden>
+                        {field.name}
+                      </span>
+                      <span aria-hidden="true">{nameWithWordBreaks(field.name)}</span>
+                      {/* Likewise the checkbox is described by the plain prompt: Chrome also
+                          reads a <wbr> as a space in a description, so the shown copy is
+                          hidden from assistive technology. */}
+                      {described && (
+                        <>
+                          <small id={descriptionId} hidden>
+                            {field.label}
+                          </small>
+                          <small aria-hidden="true">{promptWithWordBreaks(field.label)}</small>
+                        </>
+                      )}
+                    </label>
+                  );
+                })}
+              </div>
+            </fieldset>
+
+            {criteria.length === 0 ? (
+              <p>
+                <small>{NO_FIELD_NOTE}</small>
+              </p>
+            ) : (
+              fields.map((field, index) => {
+                if (!selected.has(field.name)) {
+                  return null;
+                }
+                const inputId = `${baseId}-value-${index}`;
+                const hintId = `${inputId}-hint`;
+                const errorId = `${inputId}-error`;
+                const messages = byField.get(field.name) ?? [];
+                const invalid = messages.length > 0;
                 return (
-                  <label key={field.name}>
+                  <div key={field.name} className="find-dialog__criterion">
+                    <label htmlFor={inputId}>{criterionLabel(field)}</label>
                     <input
                       ref={(element) => {
                         if (element === null) {
-                          checkboxRefs.current.delete(field.name);
+                          valueRefs.current.delete(field.name);
                         } else {
-                          checkboxRefs.current.set(field.name, element);
+                          valueRefs.current.set(field.name, element);
                         }
                       }}
-                      type="checkbox"
-                      checked={picked}
-                      disabled={disabled}
-                      aria-labelledby={nameId}
-                      aria-describedby={describedBy === '' ? undefined : describedBy}
+                      id={inputId}
+                      type="text"
+                      value={texts.get(field.name) ?? ''}
+                      autoComplete="off"
+                      spellCheck={false}
+                      aria-invalid={invalid ? true : undefined}
+                      aria-describedby={invalid ? `${hintId} ${errorId}` : hintId}
                       onChange={(event) => {
-                        const checked = event.target.checked;
-                        setPicked(field.name, checked);
-                        if (checked && !atLimit) {
-                          focusValueOfRef.current = field.name;
-                        }
+                        setText(field.name, event.target.value);
                       }}
                     />
-                    {/* The checkbox is named by the plain field name. Chrome reads each
-                        <wbr> of the shown copy as a space in a name, so that copy is
-                        hidden from assistive technology. */}
-                    <span id={nameId} hidden>
-                      {field.name}
-                    </span>
-                    <span aria-hidden="true">{nameWithWordBreaks(field.name)}</span>
-                    {/* Likewise the checkbox is described by the plain prompt: Chrome also
-                        reads a <wbr> as a space in a description, so the shown copy is
-                        hidden from assistive technology. */}
-                    {described && (
-                      <>
-                        <small id={descriptionId} hidden>
-                          {field.label}
-                        </small>
-                        <small aria-hidden="true">{promptWithWordBreaks(field.label)}</small>
-                      </>
-                    )}
-                  </label>
-                );
-              })}
-            </div>
-          </fieldset>
-
-          {criteria.length === 0 ? (
-            <p>
-              <small>{NO_FIELD_NOTE}</small>
-            </p>
-          ) : (
-            fields.map((field, index) => {
-              if (!selected.has(field.name)) {
-                return null;
-              }
-              const inputId = `${baseId}-value-${index}`;
-              const hintId = `${inputId}-hint`;
-              const errorId = `${inputId}-error`;
-              const messages = byField.get(field.name) ?? [];
-              const invalid = messages.length > 0;
-              return (
-                <div key={field.name} className="find-dialog__criterion">
-                  <label htmlFor={inputId}>{criterionLabel(field)}</label>
-                  <input
-                    ref={(element) => {
-                      if (element === null) {
-                        valueRefs.current.delete(field.name);
-                      } else {
-                        valueRefs.current.set(field.name, element);
-                      }
-                    }}
-                    id={inputId}
-                    type="text"
-                    value={texts.get(field.name) ?? ''}
-                    autoComplete="off"
-                    spellCheck={false}
-                    aria-invalid={invalid ? true : undefined}
-                    aria-describedby={invalid ? `${hintId} ${errorId}` : hintId}
-                    onChange={(event) => {
-                      setText(field.name, event.target.value);
-                    }}
-                  />
-                  <button
-                    type="button"
-                    onClick={() => {
-                      removeField(field.name);
-                    }}
-                  >
-                    Remove<span className="visually-hidden"> {field.name}</span>
-                  </button>
-                  <small id={hintId}>{field.hint}</small>
-                  {invalid && (
-                    <div className="field-error" id={errorId}>
-                      {messages.map((message, messageIndex) => (
-                        <p key={`${messageIndex}-${message}`}>{message}</p>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              );
-            })
-          )}
-        </form>
-
-        {/* The status line, Search and Close stay on the dialog's bottom edge while the
-            picker and criteria scroll, and on its top edge while the results do; after
-            the criteria and before the results in document and Tab order. Outside the
-            form, which lays its children out in one column; the form attribute keeps
-            Search the form's submit button, so Enter in a value searches. */}
-        <div ref={footerRef} className="find-dialog__footer">
-          {/* Always rendered, so "Searching…" and the result count are announced. */}
-          <p id={statusId} role="status" className={statusText === '' ? 'visually-hidden' : undefined}>
-            {statusText}
-            {statusNote !== null && <span>{` ${statusNote}`}</span>}
-          </p>
-          {/* One group, so the two buttons wrap together below a long status line. */}
-          <div className="find-dialog__actions">
-            <button ref={searchButtonRef} type="submit" form={formId} disabled={criteria.length === 0 || loading}>
-              Search
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                onClose();
-              }}
-            >
-              Close
-            </button>
-          </div>
-        </div>
-        {items.length > 0 && (
-          // A named, focusable region, so a keyboard can scroll the results sideways.
-          <div
-            ref={resultsRef}
-            className={actionable ? 'find-dialog__results' : 'find-dialog__results find-dialog__results--stale'}
-            role="region"
-            aria-label={RESULTS_REGION_LABEL}
-            tabIndex={0}
-          >
-            <table aria-busy={loading}>
-              <caption className="visually-hidden">Matching records</caption>
-              <thead>
-                <tr>
-                  <th scope="col">Position</th>
-                  {columns.map((column) => (
-                    <th key={column} scope="col">
-                      {labels.get(column) ?? column}
-                    </th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody>
-                {items.map((item) => {
-                  const deleted = item.recStatus === 0;
-                  return (
-                    <tr
-                      key={item.globalRecordId}
-                      className={deleted ? 'record-grid__row--deleted' : undefined}
-                      aria-disabled={actionable ? undefined : 'true'}
+                    <button
+                      type="button"
                       onClick={() => {
-                        if (actionable) {
-                          onOpen(item.globalRecordId);
-                        }
+                        removeField(field.name);
                       }}
                     >
-                      <td>
-                        <button
-                          type="button"
-                          aria-label={`Open record at position ${item.position}`}
+                      Remove<span className="visually-hidden"> {field.name}</span>
+                    </button>
+                    <small id={hintId}>{field.hint}</small>
+                    {invalid && (
+                      <div className="field-error" id={errorId}>
+                        {messages.map((message, messageIndex) => (
+                          <p key={`${messageIndex}-${message}`}>{message}</p>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                );
+              })
+            )}
+          </form>
+
+          {/* The status line, Search and Close, after the criteria and before the results in
+              document and Tab order. Where the viewport is tall enough, they stay on the
+              body's bottom edge while the picker and criteria scroll, and on its top edge,
+              under the heading, while the results do. Outside the form, which lays its
+              children out in one column; the form attribute keeps Search the form's submit
+              button, so Enter in a value searches. */}
+          <div ref={footerRef} className="find-dialog__footer">
+            {/* Always rendered, so "Searching…" and the result count are announced. */}
+            <p id={statusId} role="status" className={statusText === '' ? 'visually-hidden' : undefined}>
+              {statusText}
+              {statusNote !== null && <span>{` ${statusNote}`}</span>}
+            </p>
+            {/* One group, so the two buttons wrap together below a long status line. */}
+            <div className="find-dialog__actions">
+              <button ref={searchButtonRef} type="submit" form={formId} disabled={criteria.length === 0 || loading}>
+                Search
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  onClose();
+                }}
+              >
+                Close
+              </button>
+            </div>
+          </div>
+          {items.length > 0 && (
+            // The frame shades each side past which columns lie out of view.
+            <div className={frameClassName}>
+              {/* A named, focusable region, so a keyboard can scroll the results sideways. */}
+              <div
+                ref={resultsRef}
+                className={actionable ? 'find-dialog__results' : 'find-dialog__results find-dialog__results--stale'}
+                role="region"
+                aria-label={RESULTS_REGION_LABEL}
+                tabIndex={0}
+              >
+                <table aria-busy={loading}>
+                  <caption className="visually-hidden">Matching records</caption>
+                  <thead>
+                    <tr>
+                      <th scope="col">Position</th>
+                      {columns.map((column) => (
+                        <th key={column} scope="col">
+                          {labels.get(column) ?? column}
+                        </th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {items.map((item) => {
+                      const deleted = item.recStatus === 0;
+                      return (
+                        <tr
+                          key={item.globalRecordId}
+                          className={deleted ? 'record-grid__row--deleted' : undefined}
                           aria-disabled={actionable ? undefined : 'true'}
-                          aria-describedby={actionable ? undefined : statusId}
-                          onClick={(event) => {
-                            // The row's own click would report the same record a second time.
-                            event.stopPropagation();
+                          onClick={() => {
                             if (actionable) {
                               onOpen(item.globalRecordId);
                             }
                           }}
                         >
-                          {item.position}
-                        </button>
-                        {deleted && <span> (deleted)</span>}
-                      </td>
-                      {columns.map((column) => {
-                        const text = cellText(Object.hasOwn(item.values, column) ? item.values[column] : undefined);
-                        // The title holds the full value, which the column may cut short.
-                        return (
-                          <td key={column} title={text === '' ? undefined : text}>
-                            {text}
+                          <td>
+                            <button
+                              type="button"
+                              aria-label={`Open record at position ${item.position}`}
+                              aria-disabled={actionable ? undefined : 'true'}
+                              aria-describedby={actionable ? undefined : statusId}
+                              onClick={(event) => {
+                                // The row's own click would report the same record a second time.
+                                event.stopPropagation();
+                                if (actionable) {
+                                  onOpen(item.globalRecordId);
+                                }
+                              }}
+                            >
+                              {item.position}
+                            </button>
+                            {deleted && <span> (deleted)</span>}
                           </td>
-                        );
-                      })}
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
-        )}
+                          {columns.map((column) => {
+                            const text = cellText(Object.hasOwn(item.values, column) ? item.values[column] : undefined);
+                            // The title holds the full value, which the column may cut short.
+                            return (
+                              <td key={column} title={text === '' ? undefined : text}>
+                                {text}
+                              </td>
+                            );
+                          })}
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+        </div>
       </div>
     </div>,
     document.body,

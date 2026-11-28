@@ -10,6 +10,7 @@ import {
   type KeyboardEvent,
   type MouseEvent,
   type ReactNode,
+  type RefObject,
 } from 'react';
 
 import { isBlankQuery, isExactDecimal, type ApiClient, type ApiResult } from '../api/client';
@@ -345,8 +346,8 @@ type ListFailure =
   | { key: string; kind: 'notLoaded' }
   | { key: string; kind: 'formGone' };
 
-/** The sides of the table's scroll box past which columns lie out of view. */
-interface HiddenSides {
+/** The sides of a table's sideways scroll box past which columns lie out of view. */
+export interface HiddenSides {
   readonly start: boolean;
   readonly end: boolean;
 }
@@ -357,6 +358,43 @@ const NO_HIDDEN_SIDES: HiddenSides = { start: false, end: false };
 function hiddenSidesOf(box: HTMLElement): HiddenSides {
   const hiddenAtEnd = box.scrollWidth - box.clientWidth - box.scrollLeft;
   return { start: box.scrollLeft >= 1, end: hiddenAtEnd >= 1 };
+}
+
+/**
+ * Which sides of the sideways scroll box in `boxRef` hide columns, for the scroll cue its
+ * frame draws: the record grid's and the find results'. Measured before paint while
+ * `shown`, again whenever the box scrolls or it or its table changes size, and again for
+ * each new `content`: a caller that moves the box back to its inline start for other
+ * content passes that content, so the cue shows the reset offset from the first paint.
+ * Without ResizeObserver (jsdom) a size change is not remeasured; a scroll still is.
+ */
+export function useHiddenSides(boxRef: RefObject<HTMLElement>, shown: boolean, content: unknown = null): HiddenSides {
+  const [hiddenSides, setHiddenSides] = useState<HiddenSides>(NO_HIDDEN_SIDES);
+  useLayoutEffect(() => {
+    const box = boxRef.current;
+    if (!shown || box === null) {
+      return;
+    }
+    const measure = () => {
+      const next = hiddenSidesOf(box);
+      setHiddenSides((current) => (current.start === next.start && current.end === next.end ? current : next));
+    };
+    measure();
+    box.addEventListener('scroll', measure, { passive: true });
+    const observer = typeof ResizeObserver === 'function' ? new ResizeObserver(measure) : null;
+    if (observer !== null) {
+      observer.observe(box);
+      if (box.firstElementChild !== null) {
+        observer.observe(box.firstElementChild);
+      }
+    }
+    return () => {
+      box.removeEventListener('scroll', measure);
+      observer?.disconnect();
+    };
+    // content is read by no statement: a new one only runs the measurement again.
+  }, [boxRef, shown, content]);
+  return hiddenSides;
 }
 
 /**
@@ -400,9 +438,8 @@ export const RecordGrid = memo(function RecordGrid({
   const [reloadToken, setReloadToken] = useState(0);
   // The "Show deleted" state asked for and not yet applied; `null` when none is pending.
   const [requestedIncludeDeleted, setRequestedIncludeDeleted] = useState<boolean | null>(null);
-  // The table's scroll box, and which of its sides hide columns, for its scroll cue.
+  // The table's scroll box; useHiddenSides measures which of its sides hide columns.
   const scrollRef = useRef<HTMLDivElement>(null);
-  const [hiddenSides, setHiddenSides] = useState<HiddenSides>(NO_HIDDEN_SIDES);
 
   const searchText = filterText(debouncedQ);
 
@@ -768,32 +805,7 @@ export const RecordGrid = memo(function RecordGrid({
     );
   }
 
-  // Measured before paint, and again whenever the box scrolls or it or its table changes
-  // size. Without ResizeObserver (jsdom) a size change is not remeasured; a scroll still is.
-  const showsTable = table !== null;
-  useLayoutEffect(() => {
-    const box = scrollRef.current;
-    if (!showsTable || box === null) {
-      return;
-    }
-    const measure = () => {
-      const next = hiddenSidesOf(box);
-      setHiddenSides((current) => (current.start === next.start && current.end === next.end ? current : next));
-    };
-    measure();
-    box.addEventListener('scroll', measure, { passive: true });
-    const observer = typeof ResizeObserver === 'function' ? new ResizeObserver(measure) : null;
-    if (observer !== null) {
-      observer.observe(box);
-      if (box.firstElementChild !== null) {
-        observer.observe(box.firstElementChild);
-      }
-    }
-    return () => {
-      box.removeEventListener('scroll', measure);
-      observer?.disconnect();
-    };
-  }, [showsTable]);
+  const hiddenSides = useHiddenSides(scrollRef, table !== null);
   const frameClassName = [
     'record-grid__frame',
     ...(hiddenSides.start ? ['record-grid__frame--more-start'] : []),

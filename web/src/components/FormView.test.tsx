@@ -6858,6 +6858,92 @@ describe('FormView Find record', () => {
     expect(document.activeElement).toBe(region);
   });
 
+  /** Gives the results region the sideways sizes jsdom does not lay out, then reports a scroll to `scrollLeft`. */
+  function scrollRegion(region: HTMLElement, sizes: { scrollWidth: number; clientWidth: number; scrollLeft: number }) {
+    Object.defineProperty(region, 'scrollWidth', { configurable: true, value: sizes.scrollWidth });
+    Object.defineProperty(region, 'clientWidth', { configurable: true, value: sizes.clientWidth });
+    region.scrollLeft = sizes.scrollLeft;
+    fireEvent.scroll(region);
+  }
+
+  /** The sides of the results that their frame shades as holding columns out of view. */
+  function cueOf(region: HTMLElement): { start: boolean; end: boolean } {
+    const frame = present(region.parentElement, 'results frame');
+    return {
+      start: frame.classList.contains('find-dialog__frame--more-start'),
+      end: frame.classList.contains('find-dialog__frame--more-end'),
+    };
+  }
+
+  it.each<{ sides: string; scrollWidth: number; clientWidth: number; scrollLeft: number; start: boolean; end: boolean }>(
+    [
+      { sides: 'no side of results that fit', scrollWidth: 300, clientWidth: 300, scrollLeft: 0, start: false, end: false },
+      { sides: 'the end at the inline start', scrollWidth: 600, clientWidth: 300, scrollLeft: 0, start: false, end: true },
+      { sides: 'both sides in between', scrollWidth: 600, clientWidth: 300, scrollLeft: 120, start: true, end: true },
+      { sides: 'the start at the inline end', scrollWidth: 600, clientWidth: 300, scrollLeft: 300, start: true, end: false },
+      {
+        sides: 'the start only past a sub-pixel remainder',
+        scrollWidth: 600,
+        clientWidth: 300,
+        scrollLeft: 299.5,
+        start: true,
+        end: false,
+      },
+    ],
+  )('shades $sides, as measured when the results scroll', async ({ start, end, ...sizes }) => {
+    await renderForm(undefined, { route: searchRoute(() => matches(MATCH)) });
+    const dialog = await openFind();
+    fireEvent.change(pick(dialog, 'LastName'), { target: { value: 'Lovelace' } });
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Search' }));
+    await within(dialog).findByText('1 record matches.');
+    const region = within(dialog).getByRole('region', { name: 'Search results' });
+
+    scrollRegion(region, sizes);
+    expect(cueOf(region)).toEqual({ start, end });
+    // The region stays the table's own scroll box inside the frame.
+    expect(within(dialog).getByRole('table', { name: 'Matching records' }).parentElement).toBe(region);
+  });
+
+  // Keyed by what the newer search answers: the rows it replaces, or other rows.
+  it.each<{ answer: string; rows: () => readonly SearchResult[] }>([
+    { answer: 'the same match again', rows: () => [MATCH] },
+    { answer: 'other matches', rows: () => [MATCH, matchOf(RECORD_B)] },
+  ])(
+    'keeps the sideways offset of out-of-date and pending results, and shows $answer from the inline start',
+    async ({ rows }) => {
+      const newer = deferred();
+      await renderForm(undefined, { route: searchRoute(() => matches(MATCH), () => newer.response) });
+      const dialog = await openFind();
+      const box = pick(dialog, 'LastName');
+      const search = within(dialog).getByRole('button', { name: 'Search' });
+      fireEvent.change(box, { target: { value: 'Lovelace' } });
+      fireEvent.click(search);
+      await within(dialog).findByText('1 record matches.');
+      const region = within(dialog).getByRole('region', { name: 'Search results' });
+      scrollRegion(region, { scrollWidth: 600, clientWidth: 300, scrollLeft: 120 });
+      expect(cueOf(region)).toEqual({ start: true, end: true });
+
+      // Out of date after an edit, then pending under a newer search: the same rows at the same offset.
+      fireEvent.change(box, { target: { value: 'Lovelace or Smith' } });
+      expect(resultState(dialog)).toEqual(OUT_OF_DATE);
+      expect(region.scrollLeft).toBe(120);
+      fireEvent.click(search);
+      expect(resultState(dialog)).toEqual(PENDING);
+      expect(region.scrollLeft).toBe(120);
+      expect(cueOf(region)).toEqual({ start: true, end: true });
+
+      // The settled response opens in the same region at its inline start, with Position and
+      // Open in view, and the cue measures that offset without waiting for a scroll.
+      newer.release(matches(...rows()));
+      await vi.waitFor(() => {
+        expect(resultState(dialog)).toEqual(ACTIONABLE);
+      });
+      expect(within(dialog).getByRole('region', { name: 'Search results' })).toBe(region);
+      expect(region.scrollLeft).toBe(0);
+      expect(cueOf(region)).toEqual({ start: false, end: true });
+    },
+  );
+
   /** The fixture plus `LASTNAME`, just before `LastName`, whose name differs from it only in letter case. */
   function caseDistinctDefinition(): FormDefinition {
     const definition = createFormDefinitionFixture();
@@ -6958,6 +7044,11 @@ describe('FormView Find record', () => {
     return search;
   }
 
+  /** The part of the dialog that scrolls, below its heading. */
+  function bodyOf(dialog: HTMLElement): HTMLElement {
+    return present(dialog.querySelector<HTMLElement>(':scope > .find-dialog__body'), 'Find dialog body');
+  }
+
   it('keeps the status line, Search and Close in one footer between the criteria and the results', async () => {
     await renderForm(undefined, { route: searchRoute(() => matches(MATCH)) });
     const dialog = await openFind();
@@ -6968,7 +7059,7 @@ describe('FormView Find record', () => {
     const search = searchFromButton(dialog);
     await within(dialog).findByText('1 record matches.');
     const close = within(dialog).getByRole('button', { name: 'Close' });
-    expect(footer.parentElement).toBe(dialog);
+    expect(footer.parentElement).toBe(bodyOf(dialog));
     // The status line first, at the bar's start, then the buttons as one group; Search
     // still submits the form.
     const [first, actions, ...rest] = Array.from(footer.children);
@@ -6992,6 +7083,37 @@ describe('FormView Find record', () => {
       expect(ordered[index].compareDocumentPosition(element) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
     }
     expect(footer.contains(table)).toBe(false);
+  });
+
+  // What a search brings into view scrolls the body alone, so the heading that names the
+  // dialog stays above it, out of every scroll; the banner is the body's first row.
+  it('keeps the heading outside the scrolling body that holds the banner, criteria, footer and results', async () => {
+    await renderForm(undefined, {
+      route: searchRoute(
+        () => searchProblem({ criteria: ['A search names at most six fields.'] }),
+        () => matches(MATCH),
+      ),
+    });
+    const dialog = await openFind();
+    const search = searchFromButton(dialog);
+    const banner = await within(dialog).findByRole('alert');
+    const body = bodyOf(dialog);
+    const heading = within(dialog).getByRole('heading', { name: 'Find record' });
+    expect(Array.from(dialog.children)).toEqual([heading, body]);
+    expect(dialog.getAttribute('aria-labelledby')).toBe(heading.id);
+    expect(body.firstElementChild).toBe(banner);
+
+    await vi.waitFor(() => {
+      expect(isDisabled(search)).toBe(false);
+    });
+    fireEvent.click(search);
+    const table = await within(dialog).findByRole('table', { name: 'Matching records' });
+    expect(Array.from(dialog.children)).toEqual([heading, body]);
+    const region = within(dialog).getByRole('region', { name: 'Search results' });
+    for (const part of [present(dialog.querySelector('form'), 'Find form'), footerOf(dialog), region, table]) {
+      expect(body.contains(part)).toBe(true);
+    }
+    expect(body.contains(heading)).toBe(false);
   });
 
   it('shows the limit note under the picker legend, outside the scrolling options', async () => {
