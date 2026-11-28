@@ -457,7 +457,9 @@ internal sealed class SqlRecordRepository(
     /// Reads one page of the records list, as <see cref="IDataStore.ListAsync"/>: the selected set, filtered by the
     /// grid filter, ordered by <c>UniqueKey</c> and paged, holding the grid columns the form's data fields select. One
     /// statement returns the page and the total of the filtered set and holds every base and page row it reads until
-    /// it completes (<see cref="SearchSqlBuilder.ListPage"/>), so both describe one committed state.
+    /// it completes
+    /// (<see cref="SearchSqlBuilder.ListPage(FormSchema, IReadOnlyList{DataFieldMetadata}, RecordListQuery)"/>), so
+    /// both describe one committed state.
     /// </summary>
     /// <param name="form">The form's metadata.</param>
     /// <param name="query">The coerced list parameters.</param>

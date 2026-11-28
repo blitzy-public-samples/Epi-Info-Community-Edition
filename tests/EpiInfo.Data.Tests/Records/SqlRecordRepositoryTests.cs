@@ -1789,6 +1789,13 @@ public sealed class ListAndFindSqlTests
     private const string HoldLockHint = " WITH (HOLDLOCK)";
     private const string ListPlanHints = " OPTION (FORCE ORDER, LOOP JOIN)";
 
+    // The list's fixed text around its page: the end of the filtered-set CTE, the derived table of the page, the id
+    // column the page's rows carry, and the ordering that follows the page and its joins.
+    private const string ListSetEnd = ") SELECT ";
+    private const string ListPageTable = ") AS [pg]";
+    private const string FetchedIdReference = "[pg].[c0]";
+    private const string ListPageOrder = " ORDER BY [pg].[c1]";
+
     // The seeded CaseReport text field the Find pattern cases search, and the shortest seeded value they are built
     // from, long enough for every case's slices.
     private const string PatternField = "LastName";
@@ -1881,6 +1888,84 @@ public sealed class ListAndFindSqlTests
 
         // The builder's statement is a read: the recorder saw it once and no write.
         Assert.Single(form.Recorder.ForOperation(ListPageOperation));
+        Assert.Empty(form.Recorder.Writes());
+    }
+
+    // AAP 0.3.4.1 "Offsets" and 0.3.4.4: with no grid filter, the list pages the selected set's base keys with
+    // OFFSET ... FETCH in UniqueKey order and only then LEFT JOINs each page holding a grid column to the fetched rows,
+    // so a deep page seeks no page row for a skipped record. The filtered set, the statement's CTE, reads the base
+    // table alone under HOLDLOCK and joins nothing; every page join follows the page, held and keyed on the fetched
+    // rows' ids; and the plan hints that make those held base rows the outer input of each page join end the
+    // statement. The rows are checked against direct SQL, the base table LEFT JOINed to the same pages, ordered by
+    // UniqueKey with OFFSET ... FETCH, and a count of the selected set: the id, key, status and grid values of each
+    // row, in order, flagged as on the page, with the total; and for a page past the end, one row flagged 0 that
+    // carries the total alone. The pages are the first, a middle and the last at the largest page size, the one after
+    // the last, and the largest admitted page, whose offset only a bigint holds, in both selected sets.
+    [Theory]
+    [InlineData(CaseReportForm, false)]
+    [InlineData(CaseReportForm, true)]
+    [InlineData(FoodHistoryForm, false)]
+    [InlineData(FoodHistoryForm, true)]
+    public async Task List_WithoutFilter_PagesTheBaseKeysBeforeJoiningThePagesAndListsAsDirectSql(
+        string formName,
+        bool includeDeleted)
+    {
+        await TestDatabase.EnsureReachableAsync();
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        var cancellationToken = timeout.Token;
+        await using var sharedLock = await DatabaseWriteLock.AcquireSharedAsync(cancellationToken);
+
+        var form = await FormUnderTest.LoadAsync(formName, cancellationToken);
+        var pageSize = RecordQueryRules.MaxPageSize;
+        var first = await form.DirectListPageAsync(includeDeleted, offset: 0, pageSize, cancellationToken);
+        var lastPage = (int)((first.Total + pageSize - 1) / pageSize);
+        Assert.True(lastPage >= 3, $"The {formName} set holds {first.Total} records, too few for a middle page.");
+        int[] pages = [1, (lastPage + 1) / 2, lastPage, lastPage + 1, int.MaxValue];
+
+        var baseTable = SqlIdentifier.Quote(form.Schema.BaseTable);
+        var joins = form.HeldListJoins(FetchedIdReference);
+        Assert.NotEmpty(joins);
+        foreach (var page in pages)
+        {
+            var query = new RecordListQuery(null, includeDeleted, page, pageSize);
+            var select = SearchSqlBuilder.ListPage(form.Schema, form.Grid, query);
+            var list = select.Statement;
+
+            // The filtered set reads the base table alone, held, and joins no page.
+            var setEnd = list.Text.IndexOf(ListSetEnd, StringComparison.Ordinal);
+            Assert.True(setEnd > 0, "The list statement has no filtered-set CTE.");
+            var set = list.Text[..setEnd];
+            Assert.DoesNotContain(" JOIN ", set, StringComparison.Ordinal);
+            Assert.Equal(1, CountOccurrences(set, baseTable));
+            Assert.Equal(1, CountOccurrences(set, HoldLockHint));
+            Assert.Contains(
+                $" FROM {baseTable} {RecordSqlBuilder.BaseAlias}{HoldLockHint}", set, StringComparison.Ordinal);
+
+            // Every page join follows the page, in page order, held and keyed on the fetched rows' ids, and no other
+            // join or held read is written.
+            var pageEnd = list.Text.IndexOf(ListPageTable, StringComparison.Ordinal);
+            var orderBy = list.Text.LastIndexOf(ListPageOrder, StringComparison.Ordinal);
+            Assert.True(pageEnd > setEnd && orderBy > pageEnd, "The list statement has no page before its ordering.");
+            Assert.Equal(
+                string.Concat(joins.Select(join => " " + join)),
+                list.Text[(pageEnd + ListPageTable.Length)..orderBy]);
+            Assert.Equal(joins.Count, CountOccurrences(list.Text, " JOIN "));
+            Assert.Equal(joins.Count + 1, CountOccurrences(list.Text, HoldLockHint));
+            Assert.EndsWith(ListPageOrder + ListPlanHints, list.Text, StringComparison.Ordinal);
+
+            // The rows and the total equal the direct page's, and an empty page is one row flagged 0.
+            var expected = page == 1
+                ? first
+                : await form.DirectListPageAsync(includeDeleted, query.Offset, pageSize, cancellationToken);
+            var listed = await form.ListPageAsync(select, cancellationToken);
+            Assert.Equal(expected.Total, listed.Total);
+            Assert.Equal(expected.Rows, listed.Rows);
+            Assert.Equal(expected.Rows.Count == 0 ? 1 : 0, listed.EmptyRows);
+            Assert.Equal(page <= lastPage, expected.Rows.Count > 0);
+        }
+
+        // The builder's statements are reads: the recorder saw one per page and no write.
+        Assert.Equal(pages.Length, form.Recorder.ForOperation(ListPageOperation).Count);
         Assert.Empty(form.Recorder.Writes());
     }
 
@@ -2221,6 +2306,12 @@ public sealed class ListAndFindSqlTests
     /// <summary>The ids of one list page, in the order returned, and the list's total.</summary>
     private sealed record ListRows(IReadOnlyList<string> Ids, long Total);
 
+    /// <summary>
+    /// One list page as rows of values, in the order returned: each row's id, key, status and grid values; the total;
+    /// and the number of rows the statement flagged as not on the page.
+    /// </summary>
+    private sealed record ListedPage(IReadOnlyList<object[]> Rows, long Total, int EmptyRows);
+
     /// <summary>The ids a Find returned, in the order returned, and the total of its matches.</summary>
     private sealed record FindRows(IReadOnlyList<string> Ids, long Total);
 
@@ -2322,6 +2413,133 @@ public sealed class ListAndFindSqlTests
                     $"LEFT JOIN {SqlIdentifier.Quote(Schema.Pages[index].Table!)} " +
                     $"{RecordSqlBuilder.PageAlias(index)}{HoldLockHint} ON "),
         ];
+
+        /// <summary>
+        /// The whole held join the list writes for each page table it joins, in page order, with the page row's key
+        /// equal to <paramref name="key"/>:
+        /// <c>LEFT JOIN [page] p{i} WITH (HOLDLOCK) ON p{i}.[GlobalRecordId] = key</c>.
+        /// </summary>
+        public IReadOnlyList<string> HeldListJoins(string key) =>
+        [
+            .. Grid
+                .Select(field => RecordSqlBuilder.PageIndexOf(Schema, field.Page.PageId))
+                .Distinct()
+                .Order()
+                .Where(index => Schema.Pages[index].Table is not null)
+                .Select(index =>
+                {
+                    var table = Schema.Pages[index].Table!;
+                    var pageKey = table.FindColumn(PageKeyColumn);
+                    Assert.NotNull(pageKey);
+                    var alias = RecordSqlBuilder.PageAlias(index);
+                    return $"LEFT JOIN {SqlIdentifier.Quote(table)} {alias}{HoldLockHint} ON " +
+                        $"{alias}.{SqlIdentifier.Quote(pageKey)} = {key}";
+                }),
+        ];
+
+        /// <summary>
+        /// Runs a list statement and reads, in the order returned, the id, key, status and grid values of each row it
+        /// flags as on the page, the total every row carries, and the number of rows it flags as not on the page, each
+        /// of whose other columns must be <c>NULL</c>.
+        /// </summary>
+        public async Task<ListedPage> ListPageAsync(ListSelect list, CancellationToken cancellationToken)
+        {
+            await using var connection = await TestDatabase.OpenConnectionAsync(cancellationToken);
+            return await SqlExecution.ReadAsync(
+                connection,
+                transaction: null,
+                ListPageOperation,
+                list.Statement,
+                Options.CommandTimeoutSeconds,
+                Recorder,
+                cancellationToken,
+                async (reader, token) =>
+                {
+                    var rows = new List<object[]>();
+                    long? total = null;
+                    var emptyRows = 0;
+                    while (await reader.ReadAsync(token))
+                    {
+                        total = reader.GetInt64(SearchSqlBuilder.TotalOrdinal);
+                        object[] values =
+                        [
+                            reader.GetValue(SearchSqlBuilder.IdOrdinal),
+                            reader.GetValue(SearchSqlBuilder.UniqueKeyOrdinal),
+                            reader.GetValue(SearchSqlBuilder.RecStatusOrdinal),
+                            .. list.Columns.Select(column => reader.GetValue(column.Ordinal)),
+                        ];
+                        if (reader.GetInt32(SearchSqlBuilder.InPageOrdinal) == 1)
+                        {
+                            rows.Add(values);
+                        }
+                        else
+                        {
+                            Assert.All(values, value => Assert.IsType<DBNull>(value));
+                            emptyRows++;
+                        }
+                    }
+
+                    Assert.True(total.HasValue, "The list statement returned no row, so no total.");
+                    return new ListedPage(rows, total.Value, emptyRows);
+                });
+        }
+
+        /// <summary>
+        /// One list page computed by a direct query: the base rows of the selected set, the active set
+        /// (<c>RecStatus = 1</c>) or every row, joined with <c>LEFT JOIN</c> to each page holding a grid column,
+        /// ordered by <c>UniqueKey</c> with <c>OFFSET ... FETCH</c>, each read as its id, key, status and grid values
+        /// in grid order; and the count of the selected set in the base table alone.
+        /// </summary>
+        public async Task<ListedPage> DirectListPageAsync(
+            bool includeDeleted,
+            long offset,
+            int pageSize,
+            CancellationToken cancellationToken)
+        {
+            var baseTable = SqlIdentifier.Quote(Schema.BaseTable);
+            var baseId = SqlIdentifier.Quote(RecordSqlBuilder.Require(Schema.GlobalRecordId));
+            var uniqueKey = SqlIdentifier.Quote(RecordSqlBuilder.Require(Schema.UniqueKey));
+            var recStatus = SqlIdentifier.Quote(RecordSqlBuilder.Require(Schema.RecStatus));
+            var from = new StringBuilder(" FROM ").Append(baseTable).Append(" b");
+            var joinedPages = new HashSet<int>();
+            var gridValues = new StringBuilder();
+            foreach (var field in Grid)
+            {
+                var (table, column) = PageColumn(field.Name);
+                var alias = "t" + field.Page.PageId.ToString(CultureInfo.InvariantCulture);
+                if (joinedPages.Add(field.Page.PageId))
+                {
+                    from.Append(" LEFT JOIN ").Append(table).Append(' ').Append(alias)
+                        .Append(" ON ").Append(alias).Append('.').Append(PageKey(field.Name))
+                        .Append(" = b.").Append(baseId);
+                }
+
+                gridValues.Append(", ").Append(alias).Append('.').Append(column);
+            }
+
+            var where = includeDeleted ? string.Empty : $" WHERE b.{recStatus} = @activeStatus";
+            var sql = $"SELECT b.{baseId}, b.{uniqueKey}, b.{recStatus}{gridValues}{from}{where}" +
+                $" ORDER BY b.{uniqueKey} OFFSET @offset ROWS FETCH NEXT @pageSize ROWS ONLY;" +
+                $" SELECT COUNT_BIG(*) FROM {baseTable} b{where};";
+
+            await using var connection = await TestDatabase.OpenConnectionAsync(cancellationToken);
+            await using var command = new SqlCommand(sql, connection) { CommandTimeout = Options.CommandTimeoutSeconds };
+            command.Parameters.Add(ActiveStatusParameter());
+            command.Parameters.Add(new SqlParameter("@offset", SqlDbType.BigInt) { Value = offset });
+            command.Parameters.Add(new SqlParameter("@pageSize", SqlDbType.Int) { Value = pageSize });
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+            var rows = new List<object[]>();
+            while (await reader.ReadAsync(cancellationToken))
+            {
+                var values = new object[reader.FieldCount];
+                reader.GetValues(values);
+                rows.Add(values);
+            }
+
+            Assert.True(await reader.NextResultAsync(cancellationToken), "The direct query returned no count.");
+            Assert.True(await reader.ReadAsync(cancellationToken), "The direct query returned no count row.");
+            return new ListedPage(rows, reader.GetInt64(0), EmptyRows: 0);
+        }
 
         /// <summary>
         /// Runs a list statement and reads the ids of the rows it flags as on the page, in the order returned, and the
@@ -2836,7 +3054,8 @@ public sealed class ListAndFindSqlTests
 /// fields; a threshold search holding more alternatives than the parser admits in one value or one search is parsed in
 /// chunks within its bounds, whose alternatives form the one condition the builder receives, since the builder binds a
 /// condition of any size. Their values are read from the database by direct SQL, from seeded active records with a row
-/// on every page, so each search matches something whatever rows the database holds. Every record a test creates
+/// on every page, so each search matches something whatever rows the database holds; the lowest and highest
+/// <c>GlobalRecordId</c> a comparison takes are read from every base row. Every record a test creates
 /// carries a test marker at the start of <c>LastName</c>, so the samples leave out each record whose <c>LastName</c>
 /// starts with <see cref="TestDatabase.MarkerPrefix"/>: records other tests leave behind, such as a <c>LastName</c> at
 /// the column's full length, never become a criterion, and a rerun draws the same values. No count is hard-coded: every
@@ -2851,7 +3070,7 @@ public sealed class ListAndFindSqlTests
 /// No statement may use <c>OPENJSON</c>, which needs database compatibility level 130 or higher: packed values travel
 /// in a list every level decodes alike. Every packed statement, and no per-alternative one, ends with the plan hints
 /// that make SQL Server decode each packed list once rather than once per row, and every statement runs under the
-/// default command timeout, so a plan that decodes a long list per row fails its test by timeout. Run with
+/// default command timeout, so a statement that outlasts it fails its test by timeout. Run with
 /// <c>ConnectionStrings__EpiInfo</c> naming a database below level 130, the class proves the packed statements
 /// there; no test changes a database setting.
 /// </para>
@@ -2881,11 +3100,6 @@ public sealed class SearchStatementBoundsTests : IAsyncLifetime
         " OPTION (USE HINT ('DISABLE_OPTIMIZER_ROWGOAL', 'FORCE_LEGACY_CARDINALITY_ESTIMATION'))";
     private const string QueryHint = " OPTION (";
 
-    // The length of the equality and LIKE list on GlobalRecordId, five times the scalar budget: a plan that decodes
-    // and sorts the list again for every row takes minutes over it at every compatibility level, and one that decodes
-    // it once takes a few seconds.
-    private const int PerRowDecodingAlternatives = 5 * ScalarParameterBudget;
-
     // Session options unlike SqlClient's defaults in each respect a decoding could depend on: quoted identifiers, which
     // xml methods need; arithmetic aborts and warnings, and rounding aborts; NULL concatenation; and the language, date
     // format and first weekday, which govern date text. The SELECT reads one option back.
@@ -2909,19 +3123,77 @@ public sealed class SearchStatementBoundsTests : IAsyncLifetime
     private const int CollationSamples = 2;
     private const int MaxCollationTextLength = 100;
 
-    // What a statement running a long-pattern program holds: the first program's CTE and its recursion hint.
+    // What a statement running a long-pattern program holds: the first program's CTE and its hints, which lift the
+    // recursion limit and keep the program on one worker.
     private const string LongPatternCte = "[x0] ([k], [v], [l], [z], [st]) AS (";
-    private const string LongPatternHint = " OPTION (MAXRECURSION 0)";
+    private const string LongPatternHint = " OPTION (MAXRECURSION 0, MAXDOP 1)";
 
     // What every list statement holds, long filter or not: the table hint of each base- and page-table read, and the
-    // plan hints that read a base row before its page rows, which a long filter's statement puts after the recursion
-    // hint.
+    // plan hints that read a base row before its page rows, which a long filter's statement puts after the program's
+    // hints.
     private const string ListHoldLock = " WITH (HOLDLOCK)";
     private const string ListPlanHints = " OPTION (FORCE ORDER, LOOP JOIN)";
-    private const string LongListPlanHints = " OPTION (MAXRECURSION 0, FORCE ORDER, LOOP JOIN)";
+    private const string LongListPlanHints = " OPTION (MAXRECURSION 0, MAXDOP 1, FORCE ORDER, LOOP JOIN)";
 
     // The page size of the list cases, the largest the API admits.
     private const int ListPageSize = 200;
+
+    // The most text elements of a literal run one character of the grid filter's collation can rank equal to, the
+    // bound a long run's seek relies on, so a value matching a long filter has at least ceil(n / RunCuts) characters,
+    // n the filter's text elements that hold a character SearchSqlBuilder.IsWeightedCharacter counts.
+    private const int RunCuts = 33;
+    private const string MinimumLengthGuard = " WHERE [u].[v] IS NOT NULL AND [h].[l] >= ";
+
+    // The digits of the numbers the weighted-character comparison adds to each range's first code point: five of them,
+    // cross joined, give each number from 0 to 99,999 once, more than the longest range spans.
+    private const string Digits = "(VALUES (0), (1), (2), (3), (4), (5), (6), (7), (8), (9))";
+
+    /// <summary>
+    /// Grid filters, each a unit repeated a number of times, with the fewest characters a value must have to contain
+    /// it: one per <see cref="RunCuts"/> text elements holding a weighted character
+    /// (<see cref="SearchSqlBuilder.IsWeightedCharacter(char)"/>), a letter, number, punctuation mark, symbol or space
+    /// separator of <see cref="SearchSqlBuilder.WeightedCharacterRanges"/>, rounded up, whether the element is one code
+    /// unit, a letter and a combining mark, or a Thai consonant and its SARA AM, two letters counted once; Latin,
+    /// Cyrillic, CJK and Hangul alike. Punctuation, symbols and spaces count like letters: 4,000 hyphens, and 2,000
+    /// each of <c>%</c>, <c>_</c>, <c>[</c> and <c>\</c>, whose escaped contains patterns pass the native limit; a
+    /// letter followed by a space; and a unit of k such characters repeated <c>RunCuts + 1</c> times, which binds
+    /// k + 1, where one character not counted would give k: a hyphen between two blanks, thirteen ASCII punctuation
+    /// marks, and a math, currency, modifier and other symbol, a superscript digit (No), the two guillemets (Pi, Pf),
+    /// parentheses and the no-break space. And none for a filter of characters outside the ranges, which the collation
+    /// ignores (U+9FBC, assigned after its weights, and the tatweel U+0640), of supplementary characters, an emoji or a
+    /// CJK letter, which no range holds, or of code points of the ranges the predicate's categories leave out and the
+    /// collation ignores: NUL (a control), the soft hyphen (a format character), the mark U+0E4C alone and the
+    /// unassigned U+038B. A filter of blanks alone is no filter.
+    /// </summary>
+    public static TheoryData<string, int, long> LongFilterMinimumLengths => new()
+    {
+        { "z", NativeLikeLimit, 122 },
+        { "z", RunCuts, 1 },
+        { "z", RunCuts + 1, 2 },
+        { "\u00E9", 2 * RunCuts, 2 },
+        { "a\u0301", RunCuts + 1, 2 },
+        { "\u4E00", NativeLikeLimit, 122 },
+        { "\u0436", 2 * RunCuts, 2 },
+        { "\uAC00", RunCuts + 1, 2 },
+        { "\u0E01\u0E33", RunCuts + 1, 2 },
+        { "-", NativeLikeLimit, 122 },
+        { "%", NativeLikeLimit / 2, 61 },
+        { "_", NativeLikeLimit / 2, 61 },
+        { "[", NativeLikeLimit / 2, 61 },
+        { "\\", NativeLikeLimit / 2, 61 },
+        { "z ", NativeLikeLimit / 2, 122 },
+        { " - ", RunCuts + 1, 4 },
+        { ".,;:!?'\"%_[]\\", RunCuts + 1, 14 },
+        { "+$^\u00A9\u00B2\u00AB\u00BB(\u00A0)", RunCuts + 1, 11 },
+        { "\u9FBC", NativeLikeLimit, 0 },
+        { "\u0640", RunCuts + 1, 0 },
+        { "\uD83D\uDE00", RunCuts + 1, 0 },
+        { "\uD840\uDC00", RunCuts + 1, 0 },
+        { "\0", 2, 0 },
+        { "\u00AD", 1, 0 },
+        { "\u0E4C", RunCuts + 1, 0 },
+        { "\u038B", RunCuts + 1, 0 },
+    };
 
     // Chunks of the threshold searches, run per alternative to build the expected union.
     private const int ChunkSize = 500;
@@ -3140,14 +3412,16 @@ public sealed class SearchStatementBoundsTests : IAsyncLifetime
         Assert.Equal(expected, await RunAsync(connection, packed, token));
     }
 
-    // Equality and LIKE alternatives on the unique GlobalRecordId far past the scalar budget, two of each matching a
-    // seeded record and the other patterns nothing: the packed statement, the only one with the plan hints, runs
-    // within the default command timeout at the database's compatibility level and returns the union of the
-    // per-alternative statements over chunks of the alternatives. The parser gives GlobalRecordId no wildcard path, so
-    // the patterns are built directly; they take the packed LIKE path a text field's patterns take, where an
-    // unhinted plan, or one under the row goal alone at level 130 and later, decodes the list once per row.
+    // Equality and comparison alternatives on the unique GlobalRecordId as a client writes them, as many as one value
+    // admits, its last filler sized so the value holds exactly the 32,767-unit bound: equalities on two seeded ids,
+    // <= the lowest id and >= the highest, each matching at most the record holding it, then, in turn, equalities on
+    // short text no id holds and < on the lowest id's first one to three characters, which no id sorts before, with
+    // 'x' characters, as one more equality or at the end of the last, filling the units left. They pass the scalar
+    // budget and stay within the parser's bounds; GlobalRecordId has no wildcard path, so none is a pattern. The
+    // packed statement, the only one with the plan hints, runs within the default command timeout and returns the
+    // union of the per-alternative statements over chunks of the alternatives.
     [Fact]
-    public async Task Search_PackedEqualityAndLikeOnGlobalRecordId_DecodesOnceWithinTheDefaultTimeout()
+    public async Task Search_PackedEqualityAndComparisonsOnGlobalRecordId_AtTheValueBound_RunWithinTheDefaultTimeout()
     {
         using var cancellation = new CancellationTokenSource(TestTimeout);
         var token = cancellation.Token;
@@ -3155,31 +3429,67 @@ public sealed class SearchStatementBoundsTests : IAsyncLifetime
         await using var connection = await TestDatabase.OpenConnectionAsync(token);
         var form = await ReadFormAsync(connection, CaseReport, token);
 
-        var ids = await SampleAsync(connection, CaseReport, "b.[GlobalRecordId]", 4, token);
-        var parsed = Assert.Single(Parse(form, [Text(SearchCriteriaParser.GlobalRecordIdFieldName, ids[0])]));
-        SearchAlternative Prefix(string id) =>
-            new(SearchOperator.Like, FieldValue.FromText(id[..Math.Max(1, id.Length / 2)] + "%"));
+        var ids = await SampleAsync(connection, CaseReport, "b.[GlobalRecordId]", 2, token);
+        var (lowest, highest) = await GlobalRecordIdBoundsAsync(connection, token);
 
-        var alternatives = new List<SearchAlternative>(PerRowDecodingAlternatives)
+        var alternatives = new List<string> { ids[0], ids[1], "<=" + lowest, ">=" + highest };
+        var length = Or(alternatives).Length;
+        for (var filler = 0; ; filler++)
         {
-            new(SearchOperator.Equal, FieldValue.FromText(ids[0])),
-            Prefix(ids[1]),
-            new(SearchOperator.Equal, FieldValue.FromText(ids[2])),
-            Prefix(ids[3]),
-        };
-        while (alternatives.Count < PerRowDecodingAlternatives)
-        {
-            alternatives.Add(new(SearchOperator.Like, FieldValue.FromText(NoMatch(alternatives.Count) + "%")));
+            var next = filler % 2 == 0
+                ? "x" + filler.ToString(CultureInfo.InvariantCulture)
+                : "<" + lowest[..Math.Min(lowest.Length, 1 + (filler / 2 % 3))];
+            if (length + OrSeparator.Length + next.Length > RecordQueryRules.MaxSearchValueLength)
+            {
+                break;
+            }
+
+            alternatives.Add(next);
+            length += OrSeparator.Length + next.Length;
         }
 
-        var condition = new SearchCondition(parsed.FieldName, parsed.Target, parsed.FieldType, alternatives);
+        // The units no whole filler fits in: one more equality of 'x' characters when it fits after a separator,
+        // otherwise as many 'x' characters at the end of the last equality filler. Neither matches an id.
+        var remaining = RecordQueryRules.MaxSearchValueLength - length;
+        if (remaining > OrSeparator.Length)
+        {
+            alternatives.Add(new string('x', remaining - OrSeparator.Length));
+        }
+        else if (remaining > 0)
+        {
+            var lastEquality = alternatives.FindLastIndex(alternative => alternative.StartsWith('x'));
+            alternatives[lastEquality] += new string('x', remaining);
+        }
+
+        var value = Or(alternatives);
+        Assert.Equal(RecordQueryRules.MaxSearchValueLength, value.Length);
+
+        var conditions = Parse(form, [Text(SearchCriteriaParser.GlobalRecordIdFieldName, value)]);
+        var condition = Assert.Single(conditions);
+        Assert.Equal(alternatives.Count, condition.Alternatives.Count);
+        Assert.True(
+            condition.Alternatives.Count > ScalarParameterBudget,
+            $"{condition.Alternatives.Count} alternatives do not pass the scalar budget.");
+        var rowCompared = condition.Alternatives.Count(
+            alternative => alternative.Operator is not (SearchOperator.Equal or SearchOperator.IsNull));
+        Assert.True(
+            rowCompared <= RecordQueryRules.MaxRowComparedAlternatives,
+            $"{rowCompared} row-compared alternatives are more than the parser admits.");
+        var operators = condition.Alternatives.Select(alternative => alternative.Operator).Distinct().Order().ToArray();
+        Assert.Equal(
+            new[]
+            {
+                SearchOperator.Equal, SearchOperator.Less, SearchOperator.LessOrEqual, SearchOperator.GreaterOrEqual,
+            },
+            operators);
+
         var packed = SearchSqlBuilder.Search(
-            form.Schema, form.DataFields, form.GridColumns, [condition], includeDeleted: false, null);
+            form.Schema, form.DataFields, form.GridColumns, conditions, includeDeleted: false, null);
         AssertCarrier(packed, packed: true);
-        Assert.Equal(FixedActiveSetParameters + 2, packed.Statement.Parameters.Count);
+        Assert.Equal(FixedActiveSetParameters + operators.Length, packed.Statement.Parameters.Count);
 
         var union = new Dictionary<string, SearchRow>(StringComparer.Ordinal);
-        foreach (var chunk in alternatives.Chunk(ChunkSize))
+        foreach (var chunk in condition.Alternatives.Chunk(ChunkSize))
         {
             var part = new SearchCondition(condition.FieldName, condition.Target, condition.FieldType, chunk);
             var select = SearchSqlBuilder.Search(
@@ -3194,14 +3504,24 @@ public sealed class SearchStatementBoundsTests : IAsyncLifetime
             }
         }
 
-        Assert.Superset(ids.ToHashSet(StringComparer.Ordinal), union.Keys.ToHashSet(StringComparer.Ordinal));
-        Assert.True(union.Count <= RecordQueryRules.SearchCap, "The seeded ids match more rows than one page.");
+        var unionIds = union.Keys.ToHashSet(StringComparer.Ordinal);
+        Assert.Superset(ids.ToHashSet(StringComparer.Ordinal), unionIds);
+        Assert.Subset(new HashSet<string>(StringComparer.Ordinal) { ids[0], ids[1], lowest, highest }, unionIds);
+        Assert.True(union.Count <= RecordQueryRules.SearchCap, "The ids match more rows than one page.");
         var expected = union.Values
             .OrderBy(row => row.UniqueKey)
             .Select(row => row with { Total = union.Count })
             .ToArray();
 
-        Assert.Equal(expected, await RunAsync(connection, packed, token));
+        var clock = Stopwatch.StartNew();
+        var packedRows = await RunAsync(connection, packed, token);
+        clock.Stop();
+        output.WriteLine(
+            $"GlobalRecordId: {condition.Alternatives.Count} alternatives, {rowCompared} row-compared, "
+            + $"{value.Length} code units, packed statement {clock.Elapsed.TotalSeconds:F2} s, "
+            + $"{packedRows.Count} matches.");
+
+        Assert.Equal(expected, packedRows);
     }
 
     // A packed list decodes every element at the lengths where the digit tables that number its elements grow: an
@@ -3445,7 +3765,7 @@ public sealed class SearchStatementBoundsTests : IAsyncLifetime
         Assert.Contains("[x1]", mixed.Statement.Text, StringComparison.Ordinal);
         Assert.Equal(budget == 0, mixed.Statement.Text.Contains(PackedListMarker, StringComparison.Ordinal));
         Assert.EndsWith(
-            budget == 0 ? " OPTION (MAXRECURSION 0, " + PackedPlanHints[" OPTION (".Length..] : LongPatternHint,
+            budget == 0 ? LongPatternHint[..^1] + ", " + PackedPlanHints[QueryHint.Length..] : LongPatternHint,
             mixed.Statement.Text,
             StringComparison.Ordinal);
         Assert.Equal(expected, await RunAsync(connection, mixed, token));
@@ -3738,6 +4058,134 @@ public sealed class SearchStatementBoundsTests : IAsyncLifetime
                 Assert.Equal(expectedTotal, total);
             }
         }
+    }
+
+    // A long grid filter's program runs only on values that can contain it: its anchor admits a value of at least the
+    // filter's minimum length, which the statement binds as a bigint right after the program and before the offset and
+    // the page size, so the filter reaches the statement only as parameters. With the native limit forced to 0 every
+    // filter runs the program, whatever its length. The rows the guarded program lists are pinned by the long-filter
+    // cases above and the API's grid q cases, which compare it with native LIKE.
+    [Theory]
+    [MemberData(nameof(LongFilterMinimumLengths))]
+    public async Task List_LongFilterProgram_BindsTheShortestValueThatCanContainTheFilter(
+        string unit,
+        int repeat,
+        long minimumLength)
+    {
+        using var cancellation = new CancellationTokenSource(TestTimeout);
+        var token = cancellation.Token;
+        await using var connection = await TestDatabase.OpenConnectionAsync(token);
+        var form = await ReadFormAsync(connection, CaseReport, token);
+
+        var query = new RecordListQuery(string.Concat(Enumerable.Repeat(unit, repeat)), false, 1, ListPageSize);
+        var statement = SearchSqlBuilder.ListPage(form.Schema, form.GridColumns, query, 0).Statement;
+        AssertProgram(statement, longPattern: true);
+        AssertHeldList(form, statement, longPattern: true);
+        Assert.Equal(minimumLength, MinimumLengthParameter(statement).Value);
+    }
+
+    // The characters a long grid filter's minimum length counts are none that the grid filter's collation ignores. One
+    // statement, which reads no table, compares 'a', then each code point of SearchSqlBuilder.WeightedCharacterRanges,
+    // then 'b' with "ab" under Latin1_General_100_CI_AS, and no code point the collation finds equal there is one
+    // SearchSqlBuilder.IsWeightedCharacter counts, a letter, number, punctuation mark, symbol or space separator. Every
+    // code point of the ranges is compared once, and NUL and the soft hyphen, which the ranges hold and the collation
+    // ignores, are found, so the comparison detects an ignorable character.
+    [Fact]
+    public async Task List_LongFilterCountedCharacters_AreNoneIgnorableUnderTheGridCollation()
+    {
+        using var cancellation = new CancellationTokenSource(TestTimeout);
+        var token = cancellation.Token;
+        await using var connection = await TestDatabase.OpenConnectionAsync(token);
+
+        var ranges = SearchSqlBuilder.WeightedCharacterRanges;
+        var sql = new StringBuilder("SELECT [g].[f] + [r].[n] AS [c], CASE WHEN (N'a' + NCHAR([g].[f] + [r].[n])")
+            .Append(" + N'b') COLLATE Latin1_General_100_CI_AS = N'ab' COLLATE Latin1_General_100_CI_AS")
+            .Append(" THEN 1 ELSE 0 END AS [i] FROM (VALUES ");
+        var parameters = new List<SqlParameter>();
+        for (var index = 0; index < ranges.Count; index++)
+        {
+            var first = "@first" + index.ToString(CultureInfo.InvariantCulture);
+            var last = "@last" + index.ToString(CultureInfo.InvariantCulture);
+            sql.Append(index == 0 ? "(" : ", (").Append(first).Append(", ").Append(last).Append(')');
+            parameters.Add(new SqlParameter(first, SqlDbType.Int) { Value = (int)ranges[index].First });
+            parameters.Add(new SqlParameter(last, SqlDbType.Int) { Value = (int)ranges[index].Last });
+        }
+
+        sql.Append(") AS [g]([f], [l]) INNER JOIN (SELECT [d0].[v] + 10 * [d1].[v] + 100 * [d2].[v]")
+            .Append(" + 1000 * [d3].[v] + 10000 * [d4].[v] FROM ");
+        for (var digit = 0; digit < 5; digit++)
+        {
+            sql.Append(digit == 0 ? string.Empty : " CROSS JOIN ").Append(Digits).Append(" AS [d")
+                .Append(digit.ToString(CultureInfo.InvariantCulture)).Append("]([v])");
+        }
+
+        sql.Append(") AS [r]([n]) ON [r].[n] <= [g].[l] - [g].[f]");
+        await using var command = new SqlCommand(sql.ToString(), connection);
+        command.Parameters.AddRange(parameters.ToArray());
+        var compared = new HashSet<int>();
+        var ignored = new HashSet<int>();
+        await using (var reader = await command.ExecuteReaderAsync(token))
+        {
+            while (await reader.ReadAsync(token))
+            {
+                var codePoint = reader.GetInt32(0);
+                Assert.True(compared.Add(codePoint), "A code point of the ranges was compared twice.");
+                if (reader.GetInt32(1) == 1)
+                {
+                    ignored.Add(codePoint);
+                }
+            }
+        }
+
+        Assert.Equal(ranges.Sum(range => range.Last - range.First + 1), compared.Count);
+        Assert.All(compared, codePoint => Assert.Contains(
+            ranges, range => codePoint >= range.First && codePoint <= range.Last));
+        Assert.Contains(0x0000, ignored);
+        Assert.Contains(0x00AD, ignored);
+        string[] ignoredCounted =
+        [
+            .. ignored
+                .Where(codePoint => SearchSqlBuilder.IsWeightedCharacter((char)codePoint))
+                .Order()
+                .Select(codePoint => $"U+{codePoint:X4}"),
+        ];
+        Assert.True(
+            ignoredCounted.Length == 0,
+            "Latin1_General_100_CI_AS ignores these counted characters: " + string.Join(", ", ignoredCounted));
+    }
+
+    // A filter past SQL Server's LIKE limit that no seeded value is long enough to contain, 4,000 'z' on either form, or
+    // 4,000 U+4E00 or 4,000 hyphens on CaseReport, lists what the native filter of its 3,998-character prefix lists,
+    // nothing: its program admits no value shorter than ceil(4000 / 33) characters, so it is not run on the short
+    // seeded values at all.
+    [Theory]
+    [InlineData(CaseReport, 'z')]
+    [InlineData(FoodHistory, 'z')]
+    [InlineData(CaseReport, '\u4E00')]
+    [InlineData(CaseReport, '-')]
+    public async Task List_LongFilterLongerThanEveryValue_ListsWhatItsNativePrefixLists(string formName, char unit)
+    {
+        using var cancellation = new CancellationTokenSource(TestTimeout);
+        var token = cancellation.Token;
+        await using var databaseLock = await DatabaseWriteLock.AcquireSharedAsync(token);
+        await using var connection = await TestDatabase.OpenConnectionAsync(token);
+        var form = await ReadFormAsync(connection, formName, token);
+
+        var prefix = new RecordListQuery(new string(unit, NativeLikeLimit - 2), false, 1, ListPageSize);
+        var native = SearchSqlBuilder.ListPage(form.Schema, form.GridColumns, prefix);
+        AssertProgram(native.Statement, longPattern: false);
+        var (nativeIds, nativeTotal) = await ListRowsAsync(connection, native.Statement, token);
+        Assert.Empty(nativeIds);
+        Assert.Equal(0, nativeTotal);
+
+        var query = new RecordListQuery(new string(unit, NativeLikeLimit), false, 1, ListPageSize);
+        var page = SearchSqlBuilder.ListPage(form.Schema, form.GridColumns, query);
+        AssertProgram(page.Statement, longPattern: true);
+        AssertHeldList(form, page.Statement, longPattern: true);
+        Assert.Equal((NativeLikeLimit + RunCuts - 1L) / RunCuts, MinimumLengthParameter(page.Statement).Value);
+        var (ids, total) = await ListRowsAsync(connection, page.Statement, token);
+        Assert.Equal(nativeIds, ids);
+        Assert.Equal(nativeTotal, total);
     }
 
     // A command carries at most 2,098 parameters of its own: a statement of exactly 2,098 runs, and the builder refuses
@@ -4168,6 +4616,20 @@ public sealed class SearchStatementBoundsTests : IAsyncLifetime
         return Assert.IsType<string>(id);
     }
 
+    // The lowest and highest GlobalRecordId under the column's collation over every CaseReport base row, deleted rows
+    // and rows missing a page row included, so a <= on the lowest or a >= on the highest matches at most the record
+    // holding it.
+    private static async Task<(string Lowest, string Highest)> GlobalRecordIdBoundsAsync(
+        SqlConnection connection,
+        CancellationToken token)
+    {
+        var sql = "SELECT MIN(b.[GlobalRecordId]), MAX(b.[GlobalRecordId]) FROM [CaseReport] b";
+        await using var command = new SqlCommand(sql, connection);
+        await using var reader = await command.ExecuteReaderAsync(token);
+        Assert.True(await reader.ReadAsync(token), "The GlobalRecordId bounds query returned no row.");
+        return (Assert.IsType<string>(reader.GetValue(0)), Assert.IsType<string>(reader.GetValue(1)));
+    }
+
     // Up to count distinct values of one column of the form's seeded complete active records, as criterion text.
     private static async Task<IReadOnlyList<string>> SampleAsync(
         SqlConnection connection,
@@ -4437,8 +4899,8 @@ public sealed class SearchStatementBoundsTests : IAsyncLifetime
         field.FieldType,
         [new SearchAlternative(SearchOperator.Like, FieldValue.FromText(pattern))]);
 
-    // A statement runs a long-pattern program exactly when it should, and is in every case one read: a single SELECT or
-    // WITH statement with no batch separator and no write.
+    // A statement runs a long-pattern program exactly when it should, with the recursion and serial-plan hints exactly
+    // then, and is in every case one read: a single SELECT or WITH statement with no batch separator and no write.
     private static void AssertProgram(SqlStatement statement, bool longPattern)
     {
         Assert.DoesNotContain(";", statement.Text, StringComparison.Ordinal);
@@ -4452,12 +4914,13 @@ public sealed class SearchStatementBoundsTests : IAsyncLifetime
         {
             Assert.DoesNotContain(LongPatternCte, statement.Text, StringComparison.Ordinal);
             Assert.DoesNotContain("MAXRECURSION", statement.Text, StringComparison.Ordinal);
+            Assert.DoesNotContain("MAXDOP", statement.Text, StringComparison.Ordinal);
         }
     }
 
     // A list statement is one held read whether or not its filter is long: the base table and each page table it
     // joins carry HOLDLOCK wherever they are read, once by the filtered set and, for a long filter, once more by the
-    // program, and the statement ends with the list's plan hints, after the recursion hint when it runs a program.
+    // program, and the statement ends with the list's plan hints, after the program's hints when it runs a program.
     private static void AssertHeldList(SeededForm form, SqlStatement statement, bool longPattern)
     {
         var text = statement.Text;
@@ -4469,6 +4932,31 @@ public sealed class SearchStatementBoundsTests : IAsyncLifetime
         Assert.NotEqual(0, pageJoins);
         Assert.Equal(pageJoins, Occurrences(text, ListHoldLock + " ON "));
         Assert.EndsWith(longPattern ? LongListPlanHints : ListPlanHints, text, StringComparison.Ordinal);
+    }
+
+    // The minimum length a long filter's list statement binds: the bigint right after its one text parameter, the
+    // program, and before the offset and the page size, which its program's anchor compares each value's length with.
+    private static SqlParameterValue MinimumLengthParameter(SqlStatement statement)
+    {
+        var program = -1;
+        for (var index = 0; index < statement.Parameters.Count; index++)
+        {
+            if (statement.Parameters[index].DbType == DbType.String)
+            {
+                Assert.Equal(-1, program);
+                program = index;
+            }
+        }
+
+        Assert.True(program >= 0, "The long filter's statement binds no program.");
+        Assert.Equal(program + 4, statement.Parameters.Count);
+        Assert.All(
+            statement.Parameters.Skip(program + 1).Take(2),
+            parameter => Assert.Equal(DbType.Int64, parameter.DbType));
+        Assert.Equal(DbType.Int32, statement.Parameters[^1].DbType);
+        var minimumLength = statement.Parameters[program + 1];
+        Assert.Equal(1, Occurrences(statement.Text, MinimumLengthGuard + minimumLength.Name + " AND "));
+        return minimumLength;
     }
 
     // The number of non-overlapping ordinal occurrences of value in text.

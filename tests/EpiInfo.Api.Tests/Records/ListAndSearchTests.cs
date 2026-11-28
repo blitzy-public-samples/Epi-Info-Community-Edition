@@ -3569,8 +3569,9 @@ public sealed partial class ListAndSearchTests
         + " cannot be cut into sets of at most 3998 characters that keep its members and negation.";
 
     // The statements one list or Find request sent under its operation, as many as given: each succeeded, holds no part
-    // of the submitted text, which travels only as a parameter value, and carries OPTION (MAXRECURSION 0), which only
-    // the long-pattern recursion needs, exactly when the pattern is past the LIKE pattern limit.
+    // of the submitted text, which travels only as a parameter value, and carries OPTION (MAXRECURSION 0, MAXDOP 1),
+    // which only the long-pattern program needs, to recurse without a level limit on one worker, exactly when the
+    // pattern is past the LIKE pattern limit.
     private static void AssertLikeStatements(
         SqlCommandRecorder recorder,
         string operation,
@@ -3584,7 +3585,9 @@ public sealed partial class ListAndSearchTests
         {
             Assert.True(statement.Succeeded, statement.ToString());
             Assert.DoesNotContain(submitted, statement.CommandText, StringComparison.OrdinalIgnoreCase);
-            Assert.Equal(longPattern, statement.CommandText.Contains("MAXRECURSION 0", StringComparison.Ordinal));
+            Assert.Equal(
+                longPattern,
+                statement.CommandText.Contains("MAXRECURSION 0, MAXDOP 1", StringComparison.Ordinal));
         }
     }
 

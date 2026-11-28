@@ -200,16 +200,16 @@ internal enum SelectedSetClause
 /// application while one of these reads holds its base row, and each of them reads that row once. These reads fix no
 /// join order, so a page row a plan reads before it holds that row's base row can still change before the base row
 /// is held, as <c>SearchSqlBuilder.Search</c>'s remarks state. <c>SearchSqlBuilder.ListPage</c> is the exception: it
-/// reads its filtered set twice in one statement, once for the total and once for the page, so a page row changed
-/// between the two reads without its base row, by a writer outside the application or by an update of a base table
-/// with neither last-save column, would make them describe different sets. It therefore holds its page tables too,
-/// and its plan hints <c>OPTION (FORCE ORDER, LOOP JOIN)</c> make the base table the outer input of every page join,
-/// so it reads each page row only once it holds that row's base row, the order every application write locks them
-/// in. That removes the lock-order inversion between a held page row and its base row, so the list and an
-/// application write never wait for each other through the rows of one record; an application write that inserts a
-/// page row (a create, or an update that repairs a missing page row) can still deadlock with it through a key range
-/// the list locked for another record. Its remarks state every deadlock that order leaves possible and how each is
-/// reported.
+/// holds its page tables too, with or without a grid filter. With one, its set joins the pages and is read twice in one
+/// statement, once for the total and once for the page, so a page row changed between the two reads without its base
+/// row, by a writer outside the application or by an update of a base table with neither last-save column, would make
+/// them describe different sets; without one, the set reads the base table alone and each page row is read once, for a
+/// fetched row only. Its plan hints <c>OPTION (FORCE ORDER, LOOP JOIN)</c> make held base rows the outer input of every
+/// page join, so it reads each page row only once it holds that row's base row, the order every application write locks
+/// them in. That removes the lock-order inversion between a held page row and its base row, so the list and an
+/// application write never wait for each other through the rows of one record; an application write that inserts a page
+/// row (a create, or an update that repairs a missing page row) can still deadlock with it through a key range the list
+/// locked for another record. Its remarks state every deadlock that order leaves possible and how each is reported.
 /// </para>
 /// <para>
 /// Every exception message is fixed text naming no table, column, value or id, as the redaction policy requires.

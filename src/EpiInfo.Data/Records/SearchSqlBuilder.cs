@@ -62,11 +62,11 @@ internal sealed record ListSelect(SqlStatement Statement, IReadOnlyList<Projecte
 /// program runs under (the recursive CTEs <c>[x{n}]</c>, their columns <c>[k]</c>, <c>[v]</c>, <c>[l]</c>,
 /// <c>[z]</c> and <c>[st]</c>, and the aliases <c>[u]</c>, <c>[h]</c>, <c>[x]</c>, <c>[q]</c>, <c>[f]</c>,
 /// <c>[g]</c>, <c>[o]</c> and <c>[y]</c> with their columns), the collation name, the escape character, the decoding
-/// expressions of packed values and of programs, and the query hints, <c>MAXRECURSION 0</c>, a packed statement's
-/// <c>USE HINT ('DISABLE_OPTIMIZER_ROWGOAL', 'FORCE_LEGACY_CARDINALITY_ESTIMATION')</c> and the list's
-/// <c>FORCE ORDER, LOOP JOIN</c>, are fixed literals. Every value (criteria, packed, compiled or not, the grid filter,
-/// the excluded id, the cap, the offset and the page size) is a positional parameter, so text that looks like SQL
-/// stays inert data.
+/// expressions of packed values and of programs, and the query hints, a program's <c>MAXRECURSION 0, MAXDOP 1</c>,
+/// a packed statement's <c>USE HINT ('DISABLE_OPTIMIZER_ROWGOAL', 'FORCE_LEGACY_CARDINALITY_ESTIMATION')</c> and the
+/// list's <c>FORCE ORDER, LOOP JOIN</c>, are fixed literals. Every value (criteria, packed, compiled or not, the grid
+/// filter, the excluded id, the cap, the offset and the page size) is a positional parameter, so text that looks like
+/// SQL stays inert data.
 /// </para>
 /// <para>
 /// Every exception message is fixed text naming no table, column, field, value or id, as the redaction policy
@@ -214,10 +214,12 @@ internal static class SearchSqlBuilder
     private const string PackedPlanHints =
         "USE HINT ('DISABLE_OPTIMIZER_ROWGOAL', 'FORCE_LEGACY_CARDINALITY_ESTIMATION')";
 
-    // The query hint of a statement that runs a long-pattern program: a recursive CTE takes one level per instruction,
+    // The query hints of a statement that runs a long-pattern program. A recursive CTE takes one level per instruction,
     // bisection, extension or seek a value runs, more than the default limit of 100 levels for a long value or a long
-    // program.
-    private const string LongPatternHint = "MAXRECURSION 0";
+    // program, so MAXRECURSION 0 lifts the limit. A parallel plan re-runs the program across its workers, many times
+    // slower than one worker ("Long filters" in ListPage's remarks gives the measurement), so MAXDOP 1 keeps the
+    // program on one worker whatever the server's max degree of parallelism.
+    private const string LongPatternHint = "MAXRECURSION 0, MAXDOP 1";
 
     // A long-pattern program is ASCII text, as a packed list is: the number of patterns, the number of records, one
     // record of LongPatternFieldCount fields, each PackedNumberWidth decimal digits, per entry, instruction and data
@@ -268,6 +270,36 @@ internal static class SearchSqlBuilder
     // Latin1_General_100_CI_AS ranks equal to it span at most three text elements (U+FB03 for ffi).
     private const int RunCuts = 33;
 
+    /// <summary>
+    /// The code point ranges, each inclusive, whose weighted characters (<see cref="IsWeightedCharacter(char)"/>) a
+    /// long grid filter's minimum length counts, in Latin to Latin Extended-B, Greek, Cyrillic, Hebrew, Arabic, Thai,
+    /// Latin Extended Additional, hiragana and katakana, the CJK Unified Ideographs and the Hangul syllables: their
+    /// letters, numbers, punctuation, symbols and space separators. Measured on SQL Server 2022, none of the 33,528
+    /// such characters in them is ignorable under <c>Latin1_General_100_CI_AS</c>
+    /// (<c>(N'a' + NCHAR(c) + N'b') = N'ab'</c> is false for each). The collation ignores 13 code points of the ranges,
+    /// all of other categories: NUL (a control), the soft hyphen U+00AD (a format character), the marks U+0487 and
+    /// U+0E4C, and 9 unassigned code points. Outside the ranges it ignores 3,003 BMP characters of the counted
+    /// categories, such as U+0370 to U+0373, U+9FBC to U+9FFF, the rupee sign U+20B9 and the dashes U+2E3A and U+2E3B,
+    /// which Unicode assigned after the collation's weights, and the Arabic tatweel U+0640. So the ranges are an
+    /// allow-list of measured ones, never every character of those categories.
+    /// </summary>
+    internal static readonly IReadOnlyList<(char First, char Last)> WeightedCharacterRanges =
+        Array.AsReadOnly<(char First, char Last)>(
+        [
+            ('\u0000', '\u024F'),
+            ('\u0386', '\u03CE'),
+            ('\u0400', '\u0513'),
+            ('\u05D0', '\u05EA'),
+            ('\u0621', '\u063A'),
+            ('\u0641', '\u064A'),
+            ('\u0E01', '\u0E5B'),
+            ('\u1E00', '\u1E9B'),
+            ('\u1EA0', '\u1EF9'),
+            ('\u3041', '\u30FF'),
+            ('\u4E00', '\u9FBB'),
+            ('\uAC00', '\uD7A3'),
+        ]);
+
     // The phases of a step, the [q].[p] of a row: run the step afresh, bisect for the first end its pattern fits,
     // extend that end to a character boundary or scan a run's equal ends, and apply a seek's hit.
     private const int FreshPhase = 0;
@@ -280,8 +312,9 @@ internal static class SearchSqlBuilder
     private const string Rest = "SUBSTRING([x].[v], [q].[e] + 1, [f].[r])";
     private const string Midpoint = "([q].[t] + [q].[h]) / 2";
 
-    // The plan hints the list statement ends with: the joins run in written order, each as nested loops, so the base
-    // table is the outer input of every page join and each page row is read only after its base row is held (ListPage).
+    // The plan hints the list statement ends with: the joins run in written order, each as nested loops, so the held
+    // base rows, of the page or of the filtered set, are the outer input of every page join and each page row is read
+    // only after its base row is held (ListPage).
     private const string ListPlanHints = "FORCE ORDER, LOOP JOIN";
 
     // SQL Server's largest decimal precision, the precision a packed decimal element is read back with.
@@ -331,11 +364,12 @@ internal static class SearchSqlBuilder
     ///                                     AND CAST(SUBSTRING([y].[st], 1, 8) AS bigint) = -1)]) AND (alt OR ...)
     ///   [AND NOT (b.[GlobalRecordId] = @pX AND DATALENGTH(b.[GlobalRecordId]) = DATALENGTH(@pX))]
     /// ORDER BY b.[UniqueKey]
-    /// [OPTION ([MAXRECURSION 0][, ][USE HINT ('DISABLE_OPTIMIZER_ROWGOAL', 'FORCE_LEGACY_CARDINALITY_ESTIMATION')])]
+    /// [OPTION ([MAXRECURSION 0, MAXDOP 1][, ]
+    ///          [USE HINT ('DISABLE_OPTIMIZER_ROWGOAL', 'FORCE_LEGACY_CARDINALITY_ESTIMATION')])]
     /// </code>
     /// <para>
-    /// <c>MAXRECURSION 0</c> is written only with a long-pattern program and the <c>USE HINT</c> only in a packed
-    /// statement.
+    /// <c>MAXRECURSION 0, MAXDOP 1</c> is written only with a long-pattern program, which it lets recurse without a
+    /// level limit on one worker ("Long patterns" below), and the <c>USE HINT</c> only in a packed statement.
     /// </para>
     /// <para>
     /// <b>Positions.</b> The CTE reads the base table only and applies only the selected-set predicate, so
@@ -481,7 +515,10 @@ internal static class SearchSqlBuilder
     /// pair as one character; each recursion step runs one instruction for one value, decoding it from the parameter
     /// by its index, so neither the text nor the parameter count grows with the pattern. A value matches when one of
     /// its rows reaches state -1, which the condition's <c>EXISTS</c> term tests, and the statement carries
-    /// <c>MAXRECURSION 0</c>. Every comparison, <c>LIKE</c>, <c>PATINDEX</c>, <c>=</c> or <c>&lt;</c>, runs under the
+    /// <c>MAXRECURSION 0, MAXDOP 1</c>: the recursion can take more than the default 100 levels, and a parallel plan
+    /// re-runs the program across its workers, many times slower than one worker ("Long filters" under
+    /// <c>ListPage</c> gives the measurement), so the hint keeps the program on one worker whatever the server's max
+    /// degree of parallelism. Every comparison, <c>LIKE</c>, <c>PATINDEX</c>, <c>=</c> or <c>&lt;</c>, runs under the
     /// column's collation, as the native predicate compares, so the program returns the rows of native <c>LIKE</c>,
     /// expansions and ignorable characters included. The seek of a long literal run finds a match while no character
     /// of the collation equals more than 33 text elements of the run, a bound recorded under "Parity gaps" in the
@@ -657,7 +694,8 @@ internal static class SearchSqlBuilder
             var source = new StringBuilder("[n] " + RecordSqlBuilder.BaseAlias);
             if (condition.PageIndex is { } pageIndex && schema.Pages[pageIndex].Table is { } pageTable)
             {
-                AppendPageJoin(source, schema, pageIndex, pageTable, "INNER JOIN", holdLock: false);
+                AppendPageJoin(
+                    source, pageIndex, pageTable, "INNER JOIN", holdLock: false, BaseReference(globalRecordId));
             }
 
             sql.Append(", ");
@@ -688,7 +726,7 @@ internal static class SearchSqlBuilder
         {
             if (schema.Pages[index].Table is { } table)
             {
-                AppendPageJoin(sql, schema, index, table, "INNER JOIN", holdLock: false);
+                AppendPageJoin(sql, index, table, "INNER JOIN", holdLock: false, BaseReference(globalRecordId));
             }
         }
 
@@ -761,56 +799,81 @@ internal static class SearchSqlBuilder
     /// filtered by the grid filter, counted, and paged in <c>UniqueKey</c> order with <c>OFFSET ... FETCH</c>.
     /// </summary>
     /// <remarks>
-    /// <para>The statement has this shape:</para>
+    /// <para>Without a grid filter the statement has this shape:</para>
+    /// <code>
+    /// WITH [n] AS (SELECT b.[GlobalRecordId] AS [c0], b.[UniqueKey] AS [c1], b.[RecStatus] AS [c2]
+    ///              FROM [base] b WITH (HOLDLOCK) [WHERE b.[RecStatus] = @p0])
+    /// SELECT [pg].[c0], [pg].[c1], [pg].[c2], CASE WHEN [pg].[c1] IS NULL THEN 0 ELSE 1 END AS [c3],
+    ///        [ct].[tot] AS [c4], p0.[col] AS [c5], ...
+    /// FROM (SELECT COUNT_BIG(*) AS [tot] FROM [n]) AS [ct]
+    /// OUTER APPLY (SELECT [c0], [c1], [c2] FROM [n]
+    ///              ORDER BY [c1] OFFSET @p1 ROWS FETCH NEXT @p2 ROWS ONLY) AS [pg]
+    /// LEFT JOIN [page] p0 WITH (HOLDLOCK) ON p0.[GlobalRecordId] = [pg].[c0] ...
+    /// ORDER BY [pg].[c1]
+    /// OPTION (FORCE ORDER, LOOP JOIN)
+    /// </code>
+    /// <para>With one, it has this shape:</para>
     /// <code>
     /// WITH [[x0] ([k], [v], [l], [z], [st]) AS (anchor UNION ALL step), ]   -- long filter only
     ///      [n] AS (SELECT b.[GlobalRecordId] AS [c0], b.[UniqueKey] AS [c1], b.[RecStatus] AS [c2],
     ///                     p0.[col] AS [c5], ...
     ///              FROM [base] b WITH (HOLDLOCK)
     ///              LEFT JOIN [page] p0 WITH (HOLDLOCK) ON p0.[GlobalRecordId] = b.[GlobalRecordId] ...
-    ///              [WHERE b.[RecStatus] = @p0] [AND (filter)])
+    ///              WHERE [b.[RecStatus] = @p0 AND ](filter))
     /// SELECT [pg].[c0], [pg].[c1], [pg].[c2], CASE WHEN [pg].[c1] IS NULL THEN 0 ELSE 1 END AS [c3],
     ///        [ct].[tot] AS [c4], [pg].[c5], ...
     /// FROM (SELECT COUNT_BIG(*) AS [tot] FROM [n]) AS [ct]
     /// OUTER APPLY (SELECT [c0], [c1], [c2], [c5], ... FROM [n]
     ///              ORDER BY [c1] OFFSET @p2 ROWS FETCH NEXT @p3 ROWS ONLY) AS [pg]
     /// ORDER BY [pg].[c1]
-    /// OPTION ([MAXRECURSION 0, ]FORCE ORDER, LOOP JOIN)
+    /// OPTION ([MAXRECURSION 0, MAXDOP 1, ]FORCE ORDER, LOOP JOIN)
     /// </code>
+    /// <para>
+    /// The parameters are bound in this order: the selected set's status, for the active set; the filter's, one
+    /// contains pattern, or a long filter's program and the length below which a value cannot contain the filter; the
+    /// offset; and the page size.
+    /// </para>
     /// <para>
     /// <b>Page and total.</b> <c>[n]</c> is the filtered set. <c>[ct]</c> counts it, and <c>[pg]</c> is the page,
     /// <c>OFFSET ... FETCH</c> in <c>UniqueKey</c> order, with a <c>bigint</c> offset and an <c>int</c> page size, so
     /// the largest admitted page cannot wrap. The count is one row, and applying the page to it returns each page row
     /// with the total, flagged 1 at <see cref="InPageOrdinal"/>, or, for an empty page, one row of <c>NULL</c> page
     /// columns flagged 0 that carries the total alone: a valid page past the end has no item and the correct total, and
-    /// an empty filtered set a total of 0.
+    /// an empty filtered set a total of 0. Without a filter, the pages are joined to the page's rows after
+    /// <c>OFFSET ... FETCH</c>, so a page row is read only for a row the page lists, and a deep page costs what the
+    /// first one costs in page-table reads; the <c>NULL</c> id of an empty page's one row joins no page row.
     /// </para>
     /// <para>
     /// <b>One consistent read.</b> The count and the page each read the filtered set, so this one statement evaluates
-    /// <c>[n]</c> twice, and every table <c>[n]</c> reads, the base table and each joined page table, carries the hint
-    /// <c>WITH (HOLDLOCK)</c>. Under the database's locking <c>READ COMMITTED</c>, every shared and key-range lock
-    /// either evaluation takes is held until the statement completes, so no base or page row one of them read can
-    /// change, and no row can be inserted among the base rows, before the other has read it too: the page and the
-    /// total describe one committed state even under a concurrent soft delete, a change to a filtered field, or a
-    /// change to a page row alone, which a writer outside the application, or an application update of a base table
-    /// with neither last-save column, makes without updating the base row. This is the one read that holds its page
-    /// tables; the record reads and Find read each row once and hold only the base table, as
-    /// <see cref="RecordSqlBuilder"/>'s class remarks describe.
+    /// <c>[n]</c> twice, and every table the statement reads carries the hint <c>WITH (HOLDLOCK)</c>. Under the
+    /// database's locking <c>READ COMMITTED</c>, every shared and key-range lock either evaluation takes is held until
+    /// the statement completes, so no row one of them read can change, and no row can be inserted among the base rows,
+    /// before the other has read it too. Without a filter, <c>[n]</c> reads the base table alone: both evaluations read
+    /// held base rows, so the page and the total describe one committed state of the selected set even under a
+    /// concurrent soft delete, and each page row is read once, for a fetched row only, and held until the statement
+    /// completes. With a filter, <c>[n]</c> also reads each page joined for a grid column, and both evaluations read
+    /// held base and page rows: the page and the total describe one committed state even under a concurrent soft
+    /// delete, a change to a filtered field, or a change to a page row alone, which a writer outside the application,
+    /// or an application update of a base table with neither last-save column, makes without updating the base row.
+    /// This is the one read that holds its page tables; the record reads and Find read each row once and hold only the
+    /// base table, as <see cref="RecordSqlBuilder"/>'s class remarks describe.
     /// </para>
     /// <para>
     /// <b>Lock order.</b> A held page-row lock could deadlock with a write that holds that record's exclusive page-row
     /// lock while it waits for a base row the list holds. The statement therefore ends with
-    /// <c>OPTION (FORCE ORDER, LOOP JOIN)</c>: the joins run in their written order, each as nested loops, so the base
-    /// table is the outer input of every page join, and each evaluation reads a page row only once it holds that
-    /// row's base row. Page tables key on <c>GlobalRecordId</c>, so each inner read is a seek that locks the base row's
-    /// own page row or, where it has none, the key range that row would sit in. Every application write locks a
-    /// record's base row before any of its page rows: an update takes its update lock on the base row, and updates
-    /// the base row's last-save columns where the table has them, before its page rows; a create inserts the base row
-    /// first; and a soft delete writes the base row alone. Its later reads of other rows take only shared locks. A
-    /// write that waits for a base row the list holds therefore holds none of that record's page rows, and the hints
-    /// remove the lock-order inversion between a held page row and its base row: the list and an application write
-    /// never wait for each other through the rows of one record. An application write's page-row insert can still wait
-    /// for a key range the list locked for another record, the residual case described next.
+    /// <c>OPTION (FORCE ORDER, LOOP JOIN)</c>: the joins run in their written order, each as nested loops, so held
+    /// base rows are the outer input of every page join, and the statement reads a page row only once it holds that
+    /// row's base row. Without a filter, those are the rows of <c>[pg]</c>, which the set read from the held base
+    /// table and whose ids drive the page seeks; with one, the base table of <c>[n]</c>, before each of its joins. Page
+    /// tables key on <c>GlobalRecordId</c>, so each inner read is a seek that locks the base row's own page row or,
+    /// where it has none, the key range that row would sit in. Every application write locks a record's base row
+    /// before any of its page rows: an update takes its update lock on the base row, and updates the base row's
+    /// last-save columns where the table has them, before its page rows; a create inserts the base row first; and a
+    /// soft delete writes the base row alone. Its later reads of other rows take only shared locks. A write that waits
+    /// for a base row the list holds therefore holds none of that record's page rows, and the hints remove the
+    /// lock-order inversion between a held page row and its base row: the list and an application write never wait for
+    /// each other through the rows of one record. An application write's page-row insert can still wait for a key range
+    /// the list locked for another record, the residual case described next.
     /// </para>
     /// <para>
     /// <b>Residual deadlocks.</b> Two waits can still end in a deadlock (1205): a writer outside the application that
@@ -828,7 +891,21 @@ internal static class SearchSqlBuilder
     /// and the same page tables as <c>[n]</c>, with the same joins and the same <c>HOLDLOCK</c> hints, under the same
     /// plan hints, so its reads belong to the one consistent read and follow the same lock order; <c>[n]</c> keeps a
     /// row whose value the program matched (<c>EXISTS</c> on <c>[x0]</c>), and the statement's hints start with
-    /// <c>MAXRECURSION 0</c>.
+    /// <c>MAXRECURSION 0, MAXDOP 1</c>. The anchor admits only a value of at least <c>ceil(n / 33)</c> characters,
+    /// <c>n</c> the number of the filter's text elements that hold a weighted character
+    /// (<see cref="IsWeightedCharacter(char)"/>): a letter, number, punctuation mark, symbol or space separator of
+    /// <see cref="WeightedCharacterRanges"/>, a <c>bigint</c> parameter bound after the program. Measured, none of
+    /// those characters is ignorable under <c>Latin1_General_100_CI_AS</c>, while characters of the same categories
+    /// outside the ranges can be, and no character of the collation ranks equal to more than 33 text elements of a
+    /// literal run, the bound the program's seek already relies on, so a shorter value cannot contain the filter and is
+    /// never run through the program. A space counts too: the program compares a run with <c>=</c> after appending
+    /// <c>'x'</c> to both sides, and the native <c>LIKE</c> keeps a pattern's trailing blanks, so a value containing
+    /// the filter holds its spaces. A filter with no such element, such as one of supplementary characters only, admits
+    /// every value. The filter's text reaches the statement only through those two parameters. A parallel plan re-runs
+    /// the program across its workers: measured on SQL Server 2022 at its default parallelism settings, a list
+    /// statement whose long filter ran the program at 56 workers took 9 to 25 seconds and hundreds of CPU-seconds, or
+    /// ran past the 30-second default command timeout, where the serial plan took about 3 seconds at most, so
+    /// <c>MAXDOP 1</c> keeps the program on one worker whatever the server's max degree of parallelism.
     /// </para>
     /// <para>
     /// Only the pages holding a grid column are joined, with <c>LEFT JOIN</c>, so a record missing a page row is still
@@ -887,13 +964,18 @@ internal static class SearchSqlBuilder
         var uniqueKey = RecordSqlBuilder.Require(schema.UniqueKey);
         var columns = ResolveGridColumns(schema, gridColumns, ListFirstColumnOrdinal);
 
-        // The filtered set is the statement's one source of base and page rows, read by the count and by the page with
-        // every table under HOLDLOCK and, through the plan hints at the end, the base table first. Its source is built
-        // first, so a long filter's CTE, which reads the same tables under the same hints, can lead the statement; it
-        // allocates the parameters it binds before the paging ones, in the same order whether or not the filter is long.
+        // The filtered set is the statement's one source of base rows, read by the count and by the page under HOLDLOCK
+        // and, through the plan hints at the end, before any page row. Its source is built first, so a long filter's
+        // CTE, which reads the same tables under the same hints, can lead the statement; it allocates the parameters it
+        // binds before the paging ones, in the same order whether or not the filter is long.
         var parameters = new PositionalParameters();
         var source = new StringBuilder();
         var program = AppendListSource(source, schema, columns, query, parameters, nativeLikeLimit);
+
+        // A filter reads the grid columns, so its set joins their pages and carries them to the page. Without one the
+        // set reads the base table alone, and the pages are joined after OFFSET ... FETCH, to the fetched rows only.
+        var joinsAfterPage = query.Filter is null;
+        IReadOnlyList<ProjectedColumn> setProjections = joinsAfterPage ? [] : columns;
 
         var sql = new StringBuilder("WITH ");
         if (program is not null)
@@ -907,18 +989,16 @@ internal static class SearchSqlBuilder
         AppendBase(sql, uniqueKey).Append(" AS ").Append(RecordSqlBuilder.ColumnAlias(UniqueKeyOrdinal)).Append(", ");
         AppendBase(sql, RecordSqlBuilder.Require(schema.RecStatus))
             .Append(" AS ").Append(RecordSqlBuilder.ColumnAlias(RecStatusOrdinal));
-        AppendProjections(sql, schema, columns);
+        AppendProjections(sql, schema, setProjections);
         sql.Append(source);
 
-        // The page's columns as the filtered set names them, and as the outer query reads them from the page.
+        // The page's columns as the filtered set names them.
         var setColumns = new StringBuilder();
-        var pageColumns = new StringBuilder();
         foreach (var ordinal in new[] { IdOrdinal, UniqueKeyOrdinal, RecStatusOrdinal }
-                     .Concat(columns.Select(column => column.Ordinal)))
+                     .Concat(setProjections.Select(column => column.Ordinal)))
         {
-            var alias = RecordSqlBuilder.ColumnAlias(ordinal);
-            setColumns.Append(setColumns.Length == 0 ? string.Empty : ", ").Append(alias);
-            pageColumns.Append(", ").Append(ListPageName).Append('.').Append(alias);
+            setColumns.Append(setColumns.Length == 0 ? string.Empty : ", ")
+                .Append(RecordSqlBuilder.ColumnAlias(ordinal));
         }
 
         var pageKey = string.Concat(ListPageName, ".", RecordSqlBuilder.ColumnAlias(UniqueKeyOrdinal));
@@ -930,9 +1010,17 @@ internal static class SearchSqlBuilder
             .Append(RecordSqlBuilder.ColumnAlias(InPageOrdinal))
             .Append(", ").Append(ListTotalName).Append('.').Append(ListTotalColumn)
             .Append(" AS ").Append(RecordSqlBuilder.ColumnAlias(TotalOrdinal));
-        foreach (var column in columns)
+        if (joinsAfterPage)
         {
-            sql.Append(", ").Append(ListPageName).Append('.').Append(RecordSqlBuilder.ColumnAlias(column.Ordinal));
+            // Read from the pages joined below, under the aliases the filtered set would give them.
+            AppendProjections(sql, schema, columns);
+        }
+        else
+        {
+            foreach (var column in columns)
+            {
+                sql.Append(", ").Append(ListPageName).Append('.').Append(RecordSqlBuilder.ColumnAlias(column.Ordinal));
+            }
         }
 
         // The offset is a bigint and the page size an int, bound after the filter's parameters.
@@ -942,8 +1030,19 @@ internal static class SearchSqlBuilder
             .Append(" ORDER BY ").Append(RecordSqlBuilder.ColumnAlias(UniqueKeyOrdinal))
             .Append(" OFFSET ").Append(parameters.Add(n => ColumnValueConverter.Int64(n, offset)))
             .Append(" ROWS FETCH NEXT ").Append(parameters.Add(n => ColumnValueConverter.Int32(n, query.PageSize)))
-            .Append(" ROWS ONLY) AS ").Append(ListPageName)
-            .Append(" ORDER BY ").Append(pageKey);
+            .Append(" ROWS ONLY) AS ").Append(ListPageName);
+        if (joinsAfterPage)
+        {
+            // Each page row is sought by the id of a fetched row, a base row the set holds; the NULL id of an empty
+            // page's one row finds none.
+            AppendGridPageJoins(
+                sql,
+                schema,
+                columns,
+                string.Concat(ListPageName, ".", RecordSqlBuilder.ColumnAlias(IdOrdinal)));
+        }
+
+        sql.Append(" ORDER BY ").Append(pageKey);
         AppendQueryHints(sql, program is not null, ListPlanHints);
 
         return new ListSelect(parameters.ToStatement(sql.ToString()), columns);
@@ -1294,7 +1393,8 @@ internal static class SearchSqlBuilder
     // a middle segment of one run step, found by a seek for its prefixes, or by a scan where none fits PATINDEX.
     // The run is compared with '=', which reads no pattern character, and its prefixes are written with %, _ and [ as
     // the one-member sets [%], [_] and [[], since PATINDEX takes no ESCAPE clause, so it matches what the contains
-    // pattern with its ESCAPE clause matches.
+    // pattern with its ESCAPE clause matches. The list runs it only on values at least ContainsMinimumLength(filter)
+    // characters long.
     private static LongPatternProgram CompileContainsProgram(string filter)
     {
         var records = new List<LikeRecord>();
@@ -1302,6 +1402,76 @@ internal static class SearchSqlBuilder
         records.Add(new LikeRecord(RunStep, 0, seek, LikeMeasure.Of(filter), 0, false, 0, filter));
         LinkInstructions(records);
         return AssembleProgram([records]);
+    }
+
+    // The fewest characters a value must have to contain the grid filter under Latin1_General_100_CI_AS:
+    // ceil(n / RunCuts), n the number of the filter's text elements that hold a weighted character
+    // (IsWeightedCharacter), a letter, number, punctuation mark, symbol or space separator of WeightedCharacterRanges.
+    // An element counts once however many of them it holds, as a Thai consonant does with the SARA AM (U+0E33), a
+    // letter that joins its element. None of those characters is ignorable under that collation, so the text a value
+    // matches the filter with covers each of those n elements with at least one of its characters: a space too, since
+    // the run is compared with '=' after an 'x' is appended to both sides, so trailing blanks are not padded away, as
+    // the native LIKE keeps a pattern's trailing blanks. No character of the collation ranks equal to more than
+    // RunCuts text elements of a literal run, the bound the run's seek relies on (RunCuts), so that text, and the
+    // value, hold at least ceil(n / RunCuts) characters. Any other text element, which the collation may ignore, such
+    // as NUL, the soft hyphen, a lone combining mark or a supplementary character, counts for nothing, so a filter of
+    // none gives 0.
+    private static long ContainsMinimumLength(string filter)
+    {
+        var elements = 0L;
+        var index = 0;
+        while (index < filter.Length)
+        {
+            var end = index + StringInfo.GetNextTextElementLength(filter, index);
+            for (var at = index; at < end; at++)
+            {
+                if (IsWeightedCharacter(filter[at]))
+                {
+                    elements++;
+                    break;
+                }
+            }
+
+            index = end;
+        }
+
+        return (elements + RunCuts - 1) / RunCuts;
+    }
+
+    /// <summary>
+    /// Whether a long grid filter's minimum length counts the character: one in <see cref="WeightedCharacterRanges"/>
+    /// whose Unicode category (<see cref="char.GetUnicodeCategory(char)"/>) is a letter (Lu, Ll, Lt, Lm, Lo), a number
+    /// (Nd, Nl, No), punctuation (Pc, Pd, Ps, Pe, Pi, Pf, Po), a symbol (Sm, Sc, Sk, So) or a space separator (Zs).
+    /// Controls (NUL among them), format characters (the soft hyphen among them), marks, surrogates, private-use and
+    /// unassigned code points are never counted, nor is any character outside the ranges: the ignorable code points
+    /// the ranges' summary lists are of those categories or outside the ranges.
+    /// </summary>
+    /// <param name="character">The UTF-16 code unit.</param>
+    /// <returns><see langword="true"/> when the character is counted.</returns>
+    internal static bool IsWeightedCharacter(char character)
+    {
+        if (char.GetUnicodeCategory(character) is not (UnicodeCategory.UppercaseLetter
+            or UnicodeCategory.LowercaseLetter or UnicodeCategory.TitlecaseLetter or UnicodeCategory.ModifierLetter
+            or UnicodeCategory.OtherLetter or UnicodeCategory.DecimalDigitNumber or UnicodeCategory.LetterNumber
+            or UnicodeCategory.OtherNumber or UnicodeCategory.ConnectorPunctuation or UnicodeCategory.DashPunctuation
+            or UnicodeCategory.OpenPunctuation or UnicodeCategory.ClosePunctuation
+            or UnicodeCategory.InitialQuotePunctuation or UnicodeCategory.FinalQuotePunctuation
+            or UnicodeCategory.OtherPunctuation or UnicodeCategory.MathSymbol or UnicodeCategory.CurrencySymbol
+            or UnicodeCategory.ModifierSymbol or UnicodeCategory.OtherSymbol or UnicodeCategory.SpaceSeparator))
+        {
+            return false;
+        }
+
+        for (var index = 0; index < WeightedCharacterRanges.Count; index++)
+        {
+            var (first, last) = WeightedCharacterRanges[index];
+            if (character >= first && character <= last)
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     // The program of the patterns: one entry record per pattern, at the pattern's index, naming its first instruction,
@@ -1748,7 +1918,9 @@ internal static class SearchSqlBuilder
     // record [s] to run, -1 once the pattern matched and -2 once the value failed; the step's phase [p]; the end [e] of
     // the text matched so far; the candidate [c] where the current segment started, or in a tail matched backwards
     // the start of the text it matched so far; and the phase's two numbers [t] and [h]. The anchor starts each
-    // non-NULL value at the first instruction of every pattern. Each level unpacks a
+    // non-NULL value at the first instruction of every pattern; given minimumLength, the name of a bigint parameter,
+    // only each value of at least that many characters ([h].[l]), the length below which the caller knows no value
+    // matches. Each level unpacks a
     // row's state as [q], decodes its record from the parameter by index as [f], so neither the text nor the parameter
     // count grows with the program, and computes the next state as one expression, [o], so that no comparison is
     // evaluated twice; the record texts are read from the text area, decoded from hexadecimal once, an expression of
@@ -1789,7 +1961,8 @@ internal static class SearchSqlBuilder
         string source,
         List<string> values,
         string program,
-        LongPatternProgram compiled)
+        LongPatternProgram compiled,
+        string? minimumLength = null)
     {
         var width = PackedNumberWidth.ToString(CultureInfo.InvariantCulture);
         var record = LongPatternRecordWidth.ToString(CultureInfo.InvariantCulture);
@@ -1825,8 +1998,13 @@ internal static class SearchSqlBuilder
             .Append("CASE WHEN LEN(SUBSTRING([u].[v], 1, 0) + NCHAR(55357) + NCHAR(56832)) = 1 THEN 1 ELSE 0 END))")
             .Append(" AS [h]([l], [z]) CROSS JOIN ");
         AppendDigitIndex(sql, compiled.PatternCount);
-        sql.Append(" WHERE [u].[v] IS NOT NULL AND [a].[i] < CAST(SUBSTRING(").Append(program).Append(", 1, ")
-            .Append(width).Append(") AS int)");
+        sql.Append(" WHERE [u].[v] IS NOT NULL");
+        if (minimumLength is not null)
+        {
+            sql.Append(" AND [h].[l] >= ").Append(minimumLength);
+        }
+
+        sql.Append(" AND [a].[i] < CAST(SUBSTRING(").Append(program).Append(", 1, ").Append(width).Append(") AS int)");
 
         sql.Append(" UNION ALL SELECT [x].[k], [x].[v], [x].[l], [x].[z], [o].[st] FROM ").Append(name)
             .Append(" AS [x] CROSS APPLY (VALUES (");
@@ -2021,8 +2199,9 @@ internal static class SearchSqlBuilder
         sql.Append("EXISTS (SELECT 1 FROM ").Append(name).Append(" AS [y] WHERE [y].[k] = ").Append(key)
             .Append(" AND CAST(SUBSTRING([y].[st], 1, 8) AS bigint) = -1)");
 
-    // OPTION ([MAXRECURSION 0][, ][plan hints]): the recursion hint of a statement that runs a program, then the plan
-    // hints of a packed statement or of the list; nothing when the statement has neither.
+    // OPTION ([MAXRECURSION 0, MAXDOP 1][, ][plan hints]): the hints of a statement that runs a program, which lift the
+    // recursion limit and keep the program on one worker (LongPatternHint), then the plan hints of a packed statement
+    // or of the list; nothing when the statement has neither.
     private static void AppendQueryHints(StringBuilder sql, bool hasLongPatterns, string? planHints)
     {
         if (!hasLongPatterns && planHints is null)
@@ -2187,19 +2366,25 @@ internal static class SearchSqlBuilder
         return columns.AsReadOnly();
     }
 
-    // The FROM clause and predicate of ListPage's filtered set: the base table LEFT JOINed to each page holding a grid
-    // column, every one of them under the HOLDLOCK hint ListPage describes, the selected set, and the grid filter. The
-    // filter is a case-insensitive "contains" over the grid columns that does not depend on the database collation:
-    // each column is converted to text (a datetime as yyyy-mm-dd), and both sides are compared under one
-    // case-insensitive collation, with the filter's pattern characters escaped by RecordQueryRules.ToContainsPattern.
-    // It has no legacy counterpart. A filter whose contains pattern is longer than the native limit is matched by the
-    // long-pattern program instead (CompileContainsProgram), over the same converted text of the same held joins, which
-    // carries the same collation into every comparison: the filter is one literal run between two runs of '%',
-    // compared with '=' under Latin1_General_100_CI_AS, so it keeps that collation's case-insensitive literal
-    // "contains", its expansions and ignorable characters included, and is found by PATINDEX of its prefixes with %, _
-    // and [ written as one-member sets, since PATINDEX takes no ESCAPE clause. The program's CTE, [x0], reads the base
-    // table and those page tables under HOLDLOCK and in the same order, so its reads belong to the list's one
-    // consistent read; it is returned for the caller to lead the statement with, and null when there is none.
+    // The FROM clause and predicate of ListPage's filtered set: the base table under the HOLDLOCK hint ListPage
+    // describes and the selected set, and with a grid filter the LEFT JOIN to each page holding a grid column, held
+    // too, and the filter. Without a filter the set reads the base table alone, and ListPage joins those pages to the
+    // fetched rows of the page instead, so a page row is read only for a row it lists. The filter reads the grid
+    // columns, so its set joins them. It is a case-insensitive "contains" over the grid columns that does not depend on
+    // the database collation: each column is converted to text (a datetime as yyyy-mm-dd), and both sides are compared
+    // under one case-insensitive collation, with the filter's pattern characters escaped by
+    // RecordQueryRules.ToContainsPattern. It has no legacy counterpart. A filter whose contains pattern is longer than
+    // the native limit is matched by the long-pattern program instead (CompileContainsProgram), over the same converted
+    // text of the same held joins, which carries the same collation into every comparison: the filter is one literal
+    // run between two runs of '%', compared with '=' under Latin1_General_100_CI_AS, so it keeps that collation's
+    // case-insensitive literal "contains", its expansions and ignorable characters included, and is found by PATINDEX
+    // of its prefixes with %, _ and [ written as one-member sets, since PATINDEX takes no ESCAPE clause. Its anchor
+    // skips a value shorter than ContainsMinimumLength(filter), one character per RunCuts text elements holding a
+    // weighted character, a letter, number, punctuation mark, symbol or space separator of WeightedCharacterRanges
+    // (IsWeightedCharacter), none of which that collation ignores (measured), bound as a bigint right after the
+    // program: such a value cannot contain the filter. The program's CTE, [x0], reads the base table and those page
+    // tables under HOLDLOCK and in the same order, so its reads belong to the list's one consistent read; it is
+    // returned for the caller to lead the statement with, and null when there is none.
     private static string? AppendListSource(
         StringBuilder sql,
         FormSchema schema,
@@ -2208,28 +2393,19 @@ internal static class SearchSqlBuilder
         PositionalParameters parameters,
         int nativeLikeLimit)
     {
+        var filter = query.Filter;
         var from = new StringBuilder();
         AppendBaseTable(from, schema);
         from.Append(" WITH (HOLDLOCK)");
-
-        var joined = new bool[schema.Pages.Count];
-        foreach (var column in columns)
+        if (filter is not null)
         {
-            joined[RecordSqlBuilder.PageIndexOf(schema, column.Field.Page.PageId)] = true;
-        }
-
-        for (var index = 0; index < joined.Length; index++)
-        {
-            if (joined[index] && schema.Pages[index].Table is { } table)
-            {
-                AppendPageJoin(from, schema, index, table, "LEFT JOIN", holdLock: true);
-            }
+            AppendGridPageJoins(from, schema, columns, BaseReference(RecordSqlBuilder.Require(schema.GlobalRecordId)));
         }
 
         sql.Append(" FROM ").Append(from);
         var filtered = RecordSqlBuilder.AppendSelectedSetPredicate(
             sql, schema, query.IncludeDeleted, parameters, SelectedSetClause.Where);
-        if (query.Filter is not { } filter)
+        if (filter is null)
         {
             return null;
         }
@@ -2256,6 +2432,8 @@ internal static class SearchSqlBuilder
             var name = LongPatternName(0);
             var key = BaseReference(RecordSqlBuilder.Require(schema.GlobalRecordId));
             var compiled = CompileContainsProgram(filter);
+            var minimumLength = ContainsMinimumLength(filter);
+            var programText = parameters.Add(n => ColumnValueConverter.Text(n, compiled.Text));
             var program = new StringBuilder();
             AppendLongPatternProgram(
                 program,
@@ -2263,8 +2441,9 @@ internal static class SearchSqlBuilder
                 key,
                 from.ToString(),
                 texts,
-                parameters.Add(n => ColumnValueConverter.Text(n, compiled.Text)),
-                compiled);
+                programText,
+                compiled,
+                parameters.Add(n => ColumnValueConverter.Int64(n, minimumLength)));
             AppendLongPatternMatch(sql, name, key);
             return program.ToString();
         }
@@ -2306,15 +2485,40 @@ internal static class SearchSqlBuilder
         }
     }
 
-    // <join> [page] p{i} [WITH (HOLDLOCK)] ON p{i}.[GlobalRecordId] = b.[GlobalRecordId]; only ListPage holds its page
-    // tables, for the reason it describes, so Find's joins carry no hint.
-    private static void AppendPageJoin(
+    // LEFT JOIN [page] p{i} WITH (HOLDLOCK) ON p{i}.[GlobalRecordId] = key for each page with a table that holds a grid
+    // column, in page order: the list's joins, keyed on the GlobalRecordId reference key, b.[GlobalRecordId] in the
+    // filtered set and [pg].[c0] after the page.
+    private static void AppendGridPageJoins(
         StringBuilder sql,
         FormSchema schema,
+        IReadOnlyList<ProjectedColumn> columns,
+        string key)
+    {
+        var joined = new bool[schema.Pages.Count];
+        foreach (var column in columns)
+        {
+            joined[RecordSqlBuilder.PageIndexOf(schema, column.Field.Page.PageId)] = true;
+        }
+
+        for (var index = 0; index < joined.Length; index++)
+        {
+            if (joined[index] && schema.Pages[index].Table is { } table)
+            {
+                AppendPageJoin(sql, index, table, "LEFT JOIN", holdLock: true, key);
+            }
+        }
+    }
+
+    // <join> [page] p{i} [WITH (HOLDLOCK)] ON p{i}.[GlobalRecordId] = key, key the reference to the base row's
+    // GlobalRecordId the page row is joined to; only ListPage holds its page tables, for the reason it describes, so
+    // Find's joins carry no hint.
+    private static void AppendPageJoin(
+        StringBuilder sql,
         int pageIndex,
         TableSchema table,
         string join,
-        bool holdLock)
+        bool holdLock,
+        string key)
     {
         var alias = RecordSqlBuilder.PageAlias(pageIndex);
         sql.Append(' ').Append(join).Append(' ').Append(SqlIdentifier.Quote(table)).Append(' ').Append(alias);
@@ -2324,8 +2528,7 @@ internal static class SearchSqlBuilder
         }
 
         sql.Append(" ON ").Append(alias).Append('.').Append(SqlIdentifier.Quote(RecordSqlBuilder.RequirePageKey(table)))
-            .Append(" = ");
-        AppendBase(sql, RecordSqlBuilder.Require(schema.GlobalRecordId));
+            .Append(" = ").Append(key);
     }
 
     // [base] b
