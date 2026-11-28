@@ -84,6 +84,13 @@ namespace EpiInfo.Api.OpenApi;
 /// always writes as required, so the generated TypeScript members are non-optional; a member that may be
 /// <c>null</c> keeps <c>null</c> in its type.
 /// </description></item>
+/// <item><description>
+/// <c>info.description</c>, the precondition of every request on every path: its <c>Host</c> names
+/// <see cref="LoopbackBindingGuard.AllowedHost"/> or <see cref="LoopbackBindingGuard.LocalhostName"/>, in any case
+/// and with any port, and any other is answered before routing with the request-level 400
+/// <see cref="ApiProblems.HostNotAllowedDetail"/>. That 400 is stated once for the document and not under each
+/// operation, so every operation keeps the statuses its endpoint declares.
+/// </description></item>
 /// </list>
 /// <para>
 /// The committed <c>openapi/EpiInfo.Api.json</c> and the client types generated from it are compared byte for byte by
@@ -133,6 +140,16 @@ public sealed class ScalarSchemaTransformer :
     private const string CreatedLocationDescription =
         "The relative URI of the created record, /api/forms/{viewId}/records/{globalRecordId}, with the id "
         + "percent-encoded.";
+
+    // The Host precondition that LoopbackBindingGuard.UseLoopbackHostGuard enforces ahead of routing, outside every
+    // operation's metadata, so the document states it once instead of as a 400 under each operation.
+    private const string HostPreconditionDescription =
+        "The API is for local single-user use. Every request on every path, the /api operations, /health, this "
+        + $"document and the client included, must carry a Host naming {LoopbackBindingGuard.AllowedHost} or "
+        + $"{LoopbackBindingGuard.LocalhostName}, in any letter case and with any port. A request with any other Host "
+        + $"is answered before routing with the request-level 400, an {ApiProblems.ProblemContentType} ProblemDetails "
+        + $"whose detail is \"{ApiProblems.HostNotAllowedDetail}\". That response applies to every operation and is "
+        + "not repeated under each one.";
 
     // The JSON name WriteProblemDetails declares for its outcome member.
     private const string WriteOutcomeProperty = "writeOutcome";
@@ -195,8 +212,9 @@ public sealed class ScalarSchemaTransformer :
     /// <remarks>
     /// The schema role does the essential work; the operation role corrects the JSON request bodies and their 400, adds
     /// the create's <c>Location</c> header, repoints the write 500 and 503 responses and narrows each <c>/health</c>
-    /// response to its status literal, and the document role drops helper components. Each role is correct on its own,
-    /// so none depends on the order in which the framework runs them.
+    /// response to its status literal, and the document role drops helper components and states the <c>Host</c>
+    /// precondition as <c>info.description</c>. Each role is correct on its own, so none depends on the order in which
+    /// the framework runs them.
     /// </remarks>
     /// <param name="options">The options of the default <c>v1</c> document.</param>
     /// <returns><paramref name="options"/>, for chaining.</returns>
@@ -580,9 +598,11 @@ public sealed class ScalarSchemaTransformer :
     }
 
     /// <summary>
-    /// Removes the <c>JsonElement</c> and <c>FieldValueKind</c> components when present. The schema role leaves
-    /// nothing referencing them, so a reference that still did would surface as a dangling <c>$ref</c> that
-    /// <c>openapi-typescript</c> rejects, rather than as a helper type in the client.
+    /// Removes the <c>JsonElement</c> and <c>FieldValueKind</c> components when present, and states the <c>Host</c>
+    /// precondition of every request as <c>info.description</c>. The schema role leaves nothing referencing the two
+    /// components, so a reference that still did would surface as a dangling <c>$ref</c> that
+    /// <c>openapi-typescript</c> rejects, rather than as a helper type in the client. The precondition is answered by
+    /// <see cref="LoopbackBindingGuard.UseLoopbackHostGuard"/> before routing, so no operation's metadata can carry it.
     /// </summary>
     /// <param name="document">The document to rewrite in place.</param>
     /// <param name="context">Not used.</param>
@@ -601,6 +621,12 @@ public sealed class ScalarSchemaTransformer :
         {
             schemas.Remove(JsonElementSchemaId);
             schemas.Remove(FieldValueKindSchemaId);
+        }
+
+        // The framework fills info before any document transformer runs; a document without one is left as generated.
+        if (document.Info is { } info)
+        {
+            info.Description = HostPreconditionDescription;
         }
 
         return Task.CompletedTask;

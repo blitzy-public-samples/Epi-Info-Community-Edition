@@ -2,6 +2,7 @@
   "openapi": "3.1.1",
   "info": {
     "title": "EpiInfo.Api | v1",
+    "description": "The API is for local single-user use. Every request on every path, the /api operations, /health, this document and the client included, must carry a Host naming 127.0.0.1 or localhost, in any letter case and with any port. A request with any other Host is answered before routing with the request-level 400, an application/problem+json ProblemDetails whose detail is \"the request host is not allowed\". That response applies to every operation and is not repeated under each one.",
     "version": "1.0.0"
   },
   "paths": {

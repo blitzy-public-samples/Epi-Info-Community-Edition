@@ -515,6 +515,28 @@ public sealed class LoopbackHostGuardTests : IDisposable
         Assert.DoesNotContain(ApiProblems.HostNotAllowedDetail, api.Text, StringComparison.Ordinal);
     }
 
+    // The guard answers before routing, so no operation lists its 400: the contract states the Host precondition once,
+    // in info.description, and the document keeps its title.
+    [Fact]
+    public async Task DocumentStatesTheHostPreconditionInItsDescription()
+    {
+        await using ApiFactory factory = CreateFactory();
+        using HttpClient client = factory.CreateClient();
+
+        ReceivedResponse response = await GetAsync(client, "/openapi/v1.json", "127.0.0.1:5000");
+        Assert.Equal(HttpStatusCode.OK, response.Status);
+
+        using JsonDocument document = JsonDocument.Parse(response.Text);
+        JsonElement info = document.RootElement.GetProperty("info");
+        Assert.Equal("EpiInfo.Api | v1", info.GetProperty("title").GetString());
+
+        string description = info.GetProperty("description").GetString() ?? string.Empty;
+        Assert.Contains(LoopbackBindingGuard.AllowedHost, description, StringComparison.Ordinal);
+        Assert.Contains(LoopbackBindingGuard.LocalhostName, description, StringComparison.Ordinal);
+        Assert.Contains(ApiProblems.HostNotAllowedDetail, description, StringComparison.Ordinal);
+        Assert.Contains("400", description, StringComparison.Ordinal);
+    }
+
     // Sent with an explicit Host header, which TestServer passes to the request as given instead of deriving it from
     // the client's base address, so a Host in any case reaches the guard unchanged.
     private static async Task<ReceivedResponse> GetAsync(HttpClient client, string path, string authority)
