@@ -1,3 +1,5 @@
+import type { RefObject } from 'react';
+
 import {
   describeError,
   describeUncertainWrite,
@@ -27,6 +29,11 @@ export interface ConnectionErrorProps {
   /** Resends the draft at the user's explicit request although the earlier save may have been applied. */
   onSaveAgain?: () => void;
   onDismiss?: () => void;
+  /**
+   * The banner's root. Given, the root can take focus (tabIndex -1): the form focuses the
+   * banner of a failed save that stopped the user's action, and focusing it scrolls it into view.
+   */
+  containerRef?: RefObject<HTMLDivElement>;
 }
 
 // The visible text stays "Save again", never the toolbar's exact "Save", and the
@@ -81,6 +88,7 @@ export function ConnectionError({
   onRetry,
   onSaveAgain,
   onDismiss,
+  containerRef,
 }: ConnectionErrorProps) {
   const safe = isSafeToResend(error, method);
   const message =
@@ -99,7 +107,12 @@ export function ConnectionError({
   const showDismiss = onDismiss !== undefined;
 
   return (
-    <div className="banner banner--error" role="alert">
+    <div
+      ref={containerRef}
+      className="banner banner--error"
+      role="alert"
+      tabIndex={containerRef === undefined ? undefined : -1}
+    >
       <p>{message}</p>
       {traceLine !== null && (
         <p>

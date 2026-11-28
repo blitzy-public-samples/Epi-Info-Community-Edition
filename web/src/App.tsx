@@ -231,11 +231,13 @@ function replaceUrl(url: string): void {
 
 /**
  * Keeps keyboard focus on a button that is disabled only while its own request runs, such
- * as Next, Save or Go. The browser moves focus to <body> when the focused control becomes
- * disabled, so a second key press would do nothing. Once that button is enabled again, and
- * focus has gone nowhere else meanwhile, focus returns to it; a button that stays disabled
- * is left alone. Buttons only, because focusing a field raises a check-code event. React's
- * focus events bubble through portals, so the dialogs are covered as well.
+ * as a delete confirmation's Delete record or Find's Search; the form's Save and navigator
+ * are held, not disabled, while a save runs, so they keep focus themselves. The browser
+ * moves focus to <body> when the focused control becomes disabled, so a second key press
+ * would do nothing. Once that button is enabled again, and focus has gone nowhere else
+ * meanwhile, focus returns to it; a button that stays disabled is left alone. Buttons only,
+ * because focusing a field raises a check-code event. React's focus events bubble through
+ * portals, so the dialogs are covered as well.
  */
 function useFocusReturn(): { onBlur: (event: FocusEvent<HTMLElement>) => void; onFocus: () => void } {
   // Watches the one button that lost focus until it is enabled again.

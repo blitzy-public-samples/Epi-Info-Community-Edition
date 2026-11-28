@@ -63,6 +63,8 @@ type NavigatorState = Pick<
   | 'canFirst'
   | 'canPrevious'
   | 'canNext'
+  | 'canPreviousFromShown'
+  | 'canNextFromShown'
   | 'canLast'
   | 'canGoTo'
   | 'first'
@@ -76,7 +78,13 @@ type NavigatorState = Pick<
 export interface RecordNavigatorProps {
   /** State and actions of the open form, as `useRecordNavigation` returns them. */
   navigation: NavigatorState;
-  /** The editor is saving: every control is disabled until it settles. */
+  /**
+   * The editor is saving: every available control is held until it settles. A held control
+   * is marked unavailable (aria-disabled) and ignores its press, but stays focusable, unlike
+   * a disabled one, so the move, Go or New a keyboard user pressed keeps focus while the save
+   * it waits on runs, and Tab moves on from it as usual. The go-to box is held read-only.
+   * Previous and Next at an edge stay disabled, held only while they hold focus.
+   */
   busy?: boolean;
   /**
    * Every move would first save a dirty draft that a write of unknown outcome blocks, so it
@@ -94,6 +102,9 @@ export interface RecordNavigatorProps {
 
 /** How a move button is marked while `blocked` holds and the button is not disabled. */
 const BLOCKED_BUTTON_PROPS = { 'aria-disabled': true, className: 'button--blocked' } as const;
+
+/** How a control is marked while it is held, by a save in progress or as an edge that holds focus. */
+const HELD_PROPS = { 'aria-disabled': true } as const;
 
 /** An optional sign, then ASCII digits only: "1e3", "2.0" and "0x10" are not record numbers. */
 const RECORD_NUMBER_PATTERN = /^[+-]?\d+$/;
@@ -122,22 +133,53 @@ export function RecordNavigator({ navigation, busy = false, blocked = false, can
   const errorId = `${inputId}-error`;
   const [entry, setEntry] = useState('');
   const [submission, setSubmission] = useState<Submission | null>(null);
+  // Previous or Next while it holds focus, as the toolbar's focus events report it; null
+  // while any other control, or none, does.
+  const [focusedMove, setFocusedMove] = useState<'previous' | 'next' | null>(null);
 
   // A pending load disables nothing: useRecordNavigation drops the responses of a load a
   // newer action overtakes, so a move, Go or New pressed mid-load supersedes it, and the
   // load is announced instead. A control is disabled only while its operation is
-  // unavailable: an edge or an empty set (canX false), a save in progress (busy), or, for
-  // New, a denied insert permission.
+  // unavailable: an edge or an empty set (canX false), or, for New, a denied insert
+  // permission. A save in progress (busy) holds the others instead (see `busy`).
   const pending = navigation.loading;
-  const firstDisabled = !navigation.canFirst || busy;
-  const previousDisabled = !navigation.canPrevious || busy;
-  const nextDisabled = !navigation.canNext || busy;
-  const lastDisabled = !navigation.canLast || busy;
-  const goToDisabled = !navigation.canGoTo || busy;
+  // Previous and Next count from a pending move's target, so the Next pressed toward the last
+  // record is an edge from the moment it is pressed. A save holds the toolbar on the record it
+  // shows, since the move waits on it, so an edge of that record is one too meanwhile: Previous
+  // on record 1 while a Next from there saves. An edge is disabled and out of the tab order,
+  // so Tab and Shift+Tab pass over it as they did before the press, except the one that holds
+  // focus while a save or a move is pending: that one is held instead, keeping focus, until
+  // the move lands or is refused, or focus leaves it.
+  const holdsFocusedEdge = busy || navigation.transitioning;
+  const previousAtEdge = !navigation.canPrevious || (busy && !navigation.canPreviousFromShown);
+  const nextAtEdge = !navigation.canNext || (busy && !navigation.canNextFromShown);
+  const previousHeldAtEdge = previousAtEdge && holdsFocusedEdge && focusedMove === 'previous';
+  const nextHeldAtEdge = nextAtEdge && holdsFocusedEdge && focusedMove === 'next';
+  const firstDisabled = !navigation.canFirst;
+  const previousDisabled = previousAtEdge && !previousHeldAtEdge;
+  const nextDisabled = nextAtEdge && !nextHeldAtEdge;
+  const lastDisabled = !navigation.canLast;
+  const goToDisabled = !navigation.canGoTo;
   // Legacy GotoNewRecord runs only with canInsertRecords; New stays enabled on an empty form.
-  const newDisabled = busy || canInsert === false;
-  // A disabled button already says it is unavailable; only an enabled one takes the marking.
-  const blockedMarking = (disabled: boolean) => (blocked && !disabled ? BLOCKED_BUTTON_PROPS : {});
+  const newDisabled = canInsert === false;
+  // A disabled control already says it is unavailable; only an enabled one takes a marking:
+  // held while a save runs, or as an edge that holds focus, which ignores its press, else
+  // blocked, which runs it.
+  const unavailableMarking = (disabled: boolean, held = busy) => {
+    if (disabled) {
+      return {};
+    }
+    if (held) {
+      return HELD_PROPS;
+    }
+    return blocked ? BLOCKED_BUTTON_PROPS : {};
+  };
+  /** Runs a move, unless its control is held: Enter and Space still press a held button. */
+  const runMove = (move: () => Promise<unknown>, held = busy): void => {
+    if (!held) {
+      void move();
+    }
+  };
 
   // A rejection describes the text that was submitted, on the record open at the time, as
   // Find's criterion messages do. It shows, with aria-invalid and aria-describedby, only while
@@ -153,11 +195,11 @@ export function RecordNavigator({ navigation, busy = false, blocked = false, can
   // Next reaching the last record, or Previous the first, is disabled for good while it holds
   // focus: focus goes to the move the other way, else to Last or First, which stay enabled
   // while the set holds a record. Moved in the layout phase of the commit that disables the
-  // button, before the browser paints. A save disables every control only while it runs, and
-  // App's focus return gives that focus back, so nothing moves while busy. Nor while a move is
-  // in flight: Previous and Next count from its target, so a move its leave then refuses would
-  // look like an edge for a render. Once it has landed, `lastFocusedRef` still names the
-  // button whose focus fell to the page body, so a move that did reach the edge is handled then.
+  // button, before the browser paints. Nothing moves while a save or a move is pending: the
+  // edge that holds focus is held then, so the commit in which the move lands at an edge, or
+  // the save settles on one, is the one that disables it. A move its leave refuses lands
+  // nowhere, and Previous and Next count from the record shown again. `lastFocusedRef` names
+  // the button that held focus, should the browser have dropped it to the page body already.
   const firstRef = useRef<HTMLButtonElement>(null);
   const previousRef = useRef<HTMLButtonElement>(null);
   const nextRef = useRef<HTMLButtonElement>(null);
@@ -178,7 +220,7 @@ export function RecordNavigator({ navigation, busy = false, blocked = false, can
   });
 
   function submitGoTo(): void {
-    if (goToDisabled) {
+    if (goToDisabled || busy) {
       return;
     }
     const submitted = entry;
@@ -216,9 +258,17 @@ export function RecordNavigator({ navigation, busy = false, blocked = false, can
         aria-busy={pending || busy ? true : undefined}
         onFocus={(event) => {
           lastFocusedRef.current = event.target;
+          const target: EventTarget = event.target;
+          setFocusedMove(target === previousRef.current ? 'previous' : target === nextRef.current ? 'next' : null);
         }}
         onBlur={(event) => {
           forgetGroupFocus(lastFocusedRef, event);
+          // Focus moving to another control of the toolbar is reported by that control's focus
+          // event; focus leaving it, or dropped by the browser from a button it disables, is not.
+          const { relatedTarget } = event;
+          if (!(relatedTarget instanceof Node && event.currentTarget.contains(relatedTarget))) {
+            setFocusedMove(null);
+          }
         }}
       >
         {/* The toolbar wraps only between these groups, in reading order: First and
@@ -230,9 +280,9 @@ export function RecordNavigator({ navigation, busy = false, blocked = false, can
             ref={firstRef}
             type="button"
             disabled={firstDisabled}
-            {...blockedMarking(firstDisabled)}
+            {...unavailableMarking(firstDisabled)}
             onClick={() => {
-              void navigation.first();
+              runMove(navigation.first);
             }}
           >
             First
@@ -241,9 +291,9 @@ export function RecordNavigator({ navigation, busy = false, blocked = false, can
             ref={previousRef}
             type="button"
             disabled={previousDisabled}
-            {...blockedMarking(previousDisabled)}
+            {...unavailableMarking(previousDisabled, busy || previousHeldAtEdge)}
             onClick={() => {
-              void navigation.previous();
+              runMove(navigation.previous, busy || previousHeldAtEdge);
             }}
           >
             Previous
@@ -259,9 +309,9 @@ export function RecordNavigator({ navigation, busy = false, blocked = false, can
             ref={nextRef}
             type="button"
             disabled={nextDisabled}
-            {...blockedMarking(nextDisabled)}
+            {...unavailableMarking(nextDisabled, busy || nextHeldAtEdge)}
             onClick={() => {
-              void navigation.next();
+              runMove(navigation.next, busy || nextHeldAtEdge);
             }}
           >
             Next
@@ -270,9 +320,9 @@ export function RecordNavigator({ navigation, busy = false, blocked = false, can
             ref={lastRef}
             type="button"
             disabled={lastDisabled}
-            {...blockedMarking(lastDisabled)}
+            {...unavailableMarking(lastDisabled)}
             onClick={() => {
-              void navigation.last();
+              runMove(navigation.last);
             }}
           >
             Last
@@ -292,6 +342,8 @@ export function RecordNavigator({ navigation, busy = false, blocked = false, can
               spellCheck={false}
               value={entry}
               disabled={goToDisabled}
+              readOnly={busy && !goToDisabled}
+              aria-disabled={busy && !goToDisabled ? true : undefined}
               aria-invalid={error !== null ? true : undefined}
               aria-describedby={error !== null ? errorId : undefined}
               onChange={(event) => {
@@ -299,16 +351,16 @@ export function RecordNavigator({ navigation, busy = false, blocked = false, can
               }}
               onKeyDown={handleEntryKeyDown}
             />
-            <button type="button" disabled={goToDisabled} {...blockedMarking(goToDisabled)} onClick={submitGoTo}>
+            <button type="button" disabled={goToDisabled} {...unavailableMarking(goToDisabled)} onClick={submitGoTo}>
               Go
             </button>
           </div>
           <button
             type="button"
             disabled={newDisabled}
-            {...blockedMarking(newDisabled)}
+            {...unavailableMarking(newDisabled)}
             onClick={() => {
-              void navigation.newRecord();
+              runMove(navigation.newRecord);
             }}
           >
             New

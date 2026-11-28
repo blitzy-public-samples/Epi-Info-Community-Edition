@@ -95,6 +95,14 @@ export interface RecordNavigation {
   readonly canPrevious: boolean;
   /** next() would move: counted from where it counts, a pending move's target included. */
   readonly canNext: boolean;
+  /**
+   * previous() would move from the record shown, were no move pending: canPrevious before
+   * the pending move started. A save the pending move waits on keeps that record open, so
+   * the navigator shows its edges meanwhile.
+   */
+  readonly canPreviousFromShown: boolean;
+  /** next() would move from the record shown, were no move pending, as canPreviousFromShown. */
+  readonly canNextFromShown: boolean;
   readonly canLast: boolean;
   readonly canGoTo: boolean;
   readonly first: () => Promise<void>;
@@ -1438,9 +1446,11 @@ function statusTextOf({ isNew, n, count }: ShownPlace): string {
 
 function present(state: NavigationState, actions: NavigationActions): RecordNavigation {
   // The move origin stays internal, and the status shows the installed record until a move
-  // settles, while Previous and Next are available exactly when a press would move.
+  // settles, while Previous and Next are available exactly when a press would move. Their
+  // FromShown forms leave the pending move out and count from the record shown.
   const { pendingMove, vacated, knownSize, ...shown } = state;
   const origin = originOf(pendingMove, vacated, knownSize, shown);
+  const here = originOf(null, vacated, knownSize, shown);
   const hasRecords = shown.count > 0;
   return {
     ...shown,
@@ -1449,6 +1459,8 @@ function present(state: NavigationState, actions: NavigationActions): RecordNavi
     canFirst: hasRecords,
     canPrevious: resolveMove('previous', shown, origin) !== null,
     canNext: resolveMove('next', shown, origin) !== null,
+    canPreviousFromShown: resolveMove('previous', shown, here) !== null,
+    canNextFromShown: resolveMove('next', shown, here) !== null,
     canLast: hasRecords,
     canGoTo: hasRecords,
     ...actions,

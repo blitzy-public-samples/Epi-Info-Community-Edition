@@ -822,16 +822,17 @@ function useStickyBlockSizes(rootRef: RefObject<HTMLElement>, headerRef: RefObje
 
 /**
  * Scrolls a focused control that starts inside its scroll margin to start just below it.
- * styles.css gives each control a scroll margin as deep as the parts stuck above it, so a
- * control starting inside it is hidden, wholly or in part, under them. A control taller than
- * the room below its margin, such as a tab panel that a click on its background focuses, is
- * left where it is, and so is one with no margin: the header's controls, or any control
- * where nothing sticks above it. With `inViewOnly`, so is a control starting above the
- * viewport, which the user has scrolled away from.
+ * styles.css gives each control a scroll margin as deep as the parts stuck above it and its
+ * focus ring, so a control starting inside it is hidden, wholly or in part, under them, or
+ * where nothing sticks has its ring cut off by the top of the viewport. A control taller
+ * than the room below its margin, such as a tab panel that a click on its background
+ * focuses, is left where it is, and so is one with no margin: the header's controls. With
+ * `inViewOnly`, so is a control starting above the viewport, which the user has scrolled
+ * away from.
  */
 function keepClearOfStickyParts(control: Element, inViewOnly: boolean): void {
   const margin = Number.parseFloat(getComputedStyle(control).scrollMarginBlockStart);
-  // NaN where no style sheet sets it (jsdom); 0 where nothing sticks above the control.
+  // NaN where no style sheet sets it (jsdom); 0 for the header's controls.
   if (!(margin > 0)) {
     return;
   }
@@ -839,6 +840,45 @@ function keepClearOfStickyParts(control: Element, inViewOnly: boolean): void {
   // A sliver under a pixel is layout rounding, not a hidden control.
   if (top <= margin - 1 && (!inViewOnly || top > -1) && height <= document.documentElement.clientHeight - margin) {
     window.scrollBy(0, top - margin);
+  }
+}
+
+/**
+ * Scrolls a focused control whose block-end scroll margin runs past the bottom of the
+ * viewport up until that margin ends at it. styles.css gives each control below the header
+ * a block-end margin that holds its focus ring and the lines that describe it, which the
+ * browser keeps in view when focus scrolls a control into view, but not for every control:
+ * Chromium scrolls a focused textarea only as far as its caret, so Tab would leave its ring,
+ * hint and messages below the viewport. Runs after keepClearOfStickyParts, and never
+ * scrolls the control's start into its block-start margin, under the stuck parts. A control
+ * with no margin (the header's), one taller than the room between its margins, and one
+ * wholly out of view, as after focus that scrolls nothing or once the user has scrolled
+ * away, are left where they are.
+ */
+function keepClearOfViewportEnd(control: Element): void {
+  const style = getComputedStyle(control);
+  const endMargin = Number.parseFloat(style.scrollMarginBlockEnd);
+  // NaN where no style sheet sets it (jsdom); 0 for the header's controls.
+  if (!(endMargin > 0)) {
+    return;
+  }
+  const parsedStartMargin = Number.parseFloat(style.scrollMarginBlockStart);
+  const startMargin = parsedStartMargin > 0 ? parsedStartMargin : 0;
+  const viewportHeight = document.documentElement.clientHeight;
+  const { top, bottom, height } = control.getBoundingClientRect();
+  if (top >= viewportHeight || bottom <= 0 || height > viewportHeight - startMargin - endMargin) {
+    return;
+  }
+  const overflow = bottom + endMargin - viewportHeight;
+  // A sliver under a pixel is layout rounding, not a hidden ring.
+  if (overflow < 1) {
+    return;
+  }
+  // Whole pixels, so a scroll offset the browser rounds still clears the end margin, and
+  // never past the point where the start would enter its own margin.
+  const distance = Math.min(Math.ceil(overflow), Math.floor(top - startMargin));
+  if (distance > 0) {
+    window.scrollBy(0, distance);
   }
 }
 
@@ -903,7 +943,25 @@ function useStickyNoticeBlockSize(rootRef: RefObject<HTMLElement>): (notice: HTM
  * clear of its scroll margin when focus scrolls it into view, but not when focus lands on a
  * part inside a native control, such as the day, month or year of a date input: Shift+Tab
  * would leave that date under the header. So a focused control that still starts inside its
- * scroll margin is scrolled to start just below it (keepClearOfStickyParts).
+ * scroll margin is scrolled to start just below it (keepClearOfStickyParts). The browser
+ * scrolls before the focus events, so the handler measures where focus left the control.
+ *
+ * The same goes for the margin below a control, which keeps its focus ring and the lines
+ * that describe it above the bottom of the viewport: a control still ending inside it is
+ * then scrolled up (keepClearOfViewportEnd).
+ *
+ * Neither is done while a pointer press is down, as the browser scrolls nothing for the
+ * focus a press gives: a control moving away from under the pointer would lose the press's
+ * click, to a checkbox whose release lands above or below it, or extend a selection in a
+ * text field. A press counts from its pointerdown until its click or a cancel; a touch
+ * focuses after its pointerup, so the release alone does not end it. Once it has ended, a
+ * task later, so its click is dispatched first, the control it focused is kept clear of the
+ * stuck parts and its ring, if it still holds focus and has not been scrolled above the
+ * viewport; the margin below it is not made up for. A key press also ends a press, held or
+ * one whose click never came, such as one whose release the window never saw, but drops
+ * the control it focused, as the pointer may still be down on it. A new press drops what
+ * an earlier one left, a correction still waiting for its task included, which would
+ * otherwise scroll the page under the new press.
  */
 function useFocusClearOfStickyParts(rootRef: RefObject<HTMLElement>): void {
   useEffect(() => {
@@ -911,13 +969,64 @@ function useFocusClearOfStickyParts(rootRef: RefObject<HTMLElement>): void {
     if (root === null) {
       return undefined;
     }
-    const handleFocusIn = (event: FocusEvent): void => {
-      if (event.target instanceof Element) {
-        keepClearOfStickyParts(event.target, false);
+    let pointerPressed = false;
+    // The control the press that is down focused, kept clear once the press ends.
+    let pressFocused: Element | null = null;
+    let deferredCorrection: ReturnType<typeof setTimeout> | undefined;
+    const cancelDeferredCorrection = (): void => {
+      if (deferredCorrection !== undefined) {
+        clearTimeout(deferredCorrection);
+        deferredCorrection = undefined;
       }
     };
+    const handlePointerDown = (): void => {
+      cancelDeferredCorrection();
+      pointerPressed = true;
+      pressFocused = null;
+    };
+    const handlePressEnd = (): void => {
+      const focused = pressFocused;
+      pointerPressed = false;
+      pressFocused = null;
+      if (focused === null) {
+        return;
+      }
+      cancelDeferredCorrection();
+      deferredCorrection = setTimeout(() => {
+        deferredCorrection = undefined;
+        if (document.activeElement === focused) {
+          keepClearOfStickyParts(focused, true);
+        }
+      }, 0);
+    };
+    const handleKeyDown = (): void => {
+      pointerPressed = false;
+      pressFocused = null;
+    };
+    const handleFocusIn = (event: FocusEvent): void => {
+      if (!(event.target instanceof Element)) {
+        return;
+      }
+      if (pointerPressed) {
+        pressFocused = event.target;
+        return;
+      }
+      keepClearOfStickyParts(event.target, false);
+      keepClearOfViewportEnd(event.target);
+    };
+    // Captured on the window, so a handler that stops the event cannot hide the press or key,
+    // and a click ends its press before the click's own handlers move any focus.
+    window.addEventListener('pointerdown', handlePointerDown, true);
+    window.addEventListener('click', handlePressEnd, true);
+    window.addEventListener('pointercancel', handlePressEnd, true);
+    window.addEventListener('keydown', handleKeyDown, true);
     root.addEventListener('focusin', handleFocusIn);
     return () => {
+      cancelDeferredCorrection();
+      window.removeEventListener('pointerdown', handlePointerDown, true);
+      window.removeEventListener('click', handlePressEnd, true);
+      window.removeEventListener('pointercancel', handlePressEnd, true);
+      window.removeEventListener('keydown', handleKeyDown, true);
       root.removeEventListener('focusin', handleFocusIn);
     };
   }, [rootRef]);
@@ -1030,8 +1139,19 @@ function blockedText(action: RecordAction): string {
   }
 }
 
-/** Where the workspace moves focus to show the outcome of an action. */
-type OutcomeTarget = 'summary' | 'heading' | 'formGone';
+/**
+ * Where the workspace moves focus to show the outcome of an action: the editor banner of a
+ * failed save or delete, the validation summary, the heading or the form-gone banner.
+ */
+type OutcomeTarget = 'banner' | 'summary' | 'heading' | 'formGone';
+
+/**
+ * Where a stopped action's outcome is, in order. A failed save shows either field errors with
+ * no banner, or a banner of its own, which may sit above field errors left from an earlier
+ * save, such as a 413 after a 400 or a 409 that ends them: so the banner, when one is up, is
+ * what stopped this action, and the summary otherwise.
+ */
+const STOPPED_ACTION_TARGETS: readonly OutcomeTarget[] = ['banner', 'summary'];
 
 /** A user action that may be stopped by a failed save, as it was started. */
 interface ActionAttempt {
@@ -1041,7 +1161,7 @@ interface ActionAttempt {
    * from the page body; `null` lets the outcome take focus from anywhere but a field.
    */
   readonly origin: Element | null;
-  /** Where focus goes when the action is stopped and no validation summary says why. */
+  /** Where focus goes when the action is stopped and neither a banner nor a validation summary says why. */
   readonly fallback?: OutcomeTarget;
   /** Told whether the leave the action asked for was granted. */
   readonly onLeave?: (left: boolean) => void;
@@ -1049,19 +1169,26 @@ interface ActionAttempt {
 
 /** A request to focus an outcome; `sequence` makes a repeated request a new one. */
 interface OutcomeFocusRequest {
-  readonly target: OutcomeTarget;
-  /** Taken when `target` is not on the page, such as the summary of a save that failed with a banner. */
-  readonly fallback: OutcomeTarget | null;
+  /** In order of preference: the first one on the page takes focus. */
+  readonly targets: readonly OutcomeTarget[];
   readonly origin: Element | null;
   readonly sequence: number;
 }
 
 /** The elements an outcome can take focus on, each with tabIndex -1. */
 interface OutcomeTargets {
+  readonly banner: RefObject<HTMLElement>;
   readonly heading: RefObject<HTMLElement>;
   readonly summary: RefObject<HTMLElement>;
   readonly formGone: RefObject<HTMLElement>;
 }
+
+/**
+ * The parts whose focus no outcome disturbs: a tab panel, whose fields raise check-code
+ * events on focus and blur, and a modal dialog. An outcome neither takes focus from inside
+ * them nor scrolls the page away from them.
+ */
+const HELD_FOCUS_SELECTOR = '[role="tabpanel"], [aria-modal="true"]';
 
 /**
  * Whether an outcome may take focus now. Never from a field, whose focus and blur raise
@@ -1074,22 +1201,110 @@ function mayTakeFocus(origin: Element | null): boolean {
   if (active === null || active === document.body || active === document.documentElement) {
     return true;
   }
-  if (active.closest('[role="tabpanel"], [aria-modal="true"]') !== null) {
+  if (active.closest(HELD_FOCUS_SELECTOR) !== null) {
     return false;
   }
   return origin === null || active === origin;
 }
 
+/** The block size an element's focus ring takes beyond its box, in px: its outline's width and outward offset. */
+function focusRingRoom(element: Element): number {
+  const style = getComputedStyle(element);
+  if (style.outlineStyle === 'none') {
+    return 0;
+  }
+  // NaN where no style sheet sets them (jsdom); an inward offset takes no room outside the box.
+  const width = Number.parseFloat(style.outlineWidth);
+  const offset = Number.parseFloat(style.outlineOffset);
+  return (width > 0 ? width : 0) + (offset > 0 ? offset : 0);
+}
+
+/**
+ * Scrolls an outcome that may not take focus into view, leaving focus where the user moved
+ * it while the action ran, such as Tab from Save on to Find during the save: the outcome,
+ * a banner the browser announced as it appeared, is still seen, and focus stays the user's.
+ * The page scrolls the least distance that shows the outcome clear of its scroll margins,
+ * which styles.css makes as deep as the parts stuck above it, the sticky header and
+ * check-code notice, and its focus ring, as focusing it would; one taller than the room
+ * between them shows from its start, and one already clear of them stays.
+ *
+ * The scroll never carries visible focus out of view. Focus in a field or a dialog
+ * (HELD_FOCUS_SELECTOR) is never scrolled away from. Where the workspace header sticks, its
+ * controls stay in view whatever the scroll. Anywhere else, the header where it does not
+ * stick (a narrow or short viewport) included, the focused control moves with the page and
+ * keeps its focus ring in view: both show when they fit; otherwise an outcome below focus,
+ * as a banner is below the header, is shown from its start as far as focus allows, and one
+ * above focus, which would show its end first, stays where it is. Focus already out of view,
+ * such as on a control the user has scrolled away from, has nothing to lose.
+ */
+function revealOutcome(target: HTMLElement, header: HTMLElement | null): void {
+  const active = document.activeElement;
+  const focused =
+    active === null || active === document.body || active === document.documentElement || target.contains(active)
+      ? null
+      : active;
+  if (focused !== null && focused.closest(HELD_FOCUS_SELECTOR) !== null) {
+    return;
+  }
+  const style = getComputedStyle(target);
+  // NaN where no style sheet sets them (jsdom).
+  const parsedStartMargin = Number.parseFloat(style.scrollMarginBlockStart);
+  const parsedEndMargin = Number.parseFloat(style.scrollMarginBlockEnd);
+  const startMargin = parsedStartMargin > 0 ? parsedStartMargin : 0;
+  const endMargin = parsedEndMargin > 0 ? parsedEndMargin : 0;
+  const viewportHeight = document.documentElement.clientHeight;
+  const { top, bottom } = target.getBoundingClientRect();
+  // A sliver under a pixel is layout rounding, not a hidden outcome. Whole pixels, so a scroll
+  // offset the browser rounds still clears the margins, and never so far down that the start
+  // would enter its block-start margin.
+  let distance: number;
+  if (top < startMargin - 1) {
+    distance = Math.floor(top - startMargin);
+  } else if (bottom > viewportHeight - endMargin + 1) {
+    distance = Math.max(0, Math.min(Math.ceil(bottom + endMargin - viewportHeight), Math.floor(top - startMargin)));
+  } else {
+    return;
+  }
+  if (distance === 0) {
+    return;
+  }
+  const stuck =
+    header !== null && focused !== null && header.contains(focused) && getComputedStyle(header).position === 'sticky';
+  if (focused !== null && !stuck) {
+    const box = focused.getBoundingClientRect();
+    if (box.bottom > 0 && box.top < viewportHeight) {
+      const ring = focusRingRoom(focused);
+      if (distance > 0) {
+        // The outcome lies below focus: the page scrolls no further than keeps focus in view,
+        // and not at all unless that brings the outcome's start, which says what happened, in.
+        distance = Math.max(0, Math.min(distance, Math.floor(box.top - ring)));
+        if (distance === 0 || top - distance >= viewportHeight - endMargin) {
+          return;
+        }
+      } else if (box.bottom + ring - distance > viewportHeight + 1) {
+        // The outcome lies above focus, and its start would show only once focus had gone.
+        return;
+      }
+    }
+  }
+  window.scrollBy(0, distance);
+}
+
 /**
  * Brings an action's outcome to the user where the action started out of its sight: a save
- * or move stopped by field errors focuses the validation summary, an open from the grid
- * focuses the heading the opened record's banners sit under, and a list 404 focuses the
- * form-gone banner and its "Discard edits". Focusing an element scrolls it into view, but
- * focusing the element that already holds focus does nothing, so a target still focused by
- * an earlier outcome (a repeated stopped save, a second open from the grid, after a click
- * that focused no button) is scrolled into view instead. It is centred, where focusing puts
- * an element out of view, so it lands clear of the check-code notice pinned at the top.
- * A 409 that disables Save is not an outcome here: its banner's own effect focuses the heading.
+ * or move stopped by a failed save focuses the banner that says why, or the validation
+ * summary of the field errors that stopped it (a 409 that disables Save included: its
+ * banner says the record is deleted and ends those errors); an open from the grid focuses
+ * the heading the opened record's banners sit under, and a list 404 focuses the form-gone
+ * banner and its "Discard edits". Focusing an element scrolls it into view, clear of the
+ * sticky header through its scroll margin (styles.css), but focusing the element that
+ * already holds focus does nothing, so a target still focused by an earlier outcome (a
+ * repeated stopped save, a second open from the grid, after a click that focused no button)
+ * is scrolled into view instead. It is centred, where focusing puts an element out of view,
+ * so it lands clear of the check-code notice pinned at the top. Where the user moved focus on
+ * while the action ran, the outcome takes none and is scrolled into view where that keeps
+ * focus in view (revealOutcome); `header` is the workspace header, which stays in view where
+ * it sticks.
  *
  * The focus moves in a passive effect of the commit that shows the outcome: a dialog closed
  * in that commit (Find, after a result was chosen) releases the page from `inert` and returns
@@ -1098,36 +1313,46 @@ function mayTakeFocus(origin: Element | null): boolean {
  */
 function useOutcomeFocus(
   targets: OutcomeTargets,
-): (target: OutcomeTarget, origin: Element | null, fallback?: OutcomeTarget | null) => void {
+  header: RefObject<HTMLElement>,
+): (ordered: readonly OutcomeTarget[], origin: Element | null) => void {
   const [request, setRequest] = useState<OutcomeFocusRequest | null>(null);
-  const { heading, summary, formGone } = targets;
+  const { banner, heading, summary, formGone } = targets;
   useEffect(() => {
     if (request === null) {
       return;
     }
-    const elementOf = (target: OutcomeTarget | null): HTMLElement | null => {
+    const elementOf = (target: OutcomeTarget): HTMLElement | null => {
       switch (target) {
+        case 'banner':
+          return banner.current;
         case 'heading':
           return heading.current;
         case 'summary':
           return summary.current;
         case 'formGone':
           return formGone.current;
-        case null:
-          return null;
       }
     };
-    const element = elementOf(request.target) ?? elementOf(request.fallback);
-    if (element !== null && mayTakeFocus(request.origin)) {
-      if (element === document.activeElement) {
-        element.scrollIntoView({ block: 'center' });
-      } else {
-        element.focus();
+    let element: HTMLElement | null = null;
+    for (const target of request.targets) {
+      element = elementOf(target);
+      if (element !== null) {
+        break;
       }
     }
-  }, [request, heading, summary, formGone]);
-  return useCallback((target: OutcomeTarget, origin: Element | null, fallback: OutcomeTarget | null = null) => {
-    setRequest((previous) => ({ target, fallback, origin, sequence: (previous?.sequence ?? 0) + 1 }));
+    if (element === null) {
+      return;
+    }
+    if (!mayTakeFocus(request.origin)) {
+      revealOutcome(element, header.current);
+    } else if (element === document.activeElement) {
+      element.scrollIntoView({ block: 'center' });
+    } else {
+      element.focus();
+    }
+  }, [request, banner, heading, summary, formGone, header]);
+  return useCallback((ordered: readonly OutcomeTarget[], origin: Element | null) => {
+    setRequest((previous) => ({ targets: ordered, origin, sequence: (previous?.sequence ?? 0) + 1 }));
   }, []);
 }
 
@@ -1150,12 +1375,24 @@ function FormWorkspace({
   // move runs before the editor's leave is installed: nothing is on screen to start one.
   const leaveRef = useRef<() => Promise<boolean>>(() => Promise.resolve(true));
 
-  // Outcomes of the user's actions. The summary and the form-gone banner take focus (both
-  // have tabIndex -1) when an action that started out of their sight is stopped or finds
-  // the form gone.
+  // Outcomes of the user's actions. The editor banner, the summary and the form-gone banner
+  // take focus (each has tabIndex -1) when an action that started out of their sight is
+  // stopped or finds the form gone.
+  const editorBannerRef = useRef<HTMLDivElement>(null);
   const summaryRef = useRef<HTMLDivElement>(null);
   const formGoneRef = useRef<HTMLDivElement>(null);
-  const focusOutcome = useOutcomeFocus({ heading: headingRef, summary: summaryRef, formGone: formGoneRef });
+  // The workspace header: where it sticks, focus on its controls stays in view as an outcome
+  // is scrolled to.
+  const headerRef = useRef<HTMLDivElement>(null);
+  const focusOutcome = useOutcomeFocus(
+    {
+      banner: editorBannerRef,
+      heading: headingRef,
+      summary: summaryRef,
+      formGone: formGoneRef,
+    },
+    headerRef,
+  );
   // The record generation on screen, for a refusal reported after the render that started it.
   const generationRef = useRef(navigation.recordGeneration);
   // The action a failed save stopped, while the field errors that stopped it are shown on
@@ -1171,7 +1408,10 @@ function FormWorkspace({
         attempt: blockedAttemptsRef.current,
         generation: generationRef.current,
       });
-      focusOutcome('summary', attempt.origin, attempt.fallback ?? null);
+      focusOutcome(
+        attempt.fallback === undefined ? STOPPED_ACTION_TARGETS : [...STOPPED_ACTION_TARGETS, attempt.fallback],
+        attempt.origin,
+      );
     },
     [focusOutcome],
   );
@@ -1255,8 +1495,15 @@ function FormWorkspace({
     setDeletedIn(null);
   }
   // Also adjusted during render: the line explains the errors on screen, so it goes with them,
-  // and with the record they were stopped on.
-  if (blocked !== null && (blocked.generation !== navigation.recordGeneration || !hasFieldErrors(editor.fieldErrors))) {
+  // and with the record they were stopped on. A failed save that shows a banner, such as a 413
+  // or 409, was stopped by what the banner says, not by field errors an earlier save left, so
+  // the line goes then too.
+  if (
+    blocked !== null &&
+    (blocked.generation !== navigation.recordGeneration ||
+      !hasFieldErrors(editor.fieldErrors) ||
+      editor.banner !== null)
+  ) {
     setBlocked(null);
   }
   const { leave } = editor;
@@ -1271,7 +1518,6 @@ function FormWorkspace({
   const { selectedPageId, selectPage, selectField } = usePageSelection(definition);
 
   const rootRef = useRef<HTMLDivElement>(null);
-  const headerRef = useRef<HTMLDivElement>(null);
   useStickyBlockSizes(rootRef, headerRef);
   const eventNoticeRef = useStickyNoticeBlockSize(rootRef);
   useFocusClearOfStickyParts(rootRef);
@@ -1309,7 +1555,7 @@ function FormWorkspace({
   const handleGridFormNotFound = useCallback(() => {
     const origin = document.activeElement;
     handleFormNotFound();
-    focusOutcome('formGone', origin);
+    focusOutcome(['formGone'], origin);
   }, [handleFormNotFound, focusOutcome]);
   // Adjusted during render, so the count's 404 stays recorded after a later navigation
   // action clears navigation's load error.
@@ -1352,8 +1598,8 @@ function FormWorkspace({
   // stable callbacks only: navigation's actions keep their identity, and so do these. The
   // grid sits far below the form, so its open ends on the heading, under which the opened
   // record's banners sit (deleted, no longer exists, a failed read). An open stopped by a
-  // failed save focuses the summary of its field errors, or the heading when a banner says
-  // why instead.
+  // failed save focuses the banner that says why, or the summary of its field errors, as any
+  // stopped action does, and the heading when neither is shown.
   const { openById } = navigation;
   const openFromGrid = useCallback(
     (id: string) => {
@@ -1369,7 +1615,7 @@ function FormWorkspace({
       };
       void attempting(attempt, () => openById(id)).then(() => {
         if (!refused) {
-          focusOutcome('heading', origin);
+          focusOutcome(['heading'], origin);
         }
       });
     },
@@ -1421,15 +1667,18 @@ function FormWorkspace({
   const busy = editor.saving || editor.savePending;
   // Permission flags are null until permission awareness is delivered; only `false` restricts.
   const { canInsert, canUpdate, canDelete } = definition;
-  const saveDisabled =
-    busy || recordDeleted || nothingOpen || (navigation.isNew ? canInsert === false : canUpdate === false);
+  const saveDisabled = recordDeleted || nothingOpen || (navigation.isNew ? canInsert === false : canUpdate === false);
+  // While a save runs, Save is held, as the navigator's controls are: marked unavailable and its
+  // press ignored, but not disabled, so a Save pressed from the keyboard keeps focus until the
+  // save settles, where a disabled one would drop it to the page body meanwhile.
+  const saveHeld = busy && !saveDisabled;
   // A new draft with no entry has nothing to delete or discard, so Delete waits for one.
   const deleteDisabled =
     busy || recordDeleted || nothingOpen || canDelete === false || (navigation.isNew && !editor.isDirty);
   // While a write of the draft may already have been applied, Save refuses, and so does each
   // move that would first save the dirty draft (Back to forms and the navigator's moves): a
   // press shows that write's banner again. They stay operable for that, marked unavailable.
-  const saveBlocked = editor.saveBlocked && !saveDisabled;
+  const saveBlocked = editor.saveBlocked && !saveDisabled && !saveHeld;
   const movesBlocked = editor.saveBlocked && editor.isDirty;
 
   const isProtected = (field: FieldDefinition): boolean => editor.isProtected(field.name);
@@ -1464,30 +1713,10 @@ function FormWorkspace({
 
   // A 409's banner says the record is deleted and read-only, and that the edits were not
   // saved, so while it is up it stands in for the deleted status, which returns once the
-  // banner is dismissed.
+  // banner is dismissed. Save stays disabled on a deleted record, so the Save or move the 409
+  // stopped hands its focus to that banner as its outcome (noteBlocked), the one place that
+  // explains the record's state.
   const conflictBanner = editor.banner?.kind === 'deleted' ? editor.banner : null;
-  // Save stays disabled on a deleted record, so focus that a pressed Save lost while it
-  // saved never returns to it: the heading takes it once a 409's banner is up. It does so a
-  // task after the banner's commit, not in it. A navigator button whose leave the 409
-  // cancelled is enabled again by that same commit, and the shell returns the focus it lost
-  // in a microtask after the commit, which runs first and keeps it. The heading takes focus
-  // only when it is still on the page body by then, so focus the user or the shell placed
-  // elsewhere stays there. A newer banner, the banner's removal or unmounting cancels a
-  // move still pending, so none lands on a record the banner no longer speaks for.
-  useEffect(() => {
-    if (conflictBanner === null) {
-      return undefined;
-    }
-    const timer = setTimeout(() => {
-      const active = document.activeElement;
-      if (active === null || active === document.body) {
-        headingRef.current?.focus();
-      }
-    }, 0);
-    return () => {
-      clearTimeout(timer);
-    };
-  }, [conflictBanner, headingRef]);
   // Every banner action removes the banner whose control ran it, so each goes through
   // runBannerAction, which hands that control's focus on to the heading.
   const runBannerAction = useBannerFocusReturn(headingRef);
@@ -1554,6 +1783,7 @@ function FormWorkspace({
       <div ref={headerRef} className="form-view__header">
         <WorkspaceToolbar
           saveDisabled={saveDisabled}
+          saveHeld={saveHeld}
           saveBlocked={saveBlocked}
           backBlocked={movesBlocked}
           saving={editor.savePending}
@@ -1594,6 +1824,7 @@ function FormWorkspace({
         offerDiscard={editor.isDirty && !discardChosen}
         onDiscardFormGone={() => runBannerAction(() => setDiscardChosen(true))}
         editorBanner={editor.banner}
+        editorBannerRef={editorBannerRef}
         bannerHandlers={bannerHandlers}
         dialogsFailed={modals.failed}
         onRetryDialogs={() => {
@@ -1691,6 +1922,8 @@ function FormWorkspace({
 
 interface WorkspaceToolbarProps {
   readonly saveDisabled: boolean;
+  /** A save is running: Save is marked unavailable and ignores its press, but keeps focus. */
+  readonly saveHeld: boolean;
   /** Save is enabled, yet refuses while a write of the draft may already have been applied. */
   readonly saveBlocked: boolean;
   /** Back to forms would first save the dirty draft, which that write blocks, so it refuses. */
@@ -1723,6 +1956,7 @@ interface WorkspaceToolbarProps {
 /** The form's actions, Back to forms, Save, Delete and Find, under the names the smoke test matches. */
 function WorkspaceToolbar({
   saveDisabled,
+  saveHeld,
   saveBlocked,
   backBlocked,
   saving,
@@ -1756,12 +1990,18 @@ function WorkspaceToolbar({
       >
         {BACK_TO_FORMS}
       </button>
+      {/* Held while a save runs: marked, not disabled, so it keeps focus; Enter and Space still
+          press it, so the press is ignored here. */}
       <button
         type="button"
         disabled={saveDisabled}
-        aria-disabled={saveBlocked ? true : undefined}
+        aria-disabled={saveHeld || saveBlocked ? true : undefined}
         className={saveBlocked ? BLOCKED_BUTTON_CLASS : undefined}
-        onClick={() => onSave()}
+        onClick={() => {
+          if (!saveHeld) {
+            onSave();
+          }
+        }}
       >
         {SAVE}
       </button>
@@ -1802,6 +2042,8 @@ interface WorkspaceNoticesProps {
   readonly onDiscardFormGone: () => void;
   /** The failed save or delete; `null` when there is none. */
   readonly editorBanner: EditorBanner | null;
+  /** Set on the editor banner, which takes focus when its failure stopped the user's action. */
+  readonly editorBannerRef: RefObject<HTMLDivElement>;
   /** The editor banner's actions. */
   readonly bannerHandlers: EditorBannerHandlers;
   /** A dialog asked for could not be opened: its chunk could not be fetched. */
@@ -1829,6 +2071,7 @@ function WorkspaceNotices({
   offerDiscard,
   onDiscardFormGone,
   editorBanner,
+  editorBannerRef,
   bannerHandlers,
   dialogsFailed,
   onRetryDialogs,
@@ -1871,7 +2114,12 @@ function WorkspaceNotices({
 
       {/* Keyed by the banner object, so a banner shown again remounts and is announced again. */}
       {editorBanner !== null && (
-        <EditorBannerView key={bannerKeyOf(editorBanner)} banner={editorBanner} handlers={bannerHandlers} />
+        <EditorBannerView
+          key={bannerKeyOf(editorBanner)}
+          banner={editorBanner}
+          handlers={bannerHandlers}
+          containerRef={editorBannerRef}
+        />
       )}
 
       {dialogsFailed && (
@@ -2309,6 +2557,8 @@ interface EditorBannerHandlers {
 interface EditorBannerViewProps {
   readonly banner: EditorBanner;
   readonly handlers: EditorBannerHandlers;
+  /** The banner's root, which can take focus (tabIndex -1): the outcome of an action its failure stopped. */
+  readonly containerRef: RefObject<HTMLDivElement>;
 }
 
 /**
@@ -2318,9 +2568,10 @@ interface EditorBannerViewProps {
  * the save may already have been applied, which for a create risks a duplicate record. A
  * delete's confirmation already discarded the draft, so its text says only that the
  * delete could not be confirmed. ConnectionError offers Retry only when resending is safe,
- * and otherwise an explicit "Save again".
+ * and otherwise an explicit "Save again". Either way the root takes `containerRef` and can
+ * take focus.
  */
-function EditorBannerView({ banner, handlers }: EditorBannerViewProps) {
+function EditorBannerView({ banner, handlers, containerRef }: EditorBannerViewProps) {
   if (isConnectionFailure(banner.error)) {
     return (
       <ConnectionError
@@ -2331,6 +2582,7 @@ function EditorBannerView({ banner, handlers }: EditorBannerViewProps) {
         onRetry={banner.actions.includes('retry') ? handlers.onRetry : undefined}
         onSaveAgain={banner.actions.includes('saveAgain') ? handlers.onSaveAgain : undefined}
         onDismiss={handlers.onDismiss}
+        containerRef={containerRef}
       />
     );
   }
@@ -2338,7 +2590,7 @@ function EditorBannerView({ banner, handlers }: EditorBannerViewProps) {
   const traceLine = traceLineOf(banner.message, banner.traceId);
   const tone = banner.kind === 'deleted' ? 'banner--warning' : 'banner--error';
   return (
-    <div className={`banner ${tone}`} role="alert">
+    <div ref={containerRef} className={`banner ${tone}`} role="alert" tabIndex={-1}>
       <p>{banner.message}</p>
       {traceLine !== null && (
         <p>

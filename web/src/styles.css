@@ -574,6 +574,26 @@
     cursor: progress;
   }
 
+  /* Save and the navigator's controls held while a save runs: aria-disabled
+   * rather than disabled keeps the control a keyboard user pressed focused
+   * until the save settles, so the disabled look is given here, as for the
+   * grid's paging. The base layer's [aria-disabled="true"] rule blocks
+   * pointer input, and their handlers ignore Enter and Space. A blocked
+   * control (.button--blocked) takes the same colours. The go-to box, held
+   * read-only, takes the disabled colours of a text control. */
+  .form-toolbar button[aria-disabled="true"],
+  .record-navigator button[aria-disabled="true"] {
+    border-color: var(--color-border);
+    background-color: var(--color-surface-disabled);
+    color: var(--color-text-muted);
+  }
+
+  .record-navigator input[aria-disabled="true"] {
+    --control-border-color: var(--color-border);
+    --control-background: var(--color-surface-disabled);
+    --control-text: var(--color-text-muted);
+  }
+
   .record-navigator .field-error {
     flex-basis: 100%;
   }
@@ -698,6 +718,17 @@
    * or 400% (about 640 or 320 CSS px wide), keep normal flow, so nothing
    * fixed crowds out reflowed content (WCAG 1.4.10). */
 
+  /* Where the header does not stick, nothing sticks above a control outside
+   * it until a check-code notice shows, so focus scrolling a control in from
+   * above the viewport, as Shift+Tab does, would leave it flush with the
+   * top edge and its focus ring cut off. This margin keeps the ring in view.
+   * The notice rule and the wide-layout rules below, at the same zero
+   * specificity, come later and take over where they apply. */
+  :where(.form-view > :not(.form-view__header)),
+  :where(.form-view > :not(.form-view__header)) * {
+    scroll-margin-block-start: var(--focus-ring-room);
+  }
+
   /* Where the header does not stick, the check-code notice still sticks,
    * --space-2 below the top of the viewport, so the controls after it keep
    * clear of it, as all controls keep clear of the stuck parts in the wide
@@ -744,7 +775,8 @@
      * it and scroll to them, and so would clicking or typing in the
      * navigator's go-to box. FormView applies the margin itself where the
      * browser does not, as for a date input's inner fields, or as a notice
-     * grows over the control that holds focus.
+     * grows over the control that holds focus. These rules set the margin's
+     * start only; its end, the same in every layout, follows the media query.
      * :where() keeps the first rule at zero specificity, so the others win. */
     :where(.form-view > :not(.form-view__header)),
     :where(.form-view > :not(.form-view__header)) * {
@@ -764,6 +796,63 @@
           var(--form-view-tabs-block-size, 0px) + var(--focus-ring-room)
       );
     }
+  }
+
+  /* Block-end clearance, in both layouts. Focus scrolls a control lying partly
+   * below the viewport only until the end of its scroll margin meets the
+   * viewport's bottom edge, so that margin holds what shows below the control:
+   * its focus ring (--focus-ring-room) everywhere outside the header, and in a
+   * field also the rest of the control's row and the lines that describe it.
+   * A checkbox or radio is centred in a --target-size row beside its label,
+   * whose lower part its margin holds. Each hint, length-limit notice and error
+   * message after the control in its field is one line of small text after a
+   * --space-1 gap; a radio counts the messages below its group. Messages count
+   * up to three, each as one line, so a longer list or a wrapped message
+   * shows its first lines. Nothing sticks at the bottom of the viewport, so
+   * the margin is the same where the header sticks and where it does not. The
+   * header's own controls take none, as they take no block-start margin.
+   * Chromium scrolls a focused textarea only as far as its caret, whatever its
+   * margin, so FormView scrolls a control that focus leaves ending inside its
+   * margin the rest of the way, as it does at the start, except where a
+   * pointer press gave the focus.
+   * :where() keeps the first rule at zero specificity, so the field rules win. */
+  :where(.form-view > :not(.form-view__header)),
+  :where(.form-view > :not(.form-view__header)) * {
+    scroll-margin-block-end: var(--focus-ring-room);
+  }
+
+  .field:has(> small) {
+    --field-note-lines: 1;
+  }
+
+  .field:has(> small ~ small) {
+    --field-note-lines: 2;
+  }
+
+  .field:has(> .field-error > p) {
+    --field-error-lines: 1;
+  }
+
+  .field:has(> .field-error > p + p) {
+    --field-error-lines: 2;
+  }
+
+  .field:has(> .field-error > p + p + p) {
+    --field-error-lines: 3;
+  }
+
+  .field > input[type="checkbox"],
+  .field > fieldset > input[type="radio"] {
+    --field-row-rest: calc((var(--target-size) - var(--choice-size)) / 2);
+  }
+
+  .field > :is(input, select, textarea),
+  .field > fieldset > input[type="radio"] {
+    scroll-margin-block-end: max(
+      var(--focus-ring-room),
+      var(--field-row-rest, 0px) + (var(--field-note-lines, 0) + var(--field-error-lines, 0)) *
+        (var(--space-1) + var(--font-size-small) * var(--line-height-base))
+    );
   }
 
   /* Fields: one per row in tabIndex order. Each child of .field takes a full

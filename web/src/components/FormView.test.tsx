@@ -631,6 +631,14 @@ function isDisabled(element: Element): boolean {
   return element.matches(':disabled');
 }
 
+/**
+ * Whether a control is held while a save runs: marked unavailable (aria-disabled), yet not
+ * disabled, so the browser keeps focus on it.
+ */
+function isHeld(element: Element): boolean {
+  return !isDisabled(element) && element.getAttribute('aria-disabled') === 'true';
+}
+
 function controlValue(element: HTMLElement): string {
   if (
     element instanceof HTMLInputElement ||
@@ -1908,7 +1916,7 @@ describe('FormView field rendering: isolation, row identity, registry lookup and
 });
 
 describe('FormView save progress', () => {
-  it('announces Saving… in the form toolbar while a save is under way, with Save disabled and still named Save, then Changes saved. until the next edit', async () => {
+  it('announces Saving… in the form toolbar while a save is under way, with Save held and still named Save, then Changes saved. until the next edit', async () => {
     const { definition } = await renderForm();
     const formActions = screen.getByRole('toolbar', { name: 'Form actions' });
     const status = within(formActions).getByRole('status');
@@ -1918,6 +1926,8 @@ describe('FormView save progress', () => {
 
     edit(definition, 'LastName', EDITED_LAST_NAME);
     const held = holdWrite();
+    // Pressed from the keyboard, so Save holds focus as it is activated.
+    save.focus();
     fireEvent.click(save);
     await waitFor(() => {
       expect(writeCalls()).toHaveLength(1);
@@ -1926,7 +1936,12 @@ describe('FormView save progress', () => {
     expect(within(formActions).getByRole('status')).toBe(status);
     expect(status.textContent).toBe('Saving…');
     expect(within(formActions).getByRole('button', { name: 'Save' })).toBe(save);
-    expect(isDisabled(save)).toBe(true);
+    // Held, not disabled, so it keeps the focus; a second press meanwhile sends nothing.
+    expect(isHeld(save)).toBe(true);
+    expect(document.activeElement).toBe(save);
+    fireEvent.click(save);
+    await flush();
+    expect(writeCalls()).toHaveLength(1);
 
     held.release({ kind: 'saved', record: savedWith(RECORD, { LastName: EDITED_LAST_NAME }) });
     // The same status confirms the stored edit, visibly, until the draft changes again.
@@ -1936,6 +1951,8 @@ describe('FormView save progress', () => {
     expect(status.classList.contains('visually-hidden')).toBe(false);
 
     expect(isDisabled(save)).toBe(false);
+    expect(save.hasAttribute('aria-disabled')).toBe(false);
+    expect(document.activeElement).toBe(save);
     const writes = writeCalls();
     expect(writes.map(requestLine)).toEqual([`PUT ${FORM_PATH}/records/${RECORD.globalRecordId}`]);
     expect(writtenValues(writes[0])).toEqual({ LastName: EDITED_LAST_NAME });
@@ -1976,11 +1993,18 @@ describe('FormView save progress', () => {
       expect(status.textContent).toBe('Saving…');
     });
     expect(writeCalls().map(requestLine)).toEqual([`POST ${FORM_PATH}/checkcode/field-event`]);
-    expect(isDisabled(formActionButton('Save'))).toBe(true);
+    expect(isHeld(formActionButton('Save'))).toBe(true);
     expect(isDisabled(formActionButton('Delete'))).toBe(true);
-    for (const name of ['First', 'Previous', 'Next', 'Last', 'Go', 'New']) {
+    // Previous, at record 1, and Next, which counts from the move's target, the last record,
+    // are edges, which stay disabled while neither holds focus: a script's click focuses
+    // nothing. A Next pressed from the keyboard would hold focus, and be held instead.
+    for (const name of ['First', 'Last', 'Go', 'New']) {
+      expect(isHeld(within(navigator).getByRole('button', { name })), name).toBe(true);
+    }
+    for (const name of ['Previous', 'Next']) {
       expect(isDisabled(within(navigator).getByRole('button', { name })), name).toBe(true);
     }
+    expect(isHeld(within(navigator).getByRole('textbox', { name: 'Go to record' }))).toBe(true);
     expect(navigator.getAttribute('aria-busy')).toBe('true');
     const grid = screen.getByRole('region', { name: 'Records' });
     expect(within(grid).getByRole('row', { name: new RegExp(B_LAST_NAME) }).getAttribute('aria-disabled')).toBe('true');
@@ -3292,6 +3316,196 @@ describe('FormView sticky header and page tabs', () => {
     await flush();
   });
 
+  // styles.css also gives the controls below the header a block-end scroll margin, for their
+  // focus ring and the lines that describe them; here Last Name gets `endMargin` below a
+  // 188px block-start margin in an 800px viewport. Focus that leaves the control ending
+  // inside it, as Chromium leaves a textarea it scrolls only as far as its caret, scrolls the
+  // control up until the margin ends at the viewport's bottom, in whole pixels and never with
+  // its start inside the block-start margin. A control clear of its margin, one with none (a
+  // header control), one taller than the room between its margins and one wholly below the
+  // viewport stay, and so does one a pointer press focuses, until the press ends in its
+  // click, a cancel or a key press.
+  it.each<{
+    label: string;
+    endMargin: string;
+    top: number;
+    height: number;
+    press: 'none' | 'held' | 'clicked' | 'cancelled' | 'keyed';
+    scrolledBy: number | null;
+  }>([
+    { label: 'ending inside its end margin', endMargin: '24px', top: 740, height: 44, press: 'none', scrolledBy: 8 },
+    { label: 'running past the viewport', endMargin: '24px', top: 700, height: 114, press: 'none', scrolledBy: 38 },
+    { label: 'ending a fraction inside it', endMargin: '24px', top: 700.5, height: 103.25, press: 'none', scrolledBy: 28 },
+    { label: 'just below its start margin', endMargin: '24px', top: 191.5, height: 588, press: 'none', scrolledBy: 3 },
+    { label: 'clear of its end margin', endMargin: '24px', top: 700, height: 76, press: 'none', scrolledBy: null },
+    { label: 'with no end margin', endMargin: '0px', top: 740, height: 76, press: 'none', scrolledBy: null },
+    { label: 'taller than the room between its margins', endMargin: '24px', top: 400, height: 600, press: 'none', scrolledBy: null },
+    { label: 'wholly below the viewport', endMargin: '24px', top: 900, height: 44, press: 'none', scrolledBy: null },
+    { label: 'focused by a pointer press', endMargin: '24px', top: 700, height: 114, press: 'held', scrolledBy: null },
+    { label: 'focused after a press and its click', endMargin: '24px', top: 700, height: 114, press: 'clicked', scrolledBy: 38 },
+    { label: 'focused after a cancelled press', endMargin: '24px', top: 700, height: 114, press: 'cancelled', scrolledBy: 38 },
+    { label: 'focused after a press and a key', endMargin: '24px', top: 700, height: 114, press: 'keyed', scrolledBy: 38 },
+  ])('scrolls a focused control $label by $scrolledBy px to clear its end margin (null: not at all)', async ({
+    endMargin,
+    top,
+    height,
+    press,
+    scrolledBy,
+  }) => {
+    // Focus raises FieldBefore, which the fake API answers with no effects.
+    const { definition } = await renderForm(createFormDefinitionFixture(), { answersFieldEvents: true });
+    const control = controlOf(definition, 'LastName');
+    const realComputedStyle = window.getComputedStyle.bind(window);
+    vi.spyOn(window, 'getComputedStyle').mockImplementation((element, pseudoElement) => {
+      const style = realComputedStyle(element, pseudoElement);
+      if (element === control) {
+        Object.defineProperty(style, 'scrollMarginBlockStart', { value: '188px' });
+        Object.defineProperty(style, 'scrollMarginBlockEnd', { value: endMargin });
+      }
+      return style;
+    });
+    vi.spyOn(Element.prototype, 'getBoundingClientRect').mockImplementation(function (this: Element) {
+      return this === control ? new DOMRect(0, top, 600, height) : new DOMRect();
+    });
+    vi.spyOn(Element.prototype, 'clientHeight', 'get').mockReturnValue(800);
+    const scrollBy = vi.spyOn(window, 'scrollBy').mockImplementation(() => undefined);
+
+    if (press !== 'none') {
+      fireEvent.pointerDown(control);
+    }
+    if (press === 'clicked') {
+      fireEvent.click(control);
+    } else if (press === 'cancelled') {
+      fireEvent.pointerCancel(control);
+    } else if (press === 'keyed') {
+      fireEvent.keyDown(document.body, { key: 'Tab' });
+    }
+    act(() => {
+      control.focus();
+    });
+
+    expect(document.activeElement).toBe(control);
+    expect(scrollBy.mock.calls).toEqual(scrolledBy === null ? [] : [[0, scrolledBy]]);
+    await flush();
+  });
+
+  // The block-start correction waits for a pointer press to end, so the press's click lands on
+  // the control it was pressed on. Last Name gets a block-start `margin` of 188px (the stuck
+  // parts and the ring room) or 4px (the ring room alone, where nothing sticks) and starts at
+  // `top` in an 800px viewport. Keyboard focus, and focus after a press's click, as its label
+  // gives, scroll it at once. Focus a press gives scrolls nothing until the press ends in its
+  // click or a cancel, and then a task later (`deferred`), only for a control still focused
+  // and not above the viewport. A press with neither, which a key or a new press ends, leaves
+  // nothing pending, and a new press cancels a correction still waiting for its task.
+  it.each<{
+    label: string;
+    margin: string;
+    top: number;
+    press:
+      | 'none'
+      | 'clicked'
+      | 'cancelled'
+      | 'focused after its click'
+      | 'held'
+      | 'keyed'
+      | 'pressed again'
+      | 'clicked, then pressed again'
+      | 'clicked, then blurred';
+    deferred: boolean;
+    scrolledBy: number | null;
+  }>([
+    { label: 'from the keyboard, inside the ring room', margin: '4px', top: 1.5, press: 'none', deferred: false, scrolledBy: -2.5 },
+    { label: 'from the keyboard, under the stuck parts', margin: '188px', top: 150, press: 'none', deferred: false, scrolledBy: -38 },
+    { label: 'by a press inside the ring room', margin: '4px', top: 1.5, press: 'clicked', deferred: true, scrolledBy: -2.5 },
+    { label: 'by a press just below the stuck parts', margin: '188px', top: 186.5, press: 'clicked', deferred: true, scrolledBy: -1.5 },
+    { label: 'by a cancelled press', margin: '4px', top: 1.5, press: 'cancelled', deferred: true, scrolledBy: -2.5 },
+    { label: 'after a press and its click', margin: '4px', top: 1.5, press: 'focused after its click', deferred: false, scrolledBy: -2.5 },
+    { label: 'by a press, starting above the viewport', margin: '4px', top: -20, press: 'clicked', deferred: true, scrolledBy: null },
+    { label: 'by a press still held', margin: '4px', top: 1.5, press: 'held', deferred: true, scrolledBy: null },
+    { label: 'by a press a key ended', margin: '4px', top: 1.5, press: 'keyed', deferred: true, scrolledBy: null },
+    { label: 'by a press a new press ended', margin: '4px', top: 1.5, press: 'pressed again', deferred: true, scrolledBy: null },
+    { label: 'by a clicked press, then a new press', margin: '4px', top: 1.5, press: 'clicked, then pressed again', deferred: true, scrolledBy: null },
+    { label: 'by a clicked press, then blurred', margin: '4px', top: 1.5, press: 'clicked, then blurred', deferred: true, scrolledBy: null },
+  ])('scrolls a control focused $label by $scrolledBy px to clear its start margin (null: not at all)', async ({
+    margin,
+    top,
+    press,
+    deferred,
+    scrolledBy,
+  }) => {
+    // Focus raises FieldBefore, which the fake API answers with no effects.
+    const { definition } = await renderForm(createFormDefinitionFixture(), { answersFieldEvents: true });
+    const control = controlOf(definition, 'LastName');
+    const realComputedStyle = window.getComputedStyle.bind(window);
+    vi.spyOn(window, 'getComputedStyle').mockImplementation((element, pseudoElement) => {
+      const style = realComputedStyle(element, pseudoElement);
+      if (element === control) {
+        Object.defineProperty(style, 'scrollMarginBlockStart', { value: margin });
+      }
+      return style;
+    });
+    vi.spyOn(Element.prototype, 'getBoundingClientRect').mockImplementation(function (this: Element) {
+      return this === control ? new DOMRect(0, top, 600, 44) : new DOMRect();
+    });
+    vi.spyOn(Element.prototype, 'clientHeight', 'get').mockReturnValue(800);
+    const scrollBy = vi.spyOn(window, 'scrollBy').mockImplementation(() => undefined);
+    const scrolledAtOnce = scrolledBy === null || deferred ? [] : [[0, scrolledBy]];
+
+    if (press !== 'none') {
+      fireEvent.pointerDown(control);
+    }
+    if (press === 'focused after its click') {
+      fireEvent.click(control);
+    }
+    act(() => {
+      control.focus();
+    });
+    expect(document.activeElement).toBe(control);
+    expect(scrollBy.mock.calls).toEqual(scrolledAtOnce);
+
+    switch (press) {
+      case 'clicked':
+        fireEvent.click(control);
+        break;
+      case 'cancelled':
+        fireEvent.pointerCancel(control);
+        break;
+      case 'keyed':
+        // The key ends the press while the pointer may still be down; its release comes after.
+        fireEvent.keyDown(control, { key: 'a' });
+        fireEvent.click(control);
+        break;
+      case 'pressed again':
+        fireEvent.pointerDown(document.body);
+        fireEvent.click(document.body);
+        break;
+      case 'clicked, then pressed again':
+        fireEvent.click(control);
+        fireEvent.pointerDown(document.body);
+        fireEvent.click(document.body);
+        break;
+      case 'clicked, then blurred':
+        fireEvent.click(control);
+        act(() => {
+          control.blur();
+        });
+        break;
+      case 'none':
+      case 'focused after its click':
+      case 'held':
+        break;
+    }
+    // The press's click is dispatched over the layout it was pressed on.
+    expect(scrollBy.mock.calls).toEqual(scrolledAtOnce);
+
+    await flush();
+    expect(scrollBy.mock.calls).toEqual(scrolledBy === null ? [] : [[0, scrolledBy]]);
+    // Correcting the scroll never moves focus.
+    expect(document.activeElement).toBe(press === 'clicked, then blurred' ? document.body : control);
+    await flush();
+    expect(scrollBy.mock.calls).toEqual(scrolledBy === null ? [] : [[0, scrolledBy]]);
+  });
+
   // A sticky strip sticks 140px down, so its stuck bottom edge is at 184px. A panel starting
   // above that edge is scrolled back to start right at it: under the stuck strip, or with the
   // strip carried off-screen by a newly shown panel shorter than the old one, whose rect then
@@ -4428,8 +4642,9 @@ describe('FormView banner action focus', () => {
   // Retry, Save again, Discard edits and Dismiss each remove the banner whose button ran
   // them, at once or when the resent write starts. The form's heading then takes focus in
   // the commit that removes the button, before the browser could paint, so focus never
-  // rests on the page body. A banner that appears moves no focus, and focus the user moved
-  // elsewhere stays there.
+  // rests on the page body. A banner that a resend brings back moves no focus, and focus the
+  // user moved elsewhere stays there; the banner of a failed Save takes focus as the outcome
+  // of the Save it stopped ('FormView focus and feedback after actions').
 
   const AT_1_PATH = `${FORM_PATH}/records/at/1`;
   const AT_2_PATH = `${FORM_PATH}/records/at/2`;
@@ -4483,7 +4698,7 @@ describe('FormView banner action focus', () => {
   /**
    * Edits LastName and saves it with a PUT the fake answers with `problem`, and returns the
    * banner that shows the failure. The click does not focus Save, so focus is on the page
-   * body when the banner appears, and stays there: a banner that appears moves no focus.
+   * body when the banner appears, and the banner takes it as the outcome of the stopped Save.
    */
   async function failedSave(
     definition: FormDefinition,
@@ -4494,7 +4709,7 @@ describe('FormView banner action focus', () => {
     fireEvent.click(formActionButton('Save'));
     const banner = await screen.findByRole('alert');
     await flush();
-    expect(document.activeElement).toBe(document.body);
+    expect(document.activeElement).toBe(banner);
     return banner;
   }
 
@@ -5134,37 +5349,86 @@ describe('FormView focus and feedback after actions', () => {
     expect(writeCalls()).toEqual([]);
   });
 
-  // A Save refused with a banner, Save enabled again, leaves focus on Save: the stopped-action
-  // outcome moves focus only to a validation summary. A 409, which disables Save, is
-  // 'FormView record found deleted by its save (409)'.
+  // A Save or move stopped by a failed save that shows a banner, and no field errors, focuses
+  // that banner, which focusing scrolls into view below the sticky header: the user learns why
+  // the draft was not saved or left wherever they were on the page. A 409, which disables Save,
+  // is 'FormView record found deleted by its save (409)'.
+  const UNAVAILABLE_NOT_WRITTEN: WriteReply = {
+    kind: 'problem',
+    problem: {
+      type: 'https://tools.ietf.org/html/rfc9110#section-15.6.4',
+      title: 'Service Unavailable',
+      status: 503,
+      detail: 'The test database is unavailable.',
+      traceId: '00-test-outcome-unavailable-00',
+      writeOutcome: 'notWritten',
+    },
+  };
+  const TOO_LARGE: WriteReply = {
+    kind: 'problem',
+    problem: {
+      type: 'https://tools.ietf.org/html/rfc9110#section-15.5.14',
+      title: 'Content Too Large',
+      status: 413,
+      detail: 'The test server refused a body over its limit.',
+      traceId: '00-test-outcome-too-large-00',
+    },
+  };
+  const FORBIDDEN: WriteReply = { kind: 'problem', problem: FORBIDDEN_PROBLEM };
+  const LEAVE_CANCELLED = 'Leaving this record was cancelled.';
+
   it.each<{
     label: string;
+    /** The control the case presses from the keyboard. */
+    control: () => HTMLElement;
     /** The PUT's answer: a problem the server refuses it with, or no response at all. */
     reply: WriteReply | 'no response';
-    /** Text on screen once the refusal is shown. */
+    /** Text the banner shows once the refusal is shown. */
     shown: string;
   }>([
     {
-      label: 'a 503, under the connection banner',
-      reply: {
-        kind: 'problem',
-        problem: {
-          type: 'https://tools.ietf.org/html/rfc9110#section-15.6.4',
-          title: 'Service Unavailable',
-          status: 503,
-          detail: 'The test database is unavailable.',
-          traceId: '00-test-outcome-unavailable-00',
-          writeOutcome: 'notWritten',
-        },
-      },
+      label: 'Save refused with a 503, under the connection banner',
+      control: () => formActionButton('Save'),
+      reply: UNAVAILABLE_NOT_WRITTEN,
       shown: 'The database cannot be reached. Your changes are still on screen.',
     },
     {
-      label: 'no response, under the banner offering Save again',
+      label: 'Save refused with no response, under the banner offering Save again',
+      control: () => formActionButton('Save'),
       reply: 'no response',
       shown: 'The save may already have been applied',
     },
-  ])('keeps focus on Save when a Save is refused with $label', async ({ reply, shown }) => {
+    {
+      label: 'Save refused with a 413',
+      control: () => formActionButton('Save'),
+      reply: TOO_LARGE,
+      shown: 'Request too large',
+    },
+    {
+      label: 'Save refused with a 403',
+      control: () => formActionButton('Save'),
+      reply: FORBIDDEN,
+      shown: 'You do not have permission to save changes to this record.',
+    },
+    {
+      label: 'Next whose save is refused with a 503',
+      control: () => navigatorButton('Next'),
+      reply: UNAVAILABLE_NOT_WRITTEN,
+      shown: LEAVE_CANCELLED,
+    },
+    {
+      label: 'Next whose save is refused with a 413',
+      control: () => navigatorButton('Next'),
+      reply: TOO_LARGE,
+      shown: LEAVE_CANCELLED,
+    },
+    {
+      label: 'Next whose save is refused with a 403',
+      control: () => navigatorButton('Next'),
+      reply: FORBIDDEN,
+      shown: LEAVE_CANCELLED,
+    },
+  ])('focuses the banner that says why for $label', async ({ control, reply, shown }) => {
     const { definition } = await renderForm(createFormDefinitionFixture(), {
       records: [RECORD_A, RECORD_B],
       route: (call) =>
@@ -5174,19 +5438,363 @@ describe('FormView focus and feedback after actions', () => {
       replyToWrite(reply);
     }
     edit(definition, 'FirstName', 'Adah');
+
+    press(control());
+
+    const banner = await findAlertContaining(shown);
+    await flush();
+    expect(document.activeElement).toBe(banner);
+    expect(banner.getAttribute('tabindex')).toBe('-1');
+    expect(banner.classList.contains('banner')).toBe(true);
+    // No summary, and so no line telling the user to correct fields.
+    expect(screen.queryByRole('heading', { name: 'Please correct the following' })).toBeNull();
+    expect(isDisabled(formActionButton('Save'))).toBe(false);
+    expect(isDisabled(formActionButton('Delete'))).toBe(false);
+    expect(writeCalls().map(requestLine)).toEqual([`PUT ${A_PATH}`]);
+    expect(navigatorStatus()).toBe('1 of 2');
+    expect(controlValue(controlOf(definition, 'FirstName'))).toBe('Adah');
+  });
+
+  it('focuses the permission banner of a move whose save the definition denies, sending nothing', async () => {
+    const { definition } = await renderForm(
+      { ...createFormDefinitionFixture(), canInsert: true, canUpdate: false, canDelete: true },
+      { records: [RECORD_A, RECORD_B] },
+    );
+    expect(isDisabled(formActionButton('Save'))).toBe(true);
+    edit(definition, 'FirstName', 'Adah');
+
+    press(navigatorButton('Next'));
+
+    const banner = await findAlertContaining('You do not have permission to save changes to this record.');
+    await flush();
+    expect(banner.textContent).toContain(LEAVE_CANCELLED);
+    expect(document.activeElement).toBe(banner);
+    expect(writeCalls()).toEqual([]);
+    expect(navigatorStatus()).toBe('1 of 2');
+    expect(controlValue(controlOf(definition, 'FirstName'))).toBe('Adah');
+  });
+
+  it('focuses the 413 banner over the field errors an earlier 400 left, with no line telling the user to correct them', async () => {
+    const { definition } = await renderForm(createFormDefinitionFixture(), { records: [RECORD_A, RECORD_B] });
+    edit(definition, 'FirstName', 'Adah');
+    replyToWrite({ kind: 'problem', problem: fieldLevelProblem({ LastName: ['The test server rejects this name.'] }) });
     const save = formActionButton('Save');
 
     press(save);
+    const summary = await findValidationSummary();
+    await within(summary).findByText('The record was not saved: correct the fields below.');
+    await flush();
+    expect(document.activeElement).toBe(summary);
 
+    edit(definition, 'FirstName', 'Adah Augusta');
+    replyToWrite(TOO_LARGE);
+    press(save);
+
+    const banner = await findAlertContaining('Request too large');
+    await flush();
+    expect(document.activeElement).toBe(banner);
+    // The 400's message stays, but the 413 stopped this Save, so the summary no longer says the fields did.
+    expect(summaryItemsFor(summary, promptOf(fieldByName('LastName', definition)))).toHaveLength(1);
+    expect(within(summary).queryByText('The record was not saved: correct the fields below.')).toBeNull();
+    expect(writeCalls().map(requestLine)).toEqual([`PUT ${A_PATH}`, `PUT ${A_PATH}`]);
+  });
+
+  // While the save a move waits on is held, the move pressed from the keyboard is held too, not
+  // disabled, so focus stays on it and never falls to the page body; Tab moves on from it as
+  // usual, and the outcome takes focus only from the button the move started on. Record 1's
+  // Previous stays disabled meanwhile, so Shift+Tab from Next reaches First, as before the press.
+  // Next counts from the pending record 2, the last, so it is disabled once focus leaves it.
+  it.each<{ label: string; tabTo: string | null }>([
+    { label: 'focuses the banner of the failed save from Next', tabTo: null },
+    { label: 'leaves focus on the control Tab moved it to', tabTo: 'Last' },
+    { label: 'leaves focus on the control Shift+Tab moved it to', tabTo: 'First' },
+  ])('keeps focus on a Next held by its save, and $label', async ({ tabTo }) => {
+    const { definition } = await renderForm(createFormDefinitionFixture(), { records: [RECORD_A, RECORD_B] });
+    edit(definition, 'FirstName', 'Adah');
+    const held = holdWrite();
+    const next = navigatorButton('Next');
+
+    press(next);
     await waitFor(() => {
-      expect(document.body.textContent).toContain(shown);
+      expect(writeCalls()).toHaveLength(1);
+    });
+    expect(toolbarStatus().textContent).toBe('Saving…');
+    expect(isHeld(next)).toBe(true);
+    expect(document.activeElement).toBe(next);
+    const previous = navigatorButton('Previous');
+    expect(isDisabled(previous)).toBe(true);
+    expect(previous.hasAttribute('aria-disabled')).toBe(false);
+    // A second press while the save is held starts nothing.
+    fireEvent.click(next);
+    await flush();
+    expect(document.activeElement).toBe(next);
+    expect(writeCalls()).toHaveLength(1);
+    if (tabTo !== null) {
+      const moved = navigatorButton(tabTo);
+      act(() => {
+        moved.focus();
+      });
+      expect(document.activeElement).toBe(moved);
+      expect(isHeld(moved)).toBe(true);
+      expect(isDisabled(next)).toBe(true);
+    }
+    expect(isDisabled(previous)).toBe(true);
+
+    held.release(UNAVAILABLE_NOT_WRITTEN);
+
+    const banner = await findAlertContaining(LEAVE_CANCELLED);
+    await flush();
+    expect(document.activeElement).toBe(tabTo === null ? banner : navigatorButton(tabTo));
+    expect(isHeld(next)).toBe(false);
+    expect(isDisabled(next)).toBe(false);
+    expect(isDisabled(previous)).toBe(true);
+    expect(navigatorStatus()).toBe('1 of 2');
+    expect(writeCalls().map(requestLine)).toEqual([`PUT ${A_PATH}`]);
+  });
+
+  // Record 1 of 2 is the one before the last, so the Next pressed there is an edge from the
+  // press on: held while it keeps focus, through its save and the read of record 2, and
+  // disabled in the commit where record 2 lands, which moves its focus to Previous.
+  it('keeps focus on a Next pressed toward the last record, held until the move lands, then on Previous', async () => {
+    const atTwo = `${FORM_PATH}/records/at/2`;
+    const read = deferred();
+    let holdsRead = false;
+    const { definition } = await renderForm(createFormDefinitionFixture(), {
+      records: [RECORD_A, RECORD_B],
+      route: (call) => (holdsRead && call.method === 'GET' && call.url.pathname === atTwo ? read.response : null),
+    });
+    edit(definition, 'FirstName', 'Adah');
+    const held = holdWrite();
+    const next = navigatorButton('Next');
+    const previous = navigatorButton('Previous');
+    holdsRead = true;
+
+    press(next);
+    await waitFor(() => {
+      expect(writeCalls()).toHaveLength(1);
+    });
+    expect(isHeld(next)).toBe(true);
+    expect(isDisabled(previous)).toBe(true);
+    expect(document.activeElement).toBe(next);
+
+    held.release({ kind: 'saved', record: savedWith(RECORD_A, { FirstName: 'Adah' }) });
+    await waitFor(() => {
+      expect(calls.some((call) => call.method === 'GET' && call.url.pathname === atTwo)).toBe(true);
     });
     await flush();
-    expect(isDisabled(save)).toBe(false);
-    expect(isDisabled(formActionButton('Delete'))).toBe(false);
-    expect(document.activeElement).toBe(save);
-    expect(writeCalls().map(requestLine)).toEqual([`PUT ${A_PATH}`]);
+    // The save is over, so the toolbar no longer holds Last; Next, which holds focus, still is.
+    expect(isHeld(navigatorButton('Last'))).toBe(false);
     expect(navigatorStatus()).toBe('1 of 2');
+    expect(isHeld(next)).toBe(true);
+    expect(document.activeElement).toBe(next);
+
+    read.release(jsonResponse(200, RECORD_B));
+    await waitFor(() => {
+      expect(navigatorStatus()).toBe('2 of 2');
+    });
+    await flush();
+    expect(isDisabled(next)).toBe(true);
+    expect(next.hasAttribute('aria-disabled')).toBe(false);
+    expect(document.activeElement).toBe(previous);
+    expect(isHeld(previous)).toBe(false);
+    expect(writeCalls().map(requestLine)).toEqual([`PUT ${A_PATH}`]);
+  });
+
+  it('keeps focus on a Go held by its save, and there once the save succeeds and the move lands', async () => {
+    const { definition } = await renderForm(createFormDefinitionFixture(), { records: [RECORD_A, RECORD_B] });
+    edit(definition, 'FirstName', 'Adah');
+    const held = holdWrite();
+    const box = screen.getByRole<HTMLInputElement>('textbox', { name: 'Go to record' });
+    fireEvent.change(box, { target: { value: '2' } });
+    const go = navigatorButton('Go');
+
+    press(go);
+    await waitFor(() => {
+      expect(writeCalls()).toHaveLength(1);
+    });
+    expect(isHeld(go)).toBe(true);
+    expect(isHeld(box)).toBe(true);
+    expect(box.readOnly).toBe(true);
+    expect(document.activeElement).toBe(go);
+
+    held.release({ kind: 'saved', record: savedWith(RECORD_A, { FirstName: 'Adah' }) });
+
+    await waitFor(() => {
+      expect(navigatorStatus()).toBe('2 of 2');
+    });
+    await flush();
+    expect(document.activeElement).toBe(go);
+    expect(isHeld(go)).toBe(false);
+    expect(box.readOnly).toBe(false);
+    expect(writeCalls().map(requestLine)).toEqual([`PUT ${A_PATH}`]);
+  });
+
+  // An outcome that may not take focus, the user having moved focus on while the save was held,
+  // is scrolled into view without taking it: by the least distance that shows the banner clear
+  // of its scroll margins in a 1000px viewport, 188px under a stuck header (4px, its focus ring,
+  // where the header does not stick) and 4px below. A control in a header that sticks stays in
+  // view whatever the scroll. Any other control moves with the page and keeps its 4px focus ring
+  // in view: a banner below it is shown from its start as far as that allows, one above it only
+  // in full. Focus in a field is never scrolled away from. jsdom lays nothing out, so the boxes
+  // and styles are given here.
+  it.each<{
+    label: string;
+    /** The control the case presses from the keyboard. */
+    control: () => HTMLElement;
+    /** Where the case moves focus while the save is held. */
+    movedTo: (definition: FormDefinition) => HTMLElement;
+    headerPosition: 'sticky' | 'static';
+    /** The top and bottom of the banner's box once it is shown. */
+    bannerBox: readonly [number, number];
+    /** The top and bottom of the focused control's box. */
+    focusedBox: readonly [number, number];
+    scrolledBy: number | null;
+  }>([
+    {
+      label: 'Save, with focus moved on to Find in the sticky header',
+      control: () => formActionButton('Save'),
+      movedTo: () => formActionButton('Find'),
+      headerPosition: 'sticky',
+      bannerBox: [-1321.5, -1195.5],
+      focusedBox: [12, 56],
+      scrolledBy: -1510,
+    },
+    {
+      label: 'Next, with focus moved on to Last in the sticky header',
+      control: () => navigatorButton('Next'),
+      movedTo: () => navigatorButton('Last'),
+      headerPosition: 'sticky',
+      bannerBox: [-1321.5, -1195.5],
+      focusedBox: [80, 124],
+      scrolledBy: -1510,
+    },
+    {
+      label: 'Save, with focus moved on to Find in the sticky header and the banner already in view',
+      control: () => formActionButton('Save'),
+      movedTo: () => formActionButton('Find'),
+      headerPosition: 'sticky',
+      bannerBox: [200, 326],
+      focusedBox: [12, 56],
+      scrolledBy: null,
+    },
+    {
+      label: 'Save, with focus moved on to Find in a header that does not stick, where both fit',
+      control: () => formActionButton('Save'),
+      movedTo: () => formActionButton('Find'),
+      headerPosition: 'static',
+      bannerBox: [900, 1026],
+      focusedBox: [700, 744],
+      scrolledBy: 30,
+    },
+    {
+      label: 'Save, with focus moved on to Find in a header that does not stick, where both do not fit',
+      control: () => formActionButton('Save'),
+      movedTo: () => formActionButton('Find'),
+      headerPosition: 'static',
+      bannerBox: [900, 1026],
+      focusedBox: [20, 64],
+      scrolledBy: 16,
+    },
+    {
+      label: 'Save, with focus moved on to Find in a header that does not stick, the banner out of its reach',
+      control: () => formActionButton('Save'),
+      movedTo: () => formActionButton('Find'),
+      headerPosition: 'static',
+      bannerBox: [1100, 1226],
+      focusedBox: [20, 64],
+      scrolledBy: null,
+    },
+    {
+      label: "Save, with focus moved on to a grid row's Open below the banner, where both fit",
+      control: () => formActionButton('Save'),
+      movedTo: () => openButtonOfB(),
+      headerPosition: 'sticky',
+      bannerBox: [-100, 26],
+      focusedBox: [500, 544],
+      scrolledBy: -288,
+    },
+    {
+      label: "Save, with focus moved on to a grid row's Open below the banner, where both do not fit",
+      control: () => formActionButton('Save'),
+      movedTo: () => openButtonOfB(),
+      headerPosition: 'sticky',
+      bannerBox: [-1321.5, -1195.5],
+      focusedBox: [500, 544],
+      scrolledBy: null,
+    },
+    {
+      label: 'Save, with focus moved into a field',
+      control: () => formActionButton('Save'),
+      movedTo: (definition) => controlOf(definition, 'LastName'),
+      headerPosition: 'sticky',
+      bannerBox: [-1321.5, -1195.5],
+      focusedBox: [300, 344],
+      scrolledBy: null,
+    },
+  ])('leaves focus where the user moved it and scrolls the 413 banner by $scrolledBy px (null: not at all) for $label', async ({
+    control,
+    movedTo,
+    headerPosition,
+    bannerBox,
+    focusedBox,
+    scrolledBy,
+  }) => {
+    // Focus moved into a field raises FieldBefore, which the fake API answers with no effects.
+    const { definition } = await renderForm(createFormDefinitionFixture(), {
+      records: [RECORD_A, RECORD_B],
+      answersFieldEvents: true,
+    });
+    edit(definition, 'FirstName', 'Adah');
+    const moved = movedTo(definition);
+    const isEditorBanner = (element: Element): boolean =>
+      element.classList.contains('banner') && element.getAttribute('role') === 'alert';
+    const realComputedStyle = window.getComputedStyle.bind(window);
+    vi.spyOn(window, 'getComputedStyle').mockImplementation((element, pseudoElement) => {
+      const style = realComputedStyle(element, pseudoElement);
+      if (element.classList.contains('form-view__header')) {
+        Object.defineProperty(style, 'position', { value: headerPosition });
+      } else if (isEditorBanner(element)) {
+        Object.defineProperty(style, 'scrollMarginBlockStart', {
+          value: headerPosition === 'sticky' ? '188px' : '4px',
+        });
+        Object.defineProperty(style, 'scrollMarginBlockEnd', { value: '4px' });
+      } else if (element === moved) {
+        Object.defineProperty(style, 'outlineStyle', { value: 'solid' });
+        Object.defineProperty(style, 'outlineWidth', { value: '2px' });
+        Object.defineProperty(style, 'outlineOffset', { value: '2px' });
+      }
+      return style;
+    });
+    vi.spyOn(Element.prototype, 'getBoundingClientRect').mockImplementation(function (this: Element) {
+      const box = this === moved ? focusedBox : isEditorBanner(this) ? bannerBox : null;
+      return box === null ? new DOMRect() : new DOMRect(0, box[0], 600, box[1] - box[0]);
+    });
+    vi.spyOn(Element.prototype, 'clientHeight', 'get').mockReturnValue(1000);
+    const scrollBy = vi.spyOn(window, 'scrollBy').mockImplementation(() => undefined);
+    const held = holdWrite();
+
+    press(control());
+    await waitFor(() => {
+      expect(writeCalls()).toHaveLength(1);
+    });
+    act(() => {
+      moved.focus();
+    });
+    expect(document.activeElement).toBe(moved);
+    held.release(TOO_LARGE);
+
+    const banner = await findAlertContaining('Request too large');
+    await flush();
+    expect(isEditorBanner(banner)).toBe(true);
+    expect(document.activeElement).toBe(moved);
+    expect(scrollBy.mock.calls).toEqual(scrolledBy === null ? [] : [[0, scrolledBy]]);
+    expect(navigatorStatus()).toBe('1 of 2');
+    // The field's FieldBefore aside, the one write is the refused PUT.
+    expect(
+      writeCalls()
+        .filter((call) => !call.url.pathname.endsWith('/checkcode/field-event'))
+        .map(requestLine),
+    ).toEqual([`PUT ${A_PATH}`]);
   });
 
   // Focusing the element that already holds focus does nothing, scrolling included. An attempt
@@ -5317,8 +5925,9 @@ describe('FormView focus and feedback after actions', () => {
 describe('FormView record found deleted by its save (409)', () => {
   // The 409's banner says the record is deleted and read-only and that the edits on screen
   // were not saved; while it is up it stands in for the deleted status, which returns once
-  // it is dismissed. Save stays disabled, so the heading takes the focus Save lost; a
-  // navigator button whose leave the 409 cancelled keeps the focus returned to it.
+  // it is dismissed. It ends the field errors of earlier saves, which no protected field can
+  // take, and takes focus as the outcome of the Save or move it stopped, unless the user has
+  // moved focus elsewhere meanwhile.
   const CONFLICT_PROBLEM: ProblemDetails = {
     type: 'https://tools.ietf.org/html/rfc9110#section-15.5.10',
     title: 'Conflict',
@@ -5334,7 +5943,7 @@ describe('FormView record found deleted by its save (409)', () => {
   }
 
   it.each<{ label: string; focusFind: boolean }>([
-    { label: 'gives the heading the focus that Save lost', focusFind: false },
+    { label: 'focuses that banner as the outcome of the Save', focusFind: false },
     { label: 'leaves focus where the user moved it', focusFind: true },
   ])('says the edits were not saved in place of the deleted status, and $label', async ({ focusFind }) => {
     const { definition } = await renderForm();
@@ -5359,9 +5968,7 @@ describe('FormView record found deleted by its save (409)', () => {
     expect(isDisabled(formActionButton('Delete'))).toBe(true);
     expect(controlValue(controlOf(definition, 'LastName'))).toBe(EDITED_LAST_NAME);
     expect(isDisabled(controlOf(definition, 'LastName'))).toBe(true);
-    expect(document.activeElement).toBe(
-      focusFind ? find : screen.getByRole('heading', { level: 2, name: definition.name }),
-    );
+    expect(document.activeElement).toBe(focusFind ? find : alert);
 
     fireEvent.click(within(alert).getByRole('button', { name: 'Dismiss' }));
 
@@ -5370,41 +5977,100 @@ describe('FormView record found deleted by its save (409)', () => {
     expect(writeCalls().map(requestLine)).toEqual([`PUT ${FORM_PATH}/records/${RECORD.globalRecordId}`]);
   });
 
-  it('leaves the focus returned to the navigator button whose leave the 409 cancelled', async () => {
+  it('focuses the banner of the 409 that cancelled a move pressed from the keyboard', async () => {
     const { definition } = await renderForm(createFormDefinitionFixture(), { records: [RECORD_A, RECORD_B] });
     edit(definition, 'LastName', EDITED_LAST_NAME);
     const next = navigatorButton('Next');
     const held = holdWrite();
-    // The click does not focus Next, so focus is on the page body, where the browser drops it
-    // when the pressed Next is disabled while the leave saves.
+    // Pressed from the keyboard, so Next holds focus as the leave saves.
+    next.focus();
     fireEvent.click(next);
     await waitFor(() => {
       expect(writeCalls()).toHaveLength(1);
     });
-    expect(isDisabled(next)).toBe(true);
-    expect(document.activeElement).toBe(document.body);
-    // As the shell does for a button that lost focus by being disabled: once it is enabled
-    // again, a MutationObserver microtask after that commit returns focus to it, unless focus
-    // has gone elsewhere meanwhile.
-    const focusReturn = new MutationObserver(() => {
-      const active = document.activeElement;
-      if (!isDisabled(next) && (active === null || active === document.body)) {
-        next.focus();
-      }
-    });
-    focusReturn.observe(next, { attributes: true, attributeFilter: ['disabled'] });
-    try {
-      held.release({ kind: 'problem', problem: CONFLICT_PROBLEM });
+    held.release({ kind: 'problem', problem: CONFLICT_PROBLEM });
 
-      await findAlertContaining('not saved');
-      await flush();
-      expect(isDisabled(next)).toBe(false);
-      expect(document.activeElement).toBe(next);
-      expect(navigatorStatus()).toBe('1 of 2');
-      expect(writeCalls().map(requestLine)).toEqual([`PUT ${FORM_PATH}/records/${RECORD_A.globalRecordId}`]);
-    } finally {
-      focusReturn.disconnect();
+    const alert = await findAlertContaining('not saved');
+    await flush();
+    expect(within(alert).getByText(`${CONFLICT_TEXT} Leaving this record was cancelled.`)).toBeTruthy();
+    expect(document.activeElement).toBe(alert);
+    expect(isDisabled(next)).toBe(false);
+    expect(navigatorStatus()).toBe('1 of 2');
+    expect(writeCalls().map(requestLine)).toEqual([`PUT ${FORM_PATH}/records/${RECORD_A.globalRecordId}`]);
+  });
+
+  // A 400's field errors, a 413 that leaves them on screen, then a 409: the deleted state
+  // supersedes the errors, which no protected field can take, and its banner alone explains
+  // why the Save or move was stopped.
+  it.each<{ label: string; control: () => HTMLElement; text: string }>([
+    { label: 'Save', control: () => formActionButton('Save'), text: CONFLICT_TEXT },
+    {
+      label: 'Next',
+      control: () => navigatorButton('Next'),
+      text: `${CONFLICT_TEXT} Leaving this record was cancelled.`,
+    },
+  ])('ends the field errors of an earlier 400 and focuses the conflict banner when $label meets a 409 after a 413', async ({
+    control,
+    text,
+  }) => {
+    const REJECTED = 'The test server rejects this name.';
+    const STOPPED_LINES = [
+      'The record was not saved: correct the fields below.',
+      'Could not move to the next record: correct the fields below.',
+    ];
+    const { definition } = await renderForm(createFormDefinitionFixture(), { records: [RECORD_A, RECORD_B] });
+    const save = formActionButton('Save');
+    edit(definition, 'FirstName', 'Adah');
+    replyToWrite({ kind: 'problem', problem: fieldLevelProblem({ LastName: [REJECTED] }) });
+    save.focus();
+    fireEvent.click(save);
+    const summary = await findValidationSummary();
+    await flush();
+    expect(document.activeElement).toBe(summary);
+    expect(controlOf(definition, 'LastName').getAttribute('aria-invalid')).toBe('true');
+
+    edit(definition, 'FirstName', 'Adah Augusta');
+    replyToWrite({
+      kind: 'problem',
+      problem: {
+        type: 'https://tools.ietf.org/html/rfc9110#section-15.5.14',
+        title: 'Content Too Large',
+        status: 413,
+        detail: 'The test server refused a body over its limit.',
+        traceId: '00-test-too-large-00',
+      },
+    });
+    save.focus();
+    fireEvent.click(save);
+    await findAlertContaining('Request too large');
+    await flush();
+    expect(summary.isConnected).toBe(true);
+
+    replyToWrite({ kind: 'problem', problem: CONFLICT_PROBLEM });
+    const stopping = control();
+    stopping.focus();
+    fireEvent.click(stopping);
+
+    const alert = await findAlertContaining('not saved');
+    await flush();
+    expect(within(alert).getByText(text)).toBeTruthy();
+    expect(document.activeElement).toBe(alert);
+    // No summary, no stopped line and no inline error ask for a correction.
+    expect(summary.isConnected).toBe(false);
+    expect(screen.queryByRole('heading', { name: 'Please correct the following' })).toBeNull();
+    for (const line of STOPPED_LINES) {
+      expect(screen.queryByText(line)).toBeNull();
     }
+    expect(screen.queryByText(REJECTED)).toBeNull();
+    const lastName = controlOf(definition, 'LastName');
+    expect(lastName.getAttribute('aria-invalid')).toBeNull();
+    expect(isDisabled(lastName)).toBe(true);
+    expect(isDisabled(formActionButton('Save'))).toBe(true);
+    expect(isDisabled(formActionButton('Delete'))).toBe(true);
+    expect(controlValue(controlOf(definition, 'FirstName'))).toBe('Adah Augusta');
+    expect(navigatorStatus()).toBe('1 of 2');
+    const put = `PUT ${FORM_PATH}/records/${RECORD_A.globalRecordId}`;
+    expect(writeCalls().map(requestLine)).toEqual([put, put, put]);
   });
 });
 
@@ -5839,7 +6505,8 @@ describe('RecordNavigator pending and busy states', () => {
   // A pending navigation load disables no control: useRecordNavigation drops the responses
   // of a load a newer action overtakes, so a press mid-load supersedes it. The toolbar and
   // its status are marked busy and the load is announced instead. A control is disabled
-  // only while its operation is unavailable: an edge, an empty set, or a save in progress.
+  // only while its operation is unavailable: an edge or an empty set. A save in progress
+  // holds the others instead.
   type NavigatorState = RecordNavigatorProps['navigation'];
 
   const LOADING = 'Loading…';
@@ -6206,17 +6873,93 @@ describe('RecordNavigator pending and busy states', () => {
     expect(calls.filter((call) => call.url.pathname.endsWith('/checkcode/field-event')).map(requestLine)).toEqual([]);
   });
 
-  it('disables every control while the editor saves, and marks the toolbar busy without announcing a load', () => {
-    const navigation: NavigatorState = {
+  // A pending move counts Previous and Next from its target, while a save it waits on holds
+  // the toolbar on the record shown, so an edge of either stays disabled and out of the tab
+  // order. Only the edge that holds focus, the Next pressed toward the last record, is held,
+  // and only until focus leaves it.
+  it.each<{
+    label: string;
+    count: number;
+    statusText: string;
+    /** A move is pending, its save the one running. */
+    transitioning: boolean;
+    /** canPrevious and canNext, counted from a pending move's target as useRecordNavigation counts them. */
+    can: { readonly previous: boolean; readonly next: boolean };
+    /** canPreviousFromShown and canNextFromShown, counted from the record shown. */
+    shown: { readonly previous: boolean; readonly next: boolean };
+    /** The button that holds focus as the save starts: the one pressed. */
+    focused: 'Previous' | 'Next' | null;
+    /** The edges disabled while the save runs. */
+    disabled: readonly string[];
+    /** The edge held only while it holds focus. */
+    heldEdge: 'Previous' | 'Next' | null;
+  }>([
+    {
+      label: 'inside the set',
       count: 3,
       statusText: '2 of 3',
+      transitioning: false,
+      can: { previous: true, next: true },
+      shown: { previous: true, next: true },
+      focused: null,
+      disabled: [],
+      heldEdge: null,
+    },
+    {
+      label: 'at both edges of a one-record set, which stay disabled',
+      count: 1,
+      statusText: '1 of 1',
+      transitioning: false,
+      can: { previous: false, next: false },
+      shown: { previous: false, next: false },
+      focused: null,
+      disabled: ['Previous', 'Next'],
+      heldEdge: null,
+    },
+    {
+      label: 'on record 1 for a Next pressed there, keeping Previous disabled though the move counts it from record 2',
+      count: 3,
+      statusText: '1 of 3',
+      transitioning: true,
+      can: { previous: true, next: true },
+      shown: { previous: false, next: true },
+      focused: 'Next',
+      disabled: ['Previous'],
+      heldEdge: null,
+    },
+    {
+      label: 'for a Next pressed toward the last record, holding Next only while it keeps focus',
+      count: 3,
+      statusText: '2 of 3',
+      transitioning: true,
+      can: { previous: true, next: false },
+      shown: { previous: true, next: true },
+      focused: 'Next',
+      disabled: [],
+      heldEdge: 'Next',
+    },
+  ])('holds every available control while the editor saves $label, focusable and ignoring its press, and marks the toolbar busy without announcing a load', ({
+    count,
+    statusText,
+    transitioning,
+    can,
+    shown,
+    focused,
+    disabled,
+    heldEdge,
+  }) => {
+    const settled: NavigatorState = {
+      count,
+      statusText,
       goToError: null,
       loading: false,
       transitioning: false,
       recordGeneration: 1,
       canFirst: true,
-      canPrevious: true,
-      canNext: true,
+      canPrevious: shown.previous,
+      canNext: shown.next,
+      canPreviousFromShown: shown.previous,
+      canNextFromShown: shown.next,
       canLast: true,
       canGoTo: true,
       first: vi.fn<NavigatorState['first']>(),
@@ -6226,15 +6969,73 @@ describe('RecordNavigator pending and busy states', () => {
       goTo: vi.fn<NavigatorState['goTo']>(),
       newRecord: vi.fn<NavigatorState['newRecord']>(),
     };
-    render(<RecordNavigator navigation={navigation} busy />);
+    const navigation: NavigatorState = { ...settled, transitioning, canPrevious: can.previous, canNext: can.next };
+    const { rerender } = render(<RecordNavigator navigation={settled} />);
     const navigator = screen.getByRole('toolbar', { name: 'Record navigation' });
     const status = within(navigator).getByRole('status');
+    const box = within(navigator).getByRole<HTMLInputElement>('textbox', { name: 'Go to record' });
+    const button = (name: string): HTMLElement => within(navigator).getByRole('button', { name });
+    if (focused !== null) {
+      act(() => {
+        button(focused).focus();
+      });
+    }
 
-    expect(enabledControls(navigator)).toEqual(allControls(false));
+    rerender(<RecordNavigator navigation={navigation} busy />);
+
+    // Not disabled, so the browser keeps focus on the one a keyboard user pressed.
+    expect(document.activeElement).toBe(focused === null ? document.body : button(focused));
+    expect(enabledControls(navigator)).toEqual({
+      ...allControls(true),
+      ...Object.fromEntries(disabled.map((name) => [name, false])),
+    });
+    for (const name of BUTTONS) {
+      expect(isHeld(button(name)), name).toBe(!disabled.includes(name));
+      expect(button(name).className, name).toBe('');
+      // Enter and Space press a held button, which does nothing.
+      fireEvent.click(button(name));
+    }
+    expect(isHeld(box)).toBe(true);
+    expect(box.readOnly).toBe(true);
+    fireEvent.change(box, { target: { value: '1' } });
+    fireEvent.keyDown(box, { key: 'Enter' });
+    for (const action of [
+      navigation.first,
+      navigation.previous,
+      navigation.next,
+      navigation.last,
+      navigation.goTo,
+      navigation.newRecord,
+    ]) {
+      expect(action).not.toHaveBeenCalled();
+    }
+    // Every control held for its own sake takes focus; an edge held for its focus is disabled
+    // once focus leaves it.
+    for (const name of BUTTONS.filter((name) => !disabled.includes(name) && name !== heldEdge)) {
+      act(() => {
+        button(name).focus();
+      });
+      expect(document.activeElement, name).toBe(button(name));
+    }
+    if (heldEdge !== null) {
+      expect(isDisabled(button(heldEdge))).toBe(true);
+      expect(button(heldEdge).hasAttribute('aria-disabled')).toBe(false);
+    }
+    expect(within(navigator).queryByRole('alert')).toBeNull();
     expect(navigator.getAttribute('aria-busy')).toBe('true');
     expect(status.getAttribute('aria-busy')).toBeNull();
-    expect(status.textContent).toBe('2 of 3');
+    expect(status.textContent).toBe(statusText);
     expectAnnouncer(navigator, status, '');
+
+    // Once the save settles nothing is held, and Previous and Next follow the move again.
+    rerender(<RecordNavigator navigation={navigation} busy={false} />);
+    expect(enabledControls(navigator)).toEqual({ ...allControls(true), Previous: can.previous, Next: can.next });
+    for (const name of BUTTONS) {
+      expect(button(name).hasAttribute('aria-disabled'), name).toBe(false);
+    }
+    expect(box.readOnly).toBe(false);
+    expect(box.hasAttribute('aria-disabled')).toBe(false);
+    expect(navigator.getAttribute('aria-busy')).toBeNull();
   });
 
   it.each<{ label: string; text: string }>([

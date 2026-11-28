@@ -2691,6 +2691,9 @@ describe('record transitions (0.3.6, 0.3.4.2)', () => {
         expect(result.current.statusText).toBe(`${from} of 5`);
         expect(result.current.canPrevious).toBe(available.previous);
         expect(result.current.canNext).toBe(available.next);
+        // Counted from the record shown, the pending move left out.
+        expect(result.current.canPreviousFromShown).toBe(from > 1);
+        expect(result.current.canNextFromShown).toBe(from < 5);
 
         await perform(() => second.run(result.current));
         // The first move's answer arrives last; it is shown only while that move is the latest.

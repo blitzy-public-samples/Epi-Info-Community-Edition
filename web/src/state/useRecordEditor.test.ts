@@ -1297,6 +1297,33 @@ describe('leaving a record (0.3.6)', () => {
   });
 
   it.each([
+    { name: 'save', write: (editor: RecordEditor) => editor.save() },
+    { name: 'leave', write: (editor: RecordEditor) => editor.leave() },
+  ])('ends the field errors a 400 left, kept through a 413, when a $name finds the record deleted (409)', async ({
+    write,
+  }) => {
+    const { api, result } = mountExisting();
+    edit(result, TEXT, 'Jones');
+    api.reply(problem(400, { errors: { [TEXT]: ['Last Name is not accepted.'] } }));
+    expect(await perform(() => result.current.save())).toBe(false);
+    edit(result, OTHER_TEXT, 'Brown');
+    api.reply(problem(413));
+    expect(await perform(() => result.current.save())).toBe(false);
+    expect(Object.keys(result.current.fieldErrors)).toEqual([TEXT]);
+    api.reply(problem(409));
+
+    expect(await perform(() => write(result.current))).toBe(false);
+
+    // Every field is protected now, so no error is left asking for a correction; the banner says why.
+    expect(result.current.fieldErrors).toEqual({});
+    expect(result.current.deletedReadOnly).toBe(true);
+    expect(bannerOf(result.current).kind).toBe('deleted');
+    expect(result.current.values[TEXT]).toBe('Jones');
+    expect(result.current.values[OTHER_TEXT]).toBe('Brown');
+    expect(api.lines()).toHaveLength(3);
+  });
+
+  it.each([
     {
       // The 413 names the field holding the most text in the refused body, the one edit.
       status: 413 as const,
@@ -1367,6 +1394,32 @@ describe('save failure banners', () => {
     expect(banner.actions).toEqual([]);
     expect(sentValues(api.calls[0])).toEqual(edits);
     expect(result.current.isDirty).toBe(true);
+  });
+
+  // The hint names the field inside a sentence, where a comma follows it: the prompt's line
+  // breaks and the punctuation it ends with would break the sentence ("Other clinical:,").
+  it.each<{ readonly name: string; readonly prompt: string; readonly label: string }>([
+    { name: 'a prompt ending in a colon', prompt: 'Other clinical:', label: 'Other clinical' },
+    { name: 'a prompt ending in a colon and spaces', prompt: 'Date of diagnosis : ', label: 'Date of diagnosis' },
+    { name: 'a prompt ending in a full-width colon', prompt: '其他临床：', label: '其他临床' },
+    { name: 'a prompt ending in a question mark', prompt: 'Was the patient ill?', label: 'Was the patient ill' },
+    {
+      name: 'a prompt broken over lines',
+      prompt: 'Date of report to\r\nhealth agency:',
+      label: 'Date of report to health agency',
+    },
+    { name: 'a prompt of punctuation only, by the field name', prompt: ' :\r\n', label: TEXT },
+  ])('names the field of a 413 by $name as a sentence reads it', async ({ prompt, label }) => {
+    const definition = withField(TEXT, (field) => ({ ...field, prompt }));
+    const { api, result } = mountExisting(storedRecord(), definition);
+    edit(result, TEXT, 'Jones');
+    api.reply(problem(413));
+
+    expect(await perform(() => result.current.save())).toBe(false);
+
+    const { message } = bannerOf(result.current);
+    expect(message).toBe(errorMessages.saveTooLarge(label));
+    expect(message).toContain(`starting with ${label}, then save again.`);
   });
 
   const LEAVE_CANCELLED = ` ${errorMessages.leaveCancelled}`;

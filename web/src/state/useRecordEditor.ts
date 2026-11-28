@@ -542,10 +542,25 @@ function makeBanner(
   return { kind, message, traceId: error.traceId, actions, error, method, isCreate: method === 'POST' };
 }
 
+// Runs of whitespace, line breaks included: a prompt may span lines ("Date of onset of\r\nfirst symptoms").
+const WHITESPACE_RUN = /\s+/gu;
+// Punctuation a prompt may end with ("Other clinical:", "Was the patient ill?"), ASCII or
+// full-width, with any space around it: in the 413 text a comma follows the label.
+const TRAILING_PROMPT_PUNCTUATION = /[\s:;,.?!…：；，、。？！]+$/u;
+
 /**
- * The label a 413 banner names a field by: the prompt, or the name when the prompt is blank,
- * of the field whose text takes the most bytes in `values` as the JSON body sends it; `null`
- * when `values` holds no text. Only metadata reaches the banner, never a value.
+ * A prompt as a sentence names its field: on one line, without the punctuation it ends with;
+ * `''` when nothing else is left. The control and the validation summary keep the prompt as it is.
+ */
+function promptInSentence(prompt: string): string {
+  return prompt.replace(WHITESPACE_RUN, ' ').replace(TRAILING_PROMPT_PUNCTUATION, '').trim();
+}
+
+/**
+ * The label a 413 banner names a field by: the prompt as a sentence names it
+ * ({@link promptInSentence}), or the name when that leaves nothing, of the field whose text
+ * takes the most bytes in `values` as the JSON body sends it; `null` when `values` holds no
+ * text. Only metadata reaches the banner, never a value.
  */
 function largestTextLabel(index: FieldIndex, values: Values): string | null {
   const encoder = new TextEncoder();
@@ -562,8 +577,8 @@ function largestTextLabel(index: FieldIndex, values: Values): string | null {
   if (largest === null) {
     return null;
   }
-  const prompt = index.byName.get(largest.name)?.prompt?.trim() ?? '';
-  return prompt === '' ? largest.name : prompt;
+  const label = promptInSentence(index.byName.get(largest.name)?.prompt ?? '');
+  return label === '' ? largest.name : label;
 }
 
 /**
@@ -1059,9 +1074,11 @@ function createController(host: ControllerHost): Controller {
     const banner = saveFailureBanner(error, write, index(), leaveLocks > 0);
     if (error.kind === 'conflict') {
       // The edits cannot be saved, so they no longer hold the user on the record; nor can
-      // anything be saved to a deleted record, so no write is left to block.
+      // anything be saved to a deleted record, so no write is left to block. Field errors an
+      // earlier save left ask for corrections no protected field can take, so they go, and
+      // the banner alone explains the record's state.
       uncertainWrite = null;
-      host.update({ deletedReadOnly: true, dirty: new Set(), banner, uncertain: false });
+      host.update({ deletedReadOnly: true, dirty: new Set(), fieldErrors: {}, banner, uncertain: false });
       host.options().onConflict();
       return;
     }
