@@ -7,11 +7,13 @@
 //
 // Sources of n and N (C-17), never a search result and never the Record DTO, whose own
 // `position` and `count` are intrinsic to the record:
-// - N is GET .../records/count for the toggle's set, re-read on load, open by id, save,
-//   delete, toggle change and 404 recovery, and by the next move or New after a save, after
-//   the open record left the set (a save found it deleted, 409, or a refresh placed it
-//   outside the set), and while a 404, delete or discard landing runs; other moves reuse
-//   the known N;
+// - N is the size of the toggle's set. GET .../records/count reads it on load, delete and
+//   404 recovery, and in the next move or New after a save, after a save found the open
+//   record deleted (409), and while a 404, delete or discard landing runs. An open by id,
+//   a save and a toggle change take it from the `count` the position endpoint answers with
+//   n, so they send no count read; when that answer places the open record outside the
+//   set, its `count` is the N the next move or New uses (knownSize), while the n and N
+//   shown stay. Other moves reuse the known N;
 // - n is the requested position after GET .../records/at/{n}, and the position
 //   endpoint's answer after an open by id, a save or a toggle change. A record that has
 //   left the set keeps the n and N shown, which still count it, and coordinates read
@@ -178,6 +180,8 @@ interface NavigationState {
   readonly pendingMove: PendingMove | null;
   /** The slot the open record left the active set by; it counts only while kept (originOf). */
   readonly vacated: VacatedSlot | null;
+  /** N of the set the open record left, as a refresh read it; it counts only while kept (knownSizeOf). */
+  readonly knownSize: KnownSize | null;
 }
 
 const INITIAL_STATE: NavigationState = {
@@ -195,6 +199,7 @@ const INITIAL_STATE: NavigationState = {
   loadError: null,
   pendingMove: null,
   vacated: null,
+  knownSize: null,
 };
 
 /** The state a form starts in: nothing open, with the deleted toggle as `options` asks. */
@@ -262,31 +267,62 @@ interface VacatedSlot {
 }
 
 /**
+ * N of the selected set as the position endpoint counted it while placing the open record
+ * outside that set, and the record generation and toggle value it holds for. The N shown
+ * still counts the record; this one does not.
+ */
+interface KnownSize {
+  readonly generation: number;
+  readonly includeDeleted: boolean;
+  readonly count: number;
+}
+
+/**
  * What Previous and Next count from instead of the record shown, first to last in
  * precedence. `pending` is the move still running. `vacated` is the slot an open record
  * left when it left the active set while shown: N still counts that record, and the record
- * that followed it now stands at the slot.
+ * that followed it now stands at the slot. `size` is the N a refresh read once the record
+ * had left, the set those moves go through; `null` when none is kept.
  */
 interface MoveOrigin {
   readonly pending: PendingMove | null;
   readonly vacated: number | null;
+  readonly size: number | null;
 }
 
 /** The installed record, or New, and its place in the selected set: what originOf and resolveMove read. */
 type ShownPlace = Pick<NavigationState, 'n' | 'count' | 'isNew' | 'includeDeleted' | 'recordGeneration'>;
 
 /**
+ * The N `knownSize` holds while it is kept, the record it was read for still shown with
+ * the same toggle value; `null` otherwise. Every load, install, save and conflict
+ * retires it, so the next move or New reads the set as before.
+ */
+function knownSizeOf(knownSize: KnownSize | null, shown: ShownPlace): number | null {
+  return knownSize !== null &&
+    knownSize.generation === shown.recordGeneration &&
+    knownSize.includeDeleted === shown.includeDeleted
+    ? knownSize.count
+    : null;
+}
+
+/**
  * What Previous and Next count from: the pending move, and the vacated slot only while it
  * is kept, its record still shown at that position with the active set selected, so any
- * install, toggle change or position refresh retires it.
+ * install, toggle change or position refresh retires it; the known size likewise.
  */
-function originOf(pendingMove: PendingMove | null, vacated: VacatedSlot | null, shown: ShownPlace): MoveOrigin {
+function originOf(
+  pendingMove: PendingMove | null,
+  vacated: VacatedSlot | null,
+  knownSize: KnownSize | null,
+  shown: ShownPlace,
+): MoveOrigin {
   const kept =
     vacated !== null &&
     vacated.generation === shown.recordGeneration &&
     vacated.position === shown.n &&
     !shown.includeDeleted;
-  return { pending: pendingMove, vacated: kept ? vacated.position : null };
+  return { pending: pendingMove, vacated: kept ? vacated.position : null, size: knownSizeOf(knownSize, shown) };
 }
 
 /** The position one step from `from` in a set of `size` records; `null` past either end. */
@@ -303,8 +339,9 @@ function resolveMove(move: Move, state: ShownPlace, origin: MoveOrigin): MoveTar
   }
   if (move === 'previous' || move === 'next') {
     const { pending, vacated } = origin;
-    // While the slot is kept, the set moved through no longer holds the deleted record N counts.
-    const size = vacated === null ? count : count - 1;
+    // While the slot is kept, the set moved through no longer holds the deleted record N
+    // counts; a size read since the record left is that set's own.
+    const size = origin.size ?? (vacated === null ? count : count - 1);
     if (pending !== null) {
       // Once a load has read N for the pending move, its target lies in that set.
       const within = pending.count ?? size;
@@ -313,8 +350,9 @@ function resolveMove(move: Move, state: ShownPlace, origin: MoveOrigin): MoveTar
     }
     if (vacated !== null) {
       // The slot lies between vacated - 1 and vacated, so Next opens vacated and Previous
-      // the one before.
-      return move === 'next' ? stepFrom(move, vacated - 1, size) : stepFrom(move, vacated, size);
+      // the one before; in a set that has shrunk below the slot, it follows the last record.
+      const slot = Math.min(vacated, size + 1);
+      return move === 'next' ? stepFrom(move, slot - 1, size) : stepFrom(move, slot, size);
     }
   }
   switch (move) {
@@ -439,7 +477,7 @@ function createController(host: ControllerHost): Controller {
   /**
    * Set by afterSave, since a create grows the set; by leftSet, since the open record has
    * left the set N counts; and while a 404, delete or discard landing runs, since N may
-   * have changed: the next move or New re-reads N.
+   * have changed: the next move or New re-reads N, unless a known size stands for it.
    */
   let countStale = false;
   /** What retryLoad repeats. */
@@ -510,13 +548,22 @@ function createController(host: ControllerHost): Controller {
     };
   }
 
-  /** Starts a load that supersedes every load in flight and aborts its requests; Retry runs `repeat`. */
+  /**
+   * Starts a load that supersedes every load in flight and aborts its requests; Retry runs
+   * `repeat`. The load may change the set, so a known size no longer stands for N.
+   */
   function begin(repeat: () => Promise<unknown>): Load {
     const load = nextLoad();
     lastLoad = repeat;
     retrying = null;
-    host.update({ loading: true, loadError: null });
+    host.update({ loading: true, loadError: null, knownSize: null });
     return load;
+  }
+
+  /** The N a refresh read once the open record left the set, while it is kept (knownSizeOf). */
+  function knownSize(): number | null {
+    const state = host.state();
+    return knownSizeOf(state.knownSize, state);
   }
 
   /** Ends the current load with `error`, keeping the previous display. */
@@ -698,6 +745,19 @@ function createController(host: ControllerHost): Controller {
     landed?: LandingNotice,
   ): Promise<boolean> {
     const result = await settle(readAt(load, position, set.includeDeleted));
+    return installAt(load, result, position, set, recovering, notice, landed);
+  }
+
+  /** Installs the answer `result` of `load`'s at/{position} read, or recovers from its 404, as openAt does. */
+  async function installAt(
+    load: Load,
+    result: Settled<RecordDto>,
+    position: number,
+    set: SetView,
+    recovering: boolean,
+    notice?: string,
+    landed?: LandingNotice,
+  ): Promise<boolean> {
     if (!isCurrent(load)) {
       return false;
     }
@@ -791,10 +851,15 @@ function createController(host: ControllerHost): Controller {
   }
 
   /**
-   * Mount and form change: N, then the initial position, or New on an empty form. No leave.
-   * A position that cannot be opened as asked gets a notice naming it as written
-   * (`initialPositionText`) and saying what opened instead; a position past the end says
-   * so once the 404 of its `at` read has been recovered from, which tells where it landed.
+   * Mount and form change: N and the initial position, read together, or New on an empty
+   * form. No leave. A position that cannot be opened as asked gets a notice naming it as
+   * written (`initialPositionText`) and saying what opened instead. On a non-empty set,
+   * every 404 of the `at` read, a position past the end included, runs the 404 recovery an
+   * open runs: the grid reloads, N is read again and the record nearest to the position
+   * opens, or New on a set found empty or after a second 404. Its notice names the last
+   * record when that landing falls short of the position asked for. A record found at a
+   * position N does not count, on an empty set too, means the set grew meanwhile: N is
+   * read again and the record shows.
    */
   function loadInitial(includeDeleted: boolean): Promise<boolean> {
     const { initialPosition: requested, initialPositionText } = host.options();
@@ -804,27 +869,66 @@ function createController(host: ControllerHost): Controller {
     const asked = initialPositionText ?? (requested === undefined ? undefined : String(requested));
     const run = async (): Promise<boolean> => {
       const load = begin(run);
-      const set = await readSet(load, includeDeleted);
-      if (set === null) {
+      // Only the meaning of an at/{position} 404 depends on N, so neither read waits for the other.
+      const results = await settleAll(load, [readCount(load, includeDeleted), readAt(load, position, includeDeleted)]);
+      if (!isCurrent(load)) {
         return false;
       }
-      if (asked === undefined) {
-        return openOrNew(load, position, set, false);
+      if (results === null) {
+        settleIdle();
+        return false;
       }
-      if (!valid) {
-        host.update({ notice: notARecordNumber(asked, set.count === 0) });
-        return openOrNew(load, position, set, false);
+      const [counted, opened] = results;
+      if (!counted.ok) {
+        fail(counted.error);
+        return false;
       }
+      if (opened.ok) {
+        // The record found shows at its position, whatever N the count beside it gave.
+        const notice = asked !== undefined && !valid ? notARecordNumber(asked, false) : undefined;
+        if (position <= counted.data.count) {
+          installRecord(opened.data, position, { includeDeleted, count: counted.data.count, fresh: true }, notice);
+          return true;
+        }
+        // N does not count the record found, so the set grew between the two reads: N is
+        // read again for it.
+        const grown = await readSet(load, includeDeleted);
+        if (grown === null) {
+          return false;
+        }
+        if (grown.count >= position) {
+          installRecord(opened.data, position, grown, notice);
+          return true;
+        }
+        // N is still behind: the record's position stands for N until the next move or New
+        // reads N again.
+        countStale = true;
+        installRecord(opened.data, position, { includeDeleted, count: position, fresh: false }, notice);
+        return true;
+      }
+      const set: SetView = { includeDeleted, count: counted.data.count, fresh: true };
       if (set.count === 0) {
-        host.update({ notice: noSuchRecord(asked, null) });
+        // Nothing to open, whatever at/{position} answered.
+        let notice: string | undefined;
+        if (asked !== undefined) {
+          notice = valid ? noSuchRecord(asked, null) : notARecordNumber(asked, true);
+        }
+        installNew(set, notice);
+        return false;
+      }
+      if (asked !== undefined && !valid) {
+        host.update({ notice: notARecordNumber(asked, false) });
       }
       // A landing short of the position asked for is the last record. One at it means the
       // record there went away after N was read, which the 404 notice alone describes.
-      return openOrNew(load, position, set, false, undefined, (landing) =>
-        landing !== null && landing >= position
-          ? errorMessages.notFound
-          : `${errorMessages.notFound} ${noSuchRecord(asked, landing)}`,
-      );
+      const landed: LandingNotice | undefined =
+        asked === undefined || !valid
+          ? undefined
+          : (landing) =>
+              landing !== null && landing >= position
+                ? errorMessages.notFound
+                : `${errorMessages.notFound} ${noSuchRecord(asked, landing)}`;
+      return installAt(load, opened, position, set, false, undefined, landed);
     };
     return run();
   }
@@ -846,13 +950,16 @@ function createController(host: ControllerHost): Controller {
 
   /**
    * A user move: leave the open record, then open the target; N is reused unless it is
-   * stale (countStale). Retry repeats the whole move, so an edit made since a failure is
-   * saved before the target is read.
+   * stale (countStale), and then a known size stands for it before N is read again. Retry
+   * repeats the whole move, so an edit made since a failure is saved before the target is
+   * read.
    */
   function transition(target: MoveTarget): Promise<boolean> {
     return guarded(async () => {
       host.update({ goToError: null, notice: null });
       const { includeDeleted } = host.state();
+      // Taken before this load begins, which retires it.
+      const known = knownSize();
       const positionIn = (count: number): number => (target.kind === 'last' ? count : target.position);
       const load = begin(() => transition(target));
       // beforeLeave has just resolved while this move is the latest intent.
@@ -861,7 +968,8 @@ function createController(host: ControllerHost): Controller {
       if (!countStale && count > 0) {
         return openAt(load, positionIn(count), { includeDeleted, count, fresh: false }, false);
       }
-      const set = await readSet(load, includeDeleted);
+      const set: SetView | null =
+        known === null ? await readSet(load, includeDeleted) : { includeDeleted, count: known, fresh: true };
       if (set === null) {
         return false;
       }
@@ -891,7 +999,7 @@ function createController(host: ControllerHost): Controller {
 
   function move(kind: Move): Promise<boolean> {
     const state = host.state();
-    const target = resolveMove(kind, state, originOf(state.pendingMove, state.vacated, state));
+    const target = resolveMove(kind, state, originOf(state.pendingMove, state.vacated, state.knownSize, state));
     return target === null ? Promise.resolve(false) : transition(target);
   }
 
@@ -926,11 +1034,15 @@ function createController(host: ControllerHost): Controller {
       retrying = null;
       const stale = countStale;
       const { count, includeDeleted } = host.state();
+      // A known size is the N New shows, so N is not read again.
+      const known = knownSize();
       host.update({ goToError: null, notice: null });
-      installNew({ includeDeleted, count, fresh: false });
+      installNew(
+        known === null ? { includeDeleted, count, fresh: false } : { includeDeleted, count: known, fresh: true },
+      );
       // New is open, so the draft is the user's again while N is re-read.
       endTransition(token);
-      if (stale) {
+      if (stale && known === null) {
         await recount(includeDeleted);
       }
     } finally {
@@ -945,11 +1057,7 @@ function createController(host: ControllerHost): Controller {
       const { n, includeDeleted } = host.state();
       const anchor = n ?? 1;
       const load = begin(() => openById(id));
-      const results = await settleAll(load, [
-        readRecord(load, id),
-        readPosition(load, id, includeDeleted),
-        readCount(load, includeDeleted),
-      ]);
+      const results = await settleAll(load, [readRecord(load, id), readPosition(load, id, includeDeleted)]);
       if (!isCurrent(load)) {
         return false;
       }
@@ -957,11 +1065,9 @@ function createController(host: ControllerHost): Controller {
         settleIdle();
         return false;
       }
-      const [found, placed, counted] = results;
-      if (!counted.ok) {
-        fail(counted.error);
-        return false;
-      }
+      // A 404 of either read recovers through openNearestTo, whose count read tells a record
+      // that is gone from a form that is gone.
+      const [found, placed] = results;
       if (!found.ok) {
         await failOpen(found.error, anchor, includeDeleted);
         return false;
@@ -970,7 +1076,8 @@ function createController(host: ControllerHost): Controller {
         await failOpen(placed.error, anchor, includeDeleted);
         return false;
       }
-      const set: SetView = { includeDeleted, count: counted.data.count, fresh: true };
+      // The position endpoint counts the selected set with its answer, so it gives N as well.
+      const set: SetView = { includeDeleted, count: placed.data.count, fresh: true };
       const { position } = placed.data;
       if (position !== null) {
         installRecord(found.data, position, set);
@@ -1011,20 +1118,12 @@ function createController(host: ControllerHost): Controller {
         const load = begin(() => setIncludeDeleted(value));
         const conflictsBefore = conflicts;
         const savesBefore = saves;
-        const results = await settleAll(load, [
-          readCount(load, value),
-          readPosition(load, record.globalRecordId, value),
-        ]);
+        const placed = await settle(readPosition(load, record.globalRecordId, value));
         if (!isCurrent(load)) {
           return false;
         }
-        if (results === null) {
+        if (placed === null) {
           settleIdle();
-          return false;
-        }
-        const [counted, placed] = results;
-        if (!counted.ok) {
-          fail(counted.error);
           return false;
         }
         if (!placed.ok) {
@@ -1045,7 +1144,7 @@ function createController(host: ControllerHost): Controller {
           await openNearestTo(anchor, value, errorMessages.notFound, true);
           return false;
         }
-        const set: SetView = { includeDeleted: value, count: counted.data.count, fresh: true };
+        const set: SetView = { includeDeleted: value, count: placed.data.count, fresh: true };
         // A save found the open record deleted after these reads were sent, so a position in
         // the active set may predate the delete: the record is left and the set read again,
         // as when the position is null. With deleted records shown every row stays in the
@@ -1088,11 +1187,13 @@ function createController(host: ControllerHost): Controller {
     const before = host.state();
     countStale = true;
     // The same on-screen record, so the generation stays and the editor keeps its state.
+    // The save may have moved it into the set, so a known size no longer stands for N.
     host.update({
       record,
       isNew: false,
       n: before.isNew ? null : before.n,
       listVersion: before.listVersion + 1,
+      knownSize: null,
     });
     if (leavingToken !== null && leavingToken === intent) {
       // The save is the one the pending transition's leave made. That transition re-reads
@@ -1106,28 +1207,20 @@ function createController(host: ControllerHost): Controller {
 
   /**
    * Re-reads N and the saved record's n; the record stays, so the generation does too. A
-   * record the position endpoint places outside the set stays open at the n and N shown
-   * (leftSet).
+   * record the position endpoint places outside the set stays open at the n and N shown,
+   * and the N it answers with is kept for the next move or New (leftSet).
    */
   function refreshAfterSave(record: RecordDto, includeDeleted: boolean): Promise<boolean> {
     const run = async (): Promise<boolean> => {
       const load = begin(run);
       coordinatesRefresh = { gen: load.gen, showsLoading: true };
-      const results = await settleAll(load, [
-        readCount(load, includeDeleted),
-        readPosition(load, record.globalRecordId, includeDeleted),
-      ]);
+      const placed = await settle(readPosition(load, record.globalRecordId, includeDeleted));
       endCoordinatesRefresh(load);
       if (!isCurrent(load)) {
         return false;
       }
-      if (results === null) {
+      if (placed === null) {
         settleIdle();
-        return false;
-      }
-      const [counted, placed] = results;
-      if (!counted.ok) {
-        fail(counted.error);
         return false;
       }
       if (!placed.ok) {
@@ -1144,11 +1237,11 @@ function createController(host: ControllerHost): Controller {
       }
       if (placed.data.position === null) {
         host.update({ loading: false });
-        leftSet();
+        leftSet(placed.data.count);
         return false;
       }
       countStale = false;
-      host.update({ n: placed.data.position, count: counted.data.count, vacated: null, loading: false });
+      host.update({ n: placed.data.position, count: placed.data.count, vacated: null, loading: false });
       return true;
     };
     return run();
@@ -1159,30 +1252,23 @@ function createController(host: ControllerHost): Controller {
    * leave saved the record failed afterwards, so the record stays open with stale
    * coordinates. The failure, its Retry and `loading` stay as they are. An abort, a failure
    * or a 404 changes nothing, so Retry still re-reads N; any later load supersedes this one
-   * and aborts its requests. A record placed outside the set keeps the n and N shown
-   * (leftSet).
+   * and aborts its requests. A record placed outside the set keeps the n and N shown, and
+   * the N the answer gives is kept for the next move or New (leftSet).
    */
   async function refreshCoordinates(record: RecordDto, includeDeleted: boolean): Promise<void> {
     const load = nextLoad();
     coordinatesRefresh = { gen: load.gen, showsLoading: false };
-    const results = await settleAll(load, [
-      readCount(load, includeDeleted),
-      readPosition(load, record.globalRecordId, includeDeleted),
-    ]);
+    const placed = await settle(readPosition(load, record.globalRecordId, includeDeleted));
     endCoordinatesRefresh(load);
-    if (!isCurrent(load) || results === null) {
-      return;
-    }
-    const [counted, placed] = results;
-    if (!counted.ok || !placed.ok) {
+    if (!isCurrent(load) || placed === null || !placed.ok) {
       return;
     }
     if (placed.data.position === null) {
-      leftSet();
+      leftSet(placed.data.count);
       return;
     }
     countStale = false;
-    host.update({ n: placed.data.position, count: counted.data.count, vacated: null });
+    host.update({ n: placed.data.position, count: placed.data.count, vacated: null, knownSize: null });
   }
 
   /** The coordinates refresh `load` has its answers, so a conflict no longer supersedes it. */
@@ -1213,16 +1299,18 @@ function createController(host: ControllerHost): Controller {
   /**
    * The open record has left the selected set, a save having found it deleted (409) or a
    * refresh having placed it outside the set, and it stays open at the n and N shown, which
-   * still count it. The next move or New re-reads N and the grid reloads. With the active
-   * set selected the record that followed it now stands at n, so its slot is kept for
-   * Previous and Next (resolveMove).
+   * still count it. The grid reloads. `count` is the set's N the refresh read with that
+   * answer, which the next move or New uses (knownSize); after a 409 it is `null`, and they
+   * re-read N. With the active set selected the record that followed it now stands at n,
+   * so its slot is kept for Previous and Next (resolveMove).
    */
-  function leftSet(): void {
+  function leftSet(count: number | null): void {
     const { n, includeDeleted, recordGeneration, listVersion } = host.state();
     countStale = true;
     host.update({
       listVersion: listVersion + 1,
       vacated: !includeDeleted && n !== null ? { generation: recordGeneration, position: n } : null,
+      knownSize: count === null ? null : { generation: recordGeneration, includeDeleted, count },
     });
   }
 
@@ -1248,7 +1336,7 @@ function createController(host: ControllerHost): Controller {
     conflicts += 1;
     supersedeCoordinatesRefresh();
     deferredRefresh = null;
-    leftSet();
+    leftSet(null);
   }
 
   /** Does not call beforeLeave: the draft is gone (404) or its edits were discarded. */
@@ -1351,8 +1439,8 @@ function statusTextOf({ isNew, n, count }: ShownPlace): string {
 function present(state: NavigationState, actions: NavigationActions): RecordNavigation {
   // The move origin stays internal, and the status shows the installed record until a move
   // settles, while Previous and Next are available exactly when a press would move.
-  const { pendingMove, vacated, ...shown } = state;
-  const origin = originOf(pendingMove, vacated, shown);
+  const { pendingMove, vacated, knownSize, ...shown } = state;
+  const origin = originOf(pendingMove, vacated, knownSize, shown);
   const hasRecords = shown.count > 0;
   return {
     ...shown,

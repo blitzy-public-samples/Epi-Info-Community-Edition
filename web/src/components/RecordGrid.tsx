@@ -12,7 +12,7 @@ import {
   type ReactNode,
 } from 'react';
 
-import { isBlankQuery, isExactDecimal, type ApiClient } from '../api/client';
+import { isBlankQuery, isExactDecimal, type ApiClient, type ApiResult } from '../api/client';
 import { describeError, isAbortError, isConnectionFailure, networkError, type ApiError } from '../api/errors';
 import type { FieldDefinition, FieldValue, FormDefinition, RecordPage, RecordSummary } from '../api/types';
 import { ConnectionError } from './ConnectionError';
@@ -48,10 +48,92 @@ export interface RecordGridProps {
    * list GET, and the scroll region stays focusable, so the table can still be scrolled.
    */
   disabled?: boolean;
+  /**
+   * A list read sent before the grid mounted (primeListRead), read at mount only. The
+   * grid's first request takes it when it asks for exactly that read, and drops it
+   * otherwise; every later request is the grid's own.
+   */
+  primedFirstPage?: PrimedListRead | null;
 }
 
 const PAGE_SIZE = 50;
 const SEARCH_DEBOUNCE_MS = 300;
+
+/**
+ * The key of every input of a list request: the form, the set, the filter, the page, and the
+ * list version and Retry count whose changes reload it.
+ */
+function listRequestKey(
+  viewId: number,
+  includeDeleted: boolean,
+  searchText: string,
+  page: number,
+  listVersion: number,
+  reloadToken: number,
+): string {
+  return JSON.stringify([viewId, includeDeleted, searchText, page, listVersion, reloadToken]);
+}
+
+/**
+ * The first page of a form's record list, requested before its grid mounts, such as beside
+ * the form definition, so that the grid does not wait for the definition to ask for it.
+ */
+export interface PrimedListRead {
+  /** The request it answers, in the grid's request-key form. */
+  readonly requestKey: string;
+  /**
+   * Hands the read over: its result, aborted by `signal` from then on. `null` once it has
+   * been taken or dropped, so it answers one request only.
+   */
+  readonly take: (signal: AbortSignal) => Promise<ApiResult<RecordPage>> | null;
+  /** Aborts the read unless it has been taken. */
+  readonly drop: () => void;
+}
+
+/**
+ * Sends the request a grid of `viewId` starts with, unfiltered page 1 of the set
+ * `includeDeleted` selects, at the navigator's `listVersion`, for that grid's first request
+ * to take. The caller drops it once no grid can take it.
+ */
+export function primeListRead(
+  client: ApiClient,
+  viewId: number,
+  includeDeleted: boolean,
+  listVersion: number,
+): PrimedListRead {
+  const controller = new AbortController();
+  const read = client.listRecords(viewId, { includeDeleted, page: 1, pageSize: PAGE_SIZE }, controller.signal);
+  // Dropped, it rejects with its abort, which nothing awaits; a taker still sees every outcome.
+  read.catch(() => undefined);
+  let available = true;
+  return {
+    requestKey: listRequestKey(viewId, includeDeleted, '', 1, listVersion, 0),
+    take: (signal) => {
+      if (!available) {
+        return null;
+      }
+      available = false;
+      if (signal.aborted) {
+        controller.abort();
+      } else {
+        signal.addEventListener(
+          'abort',
+          () => {
+            controller.abort();
+          },
+          { once: true },
+        );
+      }
+      return read;
+    },
+    drop: () => {
+      if (available) {
+        available = false;
+        controller.abort();
+      }
+    },
+  };
+}
 
 const LOADING_TEXT = 'Loading records…';
 const EMPTY_TEXT = 'No records found.';
@@ -299,8 +381,11 @@ export const RecordGrid = memo(function RecordGrid({
   onOpen,
   onFormNotFound,
   disabled = false,
+  primedFirstPage = null,
 }: RecordGridProps) {
   const searchId = useId();
+  // Taken or dropped by the first list request, so no later one ever sees it.
+  const primedRef = useRef(primedFirstPage);
   // Read when a load answers, so a new callback never restarts the load effect.
   const onFormNotFoundRef = useRef(onFormNotFound);
   useLayoutEffect(() => {
@@ -333,7 +418,7 @@ export const RecordGrid = memo(function RecordGrid({
   const listingKey = JSON.stringify([viewId, includeDeleted, searchText, page]);
   // Every input of the list request: the page or failure on screen answers the request
   // with this key, or an earlier one.
-  const requestKey = JSON.stringify([viewId, includeDeleted, searchText, page, listVersion, reloadToken]);
+  const requestKey = listRequestKey(viewId, includeDeleted, searchText, page, listVersion, reloadToken);
 
   useEffect(() => {
     const timer = setTimeout(() => setDebouncedQ(q), SEARCH_DEBOUNCE_MS);
@@ -343,13 +428,22 @@ export const RecordGrid = memo(function RecordGrid({
   useEffect(() => {
     const controller = new AbortController();
     setLoading(true);
+    // The read sent before the grid mounted answers this request only when it is exactly
+    // this request; otherwise it is no longer needed.
+    const primed = primedRef.current;
+    primedRef.current = null;
+    const taken = primed !== null && primed.requestKey === requestKey ? primed.take(controller.signal) : null;
+    primed?.drop();
 
-    void client
-      .listRecords(
+    const read =
+      taken ??
+      client.listRecords(
         viewId,
         { q: searchText === '' ? undefined : searchText, includeDeleted, page, pageSize: PAGE_SIZE },
         controller.signal,
-      )
+      );
+
+    void read
       .then(
         (outcome) => {
           if (controller.signal.aborted) {

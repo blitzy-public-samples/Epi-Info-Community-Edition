@@ -167,7 +167,11 @@ interface FakeApi {
   readonly remove: (id: string) => void;
   readonly setStatus: (id: string, recStatus: number) => void;
   readonly add: (added: Row) => void;
-  readonly hold: (pathname: string) => Gate;
+  /**
+   * Holds the next request to `pathname` until the test releases it. It answers from the
+   * rows as they are on release, or, with `answerOnArrival`, as they were when it arrived.
+   */
+  readonly hold: (pathname: string, answerOnArrival?: boolean) => Gate;
   /** From now on every at/{position} answers 404, although count still counts the rows. */
   readonly failEveryAt: () => void;
   /**
@@ -175,6 +179,8 @@ interface FakeApi {
    * answers 200 with its DTO and count still counts the row.
    */
   readonly failPosition: (id: string) => void;
+  /** From now on every read answers 404, as for a form that no longer exists. */
+  readonly removeForm: () => void;
 }
 
 /** Every fake API of the running test, checked for DATA-01 after it. */
@@ -206,11 +212,15 @@ const BY_ID_ROUTE = /^\/api\/forms\/(\d+)\/records\/([^/]+)$/;
 function createFakeApi(initialRows: readonly Row[]): FakeApi {
   let rows: Row[] = [...initialRows].sort((a, b) => a.uniqueKey - b.uniqueKey);
   let everyAtMissing = false;
+  let formRemoved = false;
   const positionMissing = new Set<string>();
   const calls: Call[] = [];
   const unrouted: string[] = [];
   const log: { readonly request: boolean; readonly text: string }[] = [];
-  const holds = new Map<string, { readonly arrive: () => void; readonly released: Promise<void> }>();
+  const holds = new Map<
+    string,
+    { readonly arrive: () => void; readonly released: Promise<void>; readonly answerOnArrival: boolean }
+  >();
 
   const selected = (includeDeleted: boolean): Row[] =>
     includeDeleted ? rows : rows.filter((candidate) => candidate.recStatus === ACTIVE);
@@ -249,7 +259,7 @@ function createFakeApi(initialRows: readonly Row[]): FakeApi {
       unrouted.push(line);
       return notFound();
     }
-    if (Number(match[1]) !== VIEW_ID) {
+    if (formRemoved || Number(match[1]) !== VIEW_ID) {
       return notFound();
     }
     const set = selected(includeDeleted);
@@ -289,8 +299,10 @@ function createFakeApi(initialRows: readonly Row[]): FakeApi {
     const held = holds.get(url.pathname);
     if (held !== undefined) {
       holds.delete(url.pathname);
+      const early = held.answerOnArrival ? route(request.method, url, line) : null;
       held.arrive();
       await held.released;
+      return early ?? route(request.method, url, line);
     }
     return route(request.method, url, line);
   };
@@ -329,7 +341,7 @@ function createFakeApi(initialRows: readonly Row[]): FakeApi {
     add: (added) => {
       rows = [...rows, added].sort((a, b) => a.uniqueKey - b.uniqueKey);
     },
-    hold: (pathname) => {
+    hold: (pathname, answerOnArrival = false) => {
       const arrival = deferred<undefined>();
       const release = deferred<undefined>();
       holds.set(pathname, {
@@ -337,6 +349,7 @@ function createFakeApi(initialRows: readonly Row[]): FakeApi {
           arrival.resolve(undefined);
         },
         released: release.promise,
+        answerOnArrival,
       });
       return {
         reached: arrival.promise,
@@ -350,6 +363,9 @@ function createFakeApi(initialRows: readonly Row[]): FakeApi {
     },
     failPosition: (id) => {
       positionMissing.add(requireRow(id).globalRecordId);
+    },
+    removeForm: () => {
+      formRemoved = true;
     },
   };
   apisOfTest.push(api);
@@ -470,11 +486,11 @@ describe('useRecordNavigation', () => {
       { initialPosition: 0, opened: 1 },
       { initialPosition: 2.5, opened: 1 },
     ])(
-      'with initialPosition $initialPosition the load reads N, opens at/$opened and takes n from that request',
+      'with initialPosition $initialPosition the load reads N and at/$opened together and takes n from that request',
       async ({ initialPosition, opened }) => {
         const { api, result, beforeLeave } = await mount(activeRows(5), { initialPosition });
 
-        expect(api.requests()).toEqual([countRequest(), atRequest(opened)]);
+        expect(sorted(api.requests())).toEqual(sorted([countRequest(), atRequest(opened)]));
         expect(result.current.n).toBe(opened);
         expect(result.current.count).toBe(5);
         expect(result.current.includeDeleted).toBe(false);
@@ -486,6 +502,170 @@ describe('useRecordNavigation', () => {
         expect(beforeLeave).not.toHaveBeenCalled();
       },
     );
+
+    it('the load sends at/{n} without waiting for N', async () => {
+      const api = createFakeApi(activeRows(5));
+      const countGate = api.hold(`${RECORDS_PATH}/count`);
+      const client = createApiClient({ baseUrl: 'http://localhost', fetch: api.fetch });
+      const { result } = renderHook(() =>
+        useRecordNavigation({ client, viewId: VIEW_ID, initialPosition: 3, beforeLeave: () => Promise.resolve(true) }),
+      );
+
+      await act(async () => {
+        await countGate.reached;
+        await flush();
+      });
+      // N is still unanswered, and the record read is already sent.
+      expect(sorted(api.requests())).toEqual(sorted([countRequest(), atRequest(3)]));
+      expect(result.current.loading).toBe(true);
+      expect(result.current.record).toBeNull();
+
+      act(() => {
+        countGate.release();
+      });
+      await settled(result);
+
+      expect(api.requests()).toHaveLength(2);
+      expect(result.current.statusText).toBe('3 of 5');
+      expect(result.current.record?.globalRecordId).toBe(idOf(3));
+    });
+
+    // The load's count answers as it counted on arrival, and its at/{n} once another session
+    // has added records, so that N does not count the record found and is read again.
+    it.each<{
+      readonly name: string;
+      readonly rows: readonly Row[];
+      readonly initialPosition?: number;
+      readonly initialPositionText?: string;
+      /** Another session's changes between the load's two reads and their answers. */
+      readonly between: (api: FakeApi) => void;
+      /** Another session's changes while the second count read is held. */
+      readonly whileRecount?: (api: FakeApi) => void;
+      readonly statusText: string;
+      readonly notice: string | null;
+      /** Last's reads: at/N alone once N is fresh, the count first while it is stale. */
+      readonly lastReads: readonly string[];
+      readonly lastStatusText: string;
+    }>([
+      {
+        name: 'N is short of n until read again',
+        rows: activeRows(5),
+        initialPosition: 6,
+        between: (api) => {
+          api.add(row(6));
+          api.add(row(7));
+        },
+        statusText: '6 of 7',
+        notice: null,
+        lastReads: [atRequest(7)],
+        lastStatusText: '7 of 7',
+      },
+      {
+        // n of N never exceeds N: the record's position stands for N until N is read again.
+        name: 'N is short of n on both reads',
+        rows: activeRows(5),
+        initialPosition: 6,
+        between: (api) => {
+          api.add(row(6));
+        },
+        whileRecount: (api) => {
+          api.setStatus(idOf(1), DELETED);
+        },
+        statusText: '6 of 6',
+        notice: null,
+        lastReads: [countRequest(), atRequest(5)],
+        lastStatusText: '5 of 5',
+      },
+      {
+        name: 'N is 0 until read again',
+        rows: [],
+        initialPositionText: 'abc',
+        between: (api) => {
+          api.add(row(1));
+          api.add(row(2));
+        },
+        statusText: '1 of 2',
+        notice: "'abc' is not a record number, so the first record is shown.",
+        lastReads: [atRequest(2)],
+        lastStatusText: '2 of 2',
+      },
+      {
+        // A record found is never replaced by New on the word of a count.
+        name: 'N is 0 on both reads',
+        rows: [],
+        between: (api) => {
+          api.add(row(1));
+        },
+        whileRecount: (api) => {
+          api.setStatus(idOf(1), DELETED);
+        },
+        statusText: '1 of 1',
+        notice: null,
+        lastReads: [countRequest()],
+        lastStatusText: 'New record',
+      },
+    ])(
+      'a record the load finds while $name shows at its position, in the N read again for it',
+      async ({
+        rows,
+        initialPosition,
+        initialPositionText,
+        between,
+        whileRecount,
+        statusText,
+        notice,
+        lastReads,
+        lastStatusText,
+      }) => {
+        const position = initialPosition ?? 1;
+        const api = createFakeApi(rows);
+        const countGate = api.hold(`${RECORDS_PATH}/count`, true);
+        const atGate = api.hold(`${RECORDS_PATH}/at/${position}`);
+        const client = createApiClient({ baseUrl: 'http://localhost', fetch: api.fetch });
+        const { result } = renderHook(() =>
+          useRecordNavigation({
+            client,
+            viewId: VIEW_ID,
+            initialPosition,
+            initialPositionText,
+            beforeLeave: () => Promise.resolve(true),
+          }),
+        );
+        await act(async () => {
+          await Promise.all([countGate.reached, atGate.reached]);
+        });
+        between(api);
+        const recountGate = api.hold(`${RECORDS_PATH}/count`);
+
+        await act(async () => {
+          countGate.release();
+          atGate.release();
+          await recountGate.reached;
+        });
+        whileRecount?.(api);
+        act(() => {
+          recountGate.release();
+        });
+        await settled(result);
+
+        // N and at/{n} are read together, and N once more after both have answered.
+        expect(sorted(api.requests().slice(0, 2))).toEqual(sorted([countRequest(), atRequest(position)]));
+        expect(api.requests().slice(2)).toEqual([countRequest()]);
+        expect(result.current.record?.globalRecordId).toBe(idOf(position));
+        expect(result.current.isNew).toBe(false);
+        expect(result.current.n).toBe(position);
+        expect(result.current.statusText).toBe(statusText);
+        expect(result.current.notice).toBe(notice);
+        expect(result.current.loadError).toBeNull();
+        const mark = api.mark();
+
+        await perform(() => result.current.last());
+
+        expect(api.requestsSince(mark)).toEqual(lastReads);
+        expect(result.current.statusText).toBe(lastStatusText);
+      },
+    );
+
 
     it.each([
       { from: 1, ...FIRST, to: 1 },
@@ -595,7 +775,7 @@ describe('useRecordNavigation', () => {
       async ({ from }) => {
         const { api, result, beforeLeave } = await mount(activeRows(5), { initialPosition: from });
         // The mount's own read of at/{from} precedes the mark, so the at/5 below is a new request.
-        expect(api.requests()).toEqual([countRequest(), atRequest(from)]);
+        expect(sorted(api.requests())).toEqual(sorted([countRequest(), atRequest(from)]));
         // The record New leaves is the one at this position.
         expect(result.current.n).toBe(from);
         expect(result.current.record?.globalRecordId).toBe(idOf(from));
@@ -679,10 +859,11 @@ describe('useRecordNavigation', () => {
       },
     );
 
-    it('an empty form shows New, disables every move and never requests at/*', async () => {
+    it('an empty form shows New, disables every move and requests no at/* after its load', async () => {
       const { api, result, beforeLeave } = await mount([]);
 
-      expect(api.requests()).toEqual([countRequest()]);
+      // The load reads at/1 beside N; N of 0 shows New whatever it answered.
+      expect(sorted(api.requests())).toEqual(sorted([countRequest(), atRequest(1)]));
       expect(result.current.isNew).toBe(true);
       expect(result.current.n).toBeNull();
       expect(result.current.count).toBe(0);
@@ -711,7 +892,7 @@ describe('useRecordNavigation', () => {
       expect(result.current.goToError).toBeNull();
       expect(result.current.recordGeneration).toBe(generation + 1);
       expect(api.requestsSince(mark)).toEqual([]);
-      expect(api.calls.some((call) => call.url.pathname.includes('/records/at/'))).toBe(false);
+      expect(api.requests().filter((line) => line.includes('/records/at/'))).toEqual([atRequest(1)]);
     });
   });
 
@@ -731,7 +912,7 @@ describe('useRecordNavigation', () => {
       await perform(() => result.current.openById(B.globalRecordId));
 
       expect(sorted(api.requestsSince(mark))).toEqual(
-        sorted([byIdRequest(B.globalRecordId), positionRequest(B.globalRecordId), countRequest()]),
+        sorted([byIdRequest(B.globalRecordId), positionRequest(B.globalRecordId)]),
       );
       expect(result.current.n).toBe(2);
       expect(result.current.count).toBe(3);
@@ -745,9 +926,7 @@ describe('useRecordNavigation', () => {
       mark = api.mark();
       await perform(() => result.current.setIncludeDeleted(true));
 
-      expect(sorted(api.requestsSince(mark))).toEqual(
-        sorted([countRequest(true), positionRequest(B.globalRecordId, true)]),
-      );
+      expect(api.requestsSince(mark)).toEqual([positionRequest(B.globalRecordId, true)]);
       expect(result.current.includeDeleted).toBe(true);
       expect(result.current.n).toBe(3);
       expect(result.current.count).toBe(4);
@@ -773,7 +952,7 @@ describe('useRecordNavigation', () => {
       mark = api.mark();
       await perform(() => result.current.setIncludeDeleted(false));
 
-      expect(sorted(api.requestsSince(mark))).toEqual(sorted([countRequest(), positionRequest(B.globalRecordId)]));
+      expect(api.requestsSince(mark)).toEqual([positionRequest(B.globalRecordId)]);
       expect(result.current.includeDeleted).toBe(false);
       expect(result.current.n).toBe(2);
       expect(result.current.count).toBe(3);
@@ -794,7 +973,7 @@ describe('useRecordNavigation', () => {
       await perform(() => result.current.openById(C.globalRecordId));
 
       expect(sorted(api.requestsSince(mark))).toEqual(
-        sorted([byIdRequest(C.globalRecordId), positionRequest(C.globalRecordId, true), countRequest(true)]),
+        sorted([byIdRequest(C.globalRecordId), positionRequest(C.globalRecordId, true)]),
       );
       expect(result.current.n).toBe(4);
       expect(result.current.count).toBe(4);
@@ -851,9 +1030,7 @@ describe('useRecordNavigation', () => {
       expect(result.current.n).toBeNull();
       await settled(result);
 
-      expect(sorted(api.requestsSince(mark))).toEqual(
-        sorted([countRequest(), positionRequest(created.globalRecordId)]),
-      );
+      expect(api.requestsSince(mark)).toEqual([positionRequest(created.globalRecordId)]);
       expect(result.current.n).toBe(4);
       expect(result.current.count).toBe(4);
       expect(result.current.statusText).toBe('4 of 4');
@@ -881,7 +1058,7 @@ describe('useRecordNavigation', () => {
       });
       await settled(result);
 
-      expect(sorted(api.requestsSince(mark))).toEqual(sorted([countRequest(), positionRequest(idOf(2))]));
+      expect(api.requestsSince(mark)).toEqual([positionRequest(idOf(2))]);
       expect(result.current.n).toBe(1);
       expect(result.current.count).toBe(2);
       expect(result.current.statusText).toBe('1 of 2');
@@ -890,7 +1067,7 @@ describe('useRecordNavigation', () => {
     });
 
     // B's saved DTO is 2 of 3 over the active set in both cases, while the refresh places
-    // it elsewhere, so only the count and position reads can supply n and N.
+    // it elsewhere, so only the position read can supply n and N.
     const savedElsewhere: readonly {
       readonly name: string;
       readonly includeDeleted: boolean;
@@ -942,9 +1119,7 @@ describe('useRecordNavigation', () => {
         });
         await settled(result);
 
-        expect(sorted(api.requestsSince(mark))).toEqual(
-          sorted([countRequest(includeDeleted), positionRequest(B.globalRecordId, includeDeleted)]),
-        );
+        expect(api.requestsSince(mark)).toEqual([positionRequest(B.globalRecordId, includeDeleted)]);
         expect(result.current.includeDeleted).toBe(includeDeleted);
         expect(result.current.n).toBe(refreshed.n);
         expect(result.current.count).toBe(refreshed.count);
@@ -972,7 +1147,7 @@ describe('useRecordNavigation', () => {
       readonly dto: { readonly recStatus: number; readonly position: number; readonly count: number };
       /** The open record's status on the server when the toggle switches off. */
       readonly serverStatus: number;
-      /** The log after the toggle's two parallel reads. */
+      /** The log after the toggle's position read. */
       readonly after: readonly string[];
       /** The record open afterwards. */
       readonly landed: Row;
@@ -1049,10 +1224,11 @@ describe('useRecordNavigation', () => {
 
         await perform(() => result.current.setIncludeDeleted(false));
 
-        // The reads come first: a leave, where there is one, waits for the position response.
+        // The read comes first: a leave, where there is one, waits for the position response,
+        // which also gives N, so no count is read.
         const log = api.logSince(mark);
-        expect(sorted(log.slice(0, 2))).toEqual(sorted([countRequest(), positionRequest(open.globalRecordId)]));
-        expect(log.slice(2)).toEqual(after);
+        expect(log[0]).toBe(positionRequest(open.globalRecordId));
+        expect(log.slice(1)).toEqual(after);
         expect(beforeLeave).toHaveBeenCalledTimes(leaves + (replaced ? 1 : 0));
         expect(result.current.includeDeleted).toBe(false);
         expect(result.current.n).toBe(n);
@@ -1096,10 +1272,8 @@ describe('useRecordNavigation', () => {
 
       // The save may have moved B, so the set is read again, which places B in it: nothing follows.
       const log = api.logSince(mark);
-      const toggleReads = sorted([countRequest(), positionRequest(B.globalRecordId)]);
-      expect(sorted(log.slice(0, 2))).toEqual(toggleReads);
-      expect(log[2]).toBe('beforeLeave');
-      expect(sorted(log.slice(3))).toEqual(toggleReads);
+      const toggleRead = positionRequest(B.globalRecordId);
+      expect(log).toEqual([toggleRead, 'beforeLeave', toggleRead]);
       expect(beforeLeave).toHaveBeenCalledTimes(leaves + 1);
       expect(result.current.record?.globalRecordId).toBe(B.globalRecordId);
       expect(result.current.recordGeneration).toBe(recordGeneration);
@@ -1131,7 +1305,7 @@ describe('useRecordNavigation', () => {
 
       await perform(() => result.current.setIncludeDeleted(false));
 
-      expect(sorted(api.requestsSince(mark))).toEqual(sorted([countRequest(), positionRequest(idOf(1))]));
+      expect(api.requestsSince(mark)).toEqual([positionRequest(idOf(1))]);
       expect(result.current.isNew).toBe(true);
       expect(result.current.record).toBeNull();
       expect(result.current.n).toBeNull();
@@ -1151,7 +1325,7 @@ describe('useRecordNavigation', () => {
       /** Rows soft-deleted after the load, the opened one among them. */
       readonly deleted: readonly string[];
       readonly opening: string;
-      /** The requests after the open's three parallel reads. */
+      /** The requests after the open's two parallel reads. */
       readonly landing: readonly string[];
       readonly n: number | null;
       readonly count: number;
@@ -1201,11 +1375,10 @@ describe('useRecordNavigation', () => {
         await perform(() => result.current.openById(opening));
 
         const requests = api.requestsSince(mark);
-        expect(sorted(requests.slice(0, 3))).toEqual(
-          sorted([byIdRequest(opening), positionRequest(opening), countRequest()]),
-        );
-        // N comes from the open's own count, so the landing reads no count of its own.
-        expect(requests.slice(3)).toEqual(landing);
+        expect(sorted(requests.slice(0, 2))).toEqual(sorted([byIdRequest(opening), positionRequest(opening)]));
+        // N comes from the count the position endpoint answers with, so neither the open nor
+        // its landing reads a count of its own.
+        expect(requests.slice(2)).toEqual(landing);
         expect(result.current.notice).toMatch(DELETED_HIDDEN);
         expect(result.current.listVersion).toBe(listVersion + 1);
         expect(result.current.recordGeneration).toBe(recordGeneration + 1);
@@ -1230,9 +1403,9 @@ describe('useRecordNavigation', () => {
           strict,
         });
 
-        // StrictMode's repeated effect may send the count twice; no request reads the active set.
+        // StrictMode's repeated effect may send the reads twice; no request reads the active set.
         const requests = api.requests();
-        expect(requests.slice(-2)).toEqual([countRequest(true), atRequest(2, true)]);
+        expect(sorted(requests.slice(-2))).toEqual(sorted([countRequest(true), atRequest(2, true)]));
         expect(requests.filter((line) => line !== countRequest(true) && line !== atRequest(2, true))).toEqual([]);
         expect(result.current.includeDeleted).toBe(true);
         expect(result.current.n).toBe(2);
@@ -1246,8 +1419,7 @@ describe('useRecordNavigation', () => {
         await perform(() => result.current.setIncludeDeleted(false));
 
         const toggled = api.requestsSince(mark);
-        expect(sorted(toggled.slice(0, 2))).toEqual(sorted([countRequest(), positionRequest(D.globalRecordId)]));
-        expect(toggled.slice(2)).toEqual([atRequest(2)]);
+        expect(toggled).toEqual([positionRequest(D.globalRecordId), atRequest(2)]);
         expect(result.current.includeDeleted).toBe(false);
         expect(result.current.record?.globalRecordId).toBe(B.globalRecordId);
         expect(result.current.statusText).toBe('2 of 3');
@@ -1259,7 +1431,7 @@ describe('useRecordNavigation', () => {
       async (initialIncludeDeleted) => {
         const { api, result } = await mount(mixedRows(), { initialPosition: 2, initialIncludeDeleted });
 
-        expect(api.requests()).toEqual([countRequest(), atRequest(2)]);
+        expect(sorted(api.requests())).toEqual(sorted([countRequest(), atRequest(2)]));
         expect(result.current.includeDeleted).toBe(false);
         expect(result.current.record?.globalRecordId).toBe(B.globalRecordId);
         expect(result.current.statusText).toBe('2 of 3');
@@ -1268,6 +1440,8 @@ describe('useRecordNavigation', () => {
   });
 
   describe('the notice of an initial position that cannot be opened as asked', () => {
+    // N and at/7 are read together. The 404 of at/7 runs the 404 recovery, which reloads the
+    // grid, reads N again and opens at/{min(7, N)}.
     const PAST_THE_END = [countRequest(), atRequest(7), countRequest(), atRequest(3)];
 
     it.each<{
@@ -1276,6 +1450,8 @@ describe('useRecordNavigation', () => {
       readonly initialPosition?: number;
       readonly initialPositionText?: string;
       readonly requests: readonly string[];
+      /** 1 once the 404 recovery has reloaded the grid; 0 when no 404 recovery ran. */
+      readonly listVersion: number;
       readonly opened: string | null;
       readonly statusText: string;
       readonly notice: string | null;
@@ -1285,6 +1461,7 @@ describe('useRecordNavigation', () => {
         rows: activeRows(3),
         initialPositionText: 'abc',
         requests: [countRequest(), atRequest(1)],
+        listVersion: 0,
         opened: idOf(1),
         statusText: '1 of 3',
         notice: "'abc' is not a record number, so the first record is shown.",
@@ -1294,6 +1471,7 @@ describe('useRecordNavigation', () => {
         rows: activeRows(3),
         initialPositionText: ' ',
         requests: [countRequest(), atRequest(1)],
+        listVersion: 0,
         opened: idOf(1),
         statusText: '1 of 3',
         notice: 'The record number is blank, so the first record is shown.',
@@ -1303,6 +1481,7 @@ describe('useRecordNavigation', () => {
         rows: activeRows(3),
         initialPosition: 0,
         requests: [countRequest(), atRequest(1)],
+        listVersion: 0,
         opened: idOf(1),
         statusText: '1 of 3',
         notice: "'0' is not a record number, so the first record is shown.",
@@ -1311,7 +1490,8 @@ describe('useRecordNavigation', () => {
         name: 'text that is not a record number opens New on an empty form',
         rows: [],
         initialPositionText: 'abc',
-        requests: [countRequest()],
+        requests: [countRequest(), atRequest(1)],
+        listVersion: 0,
         opened: null,
         statusText: 'New record',
         notice: "'abc' is not a record number, and there are no records to show, so a new record is shown.",
@@ -1322,6 +1502,7 @@ describe('useRecordNavigation', () => {
         initialPosition: 7,
         initialPositionText: '7',
         requests: PAST_THE_END,
+        listVersion: 1,
         opened: idOf(3),
         statusText: '3 of 3',
         notice: 'This record no longer exists. There is no record 7; showing the last record, 3.',
@@ -1331,6 +1512,7 @@ describe('useRecordNavigation', () => {
         rows: activeRows(3),
         initialPosition: 7,
         requests: PAST_THE_END,
+        listVersion: 1,
         opened: idOf(3),
         statusText: '3 of 3',
         notice: 'This record no longer exists. There is no record 7; showing the last record, 3.',
@@ -1341,16 +1523,18 @@ describe('useRecordNavigation', () => {
         initialPosition: 2_147_483_647,
         initialPositionText: '99999999999',
         requests: [countRequest(), atRequest(2_147_483_647), countRequest(), atRequest(3)],
+        listVersion: 1,
         opened: idOf(3),
         statusText: '3 of 3',
         notice: 'This record no longer exists. There is no record 99999999999; showing the last record, 3.',
       },
       {
-        name: 'a position on an empty form opens New, with no at read',
+        name: 'a position on an empty form opens New, whatever its at read answers',
         rows: [],
         initialPosition: 3,
         initialPositionText: '3',
-        requests: [countRequest()],
+        requests: [countRequest(), atRequest(3)],
+        listVersion: 0,
         opened: null,
         statusText: 'New record',
         notice: 'There is no record 3; there are no records to show, so a new record is shown.',
@@ -1361,6 +1545,7 @@ describe('useRecordNavigation', () => {
         initialPosition: 2,
         initialPositionText: '2',
         requests: [countRequest(), atRequest(2)],
+        listVersion: 0,
         opened: idOf(2),
         statusText: '2 of 3',
         notice: null,
@@ -1369,14 +1554,18 @@ describe('useRecordNavigation', () => {
         name: 'neither position nor text opens the first record with no notice',
         rows: activeRows(3),
         requests: [countRequest(), atRequest(1)],
+        listVersion: 0,
         opened: idOf(1),
         statusText: '1 of 3',
         notice: null,
       },
-    ])('$name', async ({ rows, initialPosition, initialPositionText, requests, opened, statusText, notice }) => {
+    ])('$name', async ({ rows, initialPosition, initialPositionText, requests, listVersion, opened, statusText, notice }) => {
       const { api, result, beforeLeave } = await mount(rows, { initialPosition, initialPositionText });
 
-      expect(api.requests()).toEqual(requests);
+      // The first two, N and the position asked for, are read together.
+      expect(sorted(api.requests().slice(0, 2))).toEqual(sorted(requests.slice(0, 2)));
+      expect(api.requests().slice(2)).toEqual(requests.slice(2));
+      expect(result.current.listVersion).toBe(listVersion);
       expect(result.current.notice).toBe(notice);
       expect(result.current.record?.globalRecordId ?? null).toBe(opened);
       expect(result.current.isNew).toBe(opened === null);
@@ -1385,35 +1574,43 @@ describe('useRecordNavigation', () => {
       expect(beforeLeave).not.toHaveBeenCalled();
     });
 
-    // The count said record 2 existed, so a 404 on at/2 means it went away after N was read.
+    // A 404 on the initial at/{position} runs the 404 recovery whatever N the count beside it
+    // gave: the grid reloads, N is read again, and at/{min(position, N)} opens, or New. A 404
+    // on at/2, which that N counts, means the record went away after N was read; at/99999
+    // lies past the end of the 3 records that N counts, and the set shrinks before the
+    // recovery reads N again.
     it.each<{
       readonly name: string;
       readonly rows: readonly Row[];
-      /** Runs while at/2 is held, before it answers. */
+      readonly initialPosition: number;
+      /** Runs while at/{initialPosition} is held, before it answers. */
       readonly whileAt: (api: FakeApi) => void;
       /** Runs while the recovery's count is held, before it answers. */
-      readonly whileCount: (api: FakeApi) => void;
+      readonly whileCount?: (api: FakeApi) => void;
       readonly requests: readonly string[];
       readonly opened: string | null;
+      readonly count: number;
       readonly statusText: string;
       readonly notice: string;
     }>([
       {
         name: 'the set is empty by the recovery, so New opens',
         rows: activeRows(2),
+        initialPosition: 2,
         whileAt: (api) => {
           api.remove(idOf(1));
           api.remove(idOf(2));
         },
-        whileCount: () => undefined,
         requests: [countRequest(), atRequest(2), countRequest()],
         opened: null,
+        count: 0,
         statusText: 'New record',
         notice: 'This record no longer exists. There is no record 2; there are no records to show, so a new record is shown.',
       },
       {
         name: 'the set has a record 2 again by the recovery, which opens with the 404 notice alone',
         rows: activeRows(3),
+        initialPosition: 2,
         whileAt: (api) => {
           api.remove(idOf(2));
           api.remove(idOf(3));
@@ -1424,21 +1621,66 @@ describe('useRecordNavigation', () => {
         },
         requests: [countRequest(), atRequest(2), countRequest(), atRequest(2)],
         opened: idOf(4),
+        count: 3,
         statusText: '2 of 3',
         notice: 'This record no longer exists.',
       },
+      {
+        name: 'the last record of the N read again opens, named in the notice',
+        rows: activeRows(3),
+        initialPosition: 99999,
+        whileAt: (api) => {
+          api.remove(idOf(3));
+        },
+        requests: [countRequest(), atRequest(99999), countRequest(), atRequest(2)],
+        opened: idOf(2),
+        count: 2,
+        statusText: '2 of 2',
+        notice: 'This record no longer exists. There is no record 99999; showing the last record, 2.',
+      },
+      {
+        name: 'no record is left by the recovery, so New opens',
+        rows: activeRows(3),
+        initialPosition: 99999,
+        whileAt: (api) => {
+          api.remove(idOf(1));
+          api.remove(idOf(2));
+          api.remove(idOf(3));
+        },
+        requests: [countRequest(), atRequest(99999), countRequest()],
+        opened: null,
+        count: 0,
+        statusText: 'New record',
+        notice: 'This record no longer exists. There is no record 99999; there are no records to show, so a new record is shown.',
+      },
+      {
+        name: 'the last record of the N read again answers 404 as well, so New opens instead of looping',
+        rows: activeRows(3),
+        initialPosition: 99999,
+        whileAt: (api) => {
+          api.remove(idOf(3));
+        },
+        whileCount: (api) => {
+          api.failEveryAt();
+        },
+        requests: [countRequest(), atRequest(99999), countRequest(), atRequest(2)],
+        opened: null,
+        count: 2,
+        statusText: 'New record',
+        notice: 'This record no longer exists.',
+      },
     ])(
-      'a 404 on the initial at/2 that N counted says no "last record" when $name',
-      async ({ rows, whileAt, whileCount, requests, opened, statusText, notice }) => {
+      'a 404 on the initial at/$initialPosition runs the 404 recovery: $name',
+      async ({ rows, initialPosition, whileAt, whileCount, requests, opened, count, statusText, notice }) => {
         const api = createFakeApi(rows);
-        const atGate = api.hold(`${RECORDS_PATH}/at/2`);
+        const atGate = api.hold(`${RECORDS_PATH}/at/${initialPosition}`);
         const client = createApiClient({ baseUrl: 'http://localhost', fetch: api.fetch });
         const { result } = renderHook(() =>
           useRecordNavigation({
             client,
             viewId: VIEW_ID,
-            initialPosition: 2,
-            initialPositionText: '2',
+            initialPosition,
+            initialPositionText: String(initialPosition),
             beforeLeave: () => Promise.resolve(true),
           }),
         );
@@ -1452,15 +1694,21 @@ describe('useRecordNavigation', () => {
           atGate.release();
           await countGate.reached;
         });
-        whileCount(api);
+        whileCount?.(api);
         act(() => {
           countGate.release();
         });
         await settled(result);
 
-        expect(api.requests()).toEqual(requests);
+        // N and the position asked for are read together; the recovery's reads follow in order.
+        expect(sorted(api.requests().slice(0, 2))).toEqual(sorted(requests.slice(0, 2)));
+        expect(api.requests().slice(2)).toEqual(requests.slice(2));
+        // The list changed, so the grid reloads, and N is the one read again.
+        expect(result.current.listVersion).toBe(1);
+        expect(result.current.count).toBe(count);
         expect(result.current.notice).toBe(notice);
         expect(result.current.record?.globalRecordId ?? null).toBe(opened);
+        expect(result.current.isNew).toBe(opened === null);
         expect(result.current.statusText).toBe(statusText);
         expect(result.current.loadError).toBeNull();
       },
@@ -1478,10 +1726,8 @@ describe('useRecordNavigation', () => {
       await perform(() => result.current.openById(vanished));
 
       const requests = api.requestsSince(mark);
-      expect(sorted(requests.slice(0, 3))).toEqual(
-        sorted([byIdRequest(vanished), positionRequest(vanished), countRequest()]),
-      );
-      expect(requests.slice(3)).toEqual([countRequest(), atRequest(3)]);
+      expect(sorted(requests.slice(0, 2))).toEqual(sorted([byIdRequest(vanished), positionRequest(vanished)]));
+      expect(requests.slice(2)).toEqual([countRequest(), atRequest(3)]);
       expect(result.current.notice).toMatch(RECORD_GONE);
       expect(result.current.listVersion).toBe(listVersion + 1);
       expect(result.current.n).toBe(3);
@@ -1500,7 +1746,7 @@ describe('useRecordNavigation', () => {
       readonly initialPosition: number;
       /** Rows soft-deleted after the load, so they leave the active set. */
       readonly deleted: readonly string[];
-      /** The requests after the open's three parallel reads. */
+      /** The requests after the open's two parallel reads. */
       readonly recovery: readonly string[];
       readonly n: number | null;
       readonly count: number;
@@ -1549,10 +1795,8 @@ describe('useRecordNavigation', () => {
         await perform(() => result.current.openById(target));
 
         const requests = api.requestsSince(mark);
-        expect(sorted(requests.slice(0, 3))).toEqual(
-          sorted([byIdRequest(target), positionRequest(target), countRequest()]),
-        );
-        expect(requests.slice(3)).toEqual(recovery);
+        expect(sorted(requests.slice(0, 2))).toEqual(sorted([byIdRequest(target), positionRequest(target)]));
+        expect(requests.slice(2)).toEqual(recovery);
         expect(result.current.notice).toMatch(RECORD_GONE);
         expect(result.current.listVersion).toBe(listVersion + 1);
         expect(result.current.recordGeneration).toBe(recordGeneration + 1);
@@ -1607,10 +1851,8 @@ describe('useRecordNavigation', () => {
 
         await perform(() => result.current.setIncludeDeleted(true));
 
-        // The toggle's own reads, then the leave, and only after a successful leave the recovery.
-        const log = api.logSince(mark);
-        expect(sorted(log.slice(0, 2))).toEqual(sorted([countRequest(true), positionRequest(idOf(3), true)]));
-        expect(log.slice(2)).toEqual(['beforeLeave', ...recovery]);
+        // The toggle's own read, then the leave, and only after a successful leave the recovery.
+        expect(api.logSince(mark)).toEqual([positionRequest(idOf(3), true), 'beforeLeave', ...recovery]);
         expect(beforeLeave).toHaveBeenCalledTimes(1);
         expect(result.current.record?.globalRecordId).toBe(opened);
         expect(result.current.n).toBe(3);
@@ -1694,16 +1936,68 @@ describe('useRecordNavigation', () => {
       await act(flush);
 
       const requests = api.requestsSince(mark);
-      expect(sorted(requests.slice(0, 3))).toEqual(
-        sorted([byIdRequest(vanished), positionRequest(vanished), countRequest()]),
-      );
-      expect(requests.slice(3)).toEqual([countRequest(), atRequest(1)]);
+      expect(sorted(requests.slice(0, 2))).toEqual(sorted([byIdRequest(vanished), positionRequest(vanished)]));
+      expect(requests.slice(2)).toEqual([countRequest(), atRequest(1)]);
       expect(result.current.notice).toMatch(RECORD_GONE);
       expect(result.current.isNew).toBe(true);
       expect(result.current.count).toBe(2);
       expect(result.current.listVersion).toBe(listVersion + 1);
     });
   });
+
+  // Open by id, a toggle change and an after-save refresh read no count of their own: the
+  // position endpoint answers N with n. A 404 of their reads recovers through a count read,
+  // whose own 404 is the one that says the form itself is gone.
+  describe('a form that no longer exists', () => {
+    it.each<{
+      readonly name: string;
+      readonly start: (navigation: RecordNavigation, saved: RecordDto) => Promise<unknown>;
+      readonly reads: readonly string[];
+      readonly includeDeleted: boolean;
+    }>([
+      {
+        name: 'an open by id',
+        start: (navigation) => navigation.openById(idOf(2)),
+        reads: sorted([byIdRequest(idOf(2)), positionRequest(idOf(2))]),
+        includeDeleted: false,
+      },
+      {
+        name: 'a toggle change',
+        start: (navigation) => navigation.setIncludeDeleted(true),
+        reads: [positionRequest(idOf(1), true)],
+        includeDeleted: true,
+      },
+      {
+        name: 'an after-save refresh',
+        start: (navigation, saved) => {
+          navigation.afterSave(saved);
+          return Promise.resolve();
+        },
+        reads: [positionRequest(idOf(1))],
+        includeDeleted: false,
+      },
+    ])('$name whose reads answer 404 ends in the count 404 that says the form is gone', async ({ start, reads, includeDeleted }) => {
+      const { api, result } = await mount(activeRows(3));
+      const saved = api.dto(idOf(1));
+      api.removeForm();
+      const mark = api.mark();
+
+      await perform(() => start(result.current, saved));
+      await settled(result);
+      await act(flush);
+
+      const requests = api.requestsSince(mark);
+      expect(sorted(requests.slice(0, reads.length))).toEqual(reads);
+      expect(requests.slice(reads.length)).toEqual([countRequest(includeDeleted)]);
+      expect(result.current.loadError?.kind).toBe('notFound');
+      expect(result.current.loading).toBe(false);
+      expect(result.current.transitioning).toBe(false);
+      // The failed load keeps what was shown.
+      expect(result.current.record?.globalRecordId).toBe(idOf(1));
+      expect(result.current.includeDeleted).toBe(false);
+    });
+  });
+
 
   describe('afterDelete', () => {
     it.each([
@@ -2002,8 +2296,9 @@ describe('useRecordNavigation', () => {
       const { result } = renderHook(() => useRecordNavigation({ client, viewId: VIEW_ID, beforeLeave }));
       await settled(result);
 
-      // The load stops at the count, shown with Retry, and opens nothing from a count it lacks.
-      expect(requests).toEqual([countRequest()]);
+      // The load reads at/1 beside the count, stops at the count, shown with Retry, and opens
+      // nothing from a count it lacks.
+      expect(sorted(requests)).toEqual(sorted([countRequest(), atRequest(1)]));
       expect(result.current.loadError?.kind).toBe('server');
       expect(result.current.loadError?.status).toBe(200);
       expect(result.current.record).toBeNull();
@@ -2187,14 +2482,15 @@ describe('record transitions (0.3.6, 0.3.4.2)', () => {
       }),
     );
     await settled(result);
-    expect(connection.api.requests()).toEqual([countRequest(true)]);
+    const reads = sorted([countRequest(true), atRequest(2, true)]);
+    expect(sorted(connection.api.requests())).toEqual(reads);
     expect(result.current.loadError?.kind).toBe('unavailable');
     expect(result.current.includeDeleted).toBe(true);
     const mark = connection.api.mark();
 
     await perform(() => result.current.retryLoad());
 
-    expect(connection.api.requestsSince(mark)).toEqual([countRequest(true), atRequest(2, true)]);
+    expect(sorted(connection.api.requestsSince(mark))).toEqual(reads);
     expect(result.current.loadError).toBeNull();
     expect(result.current.includeDeleted).toBe(true);
     expect(result.current.record?.globalRecordId).toBe(idOf(2));
@@ -2514,7 +2810,7 @@ describe('record transitions (0.3.6, 0.3.4.2)', () => {
         failed: `${RECORDS_PATH}/${idOf(4)}`,
         prepare: () => undefined,
         start: (navigation) => navigation.openById(idOf(4)),
-        reads: sorted([byIdRequest(idOf(4)), positionRequest(idOf(4)), countRequest()]),
+        reads: sorted([byIdRequest(idOf(4)), positionRequest(idOf(4))]),
         parallel: true,
         opened: 4,
       },
@@ -2669,9 +2965,7 @@ describe('record transitions (0.3.6, 0.3.4.2)', () => {
       await perform(() => result.current.retryLoad());
       await act(flush);
 
-      const log = api.logSince(mark);
-      expect(log[0]).toBe('beforeLeave');
-      expect(sorted(log.slice(1))).toEqual(sorted([countRequest(), positionRequest(idOf(1))]));
+      expect(api.logSince(mark)).toEqual(['beforeLeave', positionRequest(idOf(1))]);
       expect(result.current.loadError?.kind).toBe('unavailable');
       expect(result.current.loading).toBe(false);
       expect(result.current.transitioning).toBe(false);
@@ -2708,9 +3002,7 @@ describe('record transitions (0.3.6, 0.3.4.2)', () => {
         await settled(result);
         await act(flush);
 
-        const log = api.logSince(mark);
-        expect(sorted(log.slice(0, 2))).toEqual(sorted([countRequest(), positionRequest(idOf(2))]));
-        expect(log.slice(2)).toEqual(['beforeLeave', ...expected]);
+        expect(api.logSince(mark)).toEqual([positionRequest(idOf(2)), 'beforeLeave', ...expected]);
         expect(result.current.transitioning).toBe(false);
         expect(result.current.loading).toBe(false);
         if (left) {
@@ -2831,17 +3123,17 @@ describe('record transitions (0.3.6, 0.3.4.2)', () => {
         line: byIdRequest(idOf(4)),
         prepare: () => undefined,
         start: (navigation) => navigation.openById(idOf(4)),
-        reads: sorted([byIdRequest(idOf(4)), positionRequest(idOf(4)), countRequest()]),
+        reads: sorted([byIdRequest(idOf(4)), positionRequest(idOf(4))]),
         parallel: true,
       },
       {
-        name: 'the count read of a toggle change',
-        aborted: `${RECORDS_PATH}/count`,
-        line: countRequest(true),
+        name: 'the position read of a toggle change',
+        aborted: `${RECORDS_PATH}/${idOf(1)}/position`,
+        line: positionRequest(idOf(1), true),
         prepare: () => undefined,
         start: (navigation) => navigation.setIncludeDeleted(true),
-        reads: sorted([countRequest(true), positionRequest(idOf(1), true)]),
-        parallel: true,
+        reads: [positionRequest(idOf(1), true)],
+        parallel: false,
       },
       {
         name: 'the count read of the landing after a delete',
@@ -2866,8 +3158,8 @@ describe('record transitions (0.3.6, 0.3.4.2)', () => {
           navigation.afterSave(api.dto(idOf(1)));
           return Promise.resolve();
         },
-        reads: sorted([countRequest(), positionRequest(idOf(1))]),
-        parallel: true,
+        reads: [positionRequest(idOf(1))],
+        parallel: false,
       },
     ];
 
@@ -2920,19 +3212,11 @@ describe('record transitions (0.3.6, 0.3.4.2)', () => {
         held: { pathname: `${RECORDS_PATH}/${idOf(4)}/position`, line: positionRequest(idOf(4)) },
       },
       {
-        name: 'a toggle change',
-        start: (navigation) => navigation.setIncludeDeleted(true),
-        aborted: { pathname: `${RECORDS_PATH}/count`, line: countRequest(true) },
-        held: { pathname: `${RECORDS_PATH}/${idOf(1)}/position`, line: positionRequest(idOf(1), true) },
-      },
-      {
-        name: 'the after-save refresh',
-        start: (navigation, api) => {
-          navigation.afterSave(api.dto(idOf(1)));
-          return Promise.resolve();
-        },
-        aborted: { pathname: `${RECORDS_PATH}/${idOf(1)}/position`, line: positionRequest(idOf(1)) },
-        held: { pathname: `${RECORDS_PATH}/count`, line: countRequest() },
+        // Nothing has loaded since the mount, so Retry repeats the initial load.
+        name: 'a repeated initial load',
+        start: (navigation) => navigation.retryLoad(),
+        aborted: { pathname: `${RECORDS_PATH}/count`, line: countRequest() },
+        held: { pathname: `${RECORDS_PATH}/at/1`, line: atRequest(1) },
       },
     ];
 
@@ -3126,8 +3410,8 @@ describe('record transitions (0.3.6, 0.3.4.2)', () => {
         name: 'next, cancelled after the leave saved the record,',
         run: NEXT.run,
         left: false,
-        reads: sorted([countRequest(), positionRequest(idOf(1))]),
-        parallel: true,
+        reads: [positionRequest(idOf(1))],
+        parallel: false,
         n: 1,
       },
     ])('$name sends no after-save refresh of its own before its reads', async ({ run, left, reads, parallel, n }) => {
@@ -3202,9 +3486,7 @@ describe('record transitions (0.3.6, 0.3.4.2)', () => {
         await act(flush);
 
         // The move's reads, the failing one last, then the coordinates of the saved record.
-        const log = api.logSince(mark);
-        expect(log.slice(0, 3)).toEqual(['beforeLeave', ...move]);
-        expect(sorted(log.slice(3))).toEqual(sorted([countRequest(), positionRequest(saved)]));
+        expect(api.logSince(mark)).toEqual(['beforeLeave', ...move, positionRequest(saved)]);
         expect(result.current.loadError?.kind).toBe('unavailable');
         expect(result.current.record?.globalRecordId).toBe(saved);
         expect(result.current.isNew).toBe(false);
@@ -3258,9 +3540,7 @@ describe('record transitions (0.3.6, 0.3.4.2)', () => {
       await act(flush);
 
       // The refresh's 404 starts no recovery and shows nothing of its own.
-      const log = api.logSince(mark);
-      expect(log.slice(0, 3)).toEqual(['beforeLeave', countRequest(), atRequest(1)]);
-      expect(sorted(log.slice(3))).toEqual(sorted([countRequest(), positionRequest(idOf(4))]));
+      expect(api.logSince(mark)).toEqual(['beforeLeave', countRequest(), atRequest(1), positionRequest(idOf(4))]);
       expect(result.current.loadError?.kind).toBe('unavailable');
       expect(result.current.notice).toBeNull();
       expect(result.current.record?.globalRecordId).toBe(idOf(4));
@@ -3321,10 +3601,7 @@ describe('record transitions (0.3.6, 0.3.4.2)', () => {
   // N over it: the record stays at the n and N shown, which still count it, and the next
   // move re-reads N and opens the record that followed it.
   describe('coordinates read before a conflict', () => {
-    it.each([
-      { held: 'count', path: `${RECORDS_PATH}/count`, line: countRequest() },
-      { held: 'position', path: `${RECORDS_PATH}/${idOf(4)}/position`, line: positionRequest(idOf(4)) },
-    ])(
+    it.each([{ held: 'position', path: `${RECORDS_PATH}/${idOf(4)}/position`, line: positionRequest(idOf(4)) }])(
       'an after-save refresh whose $held read is held across the conflict is superseded, and Next re-reads N',
       async ({ path, line }) => {
         const connection = await mountWire(activeRows(5), 4);
@@ -3367,11 +3644,15 @@ describe('record transitions (0.3.6, 0.3.4.2)', () => {
     );
 
     // Record 3 of 5 is deleted elsewhere once its save has answered, so the refresh finds it
-    // outside the active set.
-    it.each([
+    // outside the active set, and counts the 4 records left beside that answer.
+    const refreshesLeavingTheSet: readonly {
+      readonly name: string;
+      readonly refresh: (connection: MountedWire) => Promise<void>;
+      readonly failure: 'unavailable' | null;
+    }[] = [
       {
         name: 'an after-save refresh',
-        refresh: async ({ api, result }: MountedWire): Promise<void> => {
+        refresh: async ({ api, result }) => {
           const saved = api.dto(idOf(3));
           api.setStatus(idOf(3), DELETED);
           act(() => {
@@ -3383,7 +3664,7 @@ describe('record transitions (0.3.6, 0.3.4.2)', () => {
       },
       {
         name: 'the coordinates refresh after a Next whose leave saved it fails',
-        refresh: async (connection: MountedWire): Promise<void> => {
+        refresh: async (connection) => {
           const { api, result, beforeLeave } = connection;
           beforeLeave.mockImplementationOnce(() => {
             api.note('beforeLeave');
@@ -3397,8 +3678,10 @@ describe('record transitions (0.3.6, 0.3.4.2)', () => {
         },
         failure: 'unavailable',
       },
-    ])(
-      '$name placing the saved record outside the set keeps n and N, and Next opens the record that followed',
+    ];
+
+    it.each(refreshesLeavingTheSet)(
+      '$name placing the saved record outside the set keeps n and N, and Next opens the record that followed in the N it read',
       async ({ refresh, failure }) => {
         const connection = await mountWire(activeRows(5), 3);
         const { api, result } = connection;
@@ -3422,7 +3705,8 @@ describe('record transitions (0.3.6, 0.3.4.2)', () => {
 
         await perform(() => result.current.next());
 
-        expect(api.logSince(moveMark)).toEqual(['beforeLeave', countRequest(), atRequest(3)]);
+        // The refresh's answer gave N, so the move reads no count.
+        expect(api.logSince(moveMark)).toEqual(['beforeLeave', atRequest(3)]);
         expect(result.current.record?.globalRecordId).toBe(idOf(4));
         expect(result.current.statusText).toBe('3 of 4');
         expect(result.current.loadError).toBeNull();
@@ -3430,22 +3714,119 @@ describe('record transitions (0.3.6, 0.3.4.2)', () => {
       },
     );
 
-    it('a toggle to the active set whose reads predate the conflict leaves the record and reads the set again', async () => {
+    it.each(refreshesLeavingTheSet)(
+      '$name placing the saved record outside the set makes New show the N it read, with no count read',
+      async ({ refresh }) => {
+        const connection = await mountWire(activeRows(5), 3);
+        const { api, result } = connection;
+        await refresh(connection);
+        expect(result.current.statusText).toBe('3 of 5');
+        const mark = api.mark();
+
+        await perform(() => result.current.newRecord());
+        await settled(result);
+
+        expect(api.logSince(mark)).toEqual(['beforeLeave']);
+        expect(result.current.isNew).toBe(true);
+        expect(result.current.count).toBe(4);
+        expect(result.current.statusText).toBe('New record');
+        expect(result.current.loadError).toBeNull();
+
+        // Previous from New opens the last record of that N.
+        await perform(() => result.current.previous());
+
+        expect(api.logSince(mark)).toEqual(['beforeLeave', 'beforeLeave', atRequest(4)]);
+        expect(result.current.record?.globalRecordId).toBe(idOf(5));
+        expect(result.current.statusText).toBe('4 of 4');
+      },
+    );
+
+    // Record `open` of 5 is deleted elsewhere once its save has answered, and other records may
+    // join or leave the set meanwhile, so the N the refresh reads can differ from N - 1.
+    it.each<{
+      readonly set: string;
+      readonly open: number;
+      /** What another session changes in the set besides deleting record `open`. */
+      readonly elsewhere?: (api: FakeApi) => void;
+      readonly name: string;
+      readonly run: Action;
+      readonly to: number;
+      readonly opened: number;
+      readonly statusText: string;
+      readonly canNext: boolean;
+    }>([
+      { set: 'lost only it', open: 3, ...FIRST, to: 1, opened: 1, statusText: '1 of 4', canNext: true },
+      { set: 'lost only it', open: 3, ...PREVIOUS, to: 2, opened: 2, statusText: '2 of 4', canNext: true },
+      { set: 'lost only it', open: 3, ...LAST, to: 4, opened: 5, statusText: '4 of 4', canNext: true },
+      { set: 'lost only it', open: 3, ...goTo(4), to: 4, opened: 5, statusText: '4 of 4', canNext: true },
+      {
+        set: 'gained another record',
+        open: 3,
+        elsewhere: (api) => {
+          api.add(row(6));
+        },
+        ...NEXT,
+        to: 3,
+        opened: 4,
+        statusText: '3 of 5',
+        canNext: true,
+      },
+      {
+        // The slot follows the last record left, so Previous opens it and Next has nowhere to go.
+        set: 'lost the record before it as well',
+        open: 5,
+        elsewhere: (api) => {
+          api.setStatus(idOf(4), DELETED);
+        },
+        ...PREVIOUS,
+        to: 3,
+        opened: 3,
+        statusText: '3 of 3',
+        canNext: false,
+      },
+    ])(
+      'after a refresh placed record $open outside a set that $set, $name opens at/$to in the N it read, with no count read',
+      async ({ open, elsewhere, run, to, opened, statusText, canNext }) => {
+        const { api, result } = await mountWire(activeRows(5), open);
+        const saved = api.dto(idOf(open));
+        api.setStatus(idOf(open), DELETED);
+        elsewhere?.(api);
+
+        act(() => {
+          result.current.afterSave(saved);
+        });
+        await settled(result);
+
+        expect(result.current.statusText).toBe(`${open} of 5`);
+        expect(result.current.canPrevious).toBe(true);
+        expect(result.current.canNext).toBe(canNext);
+        const mark = api.mark();
+
+        await perform(() => run(result.current));
+
+        expect(api.logSince(mark)).toEqual(['beforeLeave', atRequest(to)]);
+        expect(result.current.record?.globalRecordId).toBe(idOf(opened));
+        expect(result.current.statusText).toBe(statusText);
+        expect(result.current.notice).toBeNull();
+        expect(result.current.loadError).toBeNull();
+      },
+    );
+
+    it('a toggle to the active set whose read predates the conflict leaves the record and reads the set again', async () => {
       const { api, result, beforeLeave } = await mount(activeRows(5), { initialPosition: 3 });
       await perform(() => result.current.setIncludeDeleted(true));
       expect(result.current.statusText).toBe('3 of 5');
-      const gate = api.hold(`${RECORDS_PATH}/count`);
+      // The position read answers from before the delete, record 3 being 3 of the active
+      // set, and that answer arrives after the conflict.
+      const gate = api.hold(`${RECORDS_PATH}/${idOf(3)}/position`, true);
       const mark = api.mark();
-      const toggleReads = sorted([countRequest(), positionRequest(idOf(3))]);
+      const toggleRead = positionRequest(idOf(3));
       let toggling: Promise<void> = Promise.resolve();
       await act(async () => {
         toggling = result.current.setIncludeDeleted(false);
         await gate.reached;
       });
-      // The position read has answered from before the delete: record 3 is 3 of the active set.
-      await waitFor(() => {
-        expect(sorted(api.requestsSince(mark))).toEqual(toggleReads);
-      });
+      expect(api.requestsSince(mark)).toEqual([toggleRead]);
       api.setStatus(idOf(3), DELETED);
       act(() => {
         result.current.afterConflict();
@@ -3457,11 +3838,7 @@ describe('record transitions (0.3.6, 0.3.4.2)', () => {
         await toggling;
       });
 
-      const log = api.logSince(mark);
-      expect(sorted(log.slice(0, 2))).toEqual(toggleReads);
-      expect(log[2]).toBe('beforeLeave');
-      expect(sorted(log.slice(3, 5))).toEqual(toggleReads);
-      expect(log.slice(5)).toEqual([atRequest(3)]);
+      expect(api.logSince(mark)).toEqual([toggleRead, 'beforeLeave', toggleRead, atRequest(3)]);
       expect(beforeLeave).toHaveBeenCalledTimes(leaves + 1);
       expect(result.current.includeDeleted).toBe(false);
       expect(result.current.record?.globalRecordId).toBe(idOf(4));
@@ -3503,7 +3880,7 @@ describe('record transitions (0.3.6, 0.3.4.2)', () => {
       return { navigation, editor };
     }
 
-    it('refuses an edit while an open by id waits for its position and count, then edits the opened record', async () => {
+    it('refuses an edit while an open by id waits for its position, then edits the opened record', async () => {
       const api = createFakeApi(activeRows(5));
       const client = createApiClient({ baseUrl: 'http://localhost', fetch: api.fetch });
       const { result } = renderHook(() => useWorkspace(client));
@@ -3515,12 +3892,11 @@ describe('record transitions (0.3.6, 0.3.4.2)', () => {
       expect(result.current.editor.isDisabled(EDITED)).toBe(false);
       expect(result.current.editor.isProtected(EDITED)).toBe(false);
       const positionGate = api.hold(`${RECORDS_PATH}/${idOf(4)}/position`);
-      const countGate = api.hold(`${RECORDS_PATH}/count`);
       let opening: Promise<void> = Promise.resolve();
 
       await act(async () => {
         opening = result.current.navigation.openById(idOf(4));
-        await Promise.all([positionGate.reached, countGate.reached]);
+        await positionGate.reached;
       });
 
       // The record read has answered and the old record is still shown, frozen: the edit
@@ -3539,7 +3915,6 @@ describe('record transitions (0.3.6, 0.3.4.2)', () => {
 
       await act(async () => {
         positionGate.release();
-        countGate.release();
         await opening;
       });
 

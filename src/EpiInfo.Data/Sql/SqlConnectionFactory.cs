@@ -13,7 +13,9 @@ namespace EpiInfo.Data.Sql;
 /// <remarks>
 /// <para>
 /// Each call opens a new connection that the caller owns and disposes (<c>await using</c>); SqlClient pools the
-/// physical connections. Nothing is retried, cached or logged here.
+/// physical connections. Nothing is retried or logged here, and no connection, result or failure is cached: the one
+/// state kept from call to call is the outage gate (<see cref="SqlOutageGate"/>), which records whether SQL Server
+/// was last found unreachable.
 /// </para>
 /// <para>
 /// SqlClient's pool blocking period is disabled (<see cref="PoolBlockingPeriod.NeverBlock"/>) unless the connection
@@ -22,18 +24,51 @@ namespace EpiInfo.Data.Sql;
 /// reads last and keeps. With blocking enabled, the SqlClient default for a server outside Azure SQL, one failed open
 /// makes the pool answer every open for the next 5 to 60 seconds with that cached failure, without contacting the
 /// server, so the API would go on reporting the database unavailable after SQL Server is back. With it disabled, each
-/// open after a failure contacts the server again, so the next request after SQL Server returns succeeds without a
-/// restart. That is not a retry: each call still opens once, and the failure of that open is what it reports. The cost
-/// is that, while the server stays unreachable, each open takes as long as SqlClient's own attempt, up to the
-/// connection string's connect timeout, before it fails; a connection string that prefers the cached failure sets
-/// <c>Pool Blocking Period</c> itself.
+/// open after a failure can contact the server again, so the next request after SQL Server returns succeeds without a
+/// restart. That is not a retry: each call still opens at most once, and the failure of that open is what it reports.
+/// The cost is that an open that contacts an unreachable server takes as long as SqlClient's own attempt, up to the
+/// connection string's connect timeout, before it fails; and SqlClient's pool makes one physical connection at a
+/// time, so the opens waiting in the pool behind that attempt would each wait out an attempt of their own in turn, the
+/// k-th about k connect timeouts. The outage gate and each open's deadline bound that cost; a connection string that
+/// prefers the cached failure sets <c>Pool Blocking Period</c> itself.
+/// </para>
+/// <para>
+/// <b>Outage gate.</b> When an open fails because SQL Server could not be reached or used, which is a
+/// <see cref="SqlException"/> that <see cref="SqlErrorClassifier"/> classifies as unavailable (a transport failure, a
+/// connect timeout, a failed login, a database that cannot be opened), the factory records an outage. At that first
+/// failure it also releases every other open then in flight: each opens under a token linked to its caller's and to
+/// the gate's current release generation, which the failure cancels, so an open still waiting inside SqlClient's pool
+/// ends at once as unavailable instead of waiting out its own attempt. While the outage is recorded, one open at a
+/// time goes through to SqlClient as the probe, and every other is refused at once, without asking SqlClient, as
+/// unavailable with no SQL error number. A probe that opens, or fails in a way showing that the server answered, such
+/// as pool exhaustion, clears the outage, so the next request opens normally, without a restart; a probe that fails
+/// as unreachable keeps it, and the next open probes again. A client's cancellation changes nothing. Recording the
+/// outage retires the generation, so an open admitted before it changes nothing when it ends: its late success
+/// cannot clear the outage while the probe runs, nor its late failure record another once a probe has cleared it.
+/// Clearing starts no generation, because the probe that clears it is the only open of its generation then in flight.
+/// </para>
+/// <para>
+/// <b>Deadline.</b> Every open the gate admits, normal or probe, also has a deadline of its own: the connection
+/// string's connect timeout plus a one-second grace, or none for a connect timeout of 0, which waits indefinitely.
+/// SqlClient cannot stop an attempt it has begun, so an open waiting in the pool behind an attempt begun for an open
+/// that has already ended, released or given up by its caller, whose failure no open hears, would begin an attempt of
+/// its own only when that one fails, and fail one connect timeout later. The deadline ends such an open first, as
+/// unavailable with no SQL error number: no connection within the connect timeout shows that the server did not
+/// answer, so it records the outage, as an unreachable server's failure does, and releases every other open in
+/// flight. The grace keeps SqlClient's pool-timeout failure, due at the connect timeout, ahead of the deadline, so pool
+/// exhaustion keeps its own classification. During an outage every admitted open therefore answers within about one
+/// connect timeout, and every refused one at once.
 /// </para>
 /// <para>
 /// The connection string carries the database password, so it never appears in an exception this class raises: the
 /// exceptions carry their fixed messages, the caller's fixed operation name and, at most, a SQL error number. The
 /// original failure is attached only as the inner exception, which the API never logs or returns.
 /// </para>
-/// <para>The instance holds only immutable options and is safe to share across threads.</para>
+/// <para>
+/// The instance holds immutable options and its outage gate, whose state changes only under the gate's lock, so it is
+/// safe to share across threads. The store builds one factory, and the API registers one store per process, so the
+/// recorded outage is the process's.
+/// </para>
 /// </remarks>
 /// <param name="options">The connection string and command timeout.</param>
 internal sealed class SqlConnectionFactory(DatabaseOptions options)
@@ -43,7 +78,18 @@ internal sealed class SqlConnectionFactory(DatabaseOptions options)
     // PoolBlockingPeriod the configured string sets wins over it.
     private const string NeverBlockDefault = "Pool Blocking Period=NeverBlock;";
 
+    // How far past its connect timeout an admitted open's deadline falls. SqlClient ends its own wait for a pooled
+    // connection at the connect timeout with its pool-timeout InvalidOperationException; the grace keeps that exception
+    // ahead of the deadline, so an exhausted pool is still reported from SqlClient's own failure, as pool exhaustion,
+    // rather than as an expired deadline.
+    private const int DeadlineGraceSeconds = 1;
+
+    // The longest deadline set, about 24.8 days, well within what a CancellationTokenSource timer accepts.
+    private static readonly TimeSpan MaxDeadline = TimeSpan.FromMilliseconds(int.MaxValue);
+
     private readonly DatabaseOptions options = options ?? throw new ArgumentNullException(nameof(options));
+
+    private readonly SqlOutageGate outageGate = new();
 
     /// <summary>
     /// The timeout, in whole seconds, every command must run with: <c>Database:CommandTimeoutSeconds</c>, 30 by default.
@@ -58,8 +104,48 @@ internal sealed class SqlConnectionFactory(DatabaseOptions options)
     /// disables the pool blocking period unless the string sets it. SqlClient reads and validates that string when the
     /// connection is created, on each call and never at construction, exactly as it reads the configured string alone,
     /// so the default changes neither which strings are accepted nor any other setting. After a failed open, the next
-    /// call therefore contacts the server again instead of receiving the pool's cached failure, and succeeds as soon as
-    /// SQL Server answers.
+    /// call the outage gate lets through therefore contacts the server again instead of receiving the pool's cached
+    /// failure, and succeeds as soon as SQL Server answers.
+    /// </para>
+    /// <para>
+    /// The steps run in this order: the <paramref name="operation"/> guard; the absent connection string; the
+    /// connection object, whose creation rejects a malformed string; then, for a caller whose token is already
+    /// cancelled, the open exactly as SqlClient refuses it, which neither consults nor changes the gate, because it
+    /// learns nothing about the server; otherwise the gate's admission (<see cref="SqlOutageGate.Admit"/>) and the open
+    /// it admits:
+    /// </para>
+    /// <list type="bullet">
+    /// <item><description>
+    /// with no outage recorded, a normal open under a token linked to <paramref name="cancellationToken"/>, to the
+    /// gate's release generation and to the open's deadline. A <see cref="SqlException"/> classified as unavailable
+    /// records an outage and releases every other normal open in flight, unless an earlier failure has already
+    /// retired the generation the open was admitted under; such a released open is reported as unavailable with no
+    /// SQL error number and its cancellation as the inner exception;
+    /// </description></item>
+    /// <item><description>
+    /// with an outage recorded and no probe in flight, the probe, under a token linked to
+    /// <paramref name="cancellationToken"/> and to the open's deadline;
+    /// </description></item>
+    /// <item><description>
+    /// with an outage recorded and a probe in flight, nothing: the connection object is released and the call fails at
+    /// once as unavailable, with no SQL error number and no inner exception, having asked SqlClient for nothing.
+    /// </description></item>
+    /// </list>
+    /// <para>
+    /// The deadline (<see cref="OpenDeadline"/>) is the connection's <see cref="SqlConnection.ConnectionTimeout"/> plus
+    /// a one-second grace, counted from just before SqlClient is asked, and there is none for a connect timeout of 0.
+    /// An open whose deadline passes before it has a connection, and before <paramref name="cancellationToken"/> is
+    /// cancelled or a release ends it, is released and reported as unavailable with no SQL error number and its
+    /// cancellation as the inner exception, and records the outage as an unavailable <see cref="SqlException"/> does,
+    /// releasing every other normal open in flight. Every admitted open therefore answers within about one connect
+    /// timeout, even one SqlClient holds in its pool behind an attempt begun for an open that has since ended, and
+    /// every refused one at once.
+    /// </para>
+    /// <para>
+    /// A connection that opens, and an open failure that is neither such an unavailable <see cref="SqlException"/>, an
+    /// expired deadline nor a cancellation, clear the outage; a cancellation by <paramref name="cancellationToken"/>
+    /// leaves it as it was. An open admitted under a generation that a later recorded outage has retired changes the
+    /// gate's state in none of these ways. A probe frees the probe slot however it ends.
     /// </para>
     /// <para>
     /// A connection that fails to open is released here, only after its failure is classified
@@ -74,15 +160,20 @@ internal sealed class SqlConnectionFactory(DatabaseOptions options)
     /// <returns>An open connection, owned and disposed by the caller.</returns>
     /// <exception cref="ArgumentException"><paramref name="operation"/> is null, empty or whitespace.</exception>
     /// <exception cref="DataStoreUnavailableException">
-    /// No connection string is configured, detected before any connection object exists; or opening failed in a way
+    /// No connection string is configured, detected before any connection object exists; opening failed in a way
     /// <see cref="SqlErrorClassifier"/> classifies as unavailable (unreachable server, failed login, database that
-    /// cannot be opened, timeout, pool exhaustion). Its outcome is <see cref="WriteOutcome.NotWritten"/>.
+    /// cannot be opened, timeout, pool exhaustion); the outage gate refused the open, or released it when another
+    /// open found the server unreachable; or the open's deadline passed before it had a connection; the last three with
+    /// no SQL error number. Its outcome is <see cref="WriteOutcome.NotWritten"/>.
     /// </exception>
     /// <exception cref="DataStoreWriteException">
     /// The connection string is malformed, or opening failed for any other reason. Its outcome is
     /// <see cref="WriteOutcome.NotWritten"/>.
     /// </exception>
-    /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> cancelled the open.</exception>
+    /// <exception cref="OperationCanceledException">
+    /// <paramref name="cancellationToken"/> cancelled the open. Once the gate has admitted the open, the exception
+    /// carries <paramref name="cancellationToken"/>, never the linked token, which is the factory's own.
+    /// </exception>
     internal async Task<SqlConnection> OpenAsync(string operation, CancellationToken cancellationToken)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(operation);
@@ -105,6 +196,137 @@ internal sealed class SqlConnectionFactory(DatabaseOptions options)
             throw new DataStoreWriteException(operation, WriteOutcome.NotWritten, sqlErrorNumber: null, exception);
         }
 
+        if (cancellationToken.IsCancellationRequested)
+        {
+            // An aborted request learns nothing about the server: SqlClient refuses the open without contacting it, and
+            // the refusal is reported as it always was, outside the gate.
+            await OpenUngatedAsync(connection, operation, cancellationToken).ConfigureAwait(false);
+            return connection;
+        }
+
+        SqlOutageGate.Ticket ticket = outageGate.Admit();
+        if (ticket.Admission == SqlOutageGate.Admission.Refused)
+        {
+            // A probe is finding out whether the recorded outage is over; until it ends, the answer is unavailable,
+            // given before SqlClient is asked, so no request waits out a connect timeout of its own.
+            await ReleaseUnopenedAsync(connection).ConfigureAwait(false);
+            throw new DataStoreUnavailableException(operation, WriteOutcome.NotWritten);
+        }
+
+        // What the gate hears once the open ends. A failure nothing below foresees leaves it Cancelled, which changes
+        // no state but frees a probe's slot.
+        SqlOutageGate.OpenEnd end = SqlOutageGate.OpenEnd.Cancelled;
+
+        // The open's own deadline, a source of its own so that its expiry stays distinct from the caller's cancellation
+        // and from a release; none when the connect timeout is 0, which SqlClient reads as waiting indefinitely.
+        CancellationTokenSource? deadline = OpenDeadline(connection.ConnectionTimeout) is TimeSpan due
+            ? new CancellationTokenSource(due)
+            : null;
+
+        // A probe runs only while an outage is recorded, when no release can be pending, so it opens under the caller's
+        // token and its deadline; a normal open is also ended by the release of its generation. For a probe, the
+        // ticket's release token is CancellationToken.None, which the linked source ignores.
+        CancellationTokenSource? linked = ticket.Admission == SqlOutageGate.Admission.Normal || deadline is not null
+            ? CancellationTokenSource.CreateLinkedTokenSource(
+                cancellationToken,
+                ticket.Release,
+                deadline?.Token ?? CancellationToken.None)
+            : null;
+        try
+        {
+            await connection.OpenAsync(linked?.Token ?? cancellationToken).ConfigureAwait(false);
+            end = SqlOutageGate.OpenEnd.Opened;
+            return connection;
+        }
+        catch (OperationCanceledException exception)
+            when (ticket.Release.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+        {
+            // Released: another open found the server unreachable while this one waited in SqlClient's pool. Nothing
+            // was sent, and the answer is the outage that open found, not a cancellation the client never asked for.
+            // A release that came with this open's deadline is taken as the release: the outage is already recorded.
+            await ReleaseUnopenedAsync(connection).ConfigureAwait(false);
+            throw new DataStoreUnavailableException(
+                operation,
+                WriteOutcome.NotWritten,
+                sqlErrorNumber: null,
+                exception);
+        }
+        catch (OperationCanceledException exception)
+            when (deadline is not null
+                && deadline.IsCancellationRequested
+                && !cancellationToken.IsCancellationRequested)
+        {
+            // No connection within the connect timeout and its grace, whether SqlClient attempted this open or held it
+            // in its pool behind an attempt begun for an open that has since ended, whose failure no open hears. Either
+            // way the server did not answer in time: the outage evidence an unreachable server gives, so the gate
+            // records it and releases every other open in flight. Nothing was sent.
+            end = SqlOutageGate.OpenEnd.ServerUnreachable;
+            await ReleaseUnopenedAsync(connection).ConfigureAwait(false);
+            throw new DataStoreUnavailableException(
+                operation,
+                WriteOutcome.NotWritten,
+                sqlErrorNumber: null,
+                exception);
+        }
+        catch (Exception exception)
+        {
+            Exception failure = await OpenFailureAsync(connection, operation, exception, cancellationToken)
+                .ConfigureAwait(false);
+            end = SqlOutageGate.EndOf(exception, failure);
+            if (failure is OperationCanceledException cancellation
+                && cancellation.CancellationToken != cancellationToken)
+            {
+                throw CallerCancellation(cancellation, exception, cancellationToken);
+            }
+
+            if (ReferenceEquals(failure, exception))
+            {
+                throw;
+            }
+
+            throw failure;
+        }
+        finally
+        {
+            // Disposed first, so a release this open's own ending triggers never reaches its linked source; the
+            // deadline after the source linked to it, which also stops its timer.
+            linked?.Dispose();
+            deadline?.Dispose();
+            outageGate.Complete(ticket, end);
+        }
+    }
+
+    /// <summary>
+    /// The deadline of an open the outage gate admits: <paramref name="connectTimeoutSeconds"/> plus a one-second
+    /// grace (<see cref="DeadlineGraceSeconds"/>), at most about 24.8 days, or none for a connect timeout of 0, which
+    /// SqlClient reads as waiting indefinitely.
+    /// </summary>
+    /// <remarks>
+    /// Internal, rather than private, so that <c>SqlErrorClassifierTests</c> can check the rule without waiting out a
+    /// deadline.
+    /// </remarks>
+    /// <param name="connectTimeoutSeconds">
+    /// The connection's <see cref="SqlConnection.ConnectionTimeout"/>, in seconds, which SqlClient never lets fall
+    /// below 0.
+    /// </param>
+    /// <returns>How long the open may wait for a connection; <see langword="null"/> for no deadline.</returns>
+    internal static TimeSpan? OpenDeadline(int connectTimeoutSeconds)
+    {
+        if (connectTimeoutSeconds <= 0)
+        {
+            return null;
+        }
+
+        TimeSpan deadline = TimeSpan.FromSeconds(connectTimeoutSeconds + (long)DeadlineGraceSeconds);
+        return deadline < MaxDeadline ? deadline : MaxDeadline;
+    }
+
+    // The open of a caller whose token is already cancelled, exactly as every open ran before the outage gate existed.
+    private static async Task OpenUngatedAsync(
+        SqlConnection connection,
+        string operation,
+        CancellationToken cancellationToken)
+    {
         try
         {
             await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
@@ -120,8 +342,37 @@ internal sealed class SqlConnectionFactory(DatabaseOptions options)
 
             throw failure;
         }
+    }
 
-        return connection;
+    // Releases a connection that never opened: refused by the gate, or released by it. Nothing can have been sent on
+    // it, so an error from the release is discarded, as OpenFailureAsync discards one, and what is reported stands.
+    private static async Task ReleaseUnopenedAsync(SqlConnection connection)
+    {
+        try
+        {
+            await connection.DisposeAsync().ConfigureAwait(false);
+        }
+        catch (Exception)
+        {
+            // Discarded by design: the unavailable answer is what is reported, and nothing was sent on this connection.
+        }
+    }
+
+    // The cancellation an admitted open raises: SqlClient's own carries no token, or the linked token, which the caller
+    // never sees, so the one raised carries the caller's token, with the fixed message, the original failure as its
+    // inner exception, and any SQL error number the classified cancellation kept.
+    private static OperationCanceledException CallerCancellation(
+        OperationCanceledException cancellation,
+        Exception exception,
+        CancellationToken cancellationToken)
+    {
+        var raised = new OperationCanceledException(SqlErrorClassifier.CancelledMessage, exception, cancellationToken);
+        if (cancellation.Data[SqlErrorClassifier.SqlErrorNumberKey] is int number)
+        {
+            raised.Data[SqlErrorClassifier.SqlErrorNumberKey] = number;
+        }
+
+        return raised;
     }
 
     /// <summary>
@@ -230,6 +481,280 @@ internal sealed class SqlConnectionFactory(DatabaseOptions options)
         return result;
     }
 }
+
+/// <summary>
+/// The outage gate of one <see cref="SqlConnectionFactory"/>: whether an outage of SQL Server is recorded, whether the
+/// one probe open allowed through during it is in flight, and the release generation whose cancellation ends every
+/// normal open in flight when an outage is first recorded.
+/// </summary>
+/// <remarks>
+/// <para>
+/// <b>Admission</b> (<see cref="Admit"/>). Every open gets a <see cref="Ticket"/>: how it is let through and the
+/// generation current at its admission. With no outage recorded, every open is <see cref="Admission.Normal"/> and
+/// opens under the current generation's release token, linked to its caller's and to its deadline, which the factory
+/// sets. With an outage recorded, the first open to find no probe in flight is the <see cref="Admission.Probe"/>, and
+/// every other is <see cref="Admission.Refused"/> until that probe ends.
+/// </para>
+/// <para>
+/// <b>Ending</b> (<see cref="Complete"/>). A probe frees the probe slot however it ends. Only an open of the current
+/// generation changes the state; one of a retired generation changes nothing, whatever it reports, because it was
+/// admitted before the outage that retired it was recorded, so its answer is older than the state. For an open of the
+/// current generation: <see cref="OpenEnd.ServerUnreachable"/> with no outage recorded records one, installs a fresh
+/// generation with a release source of its own and then, outside the lock, cancels the release source of the one it
+/// replaced, so every normal open admitted under it ends at once; with an outage already recorded it changes nothing.
+/// <see cref="OpenEnd.Opened"/> and
+/// <see cref="OpenEnd.ServerAnswered"/> clear the outage. <see cref="OpenEnd.Cancelled"/> changes nothing.
+/// <see cref="EndOf"/> derives an open failure's ending from the exception
+/// <see cref="SqlConnectionFactory.OpenFailureAsync"/> built from the classification of
+/// <see cref="SqlErrorClassifier"/>, so the gate holds no classification of its own.
+/// </para>
+/// <para>
+/// <b>Generations.</b> Only recording an outage starts a generation; clearing one starts none. Every open admitted
+/// before the recording belongs to the generation it retires, so a success or failure such an open reports late can
+/// neither clear the outage while its probe runs nor record another once a probe has cleared it. Between the
+/// recording and the clearing, the only opens of the new generation are probes, admitted one at a time, each ending
+/// before the next is admitted, and the clearing is the last probe's own ending; so no other open of the generation
+/// is in flight when the outage clears, and the normal opens admitted from then on are the generation's first.
+/// </para>
+/// <para>
+/// <b>Threading.</b> Every state change runs under one lock, held for a few assignments and never while SqlClient runs
+/// or a token is cancelled, so the healthy path costs two uncontended lock entries per open, and a ticket, a struct,
+/// allocates nothing. A generation's release source is cancelled at most once and never disposed: an open admitted
+/// under it may still link to it, and a source with no timer whose wait handle is never read holds no unmanaged
+/// resource. Each open disposes its own linked and deadline sources.
+/// </para>
+/// <para>Nothing here logs, retries, or reads request data, and the internal members exist for its unit tests.</para>
+/// </remarks>
+internal sealed class SqlOutageGate
+{
+    private readonly Lock sync = new();
+    private bool outageRecorded;
+    private bool probeInFlight;
+    private CancellationTokenSource release = new();
+
+    // The current generation, advanced with each fresh release source. It starts at 1, so a default ticket, whose
+    // generation is 0, is never of the current generation and changes nothing.
+    private long generation = 1;
+
+    /// <summary>How <see cref="Admit"/> lets one open through.</summary>
+    internal enum Admission
+    {
+        /// <summary>
+        /// No outage is recorded: the open runs under its caller's token, the release token and its own deadline.
+        /// </summary>
+        Normal,
+
+        /// <summary>
+        /// An outage is recorded and no probe was in flight: the open runs, under its caller's token and its own
+        /// deadline.
+        /// </summary>
+        Probe,
+
+        /// <summary>An outage is recorded and a probe is in flight: the open does not run.</summary>
+        Refused,
+    }
+
+    /// <summary>How an admitted open ended, as <see cref="Complete"/> hears it.</summary>
+    internal enum OpenEnd
+    {
+        /// <summary>The connection opened: the server answered.</summary>
+        Opened,
+
+        /// <summary>
+        /// The open failed with a <see cref="SqlException"/> classified as unavailable, or its deadline passed before
+        /// it had a connection: SQL Server could not be reached or used.
+        /// </summary>
+        ServerUnreachable,
+
+        /// <summary>
+        /// The open failed otherwise, which shows that the server answered: pool exhaustion, raised by a pool whose
+        /// connections are open, or an unexpected failure.
+        /// </summary>
+        ServerAnswered,
+
+        /// <summary>
+        /// The open was cancelled by its caller or released by the gate: nothing was learnt about the server.
+        /// </summary>
+        Cancelled,
+    }
+
+    /// <summary>
+    /// What <see cref="Admit"/> hands one open, and <see cref="Complete"/> takes back once an admitted open ends: how
+    /// the open is let through, its release token and the generation it was admitted under.
+    /// </summary>
+    internal readonly struct Ticket
+    {
+        internal Ticket(Admission admission, long generation, CancellationToken release)
+        {
+            Admission = admission;
+            Generation = generation;
+            Release = release;
+        }
+
+        /// <summary>How the open is let through.</summary>
+        internal Admission Admission { get; }
+
+        /// <summary>The generation current when the open was admitted.</summary>
+        internal long Generation { get; }
+
+        /// <summary>
+        /// For <see cref="Admission.Normal"/>, the release token of <see cref="Generation"/>, cancelled when an open of
+        /// that generation records an outage, which retires it; otherwise <see cref="CancellationToken.None"/>.
+        /// </summary>
+        internal CancellationToken Release { get; }
+    }
+
+    /// <summary>Whether an outage is recorded.</summary>
+    internal bool OutageRecorded
+    {
+        get
+        {
+            lock (sync)
+            {
+                return outageRecorded;
+            }
+        }
+    }
+
+    /// <summary>Whether the probe admitted during the recorded outage has yet to end.</summary>
+    internal bool ProbeInFlight
+    {
+        get
+        {
+            lock (sync)
+            {
+                return probeInFlight;
+            }
+        }
+    }
+
+    /// <summary>
+    /// How an open failure ends for the gate, from <paramref name="reported"/>, the exception
+    /// <see cref="SqlConnectionFactory.OpenFailureAsync"/> built for <paramref name="openFailure"/>.
+    /// </summary>
+    /// <param name="openFailure">The failure the open raised.</param>
+    /// <param name="reported">The exception the factory raises for it.</param>
+    /// <returns>
+    /// <see cref="OpenEnd.Cancelled"/> for an <see cref="OperationCanceledException"/>, the classifier's client
+    /// cancellation; <see cref="OpenEnd.ServerUnreachable"/> for a <see cref="DataStoreUnavailableException"/> raised
+    /// for a <see cref="SqlException"/>, a transport failure, a connect timeout, a failed login or a database that
+    /// cannot be opened; <see cref="OpenEnd.ServerAnswered"/> for anything else, including the
+    /// <see cref="DataStoreUnavailableException"/> of SqlClient's pool-timeout <see cref="InvalidOperationException"/>,
+    /// which a pool full of open connections raises, and every <see cref="DataStoreWriteException"/>.
+    /// </returns>
+    /// <exception cref="ArgumentNullException">
+    /// <paramref name="openFailure"/> or <paramref name="reported"/> is null.
+    /// </exception>
+    internal static OpenEnd EndOf(Exception openFailure, Exception reported)
+    {
+        ArgumentNullException.ThrowIfNull(openFailure);
+        ArgumentNullException.ThrowIfNull(reported);
+
+        return reported switch
+        {
+            OperationCanceledException => OpenEnd.Cancelled,
+            DataStoreUnavailableException when openFailure is SqlException => OpenEnd.ServerUnreachable,
+            _ => OpenEnd.ServerAnswered,
+        };
+    }
+
+    /// <summary>Admits one open (class remarks).</summary>
+    /// <returns>
+    /// The open's ticket, of the current generation: <see cref="Admission.Normal"/> with that generation's release
+    /// token, or <see cref="Admission.Probe"/> or <see cref="Admission.Refused"/> with
+    /// <see cref="CancellationToken.None"/>.
+    /// </returns>
+    internal Ticket Admit()
+    {
+        lock (sync)
+        {
+            if (!outageRecorded)
+            {
+                return new Ticket(Admission.Normal, generation, release.Token);
+            }
+
+            if (probeInFlight)
+            {
+                return new Ticket(Admission.Refused, generation, CancellationToken.None);
+            }
+
+            probeInFlight = true;
+            return new Ticket(Admission.Probe, generation, CancellationToken.None);
+        }
+    }
+
+    /// <summary>Hears how an open <see cref="Admit"/> let through ended (class remarks).</summary>
+    /// <param name="ticket">
+    /// The open's ticket, of <see cref="Admission.Normal"/> or <see cref="Admission.Probe"/>, as admitted. The state
+    /// changes only when its generation is still the current one.
+    /// </param>
+    /// <param name="end">How the open ended.</param>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// <paramref name="ticket"/> is <see cref="Admission.Refused"/>, which never opens, or its admission or
+    /// <paramref name="end"/> is not a defined value. Nothing changes then.
+    /// </exception>
+    internal void Complete(Ticket ticket, OpenEnd end)
+    {
+        if (ticket.Admission is not (Admission.Normal or Admission.Probe))
+        {
+            throw new ArgumentOutOfRangeException(nameof(ticket));
+        }
+
+        if (!Enum.IsDefined(end))
+        {
+            throw new ArgumentOutOfRangeException(nameof(end));
+        }
+
+        CancellationTokenSource? replaced = null;
+        lock (sync)
+        {
+            if (ticket.Admission == Admission.Probe)
+            {
+                probeInFlight = false;
+            }
+
+            // An open of a retired generation was admitted before the outage that retired it was recorded: what it
+            // reports is older than the state, so it changes nothing.
+            if (ticket.Generation == generation)
+            {
+                switch (end)
+                {
+                    case OpenEnd.Opened or OpenEnd.ServerAnswered:
+                        outageRecorded = false;
+                        break;
+                    case OpenEnd.ServerUnreachable when !outageRecorded:
+                        outageRecorded = true;
+                        replaced = release;
+                        release = new CancellationTokenSource();
+                        generation++;
+                        break;
+                }
+            }
+        }
+
+        if (replaced is not null)
+        {
+            ReleaseGeneration(replaced);
+        }
+    }
+
+    // Ends every normal open admitted under the replaced generation. Its callbacks are those opens' linked sources and,
+    // through them, SqlClient's cancellation of an open waiting in its pool; Cancel runs every one of them before it
+    // reports any failure. A failing callback is discarded: the open that found the server unreachable reports that,
+    // and each open whose source was cancelled still ends.
+    private static void ReleaseGeneration(CancellationTokenSource source)
+    {
+        try
+        {
+            source.Cancel();
+        }
+        catch (AggregateException)
+        {
+            // Discarded by design, as the comment above sets out.
+        }
+    }
+}
+
 
 /// <summary>
 /// The single path through which <c>EpiInfo.Data</c> sends a <see cref="SqlStatement"/> to SQL Server. Every command

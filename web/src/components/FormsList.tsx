@@ -15,6 +15,11 @@ export interface FormsListProps {
   client?: ApiClient;
   /** Called with the chosen form when its button is pressed. */
   onOpen: (form: FormSummary) => void;
+  /**
+   * Called with a form whose button the pointer enters, that takes focus or that a pointer
+   * presses, before it is chosen, so the caller can start loading what opening it needs.
+   */
+  onPreview?: (form: FormSummary) => void;
 }
 
 type FormsListState =
@@ -52,7 +57,7 @@ function statusOf(state: FormsListState): { readonly text: string; readonly show
 }
 
 /** Lists the project's forms, one button per form, with loading, empty and error states. */
-export function FormsList({ client = apiClient, onOpen }: FormsListProps) {
+export function FormsList({ client = apiClient, onOpen, onPreview }: FormsListProps) {
   const headingId = useId();
   const [state, setState] = useState<FormsListState>({ status: 'loading' });
   // The in-flight load; a new load or unmounting aborts it, so a late answer never
@@ -110,7 +115,7 @@ export function FormsList({ client = apiClient, onOpen }: FormsListProps) {
       <p role="status" className={status.shown ? undefined : 'visually-hidden'}>
         {status.text}
       </p>
-      <FormsListBody state={state} onOpen={onOpen} onRetry={retry} />
+      <FormsListBody state={state} onOpen={onOpen} onPreview={onPreview} onRetry={retry} />
     </section>
   );
 }
@@ -118,10 +123,11 @@ export function FormsList({ client = apiClient, onOpen }: FormsListProps) {
 interface FormsListBodyProps {
   state: FormsListState;
   onOpen: (form: FormSummary) => void;
+  onPreview: ((form: FormSummary) => void) | undefined;
   onRetry: () => void;
 }
 
-function FormsListBody({ state, onOpen, onRetry }: FormsListBodyProps) {
+function FormsListBody({ state, onOpen, onPreview, onRetry }: FormsListBodyProps) {
   switch (state.status) {
     case 'loading':
       // The status line says so.
@@ -136,7 +142,13 @@ function FormsListBody({ state, onOpen, onRetry }: FormsListBodyProps) {
         <ul>
           {state.forms.map((form) => (
             <li key={form.viewId}>
-              <button type="button" onClick={() => onOpen(form)}>
+              <button
+                type="button"
+                onClick={() => onOpen(form)}
+                onPointerEnter={() => onPreview?.(form)}
+                onFocus={() => onPreview?.(form)}
+                onPointerDown={() => onPreview?.(form)}
+              >
                 {formButtonText(form)}
               </button>
             </li>

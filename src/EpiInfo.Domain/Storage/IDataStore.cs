@@ -47,8 +47,10 @@ namespace EpiInfo.Domain.Storage;
 /// stand, and reads them again there when they do not or for any other instance.
 /// </para>
 /// <para>
-/// <b>Cancellation.</b> Every method takes the request's abort token as its last, required parameter, so no caller
-/// can omit it.
+/// <b>Cancellation.</b> Every method takes a cancellation token as its last, required parameter, so no caller can omit
+/// it. Callers pass the request's abort token, except the API's health check, which passes
+/// <see cref="CancellationToken.None"/> to <see cref="PingAsync"/> so that one caller's abort cannot end a ping that
+/// other runs of the check share.
 /// </para>
 /// <para>
 /// <b>Reads.</b> <see cref="CountAsync"/>, <see cref="GetAtPositionAsync"/>, <see cref="GetByIdAsync"/>,
@@ -430,12 +432,16 @@ public interface IDataStore
     /// <see cref="OperationCanceledException"/>.
     /// </para>
     /// <para>
-    /// The caller, the API's SQL Server health check, therefore reports Unhealthy both for <see langword="false"/> and
-    /// for any exception other than the caller's own cancellation, and never attaches the exception or its message to
-    /// its result, so no exception text reaches the health-check log.
+    /// The caller, the API's SQL Server health check, therefore reports Unhealthy for <see langword="false"/>, for any
+    /// exception the ping ends with, a cancellation included, and for a ping that has not answered within the check's
+    /// bound. It never attaches the exception or its message to its result, so no exception text reaches the
+    /// health-check log.
     /// </para>
     /// </remarks>
-    /// <param name="cancellationToken">The request's abort token.</param>
+    /// <param name="cancellationToken">
+    /// The token that cancels the ping. The API's health check passes <see cref="CancellationToken.None"/>, so one
+    /// caller's abort cannot end a ping that other runs of the check share.
+    /// </param>
     /// <returns><see langword="true"/> when the database answered.</returns>
     Task<bool> PingAsync(CancellationToken cancellationToken);
 

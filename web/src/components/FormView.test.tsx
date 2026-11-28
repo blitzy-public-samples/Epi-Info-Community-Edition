@@ -199,6 +199,18 @@ const UNROUTED_PROBLEM: ProblemDetails = {
   traceId: '00-test-unrouted-00',
 };
 
+/**
+ * The 404 of an at/{position} outside 1..count, as the server answers it: an empty form's
+ * load reads at/1 beside its count.
+ */
+const POSITION_NOT_FOUND: ProblemDetails = {
+  type: 'https://tools.ietf.org/html/rfc9110#section-15.5.5',
+  title: 'Not Found',
+  status: 404,
+  detail: 'There is no record at that position.',
+  traceId: '00-test-position-00',
+};
+
 /** A 403 of the permission check. Its text never speaks of permission, so only the client's own banner can. */
 const FORBIDDEN_PROBLEM: ProblemDetails = {
   type: 'https://tools.ietf.org/html/rfc9110#section-15.5.4',
@@ -403,6 +415,7 @@ interface FakeApiOptions {
  */
 function fakeApi(definition: FormDefinition, records: RecordDto[], options: FakeApiOptions = {}): typeof fetch {
   const { answersFieldEvents = false, definitionText, route } = options;
+  const atPath = new RegExp(`^/api/forms/${definition.viewId}/records/at/\\d+$`);
   return async (input, init) => {
     const request = input instanceof Request ? input : new Request(input, init);
     const url = new URL(request.url);
@@ -421,6 +434,9 @@ function fakeApi(definition: FormDefinition, records: RecordDto[], options: Fake
     }
     if (body !== null) {
       return jsonResponse(200, body);
+    }
+    if (call.method === 'GET' && atPath.test(url.pathname)) {
+      return problemResponse(POSITION_NOT_FOUND);
     }
     if (answersFieldEvents && call.method === 'POST' && url.pathname === `/api/forms/${definition.viewId}/checkcode/field-event`) {
       return jsonResponse(200, NO_EFFECTS);
@@ -1837,7 +1853,7 @@ describe('FormView field rendering: isolation, row identity, registry lookup and
       expect(wrapper.querySelectorAll(`${NATIVE_CONTROLS}, button`)).toHaveLength(0);
 
       fireEvent.click(within(screen.getByRole('toolbar', { name: 'Form actions' })).getByRole('button', { name: 'Find' }));
-      const picker = within(screen.getByRole('dialog', { name: 'Find record' })).getByRole('group', {
+      const picker = within(await screen.findByRole('dialog', { name: 'Find record' })).getByRole('group', {
         name: 'Fields to search',
       });
       expect(within(picker).queryByRole('checkbox', { name: 'Zip' })).toBeNull();
@@ -3403,7 +3419,11 @@ describe('FormView malformed form metadata', () => {
     expect(screen.queryByRole('heading', { name: malformed.name })).toBeNull();
     expect(screen.queryByRole('tablist')).toBeNull();
     expect(container.querySelectorAll(NATIVE_CONTROLS)).toHaveLength(0);
-    expect(calls.map(requestLine)).toEqual([`GET ${FORM_PATH}`]);
+    // The definition, and the reads sent beside it: N, the first record and the grid's first page.
+    expect(calls.every((call) => call.method === 'GET')).toBe(true);
+    expect(calls.map((call) => call.url.pathname).sort()).toEqual(
+      [FORM_PATH, `${FORM_PATH}/records`, `${FORM_PATH}/records/at/1`, `${FORM_PATH}/records/count`].sort(),
+    );
   });
 
   it.each<{ label: string; field: string; definition: () => FormDefinition }>([
@@ -3702,7 +3722,7 @@ describe('FormView connection banners', () => {
     await loaded();
 
     fireEvent.click(formAction('Delete'));
-    const dialog = await screen.findByRole('dialog');
+    const dialog = await screen.findByRole('dialog', { name: 'Delete record' });
     fireEvent.click(within(dialog).getByRole('button', { name: 'Delete record' }));
 
     const alert = await screen.findByRole('alert');
@@ -3750,7 +3770,7 @@ describe('FormView Delete of a new record', () => {
 
     remove.focus();
     fireEvent.click(remove);
-    const dialog = await screen.findByRole('dialog');
+    const dialog = await screen.findByRole('dialog', { name: 'Delete record' });
     expect(dialog.textContent).toContain('never been saved');
     fireEvent.click(within(dialog).getByRole('button', { name: choice }));
 
@@ -4064,6 +4084,343 @@ describe('FormView definition reload focus', () => {
     expect(document.activeElement).toBe(elsewhere);
   });
 });
+
+describe('FormView form open', () => {
+  // Navigation needs no definition, so a form open sends the definition, N, the first record
+  // and the grid's first page together, and the grid takes the page sent beside the
+  // definition rather than asking again.
+
+  /** The four reads of a form open, by path. */
+  function formOpenPaths(definition: FormDefinition): string[] {
+    const form = `/api/forms/${String(definition.viewId)}`;
+    return [form, `${form}/records`, `${form}/records/at/1`, `${form}/records/count`].sort();
+  }
+
+  function sentPaths(): string[] {
+    return calls.map((call) => call.url.pathname).sort();
+  }
+
+  async function workspaceLoaded(definition: FormDefinition): Promise<void> {
+    await screen.findByRole('heading', { level: 2, name: definition.name });
+    await within(screen.getByRole('toolbar', { name: 'Record navigation' })).findByText('1 of 1');
+    await within(screen.getByRole('region', { name: 'Records' })).findByText('1 record');
+  }
+
+  it('sends N, the first record and the grid page while the definition loads, and the grid takes that page', async () => {
+    const definition = createFormDefinitionFixture();
+    const formPath = `/api/forms/${String(definition.viewId)}`;
+    const answer = deferred();
+    mountForm(definition, {
+      route: (call) => (call.method === 'GET' && call.url.pathname === formPath ? answer.response : null),
+    });
+
+    // The definition is unanswered, and the other three reads have been sent.
+    await vi.waitFor(() => {
+      expect(sentPaths()).toEqual(formOpenPaths(definition));
+    });
+    expect(screen.getByRole('status').textContent).toBe('Loading form…');
+
+    answer.release(jsonResponse(200, definition));
+    await workspaceLoaded(definition);
+
+    // Each read went out once, the grid's first page included, and every one is a GET.
+    expect(sentPaths()).toEqual(formOpenPaths(definition));
+    expect(calls.filter((call) => call.method !== 'GET').map(requestLine)).toEqual([]);
+  });
+
+  it('sends N, the first record and the grid page again with the definition on Retry', async () => {
+    const definition = createFormDefinitionFixture();
+    const formPath = `/api/forms/${String(definition.viewId)}`;
+    const unavailable: ProblemDetails = {
+      ...UNROUTED_PROBLEM,
+      status: 503,
+      detail: 'The test API failed the definition request.',
+      traceId: '00-test-503-00',
+    };
+    let definitionGets = 0;
+    mountForm(definition, {
+      route: (call) => {
+        if (call.method !== 'GET' || call.url.pathname !== formPath) {
+          return null;
+        }
+        definitionGets += 1;
+        return definitionGets === 1 ? jsonResponse(503, unavailable) : null;
+      },
+    });
+    const retry = within(await screen.findByRole('alert')).getByRole('button', { name: 'Retry' });
+    await vi.waitFor(() => {
+      expect(sentPaths()).toEqual(formOpenPaths(definition));
+    });
+
+    fireEvent.click(retry);
+    await workspaceLoaded(definition);
+
+    expect(sentPaths()).toEqual([...formOpenPaths(definition), ...formOpenPaths(definition)].sort());
+    expect(calls.filter((call) => call.method !== 'GET').map(requestLine)).toEqual([]);
+  });
+});
+
+describe('FormView dialog chunks', () => {
+  // Find, the delete confirmation and check-code messages are each a chunk of its own, which
+  // the form view fetches as it opens. Each chunk is tracked on its own: one that cannot be
+  // fetched holds up no other dialog, is fetched again when its dialog is asked for, and only
+  // its failure while its dialog is asked for is shown, with Retry. While a dialog asked for
+  // waits for its chunk, a placeholder modal says "Opening…" and holds the page as the dialog
+  // will, so a second modal cannot open beside it; Escape or Cancel cancels the open.
+  const DIALOG_FAILED = 'The dialog could not be opened. The server could not be reached.';
+  const OPENING = 'Opening…';
+
+  type DialogModule = './ConfirmDialog' | './MessageDialog' | './FindRecordDialog';
+  const DIALOG_MODULES: readonly DialogModule[] = ['./ConfirmDialog', './MessageDialog', './FindRecordDialog'];
+
+  /** How a case serves one dialog's chunk: each fetch waits for `held`, then fails while `fails` is set. */
+  interface ChunkServing {
+    held: Promise<void>;
+    fails: boolean;
+  }
+
+  /** A wait the case ends when it chooses. */
+  function hold(): { readonly held: Promise<void>; readonly release: () => void } {
+    let release: () => void = () => undefined;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    return { held, release };
+  }
+
+  /** Every chunk served at once. */
+  function servedAtOnce(): Record<DialogModule, ChunkServing> {
+    return {
+      './ConfirmDialog': { held: Promise.resolve(), fails: false },
+      './MessageDialog': { held: Promise.resolve(), fails: false },
+      './FindRecordDialog': { held: Promise.resolve(), fails: false },
+    };
+  }
+
+  afterEach(() => {
+    for (const path of DIALOG_MODULES) {
+      vi.doUnmock(path);
+    }
+    vi.resetModules();
+  });
+
+  /**
+   * Renders a fresh form view, whose dialogs have not been fetched yet, over the one RECORD,
+   * with each dialog's chunk served as `serving` says at the time of each fetch; resolves once
+   * the workspace has loaded. `route` answers before the read routes, as in mountForm.
+   */
+  async function renderFreshForm(
+    serving: Readonly<Record<DialogModule, ChunkServing>>,
+    route?: Route,
+  ): Promise<FormDefinition> {
+    vi.resetModules();
+    for (const path of DIALOG_MODULES) {
+      vi.doMock(path, async (importOriginal) => {
+        await serving[path].held;
+        if (serving[path].fails) {
+          throw new TypeError('Failed to fetch dynamically imported module');
+        }
+        return importOriginal();
+      });
+    }
+    const { FormView: FreshFormView } = await import('./FormView');
+    const definition = createFormDefinitionFixture();
+    const client = createApiClient({ baseUrl: 'http://localhost', fetch: fakeApi(definition, [RECORD], { route }) });
+    render(<FreshFormView viewId={definition.viewId} client={client} onExit={vi.fn()} onFormNotFound={vi.fn()} />);
+    await within(await screen.findByRole('toolbar', { name: 'Record navigation' })).findByText('1 of 1');
+    await within(screen.getByRole('region', { name: 'Records' })).findByText('1 record');
+    return definition;
+  }
+
+  /** The one modal on screen; fails when there is none or more than one. */
+  function onlyDialog(): HTMLElement {
+    const dialogs = screen.queryAllByRole('dialog');
+    expect(dialogs, 'the modals on screen').toHaveLength(1);
+    return dialogs[0];
+  }
+
+  function nonGetRequests(): string[] {
+    return calls.filter((call) => call.method !== 'GET').map(requestLine);
+  }
+
+  const DIALOG_OF = { Delete: 'Delete record', Find: 'Find record' } as const;
+  // The control each dialog closes with, sending nothing.
+  const CLOSE_OF = { Delete: 'Cancel', Find: 'Close' } as const;
+  const OTHER_OF = { Delete: 'Find', Find: 'Delete' } as const;
+
+  it.each<{ first: 'Delete' | 'Find'; close: 'Escape while it opens' | 'Cancel while it opens' | 'the dialog once open' }>([
+    { first: 'Delete', close: 'Escape while it opens' },
+    { first: 'Delete', close: 'Cancel while it opens' },
+    { first: 'Delete', close: 'the dialog once open' },
+    { first: 'Find', close: 'Escape while it opens' },
+    { first: 'Find', close: 'Cancel while it opens' },
+    { first: 'Find', close: 'the dialog once open' },
+  ])('opens only $first while the chunks are fetched, whatever else is pressed, and closes it with $close', async ({ first, close }) => {
+    const chunks = hold();
+    const serving = servedAtOnce();
+    for (const path of DIALOG_MODULES) {
+      serving[path].held = chunks.held;
+    }
+    await renderFreshForm(serving);
+    const opener = formActionButton(first);
+    const other = formActionButton(OTHER_OF[first]);
+
+    opener.focus();
+    fireEvent.click(opener);
+
+    // The placeholder holds the page at once, with focus on its Cancel.
+    const placeholder = onlyDialog();
+    expect(placeholder.getAttribute('aria-modal')).toBe('true');
+    expect(placeholder.getAttribute('aria-busy')).toBe('true');
+    expect(placeholder.textContent).toContain(OPENING);
+    const cancel = within(placeholder).getByRole('button', { name: 'Cancel' });
+    expect(document.activeElement).toBe(cancel);
+    expect(present(opener.closest('[inert]'), 'the inert page behind the placeholder')).toBeTruthy();
+
+    // The other toolbar dialog opens nothing beside it, as the inert page would refuse the press.
+    fireEvent.click(other);
+    expect(onlyDialog()).toBe(placeholder);
+
+    if (close === 'the dialog once open') {
+      chunks.release();
+      const dialog = await screen.findByRole('dialog', { name: DIALOG_OF[first] });
+      expect(onlyDialog()).toBe(dialog);
+      expect(dialog.contains(document.activeElement)).toBe(true);
+      fireEvent.click(within(dialog).getByRole('button', { name: CLOSE_OF[first] }));
+    } else {
+      if (close === 'Escape while it opens') {
+        fireEvent.keyDown(cancel, { key: 'Escape' });
+      } else {
+        fireEvent.click(cancel);
+      }
+      expect(screen.queryByRole('dialog')).toBeNull();
+      chunks.release();
+    }
+    await flush();
+
+    // Closed, with focus back on the button that opened it, and neither dialog opens later.
+    expect(screen.queryAllByRole('dialog')).toEqual([]);
+    expect(document.activeElement).toBe(opener);
+    expect(document.body.querySelector('[inert]')).toBeNull();
+    expect(screen.queryByText(DIALOG_FAILED)).toBeNull();
+
+    // The other dialog's press was refused, not kept: pressed now, it opens, alone.
+    fireEvent.click(other);
+    const otherDialog = await screen.findByRole('dialog', { name: DIALOG_OF[OTHER_OF[first]] });
+    expect(onlyDialog()).toBe(otherDialog);
+    fireEvent.click(within(otherDialog).getByRole('button', { name: CLOSE_OF[OTHER_OF[first]] }));
+    await waitFor(() => {
+      expect(screen.queryByRole('dialog')).toBeNull();
+    });
+    // Each dialog opened and closed with no request.
+    expect(nonGetRequests()).toEqual([]);
+  });
+
+  it('keeps check-code messages queued while their chunk is fetched, refusing Escape and Delete, and shows them once it arrives', async () => {
+    const messageChunk = hold();
+    const serving = servedAtOnce();
+    serving['./MessageDialog'].held = messageChunk.held;
+    const fieldEventPath = `/api/forms/${String(createFormDefinitionFixture().viewId)}/checkcode/field-event`;
+    let events = 0;
+    const definition = await renderFreshForm(serving, (call) => {
+      if (call.method !== 'POST' || call.url.pathname !== fieldEventPath) {
+        return null;
+      }
+      events += 1;
+      return jsonResponse(200, {
+        ...NO_EFFECTS,
+        dialogs: events === 1 ? [{ message: 'Check the onset date.', title: null }] : [],
+      });
+    });
+    await flush();
+
+    // Entering a field raises FieldBefore, whose answer holds a DIALOG.
+    const field = controlOf(definition, 'LastName');
+    field.focus();
+    const placeholder = await screen.findByRole('dialog', { name: OPENING });
+    expect(placeholder.getAttribute('aria-busy')).toBe('true');
+    // Nothing on it dismisses the message unseen: it has no Cancel, and Escape does nothing.
+    expect(within(placeholder).queryByRole('button')).toBeNull();
+    expect(document.activeElement).toBe(placeholder);
+    fireEvent.keyDown(placeholder, { key: 'Escape' });
+    fireEvent.click(formActionButton('Delete'));
+    expect(onlyDialog()).toBe(placeholder);
+
+    messageChunk.release();
+    const message = await screen.findByRole('dialog', { name: 'Message' });
+    expect(onlyDialog()).toBe(message);
+    expect(message.textContent).toContain('Check the onset date.');
+    fireEvent.click(within(message).getByRole('button', { name: 'OK' }));
+
+    await waitFor(() => {
+      expect(screen.queryByRole('dialog')).toBeNull();
+    });
+    // Focus is back in the field, and moving it through the placeholder and the message
+    // raised no event of its own: the one FieldBefore is the only request.
+    expect(document.activeElement).toBe(field);
+    await flush();
+    expect(nonGetRequests()).toEqual([`POST ${fieldEventPath}`]);
+  });
+
+  it.each<{ failing: 'Find' | 'Delete'; module: DialogModule }>([
+    { failing: 'Find', module: './FindRecordDialog' },
+    { failing: 'Delete', module: './ConfirmDialog' },
+  ])(
+    'opens the other dialog at once while $failing cannot be fetched, says so only while $failing is asked for, and Retry opens it',
+    async ({ failing, module }) => {
+      const working = OTHER_OF[failing];
+      const serving = servedAtOnce();
+      serving[module].fails = true;
+      await renderFreshForm(serving);
+      await flush();
+      // The fetch as the form opened failed while no dialog was asked for: nothing says so.
+      expect(screen.queryByText(DIALOG_FAILED)).toBeNull();
+
+      // The other dialog's chunk arrived, so it opens at once, with no failure shown.
+      const workingButton = formActionButton(working);
+      workingButton.focus();
+      fireEvent.click(workingButton);
+      const workingDialog = onlyDialog();
+      expect(screen.getByRole('dialog', { name: DIALOG_OF[working] })).toBe(workingDialog);
+      expect(screen.queryByText(DIALOG_FAILED)).toBeNull();
+      fireEvent.click(within(workingDialog).getByRole('button', { name: CLOSE_OF[working] }));
+      await waitFor(() => {
+        expect(screen.queryByRole('dialog')).toBeNull();
+      });
+      expect(document.activeElement).toBe(workingButton);
+
+      // Asking for the failing dialog fetched its chunk again, which failed too.
+      fireEvent.click(formActionButton(failing));
+      await findAlertContaining(DIALOG_FAILED);
+      expect(screen.queryByRole('dialog')).toBeNull();
+
+      // It blocks nothing: the other dialog opens, and the failure, no longer asked for, goes.
+      fireEvent.click(workingButton);
+      expect(await screen.findByRole('dialog', { name: DIALOG_OF[working] })).toBe(onlyDialog());
+      expect(screen.queryByText(DIALOG_FAILED)).toBeNull();
+      fireEvent.click(within(onlyDialog()).getByRole('button', { name: CLOSE_OF[working] }));
+      await waitFor(() => {
+        expect(screen.queryByRole('dialog')).toBeNull();
+      });
+
+      fireEvent.click(formActionButton(failing));
+      const alert = await findAlertContaining(DIALOG_FAILED);
+      serving[module].fails = false;
+      fireEvent.click(within(alert).getByRole('button', { name: 'Retry' }));
+
+      expect(await screen.findByRole('dialog', { name: DIALOG_OF[failing] })).toBe(onlyDialog());
+      expect(screen.queryByText(DIALOG_FAILED)).toBeNull();
+      fireEvent.click(within(onlyDialog()).getByRole('button', { name: CLOSE_OF[failing] }));
+      await waitFor(() => {
+        expect(screen.queryByRole('dialog')).toBeNull();
+      });
+      // Retry has gone with its banner, so focus returns to the toolbar button of the dialog it opened.
+      expect(document.activeElement).toBe(formActionButton(failing));
+      expect(nonGetRequests()).toEqual([]);
+    },
+  );
+});
+
 
 describe('FormView banner action focus', () => {
   // Retry, Save again, Discard edits and Dismiss each remove the banner whose button ran
@@ -4407,7 +4764,9 @@ describe('FormView focus and feedback after actions', () => {
   /** Deletes the open record A through the toolbar and its confirmation, and waits for B to open. */
   async function deleteA(definition: FormDefinition): Promise<void> {
     fireEvent.click(formActionButton('Delete'));
-    fireEvent.click(within(await screen.findByRole('dialog')).getByRole('button', { name: 'Delete record' }));
+    fireEvent.click(
+      within(await screen.findByRole('dialog', { name: 'Delete record' })).getByRole('button', { name: 'Delete record' }),
+    );
     await waitFor(() => {
       expect(navigatorStatus()).toBe('1 of 1');
       expect(controlValue(controlOf(definition, 'LastName'))).toBe(B_LAST_NAME);
@@ -4663,9 +5022,9 @@ describe('FormView focus and feedback after actions', () => {
     const findButton = formActionButton('Find');
     const openName = 'Open record at position 2';
     /** Opens Find and returns its dialog. */
-    function openFind(): HTMLElement {
+    async function openFind(): Promise<HTMLElement> {
       fireEvent.click(findButton);
-      return screen.getByRole('dialog', { name: 'Find record' });
+      return screen.findByRole('dialog', { name: 'Find record' });
     }
     /** Searches LastName for B in the dialog and waits for the one match. */
     async function searchForB(dialog: HTMLElement): Promise<void> {
@@ -4681,7 +5040,7 @@ describe('FormView focus and feedback after actions', () => {
     }
 
     edit(definition, 'Age', AGE_TOO_HIGH);
-    let dialog = openFind();
+    let dialog = await openFind();
     await searchForB(dialog);
     fireEvent.click(within(dialog).getByRole('button', { name: openName }));
     expect(screen.queryByRole('dialog', { name: 'Find record' })).toBeNull();
@@ -4694,7 +5053,7 @@ describe('FormView focus and feedback after actions', () => {
     expect(navigatorStatus()).toBe('1 of 2');
 
     // Find shows the same results again, ready to open, with no new search.
-    dialog = openFind();
+    dialog = await openFind();
     expect(within(dialog).getByText('1 record matches.')).toBeTruthy();
     expect(within(dialog).getByRole('button', { name: openName }).getAttribute('aria-disabled')).toBeNull();
     expect(calls.filter(isSearch)).toHaveLength(1);
@@ -4702,7 +5061,7 @@ describe('FormView focus and feedback after actions', () => {
     // Close drops them.
     fireEvent.click(within(dialog).getByRole('button', { name: 'Close' }));
     await flush();
-    dialog = openFind();
+    dialog = await openFind();
     expect(within(dialog).queryByRole('table', { name: 'Matching records' })).toBeNull();
 
     // With Age corrected, the chosen result opens once the draft is saved, and its results go with the open.
@@ -4710,7 +5069,7 @@ describe('FormView focus and feedback after actions', () => {
     // 32, not A's stored 31: an edit back to the stored value would leave the draft clean.
     edit(definition, 'Age', '32');
     replyToWrite({ kind: 'saved', record: savedWith(RECORD_A, { Age: 32 }) });
-    dialog = openFind();
+    dialog = await openFind();
     await searchForB(dialog);
     fireEvent.click(within(dialog).getByRole('button', { name: openName }));
     await waitFor(() => {
@@ -4718,7 +5077,7 @@ describe('FormView focus and feedback after actions', () => {
     });
     await flush();
     expect(writeCalls().filter((call) => !isSearch(call)).map(requestLine)).toEqual([`PUT ${A_PATH}`]);
-    dialog = openFind();
+    dialog = await openFind();
     expect(within(dialog).queryByRole('table', { name: 'Matching records' })).toBeNull();
     fireEvent.click(within(dialog).getByRole('button', { name: 'Close' }));
   });
@@ -5455,7 +5814,7 @@ describe('a tabIndex beyond the safe range', () => {
 
     fireEvent.click(within(screen.getByRole('toolbar', { name: 'Form actions' })).getByRole('button', { name: 'Find' }));
 
-    const picker = within(screen.getByRole('dialog', { name: 'Find record' })).getByRole('group', {
+    const picker = within(await screen.findByRole('dialog', { name: 'Find record' })).getByRole('group', {
       name: 'Fields to search',
     });
     const picked = within(picker)
@@ -5948,10 +6307,10 @@ describe('RecordNavigator pending and busy states', () => {
 
 describe('FormView Find record', () => {
   // The dialog renders into <body>, so its controls are found through the screen.
-  function openFind(): HTMLElement {
+  async function openFind(): Promise<HTMLElement> {
     const formActions = screen.getByRole('toolbar', { name: 'Form actions' });
     fireEvent.click(within(formActions).getByRole('button', { name: 'Find' }));
-    return screen.getByRole('dialog', { name: 'Find record' });
+    return screen.findByRole('dialog', { name: 'Find record' });
   }
 
   /**
@@ -6044,7 +6403,7 @@ describe('FormView Find record', () => {
     'describes the $kind criterion $name by the syntax the server applies',
     async ({ name, definition, includes, excludes }) => {
       await renderForm(definition?.());
-      const box = pick(openFind(), name);
+      const box = pick(await openFind(), name);
 
       const [hint] = descriptionsOf(box);
       for (const fragment of includes) {
@@ -6078,7 +6437,7 @@ describe('FormView Find record', () => {
     { name: 'RecStatus', label: 'Record status (RecStatus)' },
   ])('labels the criterion of $name $label', async ({ name, definition, label }) => {
     await renderForm(definition?.());
-    const dialog = openFind();
+    const dialog = await openFind();
     fireEvent.click(within(dialog).getByRole('checkbox', { name }));
 
     const box = within(dialog).getByRole('textbox', { name: label });
@@ -6102,7 +6461,7 @@ describe('FormView Find record', () => {
     expect(fieldByName(name, definition).fieldType).toBe(fieldType);
     await renderForm(definition);
 
-    const picker = within(openFind()).getByRole('group', { name: 'Fields to search' });
+    const picker = within(await openFind()).getByRole('group', { name: 'Fields to search' });
     expect(within(picker).queryByRole('checkbox', { name })).toBeNull();
     const offered = within(picker)
       .getAllByRole('checkbox')
@@ -6145,7 +6504,7 @@ describe('FormView Find record', () => {
     { name: 'Radiculoneuropathy', words: ['Radiculoneuropathy'] },
   ])('marks the word boundaries of the picker name $name', async ({ name, words }) => {
     await renderForm(withField('FeverTemp', (field) => ({ ...field, name })));
-    const checkbox = within(openFind()).getByRole('checkbox', { name });
+    const checkbox = within(await openFind()).getByRole('checkbox', { name });
 
     const nameId = present(checkbox.getAttribute('aria-labelledby'), 'aria-labelledby of the checkbox');
     const nameElement = present(document.getElementById(nameId), `element #${nameId}`);
@@ -6170,7 +6529,7 @@ describe('FormView Find record', () => {
     { prompt: 'Highest fever temp', words: ['Highest fever temp'] },
   ])('marks the word breaks of the picker prompt $prompt', async ({ prompt, words }) => {
     await renderForm(withField('FeverTemp', (field) => ({ ...field, prompt })));
-    const checkbox = within(openFind()).getByRole('checkbox', { name: 'FeverTemp', description: prompt });
+    const checkbox = within(await openFind()).getByRole('checkbox', { name: 'FeverTemp', description: prompt });
 
     const descriptionId = present(checkbox.getAttribute('aria-describedby'), 'aria-describedby of the checkbox');
     const description = present(document.getElementById(descriptionId), `element #${descriptionId}`);
@@ -6261,7 +6620,7 @@ describe('FormView Find record', () => {
     });
     const openByIdPath = `/api/forms/${definition.viewId}/records/${RECORD.globalRecordId}`;
     const opened = () => calls.filter((call) => call.method === 'GET' && call.url.pathname === openByIdPath);
-    const dialog = openFind();
+    const dialog = await openFind();
     const box = pick(dialog, 'LastName');
     const search = within(dialog).getByRole('button', { name: 'Search' });
 
@@ -6357,7 +6716,7 @@ describe('FormView Find record', () => {
         fireEvent.click(within(navigator).getByRole('button', { name: 'New' }));
         await within(navigator).findByText('New record');
       }
-      const dialog = openFind();
+      const dialog = await openFind();
       fireEvent.change(pick(dialog, 'LastName'), { target: { value: 'Lovelace or Hopper' } });
       fireEvent.click(within(dialog).getByRole('button', { name: 'Search' }));
 
@@ -6383,7 +6742,7 @@ describe('FormView Find record', () => {
     await vi.waitFor(() => {
       expect(calls.some((call) => call.method === 'GET' && call.url.pathname === atTwo)).toBe(true);
     });
-    const dialog = openFind();
+    const dialog = await openFind();
     fireEvent.change(pick(dialog, 'LastName'), { target: { value: B_LAST_NAME } });
     fireEvent.click(within(dialog).getByRole('button', { name: 'Search' }));
     const status = await within(dialog).findByText('1 record matches.');
@@ -6410,7 +6769,7 @@ describe('FormView Find record', () => {
       },
     };
     await renderForm(undefined, { route: searchRoute(() => jsonResponse(400, problem)) });
-    const dialog = openFind();
+    const dialog = await openFind();
     const lastName = pick(dialog, 'LastName');
     const caseId = pick(dialog, 'CaseID');
     const [lastNameHint] = descriptionsOf(lastName);
@@ -6472,7 +6831,7 @@ describe('FormView Find record', () => {
     await renderForm(undefined, {
       route: searchRoute(() => matches({ ...MATCH, values: { LastName: long, FirstName: null } })),
     });
-    const dialog = openFind();
+    const dialog = await openFind();
     fireEvent.change(pick(dialog, 'LastName'), { target: { value: 'L*' } });
     fireEvent.click(within(dialog).getByRole('button', { name: 'Search' }));
     await within(dialog).findByText('1 record matches.');
@@ -6485,7 +6844,7 @@ describe('FormView Find record', () => {
 
   it('wraps the results in a named region that takes focus, so a keyboard can scroll it', async () => {
     await renderForm(undefined, { route: searchRoute(() => matches(MATCH)) });
-    const dialog = openFind();
+    const dialog = await openFind();
     fireEvent.change(pick(dialog, 'LastName'), { target: { value: 'Lovelace' } });
     fireEvent.click(within(dialog).getByRole('button', { name: 'Search' }));
     await within(dialog).findByText('1 record matches.');
@@ -6555,7 +6914,7 @@ describe('FormView Find record', () => {
     await renderForm(caseDistinctDefinition(), {
       route: searchRoute(() => jsonResponse(400, problem)),
     });
-    const dialog = openFind();
+    const dialog = await openFind();
     const boxes = new Map(['FirstName', 'LASTNAME', 'LastName'].map((name) => [name, pick(dialog, name)]));
 
     fireEvent.click(within(dialog).getByRole('button', { name: 'Search' }));
@@ -6599,7 +6958,7 @@ describe('FormView Find record', () => {
 
   it('keeps the status line, Search and Close in one footer between the criteria and the results', async () => {
     await renderForm(undefined, { route: searchRoute(() => matches(MATCH)) });
-    const dialog = openFind();
+    const dialog = await openFind();
     const footer = footerOf(dialog);
     const status = within(footer).getByRole('status');
     expect(status.className).toBe('visually-hidden');
@@ -6635,7 +6994,7 @@ describe('FormView Find record', () => {
 
   it('shows the limit note under the picker legend, outside the scrolling options', async () => {
     await renderForm();
-    const dialog = openFind();
+    const dialog = await openFind();
     const picker = within(dialog).getByRole('group', { name: 'Fields to search' });
     const options = present(picker.querySelector<HTMLElement>('.find-dialog__options'), 'picker options');
     const boxes = within(options).getAllByRole('checkbox');
@@ -6661,7 +7020,7 @@ describe('FormView Find record', () => {
     'moves focus from the checked $name checkbox to its new value box',
     async ({ name }) => {
       await renderForm();
-      const dialog = openFind();
+      const dialog = await openFind();
       within(dialog).getByRole('checkbox', { name }).focus();
 
       const box = pick(dialog, name);
@@ -6671,7 +7030,7 @@ describe('FormView Find record', () => {
 
   it('keeps focus in the picker on open, on unchecking and after Remove, and says checking moves it', async () => {
     await renderForm();
-    const dialog = openFind();
+    const dialog = await openFind();
     const picker = within(dialog).getByRole('group', { name: 'Fields to search' });
     const guidance = 'Checking a field moves focus to its value box.';
     expect(document.activeElement).toBe(within(picker).getAllByRole('checkbox')[0]);
@@ -6726,7 +7085,7 @@ describe('FormView Find record', () => {
     };
     try {
       await renderForm(undefined, { route: searchRoute(() => searchProblem(errors)) });
-      const dialog = openFind();
+      const dialog = await openFind();
       const boxes = new Map(['LastName', 'CaseID'].map((name) => [name, pick(dialog, name)]));
       const search = within(dialog).getByRole('button', { name: 'Search' });
       search.focus();
@@ -6755,7 +7114,7 @@ describe('FormView Find record', () => {
   it('leaves focus where the user moved it while the search ran', async () => {
     const answer = deferred();
     await renderForm(undefined, { route: searchRoute(() => answer.response) });
-    const dialog = openFind();
+    const dialog = await openFind();
     searchFromButton(dialog);
     const caseId = pick(dialog, 'CaseID');
     caseId.focus();
@@ -6811,7 +7170,7 @@ describe('FormView Find record', () => {
     });
     try {
       await renderForm(undefined, { route: searchRoute(answer) });
-      const dialog = openFind();
+      const dialog = await openFind();
       const search = searchFromButton(dialog);
       await vi.waitFor(() => {
         expect(isDisabled(search)).toBe(false);
@@ -6847,7 +7206,7 @@ describe('FormView Find record', () => {
     },
   ])('says only what cannot be reached, with Retry, when a search gets $label', async ({ failure, text }) => {
     await renderForm(undefined, { route: searchRoute(failure, () => matches(MATCH)) });
-    const dialog = openFind();
+    const dialog = await openFind();
     searchFromButton(dialog);
 
     const alert = await within(dialog).findByRole('alert');
@@ -7027,6 +7386,34 @@ describe('FormView record grid', () => {
     expect(gridStatus()).toBe(grid);
     expect(screen.queryByRole('button', { name: 'Retry' })).toBeNull();
     expect(screen.queryByRole('button', { name: 'Discard edits' })).toBeNull();
+  });
+
+  it('hands a record count 404 answered before the definition over to the forms list once', async () => {
+    const definition = createFormDefinitionFixture();
+    const answer = deferred();
+    const { onFormNotFound } = mountForm(definition, {
+      route: (call) => {
+        if (isGet(call, FORM_PATH)) {
+          return answer.response;
+        }
+        return isGet(call, COUNT_PATH) ? jsonResponse(404, NOT_FOUND) : null;
+      },
+    });
+    await vi.waitFor(() => {
+      expect(calls.some((call) => isGet(call, COUNT_PATH))).toBe(true);
+    });
+    await act(flush);
+    // Nothing is on screen yet to hand over: the definition is still loading.
+    expect(onFormNotFound).not.toHaveBeenCalled();
+    expect(screen.getByRole('status').textContent).toBe('Loading form…');
+
+    answer.release(jsonResponse(200, definition));
+
+    await findInGrid('1 record');
+    await vi.waitFor(() => {
+      expect(onFormNotFound).toHaveBeenCalledTimes(1);
+    });
+    expect(screen.getAllByRole('alert').map((alert) => alert.textContent)).toEqual([FORM_GONE]);
   });
 
   it('keeps a dirty draft on a list 404 until "Discard edits" is chosen', async () => {
@@ -7445,10 +7832,10 @@ describe('FormView record grid', () => {
   });
 
   /** Opens Find, picks LastName, enters a value and presses Search; returns the dialog and its Search button. */
-  function searchLastName(): { readonly dialog: HTMLElement; readonly search: HTMLElement } {
+  async function searchLastName(): Promise<{ readonly dialog: HTMLElement; readonly search: HTMLElement }> {
     const formActions = screen.getByRole('toolbar', { name: 'Form actions' });
     fireEvent.click(within(formActions).getByRole('button', { name: 'Find' }));
-    const dialog = screen.getByRole('dialog', { name: 'Find record' });
+    const dialog = await screen.findByRole('dialog', { name: 'Find record' });
     fireEvent.click(within(dialog).getByRole('checkbox', { name: 'LastName' }));
     fireEvent.change(within(dialog).getByRole('textbox', { name: 'Last Name (LastName)' }), {
       target: { value: 'Lovelace' },
@@ -7464,7 +7851,7 @@ describe('FormView record grid', () => {
         isSearch(call) ? jsonResponse(404, NOT_FOUND) : null,
     });
 
-    searchLastName();
+    await searchLastName();
     await vi.waitFor(() => {
       expect(onFormNotFound).toHaveBeenCalledTimes(1);
     });
@@ -7509,7 +7896,7 @@ describe('FormView record grid', () => {
       },
     });
 
-    const { dialog, search } = searchLastName();
+    const { dialog, search } = await searchLastName();
     expect(isDisabled(search)).toBe(true);
     await vi.waitFor(() => {
       expect(isDisabled(search)).toBe(false);
@@ -7694,10 +8081,11 @@ describe('FormView record grid', () => {
   });
 
   it('shows a "Show deleted" change as pending, ignoring further changes, until navigation applies it', async () => {
-    const count = deferred();
-    const isDeletedCount = (call: Call) =>
-      isGet(call, COUNT_PATH) && call.url.searchParams.get('includeDeleted') === 'true';
-    await renderForm(undefined, { route: (call) => (isDeletedCount(call) ? count.response : null) });
+    // The toggle's one read: the open record's position in the set with deleted records.
+    const position = deferred();
+    const isDeletedPosition = (call: Call) =>
+      isGet(call, `${OPEN_PATH}/position`) && call.url.searchParams.get('includeDeleted') === 'true';
+    await renderForm(undefined, { route: (call) => (isDeletedPosition(call) ? position.response : null) });
     const toggle = within(records()).getByRole('checkbox', { name: 'Show deleted' });
     const state = () => ({
       checked: toggle.matches(':checked'),
@@ -7709,7 +8097,7 @@ describe('FormView record grid', () => {
 
     fireEvent.click(toggle);
     await vi.waitFor(() => {
-      expect(calls.some(isDeletedCount)).toBe(true);
+      expect(calls.some(isDeletedPosition)).toBe(true);
     });
     const pending = { checked: true, busy: 'true', pendingStyle: true, rows: 'true' };
     expect(state()).toEqual(pending);
@@ -7717,7 +8105,7 @@ describe('FormView record grid', () => {
     fireEvent.click(toggle);
     expect(state()).toEqual(pending);
 
-    count.release(jsonResponse(200, { count: 1 }));
+    position.release(jsonResponse(200, { position: 1, count: 1 } satisfies NavigationPosition));
     await vi.waitFor(() => {
       expect(listCalls().at(-1)?.url.searchParams.get('includeDeleted')).toBe('true');
     });

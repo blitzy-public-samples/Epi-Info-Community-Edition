@@ -406,7 +406,10 @@ public static class FakeForms
 /// writer wins per field, as the SQL store's <c>UPDLOCK</c> makes them. Rows are immutable and each write publishes
 /// replacements, so <see cref="ListAsync"/> and <see cref="SearchAsync"/> take the form's current rows under the lock
 /// and filter outside it, seeing one consistent state of the form. Every member completes synchronously and reports
-/// failures through the returned task, as an asynchronous store does.
+/// failures through the returned task, as an asynchronous store does, except a ping that <see cref="HoldPings"/>
+/// holds, whatever its token, until <see cref="ReleasePings(bool)"/> or <see cref="ReleasePings(Exception)"/>
+/// answers it, and a ping that <see cref="BlockPings"/> blocks, which returns its task only once
+/// <see cref="UnblockPings"/> or its longest block lets it.
 /// </para>
 /// </remarks>
 public sealed class FakeDataStore : IDataStore
@@ -437,9 +440,12 @@ public sealed class FakeDataStore : IDataStore
     private readonly List<FakeStoreCall> _calls = new();
     private readonly Dictionary<string, (Exception Exception, FakeFailureStage Stage)> _failures =
         new(StringComparer.Ordinal);
+    private readonly List<(int Count, TaskCompletionSource Reached)> _pingCallWaiters = new();
 
     private Exception? _failureForAll;
     private bool _pingAnswered = true;
+    private TaskCompletionSource<bool>? _pingHold;
+    private (TaskCompletionSource Unblocked, TimeSpan Longest)? _pingBlock;
 
     /// <summary>Creates a store that holds no form.</summary>
     public FakeDataStore()
@@ -717,6 +723,114 @@ public sealed class FakeDataStore : IDataStore
         lock (_gate)
         {
             _pingAnswered = answered;
+        }
+    }
+
+    /// <summary>
+    /// Holds every later <see cref="PingAsync"/> call, once it is logged and no injected failure or cancellation
+    /// applies, until <see cref="ReleasePings(bool)"/> or <see cref="ReleasePings(Exception)"/> answers it. A held
+    /// ping ignores its token, as SqlClient does for a command on a session whose server has stopped answering, so
+    /// only the release ends it. Holding while pings are already held changes nothing.
+    /// </summary>
+    public void HoldPings()
+    {
+        lock (_gate)
+        {
+            // Not RunContinuationsAsynchronously: a release runs the held pings' synchronous continuations before it
+            // returns, which is what makes a test's next step deterministic.
+            _pingHold ??= new TaskCompletionSource<bool>();
+        }
+    }
+
+    /// <summary>
+    /// Answers every held ping with <paramref name="answered"/> and stops holding, so later pings answer at once
+    /// again. The held tasks complete before this returns, and their synchronous continuations run on the caller's
+    /// thread, as a driver completing its I/O runs them, so a caller's own settlement of a held ping has run by then.
+    /// </summary>
+    /// <param name="answered">The answer of every held ping.</param>
+    /// <exception cref="InvalidOperationException">No hold is in place.</exception>
+    public void ReleasePings(bool answered) => TakePingHold().SetResult(answered);
+
+    /// <summary>
+    /// Fails every held ping with <paramref name="failure"/> and stops holding, as <see cref="ReleasePings(bool)"/>
+    /// does. The store keeps no reference to the failed task, so a test can collect it to check that its fault was
+    /// observed.
+    /// </summary>
+    /// <param name="failure">The exception every held ping fails with.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="failure"/> is <see langword="null"/>.</exception>
+    /// <exception cref="InvalidOperationException">No hold is in place.</exception>
+    public void ReleasePings(Exception failure)
+    {
+        ArgumentNullException.ThrowIfNull(failure);
+        TakePingHold().SetException(failure);
+    }
+
+    /// <summary>
+    /// Makes every later <see cref="PingAsync"/> call, once it is logged and no injected failure or cancellation
+    /// applies, block the thread that made it before returning its task, until <see cref="UnblockPings"/> or until
+    /// <paramref name="longest"/> has passed, as SqlClient's asynchronous open blocks its caller while it replaces a
+    /// dead pooled connection synchronously. A blocked call ignores its token and blocks outside the store's lock, so
+    /// <see cref="Calls"/> and every other member stay usable; once it returns, a hold of <see cref="HoldPings"/>
+    /// still applies. The longest block keeps a caller that never unblocks from losing the thread for good. Blocking
+    /// while pings are already blocked changes nothing.
+    /// </summary>
+    /// <param name="longest">
+    /// The longest one call blocks; greater than zero and at most <see cref="int.MaxValue"/> milliseconds.
+    /// </param>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="longest"/> is out of range.</exception>
+    public void BlockPings(TimeSpan longest)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(longest, TimeSpan.Zero);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(longest, TimeSpan.FromMilliseconds(int.MaxValue));
+        lock (_gate)
+        {
+            // Not RunContinuationsAsynchronously: the unblock wakes the blocked threads itself, never through a thread
+            // pool that the blocked calls may be starving.
+            _pingBlock ??= (new TaskCompletionSource(), longest);
+        }
+    }
+
+    /// <summary>
+    /// Lets every blocked ping return its task and stops blocking, so later pings return at once again. Unblocking
+    /// when no ping is blocked changes nothing, so a test can unblock in a <c>finally</c> whatever happened before.
+    /// </summary>
+    public void UnblockPings()
+    {
+        TaskCompletionSource? unblocked;
+        lock (_gate)
+        {
+            unblocked = _pingBlock?.Unblocked;
+            _pingBlock = null;
+        }
+
+        unblocked?.TrySetResult();
+    }
+
+    /// <summary>
+    /// Completes once the call log holds at least <paramref name="count"/> <see cref="PingAsync"/> calls, at once when
+    /// it already does. A caller that hands its ping to another thread, as the health check does, waits on it to know
+    /// that the store has been reached, and so that a held or blocked ping has taken its hold or block, before it
+    /// asserts on <see cref="Calls"/> or releases the ping. <see cref="ClearCalls"/> forgets the calls it counts.
+    /// </summary>
+    /// <param name="count">How many logged ping calls to wait for; greater than zero.</param>
+    /// <returns>
+    /// A task that completes once that many ping calls are logged; its continuations never run inside the store's lock.
+    /// </returns>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="count"/> is zero or negative.</exception>
+    public Task WaitForPingCallsAsync(int count)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(count);
+        lock (_gate)
+        {
+            if (PingCallCount() >= count)
+            {
+                return Task.CompletedTask;
+            }
+
+            // Its continuations run asynchronously, so a waiting caller never resumes inside the store's lock.
+            var reached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            _pingCallWaiters.Add((count, reached));
+            return reached.Task;
         }
     }
 
@@ -1148,15 +1262,39 @@ public sealed class FakeDataStore : IDataStore
         });
 
     /// <inheritdoc />
-    public Task<bool> PingAsync(CancellationToken cancellationToken) =>
-        Complete(() =>
+    public Task<bool> PingAsync(CancellationToken cancellationToken)
+    {
+        TaskCompletionSource<bool>? hold = null;
+        (TaskCompletionSource Unblocked, TimeSpan Longest)? block = null;
+        Task<bool> answer = Complete(() =>
         {
             lock (_gate)
             {
-                BeginRead(nameof(PingAsync), cancellationToken);
-                return _pingAnswered;
+                try
+                {
+                    BeginRead(nameof(PingAsync), cancellationToken);
+                    hold = _pingHold;
+                    block = _pingBlock;
+                    return _pingAnswered;
+                }
+                finally
+                {
+                    // A call is logged even when it then fails, so its waiters learn of it either way.
+                    SignalPingCallWaiters();
+                }
             }
         });
+
+        // A blocked ping blocks outside the lock and never reads its token again: only the unblock, or its longest
+        // block, lets it return. Whether the block ended in time is the caller's to measure, so the result is unused.
+        if (block is { } blocking)
+        {
+            _ = blocking.Unblocked.Task.Wait(blocking.Longest);
+        }
+
+        // A held ping never reads its token again: only the release answers it.
+        return hold?.Task ?? answer;
+    }
 
     /// <inheritdoc />
     public Task<FormPermissions?> GetPermissionsAsync(FormMetadata form, CancellationToken cancellationToken) =>
@@ -1422,6 +1560,42 @@ public sealed class FakeDataStore : IDataStore
             return Task.FromException<T>(exception);
         }
     }
+
+    // The hold in place, which the store forgets before the caller completes it outside the lock.
+    private TaskCompletionSource<bool> TakePingHold()
+    {
+        lock (_gate)
+        {
+            TaskCompletionSource<bool> hold = _pingHold
+                ?? throw new InvalidOperationException("No ping is held; call HoldPings first.");
+            _pingHold = null;
+            return hold;
+        }
+    }
+
+    // Under the lock: completes every waiter of WaitForPingCallsAsync whose count the call log has reached.
+    private void SignalPingCallWaiters()
+    {
+        if (_pingCallWaiters.Count == 0)
+        {
+            return;
+        }
+
+        int calls = PingCallCount();
+        _pingCallWaiters.RemoveAll(waiter =>
+        {
+            if (waiter.Count > calls)
+            {
+                return false;
+            }
+
+            waiter.Reached.TrySetResult();
+            return true;
+        });
+    }
+
+    // Under the lock: the logged calls of PingAsync.
+    private int PingCallCount() => _calls.Count(call => call.Method == nameof(PingAsync));
 
     // The format the SQL store writes: a lower-case hyphenated GUID, as legacy Guid.NewGuid().ToString() gives it.
     private static string NewGlobalRecordId() => Guid.NewGuid().ToString("D", CultureInfo.InvariantCulture);

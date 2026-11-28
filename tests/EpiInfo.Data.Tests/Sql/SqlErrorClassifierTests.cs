@@ -1166,6 +1166,250 @@ public sealed class SqlErrorClassifierTests
     }
 
     /// <summary>
+    /// Open failures, each with whether the request token is cancelled and how the outage gate hears the failure the
+    /// factory reports for it: only a SQL exception classified as unavailable is the server found unreachable; pool
+    /// exhaustion, which a pool full of open connections raises, and an unexpected error show that the server answered;
+    /// the client's cancellation tells nothing.
+    /// </summary>
+    public static TheoryData<Exception, bool, string> OutageGateEndingCases => new()
+    {
+        { SqlExceptionFactory.Create(53), false, nameof(SqlOutageGate.OpenEnd.ServerUnreachable) },
+        { SqlExceptionFactory.Create(-2), false, nameof(SqlOutageGate.OpenEnd.ServerUnreachable) },
+        { SqlExceptionFactory.Create(18456), false, nameof(SqlOutageGate.OpenEnd.ServerUnreachable) },
+        { SqlExceptionFactory.Create(4060), false, nameof(SqlOutageGate.OpenEnd.ServerUnreachable) },
+        {
+            SqlExceptionFactory.Create([SqlExceptionFactory.Error(0, 20, RefusedOrUnreachableMessage)]), false,
+            nameof(SqlOutageGate.OpenEnd.ServerUnreachable)
+        },
+        {
+            new InvalidOperationException(PooledOpenTimeoutEnglish), false,
+            nameof(SqlOutageGate.OpenEnd.ServerAnswered)
+        },
+        {
+            SqlExceptionFactory.Create([SqlExceptionFactory.Error(547, 16, "constraint")]), false,
+            nameof(SqlOutageGate.OpenEnd.ServerAnswered)
+        },
+        { new InvalidOperationException("not open"), false, nameof(SqlOutageGate.OpenEnd.ServerAnswered) },
+        { new OperationCanceledException(CancelledToken), true, nameof(SqlOutageGate.OpenEnd.Cancelled) },
+    };
+
+    // The ending decides the gate's state from either state it can be in: with no outage recorded, only the server
+    // found unreachable records one; with one recorded and its probe ending, the probe slot comes free whatever the
+    // ending, a failure showing that the server answered clears the outage, and an unreachable server or a
+    // cancellation keeps it.
+    [Theory]
+    [MemberData(nameof(OutageGateEndingCases))]
+    public async Task OutageGate_OpenFailureEnding_RecordsAnOutageOnlyForAnUnreachableServer(
+        Exception openFailure,
+        bool tokenCancelled,
+        string expectedEnd)
+    {
+        CancellationToken token = tokenCancelled ? CancelledToken : CancellationToken.None;
+        Exception reported = await SqlConnectionFactory.OpenFailureAsync(
+            new ThrowingReleaseConnection(),
+            "CountAsync",
+            openFailure,
+            token);
+
+        SqlOutageGate.OpenEnd end = SqlOutageGate.EndOf(openFailure, reported);
+
+        Assert.Equal(Enum.Parse<SqlOutageGate.OpenEnd>(expectedEnd), end);
+        bool unreachable = end == SqlOutageGate.OpenEnd.ServerUnreachable;
+
+        var healthy = new SqlOutageGate();
+        SqlOutageGate.Ticket admitted = healthy.Admit();
+        Assert.Equal(SqlOutageGate.Admission.Normal, admitted.Admission);
+        healthy.Complete(admitted, end);
+        Assert.Equal(unreachable, healthy.OutageRecorded);
+        Assert.Equal(unreachable, admitted.Release.IsCancellationRequested);
+
+        (SqlOutageGate probing, SqlOutageGate.Ticket probe) = GateProbingARecordedOutage();
+        probing.Complete(probe, end);
+        Assert.False(probing.ProbeInFlight);
+        Assert.Equal(unreachable || end == SqlOutageGate.OpenEnd.Cancelled, probing.OutageRecorded);
+    }
+
+    // A probe the client cancelled frees its slot and leaves the outage recorded, so the next open is the next probe
+    // and the one after it is refused again.
+    [Fact]
+    public void OutageGate_ProbeCancelled_FreesTheProbeSlotAndKeepsTheOutage()
+    {
+        (SqlOutageGate gate, SqlOutageGate.Ticket probe) = GateProbingARecordedOutage();
+        Assert.Equal(SqlOutageGate.Admission.Refused, gate.Admit().Admission);
+
+        gate.Complete(probe, SqlOutageGate.OpenEnd.Cancelled);
+
+        Assert.True(gate.OutageRecorded);
+        Assert.False(gate.ProbeInFlight);
+        SqlOutageGate.Ticket nextProbe = gate.Admit();
+        Assert.Equal(SqlOutageGate.Admission.Probe, nextProbe.Admission);
+        Assert.False(nextProbe.Release.CanBeCanceled);
+        Assert.Equal(SqlOutageGate.Admission.Refused, gate.Admit().Admission);
+    }
+
+    // Only the first unreachable ending releases: it cancels the generation every normal open in flight was admitted
+    // under, and installs a fresh one, which a second unreachable ending while the outage is recorded leaves alone, so
+    // the opens admitted once a probe has cleared the outage are not released by a failure that came before them. A
+    // refused ticket, which never opens, is rejected, and a default ticket, which no admission handed out, changes
+    // nothing.
+    [Fact]
+    public void OutageGate_UnreachableEndings_ReleaseOnlyTheGenerationInFlightAtTheFirst()
+    {
+        var gate = new SqlOutageGate();
+        SqlOutageGate.Ticket first = gate.Admit();
+        SqlOutageGate.Ticket second = gate.Admit();
+        Assert.Equal(SqlOutageGate.Admission.Normal, first.Admission);
+        Assert.Equal(SqlOutageGate.Admission.Normal, second.Admission);
+
+        gate.Complete(first, SqlOutageGate.OpenEnd.ServerUnreachable);
+
+        Assert.True(first.Release.IsCancellationRequested);
+        Assert.True(second.Release.IsCancellationRequested);
+        gate.Complete(second, SqlOutageGate.OpenEnd.ServerUnreachable);
+        SqlOutageGate.Ticket probe = gate.Admit();
+        Assert.Equal(SqlOutageGate.Admission.Probe, probe.Admission);
+        SqlOutageGate.Ticket refused = gate.Admit();
+        Assert.Equal(SqlOutageGate.Admission.Refused, refused.Admission);
+        gate.Complete(probe, SqlOutageGate.OpenEnd.Opened);
+
+        Assert.False(gate.OutageRecorded);
+        SqlOutageGate.Ticket afterRecovery = gate.Admit();
+        Assert.Equal(SqlOutageGate.Admission.Normal, afterRecovery.Admission);
+        Assert.True(afterRecovery.Release.CanBeCanceled);
+        Assert.False(afterRecovery.Release.IsCancellationRequested);
+        Assert.Throws<ArgumentOutOfRangeException>(
+            () => gate.Complete(refused, SqlOutageGate.OpenEnd.ServerUnreachable));
+        gate.Complete(default, SqlOutageGate.OpenEnd.ServerUnreachable);
+        Assert.False(gate.OutageRecorded);
+        Assert.False(afterRecovery.Release.IsCancellationRequested);
+    }
+
+    /// <summary>Every way an admitted open can end, by name.</summary>
+    public static TheoryData<string> EveryOpenEnd =>
+        new(Enum.GetNames<SqlOutageGate.OpenEnd>());
+
+    // An open admitted before the outage was recorded, whose success or failure arrives once the probe is in flight,
+    // belongs to the generation the recording retired, so whatever it reports changes nothing: a late success cannot
+    // clear the outage beside its probe, and the open after it is still refused.
+    [Theory]
+    [MemberData(nameof(EveryOpenEnd))]
+    public void OutageGate_RetiredOpenEndingWhileTheProbeRuns_KeepsTheOutageAndItsProbe(string lateEnd)
+    {
+        var gate = new SqlOutageGate();
+        SqlOutageGate.Ticket late = gate.Admit();
+        SqlOutageGate.Ticket failing = gate.Admit();
+        gate.Complete(failing, SqlOutageGate.OpenEnd.ServerUnreachable);
+        Assert.Equal(SqlOutageGate.Admission.Probe, gate.Admit().Admission);
+
+        gate.Complete(late, Enum.Parse<SqlOutageGate.OpenEnd>(lateEnd));
+
+        Assert.True(gate.OutageRecorded);
+        Assert.True(gate.ProbeInFlight);
+        Assert.Equal(SqlOutageGate.Admission.Refused, gate.Admit().Admission);
+    }
+
+    /// <summary>
+    /// Each ending of a probe that clears the outage, with each ending an open admitted before the outage may report
+    /// after it, a deadline's expiry included, which reaches the gate as an unreachable server.
+    /// </summary>
+    public static TheoryData<string, string> RetiredOpenEndingAfterRecoveryCases
+    {
+        get
+        {
+            var cases = new TheoryData<string, string>();
+            foreach (string recoveryEnd in new[]
+                     {
+                         nameof(SqlOutageGate.OpenEnd.Opened),
+                         nameof(SqlOutageGate.OpenEnd.ServerAnswered),
+                     })
+            {
+                foreach (string lateEnd in Enum.GetNames<SqlOutageGate.OpenEnd>())
+                {
+                    cases.Add(recoveryEnd, lateEnd);
+                }
+            }
+
+            return cases;
+        }
+    }
+
+    // An open admitted before the outage was recorded, whose ending arrives once a probe has cleared it, belongs to the
+    // generation the recording retired, so whatever it reports changes nothing: a late failure cannot record another
+    // outage or release the opens admitted since the recovery, and the next open is admitted normally. Those opens are
+    // the current generation's, so the first of them to find the server unreachable still records the outage and
+    // releases the others.
+    [Theory]
+    [MemberData(nameof(RetiredOpenEndingAfterRecoveryCases))]
+    public void OutageGate_RetiredOpenEndingAfterRecovery_LeavesTheRecoveredGenerationAlone(
+        string recoveryEnd,
+        string lateEnd)
+    {
+        var gate = new SqlOutageGate();
+        SqlOutageGate.Ticket late = gate.Admit();
+        SqlOutageGate.Ticket failing = gate.Admit();
+        gate.Complete(failing, SqlOutageGate.OpenEnd.ServerUnreachable);
+        Assert.True(late.Release.IsCancellationRequested);
+        SqlOutageGate.Ticket probe = gate.Admit();
+        Assert.Equal(SqlOutageGate.Admission.Probe, probe.Admission);
+        gate.Complete(probe, Enum.Parse<SqlOutageGate.OpenEnd>(recoveryEnd));
+        SqlOutageGate.Ticket recovered = gate.Admit();
+        Assert.Equal(SqlOutageGate.Admission.Normal, recovered.Admission);
+
+        gate.Complete(late, Enum.Parse<SqlOutageGate.OpenEnd>(lateEnd));
+
+        Assert.False(gate.OutageRecorded);
+        Assert.False(recovered.Release.IsCancellationRequested);
+        SqlOutageGate.Ticket next = gate.Admit();
+        Assert.Equal(SqlOutageGate.Admission.Normal, next.Admission);
+
+        gate.Complete(recovered, SqlOutageGate.OpenEnd.ServerUnreachable);
+
+        Assert.True(gate.OutageRecorded);
+        Assert.True(next.Release.IsCancellationRequested);
+    }
+
+    // An admitted open's deadline is its connect timeout plus a one-second grace; a connect timeout of 0, which
+    // SqlClient reads as waiting indefinitely, has none; and one too long for a timer is bounded at int.MaxValue
+    // milliseconds, just past the last connect timeout that is not. Every deadline given is one a
+    // CancellationTokenSource accepts.
+    [Theory]
+    [InlineData(0, null)]
+    [InlineData(1, 2_000d)]
+    [InlineData(15, 16_000d)]
+    [InlineData(2_147_482, 2_147_483_000d)]
+    [InlineData(2_147_483, 2_147_483_647d)]
+    [InlineData(int.MaxValue, 2_147_483_647d)]
+    public void OpenDeadline_IsTheConnectTimeoutPlusOneSecondAndNoneForZero(
+        int connectTimeoutSeconds,
+        double? expectedMilliseconds)
+    {
+        TimeSpan? deadline = SqlConnectionFactory.OpenDeadline(connectTimeoutSeconds);
+
+        TimeSpan? expected = expectedMilliseconds is double milliseconds
+            ? TimeSpan.FromMilliseconds(milliseconds)
+            : null;
+        Assert.Equal(expected, deadline);
+        if (deadline is TimeSpan due)
+        {
+            using var source = new CancellationTokenSource(due);
+            Assert.False(source.IsCancellationRequested);
+        }
+    }
+
+    // A gate whose outage is recorded and whose probe is in flight, with that probe's ticket.
+    private static (SqlOutageGate Gate, SqlOutageGate.Ticket Probe) GateProbingARecordedOutage()
+    {
+        var gate = new SqlOutageGate();
+        SqlOutageGate.Ticket failing = gate.Admit();
+        Assert.Equal(SqlOutageGate.Admission.Normal, failing.Admission);
+        gate.Complete(failing, SqlOutageGate.OpenEnd.ServerUnreachable);
+        SqlOutageGate.Ticket probe = gate.Admit();
+        Assert.Equal(SqlOutageGate.Admission.Probe, probe.Admission);
+        Assert.True(gate.ProbeInFlight);
+        return (gate, probe);
+    }
+
+    /// <summary>
     /// A statement a local guard of <see cref="SqlExecution"/> refuses is never sent, so its dispatch callback is not
     /// called and the observer hears nothing, for both forms a write sends: the state guard (a connection never
     /// opened) and an argument guard (a timeout below one second). The connection is only constructed, from a
@@ -1504,11 +1748,16 @@ public sealed class SqlConnectionFactoryConnectionStringTests : IAsyncLifetime
 }
 
 /// <summary>
-/// Integration test of recovery without a restart (<see cref="SqlConnectionFactory"/>): once SQL Server answers again
-/// after a failed open, the very next open reaches it, instead of receiving SqlClient's cached failure for the pool's
-/// blocking period. The server is reached through <see cref="SwitchableForwarder"/>, so the outage is this test's own,
-/// and its pool, keyed by the forwarder's port and a unique application name, is shared with no other test. It needs
-/// the rehearsal database and changes no data: its only statement is <c>SELECT 1</c>.
+/// Integration tests of recovery without a restart and of failing fast during an outage
+/// (<see cref="SqlConnectionFactory"/>): once SQL Server answers again after a failed open, the very next open reaches
+/// it, instead of receiving SqlClient's cached failure for the pool's blocking period; and while the server accepts
+/// connections and never answers, as an unreachable host does, opens waiting together fail within about one connect
+/// timeout rather than one each in turn, opens SqlClient holds behind an attempt begun for an open whose caller gave
+/// up fail at their own deadline rather than after an attempt of their own, and opens beside the outage gate's probe
+/// fail at once. The server is reached
+/// through <see cref="SwitchableForwarder"/>, so the outage is each test's own, and its pool, keyed by the forwarder's
+/// port and a unique application name, is shared with no other test. They need the rehearsal database and change no
+/// data: their only statement is <c>SELECT 1</c>.
 /// </summary>
 [Collection(DatabaseCollections.Database)]
 [Trait("Category", "Integration")]
@@ -1517,9 +1766,33 @@ public sealed class SqlConnectionFactoryRecoveryTests : IAsyncLifetime
     // Short, so the failed open ends soon; long enough for a login relayed over loopback.
     private const int ConnectTimeoutSeconds = 3;
 
+    // How many opens wait together at the start of the stalled outage, and after it.
+    private const int ConcurrentOpens = 5;
+
+    // The connect timeout of the opens queued behind an abandoned attempt: long enough that waiting out that attempt
+    // and then one of their own, about two connect timeouts, is clearly slower than one deadline and the margin.
+    private const int QueuedConnectTimeoutSeconds = 5;
+
+    // How many opens SqlClient holds behind the abandoned attempt.
+    private const int QueuedOpens = 4;
+
     private const int DefaultSqlServerPort = 1433;
     private const string TcpPrefix = "tcp:";
     private const string ApplicationNamePrefix = "EpiInfo.Web.Tests recovery ";
+
+    // Opens that each waited out an attempt of their own in turn would take ConcurrentOpens connect timeouts, the last
+    // of them 15 seconds; failing within about one, they all end inside two.
+    private static readonly TimeSpan OneAttemptBound = TimeSpan.FromSeconds(2 * ConnectTimeoutSeconds);
+
+    // An open the gate refuses asks SqlClient for nothing, so it ends far inside a second.
+    private static readonly TimeSpan RefusalBound = TimeSpan.FromSeconds(1);
+
+    // When the caller of the open at the head of SqlClient's queue gives up: once SqlClient has begun its attempt.
+    private static readonly TimeSpan AbandonAfter = TimeSpan.FromMilliseconds(500);
+
+    // Each queued open's deadline, its connect timeout and the one-second grace, plus a margin for scheduling; ten
+    // seconds, two connect timeouts, without the deadline.
+    private static readonly TimeSpan DeadlineBound = TimeSpan.FromSeconds(QueuedConnectTimeoutSeconds + 1 + 1.5);
 
     public Task InitializeAsync() => TestDatabase.EnsureReachableAsync();
 
@@ -1534,23 +1807,9 @@ public sealed class SqlConnectionFactoryRecoveryTests : IAsyncLifetime
         string? effective = null;
         try
         {
-            // The certificate is still checked against the server's own name, not the forwarder's address.
-            if (!target.ShouldSerialize("Host Name In Certificate"))
-            {
-                target.HostNameInCertificate = host;
-            }
-
-            target.DataSource = string.Create(CultureInfo.InvariantCulture, $"{TcpPrefix}127.0.0.1,{forwarder.Port}");
-            target.ConnectTimeout = ConnectTimeoutSeconds;
-            target.ApplicationName = ApplicationNamePrefix + Guid.NewGuid().ToString("N");
-
-            // The test is about the factory's own pool default, so the fixture string never decides it: a Pool Blocking
-            // Period from the environment's connection string, under either spelling, would override that default, and
-            // without pooling there would be no pool to block.
-            target.Remove("Pool Blocking Period");
-            target.Pooling = true;
-            effective = SqlConnectionFactory.EffectiveConnectionString(target.ConnectionString);
-            var factory = new SqlConnectionFactory(new DatabaseOptions(target.ConnectionString));
+            string configured = RelayedConnectionString(target, host, forwarder);
+            effective = SqlConnectionFactory.EffectiveConnectionString(configured);
+            var factory = new SqlConnectionFactory(new DatabaseOptions(configured));
 
             DataStoreUnavailableException outage = await Assert.ThrowsAsync<DataStoreUnavailableException>(
                 () => factory.OpenAsync(nameof(IDataStore.PingAsync), CancellationToken.None));
@@ -1578,6 +1837,291 @@ public sealed class SqlConnectionFactoryRecoveryTests : IAsyncLifetime
             await forwarder.DisposeAsync();
         }
     }
+
+    // The server accepts every connection and never answers, as an unreachable host or a hung server does. SqlClient's
+    // pool makes one physical connection at a time, so without the outage gate the opens waiting together would fail
+    // one connect timeout apart. With it: the first open that finds the server unreachable releases the others, so all
+    // of them fail within about one connect timeout; while the probe of the recorded outage is in flight, another open
+    // fails at once, having asked SqlClient for nothing; and once the server is back, the next open succeeds and the
+    // gate admits every open again, without a restart.
+    [Fact]
+    public async Task OpenAsync_ServerStalls_OpensFailWithinOneConnectTimeoutAndRecoverWithoutARestart()
+    {
+        SqlConnectionStringBuilder target = TestDatabase.Builder();
+        (string host, int port) = UpstreamEndpoint(target.DataSource);
+        SwitchableForwarder forwarder = SwitchableForwarder.Start(host, port);
+        forwarder.Stalling = true;
+        string? effective = null;
+        try
+        {
+            string configured = RelayedConnectionString(target, host, forwarder);
+            effective = SqlConnectionFactory.EffectiveConnectionString(configured);
+            var factory = new SqlConnectionFactory(new DatabaseOptions(configured));
+
+            var clock = Stopwatch.StartNew();
+            Task<SqlConnection>[] together =
+                [.. Enumerable.Range(0, ConcurrentOpens).Select(_ => PingOpenAsync(factory))];
+            DataStoreUnavailableException[] failures = await Task.WhenAll(
+                together.Select(open => Assert.ThrowsAsync<DataStoreUnavailableException>(() => open)));
+            TimeSpan elapsed = clock.Elapsed;
+
+            Assert.True(
+                elapsed < OneAttemptBound,
+                string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"{ConcurrentOpens} opens during the outage took {elapsed.TotalSeconds:F1} s; within about " +
+                    $"one {ConnectTimeoutSeconds}-second connect timeout they end inside " +
+                    $"{OneAttemptBound.TotalSeconds} s."));
+            Assert.All(failures, failure => Assert.Equal(WriteOutcome.NotWritten, failure.Outcome));
+
+            // One open found the server unreachable, with SqlClient's own failure; every other was released by it.
+            DataStoreUnavailableException found =
+                Assert.Single(failures, failure => failure.SqlErrorNumber is not null);
+            Assert.IsType<SqlException>(found.InnerException);
+            Assert.All(
+                failures.Where(failure => !ReferenceEquals(failure, found)),
+                released => Assert.IsAssignableFrom<OperationCanceledException>(released.InnerException));
+
+            // The outage is recorded, so the next open is its probe, and while it is in flight the one after it is
+            // refused before SqlClient is asked: no SQL error number and no inner exception.
+            Task<SqlConnection> probe = PingOpenAsync(factory);
+            clock.Restart();
+            DataStoreUnavailableException refused = await Assert.ThrowsAsync<DataStoreUnavailableException>(
+                () => PingOpenAsync(factory));
+            elapsed = clock.Elapsed;
+
+            Assert.True(
+                elapsed < RefusalBound,
+                string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"An open beside the probe took {elapsed.TotalMilliseconds:F0} ms to be refused."));
+            Assert.Equal(WriteOutcome.NotWritten, refused.Outcome);
+            Assert.Null(refused.SqlErrorNumber);
+            Assert.Null(refused.InnerException);
+
+            // The probe fails with SqlClient's failure of its own attempt or, when SqlClient holds it behind the
+            // attempt it began for an open the first failure released, at its deadline with no SQL error number;
+            // either way within about one connect timeout of its start.
+            DataStoreUnavailableException probeFailure = await Assert.ThrowsAsync<DataStoreUnavailableException>(
+                () => probe);
+            elapsed = clock.Elapsed;
+            Assert.Equal(WriteOutcome.NotWritten, probeFailure.Outcome);
+            Assert.True(
+                probeFailure.InnerException is SqlException
+                    || (probeFailure.SqlErrorNumber is null
+                        && probeFailure.InnerException is OperationCanceledException),
+                $"The probe failed with {probeFailure.InnerException?.GetType().Name ?? "no inner exception"}.");
+            Assert.True(
+                elapsed < OneAttemptBound,
+                string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"The probe took {elapsed.TotalSeconds:F1} s to fail; within about one " +
+                    $"{ConnectTimeoutSeconds}-second connect timeout it ends inside " +
+                    $"{OneAttemptBound.TotalSeconds} s."));
+
+            // The server is back: the next open is a probe that reaches it and clears the outage, after which opens
+            // waiting together are all admitted and all open.
+            forwarder.Forwarding = true;
+            await using (SqlConnection recovered = await PingOpenAsync(factory))
+            {
+                Assert.Equal(1, await SelectOneAsync(recovered));
+            }
+
+            SqlConnection[] reopened = await Task.WhenAll(
+                Enumerable.Range(0, ConcurrentOpens).Select(_ => PingOpenAsync(factory)));
+            try
+            {
+                foreach (SqlConnection connection in reopened)
+                {
+                    Assert.Equal(1, await SelectOneAsync(connection));
+                }
+            }
+            finally
+            {
+                foreach (SqlConnection connection in reopened)
+                {
+                    await connection.DisposeAsync();
+                }
+            }
+        }
+        finally
+        {
+            // Only this test's pool is cleared: the one keyed by the effective string of its own connection string.
+            if (effective is not null)
+            {
+                await using var poolKey = new SqlConnection(effective);
+                SqlConnection.ClearPool(poolKey);
+            }
+
+            await forwarder.DisposeAsync();
+        }
+    }
+
+    // A caller that gives up while the server stalls gets its own cancellation, carrying its own token rather than the
+    // factory's linked one, and the outage gate learns nothing from it. A cancelled normal open records no outage, so
+    // the next opens are admitted together, none refused; and a cancelled probe frees the probe slot and keeps the
+    // outage, so the open after it is the next probe and the one after that is refused. An open the gate refuses has
+    // failed by the time OpenAsync returns, so a task still pending on return was admitted.
+    [Fact]
+    public async Task OpenAsync_CallerCancelsDuringAStall_RaisesTheCallersTokenAndTellsTheGateNothing()
+    {
+        SqlConnectionStringBuilder target = TestDatabase.Builder();
+        (string host, int port) = UpstreamEndpoint(target.DataSource);
+        SwitchableForwarder forwarder = SwitchableForwarder.Start(host, port);
+        forwarder.Stalling = true;
+        string? effective = null;
+        try
+        {
+            string configured = RelayedConnectionString(target, host, forwarder);
+            effective = SqlConnectionFactory.EffectiveConnectionString(configured);
+            var factory = new SqlConnectionFactory(new DatabaseOptions(configured));
+
+            await AssertCancelledByTheCallerAsync(factory);
+
+            Task<SqlConnection>[] admitted = [PingOpenAsync(factory), PingOpenAsync(factory)];
+            Assert.All(admitted, open => Assert.False(open.IsCompleted, "An open after a cancellation was refused."));
+            DataStoreUnavailableException[] failures = await Task.WhenAll(
+                admitted.Select(open => Assert.ThrowsAsync<DataStoreUnavailableException>(() => open)));
+            Assert.All(failures, failure => Assert.NotNull(failure.InnerException));
+
+            // The outage those opens found is recorded: a cancelled probe gives its slot to the next one.
+            await AssertCancelledByTheCallerAsync(factory, refusedBeside: true);
+            await AssertCancelledByTheCallerAsync(factory, refusedBeside: true);
+        }
+        finally
+        {
+            // Only this test's pool is cleared: the one keyed by the effective string of its own connection string.
+            if (effective is not null)
+            {
+                await using var poolKey = new SqlConnection(effective);
+                SqlConnection.ClearPool(poolKey);
+            }
+
+            await forwarder.DisposeAsync();
+        }
+    }
+
+    // The caller of the open at the head of SqlClient's queue gives up once SqlClient has begun its attempt, which then
+    // runs on to the connect timeout, heard by no open; SqlClient holds the opens behind it until that attempt fails,
+    // and each would then begin an attempt of its own and fail one connect timeout later, about two after it began.
+    // Each open's own deadline ends them first: the abandoned open ends as its caller's cancellation, the opens behind
+    // it fail within about one connect timeout as unavailable with no SQL error number, and the outage their deadline
+    // showed is recorded, so the next open is the probe and the one beside it is refused.
+    [Fact]
+    public async Task OpenAsync_OpensQueuedBehindAnAbandonedAttempt_FailAtTheirDeadlineAndRecordTheOutage()
+    {
+        SqlConnectionStringBuilder target = TestDatabase.Builder();
+        (string host, int port) = UpstreamEndpoint(target.DataSource);
+        SwitchableForwarder forwarder = SwitchableForwarder.Start(host, port);
+        forwarder.Stalling = true;
+        string? effective = null;
+        try
+        {
+            string configured = RelayedConnectionString(target, host, forwarder, QueuedConnectTimeoutSeconds);
+            effective = SqlConnectionFactory.EffectiveConnectionString(configured);
+            var factory = new SqlConnectionFactory(new DatabaseOptions(configured));
+
+            var clock = Stopwatch.StartNew();
+            using var abandoning = new CancellationTokenSource(AbandonAfter);
+            Task<SqlConnection> abandoned = PingOpenAsync(factory, abandoning.Token);
+            Task<SqlConnection>[] queued = [.. Enumerable.Range(0, QueuedOpens).Select(_ => PingOpenAsync(factory))];
+
+            OperationCanceledException cancelled = await Assert.ThrowsAnyAsync<OperationCanceledException>(
+                () => abandoned);
+            Assert.Equal(abandoning.Token, cancelled.CancellationToken);
+            DataStoreUnavailableException[] failures = await Task.WhenAll(
+                queued.Select(open => Assert.ThrowsAsync<DataStoreUnavailableException>(() => open)));
+            TimeSpan elapsed = clock.Elapsed;
+
+            Assert.True(
+                elapsed < DeadlineBound,
+                string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"{QueuedOpens} opens queued behind an abandoned attempt took {elapsed.TotalSeconds:F1} s; at " +
+                    $"their deadline, a {QueuedConnectTimeoutSeconds}-second connect timeout and the one-second " +
+                    $"grace, they end inside {DeadlineBound.TotalSeconds} s."));
+            Assert.All(
+                failures,
+                failure =>
+                {
+                    Assert.Equal(WriteOutcome.NotWritten, failure.Outcome);
+                    Assert.Null(failure.SqlErrorNumber);
+                    Assert.IsAssignableFrom<OperationCanceledException>(failure.InnerException);
+                });
+
+            await AssertCancelledByTheCallerAsync(factory, refusedBeside: true);
+        }
+        finally
+        {
+            // Only this test's pool is cleared: the one keyed by the effective string of its own connection string.
+            if (effective is not null)
+            {
+                await using var poolKey = new SqlConnection(effective);
+                SqlConnection.ClearPool(poolKey);
+            }
+
+            await forwarder.DisposeAsync();
+        }
+    }
+
+    // Starts an open the server never answers and cancels its caller: the open is admitted, beside it another open is
+    // refused when refusedBeside is true, and the cancellation the caller sees carries the caller's token.
+    private static async Task AssertCancelledByTheCallerAsync(SqlConnectionFactory factory, bool refusedBeside = false)
+    {
+        using var caller = new CancellationTokenSource();
+        Task<SqlConnection> open = PingOpenAsync(factory, caller.Token);
+        Assert.False(open.IsCompleted, "The gate refused an open it should have admitted.");
+        if (refusedBeside)
+        {
+            DataStoreUnavailableException refused = await Assert.ThrowsAsync<DataStoreUnavailableException>(
+                () => PingOpenAsync(factory));
+            Assert.Null(refused.SqlErrorNumber);
+            Assert.Null(refused.InnerException);
+        }
+
+        await caller.CancelAsync();
+        OperationCanceledException cancelled = await Assert.ThrowsAnyAsync<OperationCanceledException>(() => open);
+
+        Assert.Equal(caller.Token, cancelled.CancellationToken);
+    }
+
+    // The test server's connection string, relayed through forwarder with a short connect timeout and a pool of its
+    // own.
+    private static string RelayedConnectionString(
+        SqlConnectionStringBuilder target,
+        string host,
+        SwitchableForwarder forwarder,
+        int connectTimeoutSeconds = ConnectTimeoutSeconds)
+    {
+        // The certificate is still checked against the server's own name, not the forwarder's address.
+        if (!target.ShouldSerialize("Host Name In Certificate"))
+        {
+            target.HostNameInCertificate = host;
+        }
+
+        target.DataSource = string.Create(CultureInfo.InvariantCulture, $"{TcpPrefix}127.0.0.1,{forwarder.Port}");
+        target.ConnectTimeout = connectTimeoutSeconds;
+        target.ApplicationName = ApplicationNamePrefix + Guid.NewGuid().ToString("N");
+
+        // The tests are about the factory's own pool default, so the fixture string never decides it: a Pool Blocking
+        // Period from the environment's connection string, under either spelling, would override that default, and
+        // without pooling there would be no pool to block.
+        target.Remove("Pool Blocking Period");
+        target.Pooling = true;
+        return target.ConnectionString;
+    }
+
+    private static Task<SqlConnection> PingOpenAsync(
+        SqlConnectionFactory factory,
+        CancellationToken cancellationToken = default) =>
+        factory.OpenAsync(nameof(IDataStore.PingAsync), cancellationToken);
+
+    private static async Task<object?> SelectOneAsync(SqlConnection connection)
+    {
+        await using var command = new SqlCommand("SELECT 1;", connection);
+        return await command.ExecuteScalarAsync();
+    }
+
 
     // The TCP endpoint of the test server's data source: "host" (port 1433) or "host,port", optionally prefixed "tcp:",
     // where an "\instance" is ignored when a port is given, as SqlClient ignores it. An instance without a port is found
@@ -1621,20 +2165,23 @@ public sealed class SqlConnectionFactoryRecoveryTests : IAsyncLifetime
     }
 
     /// <summary>
-    /// A loopback TCP listener standing in for the test server. Each connection it accepts is either reset at once
-    /// (<see cref="Forwarding"/> false, the initial state: the server has gone away) or relayed byte for byte to the
-    /// server (true). Switching keeps the same port, so the factory's connection string, and with it its pool, is the
-    /// same during the outage and after it.
+    /// A loopback TCP listener standing in for the test server. Each connection it accepts is relayed byte for byte to
+    /// the server (<see cref="Forwarding"/> true); otherwise held open and never answered (<see cref="Stalling"/> true:
+    /// the server cannot be reached, though the connection is made), or reset at once (both false, the initial state:
+    /// the server has gone away). Switching keeps the same port, so the factory's connection string, and with it its
+    /// pool, is the same during the outage and after it.
     /// </summary>
     private sealed class SwitchableForwarder : IAsyncDisposable
     {
         private readonly TcpListener listener = new(IPAddress.Loopback, 0);
         private readonly CancellationTokenSource stopping = new();
         private readonly List<Task> relays = [];
+        private readonly List<Socket> held = [];
         private readonly string upstreamHost;
         private readonly int upstreamPort;
         private Task accepting = Task.CompletedTask;
         private volatile bool forwarding;
+        private volatile bool stalling;
 
         private SwitchableForwarder(string upstreamHost, int upstreamPort)
         {
@@ -1652,6 +2199,16 @@ public sealed class SqlConnectionFactoryRecoveryTests : IAsyncLifetime
             set => forwarding = value;
         }
 
+        /// <summary>
+        /// Whether a connection accepted from now on, while not <see cref="Forwarding"/>, is held open without a byte
+        /// in reply until the forwarder stops, rather than reset.
+        /// </summary>
+        public bool Stalling
+        {
+            get => stalling;
+            set => stalling = value;
+        }
+
         /// <summary>Starts listening on a free loopback port, resetting every connection it accepts.</summary>
         /// <param name="upstreamHost">The test server's host.</param>
         /// <param name="upstreamPort">The test server's TCP port.</param>
@@ -1664,7 +2221,10 @@ public sealed class SqlConnectionFactoryRecoveryTests : IAsyncLifetime
             return forwarder;
         }
 
-        /// <summary>Stops listening, ends every relay, and returns once each has closed both of its sockets.</summary>
+        /// <summary>
+        /// Stops listening, closes every held connection, ends every relay, and returns once each has closed both of
+        /// its sockets.
+        /// </summary>
         /// <returns>A task that completes when the forwarder has stopped.</returns>
         public async ValueTask DisposeAsync()
         {
@@ -1672,7 +2232,12 @@ public sealed class SqlConnectionFactoryRecoveryTests : IAsyncLifetime
             listener.Stop();
             await accepting;
 
-            // The accept loop has ended, so no relay is added while these are awaited.
+            // The accept loop has ended, so no relay or held connection is added while these are closed and awaited.
+            foreach (Socket stalled in held)
+            {
+                stalled.Dispose();
+            }
+
             await Task.WhenAll(relays);
             stopping.Dispose();
         }
@@ -1694,6 +2259,11 @@ public sealed class SqlConnectionFactoryRecoveryTests : IAsyncLifetime
                 if (forwarding)
                 {
                     relays.Add(RelayAsync(client, stop));
+                }
+                else if (stalling)
+                {
+                    // Accepted and never read or answered: the client waits for a reply until its own timeout.
+                    held.Add(client);
                 }
                 else
                 {

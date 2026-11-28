@@ -19,13 +19,17 @@
 // lost response, an OK answer that is not a forms list, or any other error) leaves the form
 // unknown, so the request and its URL are kept and Retry repeats the open; `GET /api/forms`
 // is safe to send again.
+//
+// The form screen is a chunk of its own, so the forms list loads without it. It is fetched
+// ahead of an open, when a form's button is hovered, focused or pressed, and beside the
+// lookup of a `?view=` URL, so an open does not wait for it.
 import { useCallback, useEffect, useRef, useState, type FocusEvent, type ReactNode } from 'react';
 
 import { apiClient, type ApiClient, type ApiResult } from './api/client';
 import { describeError, isConnectionFailure, networkError, type ApiError } from './api/errors';
 import type { FormSummary } from './api/types';
 import { ConnectionError } from './components/ConnectionError';
-import { FormView } from './components/FormView';
+import type { FormView, FormViewProps } from './components/FormView';
 import { FormsList } from './components/FormsList';
 
 export interface AppProps {
@@ -64,6 +68,110 @@ const FORM_NOT_FOUND_NOTICE = 'This form no longer exists.';
 const LIST_PATH = '/';
 const RETRY = 'Retry';
 const SHOW_FORMS_LIST = 'Show forms list';
+// FormView's own texts for its loading status, its failed load and its way back, which the
+// form screen shows while its chunk is fetched or cannot be.
+const LOADING_FORM_TEXT = 'Loading form…';
+const FORM_LOAD_FAILED_TEXT = 'The form could not be loaded.';
+const BACK_TO_FORMS = 'Back to forms';
+
+/** The form screen's chunk: its one export the shell renders. */
+interface FormViewChunk {
+  readonly FormView: typeof FormView;
+}
+
+/** The fetch of the form screen's chunk, shared by every caller; `null` before one starts or after one fails. */
+let formViewFetch: Promise<FormViewChunk> | null = null;
+/** The form screen's chunk once fetched, so a later open renders the form in the same commit. */
+let formViewChunk: FormViewChunk | null = null;
+
+/** The form screen's chunk, fetched once; a failed fetch is forgotten, so the next call fetches again. */
+function loadFormView(): Promise<FormViewChunk> {
+  formViewFetch ??= import('./components/FormView').then(
+    (chunk) => {
+      formViewChunk = chunk;
+      return chunk;
+    },
+    (error: unknown) => {
+      formViewFetch = null;
+      throw error;
+    },
+  );
+  return formViewFetch;
+}
+
+/** Starts fetching the form screen ahead of an open. A failure shows only once a form opens, which fetches again. */
+function preloadFormView(): void {
+  loadFormView().catch(() => undefined);
+}
+
+interface FormScreenProps {
+  readonly view: FormViewProps;
+  /** Called as Retry is pressed, before the status and its Retry are replaced. */
+  readonly onRetry: () => void;
+}
+
+/**
+ * The open form: FormView, rendered at once when its chunk has been fetched, as it has after
+ * a hover or focus of the form's button. Until it arrives, the form's loading status shows;
+ * a failed fetch shows the failed load, as a definition that cannot be reached does, with
+ * Retry and Back to forms. Nothing was open, so going back saves nothing.
+ */
+function FormScreen({ view, onRetry }: FormScreenProps) {
+  const [chunk, setChunk] = useState<FormViewChunk | null>(() => formViewChunk);
+  // Bumped by Retry; the fetch effect depends on it so that it runs again.
+  const [attempt, setAttempt] = useState(0);
+  const [failedAttempt, setFailedAttempt] = useState<number | null>(null);
+
+  useEffect(() => {
+    if (chunk !== null) {
+      return undefined;
+    }
+    // Unmounting, or a Retry, makes this fetch's answer moot here; the chunk stays shared.
+    let current = true;
+    loadFormView().then(
+      (fetched) => {
+        if (current) {
+          setChunk(fetched);
+        }
+      },
+      () => {
+        if (current) {
+          setFailedAttempt(attempt);
+        }
+      },
+    );
+    return () => {
+      current = false;
+    };
+  }, [chunk, attempt]);
+
+  if (chunk !== null) {
+    return <chunk.FormView {...view} />;
+  }
+  const failed = failedAttempt === attempt;
+  return (
+    <div className="form-view">
+      {failed && (
+        <div className="form-toolbar" role="toolbar" aria-label="Form actions">
+          <button type="button" onClick={() => view.onExit(false)}>
+            {BACK_TO_FORMS}
+          </button>
+        </div>
+      )}
+      <p role="status">{failed ? FORM_LOAD_FAILED_TEXT : LOADING_FORM_TEXT}</p>
+      {failed && (
+        <ConnectionError
+          error={networkError()}
+          method="GET"
+          onRetry={() => {
+            onRetry();
+            setAttempt((previous) => previous + 1);
+          }}
+        />
+      )}
+    </div>
+  );
+}
 
 /** The forms list's confirmation that Back to forms saved the draft of the form `name`. */
 function savedNoticeOf(name: string): string {
@@ -263,6 +371,8 @@ export default function App({ client = apiClient }: AppProps) {
       return;
     }
     const { view, record, recordText, deleted } = switches;
+    // The form screen is fetched beside the lookup, so the open that follows waits for neither.
+    preloadFormView();
     // Unmounting, a Retry, or StrictMode's repeated effect aborts this lookup; only the last
     // one applies.
     const controller = new AbortController();
@@ -363,6 +473,10 @@ export default function App({ client = apiClient }: AppProps) {
 
   // Each removes the button just pressed, and the title stays on every screen, so focus goes
   // there first rather than falling to the page body.
+  const focusTitle = useCallback(() => {
+    headingRef.current?.focus();
+  }, []);
+
   const dismissNotice = useCallback(() => {
     headingRef.current?.focus();
     setNotice(null);
@@ -389,19 +503,22 @@ export default function App({ client = apiClient }: AppProps) {
   } else if (switches !== null) {
     content = <p role="status">{`Opening form ${switches.view}…`}</p>;
   } else if (selected === null) {
-    content = <FormsList client={client} onOpen={openFromList} />;
+    content = <FormsList client={client} onOpen={openFromList} onPreview={preloadFormView} />;
   } else {
     content = (
-      <FormView
+      <FormScreen
         key={selected.viewId}
-        viewId={selected.viewId}
-        client={client}
-        initialPosition={selected.initialPosition}
-        initialPositionText={selected.initialPositionText}
-        initialIncludeDeleted={selected.initialIncludeDeleted}
-        onExit={returnToList}
-        onFormNotFound={formNotFound}
-        onPositionChange={(n, includeDeleted) => reportPosition(selected, n, includeDeleted)}
+        view={{
+          viewId: selected.viewId,
+          client,
+          initialPosition: selected.initialPosition,
+          initialPositionText: selected.initialPositionText,
+          initialIncludeDeleted: selected.initialIncludeDeleted,
+          onExit: returnToList,
+          onFormNotFound: formNotFound,
+          onPositionChange: (n, includeDeleted) => reportPosition(selected, n, includeDeleted),
+        }}
+        onRetry={focusTitle}
       />
     );
   }

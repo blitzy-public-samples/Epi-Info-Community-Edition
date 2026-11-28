@@ -39,6 +39,21 @@ namespace EpiInfo.Domain.Storage;
 /// an absent or blank <c>ConnectionStrings:EpiInfo</c>, detected before any connection is attempted;
 /// </description></item>
 /// <item><description>
+/// an open the outage gate ends early, once an open has failed with one of the SQL exceptions above or past its
+/// deadline (next item), meaning SQL Server could not be reached or used: every other open then waiting for a
+/// connection is released at once, rather than waiting out a connect timeout of its own, and while that outage is
+/// recorded every open but the single probe is refused before any connection is attempted. Nothing was sent. The
+/// probe that opens, or that fails in a way showing the server answered, clears the outage;
+/// </description></item>
+/// <item><description>
+/// an open, normal or probe, that has no connection when its deadline passes: the connection string's connect
+/// timeout plus a one-second grace, none for a connect timeout of 0. SqlClient cannot stop an attempt it has begun,
+/// so without the deadline an open waiting behind an attempt begun for a request that has since ended would answer
+/// only after about two connect timeouts. Such an open is evidence that the server did not answer, so it records the
+/// outage as the SQL exceptions above do. Nothing was sent. The grace keeps SqlClient's own pool-exhaustion failure,
+/// due at the connect timeout, ahead of the deadline;
+/// </description></item>
+/// <item><description>
 /// the refusal of the per-form write lock that a write requests through <c>sp_getapplock</c> inside its transaction,
 /// before its first DML statement: <c>sp_getapplock</c> returns -1, the lock request timed out, or -3, the request
 /// was chosen as a deadlock victim. These are <c>sp_getapplock</c> return codes, not SQL Server error numbers, so the
@@ -134,8 +149,9 @@ public sealed class DataStoreUnavailableException : Exception
 
     /// <summary>
     /// The SQL Server error number of the underlying SQL exception, or <see langword="null"/> when the cause was not a
-    /// SQL exception: a missing connection string, pool exhaustion, or a form write lock that <c>sp_getapplock</c>
-    /// refused with its return code -1 (timed out) or -3 (deadlock victim), which is never stored here.
+    /// SQL exception: a missing connection string, pool exhaustion, an open the outage gate released or refused, an
+    /// open whose deadline passed, or a form write lock that <c>sp_getapplock</c> refused with its return code -1
+    /// (timed out) or -3 (deadlock victim), which is never stored here.
     /// </summary>
     public int? SqlErrorNumber { get; }
 }

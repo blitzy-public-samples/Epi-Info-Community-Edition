@@ -84,6 +84,9 @@ builder.Services.AddScoped<FormService>();
 builder.Services.AddScoped<RecordService>();
 builder.Services.AddScoped<FieldEventService>();
 
+// A singleton, because the check holds the one ping in flight that concurrent and later runs join: AddCheck<T> takes T
+// from the container when it is registered there and otherwise creates a new instance for every run.
+builder.Services.AddSingleton<SqlServerHealthCheck>();
 builder.Services.AddHealthChecks().AddCheck<SqlServerHealthCheck>(SqlServerHealthCheck.Name);
 
 // Routing asks every registered matcher policy; this one settles route constraints such as {viewId:int} before the

@@ -11,27 +11,39 @@
 import {
   useCallback,
   useEffect,
+  useId,
   useLayoutEffect,
   useMemo,
   useRef,
   useState,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type MouseEvent as ReactMouseEvent,
+  type MutableRefObject,
   type ReactNode,
   type RefObject,
 } from 'react';
+import { createPortal } from 'react-dom';
 
 import { apiClient, type ApiClient } from '../api/client';
-import { describeError, isAbortError, isConnectionFailure, networkError, type ApiError } from '../api/errors';
+import {
+  describeError,
+  errorMessages,
+  isAbortError,
+  isConnectionFailure,
+  networkError,
+  type ApiError,
+} from '../api/errors';
 import type { DialogMessage, FieldDefinition, FormDefinition, PageDefinition } from '../api/types';
 import { useRecordEditor, type BannerAction, type EditorBanner } from '../state/useRecordEditor';
 import { useRecordNavigation, type RecordNavigation } from '../state/useRecordNavigation';
 import { hasFieldErrors, isDataField } from '../validation/clientValidation';
-import { ConfirmDialog } from './ConfirmDialog';
+import type { ConfirmDialog } from './ConfirmDialog';
 import { ConnectionError } from './ConnectionError';
 import { FieldRenderer } from './FieldRenderer';
-import { FindRecordDialog } from './FindRecordDialog';
-import { MessageDialog } from './MessageDialog';
+import type { FindRecordDialog } from './FindRecordDialog';
+import type { MessageDialog } from './MessageDialog';
 import { PageTabs, pageTabId, pageTabPanelId } from './PageTabs';
-import { RecordGrid } from './RecordGrid';
+import { RecordGrid, primeListRead, type PrimedListRead } from './RecordGrid';
 import { RecordNavigator } from './RecordNavigator';
 import { ValidationSummary, type BlockedAction } from './ValidationSummary';
 import { fieldControlId } from './fields/fieldComponents';
@@ -65,12 +77,234 @@ export interface FormViewProps {
   onPositionChange?: (n: number | null, includeDeleted: boolean) => void;
 }
 
+/**
+ * The definition load. A loaded definition carries the grid's first page, requested beside
+ * it, which the workspace's grid takes as it mounts.
+ */
 type DefinitionState =
   | { readonly status: 'loading' }
-  | { readonly status: 'loaded'; readonly viewId: number; readonly definition: FormDefinition }
+  | {
+      readonly status: 'loaded';
+      readonly viewId: number;
+      readonly definition: FormDefinition;
+      readonly primedList: PrimedListRead;
+    }
   | { readonly status: 'failed'; readonly viewId: number; readonly error: ApiError };
 
 const LOADING_STATE: DefinitionState = { status: 'loading' };
+
+/** Navigation's beforeLeave while no workspace is mounted: nothing is open, so nothing needs saving. */
+const leaveNothing = (): Promise<boolean> => Promise.resolve(true);
+
+/** The workspace's modals, each a chunk of its own that a form open does not wait for. */
+interface DialogComponents {
+  readonly confirm: typeof ConfirmDialog;
+  readonly message: typeof MessageDialog;
+  readonly find: typeof FindRecordDialog;
+}
+
+type DialogKind = keyof DialogComponents;
+
+/** One dialog's chunk, shared by every workspace. */
+interface DialogChunkCache<C> {
+  /** Fetches the chunk and takes the dialog from it. */
+  readonly load: () => Promise<C>;
+  /** The fetch under way or done; `null` before one starts or after one fails. */
+  fetch: Promise<C> | null;
+  /** The dialog once fetched, so a later workspace renders it in its first commit. */
+  fetched: C | null;
+}
+
+const dialogChunks: { readonly [K in DialogKind]: DialogChunkCache<DialogComponents[K]> } = {
+  confirm: { load: () => import('./ConfirmDialog').then((chunk) => chunk.ConfirmDialog), fetch: null, fetched: null },
+  message: { load: () => import('./MessageDialog').then((chunk) => chunk.MessageDialog), fetch: null, fetched: null },
+  find: { load: () => import('./FindRecordDialog').then((chunk) => chunk.FindRecordDialog), fetch: null, fetched: null },
+};
+
+/** One dialog's chunk, fetched once; a failed fetch is forgotten, so the next call fetches it again. */
+function loadDialog<C>(cache: DialogChunkCache<C>): Promise<C> {
+  cache.fetch ??= cache.load().then(
+    (component) => {
+      cache.fetched = component;
+      return component;
+    },
+    (error: unknown) => {
+      cache.fetch = null;
+      throw error;
+    },
+  );
+  return cache.fetch;
+}
+
+/** Starts fetching every dialog's chunk. A failure shows only once its dialog is asked for, which fetches it again. */
+function prefetchDialogs(): void {
+  loadDialog(dialogChunks.confirm).catch(() => undefined);
+  loadDialog(dialogChunks.message).catch(() => undefined);
+  loadDialog(dialogChunks.find).catch(() => undefined);
+}
+
+/** Where a dialog's chunk stands: fetched, being fetched, or failed in the latest attempt. */
+type DialogChunkStatus = 'loaded' | 'pending' | 'failed';
+
+/** One dialog's chunk as its fetch stands. */
+interface DialogChunk<K extends DialogKind> {
+  /** The dialog, `null` until its chunk is fetched. */
+  readonly component: DialogComponents[K] | null;
+  readonly status: DialogChunkStatus;
+  /** Fetches the chunk again after a failure. */
+  readonly retry: () => void;
+}
+
+/**
+ * One dialog's chunk, fetched once the workspace has mounted unless FormView's fetch has
+ * already brought it. Each dialog's chunk has its own attempts, so one that cannot be fetched
+ * holds up no other. `wanted` says the dialog is asked for: one asked for after a failed
+ * fetch fetches again at once.
+ */
+function useDialogChunk<K extends DialogKind>(kind: K, wanted: boolean): DialogChunk<K> {
+  const cache: DialogChunkCache<DialogComponents[K]> = dialogChunks[kind];
+  // Boxed: a component is a function, which a state setter would call as an updater.
+  const [fetched, setFetched] = useState<{ readonly component: DialogComponents[K] } | null>(() => {
+    const component = cache.fetched;
+    return component === null ? null : { component };
+  });
+  // Bumped to fetch again; the fetch effect depends on it.
+  const [attempt, setAttempt] = useState(0);
+  const [failedAttempt, setFailedAttempt] = useState<number | null>(null);
+  const failed = fetched === null && failedAttempt === attempt;
+  // Adjusted during render, so a dialog asked for after a failure never shows that failure first.
+  const [wantedBefore, setWantedBefore] = useState(wanted);
+  if (wanted !== wantedBefore) {
+    setWantedBefore(wanted);
+    if (wanted && failed) {
+      setAttempt(attempt + 1);
+    }
+  }
+
+  useEffect(() => {
+    if (fetched !== null) {
+      return undefined;
+    }
+    // Unmounting, or a newer attempt, makes this fetch's answer moot here; the chunk stays shared.
+    let current = true;
+    loadDialog(cache).then(
+      (component) => {
+        if (current) {
+          setFetched({ component });
+        }
+      },
+      () => {
+        if (current) {
+          setFailedAttempt(attempt);
+        }
+      },
+    );
+    return () => {
+      current = false;
+    };
+  }, [cache, fetched, attempt]);
+
+  const retry = useCallback(() => {
+    setAttempt((previous) => previous + 1);
+  }, []);
+  let status: DialogChunkStatus = 'pending';
+  if (fetched !== null) {
+    status = 'loaded';
+  } else if (failed) {
+    status = 'failed';
+  }
+  return { component: fetched?.component ?? null, status, retry };
+}
+
+/** The dialogs the toolbar opens: the delete confirmation and Find. */
+type ToolbarDialog = 'delete' | 'find';
+
+/** Which of the workspace's modals show, and how each one's chunk stands. */
+interface WorkspaceModals {
+  readonly confirm: DialogChunk<'confirm'>;
+  readonly message: DialogChunk<'message'>;
+  readonly find: DialogChunk<'find'>;
+  /**
+   * The toolbar dialog shown: the dialog itself, or a placeholder while its chunk is being
+   * fetched. `null` when none is asked for, or the one asked for could not be fetched.
+   */
+  readonly toolbarDialog: ToolbarDialog | null;
+  /** The check-code messages show: as their dialog, or a placeholder while its chunk is being fetched. */
+  readonly messagesShown: boolean;
+  /** A modal is shown or on its way, so Delete and Find open nothing else meanwhile. */
+  readonly occupied: boolean;
+  /** A dialog asked for could not be opened: its chunk could not be fetched. */
+  readonly failed: boolean;
+  /** The toolbar dialog asked for whose chunk could not be fetched; `null` for none. */
+  readonly failedToolbarDialog: ToolbarDialog | null;
+  /** Fetches again each chunk asked for that could not be fetched; its dialog opens once it arrives. */
+  readonly retry: () => void;
+}
+
+/**
+ * The workspace's modals, one flow at a time. The delete confirmation and Find open from the
+ * toolbar and never together: while a modal is shown or its chunk is on its way, Delete and
+ * Find open nothing (`occupied`), as the page behind a modal is inert. Check-code messages
+ * arrive on their own; they show over the toolbar dialog as a newer modal, but only in a later
+ * commit than the one that showed the toolbar dialog itself: two modals mounted in one commit
+ * would each make the other inert, and neither would answer a key. Over a placeholder they wait
+ * for the dialog it stands for. A dialog whose chunk could not be fetched is not shown and
+ * blocks nothing; `failed` reports it until it is fetched, or no longer asked for.
+ */
+function useWorkspaceModals(deleteWanted: boolean, findWanted: boolean, messagesWanted: boolean): WorkspaceModals {
+  const confirm = useDialogChunk('confirm', deleteWanted);
+  const message = useDialogChunk('message', messagesWanted);
+  const find = useDialogChunk('find', findWanted);
+
+  let toolbarDialog: ToolbarDialog | null = null;
+  if (deleteWanted && confirm.status !== 'failed') {
+    toolbarDialog = 'delete';
+  } else if (findWanted && find.status !== 'failed') {
+    toolbarDialog = 'find';
+  }
+  const toolbarChunk = toolbarDialog === 'delete' ? confirm : toolbarDialog === 'find' ? find : null;
+  // The toolbar dialog shown as itself rather than as its placeholder.
+  const toolbarDialogOpen = toolbarChunk?.status === 'loaded' ? toolbarDialog : null;
+  // The toolbar dialog the last commit showed as itself.
+  const [committedToolbarDialog, setCommittedToolbarDialog] = useState<ToolbarDialog | null>(null);
+  useEffect(() => {
+    setCommittedToolbarDialog(toolbarDialogOpen);
+  }, [toolbarDialogOpen]);
+
+  const messagesOpen = messagesWanted && message.status !== 'failed';
+  const messagesShown =
+    messagesOpen &&
+    (toolbarDialog === null || (toolbarDialogOpen !== null && committedToolbarDialog === toolbarDialogOpen));
+
+  const deleteFailed = deleteWanted && confirm.status === 'failed';
+  const findFailed = findWanted && find.status === 'failed';
+  const failedChunks = [
+    ...(deleteFailed ? [confirm] : []),
+    ...(messagesWanted && message.status === 'failed' ? [message] : []),
+    ...(findFailed ? [find] : []),
+  ];
+  let failedToolbarDialog: ToolbarDialog | null = null;
+  if (deleteFailed) {
+    failedToolbarDialog = 'delete';
+  } else if (findFailed) {
+    failedToolbarDialog = 'find';
+  }
+  return {
+    confirm,
+    message,
+    find,
+    toolbarDialog,
+    messagesShown,
+    occupied: toolbarDialog !== null || messagesOpen,
+    failed: failedChunks.length > 0,
+    failedToolbarDialog,
+    retry: () => {
+      for (const chunk of failedChunks) {
+        chunk.retry();
+      }
+    },
+  };
+}
 
 // Toolbar names are matched by the browser smoke test. No other control of the form view
 // may contain them, nor First, Previous, Next, Last or New, which the navigator owns:
@@ -89,6 +323,8 @@ const DELETED_TEXT = 'This record is deleted and is read-only.';
 const SAVING_TEXT = 'Saving…';
 const RECORD_DELETED_TEXT = 'Record deleted.';
 const SAVED_TEXT = 'Changes saved.';
+// A dialog's chunk could not be fetched: the server, which serves it, did not answer.
+const DIALOG_FAILED_TEXT = `The dialog could not be opened. ${errorMessages.networkWithoutDraft}`;
 const RETRY = 'Retry';
 const DISMISS = 'Dismiss';
 const DISCARD_EDITS = 'Discard edits';
@@ -146,8 +382,10 @@ function useReportOnce(trigger: object | null, callback: () => void): void {
 
 /**
  * The form view: loads the form definition, then renders the workspace of that form.
- * The workspace is keyed by form, so another `viewId` starts fresh navigation and editor
- * state, and its hooks run only once a definition exists.
+ * Navigation needs no definition, so it starts with the definition load: the definition,
+ * N, the first record and the grid's first page are requested together. The workspace is
+ * keyed by form, so another `viewId` starts fresh editor state, as navigation does for
+ * itself, and the workspace's hooks run only once a definition exists.
  */
 export function FormView({
   viewId,
@@ -163,9 +401,28 @@ export function FormView({
   // Bumped by Retry; the load effect depends on it so that it runs again.
   const [attempt, setAttempt] = useState(0);
 
+  // Navigation's beforeLeave is the workspace's, installed through this ref while the
+  // workspace is mounted. No navigation action runs before that: nothing is shown to act on.
+  const beforeLeaveRef = useRef<() => Promise<boolean>>(leaveNothing);
+  const navigation = useRecordNavigation({
+    client,
+    viewId,
+    initialPosition,
+    initialPositionText,
+    initialIncludeDeleted,
+    beforeLeave: () => beforeLeaveRef.current(),
+  });
+  // Read by the load effect: the grid's first page asks for navigation's set and list version.
+  const navigationRef = useRef(navigation);
+  useLayoutEffect(() => {
+    navigationRef.current = navigation;
+  });
+
   useEffect(() => {
     // A new load, or unmounting, aborts this one, so a late answer never replaces a newer state.
     const controller = new AbortController();
+    const { includeDeleted, listVersion } = navigationRef.current;
+    const primedList = primeListRead(client, viewId, includeDeleted, listVersion);
     setState(LOADING_STATE);
     void (async () => {
       try {
@@ -173,7 +430,7 @@ export function FormView({
         if (!controller.signal.aborted) {
           setState(
             result.ok
-              ? { status: 'loaded', viewId, definition: result.data }
+              ? { status: 'loaded', viewId, definition: result.data, primedList }
               : { status: 'failed', viewId, error: result.error },
           );
         }
@@ -188,8 +445,16 @@ export function FormView({
     })();
     return () => {
       controller.abort();
+      // A grid that took the page owns it; otherwise no grid will take it.
+      primedList.drop();
     };
   }, [client, viewId, attempt]);
+
+  // The dialogs' chunks are fetched as the form opens, after the effects above have sent its
+  // reads, so a dialog asked for once the workspace shows seldom waits for its chunk.
+  useEffect(() => {
+    prefetchDialogs();
+  }, []);
 
   // Retry removes its own button and the toolbar while the definition reloads, which would
   // drop focus to the page body. The status line stays one element from failure to loading
@@ -201,12 +466,16 @@ export function FormView({
   // its own title when a form opens.
   const retriedRef = useRef(false);
 
+  // N and the first record were requested beside the failed definition, so Retry requests
+  // them again with it, as it requests the grid's first page; every one is a GET.
+  const { retryLoad } = navigation;
   const reload = useCallback(() => {
     statusRef.current?.focus();
     retriedRef.current = true;
     setState(LOADING_STATE);
     setAttempt((previous) => previous + 1);
-  }, []);
+    void retryLoad();
+  }, [retryLoad]);
 
   // A state left from another form, in the render before the load effect resets it, is
   // still loading for this one.
@@ -248,8 +517,9 @@ export function FormView({
           client={client}
           viewId={current.viewId}
           definition={current.definition}
-          initialPosition={initialPosition}
-          initialPositionText={initialPositionText}
+          navigation={navigation}
+          beforeLeaveRef={beforeLeaveRef}
+          primedList={current.primedList}
           initialIncludeDeleted={initialIncludeDeleted}
           headingRef={headingRef}
           onExit={onExit}
@@ -323,8 +593,13 @@ interface FormWorkspaceProps {
   readonly viewId: number;
   /** Kept as loaded while the form is open: the editor starts a new field-event queue for a new object. */
   readonly definition: FormDefinition;
-  readonly initialPosition: number | undefined;
-  readonly initialPositionText: string | undefined;
+  /** The form's navigation, started by FormView with the definition load. */
+  readonly navigation: RecordNavigation;
+  /** Navigation's beforeLeave, which the workspace sets to its own while it is mounted. */
+  readonly beforeLeaveRef: MutableRefObject<() => Promise<boolean>>;
+  /** The grid's first page, requested beside the definition. */
+  readonly primedList: PrimedListRead;
+  /** The deleted toggle the form opened with, which the shell's URL already shows. */
   readonly initialIncludeDeleted: boolean | undefined;
   /**
    * The form's heading, which FormView focuses once a retried definition load succeeds,
@@ -693,19 +968,24 @@ function useBannerFocusReturn(targetRef: RefObject<HTMLElement>): (action: () =>
 
 /**
  * Reports each change of the navigator's position or of its deleted toggle, with both, so
- * a toggle that leaves n as it was is reported too. The pair the workspace mounts with
- * (`null` until the first record opens) is not a change and is not reported.
+ * a toggle that leaves n as it was is reported too. Changes count from the pair the shell
+ * shows as the form opens: no position yet, and `openedIncludeDeleted`, the toggle it opened
+ * with. A record navigation opened before the workspace mounted is reported as it mounts.
  */
 function usePositionReport(
   n: number | null,
   includeDeleted: boolean,
   report: ((n: number | null, includeDeleted: boolean) => void) | undefined,
+  openedIncludeDeleted: boolean,
 ): void {
   const reportRef = useRef(report);
   useLayoutEffect(() => {
     reportRef.current = report;
   });
-  const reportedRef = useRef({ n, includeDeleted });
+  const reportedRef = useRef<{ readonly n: number | null; readonly includeDeleted: boolean }>({
+    n: null,
+    includeDeleted: openedIncludeDeleted,
+  });
   useEffect(() => {
     const reported = reportedRef.current;
     if (n !== reported.n || includeDeleted !== reported.includeDeleted) {
@@ -854,17 +1134,18 @@ function FormWorkspace({
   client,
   viewId,
   definition,
-  initialPosition,
-  initialPositionText,
+  navigation,
+  beforeLeaveRef,
+  primedList,
   initialIncludeDeleted,
   headingRef,
   onExit,
   onFormNotFound,
   onPositionChange,
 }: FormWorkspaceProps) {
-  // The navigator awaits the editor's leave() before each move, while the editor needs the
-  // navigator's record and callbacks; the ref breaks that cycle. Until the editor's leave
-  // is installed nothing is open, so there is nothing to save.
+  // The navigator awaits the editor's leave() before each move (beforeLeave, below), while
+  // the editor needs the navigator's record and callbacks; the ref breaks that cycle. No
+  // move runs before the editor's leave is installed: nothing is on screen to start one.
   const leaveRef = useRef<() => Promise<boolean>>(() => Promise.resolve(true));
 
   // Outcomes of the user's actions. The summary and the form-gone banner take focus (both
@@ -874,7 +1155,7 @@ function FormWorkspace({
   const formGoneRef = useRef<HTMLDivElement>(null);
   const focusOutcome = useOutcomeFocus({ heading: headingRef, summary: summaryRef, formGone: formGoneRef });
   // The record generation on screen, for a refusal reported after the render that started it.
-  const generationRef = useRef(0);
+  const generationRef = useRef(navigation.recordGeneration);
   // The action a failed save stopped, while the field errors that stopped it are shown on
   // the record it was stopped on. `attempt` grows with every stopped action, so a repeated
   // one is announced again.
@@ -907,27 +1188,28 @@ function FormWorkspace({
 
   // Successful saves of this workspace, counted so Back to forms can tell whether its leave saved.
   const savesRef = useRef(0);
-  const navigation = useRecordNavigation({
-    client,
-    viewId,
-    initialPosition,
-    initialPositionText,
-    initialIncludeDeleted,
-    beforeLeave: () => {
-      const attempt: ActionAttempt = attemptRef.current ?? {
-        action: { kind: 'leave' },
-        origin: document.activeElement,
-      };
-      attemptRef.current = null;
-      return leaveRef.current().then((left) => {
-        attempt.onLeave?.(left);
-        if (!left) {
-          noteBlocked(attempt);
-        }
-        return left;
-      });
-    },
-  });
+  // Navigation's beforeLeave while the workspace is mounted: the editor's leave(), reported
+  // as the action that asked for it.
+  const beforeLeave = useCallback((): Promise<boolean> => {
+    const attempt: ActionAttempt = attemptRef.current ?? {
+      action: { kind: 'leave' },
+      origin: document.activeElement,
+    };
+    attemptRef.current = null;
+    return leaveRef.current().then((left) => {
+      attempt.onLeave?.(left);
+      if (!left) {
+        noteBlocked(attempt);
+      }
+      return left;
+    });
+  }, [noteBlocked]);
+  useLayoutEffect(() => {
+    beforeLeaveRef.current = beforeLeave;
+    return () => {
+      beforeLeaveRef.current = leaveNothing;
+    };
+  }, [beforeLeaveRef, beforeLeave]);
   useLayoutEffect(() => {
     generationRef.current = navigation.recordGeneration;
   });
@@ -982,7 +1264,7 @@ function FormWorkspace({
   // The browser's leave prompt for a dirty draft is registered by useRecordEditor itself,
   // so none is registered here: two listeners would prompt twice.
 
-  usePositionReport(navigation.n, navigation.includeDeleted, onPositionChange);
+  usePositionReport(navigation.n, navigation.includeDeleted, onPositionChange, initialIncludeDeleted === true);
 
   const { selectedPageId, selectPage, selectField } = usePageSelection(definition);
 
@@ -996,6 +1278,10 @@ function FormWorkspace({
   // Find closes as a result is chosen, and keeps its results until the record on screen has
   // been left for it: an open refused because the draft could not be saved finds them again.
   const [keepFindResults, setKeepFindResults] = useState(false);
+  const modals = useWorkspaceModals(editor.deleteDialogOpen, findOpen, editor.dialogs.length > 0);
+  // The toolbar's Delete and Find, which open the toolbar dialogs.
+  const deleteButtonRef = useRef<HTMLButtonElement>(null);
+  const findButtonRef = useRef<HTMLButtonElement>(null);
 
   // One form-not-found path for every 404 that means the form itself is gone: the count's,
   // the grid's list and Find's search. It closes Find. A clean draft hands over to the
@@ -1221,10 +1507,30 @@ function FormWorkspace({
   // discards it, which leaves Delete disabled on the empty draft, so the dialog would fall back
   // to the toolbar's first button, Back to forms, where a keyboard user's next Enter would leave
   // the form: the heading takes focus instead, as it does after a confirmed delete's 204.
-  const { requestDelete, confirmDelete } = editor;
+  //
+  // One modal flow at a time: while a modal is shown or its chunk is on its way, Delete and
+  // Find open nothing, as the inert page behind it would refuse their press. A toolbar dialog
+  // still asked for whose chunk could not be fetched blocks nothing and gives way to the other.
+  const { requestDelete, confirmDelete, cancelDelete } = editor;
   const openDeleteDialog = (): void => {
+    if (modals.occupied) {
+      return;
+    }
+    if (findOpen) {
+      // Closed as its Close button would close it.
+      setFindOpen(false);
+      setKeepFindResults(false);
+    }
     deleteFocusRef.current = null;
     requestDelete();
+  };
+  const openFind = (): void => {
+    if (modals.occupied) {
+      return;
+    }
+    // Sends no request: cancelling the confirmation keeps the draft.
+    cancelDelete();
+    setFindOpen(true);
   };
   const confirmDeleteDialog = (): Promise<void> => {
     if (navigation.isNew) {
@@ -1262,7 +1568,9 @@ function FormWorkspace({
             });
           }}
           onDelete={openDeleteDialog}
-          onFind={() => setFindOpen(true)}
+          onFind={openFind}
+          deleteButtonRef={deleteButtonRef}
+          findButtonRef={findButtonRef}
         />
 
         <RecordNavigator navigation={navigatorActions} busy={busy} blocked={movesBlocked} canInsert={canInsert} />
@@ -1284,6 +1592,20 @@ function FormWorkspace({
         onDiscardFormGone={() => runBannerAction(() => setDiscardChosen(true))}
         editorBanner={editor.banner}
         bannerHandlers={bannerHandlers}
+        dialogsFailed={modals.failed}
+        onRetryDialogs={() => {
+          // A toolbar dialog opened by Retry takes its own toolbar button as its opener, as a
+          // press of that button would, so its close returns focus there. A button that refuses
+          // focus leaves it on Retry, which hands it on to the heading as the banner goes.
+          const opener =
+            modals.failedToolbarDialog === 'delete'
+              ? deleteButtonRef.current
+              : modals.failedToolbarDialog === 'find'
+                ? findButtonRef.current
+                : null;
+          opener?.focus();
+          runBannerAction(() => modals.retry());
+        }}
         eventNotices={editor.eventNotices}
         eventNoticeRef={eventNoticeRef}
       />
@@ -1316,9 +1638,11 @@ function FormWorkspace({
         onOpen={openFromGrid}
         onFormNotFound={handleGridFormNotFound}
         disabled={busy}
+        primedFirstPage={primedList}
       />
 
       <WorkspaceDialogs
+        modals={modals}
         client={client}
         viewId={viewId}
         definition={definition}
@@ -1382,6 +1706,10 @@ interface WorkspaceToolbarProps {
   readonly onSave: () => void;
   readonly onDelete: () => void;
   readonly onFind: () => void;
+  /** Set on Delete, which a delete confirmation opened by Retry takes as its opener. */
+  readonly deleteButtonRef: RefObject<HTMLButtonElement>;
+  /** Set on Find, which a Find opened by Retry takes as its opener. */
+  readonly findButtonRef: RefObject<HTMLButtonElement>;
 }
 
 /** The form's actions, Back to forms, Save, Delete and Find, under the names the smoke test matches. */
@@ -1397,6 +1725,8 @@ function WorkspaceToolbar({
   onSave,
   onDelete,
   onFind,
+  deleteButtonRef,
+  findButtonRef,
 }: WorkspaceToolbarProps) {
   let statusText = '';
   if (saving) {
@@ -1426,10 +1756,10 @@ function WorkspaceToolbar({
       >
         {SAVE}
       </button>
-      <button type="button" disabled={deleteDisabled} onClick={() => onDelete()}>
+      <button ref={deleteButtonRef} type="button" disabled={deleteDisabled} onClick={() => onDelete()}>
         {DELETE}
       </button>
-      <button type="button" onClick={() => onFind()}>
+      <button ref={findButtonRef} type="button" onClick={() => onFind()}>
         {FIND}
       </button>
       {/* Always rendered, so the status text is announced when it appears; it tells a save
@@ -1464,6 +1794,10 @@ interface WorkspaceNoticesProps {
   readonly editorBanner: EditorBanner | null;
   /** The editor banner's actions. */
   readonly bannerHandlers: EditorBannerHandlers;
+  /** A dialog asked for could not be opened: its chunk could not be fetched. */
+  readonly dialogsFailed: boolean;
+  /** Fetches again each chunk asked for that could not be fetched; its dialog opens once it arrives. */
+  readonly onRetryDialogs: () => void;
   /** The non-blocking notices of the fields whose field events could not be evaluated. */
   readonly eventNotices: readonly string[];
   /** Set on the field-event notice while it is shown, whose block size the sticky parts below it clear. */
@@ -1472,7 +1806,7 @@ interface WorkspaceNoticesProps {
 
 /**
  * The workspace's banners, in order: deleted record, navigation notice, failed load, form
- * gone, failed write, field event.
+ * gone, failed write, dialog that could not be fetched, field event.
  */
 function WorkspaceNotices({
   recordDeleted,
@@ -1486,6 +1820,8 @@ function WorkspaceNotices({
   onDiscardFormGone,
   editorBanner,
   bannerHandlers,
+  dialogsFailed,
+  onRetryDialogs,
   eventNotices,
   eventNoticeRef,
 }: WorkspaceNoticesProps) {
@@ -1526,6 +1862,10 @@ function WorkspaceNotices({
       {/* Keyed by the banner object, so a banner shown again remounts and is announced again. */}
       {editorBanner !== null && (
         <EditorBannerView key={bannerKeyOf(editorBanner)} banner={editorBanner} handlers={bannerHandlers} />
+      )}
+
+      {dialogsFailed && (
+        <ConnectionError error={networkError()} method="GET" message={DIALOG_FAILED_TEXT} onRetry={onRetryDialogs} />
       )}
 
       {/* Raised by work on a field, which may sit far below; it sticks to the top of the
@@ -1606,6 +1946,8 @@ function useHeldWhilePointerPressed<T>(latest: T): T {
 }
 
 interface WorkspaceDialogsProps {
+  /** Which modals show, and the dialogs whose chunks have been fetched. */
+  readonly modals: WorkspaceModals;
   readonly client: ApiClient;
   readonly viewId: number;
   readonly definition: FormDefinition;
@@ -1633,8 +1975,13 @@ interface WorkspaceDialogsProps {
   readonly onFindFormNotFound: () => void;
 }
 
-/** The workspace's modals: delete confirmation, check-code messages and Find. */
+/**
+ * The workspace's modals: delete confirmation, check-code messages and Find. A dialog renders
+ * once its chunk is fetched, and Find stays mounted while closed, keeping its picked fields. A
+ * modal that shows while its chunk is still being fetched is a placeholder in its place.
+ */
 function WorkspaceDialogs({
+  modals,
   client,
   viewId,
   definition,
@@ -1654,32 +2001,251 @@ function WorkspaceDialogs({
   onFindClose,
   onFindFormNotFound,
 }: WorkspaceDialogsProps) {
+  const { toolbarDialog, messagesShown } = modals;
+  const Confirm = modals.confirm.component;
+  const Message = modals.message.component;
+  const Find = modals.find.component;
+  const toolbarChunk = toolbarDialog === 'delete' ? modals.confirm : modals.find;
   return (
     <>
-      <ConfirmDialog
-        open={deleteDialogOpen}
-        busy={busy}
-        isNew={isNew}
-        returnFocusRef={deleteFocusRef}
-        onConfirm={onConfirmDelete}
-        onCancel={onCancelDelete}
-      />
+      {Confirm !== null && (
+        <Confirm
+          open={deleteDialogOpen && toolbarDialog === 'delete'}
+          busy={busy}
+          isNew={isNew}
+          returnFocusRef={deleteFocusRef}
+          onConfirm={onConfirmDelete}
+          onCancel={onCancelDelete}
+        />
+      )}
 
-      <MessageDialog dialogs={dialogs} onDismiss={onDismissDialog} />
+      {Message !== null && <Message dialogs={messagesShown ? dialogs : NO_DIALOGS} onDismiss={onDismissDialog} />}
 
-      <FindRecordDialog
-        open={findOpen}
-        client={client}
-        viewId={viewId}
-        definition={definition}
-        includeDeleted={includeDeleted}
-        openRecordId={isNew ? null : openRecordId}
-        onOpen={onFindResult}
-        onClose={onFindClose}
-        onFormNotFound={onFindFormNotFound}
-        keepResults={keepFindResults}
-      />
+      {Find !== null && (
+        <Find
+          open={findOpen && toolbarDialog === 'find'}
+          client={client}
+          viewId={viewId}
+          definition={definition}
+          includeDeleted={includeDeleted}
+          openRecordId={isNew ? null : openRecordId}
+          onOpen={onFindResult}
+          onClose={onFindClose}
+          onFormNotFound={onFindFormNotFound}
+          keepResults={keepFindResults}
+        />
+      )}
+
+      {/* Keyed by the dialog it stands for, so each open records its own opener. */}
+      {toolbarDialog !== null && toolbarChunk.status === 'pending' && (
+        <PendingDialog key={toolbarDialog} onCancel={toolbarDialog === 'delete' ? onCancelDelete : onFindClose} />
+      )}
+
+      {/* Messages keep their queue until their dialog shows them, so nothing here dismisses one. */}
+      {messagesShown && modals.message.status === 'pending' && <PendingDialog />}
     </>
+  );
+}
+
+/** No check-code message: what the message dialog gets while the messages wait for another modal. */
+const NO_DIALOGS: readonly DialogMessage[] = [];
+
+const OPENING_TEXT = 'Opening…';
+const CANCEL = 'Cancel';
+const MODAL_SELECTOR = '[aria-modal="true"]';
+
+/** Whether the element is, or contains, a modal dialog. */
+function holdsModal(element: Element): boolean {
+  return element.matches(MODAL_SELECTOR) || element.querySelector(MODAL_SELECTOR) !== null;
+}
+
+/**
+ * The placeholder's keys: Escape cancels the open it stands for, when it can be cancelled,
+ * and Tab and Shift+Tab keep focus inside. Returns whether the key was handled.
+ */
+function handlePendingDialogKey(event: KeyboardEvent, focusInside: () => void, cancel: (() => void) | undefined): boolean {
+  if (event.key === 'Escape') {
+    event.preventDefault();
+    cancel?.();
+    return true;
+  }
+  if (event.key === 'Tab') {
+    event.preventDefault();
+    focusInside();
+    return true;
+  }
+  return false;
+}
+
+interface PendingDialogProps {
+  /** Cancels the open the placeholder stands for; absent for check-code messages, which wait to be shown. */
+  readonly onCancel?: () => void;
+}
+
+/**
+ * A modal whose chunk is still being fetched: "Opening…" in the dialogs' own backdrop and
+ * box, which holds the page exactly as the modal will. Like ConfirmDialog it is a plain
+ * role="dialog" element rendered into <body>: the rest of <body>, content added while it is
+ * open included, is made inert, focus that lands outside is pulled back to Cancel (or to the
+ * placeholder itself when there is no Cancel), Tab stays inside, and Escape or Cancel cancels
+ * the open. A newer modal dialog owns focus and keys while it is open.
+ *
+ * On unmount, whether cancelled or replaced by the dialog it stood for, it releases what it
+ * made inert and returns focus to the element focused at open when focus would otherwise be
+ * lost. Passive effect cleanups run before the next commit's effects, so the dialog mounted
+ * in its place takes that element as its own opener and returns focus there when it closes.
+ */
+function PendingDialog({ onCancel }: PendingDialogProps) {
+  const labelId = useId();
+  const backdropRef = useRef<HTMLDivElement>(null);
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const cancelRef = useRef<HTMLButtonElement>(null);
+
+  // The document listeners live for the placeholder's life and read the latest callback here.
+  const onCancelRef = useRef(onCancel);
+  useLayoutEffect(() => {
+    onCancelRef.current = onCancel;
+  });
+
+  useEffect(() => {
+    const backdrop = backdropRef.current;
+    const dialog = dialogRef.current;
+    if (backdrop === null || dialog === null) {
+      return undefined;
+    }
+
+    const active = document.activeElement;
+    const opener =
+      active instanceof HTMLElement &&
+      active !== document.body &&
+      active !== document.documentElement &&
+      !backdrop.contains(active)
+        ? active
+        : null;
+
+    const focusInside = (): void => {
+      (cancelRef.current ?? dialog).focus();
+    };
+    // Focus moves in before the page is made inert, so the page's blur names it as the related target.
+    focusInside();
+
+    // Only the elements made inert here are released on unmount, so one that was already
+    // inert stays inert. A newer modal dialog added to <body> isolates the page itself.
+    const madeInert: Element[] = [];
+    const makeInert = (element: Element): void => {
+      element.setAttribute('inert', '');
+      madeInert.push(element);
+    };
+    for (const child of document.body.children) {
+      if (child !== backdrop && !child.hasAttribute('inert')) {
+        makeInert(child);
+      }
+    }
+    const observer = new MutationObserver((records) => {
+      for (const record of records) {
+        for (const node of record.addedNodes) {
+          if (
+            node instanceof Element &&
+            node.parentNode === document.body &&
+            node !== backdrop &&
+            !node.hasAttribute('inert') &&
+            !holdsModal(node)
+          ) {
+            makeInert(node);
+          }
+        }
+      }
+    });
+    observer.observe(document.body, { childList: true });
+
+    const isOutside = (target: EventTarget | null): boolean => !(target instanceof Node && dialog.contains(target));
+    // A newer modal dialog owns focus and keys while it is open: while it has made this
+    // placeholder inert, and for events inside it.
+    const yieldsTo = (target: EventTarget | null): boolean => {
+      if (backdrop.closest('[inert]') !== null) {
+        return true;
+      }
+      const modal = target instanceof Element ? target.closest(MODAL_SELECTOR) : null;
+      return modal !== null && modal !== dialog;
+    };
+
+    const handleFocusIn = (event: FocusEvent): void => {
+      if (isOutside(event.target) && !yieldsTo(event.target)) {
+        focusInside();
+      }
+    };
+    // Keys pressed inside the placeholder are handled by its own onKeyDown.
+    const handleDocumentKeyDown = (event: KeyboardEvent): void => {
+      if (isOutside(event.target) && !yieldsTo(event.target)) {
+        handlePendingDialogKey(event, focusInside, onCancelRef.current);
+      }
+    };
+
+    document.addEventListener('focusin', handleFocusIn);
+    document.addEventListener('keydown', handleDocumentKeyDown);
+
+    return () => {
+      observer.disconnect();
+      document.removeEventListener('focusin', handleFocusIn);
+      document.removeEventListener('keydown', handleDocumentKeyDown);
+      // Inert elements cannot take focus, so they are released before focus returns.
+      for (const element of madeInert) {
+        element.removeAttribute('inert');
+      }
+      // Focus returns only when it has nowhere else to be: it was inside the placeholder, or
+      // on <body> once the placeholder left the page.
+      const focused = document.activeElement;
+      if (
+        opener !== null &&
+        opener.isConnected &&
+        (focused === null ||
+          focused === document.body ||
+          focused === document.documentElement ||
+          backdrop.contains(focused))
+      ) {
+        opener.focus();
+      }
+    };
+  }, []);
+
+  const handleKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>): void => {
+    const focusInside = (): void => {
+      (cancelRef.current ?? dialogRef.current)?.focus();
+    };
+    if (handlePendingDialogKey(event.nativeEvent, focusInside, onCancel)) {
+      event.stopPropagation();
+    }
+  };
+
+  // A press on the backdrop cancels nothing; preventing its default also keeps focus inside
+  // the placeholder instead of moving it to the page.
+  const handleBackdropMouseDown = (event: ReactMouseEvent<HTMLDivElement>): void => {
+    if (event.target === event.currentTarget) {
+      event.preventDefault();
+    }
+  };
+
+  return createPortal(
+    <div ref={backdropRef} className="dialog-backdrop" onMouseDown={handleBackdropMouseDown}>
+      <div
+        ref={dialogRef}
+        className="dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-busy="true"
+        aria-labelledby={labelId}
+        tabIndex={-1}
+        onKeyDown={handleKeyDown}
+      >
+        <p id={labelId}>{OPENING_TEXT}</p>
+        {onCancel !== undefined && (
+          <button ref={cancelRef} type="button" onClick={() => onCancel()}>
+            {CANCEL}
+          </button>
+        )}
+      </div>
+    </div>,
+    document.body,
   );
 }
 

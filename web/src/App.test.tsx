@@ -12,10 +12,11 @@
 // is answered 404 and fails the test, so opening a form from the URL is also shown to send
 // GETs only and to raise no field event (DATA-01).
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import App from './App';
 import { createApiClient, type ApiClient } from './api/client';
+import { FormsList } from './components/FormsList';
 import type {
   FormDefinition,
   FormSummary,
@@ -499,7 +500,16 @@ describe('App URL parameters', () => {
       await expectOpenRecord(3);
       await expectUrlSearch('?view=CaseReport&record=3');
 
-      expect(requestedPaths()).toContain(`GET ${FORM_PATH}/records/at/${String(at)}`);
+      // N and at/{at} are read together. Its 404 runs the 404 recovery, which reloads the
+      // grid, reads N again and opens at/{min(at, N)}.
+      const recordReads = requestedPaths().filter((path) => /\/records\/(count|at\/\d+)$/.test(path));
+      expect(recordReads.slice(0, 2).sort()).toEqual(
+        [`GET ${FORM_PATH}/records/count`, `GET ${FORM_PATH}/records/at/${String(at)}`].sort(),
+      );
+      expect(recordReads.slice(2)).toEqual([`GET ${FORM_PATH}/records/count`, `GET ${FORM_PATH}/records/at/3`]);
+      await waitFor(() => {
+        expect(requestedPaths().filter((path) => path === `GET ${FORM_PATH}/records`)).toHaveLength(2);
+      });
       await findNavigationNotice(
         `This record no longer exists. There is no record ${record}; showing the last record, 3.`,
       );
@@ -742,6 +752,97 @@ describe('App return to the forms list', () => {
     await expectOpenRecord(1);
     expect(region.textContent).toBe('');
     expect(region.className).toBe('visually-hidden');
+  });
+});
+
+// The form screen is a chunk of its own: the forms list asks for it ahead of an open, and an
+// open whose chunk cannot be fetched shows the failed load, with Retry and Back to forms.
+describe('App form screen chunk', () => {
+  it('previews a form to the shell when its button is hovered, focused or pressed, and opens it on a click', async () => {
+    window.history.replaceState(null, '', '/');
+    const onPreview = vi.fn<(form: FormSummary) => void>();
+    const onOpen = vi.fn<(form: FormSummary) => void>();
+    render(
+      <FormsList client={createApiClient({ baseUrl: API_ORIGIN, fetch: fakeFetch })} onOpen={onOpen} onPreview={onPreview} />,
+    );
+    const button = await screen.findByRole('button', { name: 'CaseReport — 2 pages' });
+
+    fireEvent.pointerEnter(button);
+    fireEvent.focus(button);
+    fireEvent.pointerDown(button);
+
+    expect(onPreview.mock.calls).toEqual([[FORMS[0]], [FORMS[0]], [FORMS[0]]]);
+    expect(onOpen).not.toHaveBeenCalled();
+    fireEvent.click(button);
+    expect(onOpen.mock.calls).toEqual([[FORMS[0]]]);
+    // A preview asks the API for nothing.
+    expect(requests.map((request) => request.line)).toEqual(['GET /api/forms']);
+  });
+
+  it('shows an open whose form screen cannot be fetched as a failed load, and Retry fetches it again', async () => {
+    window.history.replaceState(null, '', '/');
+    // A fresh shell, whose form screen chunk has not been fetched yet, and whose fetch fails
+    // until the case lets it through.
+    let fetchFails = true;
+    vi.resetModules();
+    vi.doMock('./components/FormView', async (importOriginal) => {
+      if (fetchFails) {
+        throw new TypeError('Failed to fetch dynamically imported module');
+      }
+      return importOriginal<typeof import('./components/FormView')>();
+    });
+    try {
+      const { default: FreshApp } = await import('./App');
+      render(<FreshApp client={createApiClient({ baseUrl: API_ORIGIN, fetch: fakeFetch })} />);
+
+      fireEvent.click(await screen.findByRole('button', { name: 'CaseReport — 2 pages' }));
+
+      const alert = await screen.findByRole('alert');
+      expect(within(alert).getByText('The server could not be reached.')).toBeDefined();
+      expect(screen.getByText('The form could not be loaded.')).toBeDefined();
+      const formActions = screen.getByRole('toolbar', { name: 'Form actions' });
+      expect(within(formActions).getAllByRole('button').map((button) => button.textContent)).toEqual(['Back to forms']);
+      // The chunk is not the API's: the open asked the API for nothing yet.
+      expect(requests.map((request) => request.line)).toEqual(['GET /api/forms']);
+
+      fetchFails = false;
+      fireEvent.click(within(alert).getByRole('button', { name: 'Retry' }));
+
+      // Retry hands focus to the title, which stays as the form replaces the status.
+      expect(document.activeElement).toBe(screen.getByRole('heading', { level: 1 }));
+      await expectOpenRecord(1);
+      expect(screen.queryByText('The form could not be loaded.')).toBeNull();
+      expectReadsOnly();
+    } finally {
+      vi.doUnmock('./components/FormView');
+      vi.resetModules();
+    }
+  });
+
+  it('goes back to the forms list from an open whose form screen cannot be fetched', async () => {
+    window.history.replaceState(null, '', '/');
+    vi.resetModules();
+    vi.doMock('./components/FormView', () => {
+      throw new TypeError('Failed to fetch dynamically imported module');
+    });
+    try {
+      const { default: FreshApp } = await import('./App');
+      render(<FreshApp client={createApiClient({ baseUrl: API_ORIGIN, fetch: fakeFetch })} />);
+      fireEvent.click(await screen.findByRole('button', { name: 'CaseReport — 2 pages' }));
+      await screen.findByText('The form could not be loaded.');
+
+      fireEvent.click(
+        within(screen.getByRole('toolbar', { name: 'Form actions' })).getByRole('button', { name: 'Back to forms' }),
+      );
+
+      expect(await screen.findByRole('button', { name: 'CaseReport — 2 pages' })).toBeDefined();
+      expect(document.activeElement).toBe(screen.getByRole('heading', { level: 1 }));
+      await expectUrlSearch('');
+      expect(requests.map((request) => request.line)).toEqual(['GET /api/forms', 'GET /api/forms']);
+    } finally {
+      vi.doUnmock('./components/FormView');
+      vi.resetModules();
+    }
   });
 });
 
