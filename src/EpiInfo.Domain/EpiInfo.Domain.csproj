@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Foundation library of the web data-entry server. It references no project and no package:
+    the CheckCode, Data and Api projects depend on it, never the other way round.
+    Target framework, nullable settings and implicit usings come from src/Directory.Build.props.
+  -->
+  <PropertyGroup>
+    <RootNamespace>EpiInfo.Domain</RootNamespace>
+    <AssemblyName>EpiInfo.Domain</AssemblyName>
+  </PropertyGroup>
+
+</Project>

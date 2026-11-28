@@ -1,0 +1,42 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <RootNamespace>EpiInfo.Api</RootNamespace>
+    <AssemblyName>EpiInfo.Api</AssemblyName>
+    <!--
+      Ordinary builds never rewrite the committed openapi/EpiInfo.Api.json. The generation scripts in web/scripts
+      pass OpenApiGenerateDocumentsOnBuild=true and OpenApiDocumentsDirectory=<temp dir> as global properties.
+    -->
+    <OpenApiGenerateDocumentsOnBuild>false</OpenApiGenerateDocumentsOnBuild>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\EpiInfo.Domain\EpiInfo.Domain.csproj" />
+    <ProjectReference Include="..\EpiInfo.CheckCode\EpiInfo.CheckCode.csproj" />
+    <ProjectReference Include="..\EpiInfo.Data\EpiInfo.Data.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.AspNetCore.OpenApi" />
+    <PackageReference Include="Microsoft.Extensions.ApiDescription.Server">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="EpiInfo.Api.Tests" />
+  </ItemGroup>
+
+  <!--
+    The committed OpenAPI document is a build input for the web client, not application content: keep it out of the
+    Web SDK's **/*.json Content glob so it is neither copied to build or publish output nor read as configuration.
+    The glob is limited to *.json because openapi/ and the OpenApi/ transformer sources share one folder on
+    case-insensitive file systems.
+  -->
+  <ItemGroup>
+    <Content Remove="openapi\**\*.json" />
+    <None Include="openapi\**\*.json" />
+  </ItemGroup>
+
+</Project>

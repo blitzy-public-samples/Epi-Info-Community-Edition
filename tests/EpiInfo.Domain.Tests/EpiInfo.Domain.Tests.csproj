@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Database-free unit tests of the Domain library.
+    Target framework, nullable settings, implicit usings, test-project flags and the global
+    Xunit using come from tests/Directory.Build.props; package versions come from the root
+    Directory.Packages.props, so the references below carry none.
+  -->
+
+  <ItemGroup>
+    <ProjectReference Include="../../src/EpiInfo.Domain/EpiInfo.Domain.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" />
+    <PackageReference Include="xunit" />
+    <PackageReference Include="xunit.runner.visualstudio">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,1973 @@
+{
+  "openapi": "3.1.1",
+  "info": {
+    "title": "EpiInfo.Api | v1",
+    "description": "The API is for local single-user use. Every request on every path, the /api operations, /health, this document and the client included, must carry a Host naming 127.0.0.1 or localhost, in any letter case and with any port. A request with any other Host is answered before routing with the request-level 400, an application/problem+json ProblemDetails whose detail is \"the request host is not allowed\". That response applies to every operation and is not repeated under each one.",
+    "version": "1.0.0"
+  },
+  "paths": {
+    "/api/forms/{viewId}/checkcode/field-event": {
+      "post": {
+        "tags": [
+          "CheckCode"
+        ],
+        "summary": "Runs one check-code field event on the posted values. Stateless; nothing is written.",
+        "operationId": "RunFieldEvent",
+        "parameters": [
+          {
+            "name": "viewId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int32"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FieldEventRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FieldEventResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ProblemDetails"
+                    },
+                    {
+                      "$ref": "#/components/schemas/HttpValidationProblemDetails"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not Found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Payload Too Large",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Unsupported Media Type",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal Server Error",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Service Unavailable",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/health": {
+      "get": {
+        "tags": [
+          "Health"
+        ],
+        "operationId": "GetHealth",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/HealthResponse"
+                    },
+                    {
+                      "required": [
+                        "status"
+                      ],
+                      "type": "object",
+                      "properties": {
+                        "status": {
+                          "enum": [
+                            "healthy"
+                          ],
+                          "type": "string"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Service Unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/HealthResponse"
+                    },
+                    {
+                      "required": [
+                        "status"
+                      ],
+                      "type": "object",
+                      "properties": {
+                        "status": {
+                          "enum": [
+                            "unhealthy"
+                          ],
+                          "type": "string"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/forms": {
+      "get": {
+        "tags": [
+          "Forms"
+        ],
+        "summary": "List the forms of the connected project.",
+        "operationId": "ListForms",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/FormSummary"
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal Server Error",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Service Unavailable",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/forms/{viewId}": {
+      "get": {
+        "tags": [
+          "Forms"
+        ],
+        "summary": "Get a form's definition: its pages, their fields and the unsupported check code.",
+        "operationId": "GetFormDefinition",
+        "parameters": [
+          {
+            "name": "viewId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int32"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FormDefinition"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not Found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal Server Error",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Service Unavailable",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/forms/{viewId}/records": {
+      "get": {
+        "tags": [
+          "Records"
+        ],
+        "summary": "List one page of a form's records, optionally filtered by the grid columns.",
+        "operationId": "ListRecords",
+        "parameters": [
+          {
+            "name": "viewId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int32"
+            }
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "includeDeleted",
+            "in": "query",
+            "schema": {
+              "type": "boolean",
+              "default": false
+            }
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "schema": {
+              "minimum": 1,
+              "type": "integer",
+              "format": "int32",
+              "default": 1
+            }
+          },
+          {
+            "name": "pageSize",
+            "in": "query",
+            "schema": {
+              "maximum": 200,
+              "minimum": 1,
+              "type": "integer",
+              "format": "int32",
+              "default": 50
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecordPage"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HttpValidationProblemDetails"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not Found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal Server Error",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Service Unavailable",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Records"
+        ],
+        "summary": "Create a record from the submitted field values.",
+        "operationId": "CreateRecord",
+        "parameters": [
+          {
+            "name": "viewId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int32"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RecordWriteRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Created",
+            "headers": {
+              "Location": {
+                "description": "The relative URI of the created record, /api/forms/{viewId}/records/{globalRecordId}, with the id percent-encoded.",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "format": "uri-reference"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecordDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ProblemDetails"
+                    },
+                    {
+                      "$ref": "#/components/schemas/HttpValidationProblemDetails"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not Found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Payload Too Large",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Unsupported Media Type",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal Server Error",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WriteProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Service Unavailable",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WriteProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/forms/{viewId}/records/count": {
+      "get": {
+        "tags": [
+          "Records"
+        ],
+        "summary": "Count the records of the selected set.",
+        "operationId": "CountRecords",
+        "parameters": [
+          {
+            "name": "viewId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int32"
+            }
+          },
+          {
+            "name": "includeDeleted",
+            "in": "query",
+            "schema": {
+              "type": "boolean",
+              "default": false
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecordCountResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HttpValidationProblemDetails"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not Found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal Server Error",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Service Unavailable",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/forms/{viewId}/records/at/{position}": {
+      "get": {
+        "tags": [
+          "Records"
+        ],
+        "summary": "Open the record at a 1-based position of the selected set, in UniqueKey order.",
+        "operationId": "GetRecordAt",
+        "parameters": [
+          {
+            "name": "viewId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int32"
+            }
+          },
+          {
+            "name": "position",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "minimum": 1,
+              "type": "integer",
+              "format": "int32"
+            }
+          },
+          {
+            "name": "includeDeleted",
+            "in": "query",
+            "schema": {
+              "type": "boolean",
+              "default": false
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecordDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HttpValidationProblemDetails"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not Found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal Server Error",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Service Unavailable",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/forms/{viewId}/records/{globalRecordId}": {
+      "get": {
+        "tags": [
+          "Records"
+        ],
+        "summary": "Open a record by its GlobalRecordId; deleted records are returned.",
+        "operationId": "GetRecord",
+        "parameters": [
+          {
+            "name": "viewId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int32"
+            }
+          },
+          {
+            "name": "globalRecordId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecordDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not Found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal Server Error",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Service Unavailable",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "Records"
+        ],
+        "summary": "Update a record with the submitted field values; absent fields are unchanged.",
+        "operationId": "UpdateRecord",
+        "parameters": [
+          {
+            "name": "viewId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int32"
+            }
+          },
+          {
+            "name": "globalRecordId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RecordWriteRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecordDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ProblemDetails"
+                    },
+                    {
+                      "$ref": "#/components/schemas/HttpValidationProblemDetails"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not Found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Conflict",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Payload Too Large",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Unsupported Media Type",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal Server Error",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WriteProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Service Unavailable",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WriteProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Records"
+        ],
+        "summary": "Soft-delete a record: its base row's RECSTATUS becomes 0. Repeating it changes nothing.",
+        "operationId": "DeleteRecord",
+        "parameters": [
+          {
+            "name": "viewId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int32"
+            }
+          },
+          {
+            "name": "globalRecordId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "No Content"
+          },
+          "404": {
+            "description": "Not Found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal Server Error",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WriteProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Service Unavailable",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WriteProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/forms/{viewId}/records/{globalRecordId}/position": {
+      "get": {
+        "tags": [
+          "Records"
+        ],
+        "summary": "Place a record in the selected set; position is null when the record is outside it.",
+        "operationId": "GetRecordPosition",
+        "parameters": [
+          {
+            "name": "viewId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int32"
+            }
+          },
+          {
+            "name": "globalRecordId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "includeDeleted",
+            "in": "query",
+            "schema": {
+              "type": "boolean",
+              "default": false
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NavigationPosition"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HttpValidationProblemDetails"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not Found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal Server Error",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Service Unavailable",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/forms/{viewId}/records/search": {
+      "post": {
+        "tags": [
+          "Records"
+        ],
+        "summary": "Find records with the legacy Find criteria syntax.",
+        "operationId": "SearchRecords",
+        "parameters": [
+          {
+            "name": "viewId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int32"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SearchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SearchResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ProblemDetails"
+                    },
+                    {
+                      "$ref": "#/components/schemas/HttpValidationProblemDetails"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not Found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Payload Too Large",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Unsupported Media Type",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal Server Error",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Service Unavailable",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "Diagnostic": {
+        "required": [
+          "command",
+          "form",
+          "line",
+          "message",
+          "severity"
+        ],
+        "type": "object",
+        "properties": {
+          "severity": {
+            "$ref": "#/components/schemas/DiagnosticSeverity"
+          },
+          "form": {
+            "type": "string"
+          },
+          "line": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "command": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          }
+        }
+      },
+      "DiagnosticSeverity": {
+        "enum": [
+          "info",
+          "warning",
+          "error"
+        ],
+        "type": "string"
+      },
+      "DialogMessage": {
+        "required": [
+          "message",
+          "title"
+        ],
+        "type": "object",
+        "properties": {
+          "message": {
+            "type": "string"
+          },
+          "title": {
+            "type": [
+              "null",
+              "string"
+            ]
+          }
+        }
+      },
+      "FieldDefinition": {
+        "required": [
+          "fieldType",
+          "members",
+          "name",
+          "options",
+          "pageId",
+          "prompt",
+          "tabIndex",
+          "unsupported",
+          "unsupportedType",
+          "validation"
+        ],
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "fieldType": {
+            "$ref": "#/components/schemas/FieldType"
+          },
+          "prompt": {
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "tabIndex": {
+            "type": "number",
+            "format": "double"
+          },
+          "pageId": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "unsupported": {
+            "type": "boolean"
+          },
+          "unsupportedType": {
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "validation": {
+            "$ref": "#/components/schemas/FieldValidation"
+          },
+          "options": {
+            "type": [
+              "null",
+              "array"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/FieldOption"
+            }
+          },
+          "members": {
+            "type": [
+              "null",
+              "array"
+            ],
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "FieldEventRequest": {
+        "required": [
+          "event",
+          "fieldName",
+          "values"
+        ],
+        "type": "object",
+        "properties": {
+          "event": {
+            "enum": [
+              "FieldBefore",
+              "FieldAfter",
+              "FieldClick"
+            ],
+            "type": "string"
+          },
+          "fieldName": {
+            "type": "string"
+          },
+          "values": {
+            "type": "object",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/FieldValue"
+            }
+          }
+        }
+      },
+      "FieldEventResponse": {
+        "required": [
+          "assigned",
+          "cleared",
+          "diagnostics",
+          "dialogs",
+          "disabled",
+          "enabled"
+        ],
+        "type": "object",
+        "properties": {
+          "enabled": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "disabled": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "cleared": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "assigned": {
+            "type": "object",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/FieldValue"
+            }
+          },
+          "dialogs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DialogMessage"
+            }
+          },
+          "diagnostics": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Diagnostic"
+            }
+          }
+        }
+      },
+      "FieldOption": {
+        "required": [
+          "label",
+          "value"
+        ],
+        "type": "object",
+        "properties": {
+          "value": {
+            "oneOf": [
+              {
+                "minimum": 0,
+                "type": "integer",
+                "format": "int32"
+              },
+              {
+                "type": "string"
+              }
+            ]
+          },
+          "label": {
+            "type": "string"
+          }
+        }
+      },
+      "FieldType": {
+        "enum": [
+          "label",
+          "group",
+          "text",
+          "multiline",
+          "number",
+          "date",
+          "checkbox",
+          "option",
+          "legalValues",
+          "unsupported"
+        ],
+        "type": "string"
+      },
+      "FieldValidation": {
+        "required": [
+          "lower",
+          "maxLength",
+          "pattern",
+          "readOnly",
+          "required",
+          "upper"
+        ],
+        "type": "object",
+        "properties": {
+          "required": {
+            "type": "boolean"
+          },
+          "readOnly": {
+            "type": "boolean"
+          },
+          "maxLength": {
+            "type": [
+              "null",
+              "integer"
+            ],
+            "format": "int32"
+          },
+          "lower": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "string",
+                "format": "date"
+              }
+            ]
+          },
+          "upper": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "string",
+                "format": "date"
+              }
+            ]
+          },
+          "pattern": {
+            "type": [
+              "null",
+              "string"
+            ]
+          }
+        }
+      },
+      "FieldValue": {
+        "type": [
+          "null",
+          "boolean",
+          "number",
+          "string"
+        ]
+      },
+      "FormDefinition": {
+        "required": [
+          "canDelete",
+          "canInsert",
+          "canUpdate",
+          "name",
+          "pages",
+          "unsupportedCheckCode",
+          "viewId"
+        ],
+        "type": "object",
+        "properties": {
+          "viewId": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "name": {
+            "type": "string"
+          },
+          "pages": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PageDefinition"
+            }
+          },
+          "unsupportedCheckCode": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Diagnostic"
+            }
+          },
+          "canInsert": {
+            "type": [
+              "null",
+              "boolean"
+            ]
+          },
+          "canUpdate": {
+            "type": [
+              "null",
+              "boolean"
+            ]
+          },
+          "canDelete": {
+            "type": [
+              "null",
+              "boolean"
+            ]
+          }
+        }
+      },
+      "FormSummary": {
+        "required": [
+          "name",
+          "pageCount",
+          "viewId"
+        ],
+        "type": "object",
+        "properties": {
+          "viewId": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "name": {
+            "type": "string"
+          },
+          "pageCount": {
+            "type": "integer",
+            "format": "int32"
+          }
+        }
+      },
+      "HealthResponse": {
+        "required": [
+          "status"
+        ],
+        "type": "object",
+        "properties": {
+          "status": {
+            "enum": [
+              "healthy",
+              "unhealthy"
+            ],
+            "type": "string"
+          }
+        }
+      },
+      "HttpValidationProblemDetails": {
+        "required": [
+          "detail",
+          "errors",
+          "status",
+          "title",
+          "traceId",
+          "type"
+        ],
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "status": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "detail": {
+            "type": "string"
+          },
+          "instance": {
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "errors": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "traceId": {
+            "type": "string"
+          }
+        }
+      },
+      "NavigationPosition": {
+        "required": [
+          "count",
+          "position"
+        ],
+        "type": "object",
+        "properties": {
+          "position": {
+            "type": [
+              "null",
+              "integer"
+            ],
+            "format": "int32"
+          },
+          "count": {
+            "type": "integer",
+            "format": "int32"
+          }
+        }
+      },
+      "PageDefinition": {
+        "required": [
+          "fields",
+          "name",
+          "pageId",
+          "position"
+        ],
+        "type": "object",
+        "properties": {
+          "pageId": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "name": {
+            "type": "string"
+          },
+          "position": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "fields": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FieldDefinition"
+            }
+          }
+        }
+      },
+      "ProblemDetails": {
+        "required": [
+          "detail",
+          "status",
+          "title",
+          "traceId",
+          "type"
+        ],
+        "type": "object",
+        "not": {
+          "required": [
+            "errors"
+          ]
+        },
+        "properties": {
+          "type": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "status": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "detail": {
+            "type": "string"
+          },
+          "instance": {
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "traceId": {
+            "type": "string"
+          }
+        }
+      },
+      "RecordCountResponse": {
+        "required": [
+          "count"
+        ],
+        "type": "object",
+        "properties": {
+          "count": {
+            "type": "integer",
+            "format": "int32"
+          }
+        }
+      },
+      "RecordDto": {
+        "required": [
+          "count",
+          "globalRecordId",
+          "position",
+          "recStatus",
+          "uniqueKey",
+          "values"
+        ],
+        "type": "object",
+        "properties": {
+          "globalRecordId": {
+            "type": "string"
+          },
+          "uniqueKey": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "recStatus": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "position": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "count": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "values": {
+            "type": "object",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/FieldValue"
+            }
+          }
+        }
+      },
+      "RecordPage": {
+        "required": [
+          "items",
+          "page",
+          "pageSize",
+          "total"
+        ],
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RecordSummary"
+            }
+          },
+          "total": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "page": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "pageSize": {
+            "type": "integer",
+            "format": "int32"
+          }
+        }
+      },
+      "RecordSummary": {
+        "required": [
+          "globalRecordId",
+          "recStatus",
+          "uniqueKey",
+          "values"
+        ],
+        "type": "object",
+        "properties": {
+          "globalRecordId": {
+            "type": "string"
+          },
+          "uniqueKey": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "recStatus": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "values": {
+            "type": "object",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/FieldValue"
+            }
+          }
+        }
+      },
+      "RecordWriteRequest": {
+        "required": [
+          "values"
+        ],
+        "type": "object",
+        "properties": {
+          "values": {
+            "type": "object",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/FieldValue"
+            }
+          }
+        }
+      },
+      "SearchCriterion": {
+        "required": [
+          "field",
+          "value"
+        ],
+        "type": "object",
+        "properties": {
+          "field": {
+            "type": "string"
+          },
+          "value": {
+            "$ref": "#/components/schemas/FieldValue"
+          }
+        }
+      },
+      "SearchRequest": {
+        "required": [
+          "criteria"
+        ],
+        "type": "object",
+        "properties": {
+          "criteria": {
+            "maxItems": 6,
+            "minItems": 1,
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SearchCriterion"
+            }
+          },
+          "includeDeleted": {
+            "type": [
+              "null",
+              "boolean"
+            ]
+          },
+          "excludeGlobalRecordId": {
+            "type": [
+              "null",
+              "string"
+            ]
+          }
+        }
+      },
+      "SearchResponse": {
+        "required": [
+          "items",
+          "total",
+          "truncated"
+        ],
+        "type": "object",
+        "properties": {
+          "items": {
+            "maxItems": 200,
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SearchResult"
+            }
+          },
+          "total": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "truncated": {
+            "type": "boolean"
+          }
+        }
+      },
+      "SearchResult": {
+        "required": [
+          "globalRecordId",
+          "position",
+          "recStatus",
+          "uniqueKey",
+          "values"
+        ],
+        "type": "object",
+        "properties": {
+          "globalRecordId": {
+            "type": "string"
+          },
+          "uniqueKey": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "recStatus": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "position": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "values": {
+            "type": "object",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/FieldValue"
+            }
+          }
+        }
+      },
+      "WriteProblemDetails": {
+        "required": [
+          "detail",
+          "status",
+          "title",
+          "traceId",
+          "type",
+          "writeOutcome"
+        ],
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "status": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "detail": {
+            "type": "string"
+          },
+          "instance": {
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "writeOutcome": {
+            "enum": [
+              "notWritten",
+              "unknown",
+              "written"
+            ],
+            "type": "string"
+          },
+          "traceId": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "CheckCode"
+    },
+    {
+      "name": "Health"
+    },
+    {
+      "name": "Forms"
+    },
+    {
+      "name": "Records"
+    }
+  ]
+}

@@ -1,0 +1,1806 @@
+using System.Data;
+using System.Globalization;
+using System.Net;
+using System.Net.Http.Headers;
+using System.Text.Json;
+using EpiInfo.Api.Errors;
+using EpiInfo.Api.Tests.Infrastructure;
+using EpiInfo.Domain.Metadata;
+using EpiInfo.Domain.Records;
+using EpiInfo.Domain.Storage;
+using EpiInfo.Domain.Validation;
+using EpiInfo.Domain.Values;
+using EpiInfo.Tests.Shared;
+using Microsoft.AspNetCore.Http;
+using Microsoft.Data.SqlClient;
+
+namespace EpiInfo.Api.Tests.Records;
+
+/// <summary>
+/// The write-permission rule of the record endpoints and of the form-definition flags: which of <c>POST</c>,
+/// <c>PUT</c> and <c>DELETE</c> a login's per-table INSERT and UPDATE permissions allow, the 403 ProblemDetails a denied
+/// write returns, and that a denied write changes nothing.
+/// </summary>
+/// <remarks>
+/// The class needs no database, so it carries no <c>Integration</c> trait. Each case hosts the API's own composition
+/// root, <c>Program.cs</c>, through an <see cref="ApiFactory"/> on TestServer whose store is a
+/// <see cref="FakeDataStore"/> holding <see cref="FakeForms.TwoPage"/>, or <see cref="FakeForms.WithRequiredField"/>
+/// for the case that orders the required gate before the missing-page check, with synthetic per-table permissions.
+/// Every request therefore travels the production pipeline, its error handling, guards, routing, JSON binding, the
+/// endpoint handler, the service and result execution, and every assertion reads the status, headers and body the
+/// client receives. A real denied database principal is not created, because the database's logins and users stay
+/// unchanged; <see cref="WritePermissionSqlTests"/> proves on the database where the SQL Server store reads the
+/// permissions it re-checks inside an insert, an update and a soft delete.
+/// </remarks>
+public sealed class PermissionTests
+{
+    // Text fields of the two-page form: one on its first page and one on its second.
+    private const string FirstPageField = "LastName";
+
+    private const string SecondPageField = "Notes";
+
+    private const string SeededText = "Seeded";
+
+    // The optional text field beside the required one on FakeForms.WithRequiredField's only page.
+    private const string OptionalField = "Comment";
+
+    /// <summary>
+    /// The entry a data table gets in a <see cref="FormPermissions"/>; <see cref="Missing"/> leaves the table without
+    /// one.
+    /// </summary>
+    public enum Grant
+    {
+        /// <summary>No entry for the table.</summary>
+        Missing,
+
+        /// <summary>Neither INSERT nor UPDATE.</summary>
+        Neither,
+
+        /// <summary>INSERT without UPDATE.</summary>
+        InsertOnly,
+
+        /// <summary>UPDATE without INSERT.</summary>
+        UpdateOnly,
+
+        /// <summary>INSERT and UPDATE.</summary>
+        Both,
+    }
+
+    /// <summary>One of the three record writes.</summary>
+    public enum Write
+    {
+        /// <summary><c>POST /api/forms/{viewId}/records</c>.</summary>
+        Post,
+
+        /// <summary><c>PUT /api/forms/{viewId}/records/{globalRecordId}</c>.</summary>
+        Put,
+
+        /// <summary><c>DELETE /api/forms/{viewId}/records/{globalRecordId}</c>.</summary>
+        Delete,
+    }
+
+    /// <summary>One of the three data tables of the form.</summary>
+    public enum Table
+    {
+        /// <summary>The base table.</summary>
+        Base,
+
+        /// <summary>The first page's table.</summary>
+        FirstPage,
+
+        /// <summary>The second page's table.</summary>
+        SecondPage,
+    }
+
+    /// <summary>
+    /// The entry a <see cref="FormPermissions.ResolvedTableNames"/> case adds for the base table beside the one the map
+    /// leads the base table's name to.
+    /// </summary>
+    public enum Conflict
+    {
+        /// <summary>No further entry.</summary>
+        None,
+
+        /// <summary>An entry spelled exactly as the form's metadata spells the base table.</summary>
+        ExactlySpelledEntry,
+
+        /// <summary>A second entry with the spelling the map leads the base table's name to.</summary>
+        DuplicateEntry,
+    }
+
+    /// <summary>
+    /// The grants of the base table, the first page table and the second page table, then the <c>canInsert</c>,
+    /// <c>canUpdate</c> and <c>canDelete</c> the rule derives from them: INSERT on every table, UPDATE on every table,
+    /// and UPDATE on the base table.
+    /// </summary>
+    public static TheoryData<Grant, Grant, Grant, bool, bool, bool> DerivedFlagCases => new()
+    {
+        // Everything granted: every write succeeds.
+        { Grant.Both, Grant.Both, Grant.Both, true, true, true },
+
+        // Base UPDATE granted and one page's UPDATE denied: PUT is refused while DELETE still succeeds.
+        { Grant.Both, Grant.Both, Grant.InsertOnly, true, false, true },
+
+        // INSERT denied on any one table refuses POST.
+        { Grant.UpdateOnly, Grant.Both, Grant.Both, false, true, true },
+        { Grant.Both, Grant.UpdateOnly, Grant.Both, false, true, true },
+        { Grant.Both, Grant.Both, Grant.UpdateOnly, false, true, true },
+
+        // INSERT and UPDATE both denied on a page whose row exists: page UPDATE is checked even when INSERT is denied,
+        // so PUT is refused.
+        { Grant.Both, Grant.Both, Grant.Neither, false, false, true },
+
+        // A table without an entry denies both permissions on it.
+        { Grant.Missing, Grant.Both, Grant.Both, false, false, false },
+        { Grant.Both, Grant.Missing, Grant.Both, false, false, true },
+        { Grant.Both, Grant.Both, Grant.Missing, false, false, true },
+
+        // Base UPDATE denied with every page fully granted: PUT and DELETE are refused while POST succeeds.
+        { Grant.InsertOnly, Grant.Both, Grant.Both, true, false, false },
+        { Grant.Neither, Grant.Both, Grant.Both, false, false, false },
+    };
+
+    // The form-definition flags and each write agree with the rule: an allowed write commits, and a denied one is the
+    // action's 403 with no store write, no new record and the targeted record unchanged. A denied PUT or DELETE is
+    // refused before the store's locked read, so neither the update nor the soft delete reaches the store.
+    [Theory]
+    [MemberData(nameof(DerivedFlagCases))]
+    public async Task EachWriteFollowsTheFlagThePermissionsDerive(
+        Grant baseTable,
+        Grant firstPage,
+        Grant secondPage,
+        bool canInsert,
+        bool canUpdate,
+        bool canDelete)
+    {
+        await using var harness = await Harness.StartAsync();
+        var updateTarget = harness.SeedRecord();
+        var deleteTarget = harness.SeedRecord();
+        harness.SetPermissions(harness.Permissions(baseTable, firstPage, secondPage));
+
+        AssertFlags(await harness.GetDefinitionAsync(), canInsert, canUpdate, canDelete);
+
+        var recordsBefore = harness.RecordCount;
+        var created = await harness.PostAsync(FirstPageField, "Created");
+        if (canInsert)
+        {
+            AssertCreated(harness, created, FirstPageField, "Created", recordsBefore);
+        }
+        else
+        {
+            AssertForbidden(created, ApiProblems.ForbiddenInsertDetail);
+            Assert.Equal(recordsBefore, harness.RecordCount);
+        }
+
+        var beforeUpdate = harness.Snapshot(updateTarget);
+        var updated = await harness.PutAsync(updateTarget, FirstPageField, "Updated");
+        if (canUpdate)
+        {
+            AssertUpdated(harness, updated, updateTarget, FirstPageField, "Updated");
+        }
+        else
+        {
+            AssertForbidden(updated, ApiProblems.ForbiddenUpdateDetail);
+            Assert.DoesNotContain(updated.Calls, call => call.Method == nameof(IDataStore.UpdateAsync));
+            AssertUnchanged(beforeUpdate, harness.Snapshot(updateTarget));
+        }
+
+        var beforeDelete = harness.Snapshot(deleteTarget);
+        var deleted = await harness.DeleteAsync(deleteTarget);
+        if (canDelete)
+        {
+            AssertDeleted(harness, deleted, deleteTarget);
+        }
+        else
+        {
+            AssertForbidden(deleted, ApiProblems.ForbiddenDeleteDetail);
+            Assert.DoesNotContain(deleted.Calls, call => call.Method == nameof(IDataStore.SoftDeleteAsync));
+            var afterDelete = harness.Snapshot(deleteTarget);
+            Assert.Equal(RecordQueryRules.ActiveRecStatus, afterDelete.RecStatus);
+            Assert.Equal(beforeDelete.LastSave, afterDelete.LastSave);
+            AssertUnchanged(beforeDelete, afterDelete);
+        }
+    }
+
+    // UPDATE is granted on every table and INSERT on every table but the second page, whose row one record lacks. A
+    // PUT on that record needs INSERT on the missing page whichever page the submitted field is on, so it is refused
+    // after the store's locked read with nothing written. The same PUT on a record holding every page row is saved,
+    // and once INSERT on the page is granted the record lacking the row is saved too.
+    [Theory]
+    [InlineData(SecondPageField, true)]
+    [InlineData(FirstPageField, false)]
+    public async Task UpdateNeedsInsertOnEveryPageWhoseRowIsMissing(string field, bool fieldIsOnMissingPage)
+    {
+        await using var harness = await Harness.StartAsync();
+        var missingPage = harness.SecondPage;
+        Assert.Equal(fieldIsOnMissingPage, harness.PageOf(field).PageId == missingPage.PageId);
+
+        var lacking = harness.SeedRecord(missingPage);
+        var complete = harness.SeedRecord();
+        harness.SetPermissions(harness.Permissions(Grant.Both, Grant.Both, Grant.UpdateOnly));
+
+        AssertFlags(await harness.GetDefinitionAsync(), canInsert: false, canUpdate: true, canDelete: true);
+
+        var before = harness.Snapshot(lacking);
+        Assert.DoesNotContain(missingPage.PageId, before.PresentPageIds);
+        var denied = await harness.PutAsync(lacking, field, "Denied");
+        AssertForbidden(denied, ApiProblems.ForbiddenUpdateDetail);
+        Assert.Contains(new FakeStoreCall(nameof(IDataStore.UpdateAsync), IsWrite: false), denied.Calls);
+        AssertUnchanged(before, harness.Snapshot(lacking));
+
+        var saved = await harness.PutAsync(complete, field, "Saved");
+        AssertUpdated(harness, saved, complete, field, "Saved");
+
+        harness.SetPermissions(harness.AllGranted);
+        var granted = await harness.PutAsync(lacking, field, "Granted");
+        AssertUpdated(harness, granted, lacking, field, "Granted");
+    }
+
+    // On a one-page form whose only page row a record lacks, with UPDATE everywhere and INSERT denied on that page, the
+    // store's required gate runs before its missing-page INSERT check: a PUT that leaves the required field empty is
+    // the gate's 400, and one that fills it passes the gate and is the 403, each after the store's locked read with
+    // nothing written. Once INSERT on the page is granted, the same PUT saves and inserts the page row.
+    [Fact]
+    public async Task UpdateRunsTheRequiredGateBeforeTheMissingPageInsertCheck()
+    {
+        var form = FakeForms.WithRequiredField;
+        var store = new FakeDataStore(form);
+        await using var factory = new ApiFactory(ApiFactoryOptions.ForFake(store));
+        using var client = factory.CreateClient();
+
+        var metadata = form.Metadata;
+        var page = Assert.Single(metadata.Pages);
+        Assert.Equal(page.PageId, metadata.FindField(FakeForms.RequiredFieldName)?.PageId);
+        Assert.Equal(page.PageId, metadata.FindField(OptionalField)?.PageId);
+
+        var lacking = store.SeedRecord(FakeForms.RequiredViewId, missingPageIds: [page.PageId]);
+        var path = string.Create(
+            CultureInfo.InvariantCulture,
+            $"/api/forms/{FakeForms.RequiredViewId}/records/{Uri.EscapeDataString(lacking)}");
+        store.SetPermissions(FakeForms.RequiredViewId, OnePagePermissions(metadata, pageInsert: false));
+        var before = OnePageSnapshot(store, lacking);
+        Assert.DoesNotContain(page.PageId, before.PresentPageIds);
+
+        var incomplete = await ExchangeAsync(
+            store,
+            () => ApiTestClient.PutJsonAsync(client, path, OnePageBody(surname: null, "Incomplete")));
+        AssertRequiredFieldMissing(incomplete);
+        Assert.Contains(new FakeStoreCall(nameof(IDataStore.UpdateAsync), IsWrite: false), incomplete.Calls);
+        AssertUnchanged(before, OnePageSnapshot(store, lacking));
+
+        var denied = await ExchangeAsync(
+            store,
+            () => ApiTestClient.PutJsonAsync(client, path, OnePageBody("Filled", "Denied")));
+        AssertForbidden(denied, ApiProblems.ForbiddenUpdateDetail);
+        Assert.Contains(new FakeStoreCall(nameof(IDataStore.UpdateAsync), IsWrite: false), denied.Calls);
+        AssertUnchanged(before, OnePageSnapshot(store, lacking));
+
+        store.SetPermissions(FakeForms.RequiredViewId, OnePagePermissions(metadata, pageInsert: true));
+        var granted = await ExchangeAsync(
+            store,
+            () => ApiTestClient.PutJsonAsync(client, path, OnePageBody("Filled", "Granted")));
+        Assert.Equal(StatusCodes.Status200OK, granted.Status);
+        Assert.Equal([new FakeStoreCall(nameof(IDataStore.UpdateAsync), IsWrite: true)], granted.Writes);
+        var after = OnePageSnapshot(store, lacking);
+        Assert.Contains(page.PageId, after.PresentPageIds);
+        Assert.Equal("Filled", after.Values[FakeForms.RequiredFieldName].AsText());
+        Assert.Equal("Granted", after.Values[OptionalField].AsText());
+        Assert.NotNull(after.LastSave);
+    }
+
+    // UPDATE and INSERT on the base table, UPDATE on the one page table, and INSERT on it only when pageInsert is set.
+    private static FormPermissions OnePagePermissions(FormMetadata form, bool pageInsert) => new(
+    [
+        new TablePermission(form.BaseTableName, CanInsert: true, CanUpdate: true),
+        new TablePermission(form.Pages[0].TableName, CanInsert: pageInsert, CanUpdate: true),
+    ]);
+
+    // The PUT body of FakeForms.WithRequiredField: the optional field, and the required field unless surname is null.
+    private static object OnePageBody(string? surname, string comment)
+    {
+        var values = new Dictionary<string, string> { [OptionalField] = comment };
+        if (surname is not null)
+        {
+            values[FakeForms.RequiredFieldName] = surname;
+        }
+
+        return new { values };
+    }
+
+    private static FakeRecordState OnePageSnapshot(FakeDataStore store, string globalRecordId)
+    {
+        var state = store.GetRecord(FakeForms.RequiredViewId, globalRecordId);
+        Assert.NotNull(state);
+        return state;
+    }
+
+    // The required gate's field-level 400: a validation ProblemDetails whose errors hold only the required field, with
+    // its FIELD_IS_REQUIRED_LONG message, and no data-changing store call.
+    private static void AssertRequiredFieldMissing(Response response)
+    {
+        Assert.Equal(StatusCodes.Status400BadRequest, response.Status);
+        Assert.NotNull(response.ContentType);
+        Assert.Equal(ApiProblems.ProblemContentType, MediaTypeHeaderValue.Parse(response.ContentType).MediaType);
+
+        var body = ApiTestClient.AssertProblemDetails(Body(response), StatusCodes.Status400BadRequest);
+        Assert.Equal(ApiProblems.ValidationFailedDetail, body.GetProperty("detail").GetString());
+        var entry = Assert.Single(body.GetProperty("errors").EnumerateObject());
+        Assert.Equal(FakeForms.RequiredFieldName, entry.Name);
+        var message = Assert.Single(entry.Value.EnumerateArray());
+        Assert.Equal(
+            ValidationMessages.FormatFieldIsRequired(FakeForms.RequiredFieldPrompt, FakeForms.RequiredFieldPageName),
+            message.GetString());
+
+        Assert.Empty(response.Writes);
+    }
+
+    // Permissions are read on every write and never cached: on one store behind one host, a write that was allowed is
+    // refused once the permission it needs is revoked, with nothing written, and allowed again once the permission is
+    // restored. Each write reads the permissions exactly once.
+    [Theory]
+    [InlineData(Write.Post)]
+    [InlineData(Write.Put)]
+    [InlineData(Write.Delete)]
+    public async Task EachWriteReadsThePermissionsAgain(Write write)
+    {
+        await using var harness = await Harness.StartAsync();
+        var granted = harness.AllGranted;
+        var revoked = write switch
+        {
+            // INSERT revoked on the second page.
+            Write.Post => harness.Permissions(Grant.Both, Grant.Both, Grant.UpdateOnly),
+
+            // UPDATE revoked on the second page.
+            Write.Put => harness.Permissions(Grant.Both, Grant.Both, Grant.InsertOnly),
+
+            // UPDATE revoked on the base table.
+            Write.Delete => harness.Permissions(Grant.InsertOnly, Grant.Both, Grant.Both),
+
+            _ => throw new ArgumentOutOfRangeException(nameof(write)),
+        };
+
+        var first = harness.SeedRecord();
+        var second = harness.SeedRecord();
+
+        harness.SetPermissions(granted);
+        var recordsBefore = harness.RecordCount;
+        var allowed = await harness.SendAsync(write, first, "First");
+        AssertSucceeded(harness, write, allowed, first, "First", recordsBefore);
+
+        // A soft-deleted record stays deleted, so the later DELETEs target the record still active.
+        var target = write == Write.Delete ? second : first;
+        harness.SetPermissions(revoked);
+        recordsBefore = harness.RecordCount;
+        var before = harness.Snapshot(target);
+        var denied = await harness.SendAsync(write, target, "Second");
+        AssertForbidden(denied, ForbiddenDetail(write));
+        Assert.Equal(recordsBefore, harness.RecordCount);
+        AssertUnchanged(before, harness.Snapshot(target));
+
+        harness.SetPermissions(granted);
+        var restored = await harness.SendAsync(write, target, "Third");
+        AssertSucceeded(harness, write, restored, target, "Third", recordsBefore);
+
+        foreach (var response in new[] { allowed, denied, restored })
+        {
+            Assert.Single(response.Calls, call => call.Method == nameof(IDataStore.GetPermissionsAsync));
+        }
+    }
+
+    // A store that reports no permissions means no check: the flags are null and every write proceeds, including a
+    // PUT that inserts a missing page row.
+    [Fact]
+    public async Task NoReportedPermissionsMeansNoCheck()
+    {
+        await using var harness = await Harness.StartAsync();
+        var lacking = harness.SeedRecord(harness.SecondPage);
+        var doomed = harness.SeedRecord();
+        harness.SetPermissions(null);
+
+        AssertFlags(await harness.GetDefinitionAsync(), canInsert: null, canUpdate: null, canDelete: null);
+
+        var recordsBefore = harness.RecordCount;
+        var created = await harness.PostAsync(FirstPageField, "Created");
+        AssertCreated(harness, created, FirstPageField, "Created", recordsBefore);
+
+        var updated = await harness.PutAsync(lacking, SecondPageField, "Updated");
+        AssertUpdated(harness, updated, lacking, SecondPageField, "Updated");
+        Assert.Contains(harness.SecondPage.PageId, harness.Snapshot(lacking).PresentPageIds);
+
+        var deleted = await harness.DeleteAsync(doomed);
+        AssertDeleted(harness, deleted, doomed);
+
+        foreach (var response in new[] { created, updated, deleted })
+        {
+            Assert.Single(response.Calls, call => call.Method == nameof(IDataStore.GetPermissionsAsync));
+        }
+    }
+
+    /// <summary>The permissions the store holds for the form when a write given permissions runs.</summary>
+    public enum StoreGrants
+    {
+        /// <summary>INSERT and UPDATE on every table.</summary>
+        Every,
+
+        /// <summary>No permissions at all.</summary>
+        None,
+
+        /// <summary>Every grant but INSERT on the base table.</summary>
+        BaseInsertRevoked,
+
+        /// <summary>Every grant but UPDATE on the base table.</summary>
+        BaseUpdateRevoked,
+
+        /// <summary>Every grant but UPDATE on the first page's table, whose row the targeted record holds.</summary>
+        FirstPageUpdateRevoked,
+
+        /// <summary>Every grant but INSERT on the second page's table, whose row the targeted record lacks.</summary>
+        SecondPageInsertRevoked,
+    }
+
+    /// <summary>
+    /// A write handed to the store itself, the permissions the store holds when it runs, whether the caller's argument
+    /// grants everything rather than nothing, and whether the write commits. Each write follows its own rule: an
+    /// insert needs INSERT on every table; an update of a record lacking its second-page row needs UPDATE on every
+    /// table and INSERT on the second page's; a soft delete needs UPDATE on the base table alone.
+    /// </summary>
+    public static TheoryData<Write, StoreGrants, bool, bool> StoreDecisionCases => new()
+    {
+        // The store's own grants decide, against an argument granting nothing and against one granting everything.
+        { Write.Post, StoreGrants.Every, false, true },
+        { Write.Post, StoreGrants.None, true, false },
+        { Write.Post, StoreGrants.BaseInsertRevoked, true, false },
+        { Write.Post, StoreGrants.SecondPageInsertRevoked, true, false },
+
+        // An insert needs no UPDATE.
+        { Write.Post, StoreGrants.BaseUpdateRevoked, true, true },
+        { Write.Post, StoreGrants.FirstPageUpdateRevoked, true, true },
+
+        { Write.Put, StoreGrants.Every, false, true },
+        { Write.Put, StoreGrants.None, true, false },
+        { Write.Put, StoreGrants.BaseUpdateRevoked, true, false },
+        { Write.Put, StoreGrants.FirstPageUpdateRevoked, true, false },
+        { Write.Put, StoreGrants.SecondPageInsertRevoked, true, false },
+
+        // An update needs INSERT only on the table of a page whose row is missing.
+        { Write.Put, StoreGrants.BaseInsertRevoked, true, true },
+
+        { Write.Delete, StoreGrants.Every, false, true },
+        { Write.Delete, StoreGrants.None, true, false },
+        { Write.Delete, StoreGrants.BaseUpdateRevoked, true, false },
+
+        // A soft delete needs UPDATE on the base table alone.
+        { Write.Delete, StoreGrants.BaseInsertRevoked, true, true },
+        { Write.Delete, StoreGrants.FirstPageUpdateRevoked, true, true },
+        { Write.Delete, StoreGrants.SecondPageInsertRevoked, true, true },
+    };
+
+    // The store decides each write given permissions from the permissions it holds when the write runs, never from the
+    // caller's argument, which only turns the check on, as the SQL Server store reads them again inside each write's
+    // transaction. An argument granting nothing still commits when the store's grants allow the write, and one granting
+    // everything is refused, with no write logged, no stamp asked for, no record added and the targeted record
+    // unchanged, when the store holds no permissions or lacks one the write needs. The update and the soft delete
+    // target a record lacking its second-page row.
+    [Theory]
+    [MemberData(nameof(StoreDecisionCases))]
+    public async Task TheStoreDecidesEachWriteFromThePermissionsItHoldsWhenItRuns(
+        Write write,
+        StoreGrants held,
+        bool argumentGrantsEverything,
+        bool commits)
+    {
+        await using var harness = await Harness.StartAsync();
+        var lacking = harness.SeedRecord(harness.SecondPage);
+        harness.SetPermissions(held switch
+        {
+            StoreGrants.Every => harness.AllGranted,
+            StoreGrants.None => null,
+            StoreGrants.BaseInsertRevoked => harness.Permissions(Grant.UpdateOnly, Grant.Both, Grant.Both),
+            StoreGrants.BaseUpdateRevoked => harness.Permissions(Grant.InsertOnly, Grant.Both, Grant.Both),
+            StoreGrants.FirstPageUpdateRevoked => harness.Permissions(Grant.Both, Grant.InsertOnly, Grant.Both),
+            StoreGrants.SecondPageInsertRevoked => harness.Permissions(Grant.Both, Grant.Both, Grant.UpdateOnly),
+            _ => throw new ArgumentOutOfRangeException(nameof(held)),
+        });
+        var argument = argumentGrantsEverything ? harness.AllGranted : new FormPermissions([]);
+        var stamp = new SaveStamp("tester", new DateTime(2024, 1, 2, 3, 4, 5, DateTimeKind.Local));
+        var stampCalls = 0;
+        SaveStamp CountedStamp()
+        {
+            stampCalls++;
+            return stamp;
+        }
+
+        var values = new Dictionary<string, FieldValue> { [FirstPageField] = FieldValue.FromText("Applied") };
+        var before = harness.Snapshot(lacking);
+        var recordsBefore = harness.RecordCount;
+        var callsBefore = harness.Store.Calls.Count;
+
+        bool committed;
+        bool refused;
+        string? insertedId = null;
+        switch (write)
+        {
+            case Write.Post:
+                var inserted = await harness.Store.InsertAsync(
+                    harness.Form,
+                    values,
+                    stamp,
+                    argument,
+                    CancellationToken.None);
+                committed = inserted.Status == RecordWriteStatus.Success;
+                refused = inserted.Status == RecordWriteStatus.Forbidden && inserted.Record is null;
+                insertedId = inserted.Record?.GlobalRecordId;
+                break;
+
+            case Write.Put:
+                var updated = await harness.Store.UpdateAsync(
+                    harness.Form,
+                    lacking,
+                    values,
+                    CountedStamp,
+                    _ => RecordValidationResult.Success(new Dictionary<string, FieldValue>()),
+                    argument,
+                    CancellationToken.None);
+                committed = updated.Status == RecordWriteStatus.Success;
+                refused = updated.Status == RecordWriteStatus.Forbidden && updated.Record is null;
+                break;
+
+            case Write.Delete:
+                var deleted = await harness.Store.SoftDeleteAsync(
+                    harness.Form,
+                    lacking,
+                    CountedStamp,
+                    argument,
+                    CancellationToken.None);
+                committed = deleted.Status == SoftDeleteStatus.Deleted;
+                refused = deleted.Status == SoftDeleteStatus.Forbidden
+                    && !deleted.IsFound
+                    && deleted.GlobalRecordId is null;
+                break;
+
+            default:
+                throw new ArgumentOutOfRangeException(nameof(write));
+        }
+
+        var writes = harness.Store.Calls.Skip(callsBefore).Where(call => call.IsWrite).ToList();
+        if (!commits)
+        {
+            Assert.True(refused, "The store did not refuse the write with its forbidden result.");
+            Assert.Empty(writes);
+            Assert.Equal(0, stampCalls);
+            Assert.Equal(recordsBefore, harness.RecordCount);
+            AssertUnchanged(before, harness.Snapshot(lacking));
+            return;
+        }
+
+        Assert.True(committed, "The store did not commit the write.");
+        Assert.Equal([new FakeStoreCall(StoreMethod(write), IsWrite: true)], writes);
+        switch (write)
+        {
+            case Write.Post:
+                Assert.Equal(recordsBefore + 1, harness.RecordCount);
+                Assert.NotNull(insertedId);
+                var created = harness.Snapshot(insertedId);
+                Assert.Equal("Applied", created.Values[FirstPageField].AsText());
+                Assert.Equal(stamp, created.FirstSave);
+                AssertUnchanged(before, harness.Snapshot(lacking));
+                break;
+
+            case Write.Put:
+                var afterUpdate = harness.Snapshot(lacking);
+                Assert.Equal("Applied", afterUpdate.Values[FirstPageField].AsText());
+                Assert.Equal(stamp, afterUpdate.LastSave);
+                Assert.Equal(1, stampCalls);
+                break;
+
+            case Write.Delete:
+                var afterDelete = harness.Snapshot(lacking);
+                Assert.Equal(RecordQueryRules.DeletedRecStatus, afterDelete.RecStatus);
+                Assert.Equal(stamp, afterDelete.LastSave);
+                Assert.Equal(1, stampCalls);
+                break;
+        }
+    }
+
+    // A grant revoked between the service's own permission read and the store's transaction: the service's read grants
+    // every write, while the store holds the revoke when the write runs, as the SQL Server store's read inside the
+    // transaction sees a grant revoked after the service's read and before its own. The write is the action's 403, not
+    // a failed write: no write call, no record added and the targeted record unchanged. The service read the
+    // permissions once, and the update and the soft delete reached the store's locked read. The same write sent again
+    // is refused by the service's own read, now that it sees the revoke, so the update and the soft delete then never
+    // reach the store.
+    [Theory]
+    [InlineData(Write.Post)]
+    [InlineData(Write.Put)]
+    [InlineData(Write.Delete)]
+    public async Task AGrantRevokedAfterTheServicesReadIsRefusedByTheStore(Write write)
+    {
+        await using var harness = await Harness.StartAsync();
+        var target = harness.SeedRecord();
+        harness.SetPermissions(harness.AllGranted);
+        harness.Store.SetPermissionsAfterNextRead(harness.ViewId, write switch
+        {
+            // INSERT revoked on the second page.
+            Write.Post => harness.Permissions(Grant.Both, Grant.Both, Grant.UpdateOnly),
+
+            // UPDATE revoked on the second page.
+            Write.Put => harness.Permissions(Grant.Both, Grant.Both, Grant.InsertOnly),
+
+            // UPDATE revoked on the base table.
+            Write.Delete => harness.Permissions(Grant.InsertOnly, Grant.Both, Grant.Both),
+
+            _ => throw new ArgumentOutOfRangeException(nameof(write)),
+        });
+
+        var recordsBefore = harness.RecordCount;
+        var before = harness.Snapshot(target);
+        var refusedByStore = await harness.SendAsync(write, target, "Revoked");
+
+        AssertForbidden(refusedByStore, ForbiddenDetail(write));
+        Assert.Single(refusedByStore.Calls, call => call.Method == nameof(IDataStore.GetPermissionsAsync));
+        if (write != Write.Post)
+        {
+            Assert.Contains(new FakeStoreCall(StoreMethod(write), IsWrite: false), refusedByStore.Calls);
+        }
+
+        Assert.Equal(recordsBefore, harness.RecordCount);
+        AssertUnchanged(before, harness.Snapshot(target));
+
+        var refusedByService = await harness.SendAsync(write, target, "Again");
+        AssertForbidden(refusedByService, ForbiddenDetail(write));
+        Assert.DoesNotContain(refusedByService.Calls, call => call.Method == StoreMethod(write));
+        Assert.Equal(recordsBefore, harness.RecordCount);
+        AssertUnchanged(before, harness.Snapshot(target));
+    }
+
+    /// <summary>
+    /// A table; the grant of its entry spelled exactly as the form's metadata spells it, <see cref="Grant.Missing"/>
+    /// for none; the grant of a second entry spelled in upper case; whether that second entry is listed first; then
+    /// the <c>canInsert</c>, <c>canUpdate</c> and <c>canDelete</c> the rule derives and whether a <c>PUT</c> of the
+    /// second-page field saves on a record lacking its second-page row. The two other tables are fully granted.
+    /// </summary>
+    public static TheoryData<Table, Grant, Grant, bool, bool, bool, bool, bool> OtherLetterCaseCases => new()
+    {
+        // The base table granted exactly and denied in upper case, in either order: every write succeeds.
+        { Table.Base, Grant.Both, Grant.Neither, false, true, true, true, true },
+        { Table.Base, Grant.Both, Grant.Neither, true, true, true, true, true },
+
+        // The base table denied exactly and granted in upper case, in either order: every write is refused.
+        { Table.Base, Grant.Neither, Grant.Both, false, false, false, false, false },
+        { Table.Base, Grant.Neither, Grant.Both, true, false, false, false, false },
+
+        // INSERT granted exactly on the second page and denied in upper case: the PUT inserts the missing row.
+        { Table.SecondPage, Grant.Both, Grant.UpdateOnly, false, true, true, true, true },
+        { Table.SecondPage, Grant.Both, Grant.UpdateOnly, true, true, true, true, true },
+
+        // INSERT denied exactly on the second page and granted in upper case: the PUT is refused after the locked read.
+        { Table.SecondPage, Grant.UpdateOnly, Grant.Both, false, false, true, true, false },
+        { Table.SecondPage, Grant.UpdateOnly, Grant.Both, true, false, true, true, false },
+
+        // Only the upper-case entry: the table itself has no entry, so both permissions on it are denied.
+        { Table.Base, Grant.Missing, Grant.Both, false, false, false, false, false },
+        { Table.FirstPage, Grant.Missing, Grant.Both, false, false, false, true, false },
+        { Table.SecondPage, Grant.Missing, Grant.Both, false, false, false, true, false },
+    };
+
+    // Table names compare ordinally, so an entry spelled in another letter case names another table: whether it is
+    // listed before or after the exactly spelled entry, or is the only entry, it neither grants nor denies anything on
+    // the form's table, and the flags and every write follow the exactly spelled entry alone. That includes the INSERT
+    // the store checks after its locked read for the page whose row is missing.
+    [Theory]
+    [MemberData(nameof(OtherLetterCaseCases))]
+    public async Task AnEntryInAnotherLetterCaseNeitherGrantsNorDenies(
+        Table table,
+        Grant exact,
+        Grant upperCaseEntry,
+        bool upperCaseListedFirst,
+        bool canInsert,
+        bool canUpdate,
+        bool canDelete,
+        bool putSaves)
+    {
+        await using var harness = await Harness.StartAsync();
+        var tables = new List<(string TableName, Grant Grant)>();
+        foreach (var each in new[] { Table.Base, Table.FirstPage, Table.SecondPage })
+        {
+            var name = harness.TableName(each);
+            if (each != table)
+            {
+                tables.Add((name, Grant.Both));
+            }
+            else if (upperCaseListedFirst)
+            {
+                tables.Add((Respelled(name, upperCase: true), upperCaseEntry));
+                tables.Add((name, exact));
+            }
+            else
+            {
+                tables.Add((name, exact));
+                tables.Add((Respelled(name, upperCase: true), upperCaseEntry));
+            }
+        }
+
+        harness.SetPermissions(harness.Permissions([.. tables]));
+
+        await AssertEachWriteFollows(harness, canInsert, canUpdate, canDelete, putSaves);
+    }
+
+    /// <summary>
+    /// The grant of the second page's entry, the entry each case adds for the base table, then the <c>canInsert</c>,
+    /// <c>canUpdate</c> and <c>canDelete</c> the rule derives and whether a <c>PUT</c> of the second-page field saves
+    /// on a record lacking its second-page row.
+    /// </summary>
+    public static TheoryData<Grant, Conflict, bool, bool, bool, bool> ResolvedTableNameCases => new()
+    {
+        // Every entry granted: every write succeeds, including the PUT that inserts the missing second-page row.
+        { Grant.Both, Conflict.None, true, true, true, true },
+
+        // INSERT denied on the second page's entry: POST is refused and the PUT is refused after the locked read.
+        { Grant.UpdateOnly, Conflict.None, false, true, true, false },
+
+        // The base table's name reaches two entries that both grant: they conflict, so every write is refused.
+        { Grant.Both, Conflict.ExactlySpelledEntry, false, false, false, false },
+        { Grant.Both, Conflict.DuplicateEntry, false, false, false, false },
+    };
+
+    // A store whose entries carry another spelling of each table, as the SQL Server store's carry the catalogue's,
+    // maps each form table name to its entry through ResolvedTableNames, which resolves the name to that one entry
+    // before any decision, the missing-page INSERT check after the locked read included. A name the map leads to one
+    // entry while another entry also claims the table decides nothing, so the rule fails closed.
+    [Theory]
+    [MemberData(nameof(ResolvedTableNameCases))]
+    public async Task ResolvedTableNamesLeadEachFormNameToItsEntry(
+        Grant secondPage,
+        Conflict conflict,
+        bool canInsert,
+        bool canUpdate,
+        bool canDelete,
+        bool putSaves)
+    {
+        await using var harness = await Harness.StartAsync();
+        var baseName = harness.Form.BaseTableName;
+        var baseEntry = Respelled(baseName, upperCase: true);
+        var firstEntry = Respelled(harness.FirstPage.TableName, upperCase: false);
+        var secondEntry = Respelled(harness.SecondPage.TableName, upperCase: false);
+
+        var tables = new List<(string TableName, Grant Grant)>
+        {
+            (baseEntry, Grant.Both),
+            (firstEntry, Grant.Both),
+            (secondEntry, secondPage),
+        };
+        switch (conflict)
+        {
+            case Conflict.None:
+                break;
+
+            case Conflict.ExactlySpelledEntry:
+                tables.Add((baseName, Grant.Both));
+                break;
+
+            case Conflict.DuplicateEntry:
+                tables.Add((baseEntry, Grant.Both));
+                break;
+
+            default:
+                throw new ArgumentOutOfRangeException(nameof(conflict));
+        }
+
+        harness.SetPermissions(harness.Permissions([.. tables]) with
+        {
+            ResolvedTableNames = new Dictionary<string, string>
+            {
+                [baseName] = baseEntry,
+                [harness.FirstPage.TableName] = firstEntry,
+                [harness.SecondPage.TableName] = secondEntry,
+            },
+        });
+
+        await AssertEachWriteFollows(harness, canInsert, canUpdate, canDelete, putSaves);
+    }
+
+    // The name in upper or lower case, which must differ from it ordinally, so an entry under it is spelled
+    // differently from the form's own table name.
+    private static string Respelled(string name, bool upperCase)
+    {
+        var respelled = upperCase ? name.ToUpperInvariant() : name.ToLowerInvariant();
+        Assert.NotEqual(name, respelled, StringComparer.Ordinal);
+        return respelled;
+    }
+
+    // With the permissions already set: the form-definition flags, then a POST, a PUT of the second-page field on a
+    // record lacking its second-page row, and a DELETE, each committed when allowed and otherwise its 403 with
+    // nothing written. A PUT the flags allow can still be refused by the store after its locked read, when the missing
+    // page's INSERT is denied; one the flags deny never reaches the store's update.
+    private static async Task AssertEachWriteFollows(
+        Harness harness,
+        bool canInsert,
+        bool canUpdate,
+        bool canDelete,
+        bool putSaves)
+    {
+        var lacking = harness.SeedRecord(harness.SecondPage);
+        var doomed = harness.SeedRecord();
+
+        AssertFlags(await harness.GetDefinitionAsync(), canInsert, canUpdate, canDelete);
+
+        var recordsBefore = harness.RecordCount;
+        var created = await harness.PostAsync(FirstPageField, "Created");
+        if (canInsert)
+        {
+            AssertCreated(harness, created, FirstPageField, "Created", recordsBefore);
+        }
+        else
+        {
+            AssertForbidden(created, ApiProblems.ForbiddenInsertDetail);
+            Assert.Equal(recordsBefore, harness.RecordCount);
+        }
+
+        var beforeUpdate = harness.Snapshot(lacking);
+        Assert.DoesNotContain(harness.SecondPage.PageId, beforeUpdate.PresentPageIds);
+        var updated = await harness.PutAsync(lacking, SecondPageField, "Updated");
+        if (putSaves)
+        {
+            AssertUpdated(harness, updated, lacking, SecondPageField, "Updated");
+            Assert.Contains(harness.SecondPage.PageId, harness.Snapshot(lacking).PresentPageIds);
+        }
+        else
+        {
+            AssertForbidden(updated, ApiProblems.ForbiddenUpdateDetail);
+            if (canUpdate)
+            {
+                Assert.Contains(new FakeStoreCall(nameof(IDataStore.UpdateAsync), IsWrite: false), updated.Calls);
+            }
+            else
+            {
+                Assert.DoesNotContain(updated.Calls, call => call.Method == nameof(IDataStore.UpdateAsync));
+            }
+
+            AssertUnchanged(beforeUpdate, harness.Snapshot(lacking));
+        }
+
+        var beforeDelete = harness.Snapshot(doomed);
+        var deleted = await harness.DeleteAsync(doomed);
+        if (canDelete)
+        {
+            AssertDeleted(harness, deleted, doomed);
+        }
+        else
+        {
+            AssertForbidden(deleted, ApiProblems.ForbiddenDeleteDetail);
+            Assert.DoesNotContain(deleted.Calls, call => call.Method == nameof(IDataStore.SoftDeleteAsync));
+            AssertUnchanged(beforeDelete, harness.Snapshot(doomed));
+        }
+    }
+
+    private static string ForbiddenDetail(Write write) => write switch
+    {
+        Write.Post => ApiProblems.ForbiddenInsertDetail,
+        Write.Put => ApiProblems.ForbiddenUpdateDetail,
+        Write.Delete => ApiProblems.ForbiddenDeleteDetail,
+        _ => throw new ArgumentOutOfRangeException(nameof(write)),
+    };
+
+    // The IDataStore member that runs the write, the name the fake logs its calls under.
+    private static string StoreMethod(Write write) => write switch
+    {
+        Write.Post => nameof(IDataStore.InsertAsync),
+        Write.Put => nameof(IDataStore.UpdateAsync),
+        Write.Delete => nameof(IDataStore.SoftDeleteAsync),
+        _ => throw new ArgumentOutOfRangeException(nameof(write)),
+    };
+
+    private static void AssertFlags(Response response, bool? canInsert, bool? canUpdate, bool? canDelete)
+    {
+        Assert.Equal(StatusCodes.Status200OK, response.Status);
+        var body = Body(response);
+        Assert.Equal(canInsert, Flag(body, "canInsert"));
+        Assert.Equal(canUpdate, Flag(body, "canUpdate"));
+        Assert.Equal(canDelete, Flag(body, "canDelete"));
+    }
+
+    // A flag with no value is written as JSON null rather than omitted, so a missing member fails here.
+    private static bool? Flag(JsonElement body, string name) => body.GetProperty(name).ValueKind switch
+    {
+        JsonValueKind.True => true,
+        JsonValueKind.False => false,
+        JsonValueKind.Null => null,
+        _ => throw new InvalidOperationException("A permission flag is neither a boolean nor null."),
+    };
+
+    // A denied write is a plain ProblemDetails holding exactly type, title, status, detail and traceId, with no field
+    // errors and no write outcome, and the request made no data-changing store call.
+    private static void AssertForbidden(Response response, string detail)
+    {
+        Assert.Equal(StatusCodes.Status403Forbidden, response.Status);
+        Assert.NotNull(response.ContentType);
+        Assert.Equal(ApiProblems.ProblemContentType, MediaTypeHeaderValue.Parse(response.ContentType).MediaType);
+
+        var body = Body(response);
+        Assert.Equal(
+            ["detail", "status", "title", "traceId", "type"],
+            body.EnumerateObject().Select(member => member.Name).Order(StringComparer.Ordinal));
+        Assert.Equal("https://tools.ietf.org/html/rfc9110#section-15.5.4", body.GetProperty("type").GetString());
+        Assert.Equal("Forbidden", body.GetProperty("title").GetString());
+        Assert.Equal(StatusCodes.Status403Forbidden, body.GetProperty("status").GetInt32());
+        Assert.Equal(detail, body.GetProperty("detail").GetString());
+        Assert.False(string.IsNullOrWhiteSpace(body.GetProperty("traceId").GetString()));
+
+        Assert.Empty(response.Writes);
+    }
+
+    private static void AssertSucceeded(
+        Harness harness,
+        Write write,
+        Response response,
+        string id,
+        string text,
+        int recordsBefore)
+    {
+        switch (write)
+        {
+            case Write.Post:
+                AssertCreated(harness, response, FirstPageField, text, recordsBefore);
+                break;
+
+            case Write.Put:
+                AssertUpdated(harness, response, id, FirstPageField, text);
+                break;
+
+            case Write.Delete:
+                AssertDeleted(harness, response, id);
+                break;
+
+            default:
+                throw new ArgumentOutOfRangeException(nameof(write));
+        }
+    }
+
+    private static void AssertCreated(Harness harness, Response response, string field, string text, int recordsBefore)
+    {
+        Assert.Equal(StatusCodes.Status201Created, response.Status);
+        Assert.Equal([new FakeStoreCall(nameof(IDataStore.InsertAsync), IsWrite: true)], response.Writes);
+        Assert.Equal(recordsBefore + 1, harness.RecordCount);
+
+        var body = Body(response);
+        var id = body.GetProperty("globalRecordId").GetString();
+        Assert.NotNull(id);
+        Assert.Equal($"/api/forms/{harness.ViewId}/records/{id}", response.Location);
+        Assert.Equal(text, body.GetProperty("values").GetProperty(field).GetString());
+        Assert.Equal(text, harness.Snapshot(id).Values[field].AsText());
+    }
+
+    private static void AssertUpdated(Harness harness, Response response, string id, string field, string text)
+    {
+        Assert.Equal(StatusCodes.Status200OK, response.Status);
+        Assert.Equal([new FakeStoreCall(nameof(IDataStore.UpdateAsync), IsWrite: true)], response.Writes);
+
+        var body = Body(response);
+        Assert.Equal(id, body.GetProperty("globalRecordId").GetString());
+        Assert.Equal(text, body.GetProperty("values").GetProperty(field).GetString());
+
+        var stored = harness.Snapshot(id);
+        Assert.Equal(text, stored.Values[field].AsText());
+        Assert.NotNull(stored.LastSave);
+    }
+
+    private static void AssertDeleted(Harness harness, Response response, string id)
+    {
+        Assert.Equal(StatusCodes.Status204NoContent, response.Status);
+        Assert.Null(response.Body);
+        Assert.Equal([new FakeStoreCall(nameof(IDataStore.SoftDeleteAsync), IsWrite: true)], response.Writes);
+
+        var stored = harness.Snapshot(id);
+        Assert.Equal(RecordQueryRules.DeletedRecStatus, stored.RecStatus);
+        Assert.NotNull(stored.LastSave);
+    }
+
+    // Member by member, and the values entry by entry in storage order.
+    private static void AssertUnchanged(FakeRecordState before, FakeRecordState after)
+    {
+        Assert.Equal(before.GlobalRecordId, after.GlobalRecordId);
+        Assert.Equal(before.UniqueKey, after.UniqueKey);
+        Assert.Equal(before.RecStatus, after.RecStatus);
+        Assert.Equal(before.FirstSave, after.FirstSave);
+        Assert.Equal(before.LastSave, after.LastSave);
+        Assert.Equal(before.PresentPageIds.Order(), after.PresentPageIds.Order());
+        Assert.Equal(before.Values.Keys, after.Values.Keys);
+        foreach (var (name, value) in before.Values)
+        {
+            Assert.Equal(value, after.Values[name]);
+        }
+    }
+
+    private static JsonElement Body(Response response)
+    {
+        Assert.True(response.Body.HasValue, "The response has no JSON body.");
+        return response.Body.Value;
+    }
+
+    // Sends one request and reads its whole response before collecting the store calls made while it ran. Location is
+    // read as sent: on Unix a path beginning with '/' parses as an absolute file URI, whose original string is still
+    // the header's text.
+    private static async Task<Response> ExchangeAsync(FakeDataStore store, Func<Task<HttpResponseMessage>> send)
+    {
+        var callsBefore = store.Calls.Count;
+        using var response = await send().ConfigureAwait(false);
+        var body = await response.Content.ReadAsByteArrayAsync().ConfigureAwait(false);
+
+        JsonElement? json = null;
+        if (body.Length > 0)
+        {
+            using var document = JsonDocument.Parse(body);
+            json = document.RootElement.Clone();
+        }
+
+        return new Response(
+            (int)response.StatusCode,
+            response.Content.Headers.ContentType?.ToString(),
+            response.Headers.Location?.OriginalString,
+            json,
+            [.. store.Calls.Skip(callsBefore)]);
+    }
+
+    /// <summary>A response as the client received it, with the store calls the request made.</summary>
+    /// <param name="Status">The response status.</param>
+    /// <param name="ContentType">The response's <c>Content-Type</c>, or <see langword="null"/> for none.</param>
+    /// <param name="Location">The response's <c>Location</c>, or <see langword="null"/> for none.</param>
+    /// <param name="Body">The parsed JSON body, or <see langword="null"/> for an empty body.</param>
+    /// <param name="Calls">The store calls made while the request ran, in order.</param>
+    private sealed record Response(
+        int Status,
+        string? ContentType,
+        string? Location,
+        JsonElement? Body,
+        IReadOnlyList<FakeStoreCall> Calls)
+    {
+        /// <summary>The data-changing entries of <see cref="Calls"/>.</summary>
+        public IReadOnlyList<FakeStoreCall> Writes => [.. Calls.Where(call => call.IsWrite)];
+    }
+
+    /// <summary>
+    /// <see cref="FakeForms.TwoPage"/> in a <see cref="FakeDataStore"/>, behind a started <see cref="ApiFactory"/>
+    /// host of the API, and the client that sends requests to it.
+    /// </summary>
+    private sealed class Harness : IAsyncDisposable
+    {
+        private readonly ApiFactory factory;
+
+        private readonly HttpClient client;
+
+        private Harness(FormMetadata form, FakeDataStore store, ApiFactory factory, HttpClient client)
+        {
+            Form = form;
+            Store = store;
+            this.factory = factory;
+            this.client = client;
+
+            // The cases rely on one text field on each page, read from the metadata rather than assumed.
+            Assert.Equal(2, Form.Pages.Count);
+            Assert.Equal(FirstPage.PageId, PageOf(FirstPageField).PageId);
+            Assert.Equal(SecondPage.PageId, PageOf(SecondPageField).PageId);
+        }
+
+        public FormMetadata Form { get; }
+
+        public FakeDataStore Store { get; }
+
+        public int ViewId => Form.ViewId;
+
+        public PageMetadata FirstPage => Form.Pages[0];
+
+        public PageMetadata SecondPage => Form.Pages[1];
+
+        public int RecordCount => Store.GetRecords(ViewId).Count;
+
+        public FormPermissions AllGranted => Permissions(Grant.Both, Grant.Both, Grant.Both);
+
+        // The factory replaces only the store, the clock, the SQL observer and the check-code engine, so every other
+        // registration and the whole pipeline are production's; the store being in memory, no connection is made. The
+        // first client starts the host. A host that fails to start, or whose form lacks the fields the cases rely on,
+        // is disposed before the failure propagates.
+        public static async Task<Harness> StartAsync()
+        {
+            var form = FakeForms.TwoPage;
+            var store = new FakeDataStore(form);
+            var factory = new ApiFactory(ApiFactoryOptions.ForFake(store));
+            try
+            {
+                return new Harness(form.Metadata, store, factory, factory.CreateClient());
+            }
+            catch
+            {
+                await factory.DisposeAsync().ConfigureAwait(false);
+                throw;
+            }
+        }
+
+        public PageMetadata PageOf(string field)
+        {
+            var pageId = Form.FindField(field)?.PageId;
+            Assert.NotNull(pageId);
+            var page = Form.FindPage(pageId.Value);
+            Assert.NotNull(page);
+            return page;
+        }
+
+        public string TableName(Table table) => table switch
+        {
+            Table.Base => Form.BaseTableName,
+            Table.FirstPage => FirstPage.TableName,
+            Table.SecondPage => SecondPage.TableName,
+            _ => throw new ArgumentOutOfRangeException(nameof(table)),
+        };
+
+        // Builds the per-table entries from the form's own table names, leaving out each table granted Missing.
+        public FormPermissions Permissions(Grant baseTable, Grant firstPage, Grant secondPage) => Permissions(
+            (Form.BaseTableName, baseTable),
+            (FirstPage.TableName, firstPage),
+            (SecondPage.TableName, secondPage));
+
+        // Builds one entry per listed name, in the order listed, leaving out each name granted Missing.
+        public FormPermissions Permissions(params (string TableName, Grant Grant)[] tables)
+        {
+            var entries = new List<TablePermission>();
+            foreach (var (tableName, grant) in tables)
+            {
+                AddEntry(entries, tableName, grant);
+            }
+
+            return new FormPermissions(entries);
+        }
+
+        public void SetPermissions(FormPermissions? permissions) => Store.SetPermissions(ViewId, permissions);
+
+        // An active record holding a value in both text fields, lacking the rows of missingPages.
+        public string SeedRecord(params PageMetadata[] missingPages) => Store.SeedRecord(
+            ViewId,
+            new Dictionary<string, FieldValue>
+            {
+                [FirstPageField] = FieldValue.FromText(SeededText),
+                [SecondPageField] = FieldValue.FromText(SeededText),
+            },
+            missingPageIds: missingPages.Select(page => page.PageId));
+
+        public FakeRecordState Snapshot(string globalRecordId)
+        {
+            var state = Store.GetRecord(ViewId, globalRecordId);
+            Assert.NotNull(state);
+            return state;
+        }
+
+        // GET /api/forms/{viewId}.
+        public Task<Response> GetDefinitionAsync() => ExecuteAsync(() => client.GetAsync(FormPath()));
+
+        // POST /api/forms/{viewId}/records.
+        public Task<Response> PostAsync(string field, string text) =>
+            ExecuteAsync(() => ApiTestClient.PostJsonAsync(client, $"{FormPath()}/records", WriteBody(field, text)));
+
+        // PUT /api/forms/{viewId}/records/{globalRecordId}.
+        public Task<Response> PutAsync(string globalRecordId, string field, string text) =>
+            ExecuteAsync(() => ApiTestClient.PutJsonAsync(client, RecordPath(globalRecordId), WriteBody(field, text)));
+
+        // DELETE /api/forms/{viewId}/records/{globalRecordId}.
+        public Task<Response> DeleteAsync(string globalRecordId) =>
+            ExecuteAsync(() => client.DeleteAsync(RecordPath(globalRecordId)));
+
+        // POST ignores the record id; PUT and DELETE target it. PUT and POST submit the first-page text field.
+        public Task<Response> SendAsync(Write write, string globalRecordId, string text) => write switch
+        {
+            Write.Post => PostAsync(FirstPageField, text),
+            Write.Put => PutAsync(globalRecordId, FirstPageField, text),
+            Write.Delete => DeleteAsync(globalRecordId),
+            _ => throw new ArgumentOutOfRangeException(nameof(write)),
+        };
+
+        public async ValueTask DisposeAsync()
+        {
+            client.Dispose();
+            await factory.DisposeAsync().ConfigureAwait(false);
+        }
+
+        private static void AddEntry(List<TablePermission> entries, string tableName, Grant grant)
+        {
+            if (grant == Grant.Missing)
+            {
+                return;
+            }
+
+            entries.Add(new TablePermission(
+                tableName,
+                CanInsert: grant is Grant.InsertOnly or Grant.Both,
+                CanUpdate: grant is Grant.UpdateOnly or Grant.Both));
+        }
+
+        // The record-write body, sent as application/json: {"values": {field: text}}.
+        private static object WriteBody(string field, string text) =>
+            new { values = new Dictionary<string, string> { [field] = text } };
+
+        private string FormPath() => string.Create(CultureInfo.InvariantCulture, $"/api/forms/{ViewId}");
+
+        private string RecordPath(string globalRecordId) =>
+            $"{FormPath()}/records/{Uri.EscapeDataString(globalRecordId)}";
+
+        private Task<Response> ExecuteAsync(Func<Task<HttpResponseMessage>> send) => ExchangeAsync(Store, send);
+    }
+}
+
+/// <summary>
+/// The in-transaction permission check of <c>POST</c>, <c>PUT</c> and <c>DELETE</c> on the SQL Server store, against
+/// the rehearsal database (AAP 0.2.4). Every insert reads the permissions inside its transaction after the form's
+/// write lock and before its first write, for the base table and every page table; every update after the locked
+/// read, the record read and the required gate and before its first write, for the base table and every page table,
+/// on a record whose page row is missing and once that row is repaired; and every soft delete after its locked read
+/// and before its UPDATE, for the base table alone. So the INSERT, the UPDATE and the missing-page INSERT each write
+/// needs are never decided from the service's earlier read. Each case pins that statement's parameters exactly: each
+/// table's bracket-quoted name as <c>String</c>, then the <c>Int32</c> mask of what the write needs there, 1 for
+/// INSERT, 2 for UPDATE and 3 for both.
+/// </summary>
+/// <remarks>
+/// <para>
+/// The same requests, and the form definition, send no statement twice with the same parameter values: the service's
+/// permission check takes the tables the request's own metadata read confirmed, and a write's transaction verifies that
+/// read with one statement instead of reading the form again.
+/// </para>
+/// <para>
+/// The seeded login holds every permission and no denied principal is created, because the database's logins and
+/// users stay unchanged. The cases therefore prove where and on what the check runs through
+/// <see cref="SqlCommandRecorder"/>, and <see cref="PermissionTests"/> proves the denial on
+/// <see cref="FakeDataStore"/>.
+/// </para>
+/// <para>
+/// Each record is created only through <c>POST /api/forms/{viewId}/records</c>, carrying a fresh
+/// <see cref="TestDatabase.NewMarker"/> in <see cref="TestDatabase.MarkerField"/>, and stays in the database, the one
+/// soft-deleted through <c>DELETE</c> included. The one direct write deletes the <c>FoodHistory3</c> row of the
+/// update case's record (AAP 0.3.7, "Data reach of tests"). Each case holds the exclusive
+/// <see cref="DatabaseWriteLock"/>. Failure messages describe commands without their bound values and never print a
+/// response body.
+/// </para>
+/// </remarks>
+[Trait("Category", "Integration")]
+[Collection(DatabaseCollections.Database)]
+public sealed class WritePermissionSqlTests
+{
+    private const string FoodHistory = "FoodHistory";
+
+    // FoodHistory's text fields FirstName, on its first page (FoodHistory2), and Lab, on its second (FoodHistory3),
+    // both nvarchar(4000) with no pattern, length limit or legal values (testdata/sql/03_forms.sql and
+    // 05_data_tables.sql).
+    private const string PageOneField = "FirstName";
+
+    private const string PageTwoField = "Lab";
+
+    // The fixed operation names EpiInfo.Data reports to the command observer: the record repository's insert, update
+    // and soft delete, and the permission reader's form-level read that RecordService makes before it calls the store.
+    private const string InsertOperation = "records.insert";
+
+    private const string UpdateOperation = "records.update";
+
+    private const string DeleteOperation = "records.delete";
+
+    private const string ServicePermissionOperation = "GetPermissions";
+
+    // The metadata reader's operation prefix, the operation of its write-time form verification, and that of the
+    // catalogue read a permission check sends for a form instance the reader did not return.
+    private const string MetadataOperationPrefix = "metadata.";
+
+    private const string VerifyFormOperation = "metadata.verifyForm";
+
+    private const string ResolveTablesOperation = "metadata.resolveTables";
+
+    private const string PermissionFunction = "HAS_PERMS_BY_NAME";
+
+    private const string LockHint = "UPDLOCK";
+
+    // The system procedure of the form's write lock, which an insert takes before its first lock on a record table.
+    private const string FormWriteLockProcedure = "sp_getapplock";
+
+    // The bracket-quoted catalogue names of FoodHistory's base table and of its page tables in metaPages.Position order
+    // (testdata/sql/03_forms.sql and 05_data_tables.sql), the securables the in-transaction permission statement binds.
+    private const string BaseSecurable = "[FoodHistory]";
+
+    private const string PageOneSecurable = "[FoodHistory2]";
+
+    private const string PageTwoSecurable = "[FoodHistory3]";
+
+    // The Int32 mask the in-transaction permission statement binds beside each securable, saying what the write needs
+    // on that table, as SqlPermissionReader's fixed bit checks read it: 1 INSERT, 2 UPDATE, 3 both.
+    private const int InsertMask = 1;
+
+    private const int UpdateMask = 2;
+
+    private const int InsertAndUpdateMask = InsertMask | UpdateMask;
+
+    // An insert's statement binds the base table and then each page table, each for INSERT.
+    private static readonly (string Securable, int Mask)[] InsertRequirements =
+        [(BaseSecurable, InsertMask), (PageOneSecurable, InsertMask), (PageTwoSecurable, InsertMask)];
+
+    // A soft delete's statement binds the base table alone, for UPDATE.
+    private static readonly (string Securable, int Mask)[] DeleteRequirements = [(BaseSecurable, UpdateMask)];
+
+    // Longer than DatabaseWriteLock's 300-second wait, so a lock held by another process fails the lock call rather
+    // than this token; xUnit v2 gives a test no cancellation token of its own.
+    private static readonly TimeSpan TestTimeout = TimeSpan.FromMinutes(10);
+
+    /// <summary>
+    /// The requests whose statements are compared: the FoodHistory form definition, and a create, an update and a soft
+    /// delete of a FoodHistory record.
+    /// </summary>
+    public static TheoryData<string> Requests => new() { "GET", "POST", "PUT", "DELETE" };
+
+    // A PUT of a page-one field on a record lacking its FoodHistory3 row, a PUT of the page-two field that repairs the
+    // row, and a PUT once every page row is present each read the permissions of the base table and every page table
+    // in their transaction, which is where the UPDATE on each table, and the INSERT on FoodHistory3 while its row is
+    // missing, are decided: the first two ask FoodHistory3 for INSERT and UPDATE whichever page their field is on, and
+    // the third asks it for UPDATE alone. The service's own read runs before each transaction, outside it, and decides
+    // nothing there.
+    [Fact]
+    public async Task UpdatePermissions_AreReadInsideTheUpdateTransactionBeforeItsFirstWrite()
+    {
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        var ct = timeout.Token;
+        await using var factory = await ApiFactory.ForDatabaseAsync();
+        using var client = factory.CreateClient();
+        await using var dbLock = await DatabaseWriteLock.AcquireExclusiveAsync(ct);
+
+        var viewId = await ApiTestClient.GetViewIdAsync(client, FoodHistory, ct);
+        var created = await ApiTestClient.CreateRecordAsync(
+            client,
+            viewId,
+            new Dictionary<string, object?> { [TestDatabase.MarkerField] = TestDatabase.NewMarker() },
+            ct);
+        var id = created.GlobalRecordId;
+
+        // The create wrote a FoodHistory3 row; removing it is the one direct write the test makes on its own record.
+        Assert.Equal(1, await CountPageTwoRowsAsync(id, ct));
+        Assert.Equal(1, await DeletePageTwoRowAsync(id, ct));
+        Assert.Equal(0, await CountPageTwoRowsAsync(id, ct));
+
+        factory.Recorder.Clear();
+        await PutAsync(client, viewId, id, PageOneField, "Avery", ct);
+        var pageOneUpdate = factory.Recorder.Commands;
+        AssertServiceReadPrecedesTheTransaction("The PUT", pageOneUpdate);
+        AssertUpdatePermissionsCheckedInTheTransaction(pageOneUpdate, pageTwoRowMissing: true);
+        Assert.Equal(0, await CountPageTwoRowsAsync(id, ct));
+
+        factory.Recorder.Clear();
+        await PutAsync(client, viewId, id, PageTwoField, "Pending", ct);
+        var pageTwoUpdate = factory.Recorder.Commands;
+        AssertServiceReadPrecedesTheTransaction("The PUT", pageTwoUpdate);
+        AssertUpdatePermissionsCheckedInTheTransaction(pageTwoUpdate, pageTwoRowMissing: true);
+        Assert.Equal(1, await CountPageTwoRowsAsync(id, ct));
+
+        factory.Recorder.Clear();
+        await PutAsync(client, viewId, id, PageOneField, "Blake", ct);
+        var completeUpdate = factory.Recorder.Commands;
+        AssertServiceReadPrecedesTheTransaction("The PUT", completeUpdate);
+        AssertUpdatePermissionsCheckedInTheTransaction(completeUpdate, pageTwoRowMissing: false);
+        Assert.Equal(1, await CountPageTwoRowsAsync(id, ct));
+
+        // What the update needs on each table travels only in the mask parameters, so the statement text is the same
+        // with the page row missing and with every row present.
+        Assert.True(
+            string.Equals(
+                InTransactionCheckText(pageOneUpdate),
+                InTransactionCheckText(completeUpdate),
+                StringComparison.Ordinal),
+            "The in-transaction permission statement's text must not depend on what the update needs on each table.");
+    }
+
+    // A POST reads the permissions of the base table and every page table in its transaction, once it holds the form's
+    // write lock and before its base INSERT, which is where the INSERT on each table is decided. The service's own read
+    // runs before the transaction, outside it, and decides nothing there.
+    [Fact]
+    public async Task InsertPermissions_AreReadInsideTheInsertTransactionAfterTheFormLockBeforeItsFirstWrite()
+    {
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        var ct = timeout.Token;
+        await using var factory = await ApiFactory.ForDatabaseAsync();
+        using var client = factory.CreateClient();
+        await using var dbLock = await DatabaseWriteLock.AcquireExclusiveAsync(ct);
+
+        var viewId = await ApiTestClient.GetViewIdAsync(client, FoodHistory, ct);
+        factory.Recorder.Clear();
+        var created = await ApiTestClient.CreateRecordAsync(
+            client,
+            viewId,
+            new Dictionary<string, object?> { [TestDatabase.MarkerField] = TestDatabase.NewMarker() },
+            ct);
+        var insert = factory.Recorder.Commands;
+
+        AssertServiceReadPrecedesTheTransaction("The POST", insert);
+        AssertInsertPermissionsCheckedInTheTransaction(insert);
+        Assert.Equal(1, await CountPageTwoRowsAsync(created.GlobalRecordId, ct));
+    }
+
+    // A DELETE of an active record reads the permissions of the base table alone in its transaction, after its locked
+    // read and before its UPDATE, which is where the UPDATE on the base table is decided. The service's own read runs
+    // before the transaction, outside it, and decides nothing there.
+    [Fact]
+    public async Task DeletePermissions_AreReadInsideTheDeleteTransactionAfterTheLockedReadBeforeItsUpdate()
+    {
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        var ct = timeout.Token;
+        await using var factory = await ApiFactory.ForDatabaseAsync();
+        using var client = factory.CreateClient();
+        await using var dbLock = await DatabaseWriteLock.AcquireExclusiveAsync(ct);
+
+        var viewId = await ApiTestClient.GetViewIdAsync(client, FoodHistory, ct);
+        var created = await ApiTestClient.CreateRecordAsync(
+            client,
+            viewId,
+            new Dictionary<string, object?> { [TestDatabase.MarkerField] = TestDatabase.NewMarker() },
+            ct);
+
+        factory.Recorder.Clear();
+        var path = string.Create(
+            CultureInfo.InvariantCulture,
+            $"/api/forms/{viewId}/records/{Uri.EscapeDataString(created.GlobalRecordId)}");
+        using (var response = await client.DeleteAsync(path, ct))
+        {
+            Assert.True(
+                response.StatusCode == HttpStatusCode.NoContent,
+                string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"The DELETE returned {(int)response.StatusCode}, expected 204."));
+        }
+
+        var delete = factory.Recorder.Commands;
+        AssertServiceReadPrecedesTheTransaction("The DELETE", delete);
+        AssertDeletePermissionsCheckedInTheTransaction(delete);
+    }
+
+    // No statement of the form definition or of a write is sent twice with the same parameter values (the identical-
+    // statement rule of the per-request SQL measurement): the service's permission check takes the tables the
+    // request's own metadata read confirmed, with no catalogue read of its own, and a write verifies that read inside
+    // its transaction with one probe, the transaction's first statement, instead of reading the form again; its
+    // permission statement asks only for what the write needs, so it repeats none the service sent.
+    [Theory]
+    [MemberData(nameof(Requests))]
+    public async Task Request_SendsNoStatementTwice_AndAWriteVerifiesItsFormWithOneStatement(string method)
+    {
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        var ct = timeout.Token;
+        await using var factory = await ApiFactory.ForDatabaseAsync();
+        using var client = factory.CreateClient();
+        await using var dbLock = await DatabaseWriteLock.AcquireExclusiveAsync(ct);
+
+        var viewId = await ApiTestClient.GetViewIdAsync(client, FoodHistory, ct);
+        var formPath = string.Create(CultureInfo.InvariantCulture, $"/api/forms/{viewId}");
+        string? id = null;
+        if (method is "PUT" or "DELETE")
+        {
+            var created = await ApiTestClient.CreateRecordAsync(
+                client,
+                viewId,
+                new Dictionary<string, object?> { [TestDatabase.MarkerField] = TestDatabase.NewMarker() },
+                ct);
+            id = created.GlobalRecordId;
+        }
+
+        factory.Recorder.Clear();
+        switch (method)
+        {
+            case "GET":
+                AssertStatus(await client.GetAsync(formPath, ct), HttpStatusCode.OK, "The GET");
+                break;
+            case "POST":
+                await ApiTestClient.CreateRecordAsync(
+                    client,
+                    viewId,
+                    new Dictionary<string, object?> { [TestDatabase.MarkerField] = TestDatabase.NewMarker() },
+                    ct);
+                break;
+            case "PUT" when id is not null:
+                await PutAsync(client, viewId, id, PageOneField, "Casey", ct);
+                break;
+            case "DELETE" when id is not null:
+                AssertStatus(
+                    await client.DeleteAsync($"{formPath}/records/{Uri.EscapeDataString(id)}", ct),
+                    HttpStatusCode.NoContent,
+                    "The DELETE");
+                break;
+            default:
+                throw new ArgumentOutOfRangeException(nameof(method), method, "The test sends no such request.");
+        }
+
+        var commands = factory.Recorder.Commands;
+        var repeated = commands
+            .GroupBy(StatementKey, StringComparer.Ordinal)
+            .Where(sameStatement => sameStatement.Count() > 1)
+            .Select(sameStatement => sameStatement.First())
+            .ToList();
+        Assert.True(
+            repeated.Count == 0,
+            $"The {method} sent these statements more than once with the same parameter values:" +
+            Describe(repeated) + Environment.NewLine + "All commands:" + Describe(commands));
+        Assert.True(
+            !commands.Any(command => IsOperation(command, ResolveTablesOperation)) &&
+            commands.Count(command => IsOperation(command, ServicePermissionOperation)) == 1,
+            $"The {method}'s permission check must send exactly one statement and no catalogue read:" +
+            Describe(commands));
+
+        if (method != "GET")
+        {
+            var inTransaction = commands.Where(command => command.InTransaction).ToList();
+            var metadataInTransaction = inTransaction
+                .Where(command => command.Operation.StartsWith(MetadataOperationPrefix, StringComparison.Ordinal))
+                .ToList();
+            Assert.True(
+                metadataInTransaction.Count == 1 &&
+                IsOperation(metadataInTransaction[0], VerifyFormOperation) &&
+                metadataInTransaction[0].Succeeded &&
+                ReferenceEquals(inTransaction[0], metadataInTransaction[0]),
+                $"The {method}'s transaction must verify its form with one probe, its first statement, and read no " +
+                "metadata again:" + Describe(inTransaction));
+        }
+    }
+
+    // A response's status, which a failure message names without the body; the response is disposed.
+    private static void AssertStatus(HttpResponseMessage response, HttpStatusCode expected, string request)
+    {
+        using (response)
+        {
+            Assert.True(
+                response.StatusCode == expected,
+                string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"{request} returned {(int)response.StatusCode}, expected {(int)expected}."));
+        }
+    }
+
+    // A command's text with its parameters' names, types and values: two commands with one key are one statement
+    // sent twice.
+    private static string StatementKey(RecordedCommand command) =>
+        command.CommandText + string.Concat(command.Parameters.Select(parameter => string.Create(
+            CultureInfo.InvariantCulture,
+            $"\u0000{parameter.Name}\u0000{parameter.DbType}\u0000{parameter.Value?.GetType().FullName}" +
+            $"\u0000{parameter.Value}")));
+
+    // PUT {"values": {field: text}} answers 200 with the record holding the submitted text.
+    private static async Task PutAsync(
+        HttpClient client,
+        int viewId,
+        string globalRecordId,
+        string field,
+        string text,
+        CancellationToken ct)
+    {
+        var path = string.Create(
+            CultureInfo.InvariantCulture,
+            $"/api/forms/{viewId}/records/{Uri.EscapeDataString(globalRecordId)}");
+        using var response = await ApiTestClient.PutJsonAsync(
+            client,
+            path,
+            new { values = new Dictionary<string, object?> { [field] = text } },
+            ct);
+        Assert.True(
+            response.StatusCode == HttpStatusCode.OK,
+            string.Create(
+                CultureInfo.InvariantCulture,
+                $"The PUT of {field} returned {(int)response.StatusCode}, expected 200."));
+
+        var record = await ApiTestClient.ReadJsonElementAsync(response, ct);
+        Assert.True(
+            record.ValueKind == JsonValueKind.Object &&
+            record.TryGetProperty("values", out var values) &&
+            values.ValueKind == JsonValueKind.Object &&
+            values.TryGetProperty(field, out var stored) &&
+            stored.ValueKind == JsonValueKind.String &&
+            stored.ValueEquals(text),
+            $"The record the PUT of {field} returned does not hold the submitted text.");
+    }
+
+    // RecordService's own permission read: one statement, outside any transaction, completed before the write's
+    // transaction sent its first statement. request names the write in failure messages.
+    private static void AssertServiceReadPrecedesTheTransaction(string request, IReadOnlyList<RecordedCommand> commands)
+    {
+        var serviceReads = commands
+            .Where(command => IsPermissionCheck(command) &&
+                string.Equals(command.Operation, ServicePermissionOperation, StringComparison.Ordinal))
+            .ToList();
+        Assert.True(
+            serviceReads.Count == 1 && !serviceReads[0].InTransaction && serviceReads[0].Succeeded,
+            request + " must send exactly one service permission statement, outside any transaction, and it must " +
+            "succeed:" + Describe(commands));
+
+        var firstInTransaction = commands.FirstOrDefault(command => command.InTransaction);
+        Assert.True(
+            firstInTransaction is not null && serviceReads[0].Sequence < firstInTransaction.Sequence,
+            "The service permission statement must precede every statement of the write's transaction:" +
+            Describe(commands));
+    }
+
+    // On the insert's connection, from its form write lock on, the statements before the first write are exactly the
+    // lock and one permission statement bound to the base table and then each page table, each for INSERT, both inside
+    // the transaction, and the first write is the insert's own; no other permission statement joins any transaction.
+    private static void AssertInsertPermissionsCheckedInTheTransaction(IReadOnlyList<RecordedCommand> commands)
+    {
+        var formLocks = commands
+            .Where(command => IsOperation(command, InsertOperation) &&
+                command.CommandText.Contains(FormWriteLockProcedure, StringComparison.Ordinal))
+            .ToList();
+        Assert.True(
+            formLocks.Count == 1 && formLocks[0].InTransaction && formLocks[0].Succeeded,
+            "The POST must send exactly one form write lock, inside its transaction:" + Describe(commands));
+        var formLock = formLocks[0];
+
+        var fromLock = commands
+            .Where(command => command.ClientConnectionId == formLock.ClientConnectionId &&
+                command.Sequence >= formLock.Sequence)
+            .ToList();
+        var beforeWrite = fromLock.TakeWhile(command => !command.IsWrite).ToList();
+        var firstWrite = fromLock.FirstOrDefault(command => command.IsWrite);
+        var check = beforeWrite.Count == 2 ? beforeWrite[1] : null;
+        Assert.True(
+            check is not null &&
+            IsOperation(check, InsertOperation) &&
+            check.InTransaction &&
+            IsPermissionCheck(check) &&
+            check.Succeeded &&
+            firstWrite is not null &&
+            IsOperation(firstWrite, InsertOperation) &&
+            firstWrite.InTransaction,
+            "From the form write lock on, the insert's connection must send one permission statement inside the " +
+            "transaction, and then its first write:" + Describe(fromLock));
+
+        AssertTheOneInTransactionCheck(check, InsertRequirements, commands);
+    }
+
+    // On the soft delete's connection, from its locked base read on, the statements before the first write are exactly
+    // the locked read and one permission statement bound to the base table alone, for UPDATE, both inside the
+    // transaction, and the first write is the soft delete's own; no other permission statement joins any transaction.
+    private static void AssertDeletePermissionsCheckedInTheTransaction(IReadOnlyList<RecordedCommand> commands)
+    {
+        var lockedReads = commands
+            .Where(command => IsOperation(command, DeleteOperation) &&
+                command.CommandText.Contains(LockHint, StringComparison.Ordinal))
+            .ToList();
+        Assert.True(
+            lockedReads.Count == 1 && lockedReads[0].InTransaction && lockedReads[0].Succeeded,
+            "The DELETE must send exactly one locked base read, inside its transaction:" + Describe(commands));
+        var lockedRead = lockedReads[0];
+
+        var fromLock = commands
+            .Where(command => command.ClientConnectionId == lockedRead.ClientConnectionId &&
+                command.Sequence >= lockedRead.Sequence)
+            .ToList();
+        var beforeWrite = fromLock.TakeWhile(command => !command.IsWrite).ToList();
+        var firstWrite = fromLock.FirstOrDefault(command => command.IsWrite);
+        var check = beforeWrite.Count == 2 ? beforeWrite[1] : null;
+        Assert.True(
+            check is not null &&
+            IsOperation(check, DeleteOperation) &&
+            check.InTransaction &&
+            IsPermissionCheck(check) &&
+            check.Succeeded &&
+            firstWrite is not null &&
+            IsOperation(firstWrite, DeleteOperation) &&
+            firstWrite.InTransaction,
+            "From the locked base read on, the soft delete's connection must send one permission statement inside " +
+            "the transaction, and then its UPDATE:" + Describe(fromLock));
+
+        AssertTheOneInTransactionCheck(check, DeleteRequirements, commands);
+    }
+
+    // On the update's connection, from its locked base read on, the statements before the first write are exactly the
+    // locked read, the record read and one permission statement bound to the base table and then each page table, all
+    // inside the transaction; no other permission statement joins any transaction. The statement asks each table for
+    // UPDATE, and FoodHistory3 for INSERT as well when pageTwoRowMissing says the record has no row there.
+    private static void AssertUpdatePermissionsCheckedInTheTransaction(
+        IReadOnlyList<RecordedCommand> commands,
+        bool pageTwoRowMissing)
+    {
+        var lockedReads = commands
+            .Where(command => IsUpdate(command) && command.CommandText.Contains(LockHint, StringComparison.Ordinal))
+            .ToList();
+        Assert.True(
+            lockedReads.Count == 1 && lockedReads[0].InTransaction,
+            "The PUT must send exactly one locked base read, inside its transaction:" + Describe(commands));
+        var lockedRead = lockedReads[0];
+
+        var fromLock = commands
+            .Where(command => command.ClientConnectionId == lockedRead.ClientConnectionId &&
+                command.Sequence >= lockedRead.Sequence)
+            .ToList();
+        var beforeWrite = fromLock.TakeWhile(command => !command.IsWrite).ToList();
+        var firstWrite = fromLock.FirstOrDefault(command => command.IsWrite);
+        var recordRead = beforeWrite.Count == 3 ? beforeWrite[1] : null;
+        var check = beforeWrite.Count == 3 ? beforeWrite[2] : null;
+        Assert.True(
+            recordRead is not null &&
+            IsUpdate(recordRead) &&
+            recordRead.InTransaction &&
+            !IsPermissionCheck(recordRead) &&
+            !recordRead.CommandText.Contains(LockHint, StringComparison.Ordinal) &&
+            check is not null &&
+            IsUpdate(check) &&
+            check.InTransaction &&
+            IsPermissionCheck(check) &&
+            check.Succeeded &&
+            firstWrite is not null &&
+            firstWrite.InTransaction,
+            "From the locked base read on, the update's connection must send the record read, then one permission " +
+            "statement, both inside the transaction, and then its first write:" + Describe(fromLock));
+
+        (string Securable, int Mask)[] requirements =
+        [
+            (BaseSecurable, UpdateMask),
+            (PageOneSecurable, UpdateMask),
+            (PageTwoSecurable, pageTwoRowMissing ? InsertAndUpdateMask : UpdateMask),
+        ];
+        AssertTheOneInTransactionCheck(check, requirements, commands);
+    }
+
+    // The write's in-transaction permission statement binds exactly the parameters expected, in order: for each table,
+    // @p(2i) its securable as String and @p(2i+1) the mask of what the write needs there as Int32. It is the only
+    // permission statement inside any transaction of the request.
+    private static void AssertTheOneInTransactionCheck(
+        RecordedCommand check,
+        (string Securable, int Mask)[] requirements,
+        IReadOnlyList<RecordedCommand> commands)
+    {
+        var expected = requirements
+            .SelectMany((requirement, index) => new (string Name, DbType DbType, object? Value)[]
+            {
+                (ParameterName(2 * index), DbType.String, requirement.Securable),
+                (ParameterName((2 * index) + 1), DbType.Int32, requirement.Mask),
+            })
+            .ToList();
+        Assert.True(
+            check.Parameters.Select(parameter => (parameter.Name, parameter.DbType, parameter.Value))
+                .SequenceEqual(expected),
+            "The in-transaction permission statement must bind exactly, in this order, each table's securable as " +
+            "String and then the mask of what the write needs on it as Int32: " +
+            string.Join(", ", requirements.Select(requirement => string.Create(
+                CultureInfo.InvariantCulture,
+                $"{requirement.Securable} {requirement.Mask}"))) +
+            $": {check}");
+
+        Assert.True(
+            commands.Count(command => IsPermissionCheck(command) && command.InTransaction) == 1,
+            "Exactly one permission statement may run inside a transaction:" + Describe(commands));
+    }
+
+    // The positional name EpiInfo.Data gives a statement's parameter at ordinal, @p0, @p1, ...
+    private static string ParameterName(int ordinal) =>
+        string.Create(CultureInfo.InvariantCulture, $"@p{ordinal}");
+
+    // The text of the one permission statement the request sent inside a transaction.
+    private static string InTransactionCheckText(IReadOnlyList<RecordedCommand> commands) =>
+        commands.Single(command => IsPermissionCheck(command) && command.InTransaction).CommandText;
+
+    private static bool IsPermissionCheck(RecordedCommand command) =>
+        command.CommandText.Contains(PermissionFunction, StringComparison.Ordinal);
+
+    private static bool IsUpdate(RecordedCommand command) => IsOperation(command, UpdateOperation);
+
+    private static bool IsOperation(RecordedCommand command, string operation) =>
+        string.Equals(command.Operation, operation, StringComparison.Ordinal);
+
+    // Each command on its own line, without parameter values.
+    private static string Describe(IEnumerable<RecordedCommand> commands) =>
+        string.Concat(commands.Select(command => Environment.NewLine + command));
+
+    private static SqlParameter IdParameter(string globalRecordId) =>
+        new("@id", SqlDbType.NVarChar, 255) { Value = globalRecordId };
+
+    private static async Task<int> CountPageTwoRowsAsync(string globalRecordId, CancellationToken ct)
+    {
+        await using var connection = await TestDatabase.OpenConnectionAsync(ct);
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT COUNT(*) FROM [dbo].[FoodHistory3] WHERE [GlobalRecordId] = @id;";
+        command.Parameters.Add(IdParameter(globalRecordId));
+        return Assert.IsType<int>(await command.ExecuteScalarAsync(ct));
+    }
+
+    // The missing-page fixture: the only direct write of this test, on the FoodHistory record it created.
+    private static async Task<int> DeletePageTwoRowAsync(string globalRecordId, CancellationToken ct)
+    {
+        await using var connection = await TestDatabase.OpenConnectionAsync(ct);
+        await using var command = connection.CreateCommand();
+        command.CommandText = "DELETE FROM [dbo].[FoodHistory3] WHERE [GlobalRecordId] = @id;";
+        command.Parameters.Add(IdParameter(globalRecordId));
+        return await command.ExecuteNonQueryAsync(ct);
+    }
+}

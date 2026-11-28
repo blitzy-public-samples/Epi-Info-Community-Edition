@@ -1,0 +1,2095 @@
+/*
+ * Global stylesheet for the Epi Info web data-entry client.
+ *
+ * The client renders native HTML elements only (no component library, no
+ * CSS framework, no CSS-in-JS), so this file is the one place visual styling
+ * lives.
+ *
+ * State comes from native attributes (disabled, aria-selected, aria-current,
+ * aria-invalid, aria-disabled, hidden), and no rule hides a control because
+ * of its state: disabled and protected controls stay rendered and queryable.
+ * Inactive tab panels stay mounted but carry the native hidden attribute,
+ * which the [hidden] utility keeps at display: none, so Testing Library and
+ * Playwright omit their controls from default role and visibility queries
+ * until their tab is selected.
+ *
+ * Cascade layers order the rules: element defaults (base) < component
+ * classes (components) < single-purpose helpers (utilities). A later layer
+ * wins regardless of selector specificity, so no rule needs !important.
+ */
+
+@layer base, components, utilities;
+
+/* Design tokens */
+
+/* Contrast against the background each colour is used on (WCAG AA):
+ * text 15.8:1, muted text 6.0:1 or more, accent 5.2:1, danger 6.1:1 or more,
+ * banner texts 9.1:1 or more, control borders 4.3:1 or more (3:1 needed),
+ * hover borders 8.4:1 or more, text on the pressed surface 11.6:1, text
+ * 11.6:1 and muted text 4.6:1 on the pressed row tint, text 12.6:1 and
+ * muted text 5.1:1 on the open row's hover tint (accent subtle hover), with
+ * its accent bar and focus ring 4.1:1 there (3:1 needed), text 14.8:1 in a
+ * pressed text-like control, and the invalid choice ring (danger border)
+ * 5.4:1 on the page, 4.6:1 on the hover halo and 3.9:1 on the pressed halo
+ * (3:1 needed). Selected tab text (accent strong) 6.7:1 on hover (accent
+ * subtle) and 5.6:1 pressed (accent muted), its accent top bar 4.6:1 and
+ * 3.8:1 there (3:1 needed). White text on the danger button: 6.5:1 at rest
+ * (danger), 10.5:1 on hover (danger text) and 13.3:1 pressed (danger
+ * active). Warning text on the warning button: 11.5:1 at rest (warning
+ * subtle), 9.5:1 on hover (warning hover) and 7.4:1 pressed (warning
+ * active); its warning border 4.2:1 on the error banner (3:1 needed).
+ * Disabled controls, never faded: muted text 5.5:1 on the disabled
+ * surface; a checked checkbox or radio fill (muted text) 5.5:1 against the
+ * unchecked surface, 6.0:1 on the protected band and 6.4:1 on the page, its
+ * cut-out mark, which shows that background, the same against the fill. An
+ * unchecked box in a protected field shows a recorded value, so its border
+ * (border strong) is 4.3:1 on the band and 3.9:1 on the disabled surface
+ * (3:1 needed); elsewhere its border (border) is 1.5:1 on the page and 1.2:1
+ * on the disabled surface, as on disabled text-like controls: an inactive
+ * control needs no minimum (WCAG 1.4.11), and the fill tells the value. */
+:root {
+  color-scheme: light;
+
+  --font-family-base: system-ui, sans-serif;
+  --font-size-base: 1rem;
+  --font-size-small: 0.875rem;
+  --line-height-base: 1.5;
+
+  --color-text: #1f2328;
+  --color-text-muted: #57606a;
+  --color-page: #ffffff;
+  --color-surface-muted: #f6f8fa;
+  --color-surface-hover: #eaeef2;
+  --color-surface-active: #d8dee4;
+  --color-surface-disabled: #eaeef2;
+  --color-border: #d0d7de;
+  --color-border-strong: #6e7781;
+  --color-border-hover: #424a53;
+
+  --color-accent: #0969da;
+  --color-accent-strong: #0550ae;
+  --color-accent-subtle: #ddf4ff;
+  /* Halfway from accent subtle to accent muted: the open row under the
+   * pointer, between its rest and pressed tints. */
+  --color-accent-subtle-hover: #caebff;
+  --color-accent-muted: #b6e3ff;
+  --color-focus: #0969da;
+
+  --color-danger: #b3261e;
+  --color-danger-border: #cf222e;
+  --color-danger-text: #82071e;
+  --color-danger-subtle: #ffebe9;
+  --color-danger-active: #660018;
+
+  --color-warning-border: #9a6700;
+  --color-warning-text: #4d2d00;
+  --color-warning-subtle: #fff8c5;
+  --color-warning-hover: #fae17d;
+  --color-warning-active: #eac54f;
+
+  --color-info-border: #0969da;
+  --color-info-text: #0a3069;
+  --color-info-subtle: #ddf4ff;
+
+  /* The modal backdrop is one tint at one opacity. Both are tokens of their
+   * own so that the backdrop and the backdrop over the page, the one opaque
+   * colour the page shows through it, are built from the same values. */
+  --backdrop-tint: 31 35 40;
+  --backdrop-opacity: 50%;
+  --color-backdrop: rgb(var(--backdrop-tint) / var(--backdrop-opacity));
+  --color-backdrop-over-page: color-mix(
+    in srgb,
+    rgb(var(--backdrop-tint)) var(--backdrop-opacity),
+    var(--color-page)
+  );
+  /* The scroll cue of the record grid and of the find picker: a shade at an
+   * edge of a scroll box with more content beyond it, which shows on the
+   * page, the stripes and the row tints alike. */
+  --color-scroll-cue: rgb(31 35 40 / 0.25);
+
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.5rem;
+
+  --radius-small: 6px;
+  --radius-large: 8px;
+  /* The corner of the native checkbox, kept where a disabled box is drawn by hand. */
+  --radius-choice: 2px;
+  --border-width: 1px;
+  --border-width-accent: 4px;
+  --focus-ring-width: 2px;
+  /* Outline width plus offset: the inset a scroll box needs so the focus
+   * ring of a control at its edge is not clipped. */
+  --focus-ring-room: calc(2 * var(--focus-ring-width));
+
+  /* 44px minimum pointer target for buttons, tabs and inputs. */
+  --target-size: 2.75rem;
+  /* Checkbox and radio box; option-group radio tracks use the same size. */
+  --choice-size: 1.25rem;
+  --control-max-inline-size: 40rem;
+  --content-max-inline-size: 72rem;
+  /* Starting width of each column of the record grid and the find results;
+   * a table wider than its columns shares the extra width among them. */
+  --table-column-inline-size: 7rem;
+
+  --shadow-dialog: 0 8px 24px rgb(31 35 40 / 0.25);
+  /* Depth of the scroll cue at an edge of the find picker. */
+  --shadow-scroll-edge-size: var(--space-3);
+  --transition-fast: 150ms ease-out;
+}
+
+/* Base: element defaults */
+
+@layer base {
+  *,
+  *::before,
+  *::after {
+    box-sizing: border-box;
+  }
+
+  body {
+    margin: 0;
+    font-family: var(--font-family-base);
+    font-size: var(--font-size-base);
+    line-height: var(--line-height-base);
+    color: var(--color-text);
+    background-color: var(--color-page);
+  }
+
+  h1,
+  h2,
+  h3,
+  h4 {
+    margin-block: 0;
+    line-height: 1.25;
+    overflow-wrap: break-word;
+  }
+
+  h1 {
+    font-size: 1.75rem;
+  }
+
+  h2 {
+    font-size: 1.375rem;
+  }
+
+  /* A field heading inside a group is an h4 for the outline only; it looks like an h3. */
+  h3,
+  h4 {
+    font-size: 1.0625rem;
+  }
+
+  p {
+    margin-block: 0;
+    overflow-wrap: break-word;
+  }
+
+  button,
+  input,
+  select,
+  textarea {
+    font: inherit;
+    color: inherit;
+  }
+
+  button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: var(--space-2);
+    min-block-size: var(--target-size);
+    min-inline-size: var(--target-size);
+    padding-block: var(--space-2);
+    padding-inline: var(--space-3);
+    border: var(--border-width) solid var(--color-border-strong);
+    border-radius: var(--radius-small);
+    background-color: var(--color-surface-muted);
+    color: var(--color-text);
+    font-weight: 500;
+    line-height: 1.25;
+    cursor: pointer;
+  }
+
+  button:disabled {
+    border-color: var(--color-border);
+    background-color: var(--color-surface-disabled);
+    color: var(--color-text-muted);
+    cursor: not-allowed;
+  }
+
+  /* Text-like controls read their state colours from custom properties, so a
+   * state rule (invalid, disabled) wins without out-ranking this selector. */
+  input:not([type="checkbox"]):not([type="radio"]),
+  select,
+  textarea {
+    inline-size: 100%;
+    max-inline-size: var(--control-max-inline-size);
+    min-block-size: var(--target-size);
+    padding-block: var(--space-2);
+    padding-inline: var(--space-3);
+    border: var(--border-width) solid var(--control-border-color, var(--color-border-strong));
+    border-radius: var(--radius-small);
+    background-color: var(--control-background, var(--color-page));
+    color: var(--control-text, var(--color-text));
+  }
+
+  textarea {
+    min-block-size: 6rem;
+    resize: vertical;
+  }
+
+  /* Checkboxes and radios draw their states outside the box, from custom
+   * properties as text-like controls do: an error ring (--choice-ring-color)
+   * over a hover or pressed halo (--choice-halo-color), each transparent
+   * until a state rule sets it. The focus ring is an outline, drawn over
+   * both. */
+  input[type="checkbox"],
+  input[type="radio"] {
+    flex: none;
+    inline-size: var(--choice-size);
+    block-size: var(--choice-size);
+    margin: 0;
+    accent-color: var(--color-accent);
+    cursor: pointer;
+    box-shadow:
+      0 0 0 var(--focus-ring-width) var(--choice-ring-color, transparent),
+      0 0 0 var(--space-1) var(--choice-halo-color, transparent);
+  }
+
+  /* Rounds the ring and the halo with the radio. */
+  input[type="radio"] {
+    border-radius: 50%;
+  }
+
+  /* An invalid radiogroup fieldset passes the ring colour on to its radios. */
+  [aria-invalid="true"] {
+    --control-border-color: var(--color-danger-border);
+    --choice-ring-color: var(--color-danger-border);
+  }
+
+  /* Disabled outranks invalid. A disabled fieldset passes the colours on to
+   * the controls it disables. */
+  input:disabled,
+  select:disabled,
+  textarea:disabled,
+  fieldset:disabled {
+    --control-border-color: var(--color-border);
+    --control-background: var(--color-surface-disabled);
+    --control-text: var(--color-text-muted);
+    --choice-ring-color: transparent;
+  }
+
+  /* Disabled controls show their state through the colours above at full
+   * opacity: the user-agent stylesheet would fade a disabled select (0.7 in
+   * Chrome) and take its value below the text contrast minimum. */
+  input:disabled,
+  select:disabled,
+  textarea:disabled {
+    cursor: not-allowed;
+    opacity: 1;
+  }
+
+  /* A disabled textarea cannot be edited, so it offers no resize handle. */
+  textarea:disabled {
+    resize: none;
+  }
+
+  /* The browser greys a disabled checkbox or radio until checked and
+   * unchecked are about 1.4:1 apart, so a read-only value cannot be told.
+   * These are drawn from the disabled colours instead, at the same size and
+   * without a ring or halo, as before: unchecked, the disabled surface inside
+   * the disabled border, as a disabled text box is drawn and unlike the white
+   * box and dark border of an enabled one; checked, a fill of the disabled
+   * text colour with the check mark or dot cut out of it, so the background
+   * behind shows through. Forced-colors mode keeps the native control, which
+   * draws its states in system colours. */
+  @media (forced-colors: none) {
+    input:is([type="checkbox"], [type="radio"]):disabled {
+      appearance: none;
+      border: var(--border-width) solid var(--control-border-color);
+      background-color: var(--control-background);
+    }
+
+    input[type="checkbox"]:disabled {
+      border-radius: var(--radius-choice);
+    }
+
+    input:is([type="checkbox"], [type="radio"]):disabled:checked {
+      border-color: var(--control-text);
+      background-color: var(--control-text);
+      mask-position: center;
+      mask-size: 100% 100%;
+      mask-repeat: no-repeat;
+    }
+
+    input[type="checkbox"]:disabled:checked {
+      mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath fill-rule='evenodd' d='M0 0h16v16H0zM2.8 8.4 4.2 7l2.3 2.3L11.8 4l1.4 1.4-6.7 6.7z'/%3E%3C/svg%3E");
+    }
+
+    input[type="radio"]:disabled:checked {
+      mask-image: radial-gradient(circle closest-side, transparent 40%, black calc(40% + 0.5px));
+    }
+  }
+
+  fieldset:disabled label {
+    color: var(--color-text-muted);
+  }
+
+  label {
+    font-weight: 600;
+  }
+
+  fieldset {
+    margin: 0;
+    padding: 0;
+    border: 0;
+    min-inline-size: 0;
+  }
+
+  legend {
+    padding: 0;
+    font-weight: 600;
+  }
+
+  small {
+    font-size: var(--font-size-small);
+    color: var(--color-text-muted);
+  }
+
+  table {
+    inline-size: 100%;
+    border-collapse: collapse;
+  }
+
+  th,
+  td {
+    padding-block: var(--space-3);
+    padding-inline: var(--space-3);
+    border-block-end: var(--border-width) solid var(--color-border);
+    text-align: start;
+    vertical-align: middle;
+    /* break-word, not anywhere: anywhere lowers the column's min-content
+     * width, so narrow tables would split words instead of scrolling. */
+    overflow-wrap: break-word;
+  }
+
+  thead th {
+    background-color: var(--color-surface-muted);
+    font-weight: 600;
+  }
+
+  :focus-visible {
+    outline: var(--focus-ring-width) solid var(--color-focus);
+    outline-offset: var(--focus-ring-width);
+  }
+
+  /* A date input's calendar button is a tab stop of its own in Chromium.
+   * While it has focus, the input matches :focus-within but neither :focus
+   * nor :focus-visible, and :focus or :focus-visible on the button itself
+   * never matches, so the ring is drawn on the button from the input's
+   * state in place of the browser's thin one. The ring also shows after the
+   * button is clicked, as it does on a clicked date input. Engines without
+   * this pseudo-element drop the rule, so it stays apart from the rule
+   * above. */
+  input[type="date"]:focus-within:not(:focus)::-webkit-calendar-picker-indicator {
+    outline: var(--focus-ring-width) solid var(--color-focus);
+    outline-offset: var(--focus-ring-width);
+    border-radius: var(--radius-small);
+  }
+
+  /* aria-disabled elements are not natively inert, so pointer input is
+   * blocked here. */
+  [aria-disabled="true"] {
+    pointer-events: none;
+  }
+
+  @media (hover: hover) {
+    button:hover:not(:disabled):not([aria-disabled="true"]) {
+      background-color: var(--color-surface-hover);
+    }
+
+    /* Enabled text-like controls darken their border under the pointer.
+     * :where() keeps these selectors at zero specificity, so the invalid and
+     * disabled colours above still win. The focus ring is an outline and is
+     * left as it is. */
+    :where(input:not([type="checkbox"]):not([type="radio"]):hover:not(:disabled):not([aria-disabled="true"])),
+    :where(select:hover:not(:disabled):not([aria-disabled="true"])),
+    :where(textarea:hover:not(:disabled):not([aria-disabled="true"])) {
+      --control-border-color: var(--color-border-hover);
+    }
+
+    /* Enabled checkboxes and radios show a halo under the pointer, also while
+     * it is on the label that follows them, their larger target. Zero
+     * specificity, so the pressed rule below wins at equal weight. */
+    :where(input:is([type="checkbox"], [type="radio"]):is(:hover, :has(+ label:hover)):not(:disabled):not([aria-disabled="true"])) {
+      --choice-halo-color: var(--color-surface-hover);
+    }
+  }
+
+  /* Pressed: a darker surface than hover. It answers pointer, touch and the
+   * Space key alike, so it sits outside the hover query, and it follows the
+   * hover rule at equal weight, so it wins while both apply. */
+  button:active:not(:disabled):not([aria-disabled="true"]) {
+    background-color: var(--color-surface-active);
+  }
+
+  /* Pressed checkboxes and radios, the label that follows them included,
+   * darken their halo the same way. */
+  :where(input:is([type="checkbox"], [type="radio"]):is(:active, :has(+ label:active)):not(:disabled):not([aria-disabled="true"])) {
+    --choice-halo-color: var(--color-surface-active);
+  }
+
+  /* Pressed text-like controls keep the hover border on a muted surface.
+   * Zero specificity, as for hover, so the invalid and disabled colours
+   * still win. */
+  :where(input:not([type="checkbox"]):not([type="radio"]):active:not(:disabled):not([aria-disabled="true"])),
+  :where(select:active:not(:disabled):not([aria-disabled="true"])),
+  :where(textarea:active:not(:disabled):not([aria-disabled="true"])) {
+    --control-border-color: var(--color-border-hover);
+    --control-background: var(--color-surface-muted);
+  }
+
+  @media (prefers-reduced-motion: no-preference) {
+    button,
+    input,
+    select,
+    textarea {
+      transition:
+        background-color var(--transition-fast),
+        border-color var(--transition-fast);
+    }
+  }
+}
+
+/* Components */
+
+@layer components {
+  /* Application shell: one centred column, top to bottom. */
+  .app {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-5);
+    max-inline-size: var(--content-max-inline-size);
+    margin-inline: auto;
+    padding-block: var(--space-5);
+    padding-inline: var(--space-4);
+    font-family: var(--font-family-base);
+  }
+
+  /* Forms list: one full-width button per form. */
+  .forms-list {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+  }
+
+  .forms-list ul {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+
+  .forms-list li button {
+    justify-content: flex-start;
+    inline-size: 100%;
+    padding-block: var(--space-3);
+    padding-inline: var(--space-4);
+    text-align: start;
+  }
+
+  /* Form view: toolbar, navigator, messages, page tabs, grid. */
+  .form-view {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-4);
+  }
+
+  /* The workspace header holds the toolbar and the navigator, which keep the
+   * form view's gap between them. It is sticky where the viewport has room
+   * (see "Sticky header and tab strip" below). */
+  .form-view__header {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-4);
+  }
+
+  .form-toolbar,
+  .record-navigator {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-2);
+    padding: var(--space-2);
+    border: var(--border-width) solid var(--color-border);
+    border-radius: var(--radius-small);
+    background-color: var(--color-surface-muted);
+  }
+
+  /* "[n] of N" or "New record". It keeps one line's height while empty, as
+   * it is while a form opens, so the text arriving moves nothing. */
+  .record-navigator [role="status"] {
+    min-inline-size: 7.5rem;
+    min-block-size: calc(var(--line-height-base) * 1em);
+    padding-inline: var(--space-2);
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    text-align: center;
+  }
+
+  /* A pending load's status shows the previous coordinates muted until the new ones arrive. */
+  .record-navigator [role="status"][aria-busy="true"] {
+    color: var(--color-text-muted);
+  }
+
+  /* "Saving…" while a save is under way, then "Changes saved." until the next edit; empty
+   * and visually hidden, though still rendered, otherwise. */
+  .form-toolbar [role="status"] {
+    padding-inline: var(--space-2);
+    font-weight: 600;
+  }
+
+  .record-navigator input:not([type="checkbox"]):not([type="radio"]) {
+    inline-size: 5.5rem;
+  }
+
+  /* Pressed entry: the button pressed surface, through the control's custom
+   * property like the other text-control states. */
+  .record-navigator input:not([type="checkbox"]):not([type="radio"]):active:not(:disabled) {
+    --control-background: var(--color-surface-active);
+  }
+
+  /* A pending load disables no control, since a press supersedes it, so the
+   * toolbar and its enabled controls show the progress pointer instead;
+   * disabled controls keep theirs. The label is listed because the user-agent
+   * stylesheet gives labels their own cursor, which blocks inheritance. */
+  .record-navigator[aria-busy="true"],
+  .record-navigator[aria-busy="true"] label,
+  .record-navigator[aria-busy="true"] button:not(:disabled),
+  .record-navigator[aria-busy="true"] input:not(:disabled) {
+    cursor: progress;
+  }
+
+  /* Save and the navigator's controls held while a save runs: aria-disabled
+   * rather than disabled keeps the control a keyboard user pressed focused
+   * until the save settles, so the disabled look is given here, as for the
+   * grid's paging. The base layer's [aria-disabled="true"] rule blocks
+   * pointer input, and their handlers ignore Enter and Space. A blocked
+   * control (.button--blocked) takes the same colours. The go-to box, held
+   * read-only, takes the disabled colours of a text control. */
+  .form-toolbar button[aria-disabled="true"],
+  .record-navigator button[aria-disabled="true"] {
+    border-color: var(--color-border);
+    background-color: var(--color-surface-disabled);
+    color: var(--color-text-muted);
+  }
+
+  .record-navigator input[aria-disabled="true"] {
+    --control-border-color: var(--color-border);
+    --control-background: var(--color-surface-disabled);
+    --control-text: var(--color-text-muted);
+  }
+
+  .record-navigator .field-error {
+    flex-basis: 100%;
+  }
+
+  /* Navigator groups, between which alone the toolbar wraps: a move pair
+   * and the go-to group (label, box and Go) never wrap inside, and the entry
+   * group lets New wrap below Go only when the two cannot share a row. */
+  .record-navigator__moves,
+  .record-navigator__go-to {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    white-space: nowrap;
+  }
+
+  .record-navigator__entry {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-2);
+  }
+
+  /* Page tabs (WAI-ARIA tabs pattern). Panels hide through the native hidden
+   * attribute, so no rule here sets their display. */
+  .page-tabs [role="tablist"] {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-1);
+    padding-inline: var(--space-2);
+    border-block-end: var(--border-width) solid var(--color-border);
+  }
+
+  .page-tabs [role="tab"] {
+    margin-block-end: calc(-1 * var(--border-width));
+    border: var(--border-width) solid transparent;
+    border-start-start-radius: var(--radius-small);
+    border-start-end-radius: var(--radius-small);
+    border-end-start-radius: 0;
+    border-end-end-radius: 0;
+    background-color: transparent;
+    color: var(--color-text);
+    /* The label above the zero-height bold copy below, with no gap between. */
+    flex-direction: column;
+    gap: 0;
+  }
+
+  /* A hidden, zero-height bold copy of the tab's text (its data-text) keeps
+   * every tab as wide as its bold selected state, so selecting a tab moves
+   * no neighbour. The empty alternative text, and visibility: hidden, keep
+   * it out of the tab's accessible name. */
+  .page-tabs [role="tab"]::after {
+    content: attr(data-text);
+    content: attr(data-text) / "";
+    block-size: 0;
+    overflow: hidden;
+    visibility: hidden;
+    font-weight: 700;
+  }
+
+  /* Selected: bold accent text, a top bar and a border joined to the panel,
+   * so colour is not the only cue. */
+  .page-tabs [role="tab"][aria-selected="true"] {
+    border-color: var(--color-border);
+    border-block-end-color: var(--color-page);
+    background-color: var(--color-page);
+    box-shadow: inset 0 3px 0 var(--color-accent);
+    color: var(--color-accent-strong);
+    font-weight: 700;
+  }
+
+  .page-tabs [role="tabpanel"] {
+    padding: var(--space-4);
+    border: var(--border-width) solid var(--color-border);
+    border-block-start: 0;
+    border-end-start-radius: var(--radius-small);
+    border-end-end-radius: var(--radius-small);
+    background-color: var(--color-page);
+  }
+
+  @media (hover: hover) {
+    .page-tabs [role="tab"]:hover:not([aria-selected="true"]):not(:disabled):not([aria-disabled="true"]) {
+      background-color: var(--color-surface-hover);
+    }
+
+    .page-tabs [role="tab"][aria-selected="true"]:hover:not(:disabled):not([aria-disabled="true"]) {
+      background-color: var(--color-accent-subtle);
+    }
+  }
+
+  /* The tab background is set in this layer, so the base hover and pressed
+   * rules do not reach it. An unselected tab takes the neutral surfaces and
+   * the selected tab the accent tints, each pressed one darker than its
+   * hover; the selected tab keeps its top bar, bold accent text and focus
+   * ring in both states. */
+  .page-tabs [role="tab"]:active:not([aria-selected="true"]):not(:disabled):not([aria-disabled="true"]) {
+    background-color: var(--color-surface-active);
+  }
+
+  .page-tabs [role="tab"][aria-selected="true"]:active:not(:disabled):not([aria-disabled="true"]) {
+    background-color: var(--color-accent-muted);
+  }
+
+  /* Sticky header and tab strip. A long page (CaseReport's has 61 fields)
+   * would otherwise scroll Save, the "[n] of N" position and the page tabs
+   * thousands of pixels out of reach, and a dialog returning focus to its
+   * toolbar opener would scroll the page back up to it. The header sticks to
+   * the top of the viewport, a check-code notice (.banner--sticky) just below
+   * it, at the header's block size, and the tab strip below both. FormView
+   * measures and publishes each block size on the form view: the header's as
+   * --form-view-header-block-size, the notice's as
+   * --form-view-notice-block-size (0px while none is shown) and the strip's
+   * as --form-view-tabs-block-size. The strip releases where its page ends.
+   * Header and strip take the page background, so content scrolled under
+   * them does not show through. They stack above the fields, the header
+   * above the notice and the strip it meets once the strip releases, and
+   * below the dialog backdrop (1000).
+   *
+   * Only where the viewport has room for them: at least 48rem wide, where the
+   * header takes two or three rows, about 140-190px, and at least 37.5rem
+   * tall, where header and strip take under a third of the height. Narrower
+   * or shorter viewports, such as phones or a desktop window zoomed to 200%
+   * or 400% (about 640 or 320 CSS px wide), keep normal flow, so nothing
+   * fixed crowds out reflowed content (WCAG 1.4.10). */
+
+  /* Where the header does not stick, nothing sticks above a control outside
+   * it until a check-code notice shows, so focus scrolling a control in from
+   * above the viewport, as Shift+Tab does, would leave it flush with the
+   * top edge and its focus ring cut off. This margin keeps the ring in view.
+   * The notice rule and the wide-layout rules below, at the same zero
+   * specificity, come later and take over where they apply. */
+  :where(.form-view > :not(.form-view__header)),
+  :where(.form-view > :not(.form-view__header)) * {
+    scroll-margin-block-start: var(--focus-ring-room);
+  }
+
+  /* Where the header does not stick, the check-code notice still sticks,
+   * --space-2 below the top of the viewport, so the controls after it keep
+   * clear of it, as all controls keep clear of the stuck parts in the wide
+   * layout below, whose rules come later at the same zero specificity and
+   * take over there. Nothing sticks above the controls before the notice,
+   * and while no notice is shown nothing matches. */
+  :where(.form-view > .banner--sticky ~ *),
+  :where(.form-view > .banner--sticky ~ *) * {
+    scroll-margin-block-start: calc(var(--space-2) + var(--form-view-notice-block-size, 0px) + var(--focus-ring-room));
+  }
+
+  @media (min-width: 48rem) and (min-height: 37.5rem) {
+    .form-view__header {
+      position: sticky;
+      inset-block-start: 0;
+      z-index: 2;
+      background-color: var(--color-page);
+    }
+
+    /* Below the header rather than under it, where the notice would be
+     * hidden again. Like a tab, it clears only the header, below which it
+     * sticks, when a keyboard user reaches a notice that scrolls. */
+    .form-view > .banner--sticky {
+      inset-block-start: var(--form-view-header-block-size, 0px);
+      scroll-margin-block-start: var(--form-view-header-block-size, 0px);
+    }
+
+    .page-tabs [role="tablist"] {
+      position: sticky;
+      inset-block-start: calc(var(--form-view-header-block-size, 0px) + var(--form-view-notice-block-size, 0px));
+      z-index: 1;
+      background-color: var(--color-page);
+    }
+
+    /* Focus scrolls a control into view clear of its scroll margin, so after
+     * Tab, Shift+Tab, the validation summary's jump or a dialog returning
+     * focus, the control and its focus ring sit below the stuck parts rather
+     * than under them: below the header and any check-code notice outside
+     * the page tabs, and below the header, the notice and the strip inside a
+     * tab panel. A tab clears only the header and the notice, below which it
+     * sticks, and the header's own controls clear nothing: stuck in view,
+     * they never scroll the page when focused, as Delete is when its dialog
+     * closes. A scroll padding on the page would count them as hidden under
+     * it and scroll to them, and so would clicking or typing in the
+     * navigator's go-to box. FormView applies the margin itself where the
+     * browser does not, as for a date input's inner fields, or as a notice
+     * grows over the control that holds focus. These rules set the margin's
+     * start only; its end, the same in every layout, follows the media query.
+     * :where() keeps the first rule at zero specificity, so the others win. */
+    :where(.form-view > :not(.form-view__header)),
+    :where(.form-view > :not(.form-view__header)) * {
+      scroll-margin-block-start: calc(
+        var(--form-view-header-block-size, 0px) + var(--form-view-notice-block-size, 0px) + var(--focus-ring-room)
+      );
+    }
+
+    .page-tabs [role="tab"] {
+      scroll-margin-block-start: calc(var(--form-view-header-block-size, 0px) + var(--form-view-notice-block-size, 0px));
+    }
+
+    .page-tabs [role="tabpanel"],
+    .page-tabs [role="tabpanel"] * {
+      scroll-margin-block-start: calc(
+        var(--form-view-header-block-size, 0px) + var(--form-view-notice-block-size, 0px) +
+          var(--form-view-tabs-block-size, 0px) + var(--focus-ring-room)
+      );
+    }
+  }
+
+  /* Block-end clearance, in both layouts. Focus scrolls a control lying partly
+   * below the viewport only until the end of its scroll margin meets the
+   * viewport's bottom edge, so that margin holds what shows below the control:
+   * its focus ring (--focus-ring-room) everywhere outside the header, and in a
+   * field also the rest of the control's row and the lines that describe it.
+   * A checkbox or radio is centred in a --target-size row beside its label,
+   * whose lower part its margin holds. Each hint, length-limit notice and error
+   * message after the control in its field is one line of small text after a
+   * --space-1 gap; a radio counts the messages below its group. Messages count
+   * up to three, each as one line, so a longer list or a wrapped message
+   * shows its first lines. Nothing sticks at the bottom of the viewport, so
+   * the margin is the same where the header sticks and where it does not. The
+   * header's own controls take none, as they take no block-start margin.
+   * Chromium scrolls a focused textarea only as far as its caret, whatever its
+   * margin, so FormView scrolls a control that focus leaves ending inside its
+   * margin the rest of the way, as it does at the start, except where a
+   * pointer press gave the focus.
+   * :where() keeps the first rule at zero specificity, so the field rules win. */
+  :where(.form-view > :not(.form-view__header)),
+  :where(.form-view > :not(.form-view__header)) * {
+    scroll-margin-block-end: var(--focus-ring-room);
+  }
+
+  .field:has(> small) {
+    --field-note-lines: 1;
+  }
+
+  .field:has(> small ~ small) {
+    --field-note-lines: 2;
+  }
+
+  .field:has(> .field-error > p) {
+    --field-error-lines: 1;
+  }
+
+  .field:has(> .field-error > p + p) {
+    --field-error-lines: 2;
+  }
+
+  .field:has(> .field-error > p + p + p) {
+    --field-error-lines: 3;
+  }
+
+  .field > input[type="checkbox"],
+  .field > fieldset > input[type="radio"] {
+    --field-row-rest: calc((var(--target-size) - var(--choice-size)) / 2);
+  }
+
+  .field > :is(input, select, textarea),
+  .field > fieldset > input[type="radio"] {
+    scroll-margin-block-end: max(
+      var(--focus-ring-room),
+      var(--field-row-rest, 0px) + (var(--field-note-lines, 0) + var(--field-error-lines, 0)) *
+        (var(--space-1) + var(--font-size-small) * var(--line-height-base))
+    );
+  }
+
+  /* Fields: one per row in tabIndex order. Each child of .field takes a full
+   * row (label, control, hint, errors) except a checkbox, whose label sits
+   * beside it. */
+  .page-fields {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-4);
+  }
+
+  .field {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-1) var(--space-2);
+    min-inline-size: 0;
+  }
+
+  /* A flex item's automatic minimum width is its longest unbreakable word, so
+   * a prompt, heading, hint or message holding one would widen the field past
+   * a narrow screen. min-inline-size: 0 lets each row shrink to the field's
+   * width and overflow-wrap breaks the word inside it. Labels, hints and
+   * errors take anywhere, which unlike break-word also lowers the min-content
+   * width and so keeps a checkbox's long label beside its box. */
+  .field > * {
+    flex: 1 1 100%;
+    min-inline-size: 0;
+    overflow-wrap: break-word;
+  }
+
+  .field > label,
+  .field > small,
+  .field > .field-error {
+    overflow-wrap: anywhere;
+  }
+
+  .field > input[type="checkbox"] {
+    flex: none;
+  }
+
+  /* The label clicks through to its box, so it shows the box's pointer and
+   * gives the pair its 44px row, as an option group's labels do. Its text is
+   * one anonymous flex item, so a long label still wraps beside the box. */
+  .field > input[type="checkbox"] + label {
+    display: flex;
+    flex: 1 1 0;
+    align-items: center;
+    min-block-size: var(--target-size);
+    cursor: pointer;
+  }
+
+  /* A disabled box ignores its label's clicks, so the label shows the
+   * disabled cursor as the box does. */
+  .field > input[type="checkbox"]:disabled + label {
+    cursor: not-allowed;
+  }
+
+  /* Option group: radio-label pairs in equal columns under the legend. The
+   * columns repeat in pairs, a radio track then a label track, and
+   * auto-placement fills them in source order. The layout relies on
+   * OptionGroup rendering each radio immediately followed by its own label:
+   * every radio then lands in a radio track with its label beside it on the
+   * same row, and pairs wrap only as whole pairs. The label track's minimum
+   * is capped at the width left beside the radio, so a narrow screen still
+   * fits one pair per row. The rendered legend is not a grid item. */
+  .field > fieldset {
+    display: grid;
+    grid-template-columns: repeat(
+      auto-fill,
+      var(--choice-size) minmax(min(8rem, 100% - var(--choice-size) - var(--space-2)), 1fr)
+    );
+    align-items: center;
+    gap: var(--space-1) var(--space-2);
+  }
+
+  .field > fieldset > legend {
+    margin-block-end: var(--space-1);
+  }
+
+  /* The label gives the pair its 44px row and clicks through to the radio.
+   * Its end padding keeps a long label off the next pair, and a word wider
+   * than its column breaks rather than overflowing the fieldset. */
+  .field > fieldset > input[type="radio"] + label {
+    display: inline-flex;
+    align-items: center;
+    min-block-size: var(--target-size);
+    padding-inline-end: var(--space-3);
+    font-weight: 400;
+    overflow-wrap: anywhere;
+    cursor: pointer;
+  }
+
+  /* A disabled fieldset disables its radios; their labels then click
+   * through to nothing, so they show the disabled cursor as the radios do. */
+  .field > fieldset > input[type="radio"]:disabled + label {
+    cursor: not-allowed;
+  }
+
+  /* Read-only metadata, a deleted record, or an unsupported field. The band is
+   * painted, never laid out: the background fills the wrapper and a shadow
+   * spread carries it past the wrapper's edges, so a protected field's label,
+   * control, hint and errors sit exactly where an unprotected field's do, and
+   * a record loading (every field protected) or arriving moves nothing. The
+   * spread is under half the gap between fields, so adjacent bands stay
+   * apart, and inside the padding of the tab panel and of a group. */
+  .field--protected {
+    border-radius: var(--radius-small);
+    background-color: var(--color-surface-muted);
+    box-shadow: 0 0 0 var(--space-1) var(--color-surface-muted);
+  }
+
+  /* A protected box shows a recorded value, so an unchecked one keeps the
+   * strong border and stays visible on the band. Elsewhere the pale disabled
+   * border stays: beside enabled boxes it marks one the user cannot operate. */
+  @media (forced-colors: none) {
+    .field--protected input:is([type="checkbox"], [type="radio"]):disabled:not(:checked) {
+      border-color: var(--color-border-strong);
+    }
+  }
+
+  /* .field--disabled marks a field disabled by check code only, or a draft
+   * frozen while its record is being left or replaced. It is a state hook and
+   * sets no style of its own: its native disabled controls, radios in a
+   * disabled fieldset included, take the one disabled treatment of the base
+   * layer, at full opacity, as protected controls do, and its label, legend,
+   * hint and errors keep full contrast. */
+
+  .field-error {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    color: var(--color-danger-text);
+    font-size: var(--font-size-small);
+    font-weight: 600;
+  }
+
+  .group-section {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-4);
+    padding: var(--space-4);
+    border: var(--border-width) solid var(--color-border-strong);
+    border-radius: var(--radius-large);
+  }
+
+  .group-section > :is(h3, h4) {
+    padding-block-end: var(--space-2);
+    border-block-end: var(--border-width) solid var(--color-border);
+  }
+
+  .label-heading {
+    padding-block-start: var(--space-2);
+  }
+
+  .unsupported-placeholder {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    padding-block: var(--space-2);
+    padding-inline: var(--space-3);
+    border: var(--border-width) dashed var(--color-border-strong);
+    border-radius: var(--radius-small);
+    color: var(--color-text-muted);
+    font-style: italic;
+  }
+
+  .unsupported-placeholder > :first-child {
+    color: var(--color-text);
+    font-style: normal;
+    font-weight: 600;
+  }
+
+  /* Record grid: search, "Show deleted" and the list's status share the
+   * first row; messages, the table and the paging footer each take a full
+   * row. The padding keeps the focus rings of the section's own controls
+   * inside it. The rows pack at the block start, so any height the section
+   * is held at beyond its content, while a search shrinks the list, lies
+   * below the footer instead of spreading the rows apart. */
+  .record-grid {
+    display: flex;
+    flex-wrap: wrap;
+    align-content: flex-start;
+    align-items: center;
+    gap: var(--space-3) var(--space-4);
+    padding: var(--focus-ring-room);
+  }
+
+  /* Only the table scrolls sideways when it is wider than the screen, so the
+   * search box, the toggle and the paging stay in view. min-inline-size: 0
+   * lets the box shrink below the table's width instead of widening the
+   * page, and its padding keeps the focus rings of edge cells inside it.
+   * The negative margin lays that padding over the section's own, so the
+   * table lines up with the search row and the footer. */
+  .record-grid__scroll {
+    min-inline-size: 0;
+    margin-inline: calc(-1 * var(--focus-ring-room));
+    padding: var(--focus-ring-room);
+    overflow-x: auto;
+    scroll-padding-inline: var(--focus-ring-room);
+  }
+
+  /* The grid's scroll box and the find results' wrapper take focus, so a
+   * keyboard can scroll them sideways. Their ring lies inside their padding,
+   * clear of the table, where neither the dialog nor the page clips it. */
+  .record-grid__scroll:focus-visible,
+  .find-dialog__results:focus-visible {
+    outline-offset: calc(-1 * var(--focus-ring-width));
+  }
+
+  /* The scroll box's frame, which does not scroll, draws the scroll cue of
+   * the record grid and of the find results: a shade at each side past which
+   * columns lie out of view, set from the box's measurements (RecordGrid's
+   * useHiddenSides). The shades lie over the rows, whose stripes and tints
+   * would hide a shadow under them, and let pointer input through. They
+   * reach the box's edges, which lie --scroll-cue-outset past the frame's:
+   * the grid's box by its padding, which its negative margin lays over the
+   * section's, while the find results' box has no such margin and fills its
+   * frame. They stop at the table's top and bottom, so the focus ring's top
+   * and bottom stay clear and its sides are only darkened. min-inline-size: 0
+   * lets the frame shrink below the table's width. */
+  .record-grid__frame,
+  .find-dialog__frame {
+    position: relative;
+    min-inline-size: 0;
+  }
+
+  .record-grid__frame {
+    --scroll-cue-outset: calc(-1 * var(--focus-ring-room));
+  }
+
+  .find-dialog__frame {
+    --scroll-cue-outset: 0px;
+  }
+
+  .record-grid__frame::before,
+  .record-grid__frame::after,
+  .find-dialog__frame::before,
+  .find-dialog__frame::after {
+    content: "";
+    position: absolute;
+    inset-block: var(--focus-ring-room);
+    inline-size: var(--space-4);
+    pointer-events: none;
+    opacity: 0;
+  }
+
+  .record-grid__frame::before,
+  .find-dialog__frame::before {
+    inset-inline-start: var(--scroll-cue-outset);
+    background-image: linear-gradient(to right, var(--color-scroll-cue), transparent);
+  }
+
+  .record-grid__frame::after,
+  .find-dialog__frame::after {
+    inset-inline-end: var(--scroll-cue-outset);
+    background-image: linear-gradient(to left, var(--color-scroll-cue), transparent);
+  }
+
+  .record-grid__frame--more-start::before,
+  .record-grid__frame--more-end::after,
+  .find-dialog__frame--more-start::before,
+  .find-dialog__frame--more-end::after {
+    opacity: 1;
+  }
+
+  /* Data cells stay on one line, as in a spreadsheet: values such as
+   * 1980-05-01 would otherwise break at their hyphens on narrow screens.
+   * Headers still wrap at spaces. The header cells alone set the column
+   * widths (fixed layout), so no value widens its column, a bold open row
+   * moves no column and the widths stay the same from page to page. A value
+   * wider than its column ends in an ellipsis; the cell's title holds it in
+   * full. */
+  .record-grid table,
+  .find-dialog table {
+    table-layout: fixed;
+  }
+
+  .record-grid th,
+  .find-dialog th {
+    inline-size: var(--table-column-inline-size);
+  }
+
+  .record-grid td,
+  .find-dialog td {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  /* A find result's position cell holds its Open button and, for a deleted
+   * record, the "(deleted)" note, which wraps under the button instead of
+   * being cut off in a narrow column. */
+  .find-dialog td:first-child {
+    white-space: normal;
+  }
+
+  .record-grid > .record-grid__frame,
+  .record-grid > div,
+  .record-grid > p,
+  .record-grid > footer,
+  .record-grid > .banner {
+    flex: 1 1 100%;
+  }
+
+  /* The status (loading, the outcome and the count) sits at the inline end
+   * of the controls' row, where a search or a toggle is made, with its
+   * Retry after it, and wraps below the controls when the row cannot hold
+   * it. The selector outweighs the full-row rule above. */
+  .record-grid > .record-grid__status {
+    flex: 0 1 auto;
+    margin-inline-start: auto;
+  }
+
+  /* A shown status keeps one width whichever routine text it holds (the
+   * count, "Loading records…" or the longest, "No records found."), so
+   * whether it fits beside the controls depends on the screen width alone:
+   * it no longer hops between rows, moving the table, each time a search
+   * loads. The text stays flush at the inline end. A visually hidden status
+   * is left out, because that utility narrows the box but sets no minimum,
+   * and the hidden box must stay 1px wide. */
+  .record-grid > .record-grid__status:not(.visually-hidden) {
+    min-inline-size: 9rem;
+    font-variant-numeric: tabular-nums;
+    text-align: end;
+  }
+
+  .record-grid input[type="search"] {
+    flex: 1 1 16rem;
+    max-inline-size: 24rem;
+  }
+
+  /* Pressed: while the pointer is down the search box takes the hover
+   * surface and keeps the hover border; an invalid box keeps its danger
+   * border. */
+  .record-grid input[type="search"]:active:not(:disabled) {
+    --control-background: var(--color-surface-hover);
+  }
+
+  .record-grid input[type="search"]:active:not(:disabled):not([aria-invalid="true"]) {
+    --control-border-color: var(--color-border-hover);
+  }
+
+  .record-grid label {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-2);
+    min-block-size: var(--target-size);
+    cursor: pointer;
+  }
+
+  /* A label around a disabled control is not a click target. */
+  .record-grid label:has(:disabled) {
+    cursor: not-allowed;
+  }
+
+  /* "Show deleted": the whole label is the toggle's click target, so it
+   * shows hover and pressed surfaces as a button does. */
+  .record-grid__toggle {
+    padding-inline: var(--space-2);
+    border-radius: var(--radius-small);
+  }
+
+  @media (hover: hover) {
+    .record-grid__toggle:hover:not(:has(:disabled)):not(.record-grid__toggle--pending) {
+      background-color: var(--color-surface-hover);
+    }
+  }
+
+  .record-grid__toggle:active:not(:has(:disabled)):not(.record-grid__toggle--pending) {
+    background-color: var(--color-surface-active);
+  }
+
+  /* A change waiting for the record set to be re-read: the requested state
+   * is shown muted and further presses are ignored. The selector outweighs
+   * the label's pointer cursor above. */
+  .record-grid .record-grid__toggle--pending {
+    color: var(--color-text-muted);
+    cursor: progress;
+  }
+
+  /* Rows of the record grid and of the find results open a record on click
+   * and share one stripe, one hover tint and one pressed tint. The stripe
+   * rule precedes the open-record tint below, so at equal selector weight
+   * the open record's tint beats the stripe. The hover rule follows both and
+   * outweighs them, and the pressed rule follows hover at its weight, so a
+   * pressed row shows the pressed tint over all three. */
+  .record-grid tbody tr,
+  .find-dialog tbody tr {
+    cursor: pointer;
+  }
+
+  .record-grid tbody tr:nth-child(even),
+  .find-dialog tbody tr:nth-child(even) {
+    background-color: var(--color-surface-muted);
+  }
+
+  /* Each row's open action: its first cell's text styled as a link, or
+   * "Open" when that cell is blank. It fills the cell and keeps the 44px
+   * minimum target in both directions, so a short value still has a full
+   * hover and touch target; the cell's padding sets the rest of the row
+   * height. A pointer click anywhere on the row opens the record as well. */
+  .record-grid__open {
+    /* Block-level, so no inline baseline gap adds to the row's height. */
+    display: flex;
+    justify-content: flex-start;
+    inline-size: 100%;
+    min-block-size: var(--target-size);
+    min-inline-size: var(--target-size);
+    padding: 0;
+    border: 0;
+    background-color: transparent;
+    color: inherit;
+    font-weight: inherit;
+    line-height: inherit;
+    text-align: start;
+    text-decoration: underline;
+    text-underline-offset: 2px;
+    white-space: nowrap;
+  }
+
+  /* The open action's visible text, a flex item of the button: it shrinks
+   * with its column and ends in an ellipsis, as the other cells do. */
+  .record-grid__open-text {
+    min-inline-size: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  /* The open action's cell: the button's target height takes the place of
+   * the line and part of the padding of the row's other cells, so the row
+   * stays one line plus their padding tall. */
+  .record-grid tbody td:first-child {
+    padding-block: calc((1lh + 2 * var(--space-3) - var(--target-size)) / 2);
+  }
+
+  /* A button is an atomic inline box, which does not take its cell's
+   * line-through, so a deleted row's button draws both lines itself. */
+  .record-grid__row--deleted .record-grid__open {
+    text-decoration-line: underline line-through;
+  }
+
+  @media (hover: hover) {
+    .record-grid__open:hover:not(:disabled):not([aria-disabled="true"]) {
+      background-color: transparent;
+      text-decoration-thickness: 2px;
+    }
+  }
+
+  /* Pressed: the link keeps its transparent background over the base pressed
+   * surface and thickens its underline beyond the hover state, as the
+   * validation summary's links do; the row shows its own pressed tint. */
+  .record-grid__open:active:not(:disabled):not([aria-disabled="true"]) {
+    background-color: transparent;
+    text-decoration-thickness: 3px;
+  }
+
+  /* Keyboard focus on a row's open action rings the whole row, inset as the
+   * row's own focus ring was, so the ring marks the record, not its first
+   * cell, and no cell's clipping cuts it. The row's ring replaces the
+   * button's, so one ring marks the focused record. */
+  .record-grid tbody tr:has(.record-grid__open:focus-visible) {
+    outline: var(--focus-ring-width) solid var(--color-focus);
+    outline-offset: calc(-1 * var(--focus-ring-width));
+  }
+
+  .record-grid tbody tr .record-grid__open:focus-visible {
+    outline: none;
+  }
+
+  /* The open record: tinted, bold and marked by a bar on its first cell. */
+  .record-grid tbody tr[aria-current="true"] {
+    background-color: var(--color-accent-subtle);
+    font-weight: 600;
+  }
+
+  /* The bar is an inset shadow, not a border: a collapsed border would sit
+   * half outside the table's edge and take width from the cell. It covers
+   * part of the cell's start padding, so the text does not move. The
+   * client lays out left to right, so the bar's offset is physical. */
+  .record-grid tbody tr[aria-current="true"] td:first-child {
+    box-shadow: inset var(--border-width-accent) 0 0 var(--color-accent);
+  }
+
+  /* recStatus 0 rows, listed only while "Show deleted" is on. */
+  .record-grid__row--deleted td {
+    color: var(--color-text-muted);
+    text-decoration: line-through;
+  }
+
+  /* Rows of an earlier page, filter or set, kept on screen while the next
+   * one loads: muted, and inert through their aria-disabled, until the
+   * matching page replaces them. */
+  .record-grid__table--pending tbody {
+    color: var(--color-text-muted);
+    cursor: progress;
+  }
+
+  /* The footer holds only the paging, a block-level flex box that fills
+   * it: "Page x of y" at the inline start, the buttons at the end. */
+  .record-grid__paging {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-2) var(--space-3);
+  }
+
+  .record-grid__paging > :first-child {
+    margin-inline-end: auto;
+  }
+
+  /* Earlier and Later held as one unit, as .banner__actions holds a
+   * banner's buttons: buttons that are direct children wrap one by one, so
+   * Later could land alone at the start of the next line. The group moves
+   * to its own line as a whole, stays at the inline end, and stacks its
+   * buttons in order only when a line cannot hold both. */
+  .record-grid__paging-actions {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: var(--space-2) var(--space-3);
+    margin-inline-start: auto;
+  }
+
+  /* Paging held while the requested page loads: aria-disabled keeps a
+   * pressed button focused, so the disabled look is given here. */
+  .record-grid__paging button[aria-disabled="true"] {
+    border-color: var(--color-border);
+    background-color: var(--color-surface-disabled);
+    color: var(--color-text-muted);
+  }
+
+  @media (hover: hover) {
+    .record-grid tbody tr:hover:not([aria-disabled="true"]),
+    .find-dialog tbody tr:hover:not([aria-disabled="true"]) {
+      background-color: var(--color-accent-subtle);
+    }
+
+    /* The open row rests on the hover tint, so under the pointer it takes a
+     * darker one. :where() holds the selector at the hover rule's weight,
+     * so it wins by order here and the pressed rule below still beats it. */
+    .record-grid tbody tr:where([aria-current="true"]):hover:not([aria-disabled="true"]) {
+      background-color: var(--color-accent-subtle-hover);
+    }
+  }
+
+  /* Pressed: a deeper accent tint than hover. Pointer and touch presses
+   * both set it, so it sits outside the hover query. */
+  .record-grid tbody tr:active:not([aria-disabled="true"]),
+  .find-dialog tbody tr:active:not([aria-disabled="true"]) {
+    background-color: var(--color-accent-muted);
+  }
+
+  /* Banners: message text grows, action buttons (Retry, Discard edits,
+   * Save again, Dismiss) line up at the inline end. */
+  .banner {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-2) var(--space-4);
+    padding-block: var(--space-3);
+    padding-inline: var(--space-4);
+    border: var(--border-width) solid var(--banner-border, var(--color-border-strong));
+    border-inline-start-width: var(--border-width-accent);
+    border-radius: var(--radius-small);
+    background-color: var(--banner-background, var(--color-surface-muted));
+    color: var(--banner-text, var(--color-text));
+  }
+
+  /* Text keeps its natural width: a long message takes its own line and a
+   * short one shares the line with the trace id and buttons. */
+  .banner > :not(button) {
+    flex: 1 1 auto;
+  }
+
+  /* A message can carry the user's own text, such as a URL's record value,
+   * and a flex item's automatic minimum width is its longest unbreakable
+   * word, so one long word would widen the banner past a narrow screen.
+   * min-inline-size: 0 lets the text shrink to the banner's width and
+   * overflow-wrap breaks the word inside it. anywhere, unlike break-word,
+   * also lowers the min-content width, so a banner that is itself a flex
+   * item, as in the record grid, shrinks too. A button group keeps its
+   * buttons whole, so it is left out. */
+  .banner > :not(button):not(.banner__actions) {
+    min-inline-size: 0;
+    overflow-wrap: anywhere;
+  }
+
+  .banner > button:first-of-type {
+    margin-inline-start: auto;
+  }
+
+  /* Two or more buttons held as one unit: buttons that are direct children
+   * wrap one by one, so a later button can land alone at the start of the
+   * next line. The group wraps as a whole and keeps its buttons at the inline
+   * end, wrapping inside itself only when a line cannot hold them all. */
+  .banner__actions {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: var(--space-2) var(--space-4);
+  }
+
+  /* Messages held as one unit: each takes its own line, in order, however
+   * short it is. The column may be narrower than the longest word, such as
+   * a trace id, which then wraps instead of overflowing the banner. */
+  .banner__messages {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: var(--space-1);
+  }
+
+  .banner--error {
+    --banner-border: var(--color-danger-border);
+    --banner-background: var(--color-danger-subtle);
+    --banner-text: var(--color-danger-text);
+  }
+
+  .banner--warning {
+    --banner-border: var(--color-warning-border);
+    --banner-background: var(--color-warning-subtle);
+    --banner-text: var(--color-warning-text);
+  }
+
+  .banner--info {
+    --banner-border: var(--color-info-border);
+    --banner-background: var(--color-info-subtle);
+    --banner-text: var(--color-info-text);
+  }
+
+  /* A non-blocking notice raised by work far down the page (a check-code
+   * event that could not run): it keeps its place in the flow and, once that
+   * place is scrolled past, sticks to the top of the viewport over the
+   * content, lifted by the dialog shadow, so it is seen without taking focus.
+   * Where the workspace header sticks, the notice sticks just below it
+   * instead (see "Sticky header and tab strip"). It lists one line or more
+   * per field whose event failed, so with the server out of reach it would
+   * grow over the whole viewport as the user moves through the form: past a
+   * quarter of the viewport's height it scrolls, which browsers that make a
+   * scroll container keyboard-focusable let a keyboard user do. */
+  .banner--sticky {
+    position: sticky;
+    inset-block-start: var(--space-2);
+    z-index: 1;
+    max-block-size: 25vh;
+    overflow-y: auto;
+    box-shadow: var(--shadow-dialog);
+  }
+
+  /* Field and request-level errors after a rejected save. */
+  .validation-summary {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    padding-block: var(--space-3);
+    padding-inline: var(--space-4);
+    border: var(--border-width) solid var(--color-danger-border);
+    border-inline-start-width: var(--border-width-accent);
+    border-radius: var(--radius-small);
+    background-color: var(--color-danger-subtle);
+    color: var(--color-danger-text);
+  }
+
+  .validation-summary ul {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    margin: 0;
+    padding-inline-start: var(--space-5);
+  }
+
+  /* A field label that jumps to the field: styled as a link. Its box is
+   * exactly as wide as its text, so the separator and message follow the
+   * label directly. It keeps the base button's 44px minimum height, and the
+   * invisible ::after, as tall as the button and at least 44px wide, keeps
+   * the target 44px wide: it starts at the label and, for a short label
+   * such as "Age", trails it over the separator. */
+  .validation-summary li button {
+    position: relative;
+    min-inline-size: 0;
+    padding: 0;
+    border: 0;
+    background-color: transparent;
+    color: inherit;
+    font-weight: 700;
+    text-decoration: underline;
+    text-underline-offset: 2px;
+  }
+
+  .validation-summary li button::after {
+    content: "";
+    position: absolute;
+    inset-block: 0;
+    inset-inline-start: 0;
+    inline-size: 100%;
+    min-inline-size: var(--target-size);
+  }
+
+  /* The label of a field that cannot be edited now: plain bold text, still
+   * focusable and described by its note. */
+  .validation-summary li button[aria-disabled="true"] {
+    text-decoration: none;
+    cursor: default;
+  }
+
+  @media (hover: hover) {
+    .validation-summary li button:hover:not(:disabled):not([aria-disabled="true"]) {
+      background-color: transparent;
+      text-decoration-thickness: 2px;
+    }
+  }
+
+  /* Pressed: the link keeps its transparent background, which this layer
+   * sets over the base pressed surface, and thickens its underline beyond
+   * the hover state instead. */
+  .validation-summary li button:active:not(:disabled):not([aria-disabled="true"]) {
+    text-decoration-thickness: 3px;
+  }
+
+  /* Modal dialogs: plain elements with role="dialog" and aria-modal="true"
+   * (jsdom has no HTMLDialogElement.showModal). Headings, text and forms take
+   * full rows; buttons placed directly in the dialog line up at the end.
+   *
+   * Every dialog component portals its backdrop into <body> and unmounts it on
+   * close, so the page behind is locked exactly while a backdrop is there:
+   * inert blocks the page's controls but not its scrolling. A hidden root
+   * overflow stops wheel, touch and keyboard scrolling of the page and keeps
+   * its scroll position for when the dialog closes; the stable gutter keeps
+   * the room the page scrollbar took, so the page does not shift sideways
+   * when that scrollbar goes.
+   *
+   * The fixed backdrop ends where that gutter begins, and the gutter shows
+   * only the canvas, which takes the root's background colour. So the root
+   * paints the backdrop over the page, and the gutter looks dimmed like the
+   * page beside it, while <body> keeps the page colour, which no longer
+   * passes to the canvas, and covers at least the viewport, so no canvas
+   * shows under the backdrop to be dimmed twice. Overlay scrollbars take no
+   * gutter, and there the backdrop covers the whole viewport itself. */
+  :root:has(> body > .dialog-backdrop) {
+    overflow: hidden;
+    scrollbar-gutter: stable;
+    background-color: var(--color-backdrop-over-page);
+  }
+
+  :root:has(> body > .dialog-backdrop) > body {
+    min-block-size: 100vh;
+  }
+
+  /* A check-code message shows over Find or the delete confirmation in a
+   * backdrop of its own, which dims the page a second time; the gutter takes
+   * both. */
+  :root:has(> body > .dialog-backdrop ~ .dialog-backdrop) {
+    background-color: color-mix(
+      in srgb,
+      rgb(var(--backdrop-tint)) var(--backdrop-opacity),
+      var(--color-backdrop-over-page)
+    );
+  }
+
+  /* The backdrop keeps a scroll range only for a dialog taller than the
+   * visible viewport; contain stops a scroll at its end from chaining on. */
+  .dialog-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 1000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: var(--space-4);
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    background-color: var(--color-backdrop);
+  }
+
+  /* The dialog scrolls its own content. Positioned, it is the containing
+   * block of its absolutely positioned descendants (.visually-hidden text),
+   * which therefore stay inside its scroll area; against the backdrop they
+   * would lengthen the backdrop's scroll range and let the whole dialog,
+   * heading and Close included, scroll off-screen. contain keeps a scroll
+   * that reaches the end of the dialog's content from moving what is behind. */
+  .dialog {
+    position: relative;
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    align-items: center;
+    gap: var(--space-3);
+    inline-size: 100%;
+    max-inline-size: 32rem;
+    max-block-size: calc(100vh - 2 * var(--space-4));
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    padding: var(--space-5);
+    border: var(--border-width) solid var(--color-border);
+    border-radius: var(--radius-large);
+    background-color: var(--color-page);
+    box-shadow: var(--shadow-dialog);
+    color: var(--color-text);
+  }
+
+  .dialog > :not(button) {
+    flex: 1 1 100%;
+  }
+
+  .dialog > h2 {
+    font-size: 1.25rem;
+  }
+
+  /* A dialog's heading and text break a long unbroken word, such as one in a
+   * check-code DIALOG message, inside the box. As flex items their automatic
+   * minimum width is their min-content width, which anywhere lowers and
+   * break-word does not; without it the word would overflow the dialog's
+   * start edge, where it cannot be scrolled into view. */
+  .dialog > :is(h2, p) {
+    overflow-wrap: anywhere;
+  }
+
+  /* Destructive confirmation, such as a dialog's Delete record button. White
+   * on --color-danger is 6.5:1. Disabled keeps the base button:disabled look,
+   * and focus keeps the base :focus-visible ring. */
+  .button--danger:not(:disabled) {
+    border-color: var(--color-danger);
+    background-color: var(--color-danger);
+    color: var(--color-page);
+  }
+
+  @media (hover: hover) {
+    .button--danger:hover:not(:disabled) {
+      border-color: var(--color-danger-text);
+      background-color: var(--color-danger-text);
+    }
+  }
+
+  /* Pressed: the danger counterpart of the base pressed surface, darker
+   * than hover; it follows and out-ranks the hover rule. */
+  .button--danger:active:not(:disabled):not([aria-disabled="true"]) {
+    border-color: var(--color-danger-active);
+    background-color: var(--color-danger-active);
+  }
+
+  /* A resend that may repeat a save already applied, such as a banner's Save
+   * again: warning tones set it apart from Retry and Dismiss beside it.
+   * Disabled keeps the base button:disabled look, and focus keeps the base
+   * :focus-visible ring. */
+  .button--warning:not(:disabled) {
+    border-color: var(--color-warning-border);
+    background-color: var(--color-warning-subtle);
+    color: var(--color-warning-text);
+  }
+
+  @media (hover: hover) {
+    .button--warning:hover:not(:disabled) {
+      background-color: var(--color-warning-hover);
+    }
+  }
+
+  /* Pressed: darker than hover; it follows and out-ranks the hover rule. */
+  .button--warning:active:not(:disabled):not([aria-disabled="true"]) {
+    background-color: var(--color-warning-active);
+  }
+
+  /* A control refused while a write of the draft may already have been
+   * applied: Save, and each move that would first save the dirty draft. It
+   * takes the base button:disabled look, and aria-disabled announces it as
+   * unavailable, yet it stays operable, because its press shows the banner
+   * of that write again. The base layer's [aria-disabled="true"] rule blocks
+   * pointer input, so it is lifted here: otherwise a pointer user who
+   * dismissed the banner would have no way back to its Save again. */
+  .button--blocked[aria-disabled="true"] {
+    border-color: var(--color-border);
+    background-color: var(--color-surface-disabled);
+    color: var(--color-text-muted);
+    cursor: not-allowed;
+    pointer-events: auto;
+  }
+
+  /* Find record: wider panel, heading, field picker, criterion rows,
+   * results. The heading stays above a body that scrolls on its own, so no
+   * scroll, nor what a search brings into view, takes the heading out of
+   * view: the dialog is one column that does not scroll, the heading keeps
+   * its height and the body takes the rest of the dialog's bounded height.
+   * The heading and the body hold the dialog's padding between them, so the
+   * body's scroll area reaches the dialog's edges below the heading, and the
+   * heading's own bottom padding is the gap above the body. */
+  .find-dialog {
+    flex-direction: column;
+    flex-wrap: nowrap;
+    justify-content: flex-start;
+    align-items: stretch;
+    gap: 0;
+    max-inline-size: 56rem;
+    padding: 0;
+  }
+
+  .find-dialog > h2 {
+    flex: none;
+    padding: var(--space-5) var(--space-5) var(--space-3);
+  }
+
+  /* The body: banner, form, action bar and results, one per row. Positioned,
+   * it is the containing block of its .visually-hidden text, which therefore
+   * stays inside its scroll area, as the dialog's does; contain keeps a
+   * scroll that reaches its end from moving what is behind. The scroll
+   * padding keeps the focus ring of a control focused at either edge inside
+   * the body; where the action bar pins (see "Pinned action bar" below), it
+   * also clears the bar. The first field checkbox, focused on open, lies
+   * near the body's top, which it cannot scroll above, so the body opens
+   * unscrolled. */
+  .find-dialog > .find-dialog__body {
+    position: relative;
+    display: flex;
+    flex: 1 1 auto;
+    flex-direction: column;
+    gap: var(--space-3);
+    min-block-size: 0;
+    padding: 0 var(--space-5) var(--space-5);
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    scroll-padding-block: var(--focus-ring-room);
+  }
+
+  .find-dialog form {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-4);
+  }
+
+  .find-dialog fieldset,
+  .find-dialog__fields {
+    padding: var(--space-3);
+    border: var(--border-width) solid var(--color-border);
+    border-radius: var(--radius-small);
+  }
+
+  .find-dialog fieldset > legend {
+    padding-inline: var(--space-1);
+  }
+
+  /* The picker: its legend, limit note and guidance stay in view above the
+   * options, which scroll inside a bounded box, so the criteria sit just
+   * below the picker at every width. The options' padding keeps a
+   * checkbox's focus ring inside the box, and scrolling them to their end
+   * does not scroll the dialog. */
+  .find-dialog__fields {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+  }
+
+  /* A shadow on the top or bottom edge of the options says more fields lie
+   * beyond it, also where the scrollbar overlays them and shows only while
+   * they scroll. Each shadow is fixed to the box (scroll), and a cover in
+   * the page colour at each end of the fields (local) scrolls over it once
+   * that end is reached, so the shadow shows only on an edge with fields
+   * beyond. Backgrounds paint under the fields, so neither covers a
+   * checkbox's focus ring or a field's hover and pressed tints. */
+  .find-dialog__options {
+    max-block-size: min(24rem, 40vh);
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    padding: var(--focus-ring-room);
+    scroll-padding-block: var(--focus-ring-room);
+    background-color: var(--color-page);
+    background-image:
+      linear-gradient(var(--color-page) 30%, transparent),
+      linear-gradient(transparent, var(--color-page) 70%),
+      linear-gradient(var(--color-scroll-cue), transparent),
+      linear-gradient(transparent, var(--color-scroll-cue));
+    background-position: top, bottom, top, bottom;
+    background-size:
+      100% calc(4 * var(--shadow-scroll-edge-size)),
+      100% calc(4 * var(--shadow-scroll-edge-size)),
+      100% var(--shadow-scroll-edge-size),
+      100% var(--shadow-scroll-edge-size);
+    background-repeat: no-repeat;
+    background-attachment: local, local, scroll, scroll;
+  }
+
+  /* As many columns as fit. A column is never wider than the picker, so on a
+   * narrow screen or with enlarged text the picker keeps one full-width
+   * column instead of scrolling sideways. Fields top-align, so the names in
+   * one row line up whatever the length of their descriptions. A column is
+   * at least 12.5rem: four 12rem columns across the full-width dialog leave
+   * a name column too narrow for a long single word such as
+   * Radiculoneuropathy, which Chrome does not hyphenate because it skips
+   * capitalised English words, so it would break inside the word. */
+  .find-dialog__options {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(min(100%, 12.5rem), 1fr));
+    align-items: start;
+    gap: var(--space-1) var(--space-4);
+  }
+
+  /* One child of the options per searchable field: its checkbox,
+   * then its name with the description under it. The text column shrinks
+   * with the picker, so the checkbox stays beside its name and no field
+   * overflows the picker. A name wraps at the word boundaries its <wbr>
+   * elements mark; only a single word wider than the column breaks inside,
+   * hyphenated where the browser can hyphenate it. Content starts at the
+   * top, below the padding that centres one line in the 44px target, so
+   * every field's first line, and the checkbox on it, sits at the same
+   * height whether or not a description follows. */
+  .find-dialog fieldset label,
+  .find-dialog__options > * {
+    display: inline-grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    align-items: start;
+    align-content: start;
+    column-gap: var(--space-2);
+    min-block-size: var(--target-size);
+    padding-block-start: calc((var(--target-size) - 1lh) / 2);
+    overflow-wrap: break-word;
+    hyphens: auto;
+  }
+
+  .find-dialog fieldset label > :not(input),
+  .find-dialog__options > * > :not(input) {
+    grid-column: 2;
+  }
+
+  /* Centres the checkbox (a --choice-size square) on the first line of its
+   * name, also when a long name breaks onto more lines. */
+  .find-dialog fieldset label > input,
+  .find-dialog__options > * > input {
+    margin-block-start: calc((1lh - var(--choice-size)) / 2);
+  }
+
+  /* The whole label toggles its checkbox, so it is the click target: a tint
+   * under the pointer and a darker one while pressed, as on buttons. A field
+   * the six-field limit has disabled takes neither. */
+  .find-dialog__options > label {
+    padding-inline: var(--space-1);
+    border-radius: var(--radius-small);
+    cursor: pointer;
+  }
+
+  /* A field the six-field limit has disabled reads as disabled as a whole:
+   * its name is muted like its description, as in a disabled fieldset. */
+  .find-dialog__options > label:has(:disabled) {
+    color: var(--color-text-muted);
+    cursor: not-allowed;
+  }
+
+  @media (hover: hover) {
+    .find-dialog__options > label:hover:not(:has(:disabled)) {
+      background-color: var(--color-surface-hover);
+    }
+  }
+
+  /* Pressed follows hover at equal weight, so it wins while both apply. */
+  .find-dialog__options > label:active:not(:has(:disabled)) {
+    background-color: var(--color-surface-active);
+  }
+
+  /* One row per checked field: label, value box, hint, Remove button. */
+  .find-dialog__criterion {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-1) var(--space-3);
+    padding-block: var(--space-2);
+    border-block-end: var(--border-width) solid var(--color-border);
+  }
+
+  .find-dialog__criterion > label {
+    flex: 1 1 100%;
+  }
+
+  .find-dialog__criterion > input:not([type="checkbox"]):not([type="radio"]) {
+    flex: 1 1 16rem;
+  }
+
+  /* Pressed value box: a tinted surface and the hover border. An invalid box
+   * keeps its danger border, and a disabled box keeps the disabled colours. */
+  .find-dialog__criterion > input:not([type="checkbox"]):not([type="radio"]):active:not(:disabled) {
+    --control-background: var(--color-surface-muted);
+  }
+
+  .find-dialog__criterion
+    > input:not([type="checkbox"]):not([type="radio"]):active:not(:disabled):not([aria-invalid="true"]) {
+    --control-border-color: var(--color-border-hover);
+  }
+
+  .find-dialog__criterion > small,
+  .find-dialog__criterion > .field-error {
+    flex: 1 1 100%;
+  }
+
+  /* The status line, Search and Close: an opaque bar after the criteria and
+   * before the results, in document and Tab order. A border on each side
+   * divides it from them and, where it pins (see "Pinned action bar"
+   * below), from what scrolls under it and the heading. The negative inline
+   * margins are the body's padding, so the bar spans the dialog. The status
+   * takes the room the buttons leave at the start, and wraps above them
+   * when that room is too narrow. */
+  .find-dialog__footer {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: flex-end;
+    gap: var(--space-2) var(--space-3);
+    margin-inline: calc(-1 * var(--space-5));
+    padding-block: var(--space-3);
+    padding-inline: var(--space-5);
+    border-block: var(--border-width) solid var(--color-border);
+    background-color: var(--color-page);
+  }
+
+  /* Pinned action bar. Where the viewport has room for it, the bar stays in
+   * view: it pins to the body's bottom edge while its place is below the
+   * view, as while the picker and criteria scroll under it, to its top
+   * edge, under the heading, while its place is above the view, as while
+   * the results scroll under it, and sits in its place otherwise. The body
+   * has no top padding, so the top inset is 0. The bottom inset is the
+   * body's padding plus the bar's border, so a bar pinned there sits flush
+   * on the dialog's bottom edge with its outer border clipped rather than
+   * doubling the dialog's own. The body's scroll padding at each end is the
+   * height the bar shows when pinned to that edge, with two lines of status
+   * above its buttons as on a narrow screen: both its borders at the top,
+   * under the heading, and its inner border at the bottom, where its outer
+   * one is clipped. So a control focused under the bar scrolls clear of it
+   * with its focus ring.
+   *
+   * Room is a body taller than both scroll paddings and a focused control
+   * with its ring, so a viewport at least this tall:
+   *     2rem              backdrop padding, 2 × --space-4
+   *   + 2px               the dialog's two borders
+   *   + 3.8125rem         heading: --space-5, a 1.25rem line at 1.25, --space-3
+   *   + 7.75rem + 6px     top padding: the bar's content (--target-size,
+   *                       2 × --space-3, --space-2 and two 1.5rem lines),
+   *                       its two borders and --focus-ring-room
+   *   + 7.75rem + 5px     bottom padding: the same with one border
+   *   + 2.75rem + 8px     a --target-size control, --focus-ring-room each side
+   *   = 24.0625rem + 21px, 406px at the default 16px text.
+   * In a shorter viewport, such as a phone held sideways or a short window
+   * at high zoom, no scroll position would keep a focused control clear of a
+   * pinned bar, so the bar keeps normal flow and the body's scroll padding
+   * is the focus ring's room alone: nothing pinned hides the control that
+   * has focus (WCAG 2.4.11) or crowds out reflowed content (WCAG 1.4.10).
+   * The heading stays above the body at every height. */
+  @media (min-height: calc(24.0625rem + 21px)) {
+    .find-dialog > .find-dialog__body {
+      --find-dialog-bar-content-size: calc(var(--target-size) + 2 * var(--space-3) + var(--space-2) + 2lh);
+      scroll-padding-block:
+        calc(var(--find-dialog-bar-content-size) + 2 * var(--border-width) + var(--focus-ring-room))
+        calc(var(--find-dialog-bar-content-size) + var(--border-width) + var(--focus-ring-room));
+    }
+
+    .find-dialog__footer {
+      position: sticky;
+      inset-block-start: 0;
+      inset-block-end: calc(-1 * (var(--space-5) + var(--border-width)));
+      z-index: 1;
+    }
+  }
+
+  /* Without results nothing follows the bar, so it can never pin to the top
+   * edge; its bottom border would only draw a second line just above the
+   * dialog's own. The border stays, transparent, so the bar keeps its
+   * height when results arrive. */
+  .find-dialog__footer:last-child {
+    border-block-end-color: transparent;
+  }
+
+  .find-dialog__footer > p {
+    flex: 1 1 12rem;
+  }
+
+  .find-dialog__actions {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: var(--space-3);
+    margin-inline-start: auto;
+  }
+
+  /* Wrapper around the results table; scrolls sideways on narrow screens. */
+  .find-dialog__results {
+    padding: var(--focus-ring-room);
+    overflow-x: auto;
+    scroll-padding-inline: var(--focus-ring-room);
+  }
+
+  /* Results of earlier criteria, or kept while a newer search runs: muted,
+   * their rows and Open buttons inert through aria-disabled and drawn as
+   * disabled, until a search with the criteria on screen replaces them.
+   * Inert rows and buttons are no click target, so they take the cursor
+   * of their table body, the default one, instead of the pointer. */
+  .find-dialog__results--stale tbody {
+    color: var(--color-text-muted);
+    cursor: default;
+  }
+
+  .find-dialog__results--stale tbody button {
+    border-color: var(--color-border);
+    background-color: var(--color-surface-disabled);
+    color: var(--color-text-muted);
+  }
+
+  .find-dialog__results--stale tbody :is(tr, button) {
+    cursor: inherit;
+  }
+
+  /* While a search runs, the table and its rows and buttons show progress. */
+  .find-dialog__results table[aria-busy="true"],
+  .find-dialog__results table[aria-busy="true"] tbody {
+    cursor: progress;
+  }
+
+  @media (prefers-reduced-motion: no-preference) {
+    .record-grid tbody tr,
+    .find-dialog tbody tr {
+      transition: background-color var(--transition-fast);
+    }
+  }
+}
+
+/* Utilities */
+
+@layer utilities {
+  /* Author display rules (flex on banners, dialogs, rows) would otherwise
+   * override the user-agent rule behind the hidden attribute. */
+  [hidden] {
+    display: none;
+  }
+
+  /* Present to assistive technology, not drawn on screen. */
+  .visually-hidden {
+    position: absolute;
+    inline-size: 1px;
+    block-size: 1px;
+    margin: -1px;
+    padding: 0;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    clip-path: inset(50%);
+    white-space: nowrap;
+    border: 0;
+  }
+}

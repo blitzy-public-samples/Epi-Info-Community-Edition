@@ -1,0 +1,19 @@
+<Project>
+  <!--
+    Settings shared by the SDK-style test projects of EpiInfo.Web.sln. Both groups are conditioned on
+    UsingMicrosoftNETSdk, which is empty for old-style projects, so the legacy Tests/Tests.csproj stays
+    unaffected where a case-insensitive file system makes Tests/ and tests/ one folder.
+  -->
+  <PropertyGroup Condition="'$(UsingMicrosoftNETSdk)' == 'true'">
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <WarningsAsErrors>nullable</WarningsAsErrors>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+  </PropertyGroup>
+
+  <ItemGroup Condition="'$(UsingMicrosoftNETSdk)' == 'true'">
+    <Using Include="Xunit" />
+  </ItemGroup>
+</Project>

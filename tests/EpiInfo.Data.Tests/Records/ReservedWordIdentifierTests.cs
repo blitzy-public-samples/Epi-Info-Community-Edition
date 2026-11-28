@@ -1,0 +1,2524 @@
+using System.Data;
+using System.Globalization;
+using System.Text;
+using System.Text.RegularExpressions;
+using EpiInfo.Data.Metadata;
+using EpiInfo.Data.Records;
+using EpiInfo.Data.Sql;
+using EpiInfo.Domain.Forms;
+using EpiInfo.Domain.Metadata;
+using EpiInfo.Domain.Records;
+using EpiInfo.Domain.Search;
+using EpiInfo.Domain.Storage;
+using EpiInfo.Domain.Validation;
+using EpiInfo.Domain.Values;
+using EpiInfo.Tests.Shared;
+using Microsoft.Data.SqlClient;
+
+namespace EpiInfo.Data.Tests.Records;
+
+/// <summary>
+/// Integration tests on session temporary tables, for the identifiers and column types the seeded forms do not have,
+/// such as the T-SQL reserved words <c>Order</c>, <c>Select</c> and <c>Group</c> as column names, for stored
+/// values the seeded rows lack, such as text with trailing blanks, for catalogue shapes the seeded forms never
+/// present, such as a page without its table, and for session settings a server can default to, such as
+/// <c>NOCOUNT ON</c>. Each test creates its <c>#</c> tables on one
+/// dedicated connection, reads their schema through <see cref="SqlMetadataReader.ReadTempTableSchemaAsync"/>, builds an
+/// in-memory form over them (no <c>meta*</c> row is written), writes and reads through the open-connection overloads
+/// of <see cref="SqlRecordRepository"/>, or through <see cref="RecordSqlBuilder"/>, <see cref="SearchSqlBuilder"/>
+/// and <see cref="SqlExecution"/> directly, and verifies with plain parameterised <see cref="SqlCommand"/> reads on the
+/// same connection. The temporary tables live in <c>tempdb</c> for that session only and are dropped in
+/// <c>finally</c>, so no seeded row, metadata row or schema object of the database is touched.
+/// </summary>
+/// <remarks>
+/// Assertion messages never quote a parameter or field value; values are compared with
+/// <see cref="Assert.True(bool, string)"/> and a fixed message.
+/// </remarks>
+[Trait("Category", "Integration")]
+[Collection(DatabaseCollections.Database)]
+public sealed class ReservedWordIdentifierTests
+{
+    private const string FixtureOperation = "test.reservedWordIdentifier";
+    private const string StampLogonName = "ReservedWordIdentifierTests";
+
+    // The in-memory form's ids. No seeded view has id 0; the form exists only in the test.
+    private const int FixtureViewId = 0;
+    private const int FixturePageId = 1;
+
+    // The second page only the incomplete-schema fixture adds, after the fixture page.
+    private const int SecondPageId = 2;
+
+    // metaFieldTypes ids and names, as testdata/sql/02_reference_data.sql seeds them.
+    private const int TextTypeId = 1;
+    private const string TextTypeName = "Text";
+    private const int MultilineTypeId = 4;
+    private const string MultilineTypeName = "Multiline";
+    private const int NumberTypeId = 5;
+    private const string NumberTypeName = "Number";
+    private const int PhoneNumberTypeId = 6;
+    private const string PhoneNumberTypeName = "Phone Number";
+    private const int CheckboxTypeId = 10;
+    private const string CheckboxTypeName = "Checkbox";
+    private const int OptionTypeId = 12;
+    private const string OptionTypeName = "Option";
+    private const int LegalValuesTypeId = 17;
+    private const string LegalValuesTypeName = "Legal Values";
+
+    // The items of every Option field: indexes 0, 1 and 2.
+    private const string OptionItems = "A,B,C";
+
+    // Field and column names of the fixtures.
+    private const string BigCount = "BigCount";
+    private const string SmallCount = "SmallCount";
+    private const string Measure = "Measure";
+    private const string TinyChoice = "TinyChoice";
+    private const string SmallChoice = "SmallChoice";
+    private const string IntChoice = "IntChoice";
+    private const string Score = "Score";
+    private const string Surname = "Surname";
+    private const string Remarks = "Remarks";
+    private const string Phone = "Phone";
+    private const string Grade = "Grade";
+    private const string Code = "Code";
+
+    // The width of the fixed-width fixture's nchar columns, and the Legal Values choices of its Grade field: one at
+    // the full width, one padded to it as an nchar code table returns it, and a short one SQL Server pads to the
+    // width when it stores it, which reads back as a text that is no choice.
+    private const int FixedWidth = 5;
+    private const string FullWidthChoice = "F-Fem";
+    private const string PaddedChoice = "M    ";
+    private const string ShortChoice = "U";
+    private const string PaddedShortChoice = "U    ";
+
+    // The width of the fixed-width stamp fixture's nchar(n) logon-name columns.
+    private const int FixedLogonNameWidth = 255;
+
+    // T-SQL reserved words as column names, one per admitted column family: an unquoted one is a syntax error.
+    private const string ReservedOrder = "Order";
+    private const string ReservedSelect = "Select";
+    private const string ReservedGroup = "Group";
+
+    // Dapper's literal token for parameter p1. Dapper's own DynamicParameters would replace it in the command text with
+    // the value of @p1, even inside a bracketed identifier.
+    private const string BinderMarkerColumn = "{=p1}";
+
+    // The element-token alias every packed list's decoding declares, which a per-alternative Find statement lacks.
+    private const string PackedListMarker = "AS [e]([t])";
+
+    // Session temporary tables, one pair per fixture.
+    private const string ExactBase = "#ExactBase";
+    private const string ExactPage = "#ExactPage";
+    private const string SearchBase = "#SearchBase";
+    private const string SearchPage = "#SearchPage";
+    private const string MarkerBase = "#MarkerBase";
+    private const string MarkerPage = "#MarkerPage";
+    private const string PaddingBase = "#PaddingBase";
+    private const string PaddingPage = "#PaddingPage";
+    private const string ReservedBase = "#RwBase";
+    private const string ReservedPage = "#RwPage";
+    private const string BeginBase = "#BeginBase";
+    private const string BeginPage = "#BeginPage";
+    private const string OutcomeBase = "#OutcomeBase";
+    private const string OutcomePage = "#OutcomePage";
+    private const string IncompleteBase = "#IncompleteBase";
+    private const string IncompletePage = "#IncompletePage";
+    private const string NocountBase = "#NocountBase";
+    private const string NocountPage = "#NocountPage";
+    private const string DuplicateIdBase = "#DuplicateIdBase";
+    private const string DuplicateIdPage = "#DuplicateIdPage";
+
+    // A second page's table that lacks the GlobalRecordId record key column.
+    private const string KeylessPage = "#KeylessPage";
+
+    // The fixed-width fixture's tables, whose page columns are nchar.
+    private const string FixedWidthBase = "#FixedWidthBase";
+    private const string FixedWidthPage = "#FixedWidthPage";
+
+    // The fixed-width stamp fixture's tables, whose base logon-name stamp columns are nchar.
+    private const string FixedStampBase = "#FixedStampBase";
+    private const string FixedStampPage = "#FixedStampPage";
+
+    // The bit of @@OPTIONS that SET NOCOUNT turns on.
+    private const int NocountOption = 512;
+
+    // The tail every counted UPDATE of the builders ends with: the statement selects its own row count.
+    private const string RowCountSelect = "; SELECT @@ROWCOUNT";
+
+    // The clause with which a by-id read chooses its one base row.
+    private const string TopOne = "TOP (1)";
+
+    private static readonly TimeSpan TestTimeout = TimeSpan.FromSeconds(120);
+
+    /// <summary>
+    /// Page columns named by the T-SQL reserved words <c>Order</c> (<c>nvarchar(4000)</c>), <c>Select</c>
+    /// (<c>float</c>) and <c>Group</c> (<c>bit</c>) round-trip through the repository's production insert, update and
+    /// by-id read, over a schema the reader built from the catalogue. Every statement naming them succeeds and quotes
+    /// each one in brackets, and a direct read finds the values stored; an unquoted reserved word would be a syntax
+    /// error, so the two together prove the quoting.
+    /// </summary>
+    [Fact]
+    public async Task ReservedWordColumns_RoundTripThroughTheRepository()
+    {
+        await TestDatabase.EnsureReachableAsync();
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        var cancellationToken = timeout.Token;
+        await using var writeLock = await DatabaseWriteLock.AcquireExclusiveAsync(cancellationToken);
+        await using var connection = await TestDatabase.OpenConnectionAsync(cancellationToken);
+        try
+        {
+            var fixture = await CreateFixtureAsync(
+                connection,
+                ReservedBase,
+                ReservedPage,
+                $"[{ReservedOrder}] nvarchar(4000), [{ReservedSelect}] float, [{ReservedGroup}] bit",
+                [
+                    new FixtureField(ReservedOrder, TextTypeId, TextTypeName),
+                    new FixtureField(ReservedSelect, NumberTypeId, NumberTypeName),
+                    new FixtureField(ReservedGroup, CheckboxTypeId, CheckboxTypeName),
+                ],
+                cancellationToken);
+
+            // The columns, with their spelling and family, are the reader's catalogue answer, not the DDL text.
+            var pageTable = Assert.IsType<TableSchema>(fixture.Page.Table);
+            AssertCatalogueColumn(pageTable, ReservedOrder, ColumnFamily.Character);
+            AssertCatalogueColumn(pageTable, ReservedSelect, ColumnFamily.Float);
+            AssertCatalogueColumn(pageTable, ReservedGroup, ColumnFamily.Bit);
+
+            var options = new DatabaseOptions(TestDatabase.ConnectionString);
+            var connections = new SqlConnectionFactory(options);
+            var repository = new SqlRecordRepository(
+                connections,
+                new SqlMetadataReader(connections, options, fixture.Recorder),
+                options,
+                fixture.Recorder);
+            var stamp = new SaveStamp(Environment.UserName, SaveStamp.TruncateToSeconds(DateTime.Now));
+
+            var insertedValues = Values(
+                (ReservedOrder, FieldValue.FromText("o-" + Guid.NewGuid().ToString("N"))),
+                (ReservedSelect, FieldValue.FromNumber(42.5d)),
+                (ReservedGroup, FieldValue.FromBoolean(true)));
+            var inserted = await repository.InsertAsync(
+                connection,
+                fixture.Form,
+                fixture.Schema,
+                insertedValues,
+                stamp,
+                cancellationToken);
+            Assert.True(Guid.TryParse(inserted.GlobalRecordId, out _), "The new GlobalRecordId is not a GUID.");
+            AssertSoleRecord(inserted, inserted, insertedValues, "insert");
+
+            var updatedValues = Values(
+                (ReservedOrder, FieldValue.FromText("updated")),
+                (ReservedSelect, FieldValue.FromNumber(-7d)),
+                (ReservedGroup, FieldValue.FromBoolean(false)));
+            var gated = new List<StoredRecord>();
+            var updated = await repository.UpdateAsync(
+                connection,
+                fixture.Form,
+                fixture.Schema,
+                inserted.GlobalRecordId,
+                updatedValues,
+                () => stamp,
+                stored =>
+                {
+                    gated.Add(stored);
+                    return RecordValidationResult.Success(stored.Values);
+                },
+                permissions: null,
+                cancellationToken);
+            Assert.Equal(RecordWriteStatus.Success, updated.Status);
+            AssertSoleRecord(inserted, Assert.IsType<RecordDto>(updated.Record), updatedValues, "update");
+
+            // The gate saw the stored record, read inside the update's transaction through the same quoted columns.
+            var gatedRecord = Assert.Single(gated);
+            AssertValues(gatedRecord.Values, insertedValues, "update's locked read");
+
+            var read = await repository.GetByIdAsync(
+                connection,
+                fixture.Form,
+                fixture.Schema,
+                inserted.GlobalRecordId,
+                cancellationToken);
+            AssertSoleRecord(inserted, Assert.IsType<RecordDto>(read), updatedValues, "read");
+
+            await AssertReservedWordRowAsync(
+                connection,
+                inserted.GlobalRecordId,
+                updatedValues[ReservedOrder].AsText(),
+                updatedValues[ReservedSelect].AsNumber(),
+                updatedValues[ReservedGroup].AsBoolean(),
+                cancellationToken);
+
+            const string pageInsertPrefix = "INSERT INTO [" + ReservedPage + "]";
+            const string pageUpdatePrefix = "UPDATE [" + ReservedPage + "]";
+            var pageInsert = Assert.Single(
+                fixture.Recorder.ForOperation(RecordOperations.Insert),
+                command => command.CommandText.StartsWith(pageInsertPrefix, StringComparison.Ordinal));
+            var pageUpdate = Assert.Single(
+                fixture.Recorder.ForOperation(RecordOperations.Update),
+                command => command.CommandText.StartsWith(pageUpdatePrefix, StringComparison.Ordinal));
+            var recordRead = Assert.Single(fixture.Recorder.ForOperation(RecordOperations.Get));
+            AssertQuotesReservedWords(pageInsert, inTransaction: true);
+            AssertQuotesReservedWords(pageUpdate, inTransaction: true);
+            AssertQuotesReservedWords(recordRead, inTransaction: false);
+
+            // RecordedCommand.ToString describes a command without its parameter values.
+            Assert.Empty(fixture.Recorder.Failed());
+        }
+        finally
+        {
+            await DropTablesAsync(connection, ReservedPage, ReservedBase);
+        }
+    }
+
+    /// <summary>
+    /// A write whose token is already cancelled when its transaction would start fails with the cancellation before
+    /// any statement is sent: the transaction start observes the token, so the recorder sees no command of the insert,
+    /// the session holds no open transaction afterwards, and neither table holds a row.
+    /// </summary>
+    [Fact]
+    public async Task CancelledWrite_StartsNoTransactionAndSendsNoStatement()
+    {
+        await TestDatabase.EnsureReachableAsync();
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        var cancellationToken = timeout.Token;
+        await using var writeLock = await DatabaseWriteLock.AcquireExclusiveAsync(cancellationToken);
+        await using var connection = await TestDatabase.OpenConnectionAsync(cancellationToken);
+        try
+        {
+            var fixture = await CreateFixtureAsync(
+                connection,
+                BeginBase,
+                BeginPage,
+                $"[{Surname}] nvarchar(4000)",
+                [new FixtureField(Surname, TextTypeId, TextTypeName)],
+                cancellationToken);
+
+            var options = new DatabaseOptions(TestDatabase.ConnectionString);
+            var connections = new SqlConnectionFactory(options);
+            var repository = new SqlRecordRepository(
+                connections,
+                new SqlMetadataReader(connections, options, fixture.Recorder),
+                options,
+                fixture.Recorder);
+            var stamp = new SaveStamp(StampLogonName, SaveStamp.TruncateToSeconds(DateTime.Now));
+
+            // Only the insert runs under the aborted token; the fixture and the checks keep the test's own token.
+            using var aborted = new CancellationTokenSource();
+            await aborted.CancelAsync();
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => repository.InsertAsync(
+                connection,
+                fixture.Form,
+                fixture.Schema,
+                Values((Surname, FieldValue.FromText("b-" + Guid.NewGuid().ToString("N")))),
+                stamp,
+                aborted.Token));
+
+            Assert.Empty(fixture.Recorder.ForOperation(RecordOperations.Insert));
+            await using (var command = new SqlCommand("SELECT @@TRANCOUNT", connection))
+            {
+                var openTransactions = Assert.IsType<int>(await command.ExecuteScalarAsync(cancellationToken));
+                Assert.True(openTransactions == 0, "The cancelled write left a transaction open on the session.");
+            }
+
+            foreach (var tableName in new[] { BeginBase, BeginPage })
+            {
+                await using var command = new SqlCommand($"SELECT COUNT(*) FROM [{tableName}]", connection);
+                var rows = Assert.IsType<int>(await command.ExecuteScalarAsync(cancellationToken));
+                Assert.True(rows == 0, "The cancelled write left a row in a fixture table.");
+            }
+        }
+        finally
+        {
+            await DropTablesAsync(connection, BeginPage, BeginBase);
+        }
+    }
+
+    /// <summary>
+    /// An insert through the repository's production insert, on a form whose second page has no catalogue table, or
+    /// has one without its <c>GlobalRecordId</c> record key column, is refused before any statement is sent: it fails
+    /// with the store's <see cref="DataStoreWriteException"/> for <c>records.insert</c> and
+    /// <see cref="WriteOutcome.NotWritten"/>, and neither the base table nor the first page's table holds a row, so no
+    /// record is committed without one of its page rows.
+    /// </summary>
+    /// <param name="pageTableExists">
+    /// Whether the second page has a table, which then lacks its record key column; otherwise it has none.
+    /// </param>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task InsertOnPageWithoutCatalogueTableOrKey_IsRefusedWithNothingWritten(bool pageTableExists)
+    {
+        await TestDatabase.EnsureReachableAsync();
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        var cancellationToken = timeout.Token;
+        await using var writeLock = await DatabaseWriteLock.AcquireExclusiveAsync(cancellationToken);
+        await using var connection = await TestDatabase.OpenConnectionAsync(cancellationToken);
+        try
+        {
+            var fixture = await CreateFixtureAsync(
+                connection,
+                IncompleteBase,
+                IncompletePage,
+                $"[{Surname}] nvarchar(4000)",
+                [new FixtureField(Surname, TextTypeId, TextTypeName)],
+                cancellationToken);
+
+            var options = new DatabaseOptions(TestDatabase.ConnectionString);
+            var connections = new SqlConnectionFactory(options);
+            var reader = new SqlMetadataReader(connections, options, fixture.Recorder);
+            TableSchema? secondTable = null;
+            if (pageTableExists)
+            {
+                await ExecuteDdlAsync(
+                    connection,
+                    $"CREATE TABLE [{KeylessPage}] ([{Remarks}] nvarchar(4000));",
+                    cancellationToken);
+                secondTable = await reader.ReadTempTableSchemaAsync(connection, KeylessPage, cancellationToken);
+                Assert.Null(secondTable.FindColumn("GlobalRecordId"));
+            }
+
+            // The second page holds no data field, as a page without a table has none and the keyless table's column is
+            // left unbound: the form's values all belong to the first page, so the empty submission passes the values
+            // contract. The metadata reader refuses a form whose page table is missing or lacks its record key, so only
+            // a schema built in memory, as here, reaches the store's own guard.
+            var secondPage = new PageMetadata(
+                SecondPageId,
+                "Page 2",
+                Position: 1,
+                secondTable?.Name ?? IncompleteBase + SecondPageId.ToString(CultureInfo.InvariantCulture));
+            var form = fixture.Form with { Pages = [.. fixture.Form.Pages, secondPage] };
+            var schema = new FormSchema(
+                FixtureViewId,
+                fixture.Schema.BaseTable,
+                [fixture.Page, new PageTableSchema(secondPage, secondTable)]);
+            var repository = new SqlRecordRepository(connections, reader, options, fixture.Recorder);
+            var stamp = new SaveStamp(StampLogonName, SaveStamp.TruncateToSeconds(DateTime.Now));
+
+            fixture.Recorder.Clear();
+            var failure = await Assert.ThrowsAsync<DataStoreWriteException>(() => repository.InsertAsync(
+                connection,
+                form,
+                schema,
+                Values(),
+                stamp,
+                cancellationToken));
+            Assert.Equal(WriteOutcome.NotWritten, failure.Outcome);
+            Assert.Equal(RecordOperations.Insert, failure.Operation);
+            Assert.Empty(fixture.Recorder.Writes());
+            Assert.Empty(fixture.Recorder.ForOperation(RecordOperations.Insert));
+
+            foreach (var table in new[] { IncompleteBase, IncompletePage })
+            {
+                await using var command = new SqlCommand($"SELECT COUNT(*) FROM [{table}]", connection);
+                var rows = Assert.IsType<int>(await command.ExecuteScalarAsync(cancellationToken));
+                Assert.True(rows == 0, table + " holds a row of the refused insert.");
+            }
+        }
+        finally
+        {
+            await DropTablesAsync(connection, KeylessPage, IncompletePage, IncompleteBase);
+        }
+    }
+
+    /// <summary>
+    /// A <c>bigint</c> number field and Option fields on <c>tinyint</c>, <c>smallint</c> and <c>int</c> columns
+    /// are bound with the column's exact type and CLR value, stored exactly, and read back exactly, before and after
+    /// an update to an adjacent integer that a double could not tell apart from the inserted one.
+    /// </summary>
+    [Theory]
+    [InlineData(9007199254740993L, 9007199254740992L)]
+    [InlineData(-9007199254740993L, -9007199254740992L)]
+    [InlineData(long.MaxValue, long.MaxValue - 1)]
+    [InlineData(long.MinValue, long.MinValue + 1)]
+    public async Task IntegerColumns_WriteAndReadBackExactly(long inserted, long updated)
+    {
+        await TestDatabase.EnsureReachableAsync();
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        var cancellationToken = timeout.Token;
+        await using var writeLock = await DatabaseWriteLock.AcquireExclusiveAsync(cancellationToken);
+        await using var connection = await TestDatabase.OpenConnectionAsync(cancellationToken);
+        try
+        {
+            var fixture = await CreateFixtureAsync(
+                connection,
+                ExactBase,
+                ExactPage,
+                $"[{BigCount}] bigint, [{TinyChoice}] tinyint, [{SmallChoice}] smallint, [{IntChoice}] int",
+                [
+                    new FixtureField(BigCount, NumberTypeId, NumberTypeName),
+                    new FixtureField(TinyChoice, OptionTypeId, OptionTypeName, OptionItems),
+                    new FixtureField(SmallChoice, OptionTypeId, OptionTypeName, OptionItems),
+                    new FixtureField(IntChoice, OptionTypeId, OptionTypeName, OptionItems),
+                ],
+                cancellationToken);
+
+            var globalRecordId = await InsertBaseAsync(fixture, connection, cancellationToken);
+            var insert = RecordSqlBuilder.InsertPage(
+                fixture.Page,
+                globalRecordId,
+                fixture.PageColumns,
+                Values(
+                    (BigCount, FieldValue.FromInteger(inserted)),
+                    (TinyChoice, FieldValue.FromIndex(2)),
+                    (SmallChoice, FieldValue.FromIndex(1)),
+                    (IntChoice, FieldValue.FromIndex(0))));
+
+            // INSERT INTO [page] ([GlobalRecordId], [col1], ...) VALUES (@p0, @p1, ...): each column's value follows
+            // the key's, in page-column order.
+            AssertBound(insert.Parameters[1 + fixture.IndexOf(BigCount)], DbType.Int64, inserted, BigCount);
+            AssertBound(insert.Parameters[1 + fixture.IndexOf(TinyChoice)], DbType.Byte, (byte)2, TinyChoice);
+            AssertBound(insert.Parameters[1 + fixture.IndexOf(SmallChoice)], DbType.Int16, (short)1, SmallChoice);
+            AssertBound(insert.Parameters[1 + fixture.IndexOf(IntChoice)], DbType.Int32, 0, IntChoice);
+
+            Assert.Equal(1, await ExecuteAsync(fixture, connection, insert, cancellationToken));
+            await AssertStoredExactlyAsync(fixture, connection, globalRecordId, inserted, 2, 1, 0, cancellationToken);
+
+            var updates = RecordSqlBuilder.UpdatePageColumns(
+                fixture.Page,
+                globalRecordId,
+                [
+                    (fixture.Column(BigCount), FieldValue.FromInteger(updated)),
+                    (fixture.Column(TinyChoice), FieldValue.FromIndex(0)),
+                    (fixture.Column(SmallChoice), FieldValue.FromIndex(2)),
+                    (fixture.Column(IntChoice), FieldValue.FromIndex(1)),
+                ]);
+            var update = Assert.Single(updates);
+
+            // UPDATE [page] SET [colA] = @p0, ... WHERE [GlobalRecordId] = @pN: values in submitted order.
+            AssertBound(update.Parameters[0], DbType.Int64, updated, BigCount);
+            AssertBound(update.Parameters[1], DbType.Byte, (byte)0, TinyChoice);
+            AssertBound(update.Parameters[2], DbType.Int16, (short)2, SmallChoice);
+            AssertBound(update.Parameters[3], DbType.Int32, 1, IntChoice);
+
+            Assert.Equal(1, await ExecuteAsync(fixture, connection, update, cancellationToken));
+            await AssertStoredExactlyAsync(fixture, connection, globalRecordId, updated, 0, 2, 1, cancellationToken);
+        }
+        finally
+        {
+            await DropTablesAsync(connection, ExactPage, ExactBase);
+        }
+    }
+
+    /// <summary>
+    /// Find on integer and float number columns returns exactly the rows the criterion selects, with SQL Server never
+    /// rounding a <c>bigint</c> column to <c>float</c>: adjacent values beyond 2^53 stay distinct for equality and
+    /// every ordering operator; a criterion that holds no exact integer is bound as the decimal half-way inside its
+    /// integer interval, even where its nearest double is whole; criteria beyond the <c>bigint</c> range fall on the
+    /// correct side of every value, <c>long.MinValue</c> and <c>long.MaxValue</c> included; a JSON number criterion
+    /// keeps the same exact interval; and a float column binds its criterion as before.
+    /// </summary>
+    /// <param name="field">The searched field.</param>
+    /// <param name="criterion">The criterion text, as the API receives it, or a JSON number literal.</param>
+    /// <param name="expectedRows">The labels of the rows it must return, in <c>UniqueKey</c> order.</param>
+    /// <param name="expectedType">The type the criterion must be bound with.</param>
+    /// <param name="expectedValue">
+    /// The CLR value the criterion must be bound with; for <see cref="DbType.Decimal"/> its invariant text, because an
+    /// attribute cannot hold a decimal constant.
+    /// </param>
+    /// <param name="jsonNumber">
+    /// Whether <paramref name="criterion"/> is a JSON number literal, read from its UTF-8 bytes as JSON criteria are.
+    /// </param>
+    [Theory]
+    [InlineData(BigCount, "9007199254740993", "B", DbType.Int64, 9007199254740993L)]
+    [InlineData(BigCount, "<>9007199254740993", "ACDE", DbType.Int64, 9007199254740993L)]
+    [InlineData(BigCount, "<9007199254740993", "AE", DbType.Int64, 9007199254740993L)]
+    [InlineData(BigCount, ">9007199254740992", "BCD", DbType.Int64, 9007199254740992L)]
+    [InlineData(BigCount, "<=9007199254740993", "ABE", DbType.Int64, 9007199254740993L)]
+    [InlineData(BigCount, ">=9007199254740994", "CD", DbType.Int64, 9007199254740994L)]
+    [InlineData(BigCount, ">=9223372036854775807", "D", DbType.Int64, long.MaxValue)]
+    [InlineData(BigCount, "-9223372036854775808", "E", DbType.Int64, long.MinValue)]
+    // 9007199254740992.5 has the nearest double 9007199254740992, yet is bound inside (9007199254740992, ...993).
+    [InlineData(BigCount, "9007199254740992.5", "", DbType.Decimal, "9007199254740992.5")]
+    [InlineData(BigCount, ">9007199254740992.5", "BCD", DbType.Decimal, "9007199254740992.5")]
+    [InlineData(BigCount, "<9007199254740992.5", "AE", DbType.Decimal, "9007199254740992.5")]
+    [InlineData(BigCount, "9007199254740992.5", "", DbType.Decimal, "9007199254740992.5", true)]
+    [InlineData(BigCount, ">9223372036854775806.9", "D", DbType.Decimal, "9223372036854775806.5")]
+    [InlineData(BigCount, "<9223372036854775807.5", "ABCDE", DbType.Decimal, "9223372036854775807.5")]
+    [InlineData(BigCount, "<-9223372036854775807.5", "E", DbType.Decimal, "-9223372036854775807.5")]
+    // Beyond the bigint range, whose nearest doubles 2^63 and -2^63 bigint values convert to, the criterion is bound
+    // just beyond the range's end on its side.
+    [InlineData(BigCount, "<9223372036854775808", "ABCDE", DbType.Decimal, "9223372036854775807.5")]
+    [InlineData(BigCount, "9223372036854775808", "", DbType.Decimal, "9223372036854775807.5")]
+    [InlineData(BigCount, "-9223372036854775809", "", DbType.Decimal, "-9223372036854775808.5")]
+    [InlineData(BigCount, ">-9223372036854775809", "ABCDE", DbType.Decimal, "-9223372036854775808.5")]
+    [InlineData(BigCount, ">-1e19", "ABCDE", DbType.Decimal, "-9223372036854775808.5")]
+    [InlineData(BigCount, "<-1e19", "", DbType.Decimal, "-9223372036854775808.5")]
+    [InlineData(SmallCount, "3", "B", DbType.Int64, 3L)]
+    [InlineData(SmallCount, ">2.5", "B", DbType.Decimal, "2.5")]
+    [InlineData(SmallCount, "2.5", "", DbType.Decimal, "2.5")]
+    // Both have the nearest double 2, but lie inside (2, 3) and (1, 2).
+    [InlineData(SmallCount, "2.0000000000000001", "", DbType.Decimal, "2.5")]
+    [InlineData(SmallCount, "<2.0000000000000001", "A", DbType.Decimal, "2.5")]
+    [InlineData(SmallCount, ">1.9999999999999999", "AB", DbType.Decimal, "1.5")]
+    [InlineData(Measure, "37.5", "A", DbType.Double, 37.5d)]
+    [InlineData(Measure, ">37.5", "B", DbType.Double, 37.5d)]
+    public async Task NumberColumns_FindComparesCriteriaExactly(
+        string field,
+        string criterion,
+        string expectedRows,
+        DbType expectedType,
+        object expectedValue,
+        bool jsonNumber = false)
+    {
+        var expected = expectedType == DbType.Decimal
+            ? decimal.Parse(Assert.IsType<string>(expectedValue), NumberStyles.Number, CultureInfo.InvariantCulture)
+            : expectedValue;
+        var criterionValue = jsonNumber ? JsonNumber(criterion) : FieldValue.FromText(criterion);
+
+        await TestDatabase.EnsureReachableAsync();
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        var cancellationToken = timeout.Token;
+        await using var writeLock = await DatabaseWriteLock.AcquireExclusiveAsync(cancellationToken);
+        await using var connection = await TestDatabase.OpenConnectionAsync(cancellationToken);
+        try
+        {
+            var fixture = await CreateFixtureAsync(
+                connection,
+                SearchBase,
+                SearchPage,
+                $"[{BigCount}] bigint, [{SmallCount}] int, [{Measure}] float",
+                [
+                    new FixtureField(BigCount, NumberTypeId, NumberTypeName),
+                    new FixtureField(SmallCount, NumberTypeId, NumberTypeName),
+                    new FixtureField(Measure, NumberTypeId, NumberTypeName),
+                ],
+                cancellationToken);
+
+            // Every row is active (InsertBase writes RecStatus 1) and has its page row, which Find joins.
+            var rows = new (string Label, (string Name, FieldValue Value)[] Values)[]
+            {
+                ("A", [
+                    (BigCount, FieldValue.FromInteger(9007199254740992L)),
+                    (SmallCount, FieldValue.FromInteger(2)),
+                    (Measure, FieldValue.FromNumber(37.5d)),
+                ]),
+                ("B", [
+                    (BigCount, FieldValue.FromInteger(9007199254740993L)),
+                    (SmallCount, FieldValue.FromInteger(3)),
+                    (Measure, FieldValue.FromNumber(38.25d)),
+                ]),
+                ("C", [(BigCount, FieldValue.FromInteger(9007199254740994L))]),
+                ("D", [(BigCount, FieldValue.FromInteger(long.MaxValue))]),
+                ("E", [(BigCount, FieldValue.FromInteger(long.MinValue))]),
+            };
+
+            var labels = new Dictionary<string, string>(StringComparer.Ordinal);
+            foreach (var (label, values) in rows)
+            {
+                var globalRecordId = await InsertBaseAsync(fixture, connection, cancellationToken);
+                var insert = RecordSqlBuilder.InsertPage(
+                    fixture.Page, globalRecordId, fixture.PageColumns, Values(values));
+                Assert.Equal(1, await ExecuteAsync(fixture, connection, insert, cancellationToken));
+                labels.Add(globalRecordId, label);
+            }
+
+            var parsed = SearchCriteriaParser.Parse(fixture.DataFields, [new SearchCriterion(field, criterionValue)]);
+            Assert.True(parsed.IsSuccess, "The criterion must parse as a number criterion.");
+
+            var search = SearchSqlBuilder.Search(
+                fixture.Schema,
+                fixture.DataFields,
+                RecordQueryRules.GetGridColumns(fixture.DataFields),
+                parsed.Conditions,
+                includeDeleted: false,
+                excludeGlobalRecordId: null);
+
+            var bound = CriterionParameter(search.Statement);
+            Assert.Equal(expectedType, bound.DbType);
+            Assert.Null(bound.Size);
+            Assert.IsType(expected.GetType(), bound.Value);
+            Assert.True(expected.Equals(bound.Value), "The criterion is not bound with the expected value.");
+
+            Task<List<string>> FindAsync(SqlStatement statement) => SqlExecution.ReadAsync(
+                connection,
+                transaction: null,
+                FixtureOperation,
+                statement,
+                fixture.CommandTimeoutSeconds,
+                fixture.Recorder,
+                cancellationToken,
+                static async (reader, token) =>
+                {
+                    var ids = new List<string>();
+                    while (await reader.ReadAsync(token))
+                    {
+                        ids.Add(reader.GetString(SearchSqlBuilder.IdOrdinal));
+                    }
+
+                    return ids;
+                });
+
+            var found = await FindAsync(search.Statement);
+            Assert.Equal(expectedRows, string.Concat(found.Select(id => labels[id])));
+
+            // Packed, as a search beyond the scalar budget binds it, the criterion travels as a packed list element,
+            // never through OPENJSON, which needs compatibility level 130, and selects exactly the same rows: bigint,
+            // decimal and float criteria decode to their own exact values.
+            var packed = SearchSqlBuilder.Search(
+                fixture.Schema,
+                fixture.DataFields,
+                RecordQueryRules.GetGridColumns(fixture.DataFields),
+                parsed.Conditions,
+                includeDeleted: false,
+                excludeGlobalRecordId: null,
+                scalarParameterBudget: 0);
+            Assert.Contains(PackedListMarker, packed.Statement.Text, StringComparison.Ordinal);
+            Assert.DoesNotContain(PackedListMarker, search.Statement.Text, StringComparison.Ordinal);
+            Assert.DoesNotContain("OPENJSON", packed.Statement.Text, StringComparison.Ordinal);
+            Assert.DoesNotContain("OPENJSON", search.Statement.Text, StringComparison.Ordinal);
+
+            var packedFound = await FindAsync(packed.Statement);
+            Assert.Equal(expectedRows, string.Concat(packedFound.Select(id => labels[id])));
+        }
+        finally
+        {
+            await DropTablesAsync(connection, SearchPage, SearchBase);
+        }
+    }
+
+    /// <summary>
+    /// Criteria on the text <c>Surname</c>, the multiline <c>Remarks</c> and the Phone Number <c>Phone</c>, each with
+    /// the operator the parser gives it and the labels of the rows Find must return, in <c>UniqueKey</c> order, over
+    /// the stored rows of <see cref="StoredValues_FindPadsTrailingBlanksButLikeDoesNot"/>.
+    /// </summary>
+    /// <remarks>
+    /// <c>FakeDataStoreTrailingBlankFindTests</c> in <c>EpiInfo.Api.Tests</c> pins the same rows and cases on the
+    /// in-memory store; the two tables must stay identical.
+    /// </remarks>
+    public static TheoryData<string, string, SearchOperator, string> TrailingBlankCases => new()
+    {
+        // Equality pads the shorter text, so the stored "Smith ", "Smith   " and "Smith" are all found.
+        { Surname, "Smith", SearchOperator.Equal, "ABC" },
+
+        // LIKE keeps trailing blanks significant: %Smith_ matches only the one-blank "Smith ", and %mith only "Smith".
+        // The parser takes LIKE only for a value holding *, % or ?, so * leads each pattern.
+        { Surname, "*Smith_", SearchOperator.Like, "B" },
+        { Surname, "*mith", SearchOperator.Like, "A" },
+
+        // The multiline prefix equality pads too: "Notes" finds the stored "Notes   ", and a 300-character criterion
+        // whose 255-character prefix ends in five blanks finds a stored prefix ending in the same blanks, and the
+        // stored 250 letters alone, but not 251 letters.
+        { Remarks, "Notes", SearchOperator.PrefixEqual255, "AB" },
+        {
+            Remarks,
+            new string('a', 250) + new string(' ', 5) + new string('c', 45),
+            SearchOperator.PrefixEqual255,
+            "CD"
+        },
+        { Remarks, "*Notes", SearchOperator.Like, "A" },
+
+        // Phone Number keeps its prefix as the operator, and the stored "555-0148 " orders as "555-0148" does. A NULL
+        // phone satisfies no comparison.
+        { Phone, ">555-0148", SearchOperator.Greater, "C" },
+        { Phone, ">=555-0148", SearchOperator.GreaterOrEqual, "ABC" },
+        { Phone, "<>555-0148", SearchOperator.NotEqual, "CE" },
+        { Phone, "555-0148", SearchOperator.Equal, "AB" },
+        { Phone, "<=555-0148", SearchOperator.LessOrEqual, "ABE" },
+        { Phone, "<555-0148", SearchOperator.Less, "E" },
+    };
+
+    /// <summary>
+    /// Find over stored values with trailing blanks, which no seeded row holds, returns exactly the rows SQL Server's
+    /// comparison rules select: text and Phone Number comparisons and the multiline 255-character prefix equality pad
+    /// the shorter operand with spaces, while <c>LIKE</c> keeps trailing blanks significant, on both the scalar and the
+    /// packed statement. Each criterion goes through <see cref="SearchCriteriaParser"/> on the fixture's Text,
+    /// Multiline and Phone Number metadata, over the column types their seeded fields use: <c>nvarchar(4000)</c>,
+    /// <c>ntext</c> and <c>nvarchar(20)</c>.
+    /// </summary>
+    /// <param name="field">The searched field.</param>
+    /// <param name="criterion">The criterion text, as the API receives it.</param>
+    /// <param name="expectedOperator">The operator the parser must give the criterion's one alternative.</param>
+    /// <param name="expectedRows">The labels of the rows it must return, in <c>UniqueKey</c> order.</param>
+    [Theory]
+    [MemberData(nameof(TrailingBlankCases))]
+    public async Task StoredValues_FindPadsTrailingBlanksButLikeDoesNot(
+        string field,
+        string criterion,
+        SearchOperator expectedOperator,
+        string expectedRows)
+    {
+        await TestDatabase.EnsureReachableAsync();
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        var cancellationToken = timeout.Token;
+        await using var writeLock = await DatabaseWriteLock.AcquireExclusiveAsync(cancellationToken);
+        await using var connection = await TestDatabase.OpenConnectionAsync(cancellationToken);
+        try
+        {
+            var fixture = await CreateFixtureAsync(
+                connection,
+                PaddingBase,
+                PaddingPage,
+                $"[{Surname}] nvarchar(4000), [{Remarks}] ntext, [{Phone}] nvarchar(20)",
+                [
+                    new FixtureField(Surname, TextTypeId, TextTypeName),
+                    new FixtureField(Remarks, MultilineTypeId, MultilineTypeName),
+                    new FixtureField(Phone, PhoneNumberTypeId, PhoneNumberTypeName),
+                ],
+                cancellationToken);
+
+            // Every row is active and has its page row. B holds A's three texts with trailing blanks; C and D hold
+            // multiline values whose 255-character prefixes equal the long criterion's once padded, and E one whose
+            // prefix differs before the blanks; a field a row omits is NULL.
+            var rows = new (string Label, (string Name, FieldValue Value)[] Values)[]
+            {
+                ("A", [
+                    (Surname, FieldValue.FromText("Smith")),
+                    (Remarks, FieldValue.FromText("Notes")),
+                    (Phone, FieldValue.FromText("555-0148")),
+                ]),
+                ("B", [
+                    (Surname, FieldValue.FromText("Smith ")),
+                    (Remarks, FieldValue.FromText("Notes   ")),
+                    (Phone, FieldValue.FromText("555-0148 ")),
+                ]),
+                ("C", [
+                    (Surname, FieldValue.FromText("Smith   ")),
+                    (Remarks, FieldValue.FromText(new string('a', 250) + new string(' ', 5) + new string('b', 45))),
+                    (Phone, FieldValue.FromText("555-0149")),
+                ]),
+                ("D", [
+                    (Surname, FieldValue.FromText("Smyth")),
+                    (Remarks, FieldValue.FromText(new string('a', 250))),
+                ]),
+                ("E", [
+                    (Remarks, FieldValue.FromText(new string('a', 251) + new string('b', 49))),
+                    (Phone, FieldValue.FromText("555-0147")),
+                ]),
+            };
+
+            var labels = new Dictionary<string, string>(StringComparer.Ordinal);
+            foreach (var (label, values) in rows)
+            {
+                var globalRecordId = await InsertBaseAsync(fixture, connection, cancellationToken);
+                var insert = RecordSqlBuilder.InsertPage(
+                    fixture.Page, globalRecordId, fixture.PageColumns, Values(values));
+                Assert.Equal(1, await ExecuteAsync(fixture, connection, insert, cancellationToken));
+                labels.Add(globalRecordId, label);
+            }
+
+            var parsed = SearchCriteriaParser.Parse(
+                fixture.DataFields, [new SearchCriterion(field, FieldValue.FromText(criterion))]);
+            Assert.True(parsed.IsSuccess, "The criterion must parse.");
+            Assert.Equal(expectedOperator, Assert.Single(Assert.Single(parsed.Conditions).Alternatives).Operator);
+
+            Task<List<string>> FindAsync(SqlStatement statement) => SqlExecution.ReadAsync(
+                connection,
+                transaction: null,
+                FixtureOperation,
+                statement,
+                fixture.CommandTimeoutSeconds,
+                fixture.Recorder,
+                cancellationToken,
+                static async (reader, token) =>
+                {
+                    var ids = new List<string>();
+                    while (await reader.ReadAsync(token))
+                    {
+                        ids.Add(reader.GetString(SearchSqlBuilder.IdOrdinal));
+                    }
+
+                    return ids;
+                });
+
+            var search = SearchSqlBuilder.Search(
+                fixture.Schema,
+                fixture.DataFields,
+                RecordQueryRules.GetGridColumns(fixture.DataFields),
+                parsed.Conditions,
+                includeDeleted: false,
+                excludeGlobalRecordId: null);
+            var found = await FindAsync(search.Statement);
+            Assert.Equal(expectedRows, string.Concat(found.Select(id => labels[id])));
+
+            // Packed, as a search beyond the scalar parameter budget binds it, the criterion travels in the packed
+            // carrier rather than as its own parameter, and the padding rules select exactly the same rows.
+            var packed = SearchSqlBuilder.Search(
+                fixture.Schema,
+                fixture.DataFields,
+                RecordQueryRules.GetGridColumns(fixture.DataFields),
+                parsed.Conditions,
+                includeDeleted: false,
+                excludeGlobalRecordId: null,
+                scalarParameterBudget: 0);
+            Assert.NotEqual(search.Statement.Text, packed.Statement.Text);
+
+            var packedFound = await FindAsync(packed.Statement);
+            Assert.Equal(expectedRows, string.Concat(packedFound.Select(id => labels[id])));
+        }
+        finally
+        {
+            await DropTablesAsync(connection, PaddingPage, PaddingBase);
+        }
+    }
+
+    /// <summary>
+    /// A full-width Legal Values choice that ends in spaces, and full-width Text ending in spaces, on <c>nchar(5)</c>
+    /// columns, which no seeded table has: the validator accepts them, the repository's production insert stores
+    /// them, a direct read finds exactly the texts written at their full width (<c>DATALENGTH</c> 10), the
+    /// repository's by-id read returns them unchanged, and the validator accepts the values read back again.
+    /// </summary>
+    [Fact]
+    public async Task FixedWidthColumns_FullWidthChoiceEndingInSpaces_RoundTripsExactly()
+    {
+        await TestDatabase.EnsureReachableAsync();
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        var cancellationToken = timeout.Token;
+        await using var writeLock = await DatabaseWriteLock.AcquireExclusiveAsync(cancellationToken);
+        await using var connection = await TestDatabase.OpenConnectionAsync(cancellationToken);
+        try
+        {
+            var fixture = await CreateFixedWidthFixtureAsync(connection, cancellationToken);
+            var validator = FixedWidthValidator(fixture);
+            var options = new DatabaseOptions(TestDatabase.ConnectionString);
+            var connections = new SqlConnectionFactory(options);
+            var repository = new SqlRecordRepository(
+                connections,
+                new SqlMetadataReader(connections, options, fixture.Recorder),
+                options,
+                fixture.Recorder);
+            var stamp = new SaveStamp(StampLogonName, SaveStamp.TruncateToSeconds(DateTime.Now));
+
+            var submitted = Values((Grade, FieldValue.FromText(PaddedChoice)), (Code, FieldValue.FromText("ab   ")));
+            var accepted = validator.ValidateInput([.. submitted]);
+            Assert.True(accepted.IsValid, "The validator refused full-width text.");
+            Assert.NotNull(accepted.Values);
+            AssertValues(accepted.Values, submitted, "validation");
+
+            var inserted = await repository.InsertAsync(
+                connection,
+                fixture.Form,
+                fixture.Schema,
+                accepted.Values,
+                stamp,
+                cancellationToken);
+            AssertSoleRecord(inserted, inserted, submitted, "insert");
+
+            var stored = await ReadFixedWidthRowAsync(connection, inserted.GlobalRecordId, cancellationToken);
+            Assert.True(
+                string.Equals(PaddedChoice, stored.Grade, StringComparison.Ordinal),
+                Grade + " does not hold the exact text written.");
+            Assert.Equal(2 * FixedWidth, stored.GradeBytes);
+            Assert.True(
+                string.Equals("ab   ", stored.Code, StringComparison.Ordinal),
+                Code + " does not hold the exact text written.");
+            Assert.Equal(2 * FixedWidth, stored.CodeBytes);
+
+            var read = Assert.IsType<RecordDto>(await repository.GetByIdAsync(
+                connection,
+                fixture.Form,
+                fixture.Schema,
+                inserted.GlobalRecordId,
+                cancellationToken));
+            AssertSoleRecord(inserted, read, submitted, "read");
+
+            var resubmitted = validator.ValidateInput([.. read.Values]);
+            Assert.True(resubmitted.IsValid, "The validator refused the values read back.");
+            Assert.NotNull(resubmitted.Values);
+            AssertValues(resubmitted.Values, submitted, "revalidation");
+        }
+        finally
+        {
+            await DropTablesAsync(connection, FixedWidthPage, FixedWidthBase);
+        }
+    }
+
+    /// <summary>
+    /// A short Legal Values choice and short Text on <c>nchar(5)</c> columns: the validator accepts them as submitted,
+    /// the repository's production insert binds them as given, and SQL Server stores each padded with spaces to five
+    /// characters, which a direct read finds at <c>DATALENGTH</c> 10. The insert's snapshot and the repository's by-id
+    /// read return exactly the padded texts, never trimmed. The padded choice read back is no option, so the validator
+    /// refuses it as not a legal value, while the short option chosen again is accepted.
+    /// </summary>
+    [Fact]
+    public async Task FixedWidthColumns_ShortValues_AreStoredPaddedAndReadBackAsStored()
+    {
+        await TestDatabase.EnsureReachableAsync();
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        var cancellationToken = timeout.Token;
+        await using var writeLock = await DatabaseWriteLock.AcquireExclusiveAsync(cancellationToken);
+        await using var connection = await TestDatabase.OpenConnectionAsync(cancellationToken);
+        try
+        {
+            var fixture = await CreateFixedWidthFixtureAsync(connection, cancellationToken);
+            var validator = FixedWidthValidator(fixture);
+            var options = new DatabaseOptions(TestDatabase.ConnectionString);
+            var connections = new SqlConnectionFactory(options);
+            var repository = new SqlRecordRepository(
+                connections,
+                new SqlMetadataReader(connections, options, fixture.Recorder),
+                options,
+                fixture.Recorder);
+            var stamp = new SaveStamp(StampLogonName, SaveStamp.TruncateToSeconds(DateTime.Now));
+
+            const string shortText = "abc";
+            const string paddedShortText = "abc  ";
+            var submitted = Values((Grade, FieldValue.FromText(ShortChoice)), (Code, FieldValue.FromText(shortText)));
+            var accepted = validator.ValidateInput([.. submitted]);
+            Assert.True(accepted.IsValid, "The validator refused short text on a fixed-width column.");
+            Assert.NotNull(accepted.Values);
+            AssertValues(accepted.Values, submitted, "validation");
+
+            var inserted = await repository.InsertAsync(
+                connection,
+                fixture.Form,
+                fixture.Schema,
+                accepted.Values,
+                stamp,
+                cancellationToken);
+            var padded = Values(
+                (Grade, FieldValue.FromText(PaddedShortChoice)),
+                (Code, FieldValue.FromText(paddedShortText)));
+            AssertSoleRecord(inserted, inserted, padded, "insert");
+
+            var stored = await ReadFixedWidthRowAsync(connection, inserted.GlobalRecordId, cancellationToken);
+            Assert.True(
+                string.Equals(PaddedShortChoice, stored.Grade, StringComparison.Ordinal),
+                Grade + " is not the short choice padded to the column's width.");
+            Assert.Equal(2 * FixedWidth, stored.GradeBytes);
+            Assert.True(
+                string.Equals(paddedShortText, stored.Code, StringComparison.Ordinal),
+                Code + " is not the short text padded to the column's width.");
+            Assert.Equal(2 * FixedWidth, stored.CodeBytes);
+
+            var read = Assert.IsType<RecordDto>(await repository.GetByIdAsync(
+                connection,
+                fixture.Form,
+                fixture.Schema,
+                inserted.GlobalRecordId,
+                cancellationToken));
+            AssertSoleRecord(inserted, read, padded, "read");
+
+            var resubmitted = validator.ValidateInput([.. read.Values]);
+            Assert.False(
+                resubmitted.IsValid,
+                "The validator accepted the padded choice read back, which is no option.");
+            var (key, messages) = Assert.Single(resubmitted.FieldErrors);
+            Assert.Equal(Grade, key);
+            Assert.Equal(new[] { ValidationMessages.NotALegalValue }, messages);
+
+            var reselected = validator.ValidateInput([.. Values((Grade, FieldValue.FromText(ShortChoice)))]);
+            Assert.True(reselected.IsValid, "The validator refused the short option chosen again.");
+            Assert.Empty(fixture.Recorder.Failed());
+        }
+        finally
+        {
+            await DropTablesAsync(connection, FixedWidthPage, FixedWidthBase);
+        }
+    }
+
+    /// <summary>
+    /// Two writes to an <c>nchar(5)</c> Text column that differ only in trailing spaces, <c>ab</c> through the
+    /// repository's production insert and <c>ab</c> with one trailing space through its production update, store one
+    /// value: SQL Server pads both to <c>ab</c> and three spaces at <c>DATALENGTH</c> 10, and the update's snapshot
+    /// returns that stored text.
+    /// </summary>
+    [Fact]
+    public async Task FixedWidthColumns_TextsDifferingOnlyInTrailingSpaces_StoreOneValue()
+    {
+        await TestDatabase.EnsureReachableAsync();
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        var cancellationToken = timeout.Token;
+        await using var writeLock = await DatabaseWriteLock.AcquireExclusiveAsync(cancellationToken);
+        await using var connection = await TestDatabase.OpenConnectionAsync(cancellationToken);
+        try
+        {
+            var fixture = await CreateFixedWidthFixtureAsync(connection, cancellationToken);
+            var options = new DatabaseOptions(TestDatabase.ConnectionString);
+            var connections = new SqlConnectionFactory(options);
+            var repository = new SqlRecordRepository(
+                connections,
+                new SqlMetadataReader(connections, options, fixture.Recorder),
+                options,
+                fixture.Recorder);
+            var stamp = new SaveStamp(StampLogonName, SaveStamp.TruncateToSeconds(DateTime.Now));
+
+            const string paddedText = "ab   ";
+            var inserted = await repository.InsertAsync(
+                connection,
+                fixture.Form,
+                fixture.Schema,
+                Values((Grade, FieldValue.FromText(FullWidthChoice)), (Code, FieldValue.FromText("ab"))),
+                stamp,
+                cancellationToken);
+            var afterInsert = await ReadFixedWidthRowAsync(connection, inserted.GlobalRecordId, cancellationToken);
+
+            var updated = await repository.UpdateAsync(
+                connection,
+                fixture.Form,
+                fixture.Schema,
+                inserted.GlobalRecordId,
+                Values((Code, FieldValue.FromText("ab "))),
+                () => stamp,
+                stored => RecordValidationResult.Success(stored.Values),
+                permissions: null,
+                cancellationToken);
+            Assert.Equal(RecordWriteStatus.Success, updated.Status);
+            var afterUpdate = await ReadFixedWidthRowAsync(connection, inserted.GlobalRecordId, cancellationToken);
+
+            const string pageUpdatePrefix = "UPDATE [" + FixedWidthPage + "]";
+            var pageUpdate = Assert.Single(
+                fixture.Recorder.ForOperation(RecordOperations.Update),
+                command => command.CommandText.StartsWith(pageUpdatePrefix, StringComparison.Ordinal));
+            Assert.True(pageUpdate.Completed && pageUpdate.Succeeded, "The page update did not succeed.");
+
+            Assert.True(
+                string.Equals(paddedText, afterInsert.Code, StringComparison.Ordinal),
+                Code + " after the insert is not the text padded to the column's width.");
+            Assert.True(
+                string.Equals(afterInsert.Code, afterUpdate.Code, StringComparison.Ordinal),
+                Code + " holds another value after the update of text differing only in trailing spaces.");
+            Assert.Equal(2 * FixedWidth, afterInsert.CodeBytes);
+            Assert.Equal(2 * FixedWidth, afterUpdate.CodeBytes);
+            AssertSoleRecord(
+                inserted,
+                Assert.IsType<RecordDto>(updated.Record),
+                Values((Grade, FieldValue.FromText(FullWidthChoice)), (Code, FieldValue.FromText(paddedText))),
+                "update");
+            Assert.Empty(fixture.Recorder.Failed());
+        }
+        finally
+        {
+            await DropTablesAsync(connection, FixedWidthPage, FixedWidthBase);
+        }
+    }
+
+    /// <summary>
+    /// Short text written into <c>nchar(5)</c> columns by direct SQL, as legacy writes the text it is given, is padded
+    /// with spaces to five characters by SQL Server, and the repository's by-id read returns exactly the stored text,
+    /// the padding included, never trimmed.
+    /// </summary>
+    [Fact]
+    public async Task FixedWidthColumns_ShortValueWrittenByDirectSql_ReadsBackAsStoredPaddingIncluded()
+    {
+        await TestDatabase.EnsureReachableAsync();
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        var cancellationToken = timeout.Token;
+        await using var writeLock = await DatabaseWriteLock.AcquireExclusiveAsync(cancellationToken);
+        await using var connection = await TestDatabase.OpenConnectionAsync(cancellationToken);
+        try
+        {
+            var fixture = await CreateFixedWidthFixtureAsync(connection, cancellationToken);
+            var globalRecordId = await InsertBaseAsync(fixture, connection, cancellationToken);
+            await using (var command = new SqlCommand(
+                $"INSERT INTO [{FixedWidthPage}] ([GlobalRecordId], [{Grade}], [{Code}]) VALUES (@id, @grade, @code)",
+                connection))
+            {
+                command.Parameters.Add(new SqlParameter("@id", SqlDbType.NVarChar, 255) { Value = globalRecordId });
+                command.Parameters.Add(new SqlParameter("@grade", SqlDbType.NVarChar, 4000) { Value = ShortChoice });
+                command.Parameters.Add(new SqlParameter("@code", SqlDbType.NVarChar, 4000) { Value = "ab" });
+                Assert.Equal(1, await command.ExecuteNonQueryAsync(cancellationToken));
+            }
+
+            const string paddedCode = "ab   ";
+            var stored = await ReadFixedWidthRowAsync(connection, globalRecordId, cancellationToken);
+            Assert.True(
+                string.Equals(PaddedShortChoice, stored.Grade, StringComparison.Ordinal),
+                Grade + " is not the short text padded to the column's width.");
+            Assert.Equal(2 * FixedWidth, stored.GradeBytes);
+            Assert.True(
+                string.Equals(paddedCode, stored.Code, StringComparison.Ordinal),
+                Code + " is not the short text padded to the column's width.");
+            Assert.Equal(2 * FixedWidth, stored.CodeBytes);
+
+            var options = new DatabaseOptions(TestDatabase.ConnectionString);
+            var connections = new SqlConnectionFactory(options);
+            var repository = new SqlRecordRepository(
+                connections,
+                new SqlMetadataReader(connections, options, fixture.Recorder),
+                options,
+                fixture.Recorder);
+            var read = Assert.IsType<RecordDto>(await repository.GetByIdAsync(
+                connection,
+                fixture.Form,
+                fixture.Schema,
+                globalRecordId,
+                cancellationToken));
+            Assert.True(
+                string.Equals(globalRecordId, read.GlobalRecordId, StringComparison.Ordinal),
+                "The read returned another GlobalRecordId.");
+            AssertValues(
+                read.Values,
+                Values((Grade, FieldValue.FromText(PaddedShortChoice)), (Code, FieldValue.FromText(paddedCode))),
+                "read");
+        }
+        finally
+        {
+            await DropTablesAsync(connection, FixedWidthPage, FixedWidthBase);
+        }
+    }
+
+    /// <summary>
+    /// A base table whose <c>FirstSaveLogonName</c> and <c>LastSaveLogonName</c> are <c>nchar(255)</c> takes a logon
+    /// name shorter than 255 characters on every write that stamps: the repository's production insert and update, and
+    /// the soft delete statement the repository builds and sends for an active record. Each binds the logon name as
+    /// given, and SQL Server stores it padded with spaces to 255 characters, which a direct read finds at
+    /// <c>DATALENGTH</c> 510.
+    /// </summary>
+    [Fact]
+    public async Task FixedWidthStampColumns_ShortLogonName_IsStoredPaddedByInsertUpdateAndSoftDelete()
+    {
+        await TestDatabase.EnsureReachableAsync();
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        var cancellationToken = timeout.Token;
+        await using var writeLock = await DatabaseWriteLock.AcquireExclusiveAsync(cancellationToken);
+        await using var connection = await TestDatabase.OpenConnectionAsync(cancellationToken);
+        try
+        {
+            var fixture = await CreateFixtureAsync(
+                connection,
+                FixedStampBase,
+                FixedStampPage,
+                $"[{Surname}] nvarchar(4000)",
+                [new FixtureField(Surname, TextTypeId, TextTypeName)],
+                cancellationToken,
+                logonNameType: $"nchar({FixedLogonNameWidth})");
+            foreach (var column in new[] { fixture.Schema.FirstSaveLogonName, fixture.Schema.LastSaveLogonName })
+            {
+                Assert.NotNull(column);
+                Assert.Equal("nchar", column.Metadata.SqlTypeName);
+                Assert.Equal(FixedLogonNameWidth, column.Metadata.MaxCharacters);
+            }
+
+            var options = new DatabaseOptions(TestDatabase.ConnectionString);
+            var connections = new SqlConnectionFactory(options);
+            var repository = new SqlRecordRepository(
+                connections,
+                new SqlMetadataReader(connections, options, fixture.Recorder),
+                options,
+                fixture.Recorder);
+            var time = SaveStamp.TruncateToSeconds(DateTime.Now);
+            var insertStamp = new SaveStamp(StampLogonName, time);
+            var updateStamp = new SaveStamp("RwUpdate", time);
+            var deleteStamp = new SaveStamp("RwDelete", time);
+
+            var inserted = await repository.InsertAsync(
+                connection,
+                fixture.Form,
+                fixture.Schema,
+                Values((Surname, FieldValue.FromText("s-" + Guid.NewGuid().ToString("N")))),
+                insertStamp,
+                cancellationToken);
+            var afterInsert = await ReadStampRowAsync(connection, inserted.GlobalRecordId, cancellationToken);
+            AssertPaddedLogonName(insertStamp.LogonName, afterInsert.FirstSave, afterInsert.FirstSaveBytes, "insert");
+            AssertPaddedLogonName(insertStamp.LogonName, afterInsert.LastSave, afterInsert.LastSaveBytes, "insert");
+            Assert.Equal((short)RecordQueryRules.ActiveRecStatus, afterInsert.RecStatus);
+
+            var updated = await repository.UpdateAsync(
+                connection,
+                fixture.Form,
+                fixture.Schema,
+                inserted.GlobalRecordId,
+                Values((Surname, FieldValue.FromText("updated"))),
+                () => updateStamp,
+                stored => RecordValidationResult.Success(stored.Values),
+                permissions: null,
+                cancellationToken);
+            Assert.Equal(RecordWriteStatus.Success, updated.Status);
+            var afterUpdate = await ReadStampRowAsync(connection, inserted.GlobalRecordId, cancellationToken);
+            AssertPaddedLogonName(insertStamp.LogonName, afterUpdate.FirstSave, afterUpdate.FirstSaveBytes, "update");
+            AssertPaddedLogonName(updateStamp.LogonName, afterUpdate.LastSave, afterUpdate.LastSaveBytes, "update");
+            Assert.Equal((short)RecordQueryRules.ActiveRecStatus, afterUpdate.RecStatus);
+
+            var softDelete = RecordSqlBuilder.SoftDelete(
+                fixture.Schema,
+                inserted.UniqueKey,
+                inserted.GlobalRecordId,
+                deleteStamp);
+            Assert.Equal(1, await ExecuteAsync(fixture, connection, softDelete, cancellationToken));
+            var afterDelete = await ReadStampRowAsync(connection, inserted.GlobalRecordId, cancellationToken);
+            AssertPaddedLogonName(insertStamp.LogonName, afterDelete.FirstSave, afterDelete.FirstSaveBytes, "delete");
+            AssertPaddedLogonName(deleteStamp.LogonName, afterDelete.LastSave, afterDelete.LastSaveBytes, "delete");
+            Assert.Equal((short)RecordQueryRules.DeletedRecStatus, afterDelete.RecStatus);
+
+            Assert.Empty(fixture.Recorder.Failed());
+        }
+        finally
+        {
+            await DropTablesAsync(connection, FixedStampPage, FixedStampBase);
+        }
+    }
+
+    /// <summary>
+    /// A page column named like Dapper's literal token for a numeric parameter of the same statement, <c>{=p1}</c>,
+    /// is written by an insert and an update whose command text keeps the bracketed name exactly as the recorder saw
+    /// it, which proves that the data layer's binder never rewrote the text after the observer was told about it.
+    /// </summary>
+    [Fact]
+    public async Task BinderMarkerColumnName_IsNeverRewrittenAfterObservation()
+    {
+        await TestDatabase.EnsureReachableAsync();
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        var cancellationToken = timeout.Token;
+        await using var writeLock = await DatabaseWriteLock.AcquireExclusiveAsync(cancellationToken);
+        await using var connection = await TestDatabase.OpenConnectionAsync(cancellationToken);
+        try
+        {
+            // Score comes first, so @p1 of the insert is its number; the update sets the marker column first, so @p1
+            // is the number there too.
+            var fixture = await CreateFixtureAsync(
+                connection,
+                MarkerBase,
+                MarkerPage,
+                $"[{Score}] float, [{BinderMarkerColumn}] nvarchar(4000)",
+                [
+                    new FixtureField(Score, NumberTypeId, NumberTypeName),
+                    new FixtureField(BinderMarkerColumn, TextTypeId, TextTypeName),
+                ],
+                cancellationToken);
+            const string quotedMarker = "[" + BinderMarkerColumn + "]";
+            const string insertedText = "Inserted beside a binder-marker column name";
+            const string updatedText = "Updated beside a binder-marker column name";
+
+            var globalRecordId = await InsertBaseAsync(fixture, connection, cancellationToken);
+            var insert = RecordSqlBuilder.InsertPage(
+                fixture.Page,
+                globalRecordId,
+                fixture.PageColumns,
+                Values((Score, FieldValue.FromNumber(12.5d)), (BinderMarkerColumn, FieldValue.FromText(insertedText))));
+            Assert.Equal(DbType.Double, insert.Parameters[1].DbType);
+            Assert.Contains(quotedMarker, insert.Text, StringComparison.Ordinal);
+            Assert.Equal(1, await ExecuteAsync(fixture, connection, insert, cancellationToken));
+            AssertObservedAsSent(fixture.Recorder, insert, BinderMarkerColumn);
+            var afterInsert = await ReadMarkerColumnAsync(connection, globalRecordId, cancellationToken);
+            Assert.True(
+                string.Equals(insertedText, afterInsert, StringComparison.Ordinal),
+                "The marker column does not hold the inserted text.");
+
+            var update = Assert.Single(RecordSqlBuilder.UpdatePageColumns(
+                fixture.Page,
+                globalRecordId,
+                [
+                    (fixture.Column(BinderMarkerColumn), FieldValue.FromText(updatedText)),
+                    (fixture.Column(Score), FieldValue.FromNumber(13.25d)),
+                ]));
+            Assert.Equal(DbType.Double, update.Parameters[1].DbType);
+            Assert.Contains(quotedMarker, update.Text, StringComparison.Ordinal);
+            Assert.Equal(1, await ExecuteAsync(fixture, connection, update, cancellationToken));
+            AssertObservedAsSent(fixture.Recorder, update, BinderMarkerColumn);
+            var afterUpdate = await ReadMarkerColumnAsync(connection, globalRecordId, cancellationToken);
+            Assert.True(
+                string.Equals(updatedText, afterUpdate, StringComparison.Ordinal),
+                "The marker column does not hold the updated text.");
+        }
+        finally
+        {
+            await DropTablesAsync(connection, MarkerPage, MarkerBase);
+        }
+    }
+
+    /// <summary>
+    /// An update that submits no value and dispatches no <c>INSERT</c> or <c>UPDATE</c>. Its required gate closes the
+    /// connection, so whatever follows fails and the rollback cannot be confirmed either. When the gate passes, the
+    /// first statement after it fails: the snapshot read on a base table without the last-save columns, or, with
+    /// them, the base stamp <c>UPDATE</c>, which the data layer's open-connection check refuses before it is sent.
+    /// When the gate refuses the record, the rollback itself fails. Every way, the write reports
+    /// <see cref="WriteOutcome.NotWritten"/>, because no DML was sent, and carries the failed rollback's type beside
+    /// the original failure.
+    /// </summary>
+    [Theory]
+    [InlineData(true, false)]
+    [InlineData(false, false)]
+    [InlineData(true, true)]
+    [InlineData(false, true)]
+    public async Task UpdateDispatchingNoDml_FailingWithAnUnconfirmedRollback_IsNotWritten(
+        bool gatePasses,
+        bool lastSaveColumns)
+    {
+        await TestDatabase.EnsureReachableAsync();
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        var cancellationToken = timeout.Token;
+        await using var writeLock = await DatabaseWriteLock.AcquireExclusiveAsync(cancellationToken);
+        await using var connection = await TestDatabase.OpenConnectionAsync(cancellationToken);
+        try
+        {
+            var fixture = await CreateFixtureAsync(
+                connection,
+                OutcomeBase,
+                OutcomePage,
+                $"[{Surname}] nvarchar(4000)",
+                [new FixtureField(Surname, TextTypeId, TextTypeName)],
+                cancellationToken,
+                lastSaveColumns);
+            Assert.Equal(lastSaveColumns, fixture.Schema.LastSaveLogonName is not null);
+            Assert.Equal(lastSaveColumns, fixture.Schema.LastSaveTime is not null);
+
+            var options = new DatabaseOptions(TestDatabase.ConnectionString);
+            var connections = new SqlConnectionFactory(options);
+            var repository = new SqlRecordRepository(
+                connections,
+                new SqlMetadataReader(connections, options, fixture.Recorder),
+                options,
+                fixture.Recorder);
+            var stamp = new SaveStamp(StampLogonName, SaveStamp.TruncateToSeconds(DateTime.Now));
+            var inserted = await repository.InsertAsync(
+                connection,
+                fixture.Form,
+                fixture.Schema,
+                Values((Surname, FieldValue.FromText("u-" + Guid.NewGuid().ToString("N")))),
+                stamp,
+                cancellationToken);
+
+            var gateCalls = 0;
+            var failure = await Assert.ThrowsAsync<DataStoreWriteException>(() => repository.UpdateAsync(
+                connection,
+                fixture.Form,
+                fixture.Schema,
+                inserted.GlobalRecordId,
+                Values(),
+                () => stamp,
+                stored =>
+                {
+                    gateCalls++;
+                    connection.Close();
+                    return gatePasses
+                        ? RecordValidationResult.Success(stored.Values)
+                        : RecordValidationResult.RequestFailure("The fixture gate refuses the record.");
+                },
+                permissions: null,
+                cancellationToken));
+
+            Assert.Equal(1, gateCalls);
+            Assert.Equal(RecordOperations.Update, failure.Operation);
+            Assert.Equal(WriteOutcome.NotWritten, failure.Outcome);
+            Assert.Null(failure.SqlErrorNumber);
+            Assert.IsType<InvalidOperationException>(failure.InnerException);
+            Assert.Equal(nameof(InvalidOperationException), failure.Data[SqlErrorClassifier.RollbackExceptionTypeKey]);
+            Assert.False(failure.Data.Contains(SqlErrorClassifier.RollbackSqlErrorNumberKey));
+            Assert.DoesNotContain(fixture.Recorder.ForOperation(RecordOperations.Update), command => command.IsWrite);
+        }
+        finally
+        {
+            // The gate closed the connection, which ended the session and its temporary tables.
+            await DropTablesAsync(connection, OutcomePage, OutcomeBase);
+        }
+    }
+
+    /// <summary>
+    /// A write whose first <c>INSERT</c> or <c>UPDATE</c> the server ran before the connection closed: the base insert
+    /// of a create, or the base stamp <c>UPDATE</c> of an update that submits no value. The statement after it is
+    /// refused and the rollback cannot be confirmed, so the write reports <see cref="WriteOutcome.Unknown"/>: DML was
+    /// sent, and neither a commit nor a completed rollback is confirmed. The update differs from the not-written case
+    /// above only in that its stamp <c>UPDATE</c> went out, so the pair proves DML is marked when it is dispatched.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task WriteDispatchingDml_FailingWithAnUnconfirmedRollback_IsUnknown(bool create)
+    {
+        await TestDatabase.EnsureReachableAsync();
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        var cancellationToken = timeout.Token;
+        await using var writeLock = await DatabaseWriteLock.AcquireExclusiveAsync(cancellationToken);
+        await using var connection = await TestDatabase.OpenConnectionAsync(cancellationToken);
+        try
+        {
+            var fixture = await CreateFixtureAsync(
+                connection,
+                OutcomeBase,
+                OutcomePage,
+                $"[{Surname}] nvarchar(4000)",
+                [new FixtureField(Surname, TextTypeId, TextTypeName)],
+                cancellationToken);
+            Assert.NotNull(fixture.Schema.LastSaveLogonName);
+            Assert.NotNull(fixture.Schema.LastSaveTime);
+
+            var options = new DatabaseOptions(TestDatabase.ConnectionString);
+            var connections = new SqlConnectionFactory(options);
+            var closing = new CloseAfterFirstWriteObserver(fixture.Recorder, connection);
+            var repository = new SqlRecordRepository(
+                connections,
+                new SqlMetadataReader(connections, options, closing),
+                options,
+                closing);
+            var stamp = new SaveStamp(StampLogonName, SaveStamp.TruncateToSeconds(DateTime.Now));
+            var values = Values((Surname, FieldValue.FromText("u-" + Guid.NewGuid().ToString("N"))));
+
+            string operation;
+            DataStoreWriteException failure;
+            if (create)
+            {
+                operation = RecordOperations.Insert;
+                failure = await Assert.ThrowsAsync<DataStoreWriteException>(() => repository.InsertAsync(
+                    connection,
+                    fixture.Form,
+                    fixture.Schema,
+                    values,
+                    stamp,
+                    cancellationToken));
+            }
+            else
+            {
+                // The record is created through a repository whose observer only records, so the connection closes
+                // after the update's stamp UPDATE, not after this insert.
+                var setup = new SqlRecordRepository(
+                    connections,
+                    new SqlMetadataReader(connections, options, fixture.Recorder),
+                    options,
+                    fixture.Recorder);
+                var inserted = await setup.InsertAsync(
+                    connection,
+                    fixture.Form,
+                    fixture.Schema,
+                    values,
+                    stamp,
+                    cancellationToken);
+                operation = RecordOperations.Update;
+                failure = await Assert.ThrowsAsync<DataStoreWriteException>(() => repository.UpdateAsync(
+                    connection,
+                    fixture.Form,
+                    fixture.Schema,
+                    inserted.GlobalRecordId,
+                    Values(),
+                    () => stamp,
+                    stored => RecordValidationResult.Success(stored.Values),
+                    permissions: null,
+                    cancellationToken));
+            }
+
+            Assert.Equal(operation, failure.Operation);
+            Assert.Equal(WriteOutcome.Unknown, failure.Outcome);
+            Assert.Null(failure.SqlErrorNumber);
+            Assert.IsType<InvalidOperationException>(failure.InnerException);
+            Assert.Equal(nameof(InvalidOperationException), failure.Data[SqlErrorClassifier.RollbackExceptionTypeKey]);
+            var write = Assert.Single(fixture.Recorder.ForOperation(operation), command => command.IsWrite);
+            Assert.True(write.Succeeded, "The write the server ran must be recorded as succeeded.");
+        }
+        finally
+        {
+            // The observer closed the connection, which ended the session and its temporary tables.
+            await DropTablesAsync(connection, OutcomePage, OutcomeBase);
+        }
+    }
+
+    /// <summary>
+    /// An update of a page value on a record whose page row is missing inserts the row holding only its key and
+    /// repeats the update, as legacy repairs it (<c>Epi.Core/Data/Services/CollectedDataProvider.cs:1360-1380</c>),
+    /// whatever the session's <c>NOCOUNT</c> setting. Under <c>NOCOUNT ON</c> the provider reports -1 for an
+    /// <c>UPDATE</c> that changed a row and for one that changed none, so only the row count the statement selects
+    /// itself can show the row missing. The update succeeds, its response carries the submitted value, a direct read
+    /// finds exactly one page row holding it, and the recorder shows the base stamp, the page <c>UPDATE</c>, the
+    /// key-only <c>INSERT</c> and the repeated <c>UPDATE</c>, in that order.
+    /// </summary>
+    /// <param name="noCount">Whether the session runs with <c>NOCOUNT ON</c>.</param>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task UpdateOfMissingPageRow_InsertsTheRowAndRepeatsTheUpdate_WhateverNocount(bool noCount)
+    {
+        await TestDatabase.EnsureReachableAsync();
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        var cancellationToken = timeout.Token;
+        await using var writeLock = await DatabaseWriteLock.AcquireExclusiveAsync(cancellationToken);
+        await using var connection = await TestDatabase.OpenConnectionAsync(cancellationToken);
+        var sessionNoCount = await ReadNocountAsync(connection, cancellationToken);
+        try
+        {
+            var fixture = await CreateFixtureAsync(
+                connection,
+                NocountBase,
+                NocountPage,
+                $"[{Surname}] nvarchar(4000), [{Remarks}] nvarchar(4000)",
+                [
+                    new FixtureField(Surname, TextTypeId, TextTypeName),
+                    new FixtureField(Remarks, MultilineTypeId, MultilineTypeName),
+                ],
+                cancellationToken);
+            await SetNocountAsync(connection, noCount, cancellationToken);
+
+            var options = new DatabaseOptions(TestDatabase.ConnectionString);
+            var connections = new SqlConnectionFactory(options);
+            var repository = new SqlRecordRepository(
+                connections,
+                new SqlMetadataReader(connections, options, fixture.Recorder),
+                options,
+                fixture.Recorder);
+            var stamp = new SaveStamp(StampLogonName, SaveStamp.TruncateToSeconds(DateTime.Now));
+            var inserted = await repository.InsertAsync(
+                connection,
+                fixture.Form,
+                fixture.Schema,
+                Values((Surname, FieldValue.FromText("n-" + Guid.NewGuid().ToString("N")))),
+                stamp,
+                cancellationToken);
+
+            // The missing-page fixture: the record's page row is removed. The provider counts the removed row only
+            // without NOCOUNT, which proves the session suppresses counts as the case requires.
+            await using (var delete = new SqlCommand(
+                $"DELETE FROM [{NocountPage}] WHERE [GlobalRecordId] = @id",
+                connection))
+            {
+                delete.Parameters.Add(IdParameter(inserted.GlobalRecordId));
+                var reported = await delete.ExecuteNonQueryAsync(cancellationToken);
+                Assert.True(
+                    reported == (noCount ? -1 : 1),
+                    "The provider's count of the removed page row does not follow the session's NOCOUNT setting.");
+            }
+
+            Assert.Equal(0, await CountRowsAsync(connection, NocountPage, cancellationToken));
+
+            fixture.Recorder.Clear();
+            var remarks = FieldValue.FromText("r-" + Guid.NewGuid().ToString("N"));
+            var updated = await repository.UpdateAsync(
+                connection,
+                fixture.Form,
+                fixture.Schema,
+                inserted.GlobalRecordId,
+                Values((Remarks, remarks)),
+                () => stamp,
+                stored => RecordValidationResult.Success(stored.Values),
+                permissions: null,
+                cancellationToken);
+
+            // The repaired row holds only its key and the submitted value, so the removed Surname reads as null.
+            Assert.Equal(RecordWriteStatus.Success, updated.Status);
+            AssertSoleRecord(
+                inserted,
+                Assert.IsType<RecordDto>(updated.Record),
+                Values((Surname, FieldValue.Null), (Remarks, remarks)),
+                "update");
+
+            await using (var read = new SqlCommand(
+                $"SELECT [{Surname}], [{Remarks}] FROM [{NocountPage}] WHERE [GlobalRecordId] = @id",
+                connection))
+            {
+                read.Parameters.Add(IdParameter(inserted.GlobalRecordId));
+                await using var reader = await read.ExecuteReaderAsync(cancellationToken);
+                Assert.True(await reader.ReadAsync(cancellationToken), "The repaired page row was not found.");
+                Assert.True(reader.IsDBNull(0), Surname + " of the repaired page row is not NULL.");
+                Assert.True(
+                    reader.GetValue(1) is string stored
+                        && string.Equals(remarks.AsText(), stored, StringComparison.Ordinal),
+                    Remarks + " of the repaired page row does not hold the submitted text.");
+                Assert.False(await reader.ReadAsync(cancellationToken), "The page holds more than one row for the id.");
+            }
+
+            Assert.Equal(1, await CountRowsAsync(connection, NocountPage, cancellationToken));
+
+            // Every write ran inside the update's transaction and succeeded; each UPDATE selected its own row count,
+            // and the repeated page UPDATE is the first one, text and parameters alike.
+            var writes = fixture.Recorder.ForOperation(RecordOperations.Update)
+                .Where(command => command.IsWrite)
+                .ToArray();
+            Assert.True(
+                writes.Length == 4,
+                "The update did not send the base stamp and three page writes: " + Describe(writes));
+            Assert.StartsWith("UPDATE [" + NocountBase + "] ", writes[0].CommandText, StringComparison.Ordinal);
+            Assert.StartsWith("UPDATE [" + NocountPage + "] ", writes[1].CommandText, StringComparison.Ordinal);
+            Assert.Equal("INSERT INTO [" + NocountPage + "] ([GlobalRecordId]) VALUES (@p0)", writes[2].CommandText);
+            Assert.Equal(writes[1].CommandText, writes[3].CommandText);
+            Assert.True(
+                writes[1].Parameters.SequenceEqual(writes[3].Parameters),
+                "The repeated page UPDATE does not bind the parameters of the first.");
+            RecordedCommand[] updates = [writes[0], writes[1], writes[3]];
+            Assert.All(
+                updates,
+                update => Assert.EndsWith(RowCountSelect, update.CommandText, StringComparison.Ordinal));
+            Assert.All(writes, AssertSucceededInTransaction);
+        }
+        finally
+        {
+            await RestoreNocountAsync(connection, sessionNoCount);
+            await DropTablesAsync(connection, NocountPage, NocountBase);
+        }
+    }
+
+    /// <summary>
+    /// A page <c>UPDATE</c> that changes a number of rows other than the record's one is never reported as saved,
+    /// whatever the session's <c>NOCOUNT</c> setting. On a page table that does not key on <c>GlobalRecordId</c> and
+    /// holds two rows for the record, the update is abandoned on the row count the statement selects itself, which the
+    /// provider's count (-1 under <c>NOCOUNT ON</c>) would never show. The write fails with the store's
+    /// <see cref="DataStoreWriteException"/> for <c>records.update</c> and <see cref="WriteOutcome.NotWritten"/>,
+    /// because the rollback completed after the base stamp and the page <c>UPDATE</c> were sent, and neither table
+    /// keeps any of the update.
+    /// </summary>
+    /// <remarks>
+    /// The same guard refuses an <c>UPDATE</c> of the locked row that finds no row. That needs the row to change
+    /// between the locked read and the write, inside the write's transaction; a session temporary table is visible to
+    /// no other session and cannot carry a trigger, so no fixture of this class can produce it.
+    /// </remarks>
+    /// <param name="noCount">Whether the session runs with <c>NOCOUNT ON</c>.</param>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task PageUpdateChangingMoreThanTheRecordsRow_IsRolledBack_WhateverNocount(bool noCount)
+    {
+        await TestDatabase.EnsureReachableAsync();
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        var cancellationToken = timeout.Token;
+        await using var writeLock = await DatabaseWriteLock.AcquireExclusiveAsync(cancellationToken);
+        await using var connection = await TestDatabase.OpenConnectionAsync(cancellationToken);
+        var sessionNoCount = await ReadNocountAsync(connection, cancellationToken);
+        try
+        {
+            var fixture = await CreateFixtureAsync(
+                connection,
+                NocountBase,
+                NocountPage,
+                $"[{Surname}] nvarchar(4000), [{Remarks}] nvarchar(4000)",
+                [
+                    new FixtureField(Surname, TextTypeId, TextTypeName),
+                    new FixtureField(Remarks, MultilineTypeId, MultilineTypeName),
+                ],
+                cancellationToken,
+                pageKeyIsPrimaryKey: false);
+            await SetNocountAsync(connection, noCount, cancellationToken);
+
+            var options = new DatabaseOptions(TestDatabase.ConnectionString);
+            var connections = new SqlConnectionFactory(options);
+            var repository = new SqlRecordRepository(
+                connections,
+                new SqlMetadataReader(connections, options, fixture.Recorder),
+                options,
+                fixture.Recorder);
+            var insertStamp = new SaveStamp(StampLogonName, SaveStamp.TruncateToSeconds(DateTime.Now));
+            var inserted = await repository.InsertAsync(
+                connection,
+                fixture.Form,
+                fixture.Schema,
+                Values((Surname, FieldValue.FromText("d-" + Guid.NewGuid().ToString("N")))),
+                insertStamp,
+                cancellationToken);
+
+            // A second page row for the record, holding only its key, which the page table's missing key admits.
+            await using (var duplicate = new SqlCommand(
+                $"INSERT INTO [{NocountPage}] ([GlobalRecordId]) VALUES (@id)",
+                connection))
+            {
+                duplicate.Parameters.Add(IdParameter(inserted.GlobalRecordId));
+                await duplicate.ExecuteNonQueryAsync(cancellationToken);
+            }
+
+            Assert.Equal(2, await CountRowsAsync(connection, NocountPage, cancellationToken));
+
+            fixture.Recorder.Clear();
+            var updateStamp = new SaveStamp(StampLogonName + ".update", insertStamp.Time);
+            var failure = await Assert.ThrowsAsync<DataStoreWriteException>(() => repository.UpdateAsync(
+                connection,
+                fixture.Form,
+                fixture.Schema,
+                inserted.GlobalRecordId,
+                Values((Remarks, FieldValue.FromText("r-" + Guid.NewGuid().ToString("N")))),
+                () => updateStamp,
+                stored => RecordValidationResult.Success(stored.Values),
+                permissions: null,
+                cancellationToken));
+
+            Assert.Equal(RecordOperations.Update, failure.Operation);
+            Assert.Equal(WriteOutcome.NotWritten, failure.Outcome);
+            Assert.Null(failure.SqlErrorNumber);
+            Assert.IsType<InvalidOperationException>(failure.InnerException);
+            Assert.False(failure.Data.Contains(SqlErrorClassifier.RollbackExceptionTypeKey));
+
+            // The base stamp and the page UPDATE were sent and succeeded; the page UPDATE's count stopped the write.
+            var writes = fixture.Recorder.ForOperation(RecordOperations.Update)
+                .Where(command => command.IsWrite)
+                .ToArray();
+            Assert.True(
+                writes.Length == 2,
+                "The update did not stop after the base stamp and the page UPDATE: " + Describe(writes));
+            Assert.StartsWith("UPDATE [" + NocountBase + "] ", writes[0].CommandText, StringComparison.Ordinal);
+            Assert.StartsWith("UPDATE [" + NocountPage + "] ", writes[1].CommandText, StringComparison.Ordinal);
+            Assert.EndsWith(RowCountSelect, writes[1].CommandText, StringComparison.Ordinal);
+            Assert.All(writes, AssertSucceededInTransaction);
+
+            // The rollback left both tables as the insert and the second page row made them.
+            Assert.Equal(2, await CountRowsAsync(connection, NocountPage, cancellationToken));
+            await using (var command = new SqlCommand(
+                $"SELECT COUNT(*) FROM [{NocountPage}] WHERE [{Remarks}] IS NOT NULL",
+                connection))
+            {
+                var updatedRows = Assert.IsType<int>(await command.ExecuteScalarAsync(cancellationToken));
+                Assert.True(updatedRows == 0, "A page row keeps the value of the rolled-back update.");
+            }
+
+            await using (var command = new SqlCommand($"SELECT [LastSaveLogonName] FROM [{NocountBase}]", connection))
+            {
+                Assert.True(
+                    await command.ExecuteScalarAsync(cancellationToken) is string logonName
+                        && string.Equals(StampLogonName, logonName, StringComparison.Ordinal),
+                    "The base row keeps the stamp of the rolled-back update.");
+            }
+        }
+        finally
+        {
+            await RestoreNocountAsync(connection, sessionNoCount);
+            await DropTablesAsync(connection, NocountPage, NocountBase);
+        }
+    }
+
+    /// <summary>
+    /// The base tables key on <c>UniqueKey</c> alone, so several base rows can carry one <c>GlobalRecordId</c>. For
+    /// such an id the read by id (<see cref="RecordSqlBuilder.RecordById"/>) and the selected-set placement
+    /// (<see cref="RecordSqlBuilder.SetPositionLookup"/>, over the active set and over every row) each return exactly
+    /// one row, the exact match with the lowest <c>UniqueKey</c>, with that row's own coordinates: the number of rows
+    /// of the set whose key is at most its own, and the size of the set. The read by id takes them over the row's
+    /// intrinsic set, the active rows for an active row and every row otherwise, and the placement over the selected
+    /// set. Each statement chooses that row with its one <c>TOP (1)</c>. The expected values follow from the rows the
+    /// test inserts, by the formula <c>COUNT(*)</c> of the set with <c>UniqueKey &lt;= k</c>.
+    /// </summary>
+    /// <param name="firstMatchStatus">The <c>RecStatus</c> of the lowest-keyed row carrying the id.</param>
+    [Theory]
+    [InlineData(RecordQueryRules.ActiveRecStatus)]
+    [InlineData(RecordQueryRules.DeletedRecStatus)]
+    public async Task ByIdReads_IdOnSeveralBaseRows_ReturnOnlyTheLowestKeyedMatchWithItsCoordinates(
+        int firstMatchStatus)
+    {
+        await TestDatabase.EnsureReachableAsync();
+        using var timeout = new CancellationTokenSource(TestTimeout);
+        var cancellationToken = timeout.Token;
+        await using var writeLock = await DatabaseWriteLock.AcquireExclusiveAsync(cancellationToken);
+        await using var connection = await TestDatabase.OpenConnectionAsync(cancellationToken);
+        try
+        {
+            var fixture = await CreateFixtureAsync(
+                connection,
+                DuplicateIdBase,
+                DuplicateIdPage,
+                $"[{Surname}] nvarchar(4000)",
+                [new FixtureField(Surname, TextTypeId, TextTypeName)],
+                cancellationToken);
+
+            // The shared id sits on the second, fourth and sixth rows, the first of them with the case's status, and
+            // other ids, active and deleted, lie before, between and after them, so each row carrying the id has
+            // coordinates of its own in every set.
+            var sharedId = RecordSqlBuilder.NewGlobalRecordId();
+            (string GlobalRecordId, int RecStatus)[] layout =
+            [
+                (RecordSqlBuilder.NewGlobalRecordId(), RecordQueryRules.ActiveRecStatus),
+                (sharedId, firstMatchStatus),
+                (RecordSqlBuilder.NewGlobalRecordId(), RecordQueryRules.DeletedRecStatus),
+                (sharedId, RecordQueryRules.ActiveRecStatus),
+                (RecordSqlBuilder.NewGlobalRecordId(), RecordQueryRules.ActiveRecStatus),
+                (sharedId, RecordQueryRules.DeletedRecStatus),
+            ];
+            var rows = new List<PlacedRow>(layout.Length);
+            foreach (var (globalRecordId, recStatus) in layout)
+            {
+                var uniqueKey = await InsertBaseRowAsync(
+                    connection,
+                    DuplicateIdBase,
+                    globalRecordId,
+                    recStatus,
+                    cancellationToken);
+                rows.Add(new PlacedRow(globalRecordId, uniqueKey, recStatus, Position: 0, Count: 0));
+            }
+
+            var matches = rows.Where(row => string.Equals(row.GlobalRecordId, sharedId, StringComparison.Ordinal));
+            var first = matches.MinBy(row => row.UniqueKey);
+            Assert.Equal(firstMatchStatus, first.RecStatus);
+
+            // The row's coordinates over a set: the members whose key is at most its own, and the number of members.
+            PlacedRow Placed(PlacedRow row, bool everyRow)
+            {
+                var set = rows.Where(member => everyRow || member.RecStatus == RecordQueryRules.ActiveRecStatus)
+                    .ToArray();
+                return row with
+                {
+                    Position = set.LongCount(member => member.UniqueKey <= row.UniqueKey),
+                    Count = set.LongLength,
+                };
+            }
+
+            var byId = RecordSqlBuilder.RecordById(fixture.Schema, fixture.DataFields, sharedId);
+            Assert.Equal(1, Regex.Count(byId.Statement.Text, Regex.Escape(TopOne)));
+            var read = await ReadPlacedRowsAsync(
+                fixture,
+                connection,
+                byId.Statement,
+                (RecordSqlBuilder.RecordGlobalRecordIdOrdinal,
+                    RecordSqlBuilder.RecordUniqueKeyOrdinal,
+                    RecordSqlBuilder.RecordRecStatusOrdinal,
+                    RecordSqlBuilder.RecordIntrinsicPositionOrdinal,
+                    RecordSqlBuilder.RecordIntrinsicCountOrdinal),
+                cancellationToken);
+            AssertPlacedRow(
+                Placed(first, everyRow: first.RecStatus != RecordQueryRules.ActiveRecStatus),
+                read,
+                "read by id");
+
+            foreach (var includeDeleted in new[] { false, true })
+            {
+                var lookup = RecordSqlBuilder.SetPositionLookup(fixture.Schema, sharedId, includeDeleted);
+                Assert.Equal(1, Regex.Count(lookup.Text, Regex.Escape(TopOne)));
+                var placed = await ReadPlacedRowsAsync(
+                    fixture,
+                    connection,
+                    lookup,
+                    (RecordSqlBuilder.BaseRowGlobalRecordIdOrdinal,
+                        RecordSqlBuilder.BaseRowUniqueKeyOrdinal,
+                        RecordSqlBuilder.BaseRowRecStatusOrdinal,
+                        RecordSqlBuilder.SetPositionOrdinal,
+                        RecordSqlBuilder.SetCountOrdinal),
+                    cancellationToken);
+                AssertPlacedRow(
+                    Placed(first, everyRow: includeDeleted),
+                    placed,
+                    includeDeleted ? "placement over every row" : "placement over the active set");
+            }
+
+            Assert.Empty(fixture.Recorder.Failed());
+        }
+        finally
+        {
+            await DropTablesAsync(connection, DuplicateIdPage, DuplicateIdBase);
+        }
+    }
+
+    // Creates the base and page tables on the test's connection, reads them back through the reader's temporary-table
+    // overload, and builds the in-memory form over the reader-built tables. Constraints are unnamed, so the session's
+    // tables never collide with another session's.
+    private static async Task<Fixture> CreateFixtureAsync(
+        SqlConnection connection,
+        string baseName,
+        string pageName,
+        string pageColumnDefinitions,
+        IReadOnlyList<FixtureField> fields,
+        CancellationToken cancellationToken,
+        bool lastSaveColumns = true,
+        bool pageKeyIsPrimaryKey = true,
+        string logonNameType = "nvarchar(255)")
+    {
+        // The base table has the seeded base tables' columns (testdata/sql/05_data_tables.sql), less the two last-save
+        // stamp columns when lastSaveColumns is false, which the write path then never names, and with logonNameType
+        // as the type of its logon-name stamp columns.
+        var lastSaveColumnDefinitions = lastSaveColumns
+            ? $"[LastSaveLogonName] {logonNameType}, [LastSaveTime] datetime,"
+            : string.Empty;
+
+        // The page table keys on GlobalRecordId as the seeded page tables do, unless pageKeyIsPrimaryKey is false,
+        // which lets it hold more than one row for a record.
+        var pageKeyConstraint = pageKeyIsPrimaryKey ? " PRIMARY KEY" : string.Empty;
+        await ExecuteDdlAsync(
+            connection,
+            $"""
+            CREATE TABLE [{baseName}] (
+                [UniqueKey] int IDENTITY(1,1) PRIMARY KEY NOT NULL,
+                [RecStatus] smallint NOT NULL DEFAULT 1,
+                [GlobalRecordId] nvarchar(255) NOT NULL,
+                [FirstSaveLogonName] {logonNameType},
+                [FirstSaveTime] datetime,
+                {lastSaveColumnDefinitions}
+                [FKEY] nvarchar(255));
+            CREATE TABLE [{pageName}] (
+                [GlobalRecordId] nvarchar(255){pageKeyConstraint} NOT NULL,
+                {pageColumnDefinitions});
+            """,
+            cancellationToken);
+
+        var options = new DatabaseOptions(TestDatabase.ConnectionString);
+        var recorder = new SqlCommandRecorder();
+        var reader = new SqlMetadataReader(new SqlConnectionFactory(options), options, recorder);
+        var baseTable = await reader.ReadTempTableSchemaAsync(connection, baseName, cancellationToken);
+        var pageTable = await reader.ReadTempTableSchemaAsync(connection, pageName, cancellationToken);
+
+        var page = new PageMetadata(FixturePageId, "Page 1", Position: 0, pageName);
+        var fieldRows = new List<FieldMetadata>(fields.Count);
+        for (var index = 0; index < fields.Count; index++)
+        {
+            var field = fields[index];
+            var column = pageTable.FindColumn(field.Name)
+                ?? throw new InvalidOperationException("The reader did not return a fixture column.");
+            fieldRows.Add(new FieldMetadata
+            {
+                FieldId = index + 1,
+                Name = field.Name,
+                FieldTypeId = field.FieldTypeId,
+                FieldTypeName = field.FieldTypeName,
+                Prompt = field.Name,
+                TabIndex = index + 1,
+                PageId = FixturePageId,
+                List = field.List,
+                Column = column.Metadata,
+            });
+        }
+
+        var form = new FormMetadata(FixtureViewId, "ReservedWordFixture", baseName, [page], fieldRows);
+        var dataFields = FormDefinitionFactory.GetDataFields(form);
+        Assert.Equal(fields.Count, dataFields.Count);
+
+        var pageSchema = new PageTableSchema(page, pageTable);
+        var schema = new FormSchema(FixtureViewId, baseTable, [pageSchema]);
+        var pageColumns = dataFields
+            .Select((field, ordinal) => RecordSqlBuilder.ResolveDataColumn(schema, field, ordinal))
+            .ToArray();
+
+        recorder.Clear();
+        return new Fixture(
+            form,
+            schema,
+            pageSchema,
+            dataFields,
+            pageColumns,
+            recorder,
+            options.CommandTimeoutSeconds);
+    }
+
+    // Inserts an active base row with a new id through the builder and returns the id.
+    private static async Task<string> InsertBaseAsync(
+        Fixture fixture,
+        SqlConnection connection,
+        CancellationToken cancellationToken)
+    {
+        var globalRecordId = RecordSqlBuilder.NewGlobalRecordId();
+        var stamp = new SaveStamp(StampLogonName, SaveStamp.TruncateToSeconds(DateTime.Now));
+        var uniqueKey = await SqlExecution.ExecuteScalarAsync<int>(
+            connection,
+            transaction: null,
+            FixtureOperation,
+            RecordSqlBuilder.InsertBase(fixture.Schema, globalRecordId, stamp),
+            fixture.CommandTimeoutSeconds,
+            fixture.Recorder,
+            cancellationToken);
+        Assert.True(uniqueKey > 0, "The base insert must return the new UniqueKey.");
+        return globalRecordId;
+    }
+
+    // Inserts a base row holding the given id and status by a plain parameterised command, which, unlike the builder's
+    // insert, can repeat an id, and returns the row's new UniqueKey.
+    private static async Task<int> InsertBaseRowAsync(
+        SqlConnection connection,
+        string baseName,
+        string globalRecordId,
+        int recStatus,
+        CancellationToken cancellationToken)
+    {
+        await using var command = new SqlCommand(
+            $"INSERT INTO [{baseName}] ([RecStatus], [GlobalRecordId]) OUTPUT INSERTED.[UniqueKey] " +
+            "VALUES (@status, @id)",
+            connection);
+        command.Parameters.Add(new SqlParameter("@status", SqlDbType.SmallInt) { Value = checked((short)recStatus) });
+        command.Parameters.Add(IdParameter(globalRecordId));
+        return Assert.IsType<int>(await command.ExecuteScalarAsync(cancellationToken));
+    }
+
+    // Runs a by-id read on the fixture's connection and reads every row it returns at the given ordinals: the stored
+    // id, the key and the status, then the position and the count, both bigint.
+    private static Task<List<PlacedRow>> ReadPlacedRowsAsync(
+        Fixture fixture,
+        SqlConnection connection,
+        SqlStatement statement,
+        (int GlobalRecordId, int UniqueKey, int RecStatus, int Position, int Count) ordinals,
+        CancellationToken cancellationToken) =>
+        SqlExecution.ReadAsync(
+            connection,
+            transaction: null,
+            FixtureOperation,
+            statement,
+            fixture.CommandTimeoutSeconds,
+            fixture.Recorder,
+            cancellationToken,
+            async (reader, token) =>
+            {
+                var rows = new List<PlacedRow>();
+                while (await reader.ReadAsync(token))
+                {
+                    rows.Add(new PlacedRow(
+                        reader.GetString(ordinals.GlobalRecordId),
+                        reader.GetInt32(ordinals.UniqueKey),
+                        reader.GetInt16(ordinals.RecStatus),
+                        reader.GetInt64(ordinals.Position),
+                        reader.GetInt64(ordinals.Count)));
+                }
+
+                return rows;
+            });
+
+    private static Task<int> ExecuteAsync(
+        Fixture fixture,
+        SqlConnection connection,
+        SqlStatement statement,
+        CancellationToken cancellationToken) =>
+        SqlExecution.ExecuteAsync(
+            connection,
+            transaction: null,
+            FixtureOperation,
+            statement,
+            fixture.CommandTimeoutSeconds,
+            fixture.Recorder,
+            cancellationToken);
+
+    // Verifies the stored values twice: by a plain parameterised read, which must return exactly the column's CLR
+    // type, and by the record read the API uses, converted back through ColumnValueConverter.
+    private static async Task AssertStoredExactlyAsync(
+        Fixture fixture,
+        SqlConnection connection,
+        string globalRecordId,
+        long expectedCount,
+        int expectedTiny,
+        int expectedSmall,
+        int expectedInt,
+        CancellationToken cancellationToken)
+    {
+        await using (var command = new SqlCommand(
+            $"SELECT [{BigCount}], [{TinyChoice}], [{SmallChoice}], [{IntChoice}] FROM [{ExactPage}] " +
+            "WHERE [GlobalRecordId] = @id",
+            connection))
+        {
+            command.Parameters.Add(new SqlParameter("@id", SqlDbType.NVarChar, 255) { Value = globalRecordId });
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+            Assert.True(await reader.ReadAsync(cancellationToken), "The page row was not found.");
+            AssertExact(expectedCount, reader.GetValue(0), BigCount);
+            AssertExact((byte)expectedTiny, reader.GetValue(1), TinyChoice);
+            AssertExact((short)expectedSmall, reader.GetValue(2), SmallChoice);
+            AssertExact(expectedInt, reader.GetValue(3), IntChoice);
+            Assert.False(await reader.ReadAsync(cancellationToken), "The page holds more than one row for the id.");
+        }
+
+        var select = RecordSqlBuilder.RecordById(fixture.Schema, fixture.DataFields, globalRecordId);
+        var values = await SqlExecution.ReadAsync(
+            connection,
+            transaction: null,
+            FixtureOperation,
+            select.Statement,
+            fixture.CommandTimeoutSeconds,
+            fixture.Recorder,
+            cancellationToken,
+            async (reader, token) =>
+            {
+                var read = new Dictionary<string, FieldValue>(StringComparer.Ordinal);
+                if (!await reader.ReadAsync(token))
+                {
+                    return read;
+                }
+
+                foreach (var column in select.Columns)
+                {
+                    read.Add(
+                        column.Field.Name,
+                        ColumnValueConverter.FromDbValue(
+                            column.Column.Metadata, column.Field.FieldType, reader.GetValue(column.Ordinal)));
+                }
+
+                return read;
+            });
+
+        Assert.Equal(fixture.DataFields.Count, values.Count);
+        Assert.True(
+            values[BigCount].TryGetInteger(out var count) && count == expectedCount,
+            BigCount + " read back through the converter is not the exact integer written.");
+        AssertIndex(expectedTiny, values[TinyChoice], TinyChoice);
+        AssertIndex(expectedSmall, values[SmallChoice], SmallChoice);
+        AssertIndex(expectedInt, values[IntChoice], IntChoice);
+    }
+
+    // The marker column read by a plain parameterised command that names the bracketed identifier itself.
+    private static async Task<string?> ReadMarkerColumnAsync(
+        SqlConnection connection,
+        string globalRecordId,
+        CancellationToken cancellationToken)
+    {
+        await using var command = new SqlCommand(
+            $"SELECT [{BinderMarkerColumn}] FROM [{MarkerPage}] WHERE [GlobalRecordId] = @id",
+            connection);
+        command.Parameters.Add(new SqlParameter("@id", SqlDbType.NVarChar, 255) { Value = globalRecordId });
+        var value = await command.ExecuteScalarAsync(cancellationToken);
+        return value as string;
+    }
+
+    // The recorder saw exactly the statement's text, holding the bracketed marker, and the command succeeded.
+    private static void AssertObservedAsSent(SqlCommandRecorder recorder, SqlStatement statement, string identifier)
+    {
+        var observed = Assert.Single(
+            recorder.Commands,
+            command => string.Equals(command.CommandText, statement.Text, StringComparison.Ordinal));
+        Assert.True(observed.Completed && observed.Succeeded, "The observed command did not succeed.");
+        Assert.Contains(identifier, SqlCommandRecorder.BracketedIdentifiers(observed.CommandText));
+    }
+
+    // The reader returned the column under its catalogue spelling and in the expected column family.
+    private static void AssertCatalogueColumn(TableSchema table, string name, ColumnFamily family)
+    {
+        var column = table.FindColumn(name);
+        Assert.NotNull(column);
+        Assert.Equal(name, column.Name);
+        Assert.Equal(family, column.Metadata.Family);
+    }
+
+    // The session base table holds only the fixture's record, so every read of it is active at position 1 of 1, under
+    // the id and key its insert returned.
+    private static void AssertSoleRecord(
+        RecordDto created,
+        RecordDto actual,
+        IReadOnlyDictionary<string, FieldValue> expected,
+        string step)
+    {
+        Assert.True(
+            string.Equals(created.GlobalRecordId, actual.GlobalRecordId, StringComparison.Ordinal),
+            "The record returned by the " + step + " has another GlobalRecordId.");
+        Assert.Equal(created.UniqueKey, actual.UniqueKey);
+        Assert.Equal(RecordQueryRules.ActiveRecStatus, actual.RecStatus);
+        Assert.Equal(1, actual.Position);
+        Assert.Equal(1, actual.Count);
+        AssertValues(actual.Values, expected, step);
+    }
+
+    // The read returned exactly one row, the expected base row with the expected coordinates, compared without
+    // quoting the id.
+    private static void AssertPlacedRow(PlacedRow expected, IReadOnlyList<PlacedRow> rows, string read)
+    {
+        Assert.True(rows.Count == 1, "The " + read + " returned " + rows.Count + " rows, where one was expected.");
+        var actual = rows[0];
+        Assert.True(
+            string.Equals(expected.GlobalRecordId, actual.GlobalRecordId, StringComparison.Ordinal),
+            "The " + read + " returned a row of another GlobalRecordId.");
+        Assert.Equal(expected.UniqueKey, actual.UniqueKey);
+        Assert.Equal(expected.RecStatus, actual.RecStatus);
+        Assert.Equal(expected.Position, actual.Position);
+        Assert.Equal(expected.Count, actual.Count);
+    }
+
+    // Compares every value without quoting either, so no field value reaches the test output.
+    private static void AssertValues(
+        IReadOnlyDictionary<string, FieldValue> actual,
+        IReadOnlyDictionary<string, FieldValue> expected,
+        string step)
+    {
+        Assert.Equal(expected.Count, actual.Count);
+        foreach (var (name, value) in expected)
+        {
+            Assert.True(
+                actual.TryGetValue(name, out var stored) && stored.Equals(value),
+                name + " after the " + step + " does not hold the value written.");
+        }
+    }
+
+    // Reads the fixture's rows by plain parameterised commands that name the bracketed identifiers themselves: the
+    // page row holds the expected values with the columns' exact CLR types, and the base table holds only the record,
+    // active.
+    private static async Task AssertReservedWordRowAsync(
+        SqlConnection connection,
+        string globalRecordId,
+        string expectedOrder,
+        double expectedSelect,
+        bool expectedGroup,
+        CancellationToken cancellationToken)
+    {
+        await using (var command = new SqlCommand(
+            $"SELECT [{ReservedOrder}], [{ReservedSelect}], [{ReservedGroup}] FROM [{ReservedPage}] " +
+            "WHERE [GlobalRecordId] = @id",
+            connection))
+        {
+            command.Parameters.Add(new SqlParameter("@id", SqlDbType.NVarChar, 255) { Value = globalRecordId });
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+            Assert.True(await reader.ReadAsync(cancellationToken), "The page row was not found.");
+            Assert.True(
+                reader.GetValue(0) is string order && string.Equals(expectedOrder, order, StringComparison.Ordinal),
+                ReservedOrder + " does not hold the exact text written.");
+            AssertExact(expectedSelect, reader.GetValue(1), ReservedSelect);
+            AssertExact(expectedGroup, reader.GetValue(2), ReservedGroup);
+            Assert.False(await reader.ReadAsync(cancellationToken), "The page holds more than one row for the id.");
+        }
+
+        await using (var command = new SqlCommand(
+            $"SELECT [GlobalRecordId], [RecStatus] FROM [{ReservedBase}]",
+            connection))
+        {
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+            Assert.True(await reader.ReadAsync(cancellationToken), "The base row was not found.");
+            Assert.True(
+                reader.GetValue(0) is string id && string.Equals(globalRecordId, id, StringComparison.Ordinal),
+                "The base row holds another GlobalRecordId.");
+            AssertExact((short)RecordQueryRules.ActiveRecStatus, reader.GetValue(1), "RecStatus");
+            Assert.False(await reader.ReadAsync(cancellationToken), "The base table holds more than one row.");
+        }
+    }
+
+    // The fixed-width fixture: a Legal Values field and a Text field, each on an nchar(5) page column.
+    private static Task<Fixture> CreateFixedWidthFixtureAsync(
+        SqlConnection connection,
+        CancellationToken cancellationToken) =>
+        CreateFixtureAsync(
+            connection,
+            FixedWidthBase,
+            FixedWidthPage,
+            $"[{Grade}] nchar({FixedWidth}), [{Code}] nchar({FixedWidth})",
+            [
+                new FixtureField(Grade, LegalValuesTypeId, LegalValuesTypeName),
+                new FixtureField(Code, TextTypeId, TextTypeName),
+            ],
+            cancellationToken);
+
+    // The validator as the API builds it over the fixed-width fixture's form, with Grade's choices held in memory,
+    // because no code-table row is written.
+    private static RecordValidator FixedWidthValidator(Fixture fixture)
+    {
+        var options = new Dictionary<string, IReadOnlyList<FieldOption>>(StringComparer.Ordinal)
+        {
+            [Grade] = new[] { FullWidthChoice, PaddedChoice, ShortChoice }
+                .Select(text => new FieldOption(FieldValue.FromText(text), text))
+                .ToArray(),
+        };
+        return new RecordValidator(fixture.Form, FormDefinitionFactory.Create(fixture.Form, options, []));
+    }
+
+    // The fixed-width page row read by a plain parameterised command: each text as stored and its DATALENGTH in bytes.
+    private static async Task<FixedWidthRow> ReadFixedWidthRowAsync(
+        SqlConnection connection,
+        string globalRecordId,
+        CancellationToken cancellationToken)
+    {
+        await using var command = new SqlCommand(
+            $"SELECT [{Grade}], DATALENGTH([{Grade}]), [{Code}], DATALENGTH([{Code}]) FROM [{FixedWidthPage}] " +
+            "WHERE [GlobalRecordId] = @id",
+            connection);
+        command.Parameters.Add(new SqlParameter("@id", SqlDbType.NVarChar, 255) { Value = globalRecordId });
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        Assert.True(await reader.ReadAsync(cancellationToken), "The page row was not found.");
+        var row = new FixedWidthRow(
+            Assert.IsType<string>(reader.GetValue(0)),
+            Assert.IsType<int>(reader.GetValue(1)),
+            Assert.IsType<string>(reader.GetValue(2)),
+            Assert.IsType<int>(reader.GetValue(3)));
+        Assert.False(await reader.ReadAsync(cancellationToken), "The page holds more than one row for the id.");
+        return row;
+    }
+
+    // The fixed-width stamp fixture's base row read by a plain parameterised command: each logon-name stamp as stored
+    // with its DATALENGTH in bytes, and RecStatus.
+    private static async Task<StampRow> ReadStampRowAsync(
+        SqlConnection connection,
+        string globalRecordId,
+        CancellationToken cancellationToken)
+    {
+        await using var command = new SqlCommand(
+            "SELECT [FirstSaveLogonName], DATALENGTH([FirstSaveLogonName]), [LastSaveLogonName], " +
+            $"DATALENGTH([LastSaveLogonName]), [RecStatus] FROM [{FixedStampBase}] WHERE [GlobalRecordId] = @id",
+            connection);
+        command.Parameters.Add(new SqlParameter("@id", SqlDbType.NVarChar, 255) { Value = globalRecordId });
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        Assert.True(await reader.ReadAsync(cancellationToken), "The base row was not found.");
+        var row = new StampRow(
+            Assert.IsType<string>(reader.GetValue(0)),
+            Assert.IsType<int>(reader.GetValue(1)),
+            Assert.IsType<string>(reader.GetValue(2)),
+            Assert.IsType<int>(reader.GetValue(3)),
+            Assert.IsType<short>(reader.GetValue(4)));
+        Assert.False(await reader.ReadAsync(cancellationToken), "The base table holds more than one row for the id.");
+        return row;
+    }
+
+    // An nchar(255) logon-name stamp holds the logon name written, padded with spaces by SQL Server to 255 characters.
+    private static void AssertPaddedLogonName(string written, string stored, int storedBytes, string step)
+    {
+        Assert.True(
+            string.Equals(written.PadRight(FixedLogonNameWidth), stored, StringComparison.Ordinal),
+            "A logon-name stamp after the " + step + " is not the name written, padded to the column's width.");
+        Assert.Equal(2 * FixedLogonNameWidth, storedBytes);
+    }
+
+    // A statement naming the reserved-word columns ran as recorded, quoted each of them in brackets, and succeeded.
+    private static void AssertQuotesReservedWords(RecordedCommand command, bool inTransaction)
+    {
+        Assert.True(
+            command.Completed && command.Succeeded,
+            "The command did not succeed: " + command.Describe(includeParameterValues: false));
+        Assert.Equal(inTransaction, command.InTransaction);
+        var identifiers = SqlCommandRecorder.BracketedIdentifiers(command.CommandText);
+        foreach (var name in new[] { ReservedOrder, ReservedSelect, ReservedGroup })
+        {
+            Assert.Contains(name, identifiers);
+            Assert.Contains("[" + name + "]", command.CommandText, StringComparison.Ordinal);
+        }
+    }
+
+    // A JSON number criterion as the API reads it: FieldValueJsonConverter parses the literal's UTF-8 bytes.
+    private static FieldValue JsonNumber(string literal)
+    {
+        Assert.True(
+            FieldValueCoercion.TryParseNumber(Encoding.UTF8.GetBytes(literal), out var value),
+            "The JSON number literal must parse.");
+        return value;
+    }
+
+    // With one alternative and no excluded id, the outer WHERE clause names exactly one parameter: the criterion's.
+    private static SqlParameterValue CriterionParameter(SqlStatement statement)
+    {
+        var where = statement.Text[statement.Text.LastIndexOf(" WHERE ", StringComparison.Ordinal)..];
+        return Assert.Single(
+            statement.Parameters,
+            parameter => Regex.IsMatch(where, Regex.Escape(parameter.Name) + "(?![0-9])"));
+    }
+
+    private static void AssertBound<T>(SqlParameterValue parameter, DbType expectedType, T expected, string column)
+        where T : struct
+    {
+        Assert.Equal(expectedType, parameter.DbType);
+        Assert.Null(parameter.Size);
+        AssertExact(expected, parameter.Value, column);
+    }
+
+    // Compares without quoting either value, so no field or parameter value reaches the test output.
+    private static void AssertExact<T>(T expected, object? actual, string column)
+        where T : struct
+    {
+        var typed = Assert.IsType<T>(actual);
+        Assert.True(EqualityComparer<T>.Default.Equals(expected, typed), column + " does not hold the exact value.");
+    }
+
+    private static void AssertIndex(int expected, FieldValue value, string column) =>
+        Assert.True(
+            value.TryGetIndex(out var index) && index == expected,
+            column + " read back through the converter is not the option index written.");
+
+    private static Dictionary<string, FieldValue> Values(params (string Name, FieldValue Value)[] entries)
+    {
+        var values = new Dictionary<string, FieldValue>(StringComparer.Ordinal);
+        foreach (var (name, value) in entries)
+        {
+            values.Add(name, value);
+        }
+
+        return values;
+    }
+
+    private static async Task ExecuteDdlAsync(SqlConnection connection, string sql, CancellationToken cancellationToken)
+    {
+        await using var command = new SqlCommand(sql, connection);
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    // Runs even after a timeout, on the connection that owns the tables; a closed connection has dropped them already.
+    private static async Task DropTablesAsync(SqlConnection connection, params string[] tableNames)
+    {
+        if (connection.State != ConnectionState.Open)
+        {
+            return;
+        }
+
+        foreach (var tableName in tableNames)
+        {
+            await ExecuteDdlAsync(connection, $"DROP TABLE IF EXISTS [{tableName}];", CancellationToken.None);
+        }
+    }
+
+    // Whether the session runs with NOCOUNT ON, as @@OPTIONS reports it.
+    private static async Task<bool> ReadNocountAsync(SqlConnection connection, CancellationToken cancellationToken)
+    {
+        await using var command = new SqlCommand("SELECT @@OPTIONS", connection);
+        var options = Assert.IsType<int>(await command.ExecuteScalarAsync(cancellationToken));
+        return (options & NocountOption) != 0;
+    }
+
+    // Sets the session's NOCOUNT option, which a server's 'user options' can also make every session's default, and
+    // confirms it. The option lasts for the session, so the open-connection overloads run under it.
+    private static async Task SetNocountAsync(
+        SqlConnection connection,
+        bool noCount,
+        CancellationToken cancellationToken)
+    {
+        await using (var command = new SqlCommand(noCount ? "SET NOCOUNT ON;" : "SET NOCOUNT OFF;", connection))
+        {
+            await command.ExecuteNonQueryAsync(cancellationToken);
+        }
+
+        Assert.True(
+            await ReadNocountAsync(connection, cancellationToken) == noCount,
+            "The session's NOCOUNT option is not the one the case set.");
+    }
+
+    // Puts the session's own NOCOUNT option back, even after a timeout, before the pool can reuse the session; a
+    // closed connection has ended the session already.
+    private static async Task RestoreNocountAsync(SqlConnection connection, bool noCount)
+    {
+        if (connection.State != ConnectionState.Open)
+        {
+            return;
+        }
+
+        await using var command = new SqlCommand(noCount ? "SET NOCOUNT ON;" : "SET NOCOUNT OFF;", connection);
+        await command.ExecuteNonQueryAsync(CancellationToken.None);
+    }
+
+    // The record id bound as the fixture tables' nvarchar(255) key.
+    private static SqlParameter IdParameter(string globalRecordId) =>
+        new("@id", SqlDbType.NVarChar, 255) { Value = globalRecordId };
+
+    // The number of rows of a fixture table.
+    private static async Task<int> CountRowsAsync(
+        SqlConnection connection,
+        string tableName,
+        CancellationToken cancellationToken)
+    {
+        await using var command = new SqlCommand($"SELECT COUNT(*) FROM [{tableName}]", connection);
+        return Assert.IsType<int>(await command.ExecuteScalarAsync(cancellationToken));
+    }
+
+    // Commands as an assertion message lists them, without their parameter values.
+    private static string Describe(IEnumerable<RecordedCommand> commands) =>
+        string.Join("; ", commands.Select(command => command.Describe(includeParameterValues: false)));
+
+    // A write of the operation ran inside its transaction and succeeded.
+    private static void AssertSucceededInTransaction(RecordedCommand command) =>
+        Assert.True(
+            command.Completed && command.Succeeded && command.InTransaction,
+            "A write did not succeed inside its transaction: " + command.Describe(includeParameterValues: false));
+
+    private sealed record FixtureField(string Name, int FieldTypeId, string FieldTypeName, string? List = null);
+
+    // The fixed-width page row's texts as stored, each with its DATALENGTH in bytes.
+    private readonly record struct FixedWidthRow(string Grade, int GradeBytes, string Code, int CodeBytes);
+
+    // The fixed-width stamp fixture's logon-name stamps as stored, each with its DATALENGTH in bytes, and RecStatus.
+    private readonly record struct StampRow(
+        string FirstSave,
+        int FirstSaveBytes,
+        string LastSave,
+        int LastSaveBytes,
+        short RecStatus);
+
+    // A base row as a by-id read returns it, its id as stored, with a position and a count.
+    private readonly record struct PlacedRow(
+        string GlobalRecordId,
+        int UniqueKey,
+        int RecStatus,
+        long Position,
+        long Count);
+
+    // Records every command, and closes the write's connection once the first INSERT or UPDATE has succeeded, so the
+    // server has run DML that the write's next statement and its rollback then cannot follow. A fault injection for
+    // one test: unlike a production observer, it deliberately changes what happens next.
+    private sealed class CloseAfterFirstWriteObserver(SqlCommandRecorder recorder, SqlConnection connection)
+        : ISqlCommandObserver
+    {
+        private bool _closed;
+
+        public void OnExecuting(SqlCommandInfo command) => recorder.OnExecuting(command);
+
+        public void OnExecuted(SqlCommandInfo command, int? sqlErrorNumber, Exception? error)
+        {
+            recorder.OnExecuted(command, sqlErrorNumber, error);
+            if (!_closed && error is null && SqlCommandRecorder.ContainsWriteStatement(command.CommandText))
+            {
+                _closed = true;
+                connection.Close();
+            }
+        }
+    }
+
+    // The in-memory form over reader-built temporary tables, with the recorder every fixture command reports to.
+    private sealed record Fixture(
+        FormMetadata Form,
+        FormSchema Schema,
+        PageTableSchema Page,
+        DataFieldSet DataFields,
+        IReadOnlyList<ProjectedColumn> PageColumns,
+        SqlCommandRecorder Recorder,
+        int CommandTimeoutSeconds)
+    {
+        public ProjectedColumn Column(string name) => PageColumns[IndexOf(name)];
+
+        public int IndexOf(string name)
+        {
+            for (var index = 0; index < PageColumns.Count; index++)
+            {
+                if (string.Equals(PageColumns[index].Field.Name, name, StringComparison.Ordinal))
+                {
+                    return index;
+                }
+            }
+
+            throw new InvalidOperationException("The fixture has no such column.");
+        }
+    }
+}
