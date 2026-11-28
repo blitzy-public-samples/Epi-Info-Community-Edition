@@ -156,9 +156,12 @@ function deadlineOf(deadlineMs: number | undefined): number {
 const NO_TIMELY_ANSWER = 'The server did not answer in time.';
 const UNREADABLE_ANSWER = "The server's answer could not be read.";
 const EFFECTS_NOT_APPLIED = 'Its effects could not be applied.';
+const DATABASE_NOT_REACHED = 'The database could not be reached.';
+const SERVER_NOT_REACHED = 'The server could not be reached.';
 
-// An OK status on a failure: the client settles an OK answer whose body is not JSON, or is
-// not the whole field-event response, as a failure of that status (raiseFieldEvent).
+// An OK status on a failure: the client settles an OK answer that is not served as JSON,
+// whose body is not JSON, or that is not the whole field-event response, as a failure of
+// that status (raiseFieldEvent).
 function isUnreadableAnswer(error: ApiError): boolean {
   return error.status !== null && error.status >= 200 && error.status <= 299;
 }
@@ -282,8 +285,14 @@ function latestReason(reasons: ReadonlyMap<FieldEventKind, string>): string {
   return latest;
 }
 
-// describeError's texts for these kinds speak of saving or opening records, which a field
-// event never does; the endpoint's 404 means an unknown form.
+// describeError's texts for the validation, notFound, conflict and forbidden kinds speak of
+// saving or opening records, which a field event never does; the endpoint's 404 means an
+// unknown form.
+// A notice outlives its request: it stands until the field's own event of that kind is
+// answered, through any save or Retry that succeeds meanwhile. So a 503 (or a proxy's 502
+// or 504) and no response say what happened when the event ran, never the connection as it
+// is now, and leave out describeError's sentence that the changes are still on screen,
+// which speaks for a failed save: a failed event leaves the draft as it was.
 function failureReason(error: ApiError): string {
   switch (error.kind) {
     case 'validation':
@@ -291,6 +300,10 @@ function failureReason(error: ApiError): string {
     case 'conflict':
     case 'forbidden':
       return errorMessages.badRequest;
+    case 'unavailable':
+      return DATABASE_NOT_REACHED;
+    case 'network':
+      return SERVER_NOT_REACHED;
     default:
       return describeError(error);
   }

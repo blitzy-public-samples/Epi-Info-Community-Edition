@@ -1024,6 +1024,90 @@ describe('createFieldEventQueue', () => {
     expect(drained).toBe(true);
   });
 
+  /** The complete answer above that also disables a field, so each kind of effect would show. */
+  const disabling: FieldEventResponse = { ...effectful, disabled: ['FirstName'] };
+
+  /**
+   * A 200 whose body is the JSON text of `body`, served as `contentType`: one Content-Type
+   * field holding the text given, one field for each text of a list, or none when it is `null`.
+   */
+  function servedAs(contentType: string | readonly string[] | null, body: FieldEventResponse): Response {
+    const fields: readonly string[] = typeof contentType === 'string' ? [contentType] : (contentType ?? []);
+    const headers = new Headers();
+    // Headers joins the fields of a list with ", ", as a browser joins repeated response fields.
+    for (const field of fields) {
+      headers.append('content-type', field);
+    }
+    // Bytes, unlike text, give a Response no Content-Type of its own.
+    return new Response(new TextEncoder().encode(JSON.stringify(body)), { status: 200, headers });
+  }
+
+  // Every success body the API returns is served with the one media type application/json; a
+  // complete answer served as anything else, or with more than one media type, is not the
+  // API's, so none of it is applied. A label naming fields serves one Content-Type field for
+  // each, and "one field" a single field whose value lists two media types.
+  it.each<{ label: string; contentType: string | readonly string[] | null }>([
+    { label: 'text/plain; charset=utf-8', contentType: 'text/plain; charset=utf-8' },
+    { label: 'text/html', contentType: 'text/html' },
+    { label: 'application/problem+json', contentType: 'application/problem+json' },
+    { label: 'application/vnd.x+json', contentType: 'application/vnd.x+json' },
+    { label: 'no Content-Type', contentType: null },
+    { label: 'fields JSON; charset=utf-8, text/plain', contentType: ['application/json; charset=utf-8', 'text/plain'] },
+    { label: 'fields text/plain, application/json', contentType: ['text/plain', 'application/json'] },
+    { label: 'one field application/json, text/html', contentType: 'application/json, text/html' },
+    { label: 'fields application/json twice', contentType: ['application/json', 'application/json'] },
+    {
+      label: 'fields JSON; charset=utf-8 twice',
+      contentType: ['application/json; charset=utf-8', 'application/json; charset=utf-8'],
+    },
+    { label: 'fields JSON; profile="a,b", text/plain', contentType: ['application/json; profile="a,b"', 'text/plain'] },
+  ])('applies none of a complete answer served with $label, shows a notice and sends the next event', async ({ contentType }) => {
+    const { harness, host, queue } = createQueue();
+    let drained = false;
+
+    queue.raise('FieldAfter', 'LastName');
+    queue.raise('FieldBefore', 'FirstName');
+    void queue.drain().then(() => {
+      drained = true;
+    });
+    await answer(harness, 0, servedAs(contentType, disabling));
+
+    expect(await harness.eventResult(0)).toMatchObject({ ok: false, error: { kind: 'server', status: 200 } });
+    expect(host.onNotices.mock.calls).toEqual([
+      [["Check code could not run for Last Name. The server's answer could not be read."]],
+    ]);
+    expect(host.setSnapshot).not.toHaveBeenCalled();
+    expect(host.onDialogs).not.toHaveBeenCalled();
+
+    const next = await eventAt(harness.api, 1);
+    expect(next).toMatchObject({ event: 'FieldBefore', fieldName: 'FirstName' });
+    await answer(harness, 1, json(200, envelope()));
+    expect(drained).toBe(true);
+    expect(queue.size).toBe(0);
+  });
+
+  // A comma inside a quoted parameter value is part of the one media type, also after a
+  // quote that a backslash escapes.
+  it.each([
+    'application/json; charset=utf-8',
+    'APPLICATION/JSON',
+    'application/json; profile="a,b"',
+    'application/json; profile="a\\",b"',
+  ])(
+    'applies every effect of a complete answer served as %s',
+    async (contentType) => {
+      const { harness, host, queue } = createQueue();
+
+      queue.raise('FieldAfter', 'DOB');
+      await answer(harness, 0, servedAs(contentType, disabling));
+
+      expect(host.onNotices).not.toHaveBeenCalled();
+      expect(host.snapshot.values.Age).toBe(ASSIGNED_AGE);
+      expect([...host.snapshot.checkCodeDisabled]).toEqual(['FirstName']);
+      expect(host.onDialogs.mock.calls).toEqual([[[FEVER_DIALOG]]]);
+    },
+  );
+
   it('applies an answer whose diagnostics are on line 1 or later and passes them on in source order', async () => {
     const { harness, host, queue } = createQueue();
     const onDiagnostics = vi.fn<(diagnostics: readonly Diagnostic[]) => void>();
@@ -1368,8 +1452,8 @@ describe('useRecordEditor field events', () => {
     const { api } = harness;
     api.holdPuts();
     const { result, onSaved } = await mountEditor(harness);
-    const notice =
-      'Check code could not run for First Name. The database cannot be reached. Your changes are still on screen.';
+    // Told in the past tense, so it stays true once the database is back.
+    const notice = 'Check code could not run for First Name. The database could not be reached.';
 
     act(() => {
       result.current.setValue('FirstName', 'Anna');
@@ -1405,7 +1489,9 @@ describe('useRecordEditor field events', () => {
     expect(api.puts()).toEqual([{ FirstName: 'Anna' }, { FirstName: 'Anna' }]);
     expect(onSaved).toHaveBeenCalledTimes(1);
     expect(result.current.banner).toBeNull();
-    // The record is saved, but First Name's check code still has not run.
+    // The record is saved, but First Name's check code still has not run: neither the save
+    // nor its Retry sent the failed event again.
+    expect(sentEvents(api)).toEqual([{ event: 'FieldAfter', fieldName: 'FirstName' }]);
     expect(result.current.eventNotices).toEqual([notice]);
     expect(result.current.values.FirstName).toBe('Anna');
     expect(result.current.dirty.size).toBe(0);
@@ -1457,8 +1543,7 @@ describe('useRecordEditor field events', () => {
   it('lists both failures, in order, when the next event is answered 200 without the response envelope', async () => {
     const harness = createHarness();
     const { result } = await mountEditor(harness);
-    const lastName =
-      'Check code could not run for Last Name. The database cannot be reached. Your changes are still on screen.';
+    const lastName = 'Check code could not run for Last Name. The database could not be reached.';
 
     act(() => {
       result.current.onFieldBlur('LastName');

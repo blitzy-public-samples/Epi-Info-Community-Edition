@@ -6,12 +6,13 @@
 // - Leaving a dirty record saves it first; a failed save, a 404 included, cancels the
 //   move and keeps the draft, and Discard edits alone replaces it (0.3.6, 0.3.4.2).
 // - The write-outcome table of 0.3.4.2: Retry resends a POST or PUT only on
-//   `notWritten` from the API's WriteProblemDetails, a 500 or 503 served as
-//   `application/problem+json` with every member its schema requires, received as the
+//   `notWritten` from the API's WriteProblemDetails, a 500 or 503 served as the one media
+//   type `application/problem+json` with every member its schema requires, received as the
 //   direct reply to that write; `unknown`, `written`, a missing or unrecognised outcome, a
-//   `notWritten` in any other response, one reached through a redirect included, and no
-//   response offer Save again only, for a create and an update alike. A DELETE is always
-//   safe to resend. A reply to a call that writes no record states no write outcome.
+//   `notWritten` in any other response, one reached through a redirect or served with a
+//   second Content-Type field included, and no response offer Save again only, for a
+//   create and an update alike. A DELETE is always safe to resend. A reply to a call that
+//   writes no record states no write outcome.
 // - A write is acknowledged only by its contracted status (201 for POST, 200 for PUT)
 //   with its complete Record DTO; any other 2xx offers Save again only, as no response does.
 //   A DELETE is acknowledged by its bodyless 204 alone; any other 2xx offers Retry.
@@ -1786,14 +1787,16 @@ const UNPROVEN_OUTCOMES: readonly {
 
 /**
  * Responses whose JSON body says `notWritten` but that are not the API's WriteProblemDetails
- * (a 500 or 503 served as `application/problem+json`, a ProblemDetails of that status with
- * every member the schema requires) received as the direct reply to the save, so they prove
- * nothing: the save may have been applied.
+ * (a 500 or 503 served as `application/problem+json`, its Content-Type holding that one
+ * media type, a ProblemDetails of that status with every member the schema requires)
+ * received as the direct reply to the save, so they prove nothing: the save may have been
+ * applied.
  */
 const UNTRUSTED_NOT_WRITTEN: readonly {
   readonly name: string;
   readonly status: 500 | 502 | 503 | 504;
-  readonly contentType: string;
+  /** One Content-Type field holding the text given, or one field for each text of a list. */
+  readonly contentType: string | readonly string[];
   /** Laid over the conforming body; an `undefined` member is left out. */
   readonly members: Readonly<Record<string, unknown>>;
   readonly traceId: string | null;
@@ -1830,12 +1833,29 @@ const UNTRUSTED_NOT_WRITTEN: readonly {
     members: { detail: undefined },
     traceId: TRACE_ID,
   },
+  // A conforming body whose Content-Type holds more than one media type, such as a second
+  // field an intermediary added, is not the API's answer, whatever its first media type.
+  ...OUTCOME_STATUSES.map((status) => ({
+    name: `a ${String(status)} served with two Content-Type fields, application/problem+json; charset=utf-8 and text/plain`,
+    status,
+    contentType: ['application/problem+json; charset=utf-8', 'text/plain'],
+    members: {},
+    traceId: TRACE_ID,
+  })),
   // A conforming body that answers the request a redirect led to, not the save, is refused
   // before it is read, as no response: REDIRECT_REPLIES.
 ];
 
-/** A `status` response served as `contentType` whose body is a notWritten write problem with `members` laid over it. */
-function notWrittenAnswer(status: number, contentType: string, members: Readonly<Record<string, unknown>>): Response {
+/**
+ * A `status` response served as `contentType` whose body is a notWritten write problem with
+ * `members` laid over it. Headers joins the fields of a list with ", ", as a browser joins
+ * repeated response fields.
+ */
+function notWrittenAnswer(
+  status: number,
+  contentType: string | readonly string[],
+  members: Readonly<Record<string, unknown>>,
+): Response {
   const body = {
     type: 'about:blank',
     title: 'A fixed title.',
@@ -1845,7 +1865,11 @@ function notWrittenAnswer(status: number, contentType: string, members: Readonly
     writeOutcome: 'notWritten',
     ...members,
   };
-  return new Response(JSON.stringify(body), { status, headers: { 'content-type': contentType } });
+  const headers = new Headers();
+  for (const field of typeof contentType === 'string' ? [contentType] : contentType) {
+    headers.append('content-type', field);
+  }
+  return new Response(JSON.stringify(body), { status, headers });
 }
 
 interface UnsafeCase {
@@ -3121,6 +3145,34 @@ describe('a response whose body cannot be read (0.3.4.2)', () => {
       { kind: 'unavailable', status: 503, traceId: null },
     ],
     ['a 200 HTML page', () => Promise.resolve(textResponse(200, 'text/html', HTML_PAGE)), { kind: 'server', status: 200, traceId: null }],
+    // A success body is the API's answer only when it is served as application/json, a well-formed record included.
+    [
+      'a record served as text/plain',
+      () => Promise.resolve(textResponse(200, 'text/plain; charset=utf-8', JSON.stringify(recordFixture()))),
+      { kind: 'server', status: 200, traceId: null },
+    ],
+    [
+      'a record served as application/problem+json',
+      () => Promise.resolve(textResponse(200, 'application/problem+json', JSON.stringify(recordFixture()))),
+      { kind: 'server', status: 200, traceId: null },
+    ],
+    [
+      'a record served with no Content-Type',
+      // Bytes, unlike text, give a Response no Content-Type of its own.
+      () => Promise.resolve(new Response(new TextEncoder().encode(JSON.stringify(recordFixture())), { status: 200 })),
+      { kind: 'server', status: 200, traceId: null },
+    ],
+    [
+      'a record served with two Content-Type fields, application/json; charset=utf-8 and text/plain',
+      () => {
+        // Headers joins the two fields with ", ", as a browser joins repeated response fields.
+        const headers = new Headers();
+        headers.append('content-type', 'application/json; charset=utf-8');
+        headers.append('content-type', 'text/plain');
+        return Promise.resolve(new Response(new TextEncoder().encode(JSON.stringify(recordFixture())), { status: 200, headers }));
+      },
+      { kind: 'server', status: 200, traceId: null },
+    ],
     // A null body status has no body whatever its headers advertise, so its status still decides.
     ['a 205 with a Content-Length of 5', () => Promise.resolve(nullBodyAdvertisingFive(205)), { kind: 'server', status: 205, traceId: null }],
     ['a 304 with a Content-Length of 5', () => Promise.resolve(nullBodyAdvertisingFive(304)), { kind: 'server', status: 304, traceId: null }],

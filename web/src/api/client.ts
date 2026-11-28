@@ -9,14 +9,14 @@
 //
 // Every success body, the field-event answer included, is checked against its contract
 // shape before it is reported: callers receive only well-formed data, and an OK response
-// whose body is malformed or is not JSON settles as a failure of its own status, as does a
-// record create, update or delete answered by any status but its contracted 201, 200 or
-// 204, and a health check answered by any but its 200. So does a response, OK or not,
-// whose body could not be read to its end, since its status arrived. A request that
-// received no response at all, or was answered by a redirect, which the client refuses
-// rather than follows (withinDeadline), settles as networkError(). For a POST or PUT such
-// a failure states no outcome, so the save may have been applied and is never resent
-// without the user's explicit consent.
+// that is not served as `application/json`, or whose body is malformed or is not JSON,
+// settles as a failure of its own status, as does a record create, update or delete
+// answered by any status but its contracted 201, 200 or 204, and a health check answered
+// by any but its 200. So does a response, OK or not, whose body could not be read to its
+// end, since its status arrived. A request that received no response at all, or was
+// answered by a redirect, which the client refuses rather than follows (withinDeadline),
+// settles as networkError(). For a POST or PUT such a failure states no outcome, so the
+// save may have been applied and is never resent without the user's explicit consent.
 //
 // The client keeps no state, caching or retries; its one timer is each request's deadline
 // (REQUEST_DEADLINE_MS), which ends a request that has not completed as a failure with no
@@ -34,7 +34,7 @@
 // `count`, is read as JSON.parse reads it. The wire keeps plain JSON numbers.
 import createClient from 'openapi-fetch';
 
-import { isAbortError, networkError, parseProblem, type ApiError } from './errors';
+import { holdsOneMediaType, isAbortError, mediaTypeOf, networkError, parseProblem, type ApiError } from './errors';
 import type { components, paths } from './schema';
 import type {
   Diagnostic,
@@ -223,8 +223,9 @@ interface Exchange<D> {
 }
 
 // The body-less copies readingJsonExactly returns for a response whose status arrived but
-// whose body could not be read, or whose OK body is not JSON. openapi-fetch resolves the
-// exchange with the very Response the fetch wrapper returned, so settle recognises them.
+// whose body could not be read, or whose OK body is not served as JSON or is not JSON.
+// openapi-fetch resolves the exchange with the very Response the fetch wrapper returned,
+// so settle recognises them.
 const unreadableResponses = new WeakSet<Response>();
 
 // Settles one call. `read` turns an OK response's body into the result's data, returning
@@ -264,8 +265,9 @@ async function settle<D, T>(
   }
 
   const { data, error, response } = exchange;
-  // The status arrived but the body did not, or an OK body was not JSON: nothing in it can
-  // be trusted, so it settles as a failure of that status that states no write outcome.
+  // The status arrived but the body did not, or an OK body was not served as JSON or was not
+  // JSON: nothing in it can be trusted, so it settles as a failure of that status that
+  // states no write outcome.
   if (unreadableResponses.has(response)) {
     return { ok: false, error: parseProblem(response.status, undefined) };
   }
@@ -1362,6 +1364,20 @@ function unreadable(response: Response): Response {
   return copy;
 }
 
+// The one media type of every success body in the OpenAPI document.
+const JSON_MEDIA_TYPE = 'application/json';
+
+// Whether `response` is served as `application/json`: its Content-Type holds that one media
+// type (holdsOneMediaType), in any letter case and with any parameters, such as
+// `charset=utf-8`. A missing Content-Type is not, nor is one holding more than one media
+// type, such as two Content-Type fields, even when every one of them is `application/json`,
+// and neither is any other type, `application/problem+json` and every other `+json` type
+// included.
+function isServedAsJson(response: Response): boolean {
+  const contentType = response.headers.get('Content-Type');
+  return contentType !== null && holdsOneMediaType(contentType) && mediaTypeOf(contentType) === JSON_MEDIA_TYPE;
+}
+
 // Reads every response body here, once its status has arrived, so a body that fails is
 // told apart from a request that got no response; the latter alone rejects (settle).
 // - A null body status has no body, whatever its headers advertise, so it gives a copy
@@ -1371,13 +1387,20 @@ function unreadable(response: Response): Response {
 //   and reject, the no-response case. The copy settles by its status alone: a 204
 //   acknowledges a delete, and any other such status answers no call, so it settles as a
 //   failure of that status.
+// - An OK response not served as JSON (isServedAsJson) gives a copy marked unreadable,
+//   whatever its body holds, and its body is cancelled unread: every success body the API
+//   returns is served with the one media type `application/json`, so one served as anything
+//   else, such as an intermediary's text or HTML page, or with more than one media type,
+//   such as a second Content-Type field an intermediary added, is not the API's answer even
+//   when its text parses. An abort still settles as an abort, since withinDeadline settles
+//   an aborted call itself, without waiting on this copy.
 // - A body whose stream fails, such as a connection cut mid-body, gives a copy marked
 //   unreadable, so its status is kept, unless the request's signal is aborted: an abort
 //   stays an abort. Only that signal, which follows the caller's and any deadline composed
 //   into the request, tells a cancellation apart from a failed stream; the error's name
 //   does not, since a stream can fail with an AbortError that no abort of the call caused.
-// - An OK body is parsed by parseJson, so the field values of every OK body are read
-//   exactly. Text that is not JSON, an empty body included, gives a copy marked
+// - An OK body served as JSON is parsed by parseJson, so the field values of every OK body
+//   are read exactly. Text that is not JSON, an empty body included, gives a copy marked
 //   unreadable. Otherwise the copy's json() answers the parsed body: openapi-fetch reads an
 //   OK body with json() when the response carries a Content-Length, which the copy does.
 // - An error body holds no field values, so the copy carries the bytes received, undecoded,
@@ -1387,6 +1410,11 @@ function unreadable(response: Response): Response {
 async function readingJsonExactly(request: Request, response: Response): Promise<Response> {
   if (NULL_BODY_STATUSES.has(response.status)) {
     return copyWithBody(response, null);
+  }
+
+  if (response.ok && !isServedAsJson(response)) {
+    response.body?.cancel().catch(() => undefined);
+    return unreadable(response);
   }
 
   let text: string | ArrayBuffer;

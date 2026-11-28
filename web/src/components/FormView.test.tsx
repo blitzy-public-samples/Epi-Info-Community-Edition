@@ -7578,6 +7578,13 @@ describe('FormView record grid', () => {
     detail: 'An unexpected error occurred.',
     traceId: '00-test-event-00',
   };
+  const EVENT_UNAVAILABLE: ProblemDetails = {
+    type: 'https://tools.ietf.org/html/rfc9110#section-15.6.4',
+    title: 'Service Unavailable',
+    status: 503,
+    detail: 'The database is unavailable.',
+    traceId: '00-test-event-03',
+  };
 
   /** The `event` of a field-event request; `null` for any other request. */
   function fieldEventOf(call: Call): string | null {
@@ -7624,10 +7631,17 @@ describe('FormView record grid', () => {
       dirty: false,
     },
     {
+      outcome: 'fails with a 503',
+      answer: () => Promise.resolve(problemResponse(EVENT_UNAVAILABLE)),
+      age: recordNumberText(RECORD, 'Age'),
+      notice: 'Check code could not run for DOB. The database could not be reached.',
+      dirty: false,
+    },
+    {
       outcome: 'gets no response',
       answer: () => Promise.reject(new TypeError('Failed to fetch')),
       age: recordNumberText(RECORD, 'Age'),
-      notice: 'Check code could not run for DOB. The server could not be reached. Your changes are still on screen.',
+      notice: 'Check code could not run for DOB. The server could not be reached.',
       dirty: false,
     },
   ])('decides on a list 404 only after a held FieldAfter that $outcome has settled', async (example) => {

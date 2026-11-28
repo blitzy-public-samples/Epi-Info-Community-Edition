@@ -72,8 +72,9 @@ export interface ApiError {
    * What a failed record write is known to have done; `null`, which is treated as unsafe
    * to resend, unless the response is the direct reply to a record create, update or
    * delete, not one reached through a redirect, and is a WriteProblemDetails carrying a
-   * recognised `writeOutcome`: a 500 or 503 served as `application/problem+json` whose body
-   * is a ProblemDetails for that status with string `type`, `detail` and `traceId`.
+   * recognised `writeOutcome`: a 500 or 503 served as `application/problem+json`, its
+   * Content-Type holding that one media type, whose body is a ProblemDetails for that status
+   * with string `type`, `detail` and `traceId`.
    */
   readonly writeOutcome: WriteOutcome | null;
 }
@@ -176,22 +177,58 @@ function isProblemDetailsFor(problem: Record<string, unknown>, status: number): 
 const WRITE_PROBLEM_STATUSES: ReadonlySet<number> = new Set([500, 503]);
 const PROBLEM_MEDIA_TYPE = 'application/problem+json';
 
-// The media type of a Content-Type value: the text before its parameters, lower-cased.
-function mediaTypeOf(contentType: string): string {
+/**
+ * The media type of a Content-Type value: the text before its parameters, trimmed and
+ * lower-cased, so `application/json; charset=utf-8` and `APPLICATION/JSON` both give
+ * `application/json`. The client holds a success body to `application/json` and a write
+ * problem to `application/problem+json` by it, each together with holdsOneMediaType, since
+ * of a list such as `application/problem+json; charset=utf-8, text/plain` it gives the
+ * first media type.
+ */
+export function mediaTypeOf(contentType: string): string {
   const parameters = contentType.indexOf(';');
   return (parameters === -1 ? contentType : contentType.slice(0, parameters)).trim().toLowerCase();
 }
 
+/**
+ * Whether a Content-Type value holds one media type rather than a list of them. A comma
+ * outside every quoted string separates two values, as in the value `Headers.get` joins
+ * with `, ` from two Content-Type fields, so `application/json; charset=utf-8, text/plain`
+ * holds two, as does a value repeating one media type. A comma inside a quoted string, such
+ * as a quoted parameter value, belongs to the one value, and inside one a backslash escapes
+ * the next character, a quote included, as HTTP's quoted-string rule has it. The API serves
+ * every body with one media type, so a response whose Content-Type holds more than one is
+ * not its answer.
+ */
+export function holdsOneMediaType(contentType: string): boolean {
+  let quoted = false;
+  let at = 0;
+  while (at < contentType.length) {
+    const character = contentType[at];
+    if (character === ',' && !quoted) {
+      return false;
+    }
+    if (character === '"') {
+      quoted = !quoted;
+    }
+    at += quoted && character === '\\' ? 2 : 1;
+  }
+  return true;
+}
+
 // Whether `problem` is a WriteProblemDetails answering the response with `status`: a 500 or
-// 503 served as `application/problem+json` whose body is a ProblemDetails for that status
-// with every member the schema requires. Only such a body's `writeOutcome` is trusted. An
-// intermediary's 502 or 504, a 500 or 503 another server wrote, or a body missing a member
-// states nothing about the write, whatever `writeOutcome` it carries, since `notWritten`
-// read from it could offer Retry for a save the API committed.
+// 503 served as `application/problem+json`, its Content-Type holding that one media type,
+// whose body is a ProblemDetails for that status with every member the schema requires.
+// Only such a body's `writeOutcome` is trusted. An intermediary's 502 or 504, a 500 or 503
+// another server wrote, one whose Content-Type holds more than one media type, such as a
+// second Content-Type field an intermediary added, or a body missing a member states nothing
+// about the write, whatever `writeOutcome` it carries, since `notWritten` read from it could
+// offer Retry for a save the API committed.
 function isWriteProblemFor(problem: Record<string, unknown>, status: number, contentType: string | null): boolean {
   return (
     WRITE_PROBLEM_STATUSES.has(status) &&
     isString(contentType) &&
+    holdsOneMediaType(contentType) &&
     mediaTypeOf(contentType) === PROBLEM_MEDIA_TYPE &&
     isProblemDetailsFor(problem, status) &&
     isString(problem.type) &&
@@ -264,8 +301,9 @@ function kindOf(status: number, hasFieldErrors: boolean): ApiErrorKind {
 /** What parseProblem needs of the direct reply to a record create, update or delete. */
 export interface WriteReply {
   /**
-   * The response's Content-Type header, `null` when it has none. Its parameters, such as
-   * `charset`, are ignored.
+   * The response's Content-Type header, `null` when it has none, as `Headers.get` reads it,
+   * so two Content-Type fields arrive joined with `, `. A write problem's must hold the one
+   * media type `application/problem+json`; its parameters, such as `charset`, are ignored.
    */
   readonly contentType: string | null;
 }
@@ -277,9 +315,9 @@ export interface WriteReply {
  * `type` is kept only from a body that has a string `title` and whose integer `status` is
  * the HTTP status. `title`, `detail`, `traceId` and `errors` are read from any object
  * body. `writeOutcome` is read only when `writeReply` is given and the response is a
- * WriteProblemDetails, a 500 or 503 served as `application/problem+json` whose body is a
- * ProblemDetails for that status with string `type`, `detail` and `traceId`; otherwise it
- * is `null`.
+ * WriteProblemDetails, a 500 or 503 served as `application/problem+json`, its Content-Type
+ * holding that one media type, whose body is a ProblemDetails for that status with string
+ * `type`, `detail` and `traceId`; otherwise it is `null`.
  * @param status The response's HTTP status.
  * @param body The parsed JSON body, the raw text of a non-JSON body, or `undefined` for
  *   an empty one.
